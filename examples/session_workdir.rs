@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -18,6 +19,8 @@ use pi::session_workdir::{
 };
 use pi::{Error, PiResult};
 use serde::Serialize;
+
+const V2_OPEN_MODE: &str = "PI_SESSION_V2_OPEN_MODE";
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect and explicitly recover a session's working directory")]
@@ -66,7 +69,11 @@ impl Launch {
         if !executable.is_file() {
             return Err(Error::validation("--pi-binary must name an executable file"));
         }
-        Ok(Self { executable, workdir, session })
+        Ok(Self {
+            executable,
+            workdir,
+            session,
+        })
     }
 
     fn command(&self) -> PiResult<Command> {
@@ -122,7 +129,9 @@ async fn prepare(command: RecoveryCommand) -> PiResult<Prepared> {
     match command {
         RecoveryCommand::Inspect { session } => {
             let (_, session) = load_session(&session).await?;
-            Ok(Prepared::Json(serde_json::to_value(inspect_session_workdir(&session)?)?))
+            Ok(Prepared::Json(serde_json::to_value(
+                inspect_session_workdir(&session)?,
+            )?))
         }
         RecoveryCommand::Attach { session, workdir } => {
             let (_, mut session) = load_session(&session).await?;
@@ -141,14 +150,24 @@ async fn prepare(command: RecoveryCommand) -> PiResult<Prepared> {
         RecoveryCommand::Resume { session, pi_binary } => {
             let (path, session) = load_session(&session).await?;
             let workdir = require_session_workdir(&session)?;
-            Ok(Prepared::Launch(Launch::new(&pi_binary, workdir, Some(path))?))
+            Ok(Prepared::Launch(Launch::new(
+                &pi_binary,
+                workdir,
+                Some(path),
+            )?))
         }
         RecoveryCommand::StartNew { workdir, pi_binary } => {
             let workdir = absolute_user_path(&workdir)?;
             let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&workdir) else {
-                return Err(Error::validation(format!("workdir {workdir:?} is not an accessible directory")));
+                return Err(Error::validation(format!(
+                    "workdir {workdir:?} is not an accessible directory"
+                )));
             };
-            Ok(Prepared::Launch(Launch::new(&pi_binary, canonical_path, None)?))
+            Ok(Prepared::Launch(Launch::new(
+                &pi_binary,
+                canonical_path,
+                None,
+            )?))
         }
     }
 }
@@ -175,14 +194,46 @@ fn run(arguments: Arguments) -> Result<ExitCode, Box<dyn std::error::Error>> {
             // No shell, no interpolated command string, and no inherited resume
             // arguments which could replace the explicitly selected session.
             let status = launch.command()?.status()?;
-            let code = status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1);
-            Ok(ExitCode::from(code))
+            Ok(exit_code(status))
         }
     }
 }
 
+fn exit_code(status: std::process::ExitStatus) -> ExitCode {
+    let code = status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1);
+    ExitCode::from(code)
+}
+
+fn full_hydration_command(
+    executable: &Path,
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Command {
+    let mut command = Command::new(executable);
+    command.args(arguments).env(V2_OPEN_MODE, "full");
+    command
+}
+
+fn relaunch_with_full_hydration() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe()?;
+    let status = full_hydration_command(&executable, std::env::args_os().skip(1)).status()?;
+    Ok(exit_code(status))
+}
+
 fn main() -> ExitCode {
-    match run(Arguments::parse()) {
+    // Parse help/errors before spawning anything. A bounded V2 snapshot can
+    // omit an older binding even though it contains the conversation tail.
+    // Use a child-local environment override rather than unsafe process-wide
+    // set_var (Rust 2024), and do this before creating any runtime threads.
+    let arguments = Arguments::parse();
+    let result = if std::env::var(V2_OPEN_MODE).as_deref() == Ok("full") {
+        run(arguments)
+    } else {
+        relaunch_with_full_hydration()
+    };
+    match result {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
@@ -198,15 +249,25 @@ mod tests {
     #[test]
     fn resume_requires_an_explicit_executable() {
         assert!(Arguments::try_parse_from(["recover", "resume", "session.jsonl"]).is_err());
-        assert!(Arguments::try_parse_from([
-            "recover", "resume", "session.jsonl", "--pi-binary", "/usr/bin/pi",
-        ]).is_ok());
+        assert!(
+            Arguments::try_parse_from([
+                "recover",
+                "resume",
+                "session.jsonl",
+                "--pi-binary",
+                "/usr/bin/pi",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
     fn attach_requires_explicit_session_and_target() {
         assert!(Arguments::try_parse_from(["recover", "attach", "session.jsonl"]).is_err());
-        assert!(Arguments::try_parse_from(["recover", "attach", "session.jsonl", "/workspace"]).is_ok());
+        assert!(
+            Arguments::try_parse_from(["recover", "attach", "session.jsonl", "/workspace"])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -221,9 +282,10 @@ mod tests {
         };
         let command = launch.command().expect("command");
         assert_eq!(command.get_current_dir(), Some(workdir.as_path()));
-        assert_eq!(command.get_args().collect::<Vec<_>>(), vec![
-            std::ffi::OsStr::new("--session"), session.as_os_str(),
-        ]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--session"), session.as_os_str()]
+        );
     }
 
     #[test]
@@ -254,5 +316,20 @@ mod tests {
         };
         std::fs::rename(&original, root.path().join("moved")).expect("rename");
         assert!(launch.command().is_err());
+    }
+
+    #[test]
+    fn recovery_child_forces_full_hydration_without_changing_parent_environment() {
+        let before = std::env::var_os(V2_OPEN_MODE);
+        let executable = std::env::current_exe().expect("test executable");
+        let arguments = [OsString::from("inspect"), OsString::from("a session.jsonl")];
+        let command = full_hydration_command(&executable, arguments.clone());
+        assert_eq!(command.get_program(), executable.as_os_str());
+        assert_eq!(command.get_args().collect::<Vec<_>>(), arguments.iter().map(OsString::as_os_str).collect::<Vec<_>>());
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(V2_OPEN_MODE)
+                && value == Some(std::ffi::OsStr::new("full"))
+        }));
+        assert_eq!(std::env::var_os(V2_OPEN_MODE), before);
     }
 }

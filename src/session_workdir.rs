@@ -18,6 +18,7 @@ use crate::session::{Session, SessionEntry, ensure_session_directory_readable};
 
 /// Reserved custom-entry type for an explicit workdir attachment.
 pub const WORKDIR_BINDING_TYPE: &str = "pi.session.workdir.v1";
+const WORKDIR_BINDING_PREFIX: &str = "pi.session.workdir.";
 
 /// Filesystem health is separate from the user's decision to attach a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -40,7 +41,10 @@ impl WorkdirHealth {
         }
         let probe = || -> io::Result<PathBuf> {
             if !std::fs::metadata(path)?.is_dir() {
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a directory"));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "not a directory",
+                ));
             }
             // Also enforce mode-bit denial under privileged test runners.
             ensure_session_directory_readable(path)?;
@@ -52,7 +56,9 @@ impl WorkdirHealth {
             Ok(canonical_path) => Self::Available { canonical_path },
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self::Missing,
             Err(error) if error.kind() == io::ErrorKind::NotADirectory => Self::NotDirectory,
-            Err(error) => Self::Inaccessible { reason: error.to_string() },
+            Err(error) => Self::Inaccessible {
+                reason: error.to_string(),
+            },
         }
     }
 
@@ -90,16 +96,24 @@ fn binding_path(session: &Session) -> Result<PathBuf> {
         let SessionEntry::Custom(custom) = entry else {
             continue;
         };
-        if custom.custom_type != WORKDIR_BINDING_TYPE {
+        if !custom.custom_type.starts_with(WORKDIR_BINDING_PREFIX) {
             continue;
         }
-        let invalid = || Error::session(
-            "PI_SESSION_WORKDIR_BINDING_INVALID: malformed workdir attachment; \
-             refusing to fall back to another directory",
-        );
-        let binding: WorkdirBinding = serde_json::from_value(
-            custom.data.clone().ok_or_else(invalid)?,
-        ).map_err(|_| invalid())?;
+        if custom.custom_type != WORKDIR_BINDING_TYPE {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_BINDING_UNSUPPORTED: unknown workdir attachment version; \
+                 refusing to fall back to an older directory",
+            ));
+        }
+        let invalid = || {
+            Error::session(
+                "PI_SESSION_WORKDIR_BINDING_INVALID: malformed workdir attachment; \
+                 refusing to fall back to another directory",
+            )
+        };
+        let binding: WorkdirBinding =
+            serde_json::from_value(custom.data.clone().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?;
         if binding.original_cwd != session.header.cwd || !Path::new(&binding.cwd).is_absolute() {
             return Err(invalid());
         }
@@ -150,20 +164,26 @@ pub fn check_session_workdir(session: &Session, runtime_cwd: &Path) -> Result<()
 /// original cwd, parent-session provenance nor persistence path is rewritten.
 pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bool> {
     let canonical = WorkdirHealth::inspect(target).into_directory(target)?;
-    let cwd = canonical.to_str().ok_or_else(|| Error::session(
-        "PI_SESSION_WORKDIR_INVALID_ENCODING: attachment requires a UTF-8 path",
-    ))?.to_owned();
+    let cwd = canonical
+        .to_str()
+        .ok_or_else(|| {
+            Error::session("PI_SESSION_WORKDIR_INVALID_ENCODING: attachment requires a UTF-8 path")
+        })?
+        .to_owned();
     let previous = binding_path(session)?;
-    if let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&previous) {
-        if canonical_path == canonical {
-            return Ok(false);
-        }
+    if let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&previous)
+        && canonical_path == canonical
+    {
+        return Ok(false);
     }
     let binding = WorkdirBinding {
         original_cwd: session.header.cwd.clone(),
-        previous_cwd: previous.to_str().ok_or_else(|| Error::session(
-            "PI_SESSION_WORKDIR_INVALID_ENCODING: recorded workdir is not UTF-8",
-        ))?.to_owned(),
+        previous_cwd: previous
+            .to_str()
+            .ok_or_else(|| {
+                Error::session("PI_SESSION_WORKDIR_INVALID_ENCODING: recorded workdir is not UTF-8")
+            })?
+            .to_owned(),
         cwd,
     };
     let data = serde_json::to_value(binding)?;
@@ -187,10 +207,22 @@ mod tests {
         let file = root.path().join("file");
         std::fs::write(&file, "not a directory").expect("write file");
         assert_eq!(WorkdirHealth::inspect(&file), WorkdirHealth::NotDirectory);
-        assert_eq!(WorkdirHealth::inspect(&file.join("child")), WorkdirHealth::NotDirectory);
-        assert_eq!(WorkdirHealth::inspect(&root.path().join("gone")), WorkdirHealth::Missing);
-        assert_eq!(WorkdirHealth::inspect(Path::new(".")), WorkdirHealth::InvalidPath);
-        assert_eq!(WorkdirHealth::inspect(Path::new("")), WorkdirHealth::InvalidPath);
+        assert_eq!(
+            WorkdirHealth::inspect(&file.join("child")),
+            WorkdirHealth::NotDirectory
+        );
+        assert_eq!(
+            WorkdirHealth::inspect(&root.path().join("gone")),
+            WorkdirHealth::Missing
+        );
+        assert_eq!(
+            WorkdirHealth::inspect(Path::new(".")),
+            WorkdirHealth::InvalidPath
+        );
+        assert_eq!(
+            WorkdirHealth::inspect(Path::new("")),
+            WorkdirHealth::InvalidPath
+        );
     }
 
     #[test]
@@ -231,7 +263,10 @@ mod tests {
         attach_session_workdir(&mut session, &new).expect("attach moved workdir");
         assert_eq!(session.header.cwd, old.to_str().expect("UTF-8 path"));
         assert_eq!(session.path, original_path);
-        assert_eq!(require_session_workdir(&session).expect("resolve"), new.canonicalize().expect("canonical"));
+        assert_eq!(
+            require_session_workdir(&session).expect("resolve"),
+            new.canonicalize().expect("canonical")
+        );
     }
 
     #[test]
@@ -253,9 +288,14 @@ mod tests {
         attach_session_workdir(&mut session, second.path()).expect("attach second");
         attach_session_workdir(&mut session, third.path()).expect("attach third");
         let mut imported = Session::in_memory();
-        imported.header = serde_json::from_value(serde_json::to_value(&session.header).expect("encode")).expect("decode");
-        imported.entries = serde_json::from_value(serde_json::to_value(&session.entries).expect("encode")).expect("decode");
-        check_session_workdir(&imported, third.path()).expect("latest binding survives serialization");
+        imported.header =
+            serde_json::from_value(serde_json::to_value(&session.header).expect("encode"))
+                .expect("decode");
+        imported.entries =
+            serde_json::from_value(serde_json::to_value(&session.entries).expect("encode"))
+                .expect("decode");
+        check_session_workdir(&imported, third.path())
+            .expect("latest binding survives serialization");
         assert!(check_session_workdir(&imported, second.path()).is_err());
     }
 
@@ -263,9 +303,56 @@ mod tests {
     fn malformed_latest_binding_never_falls_back() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut session = session_at(root.path());
-        session.append_custom_entry(WORKDIR_BINDING_TYPE.to_owned(), Some(serde_json::json!({"cwd": "/"})));
+        session.append_custom_entry(
+            WORKDIR_BINDING_TYPE.to_owned(),
+            Some(serde_json::json!({"cwd": "/"})),
+        );
         let error = require_session_workdir(&session).expect_err("invalid metadata");
         assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_INVALID"));
+    }
+
+    #[test]
+    fn unknown_binding_version_never_revives_an_older_attachment() {
+        let first = tempfile::tempdir().expect("first");
+        let second = tempfile::tempdir().expect("second");
+        let mut session = session_at(first.path());
+        attach_session_workdir(&mut session, second.path()).expect("known attachment");
+        session.append_custom_entry("pi.session.workdir.v2".to_owned(), None);
+        let error = require_session_workdir(&session).expect_err("unsupported version");
+        assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_UNSUPPORTED"));
+        let count = session.entries.len();
+        assert!(attach_session_workdir(&mut session, first.path()).is_err());
+        assert_eq!(session.entries.len(), count);
+    }
+
+    #[test]
+    fn binding_cannot_claim_a_different_original_workspace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut session = session_at(root.path());
+        session.append_custom_entry(
+            WORKDIR_BINDING_TYPE.to_owned(),
+            Some(serde_json::json!({
+                "originalCwd": "another-session",
+                "previousCwd": session.header.cwd,
+                "cwd": root.path(),
+            })),
+        );
+        assert!(require_session_workdir(&session).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_directory_is_inaccessible_even_under_a_privileged_runner() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let denied = root.path().join("denied");
+        std::fs::create_dir(&denied).expect("create");
+        let permissions = std::fs::metadata(&denied).expect("metadata").permissions();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("deny access");
+        let health = WorkdirHealth::inspect(&denied);
+        std::fs::set_permissions(&denied, permissions).expect("restore permissions");
+        assert!(matches!(health, WorkdirHealth::Inaccessible { .. }));
     }
 
     #[cfg(unix)]
