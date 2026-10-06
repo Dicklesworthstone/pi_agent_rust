@@ -50,9 +50,9 @@ pub use crate::extensions::{
 };
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
-    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails,
-    StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage,
-    UserContent, UserMessage,
+    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message,
+    StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall,
+    ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use crate::models::{ModelEntry, ModelRegistry};
 pub use crate::provider::{

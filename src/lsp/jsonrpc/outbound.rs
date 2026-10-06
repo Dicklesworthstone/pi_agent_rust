@@ -506,7 +506,7 @@ mod tests {
         }
         assert!(client.request("test/over-limit", Value::Null).is_err());
         lock(&client.writer)
-            .write_all(&vec![b'x'; 4096])
+            .write_all(&[b'x'; 4096])
             .expect("hold the entire ordinary frame and byte budget");
         for (id, response) in requests {
             drop(super::super::await_completion(

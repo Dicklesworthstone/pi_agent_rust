@@ -2698,23 +2698,11 @@ impl Agent {
                     // or a signature over rewritten content. Block mode has
                     // already refused detections in either case above.
                     if same_origin && assistant.stop_reason == StopReason::PauseTurn {
-                        if mode == crate::secrets::SecretsMode::Block {
-                            let original =
-                                serde_json::to_value(assistant.as_ref()).map_err(|_| {
-                                    Error::validation(
-                                        "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
-                                            .to_string(),
-                                    )
-                                })?;
-                            Self::secrets_transform_json(
-                                &original,
-                                &mut staged_vault,
-                                mode,
-                                &extra,
-                                &mut total,
-                                &mut labels,
-                            )?;
-                        }
+                        // Typed request-wide discovery above covers the
+                        // screenable text, arguments and media metadata.
+                        // Serializing this whole message for another scan
+                        // would incorrectly treat payloads and signatures as
+                        // credential-bearing text in block mode.
                         continue;
                     }
 
@@ -2905,9 +2893,16 @@ impl Agent {
                     fields.push(Value::String(thinking.thinking.clone()));
                 }
                 ContentBlock::ToolCall(call) => fields.push(call.arguments.clone()),
-                ContentBlock::RedactedThinking(_)
-                | ContentBlock::Image(_)
-                | ContentBlock::Media(_) => {}
+                ContentBlock::Image(image) => {
+                    fields.push(Value::String(image.mime_type.clone()));
+                }
+                ContentBlock::Media(media) => {
+                    fields.push(Value::String(media.mime_type.clone()));
+                    if let Some(name) = &media.name {
+                        fields.push(Value::String(name.clone()));
+                    }
+                }
+                ContentBlock::RedactedThinking(_) => {}
             }
         }
     }
@@ -2953,6 +2948,30 @@ impl Agent {
                 "PI_SECRET_JSON_PRIMITIVE: text screening changed the JSON value type".to_string(),
             )
         })
+    }
+
+    /// Media payload bytes stay opaque, but names and MIME labels can appear
+    /// in provider-visible text. MIME labels also control native transport
+    /// routing, so replacing a secret there cannot safely produce a usable
+    /// identifier. Refuse instead of sending the secret or a malformed type.
+    fn secrets_transform_media_metadata(
+        mime_type: &str,
+        name: Option<&mut String>,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<()> {
+        if Self::secrets_transform_text(mime_type, vault, mode, extra, total, labels)? != mime_type {
+            return Err(Error::validation(
+                "PI_SECRET_MEDIA_MIME: media MIME type contains secret material and cannot be rewritten without changing transport; provide a nonsecret MIME type",
+            ));
+        }
+        if let Some(name) = name {
+            *name = Self::secrets_transform_text(name, vault, mode, extra, total, labels)?;
+        }
+        Ok(())
     }
 
     /// `same_origin_assistant` is true only for assistant output from the
@@ -3028,10 +3047,25 @@ impl Agent {
                     )?
                 };
             }
-            ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
-                // Opaque signed/provider bytes and binary payloads are not
-                // interpreted as text by the secret detector.
-            }
+            ContentBlock::Image(image) => Self::secrets_transform_media_metadata(
+                &image.mime_type,
+                None,
+                vault,
+                mode,
+                extra,
+                total,
+                labels,
+            )?,
+            ContentBlock::Media(media) => Self::secrets_transform_media_metadata(
+                &media.mime_type,
+                media.name.as_mut(),
+                vault,
+                mode,
+                extra,
+                total,
+                labels,
+            )?,
+            ContentBlock::RedactedThinking(_) => {}
         }
         Ok(())
     }
@@ -15972,8 +16006,11 @@ impl AgentSession {
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
-            let (text, images) = Self::split_content_blocks_for_input(&content);
-            let outcome = self.dispatch_input_event(text, images).await?;
+            Self::validate_user_content_blocks(&content)?;
+            let (original_text, images) = Self::split_content_blocks_for_input(&content);
+            let outcome = self
+                .dispatch_input_event(original_text.clone(), images)
+                .await?;
             let (text, images) = match outcome {
                 InputEventOutcome::Continue { text, images } => (text, images),
                 InputEventOutcome::Block { reason } => {
@@ -15982,6 +16019,9 @@ impl AgentSession {
                 }
             };
 
+            let content_for_agent =
+                Self::merge_input_event_content(content, &original_text, &text, &images);
+            Self::validate_user_content_blocks(&content_for_agent)?;
             let base_system_prompt = self.agent.system_prompt().map(str::to_string);
             let BeforeAgentStartOutcome {
                 messages: custom_messages,
@@ -15997,7 +16037,6 @@ impl AgentSession {
             let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
             prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
 
-            let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
             let result = prompt_scope
                 .session
                 .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
@@ -16349,6 +16388,25 @@ impl AgentSession {
         Some(prompt)
     }
 
+    pub(crate) fn validate_user_content_blocks(blocks: &[ContentBlock]) -> Result<()> {
+        if blocks.is_empty() {
+            return Err(Error::validation(
+                "PI_INPUT_CONTENT: a structured prompt must contain at least one content block",
+            ));
+        }
+        if let Some(index) = blocks.iter().position(|block| {
+            !matches!(
+                block,
+                ContentBlock::Text(_) | ContentBlock::Image(_) | ContentBlock::Media(_)
+            )
+        }) {
+            return Err(Error::validation(format!(
+                "PI_INPUT_CONTENT: user content block {index} must be text, image, or media"
+            )));
+        }
+        Ok(())
+    }
+
     fn split_content_blocks_for_input(blocks: &[ContentBlock]) -> (String, Vec<ImageContent>) {
         let mut text = String::new();
         let mut images = Vec::new();
@@ -16376,6 +16434,61 @@ impl AgentSession {
             content.push(ContentBlock::Image(image.clone()));
         }
         content
+    }
+
+    /// Input hooks edit text and images, not the remaining native media.
+    /// Preserve the original block order when that projection is unchanged.
+    /// A transformed text replaces the old text at its first slot; transformed
+    /// images replace image slots in order, with new extra images at the end.
+    /// Neither operation can silently discard an intervening audio/video block.
+    fn merge_input_event_content(
+        content: Vec<ContentBlock>,
+        original_text: &str,
+        text: &str,
+        images: &[ImageContent],
+    ) -> Vec<ContentBlock> {
+        let text_changed = original_text != text;
+        let images_unchanged = content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::Image(_)))
+            .count()
+            == images.len()
+            && content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Image(image) => Some(image),
+                    _ => None,
+                })
+                .zip(images)
+                .all(|(before, after)| {
+                    before.data == after.data && before.mime_type == after.mime_type
+                });
+        if !text_changed && images_unchanged {
+            return content;
+        }
+
+        let mut replacement_text = (text_changed && !text.trim().is_empty())
+            .then(|| ContentBlock::Text(TextContent::new(text)));
+        let mut replacement_images = images.iter().cloned();
+        let mut result = Vec::with_capacity(content.len());
+        for block in content {
+            match block {
+                ContentBlock::Text(_) if text_changed => {
+                    result.extend(replacement_text.take());
+                }
+                ContentBlock::Image(_) if !images_unchanged => {
+                    result.extend(replacement_images.next().map(ContentBlock::Image));
+                }
+                other => result.push(other),
+            }
+        }
+        if let Some(text) = replacement_text {
+            result.insert(0, text);
+        }
+        if !images_unchanged {
+            result.extend(replacement_images.map(ContentBlock::Image));
+        }
+        result
     }
 
     fn take_pending_idle_actions(&self) -> Vec<PendingIdleAction> {

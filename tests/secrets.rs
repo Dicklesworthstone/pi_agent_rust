@@ -1424,3 +1424,360 @@ fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() 
         }
     }
 }
+
+fn attachment_message(
+    content: Vec<pi::model::ContentBlock>,
+    as_tool_result: bool,
+) -> pi::model::Message {
+    if as_tool_result {
+        pi::model::Message::tool_result(pi::model::ToolResultMessage {
+            tool_call_id: "attachment-result".to_string(),
+            tool_name: "fixture".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    } else {
+        pi::model::Message::User(pi::model::UserMessage {
+            content: pi::model::UserContent::Blocks(content),
+            timestamp: 0,
+        })
+    }
+}
+
+#[test]
+fn media_names_are_discovered_before_earlier_fields_are_screened() {
+    use pi::model::{ContentBlock, MediaContent, Message, TextContent, UserContent};
+
+    let harness =
+        TestHarness::new("media_names_are_discovered_before_earlier_fields_are_screened");
+    let root = harness.temp_path(".");
+    for as_tool_result in [false, true] {
+        for mode in ["obfuscate", "block"] {
+            let (mut agent, capture) = build_agent(
+                &root,
+                Some(SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: None,
+                }),
+            );
+            let message = attachment_message(
+                vec![
+                    ContentBlock::Text(TextContent::new(format!(
+                        "earlier echo: {OPAQUE_SECRET}"
+                    ))),
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: "audio/wav".to_string(),
+                        name: Some(SECRET.to_string()),
+                    }),
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: "video/mp4".to_string(),
+                        name: Some(format!("password={OPAQUE_SECRET}")),
+                    }),
+                ],
+                as_tool_result,
+            );
+            let original = serde_json::to_value(&message).expect("original attachment message");
+            let outcome =
+                block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
+            let capture = capture.lock().expect("capture");
+            if mode == "block" {
+                let error = outcome
+                    .expect_err("metadata must obey block mode")
+                    .to_string();
+                assert!(error.contains("PI_SECRET_BLOCK"), "{error}");
+                assert!(!error.contains(SECRET));
+                assert!(!error.contains(OPAQUE_SECRET));
+                assert!(capture.payloads.is_empty());
+            } else {
+                outcome.expect("screened names must reach the provider");
+                assert_eq!(capture.payloads.len(), 1);
+                assert!(!capture.payloads[0].contains(SECRET));
+                assert!(!capture.payloads[0].contains(OPAQUE_SECRET));
+                let blocks = match &capture.messages[0][0] {
+                    Message::User(user) => match &user.content {
+                        UserContent::Blocks(blocks) => blocks,
+                        UserContent::Text(_) => panic!("attachment blocks expected"),
+                    },
+                    Message::ToolResult(result) => &result.content,
+                    _ => panic!("user or tool-result attachment expected"),
+                };
+                assert_eq!(blocks.len(), 3);
+                for block in &blocks[1..] {
+                    let ContentBlock::Media(media) = block else {
+                        panic!("media must be retained")
+                    };
+                    assert_eq!(media.data, "cGF5bG9hZA==");
+                    assert!(matches!(media.mime_type.as_str(), "audio/wav" | "video/mp4"));
+                    assert!(media.name.as_deref().unwrap().contains("<pi-secret:"));
+                    assert!(!media.placeholder().contains(SECRET));
+                    assert!(!media.placeholder().contains(OPAQUE_SECRET));
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).expect("local transcript"),
+                original,
+                "screening names must not alter retained media or text"
+            );
+        }
+    }
+}
+
+#[test]
+fn remembered_and_configured_media_names_are_protected_at_provider_entry() {
+    use pi::model::{ContentBlock, MediaContent};
+
+    let harness = TestHarness::new(
+        "remembered_and_configured_media_names_are_protected_at_provider_entry",
+    );
+    let root = harness.temp_path(".");
+    for as_tool_result in [false, true] {
+        let (mut agent, capture) = build_agent(&root, None);
+        agent
+            .secrets_transform_outbound_text(&format!("password={OPAQUE_SECRET}"))
+            .expect("remember an opaque credential");
+        let media = ContentBlock::Media(MediaContent {
+            data: "cGF5bG9hZA==".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some(OPAQUE_SECRET.to_string()),
+        });
+        block_on_local(agent.run_with_message_with_abort(
+            attachment_message(vec![media], as_tool_result),
+            None,
+            |_| {},
+        ))
+        .expect("remembered names are obfuscated");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
+        assert!(!capture.payloads[0].contains(OPAQUE_SECRET));
+        assert!(capture.payloads[0].contains("<pi-secret:"));
+        drop(capture);
+
+        let (mut blocked, blocked_capture) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some("block".to_string()),
+                extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+            }),
+        );
+        let error = block_on_local(blocked.run_with_message_with_abort(
+            attachment_message(
+                vec![ContentBlock::Media(MediaContent {
+                    data: "cGF5bG9hZA==".to_string(),
+                    mime_type: "audio/wav".to_string(),
+                    name: Some("ACME-123456".to_string()),
+                })],
+                as_tool_result,
+            ),
+            None,
+            |_| {},
+        ))
+        .expect_err("custom patterns scan the original name field");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
+        assert!(blocked_capture.lock().expect("capture").payloads.is_empty());
+    }
+}
+
+#[test]
+fn secret_mime_types_refuse_without_changing_transport_or_learning_other_fields() {
+    use pi::model::{ContentBlock, ImageContent, MediaContent, TextContent};
+
+    const EARLY: &str = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
+    let harness = TestHarness::new(
+        "secret_mime_types_refuse_without_changing_transport_or_learning_other_fields",
+    );
+    let root = harness.temp_path(".");
+    for image in [false, true] {
+        for as_tool_result in [false, true] {
+            for mode in ["obfuscate", "block", "off"] {
+                let (mut agent, capture) = build_agent(
+                    &root,
+                    Some(SecretsSettings {
+                        mode: Some(mode.to_string()),
+                        extra_patterns: None,
+                    }),
+                );
+                let mime = format!("{}/{SECRET}", if image { "image" } else { "audio" });
+                let block = if image {
+                    ContentBlock::Image(ImageContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: mime.clone(),
+                    })
+                } else {
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: mime.clone(),
+                        name: Some("recording".to_string()),
+                    })
+                };
+                let message = attachment_message(
+                    vec![
+                        ContentBlock::Text(TextContent::new(if mode == "block" {
+                            "ordinary"
+                        } else {
+                            EARLY
+                        })),
+                        block,
+                    ],
+                    as_tool_result,
+                );
+                let original = serde_json::to_value(&message).expect("original MIME");
+                let outcome =
+                    block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
+                let capture = capture.lock().expect("capture");
+                if mode == "off" {
+                    outcome.expect("off mode keeps ordinary transport behavior");
+                    assert_eq!(capture.payloads.len(), 1);
+                    assert!(capture.payloads[0].contains(&mime));
+                } else {
+                    let error = outcome.expect_err("secret MIME cannot be sent").to_string();
+                    assert!(
+                        error.contains(if mode == "block" {
+                            "PI_SECRET_BLOCK"
+                        } else {
+                            "PI_SECRET_MEDIA_MIME"
+                        }),
+                        "{error}"
+                    );
+                    assert!(!error.contains(SECRET));
+                    assert!(!error.contains(EARLY));
+                    assert!(capture.payloads.is_empty());
+                    if mode == "obfuscate" {
+                        assert_eq!(
+                            agent
+                                .secrets_transform_outbound_text(EARLY)
+                                .expect("rolled-back vault"),
+                            "<pi-secret:000001>",
+                            "the MIME refusal must roll back discovery of every earlier field"
+                        );
+                    }
+                }
+                assert_eq!(
+                    serde_json::to_value(&agent.messages()[0]).expect("retained MIME"),
+                    original
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn encoded_image_and_media_payloads_remain_opaque_to_secret_screening() {
+    use pi::model::{ContentBlock, ImageContent, MediaContent};
+
+    // This is valid base64 whose bytes also match a built-in AWS-key rule.
+    // Inspecting the encoded payload as text would either corrupt it or refuse.
+    const PAYLOAD: &str = "AKIA1234567890ABCDEF";
+    assert!(pi::secrets::contains_secret(PAYLOAD, &[]));
+    let harness =
+        TestHarness::new("encoded_image_and_media_payloads_remain_opaque_to_secret_screening");
+    let root = harness.temp_path(".");
+    for mode in ["obfuscate", "block"] {
+        let (mut agent, capture) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: None,
+            }),
+        );
+        let blocks = vec![
+            ContentBlock::Image(ImageContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Media(MediaContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("recording".to_string()),
+            }),
+        ];
+        let messages = vec![
+            attachment_message(blocks.clone(), false),
+            attachment_message(blocks, true),
+        ];
+        let original = serde_json::to_value(&messages).expect("original encoded payloads");
+        block_on_local(agent.run_with_messages_with_abort(messages, None, |_| {}))
+            .expect("encoded payloads are not text metadata");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
+        assert_eq!(serde_json::to_value(&capture.messages[0]).unwrap(), original);
+        assert_eq!(serde_json::to_value(&agent.messages()[..2]).unwrap(), original);
+    }
+}
+
+#[test]
+fn block_mode_paused_replay_keeps_payloads_opaque_but_screens_content_and_names() {
+    use pi::model::{
+        ContentBlock, ImageContent, MediaContent, StopReason, TextContent, ThinkingContent,
+    };
+
+    const PAYLOAD: &str = "AKIA1234567890ABCDEF";
+    let harness = TestHarness::new(
+        "block_mode_paused_replay_keeps_payloads_opaque_but_screens_content_and_names",
+    );
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, Some(block_mode()));
+    let media = MediaContent {
+        data: PAYLOAD.to_string(),
+        mime_type: "audio/wav".to_string(),
+        name: Some("recording".to_string()),
+    };
+    let paused = assistant(
+        vec![
+            ContentBlock::Media(media.clone()),
+            ContentBlock::Image(ImageContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Thinking(ThinkingContent {
+                thinking: "check recording".to_string(),
+                thinking_signature: Some(PAYLOAD.to_string()),
+            }),
+            ContentBlock::Text(TextContent {
+                text: "recording received".to_string(),
+                text_signature: Some(PAYLOAD.to_string()),
+            }),
+            tool_call("paused-call", json!({"status": "ready"}), Some(PAYLOAD)),
+        ],
+        StopReason::PauseTurn,
+    );
+    let original = serde_json::to_value(&paused).expect("original paused response");
+    block_on_local(agent.run_with_message_with_abort(paused, None, |_| {}))
+        .expect("opaque paused payloads and signatures must not be screened as text");
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 1);
+    assert_eq!(serde_json::to_value(&capture.messages[0][0]).unwrap(), original);
+    assert_eq!(serde_json::to_value(&agent.messages()[0]).unwrap(), original);
+    drop(capture);
+
+    let protected_blocks = [
+        ContentBlock::Media(MediaContent {
+            name: Some(SECRET.to_string()),
+            ..media
+        }),
+        tool_call("protected-call", json!({"api_key": SECRET}), Some(PAYLOAD)),
+        ContentBlock::Text(TextContent {
+            text: SECRET.to_string(),
+            text_signature: Some(PAYLOAD.to_string()),
+        }),
+        ContentBlock::Thinking(ThinkingContent {
+            thinking: SECRET.to_string(),
+            thinking_signature: Some(PAYLOAD.to_string()),
+        }),
+    ];
+    for block in protected_blocks {
+        let (mut blocked, blocked_capture) = build_agent(&root, Some(block_mode()));
+        let error = block_on_local(blocked.run_with_message_with_abort(
+            assistant(vec![block], StopReason::PauseTurn),
+            None,
+            |_| {},
+        ))
+        .expect_err("paused replay never exempts readable content from block mode");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
+        assert!(!error.to_string().contains(SECRET));
+        assert!(blocked_capture.lock().expect("capture").payloads.is_empty());
+    }
+}

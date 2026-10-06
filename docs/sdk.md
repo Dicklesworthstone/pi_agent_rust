@@ -62,7 +62,7 @@ be breaking for Rust consumers.
 | `pi::sdk::{Error, Result}` | Stable | SDK error/result exports. |
 | `pi::sdk::{AbortHandle, AbortSignal}` | Stable | Prompt cancellation handles. |
 | `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}` | Stable | In-process agent/session integration exports. |
-| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
+| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
 | `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}` | Stable | Configuration, extension, session, and thinking-control exports. |
 | `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration exports. |
 | `pi::sdk::{ModelEntry, ModelRegistry}` | Stable | Model registry exports. |
@@ -115,6 +115,59 @@ fn main() -> pi::sdk::Result<()> {
     Ok(())
 }
 ```
+
+### Native image, audio, and video prompts
+
+Use `prompt_with_content` when the prompt contains ordered text and native
+attachments. `ImageContent` carries images; `MediaContent` carries audio or
+video with a MIME type and optional display name. The `data` field contains
+base64 payload bytes, not a path or URL. Pi does not fetch input sources from
+this method.
+
+```rust
+use pi::sdk::{AgentSessionHandle, ContentBlock, MediaContent, TextContent};
+
+async fn summarize_clip(
+    session: &mut AgentSessionHandle,
+    clip_base64: String,
+) -> pi::sdk::Result<()> {
+    let response = session
+        .prompt_with_content(
+            vec![
+                ContentBlock::Text(TextContent::new("Summarize this clip.")),
+                ContentBlock::Media(MediaContent {
+                    data: clip_base64,
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            |_| {},
+        )
+        .await?;
+    println!("{response:#?}");
+    Ok(())
+}
+```
+
+`prompt_with_content_with_abort` accepts an `AbortSignal` for the same input.
+Both methods use the handle's normal persistence, retry, failover, and event
+subscriptions. Recovery reuses the accepted user message, without appending
+the media again or repeating input hooks. Media-only prompts are supported;
+an empty block list or an assistant-only block is rejected before appending
+the user message.
+
+Input hooks retain their existing text/image interface. When a hook leaves
+those fields unchanged, the complete original block order is preserved. When
+it edits them, replacement text occupies the first original text position,
+replacement images occupy image positions, and extra images append at the
+end. Audio/video blocks remain in the prompt. Providers use their existing
+native media transport where supported; unsupported media becomes a visible
+omission placeholder. The local transcript retains the native content.
+
+Media names respect the configured secret-screening policy. A MIME type that
+contains secret material is refused when screening is enabled because replacing
+part of that identifier could change how the provider handles the attachment.
+Encoded payload bytes remain opaque to the text secret detector.
 
 ## Recipe 2: Session-Level Subscribers and Typed Hooks
 

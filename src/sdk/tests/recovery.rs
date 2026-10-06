@@ -48,6 +48,7 @@ async fn invoke(
 struct PromptObservations {
     prompts: Vec<Option<String>>,
     thinking_levels: Vec<Option<crate::model::ThinkingLevel>>,
+    messages: Vec<Vec<Message>>,
 }
 
 struct PromptProbeProvider {
@@ -84,6 +85,7 @@ impl crate::provider::Provider for PromptProbeProvider {
                 .prompts
                 .push(context.system_prompt.as_deref().map(str::to_string));
             observed.thinking_levels.push(options.thinking_level);
+            observed.messages.push(context.messages.to_vec());
             call
         };
         if self.pending_call == Some(call) {
@@ -110,9 +112,6 @@ fn record_system_prompts(
 /// Use the real native extension dispatcher. Its custom message is observable
 /// evidence that recovery has not replayed `before_agent_start` a second time.
 fn install_system_prompt_hook(handle: &mut AgentSessionHandle, prompt: Option<&str>) {
-    let manager = crate::extensions::ExtensionManager::new();
-    let temp = tempdir().unwrap();
-    let entry = temp.path().join("turn-system-prompt.native.json");
     let output = prompt.map_or_else(
         || serde_json::json!({}),
         |prompt| {
@@ -126,13 +125,26 @@ fn install_system_prompt_hook(handle: &mut AgentSessionHandle, prompt: Option<&s
             })
         },
     );
+    install_native_event_hooks(handle, serde_json::json!({"before_agent_start": output}));
+}
+
+fn install_native_event_hooks(handle: &mut AgentSessionHandle, responses: Value) {
+    let manager = crate::extensions::ExtensionManager::new();
+    let temp = tempdir().unwrap();
+    let entry = temp.path().join("turn-system-prompt.native.json");
+    let hooks = responses
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     let descriptor = serde_json::json!({
         "id": "turn-system-prompt-test",
         "name": "turn-system-prompt-test",
         "version": "1.0.0",
         "apiVersion": crate::extensions::PROTOCOL_VERSION,
-        "eventHooks": ["before_agent_start"],
-        "eventResponses": {"before_agent_start": output},
+        "eventHooks": hooks,
+        "eventResponses": responses,
     });
     std::fs::write(&entry, serde_json::to_vec(&descriptor).unwrap()).unwrap();
     run_async(async {
@@ -186,6 +198,386 @@ fn assert_prompt_hook_ran_once(handle: &AgentSessionHandle) {
         1,
         "retry/failover must not replay the hook's custom message",
     );
+}
+
+fn native_content_fixture() -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::Text(TextContent::new("describe the first scene")),
+        ContentBlock::Image(ImageContent {
+            data: "Zmlyc3Q=".to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+        ContentBlock::Media(MediaContent {
+            data: "YXVkaW8=".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            name: Some("voice.mp3".to_string()),
+        }),
+        ContentBlock::Text(TextContent::new("compare the final scene")),
+        ContentBlock::Image(ImageContent {
+            data: "c2Vjb25k".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }),
+        ContentBlock::Media(MediaContent {
+            data: "dmlkZW8=".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("motion.mp4".to_string()),
+        }),
+        ContentBlock::Text(TextContent::new(" \t\n")),
+    ]
+}
+
+fn saving_native_content_handle(
+    dir: &Path,
+    failures: usize,
+) -> (
+    AgentSessionHandle,
+    Arc<AtomicUsize>,
+    Arc<Mutex<PromptObservations>>,
+) {
+    let mut handle = saving_handle(dir).with_retry(Some(fast_retry_policy(1)));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (name, model) = handle.model();
+    handle
+        .session
+        .agent
+        .set_provider(Arc::new(FlakyThenOkProvider {
+            failures,
+            calls: Arc::clone(&calls),
+            name,
+            model,
+            input_tokens: 0,
+        }));
+    let observations = record_system_prompts(&mut handle, None);
+    (handle, calls, observations)
+}
+
+fn install_native_content_hooks(handle: &mut AgentSessionHandle, input: Value) {
+    install_native_event_hooks(
+        handle,
+        serde_json::json!({
+            "input": input,
+            "before_agent_start": {
+                "systemPrompt": "native-content-hook",
+                "messages": [{
+                    "customType": "prompt-scope-hook",
+                    "content": "hook ran once",
+                    "display": false,
+                }],
+            },
+        }),
+    );
+}
+
+fn assert_one_native_user_message(messages: &[Message], expected: &[ContentBlock]) {
+    let users = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1, "one user message for the logical turn");
+    let UserContent::Blocks(actual) = &users[0].content else {
+        panic!("native input must remain structured user content");
+    };
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap(),
+        "preserve native payloads, text slots, and their exact order"
+    );
+}
+
+fn assert_native_user_persisted_once(handle: &AgentSessionHandle, expected: &[ContentBlock]) {
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .expect("native prompt must create a saved session");
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                crate::session::SessionEntry::Message(entry)
+                    if matches!(&entry.message, crate::session::SessionMessage::User { .. })
+            ))
+            .count(),
+        1,
+        "recovery must not append another user entry to the session file"
+    );
+    assert_one_native_user_message(&reopened.to_messages_for_current_path(), expected);
+}
+
+#[test]
+fn native_content_retries_preserve_order_and_persist_one_user_message() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 1);
+    handle
+        .session
+        .agent
+        .set_system_prompt(Some("ordinary-system".to_string()));
+    install_native_content_hooks(&mut handle, serde_json::json!({"action":"continue"}));
+    let content = native_content_fixture();
+
+    let result = run_async(handle.prompt_with_content(content.clone(), |_| {})).unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one transient retry");
+    {
+        let observed = observations.lock().unwrap();
+        assert_eq!(observed.messages.len(), 2);
+        assert_eq!(
+            observed.prompts,
+            vec![Some("native-content-hook".to_string()); 2]
+        );
+        for messages in &observed.messages {
+            assert_one_native_user_message(messages, &content);
+        }
+    }
+    assert_prompt_hook_ran_once(&handle);
+    assert_eq!(handle.session.agent.system_prompt(), Some("ordinary-system"));
+    assert_native_user_persisted_once(&handle, &content);
+}
+
+#[test]
+fn native_input_hooks_replace_add_and_remove_text_and_images_without_losing_media() {
+    let original = native_content_fixture();
+    let replacements = [
+        ImageContent {
+            data: "bmV3LW9uZQ==".to_string(),
+            mime_type: "image/webp".to_string(),
+        },
+        ImageContent {
+            data: "bmV3LXR3bw==".to_string(),
+            mime_type: "image/png".to_string(),
+        },
+        ImageContent {
+            data: "bmV3LXRocmVl".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        },
+    ];
+    let rewritten = ContentBlock::Text(TextContent::new("hook-selected description"));
+    let cases = [
+        (
+            "replace",
+            serde_json::json!({
+                "action":"transform",
+                "text":"hook-selected description",
+                "images":&replacements[..2],
+            }),
+            vec![
+                rewritten.clone(),
+                ContentBlock::Image(replacements[0].clone()),
+                original[2].clone(),
+                ContentBlock::Image(replacements[1].clone()),
+                original[5].clone(),
+            ],
+        ),
+        (
+            "add",
+            serde_json::json!({
+                "action":"transform",
+                "text":"hook-selected description",
+                "images":replacements,
+            }),
+            vec![
+                rewritten,
+                ContentBlock::Image(replacements[0].clone()),
+                original[2].clone(),
+                ContentBlock::Image(replacements[1].clone()),
+                original[5].clone(),
+                ContentBlock::Image(replacements[2].clone()),
+            ],
+        ),
+        (
+            "remove text and images",
+            serde_json::json!({"action":"transform", "text":"", "images":[]}),
+            vec![original[2].clone(), original[5].clone()],
+        ),
+        (
+            "remove only images",
+            serde_json::json!({"action":"transform", "images":[]}),
+            vec![
+                original[0].clone(),
+                original[2].clone(),
+                original[3].clone(),
+                original[5].clone(),
+                original[6].clone(),
+            ],
+        ),
+    ];
+    for (case, response, expected) in cases {
+        let dir = tempdir().unwrap();
+        let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 1);
+        install_native_content_hooks(&mut handle, response);
+
+        let result = run_async(handle.prompt_with_content(original.clone(), |_| {}))
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert_eq!(result.stop_reason, StopReason::Stop, "{case}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{case}");
+        for messages in &observations.lock().unwrap().messages {
+            assert_one_native_user_message(messages, &expected);
+        }
+        assert_prompt_hook_ran_once(&handle);
+        assert_native_user_persisted_once(&handle, &expected);
+    }
+}
+
+#[test]
+fn media_only_prompts_accept_hooks_that_add_text_and_images_without_existing_slots() {
+    let original = native_content_fixture();
+    let media = vec![original[2].clone(), original[5].clone()];
+    let image = ImageContent {
+        data: "bmV3LWltYWdl".to_string(),
+        mime_type: "image/png".to_string(),
+    };
+    let cases = [
+        (serde_json::json!({"action":"continue"}), media.clone()),
+        (
+            serde_json::json!({
+                "action":"transform",
+                "text":"describe these clips",
+                "images":[image.clone()],
+            }),
+            vec![
+                ContentBlock::Text(TextContent::new("describe these clips")),
+                media[0].clone(),
+                media[1].clone(),
+                ContentBlock::Image(image),
+            ],
+        ),
+    ];
+    for (response, expected) in cases {
+        let dir = tempdir().unwrap();
+        let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
+        install_native_content_hooks(&mut handle, response);
+        let result = run_async(handle.prompt_with_content(media.clone(), |_| {})).unwrap();
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_one_native_user_message(&observations.lock().unwrap().messages[0], &expected);
+        assert_prompt_hook_ran_once(&handle);
+        assert_native_user_persisted_once(&handle, &expected);
+    }
+}
+
+#[test]
+fn invalid_native_content_refuses_before_provider_calls_or_session_persistence() {
+    let assistant_blocks = [
+        ContentBlock::Thinking(ThinkingContent {
+            thinking: "not user input".to_string(),
+            thinking_signature: None,
+        }),
+        ContentBlock::RedactedThinking(crate::model::RedactedThinkingContent {
+            data: "opaque".to_string(),
+        }),
+        ContentBlock::ToolCall(ToolCall {
+            id: "not-a-user-call".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path":"private.txt"}),
+            thought_signature: None,
+        }),
+    ];
+    let mut invalid = vec![Vec::new()];
+    invalid.extend(assistant_blocks.iter().cloned().map(|block| vec![block]));
+    invalid.extend(assistant_blocks.into_iter().map(|block| {
+        vec![ContentBlock::Text(TextContent::new("valid prefix")), block]
+    }));
+    for content in invalid {
+        let dir = tempdir().unwrap();
+        let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
+        // Invalid original content must not become accepted just because an
+        // input hook could otherwise replace the visible text/images.
+        install_native_content_hooks(
+            &mut handle,
+            serde_json::json!({"action":"transform", "text":"replacement", "images":[]}),
+        );
+        let error = run_async(handle.prompt_with_content(content, |_| {})).unwrap_err();
+        assert!(error.to_string().contains("PI_INPUT_CONTENT"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(observations.lock().unwrap().messages.is_empty());
+        assert!(handle.session.agent.messages().is_empty());
+        let store = handle.session_store();
+        let session = store.try_lock().unwrap();
+        assert!(session.entries.is_empty());
+        assert!(session.path.is_none());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn input_hooks_cannot_turn_a_native_prompt_into_an_empty_persisted_turn() {
+    let original = native_content_fixture();
+    let content = vec![original[0].clone(), original[1].clone()];
+    let dir = tempdir().unwrap();
+    let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
+    install_native_content_hooks(
+        &mut handle,
+        serde_json::json!({"action":"transform", "text":"", "images":[]}),
+    );
+
+    let error = run_async(handle.prompt_with_content(content, |_| {})).unwrap_err();
+
+    assert!(error.to_string().contains("PI_INPUT_CONTENT"), "{error}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(observations.lock().unwrap().messages.is_empty());
+    assert!(handle.session.agent.messages().is_empty());
+    let store = handle.session_store();
+    let session = store.try_lock().unwrap();
+    assert!(session.entries.is_empty());
+    assert!(session.path.is_none());
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn native_content_explicit_abort_prevents_admission_and_retry_reentry() {
+    for pre_aborted in [true, false] {
+        let dir = tempdir().unwrap();
+        let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 1);
+        install_native_content_hooks(&mut handle, serde_json::json!({"action":"continue"}));
+        let content = native_content_fixture();
+        let (abort, signal) = AbortHandle::new();
+        if pre_aborted {
+            abort.abort();
+        }
+        let retry_starts = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::clone(&retry_starts);
+        let result = run_async(handle.prompt_with_content_with_abort(
+            content.clone(),
+            signal,
+            move |event| {
+                if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                    retries.fetch_add(1, Ordering::SeqCst);
+                    abort.abort();
+                }
+            },
+        ));
+        assert!(matches!(result, Err(Error::Aborted)));
+        if pre_aborted {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(retry_starts.load(Ordering::SeqCst), 0);
+            assert!(observations.lock().unwrap().messages.is_empty());
+            assert!(handle.session.agent.messages().is_empty());
+            let store = handle.session_store();
+            let session = store.try_lock().unwrap();
+            assert!(session.entries.is_empty());
+            assert!(session.path.is_none());
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        } else {
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no request after abort");
+            assert_eq!(retry_starts.load(Ordering::SeqCst), 1);
+            let observed = observations.lock().unwrap();
+            assert_eq!(observed.messages.len(), 1);
+            assert_one_native_user_message(&observed.messages[0], &content);
+            drop(observed);
+            assert_prompt_hook_ran_once(&handle);
+            assert_native_user_persisted_once(&handle, &content);
+        }
+    }
 }
 
 #[test]
@@ -925,6 +1317,80 @@ fn saving_handle_after_failover(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUs
     assert_eq!(handle.model().1, "gpt-4o-mini");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     (handle, calls)
+}
+
+#[test]
+fn invalid_native_content_does_not_restore_an_expired_fallback_or_mutate_its_session() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_handle_after_failover(dir.path());
+    assert!(
+        handle
+            .failover_state
+            .should_restore_primary(std::time::Instant::now()),
+        "the setup must make primary restoration immediately eligible"
+    );
+    let original_model = handle.model();
+    let original_primary = handle.failover_state.primary().cloned();
+    let original_active = handle.failover_state.active().cloned();
+    let original_lifecycle = handle.failover_state.lifecycle_id().map(str::to_string);
+    let original_position = handle.failover_state.chain_position();
+    let (path, original_provenance) = {
+        let store = handle.session_store();
+        let session = store.try_lock().unwrap();
+        (
+            session.path.clone().unwrap(),
+            serde_json::to_value(
+                session
+                    .active_failover_provenance_for_current_path()
+                    .expect("saved fallback provenance"),
+            )
+            .unwrap(),
+        )
+    };
+    let original_bytes = std::fs::read(&path).unwrap();
+    let original_calls = calls.load(Ordering::SeqCst);
+    let observations = record_system_prompts(&mut handle, None);
+    let original_provider = handle.session.agent.provider();
+    let (events, callback) = event_log();
+    let (abort, signal) = AbortHandle::new();
+
+    let error = run_async(handle.prompt_with_content_with_abort(
+        Vec::new(),
+        signal,
+        move |event| {
+            // A regressed preflight could emit primary restoration before
+            // validating input. Stop there so that failure cannot contact the
+            // real reconstructed primary while still recording the defect.
+            abort.abort();
+            callback(event);
+        },
+    ))
+    .expect_err("invalid original blocks must refuse before restoration");
+
+    assert!(error.to_string().contains("PI_INPUT_CONTENT"), "{error}");
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), original_calls);
+    assert!(observations.lock().unwrap().messages.is_empty());
+    assert_eq!(handle.model(), original_model);
+    assert!(Arc::ptr_eq(
+        &handle.session.agent.provider(),
+        &original_provider
+    ));
+    assert_eq!(handle.failover_state.primary(), original_primary.as_ref());
+    assert_eq!(handle.failover_state.active(), original_active.as_ref());
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        original_lifecycle.as_deref()
+    );
+    assert_eq!(handle.failover_state.chain_position(), original_position);
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    let store = handle.session_store();
+    let session = store.try_lock().unwrap();
+    assert_eq!(session.path.as_ref(), Some(&path));
+    assert_eq!(
+        serde_json::to_value(session.active_failover_provenance_for_current_path()).unwrap(),
+        original_provenance
+    );
 }
 
 #[test]

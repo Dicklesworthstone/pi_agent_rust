@@ -389,6 +389,35 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Send native text, image, audio and video blocks as one recoverable prompt.
+    ///
+    /// Blocks retain their order and payloads. Input hooks can transform text
+    /// and images while audio/video blocks remain attached. This method does
+    /// not read paths or fetch URLs; provider-specific media transport and
+    /// unsupported-media degradation use the ordinary Agent/provider boundary.
+    /// The accepted user message is persisted once and reused on recovery.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let (_handle, signal) = AbortHandle::new();
+        self.prompt_with_content_with_abort(content, signal, on_event)
+            .await
+    }
+
+    /// Send native content with explicit cancellation and this handle's
+    /// configured retry/failover policy. Assistant-only blocks are rejected.
+    pub async fn prompt_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_recoverable_turn(Some(UserContent::Blocks(content)), abort_signal, on_event)
+            .await
+    }
+
     /// Continue without synthesizing a user message, with the same recovery,
     /// persistence and provider-admission rules as [`Self::prompt`].
     pub async fn continue_turn(
@@ -417,6 +446,14 @@ impl AgentSessionHandle {
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(&abort_signal)?;
         self.session.ensure_provider_reentry_allowed()?;
+        if let Some(UserContent::Blocks(blocks)) = &input
+            && let Err(error) = AgentSession::validate_user_content_blocks(blocks)
+        {
+            // Rejected input consumes its one-shot keyword provenance just
+            // like the AgentSession validation boundary below.
+            self.session.agent.set_magic_keyword_scan_override(None);
+            return Err(error);
+        }
         self.sync_extension_mcp_registrations().await;
         ensure_not_aborted(&abort_signal)?;
         self.session.ensure_provider_reentry_allowed()?;
