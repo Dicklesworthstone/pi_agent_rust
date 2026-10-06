@@ -1942,7 +1942,7 @@ impl AgentSessionHandle {
     /// added. Returns the number of newly registered definitions. Called at
     /// the start of every prompt; cheap when nothing changed.
     pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
-        let Some(manager) = self.mcp_manager.clone() else {
+        let Some(manager) = self.mcp_manager.clone().or_else(|| self.session.mcp_manager()) else {
             return 0;
         };
         let Some(extensions) = self.extension_manager().cloned() else {
@@ -2490,6 +2490,15 @@ impl AgentSessionHandle {
     /// Mutable access to the underlying `AgentSession`.
     pub const fn session_mut(&mut self) -> &mut AgentSession {
         &mut self.session
+    }
+
+    /// Apply credentials changed by an interactive login/logout to both the
+    /// live model and future fallback candidates, retaining the CLI key pin.
+    pub(crate) fn adopt_auth_storage(&mut self, auth: crate::auth::AuthStorage) {
+        self.session.adopt_auth_storage(auth.clone());
+        if let Some(options) = &mut self.failover {
+            Arc::make_mut(options).auth = auth;
+        }
     }
 
     /// Consume the handle and return the inner `AgentSession`.

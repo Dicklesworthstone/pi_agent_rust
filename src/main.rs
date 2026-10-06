@@ -2832,6 +2832,12 @@ async fn run(
             })
             .collect::<Vec<_>>();
         let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
+        let failover = pi::sdk::FailoverOptions::from_config(
+            &config,
+            available_models.clone(),
+            auth.clone(),
+            cli.api_key.clone(),
+        );
 
         Box::pin(run_interactive_mode(
             agent_session,
@@ -2853,6 +2859,7 @@ async fn run(
             btw_client,
             Some(btw_factory),
             Some(mcp_manager),
+            failover,
         ))
         .await
     } else {
@@ -9997,6 +10004,7 @@ async fn run_interactive_mode(
     btw_client: Option<Arc<pi::btw::BtwClient>>,
     btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
+    failover: Option<pi::sdk::FailoverOptions>,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(mut initial) = initial {
@@ -10016,16 +10024,9 @@ async fn run_interactive_mode(
         pending.push(pi::interactive::PendingInput::Text(message));
     }
 
-    let AgentSession {
-        agent,
-        session,
-        extensions: region,
-        ..
-    } = session;
-    // Extract manager for the interactive loop; the region stays alive to
-    let extensions = region.as_ref().map(|r| r.manager().clone());
-    let interactive_result = pi::interactive::run_interactive(
-        agent,
+    // Keep the configured AgentSession intact: classic turns need the same
+    // durable recovery, provider admission and extension ownership as the SDK.
+    pi::interactive::run_interactive(
         session,
         config,
         model_entry,
@@ -10037,7 +10038,6 @@ async fn run_interactive_mode(
         resources,
         resource_cli,
         package_manager,
-        extensions,
         cwd,
         runtime_handle,
         workspace,
@@ -10045,16 +10045,9 @@ async fn run_interactive_mode(
         btw_client,
         btw_factory,
         mcp_manager,
+        failover,
     )
-    .await;
-    // Explicitly shut down extension runtimes so the QuickJS GC can
-    // collect all objects before JS_FreeRuntime asserts an empty gc_obj_list.
-    // Must run even on error — otherwise ExtensionRegion::drop() runs
-    // synchronously and the GC assertion fires.
-    if let Some(ref region) = region {
-        region.shutdown().await;
-    }
-    interactive_result?;
+    .await?;
     Ok(())
 }
 

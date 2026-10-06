@@ -5,7 +5,7 @@ use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 #[derive(Clone)]
 pub(super) struct InteractiveExtensionHostActions {
     pub(super) session: Arc<Mutex<Session>>,
-    pub(super) agent: Arc<Mutex<Agent>>,
+    pub(super) agent: Arc<Mutex<InteractiveAgent>>,
     pub(super) event_tx: mpsc::Sender<PiMsg>,
     pub(super) extension_streaming: Arc<AtomicBool>,
     pub(super) user_queue: Arc<StdMutex<InteractiveMessageQueue>>,
@@ -49,16 +49,16 @@ impl InteractiveExtensionHostActions {
         Ok(())
     }
 
-    async fn append_idle_message(&self, message: ModelMessage) -> crate::error::Result<String> {
-        let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        // Match session-transition lock order (Agent, then Session) and hold
-        // both through the mutation so an idle extension message cannot land
-        // in one session log and another session's Agent history.
-        let mut agent_guard = self
-            .agent
-            .lock(&cx)
-            .await
-            .map_err(|e| crate::error::Error::session(e.to_string()))?;
+    fn append_idle_message(&self, message: ModelMessage) -> crate::error::Result<String> {
+        // The caller holds Session-action authority. Recovery acquires that
+        // authority while owning Agent, so never wait for Agent here. Holding
+        // both successful try-locks keeps the transcript and live Agent on
+        // the same Session without introducing the opposite lock order.
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            return Err(crate::error::Error::session(
+                "agent busy while delivering an extension message",
+            ));
+        };
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err(crate::error::Error::session(
                 "session busy while delivering an extension message".to_string(),
@@ -119,7 +119,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         }
 
         // Agent is idle: persist immediately and update in-memory history so it affects the next run.
-        let session_id = self.append_idle_message(custom_message.clone()).await?;
+        let session_id = self.append_idle_message(custom_message.clone())?;
 
         if let ModelMessage::Custom(custom) = &custom_message
             && custom.display
@@ -194,6 +194,7 @@ pub(super) struct InteractiveExtensionSession {
     pub(super) is_compacting: Arc<AtomicBool>,
     pub(super) config: Config,
     pub(super) save_enabled: bool,
+    pub(super) provider_admission: crate::agent::ProviderAdmissionGate,
     pub(super) session_action_admission: SessionActionAdmissionGate,
 }
 
@@ -253,12 +254,24 @@ impl InteractiveExtensionSession {
     ) -> crate::error::Result<OwnedMutexGuard<()>> {
         acquire_session_action_admission(&self.session_action_admission, origin).await
     }
+
+    async fn persist_mutations(&self, session: &mut Session) -> crate::error::Result<()> {
+        if self.save_enabled {
+            crate::agent::persist_session_mutations(
+                session,
+                &self.provider_admission,
+                crate::session::AutosaveFlushTrigger::Manual,
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 // Note on `OwnedMutexGuard` below: `asupersync::sync::MutexGuard` is `!Send` as
 // of asupersync 0.3.9, while `#[async_trait]` boxes every method here as
 // `dyn Future + Send`. The mutating methods hold the session lock across
-// `Session::save().await` — deliberately, so the mutation and its persist stay
+// `persist_mutations().await` — so the mutation and its guarded save stay
 // one critical section — so they must take an *owned* guard, which is `Send`.
 // Read-only methods that never await under the lock keep the cheaper borrow.
 #[async_trait]
@@ -424,9 +437,7 @@ impl ExtensionSession for InteractiveExtensionSession {
             .await
             .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.set_name(&name);
-        if self.save_enabled {
-            guard.save().await?;
-        }
+        self.persist_mutations(&mut guard).await?;
         Ok(())
     }
 
@@ -441,9 +452,7 @@ impl ExtensionSession for InteractiveExtensionSession {
             .await
             .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_message(message);
-        if self.save_enabled {
-            guard.save().await?;
-        }
+        self.persist_mutations(&mut guard).await?;
         Ok(())
     }
 
@@ -464,9 +473,7 @@ impl ExtensionSession for InteractiveExtensionSession {
             .await
             .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_custom_entry(custom_type, data);
-        if self.save_enabled {
-            guard.save().await?;
-        }
+        self.persist_mutations(&mut guard).await?;
         Ok(())
     }
 
@@ -493,13 +500,11 @@ impl ExtensionSession for InteractiveExtensionSession {
             }
             _ => (normalized_provider, model_id.clone(), true),
         };
-        if changed {
+        if changed || guard.active_failover_provenance_for_current_path().is_some() {
             guard.append_model_change(stored_provider.clone(), stored_model_id.clone());
         }
         guard.set_model_header(Some(stored_provider), Some(stored_model_id), None);
-        if self.save_enabled {
-            guard.save().await?;
-        }
+        self.persist_mutations(&mut guard).await?;
         Ok(())
     }
 
@@ -541,8 +546,8 @@ impl ExtensionSession for InteractiveExtensionSession {
         if changed {
             guard.append_thinking_level_change(effective_level);
         }
-        if changed && self.save_enabled {
-            guard.save().await?;
+        if changed {
+            self.persist_mutations(&mut guard).await?;
         }
         Ok(())
     }
@@ -571,9 +576,7 @@ impl ExtensionSession for InteractiveExtensionSession {
                 "target entry '{target_id}' not found in session"
             )));
         }
-        if self.save_enabled {
-            guard.save().await?;
-        }
+        self.persist_mutations(&mut guard).await?;
         Ok(())
     }
 }
@@ -790,7 +793,7 @@ mod tests {
         InteractiveExtensionHostActions,
         mpsc::Receiver<PiMsg>,
         Arc<Mutex<Session>>,
-        Arc<Mutex<Agent>>,
+        Arc<Mutex<InteractiveAgent>>,
     );
 
     struct NoopProvider;
@@ -825,11 +828,22 @@ mod tests {
     fn build_host_actions_with_capacity(capacity: usize) -> HostActionsHarness {
         let session = Arc::new(Mutex::new(Session::in_memory()));
         let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
-        let agent = Arc::new(Mutex::new(Agent::new(
+        let agent = Agent::new(
             provider,
             ToolRegistry::new(&[], Path::new("."), None),
             AgentConfig::default(),
-        )));
+        );
+        let agent = Arc::new(Mutex::new(InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    false,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                ),
+                crate::sdk::EventListeners::default(),
+            ),
+        }));
         let (event_tx, event_rx) = mpsc::channel(capacity);
         (
             InteractiveExtensionHostActions {
@@ -947,6 +961,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -988,6 +1003,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1082,6 +1098,46 @@ mod tests {
                         if custom_type == "note" && content == "continue-now"
                 )
             }));
+        });
+    }
+
+    #[test]
+    fn idle_message_never_waits_for_agent_while_holding_session_action_authority() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let (actions, mut event_rx, session, agent) = build_host_actions();
+            let held_agent = agent.try_lock().expect("hold agent during recovery");
+            let outcome = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_millis(100),
+                actions.send_message(
+                    note_message("must not cross recovery"),
+                    Some(actions.session_action_admission.capture_origin()),
+                ),
+            )
+            .await
+            .expect("idle extension action must not wait for the recovery-owned Agent");
+            let error = outcome.expect_err("busy Agent must refuse idle mutation");
+            assert!(error.to_string().contains("agent busy"), "{error}");
+            assert!(event_rx.try_recv().is_err());
+            assert!(held_agent.messages().is_empty());
+            assert!(session.try_lock().expect("session").entries.is_empty());
+
+            // Recovery can now acquire its action permit without waiting
+            // for an extension that in turn waits for this Agent owner.
+            let cx = Cx::for_request();
+            let permit = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_millis(100),
+                actions.session_action_admission.acquire(&cx),
+            )
+            .await
+            .expect("action authority must have been released")
+            .expect("recovery authority");
+            drop(permit);
+            drop(held_agent);
         });
     }
 
@@ -1277,6 +1333,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1335,6 +1392,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1375,6 +1433,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1407,6 +1466,96 @@ mod tests {
     }
 
     #[test]
+    fn extension_model_selection_retires_failover_and_fences_failed_persistence() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let mut initial = Session::create_with_dir(Some(temp.path().to_path_buf()));
+            initial.append_model_change("openai".to_string(), "primary".to_string());
+            initial.append_model_change_with_role_and_failover(
+                "openai".to_string(),
+                "fallback".to_string(),
+                Some("failover".to_string()),
+                Some(crate::session::ModelChangeFailover {
+                    primary_provider: "openai".to_string(),
+                    primary_model_id: "primary".to_string(),
+                    primary_thinking_level: Some("high".to_string()),
+                    fallback_provider: "openai".to_string(),
+                    fallback_model_id: "fallback".to_string(),
+                    chain_position: Some(0),
+                    cooldown_deadline: None,
+                    cooldown_secs: Some(300),
+                    lifecycle_id: Some("classic-selection".to_string()),
+                }),
+            );
+            let session = Arc::new(Mutex::new(initial));
+            let provider_admission = crate::agent::ProviderAdmissionGate::default();
+            let ext_session = InteractiveExtensionSession {
+                session: Arc::clone(&session),
+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                config: Config::default(),
+                save_enabled: true,
+                provider_admission: provider_admission.clone(),
+                session_action_admission: SessionActionAdmissionGate::default(),
+            };
+            ext_session
+                .set_model(
+                    "openai".to_string(),
+                    "fallback".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
+                .await
+                .expect("explicit fallback selection");
+            let path = {
+                let guard = session.try_lock().expect("session");
+                assert!(guard.active_failover_provenance_for_current_path().is_none());
+                assert_eq!(
+                    guard
+                        .entries_for_current_path()
+                        .iter()
+                        .filter(|entry| {
+                            matches!(entry, crate::session::SessionEntry::ModelChange(_))
+                        })
+                        .count(),
+                    3
+                );
+                guard.path.clone().expect("saved selection")
+            };
+            let saved = Session::open(path.to_str().expect("path"))
+                .await
+                .expect("reopen explicit selection");
+            assert!(saved.active_failover_provenance_for_current_path().is_none());
+            assert_eq!(
+                saved.effective_model_for_current_path(),
+                Some(("openai".to_string(), "fallback".to_string()))
+            );
+
+            std::fs::rename(&path, path.with_extension("before-fault"))
+                .expect("retain durable selection");
+            std::fs::create_dir(&path).expect("block following save");
+            let error = ext_session
+                .set_model(
+                    "openai".to_string(),
+                    "other".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
+                .await
+                .expect_err("failed model persistence");
+            assert!(error.is_session_persistence(), "{error}");
+            assert!(
+                provider_admission
+                    .ensure_allowed()
+                    .expect_err("same gate must fence provider entry")
+                    .is_session_persistence()
+            );
+        });
+    }
+
+    #[test]
     fn set_model_dedupes_provider_alias_targets_without_rewriting_current_branch_state() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -1431,6 +1580,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1503,6 +1653,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1556,6 +1707,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1611,6 +1763,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1668,6 +1821,7 @@ mod tests {
                     ..Config::default()
                 },
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1682,7 +1836,7 @@ mod tests {
     /// `asupersync::sync::MutexGuard` became `!Send` in 0.3.9, so any future
     /// that holds one across an `.await` cannot be spawned. Every mutating
     /// `ExtensionSession` method holds the session lock across
-    /// `Session::save().await`, which means the guard has to be an
+    /// the shared persistence helper, which means the guard has to be an
     /// `OwnedMutexGuard`. Driving those methods through
     /// `RuntimeHandle::spawn` (`F: Future + Send + 'static`) on a
     /// multi-threaded runtime pins that property: reverting to a borrowed
@@ -1712,6 +1866,7 @@ mod tests {
                 config: Config::default(),
                 // Saving is what forces the guard across an await point.
                 save_enabled: true,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
 
@@ -1847,6 +2002,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
             };
             let stale = ext_session.session_action_admission.capture_origin();
@@ -1894,13 +2050,28 @@ mod tests {
             let (actions, _, session, agent) = build_host_actions();
             let gate = actions.session_action_admission.clone();
             let mut previous = gate.generation();
-            for _ in 0..3 {
+            for saved_mode in ["off", "approved", "pending_approval"] {
+                let raw_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+                let placeholder = {
+                    let mut guard = agent.try_lock().expect("agent");
+                    guard.plan_state().enter_planning();
+                    let placeholder = guard
+                        .secrets_transform_outbound_text(raw_secret)
+                        .expect("learn source Session secret");
+                    assert_ne!(guard.mask_secrets_text(raw_secret), raw_secret);
+                    placeholder
+                };
+                let mut replacement = Session::in_memory();
+                replacement.append_custom_entry(
+                    "plan_mode".to_string(),
+                    Some(json!({"mode": saved_mode})),
+                );
                 let stale = gate.capture_origin();
                 crate::interactive::PiApp::try_install_session(
                     &session,
                     &agent,
                     &gate,
-                    Session::in_memory(),
+                    replacement,
                     Vec::new(),
                     None,
                 )
@@ -1908,6 +2079,26 @@ mod tests {
                 .expect("install replacement session");
                 assert_eq!(gate.generation(), previous + 1);
                 previous = gate.generation();
+                {
+                    let guard = agent.try_lock().expect("replacement agent");
+                    assert_eq!(guard.mask_secrets_text(raw_secret), raw_secret);
+                    let inbound = guard.restore_secrets_inbound(crate::model::ToolCall {
+                        id: "new-session".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"token": placeholder}),
+                        thought_signature: None,
+                    });
+                    assert_eq!(inbound.arguments["token"], placeholder);
+                    assert_eq!(
+                        guard.plan_state().mode(),
+                        if saved_mode == "off" {
+                            crate::plan::PlanMode::Off
+                        } else {
+                            crate::plan::PlanMode::Planning
+                        },
+                        "saved approval without a live proposal must remain read-only"
+                    );
+                }
                 let err = actions
                     .send_message(note_message("crossed-transition"), Some(stale))
                     .await
@@ -1967,6 +2158,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                provider_admission: crate::agent::ProviderAdmissionGate::default(),
                 session_action_admission: admission.clone(),
             };
 

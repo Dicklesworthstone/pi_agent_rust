@@ -1,10 +1,6 @@
-use super::conversation::{
-    add_usage, build_content_blocks_for_input, content_blocks_to_text, last_assistant_message,
-    split_content_blocks_for_input,
-};
+use super::conversation::{add_usage, content_blocks_to_text, last_assistant_message};
 use super::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use super::*;
-use crate::extension_events::{BeforeAgentStartOutcome, apply_before_agent_start_response};
 
 pub fn extension_commands_for_catalog(
     manager: &ExtensionManager,
@@ -28,135 +24,6 @@ pub(super) fn build_user_message(text: String) -> ModelMessage {
         content: UserContent::Text(text),
         timestamp: Utc::now().timestamp_millis(),
     })
-}
-
-fn append_turn_artifacts(
-    session: &mut Session,
-    mut messages: Vec<ModelMessage>,
-    repairs: &[crate::dialects::RepairEntry],
-    keyword_activations: &[crate::magic_keywords::KeywordActivation],
-) {
-    // Session retry cleanup requires an Error/Aborted assistant to remain the
-    // leaf. Audit entries are durable completed state, so place them before
-    // the incomplete assistant rather than allowing a Custom entry to mask it.
-    let incomplete_assistant = messages
-        .iter()
-        .rposition(|message| {
-            matches!(
-                message,
-                ModelMessage::Assistant(assistant)
-                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
-            )
-        })
-        .map(|index| messages.remove(index));
-    for message in messages {
-        session.append_model_message(message);
-    }
-    crate::agent::append_dialect_repair_telemetry(session, repairs);
-    crate::magic_keywords::append_session_telemetry(session, keyword_activations);
-    if let Some(message) = incomplete_assistant {
-        session.append_model_message(message);
-    }
-}
-
-async fn dispatch_input_event(
-    manager: &ExtensionManager,
-    text: String,
-    images: Vec<ImageContent>,
-) -> crate::error::Result<InputEventOutcome> {
-    let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-    let attachments_value = images_value.clone();
-    let text_clone = text.clone();
-    let payload = json!({
-        "text": text,
-        "content": text_clone,
-        "images": images_value,
-        "attachments": attachments_value,
-        "source": "interactive",
-    });
-    let response = manager
-        .dispatch_event_with_response(
-            ExtensionEventName::Input,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await?;
-    Ok(apply_input_event_response(response, text, images))
-}
-
-fn before_agent_start_payload(prompt: &str, images: &[ImageContent], system_prompt: &str) -> Value {
-    let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
-    json!({
-        "prompt": prompt,
-        "images": images_value,
-        "systemPrompt": system_prompt,
-    })
-}
-
-async fn dispatch_before_agent_start_event(
-    manager: &ExtensionManager,
-    prompt: &str,
-    images: &[ImageContent],
-    system_prompt: &str,
-) -> BeforeAgentStartOutcome {
-    let payload = before_agent_start_payload(prompt, images, system_prompt);
-    let response = manager
-        .dispatch_event_with_response(
-            ExtensionEventName::BeforeAgentStart,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await;
-
-    match response {
-        Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
-        Err(err) => {
-            tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
-            BeforeAgentStartOutcome {
-                messages: Vec::new(),
-                system_prompt: None,
-            }
-        }
-    }
-}
-
-struct TurnSystemPromptGuard<'a> {
-    agent: &'a mut crate::agent::Agent,
-    base_system_prompt: Option<String>,
-}
-
-impl<'a> TurnSystemPromptGuard<'a> {
-    fn new(
-        agent: &'a mut crate::agent::Agent,
-        base_system_prompt: Option<String>,
-        turn_system_prompt: Option<String>,
-    ) -> Self {
-        agent.set_system_prompt(turn_system_prompt.or_else(|| base_system_prompt.clone()));
-        Self {
-            agent,
-            base_system_prompt,
-        }
-    }
-}
-
-impl std::ops::Deref for TurnSystemPromptGuard<'_> {
-    type Target = crate::agent::Agent;
-
-    fn deref(&self) -> &Self::Target {
-        self.agent
-    }
-}
-
-impl std::ops::DerefMut for TurnSystemPromptGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.agent
-    }
-}
-
-impl Drop for TurnSystemPromptGuard<'_> {
-    fn drop(&mut self) {
-        self.agent.set_system_prompt(self.base_system_prompt.take());
-    }
 }
 
 const UI_STREAM_DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(45);
@@ -302,6 +169,7 @@ struct UiStreamDeltaBatcher {
     /// turn-end card is already in the transcript, so the task must not add
     /// a second `AgentError` block for the same failure.
     turn_error_surfaced: bool,
+    retry_attempts: Option<(u32, u32)>,
 }
 
 impl UiStreamDeltaBatcher {
@@ -326,6 +194,7 @@ impl UiStreamDeltaBatcher {
             pending_tool_update_bytes: 0,
             pending_tool_update_events: 0,
             turn_error_surfaced: false,
+            retry_attempts: None,
             last_tool_update_flush: now,
         }
     }
@@ -467,7 +336,10 @@ impl UiStreamDeltaBatcher {
     }
 }
 
-fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
+fn build_agent_done_pi_msg(
+    messages: &[ModelMessage],
+    retry_attempts: Option<(u32, u32)>,
+) -> PiMsg {
     let last = last_assistant_message(messages);
     let mut usage = Usage::default();
     for message in messages {
@@ -485,7 +357,7 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
         msg.error_message.as_ref().map(|raw| {
             if stop_reason == StopReason::Error {
                 crate::error::ProviderErrorSummary::from_error_text(Some(&msg.provider), raw)
-                    .turn_end_card(raw, None)
+                    .turn_end_card(raw, retry_attempts)
             } else {
                 raw.clone()
             }
@@ -500,6 +372,55 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
 
 fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBatcher) {
     match event {
+        AgentEvent::MessageStart {
+            message: ModelMessage::Assistant(_),
+        } => batcher.send_immediate(PiMsg::AssistantMessageStart),
+        AgentEvent::MessageEnd {
+            message: ModelMessage::Assistant(message),
+        } if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) => {
+            batcher.send_immediate(PiMsg::AssistantMessageStart);
+        }
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            ..
+        } => {
+            batcher.retry_attempts = Some((*attempt, *max_attempts));
+            batcher.send_immediate(PiMsg::ProviderRecovery {
+                message: format!(
+                    "Retrying provider request ({attempt}/{max_attempts}) in {delay_ms} ms"
+                ),
+                model: None,
+                discard_incomplete: true,
+            });
+        }
+        AgentEvent::FailoverStart {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            ..
+        } => batcher.send_immediate(PiMsg::ProviderRecovery {
+            message: format!(
+                "Provider fallback: {from_provider}/{from_model} → {to_provider}/{to_model}"
+            ),
+            model: Some((to_provider.clone(), to_model.clone())),
+            discard_incomplete: true,
+        }),
+        AgentEvent::FailoverEnd {
+            provider,
+            model,
+            restored_primary: true,
+            ..
+        } => batcher.send_immediate(PiMsg::ProviderRecovery {
+            message: format!("Primary model restored: {provider}/{model}"),
+            model: Some((provider.clone(), model.clone())),
+            discard_incomplete: false,
+        }),
+        AgentEvent::AutoCompactionStart { reason } => {
+            batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
+        }
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -588,18 +509,24 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AgentEnd {
             messages, error, ..
         } => {
-            let done = build_agent_done_pi_msg(messages);
-            if error.is_some()
-                && matches!(
-                    &done,
-                    PiMsg::AgentDone {
-                        stop_reason: StopReason::Error,
-                        error_message: Some(_),
-                        ..
-                    }
-                )
+            let mut done = build_agent_done_pi_msg(messages, batcher.retry_attempts);
+            if let PiMsg::AgentDone {
+                stop_reason,
+                error_message,
+                ..
+            } = &mut done
             {
-                batcher.turn_error_surfaced = true;
+                // SDK AgentEnd follows persistence. A successful assistant
+                // does not make a failed final save a successful turn.
+                if let Some(error) = error
+                    && *stop_reason != StopReason::Aborted
+                {
+                    *stop_reason = StopReason::Error;
+                    if error_message.is_none() {
+                        *error_message = Some(error.clone());
+                    }
+                }
+                batcher.turn_error_surfaced = *stop_reason == StopReason::Error;
             }
             batcher.send_immediate(done);
         }
@@ -961,7 +888,44 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.current_assistant_start = (0, 0);
+                self.discard_incomplete_on_next_assistant = false;
                 self.extension_streaming.store(true, Ordering::SeqCst);
+            }
+            PiMsg::AssistantMessageStart => {
+                if self.discard_incomplete_on_next_assistant {
+                    self.current_response.truncate(self.current_assistant_start.0);
+                    self.current_thinking.truncate(self.current_assistant_start.1);
+                    self.discard_incomplete_on_next_assistant = false;
+                }
+                self.current_assistant_start =
+                    (self.current_response.len(), self.current_thinking.len());
+            }
+            PiMsg::ProviderRecovery {
+                message,
+                model,
+                discard_incomplete,
+            } => {
+                self.discard_incomplete_on_next_assistant |= discard_incomplete;
+                if let Some((provider, model_id)) = model {
+                    let spec = format!("{provider}/{model_id}");
+                    if let Some(entry) =
+                        crate::failover::resolve_chain_spec(&spec, &self.available_models)
+                    {
+                        self.model_entry = entry.clone();
+                        if let Ok(mut shared) = self.model_entry_shared.lock() {
+                            *shared = entry;
+                        }
+                    }
+                    self.model = spec;
+                }
+                self.status_message = Some(message.clone());
+                self.messages.push(ConversationMessage::new(
+                    MessageRole::System,
+                    message,
+                    None,
+                ));
+                self.scroll_to_bottom();
             }
             PiMsg::RunPending => {
                 return self.run_next_pending();
@@ -1138,6 +1102,8 @@ impl PiApp {
                 // appearing in the next view() frame.
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.current_assistant_start = (0, 0);
+                self.discard_incomplete_on_next_assistant = false;
 
                 // Update usage
                 if let Some(ref u) = usage {
@@ -3008,176 +2974,155 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn submit_continue(&mut self) -> Option<Cmd> {
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
             self.status_message = Some(message);
             return None;
         }
+        self.spawn_recoverable_turn(None, None);
+        None
+    }
 
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+    fn spawn_recoverable_turn(
+        &mut self,
+        input: Option<UserContent>,
+        keyword_scan_source: Option<String>,
+    ) {
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-
-        // Refuse a dead region before entering `Processing`, not inside the
-        // task. The turn inherits `task_cx` for its deadline and budget, but it
-        // can arrive already cancel-requested — shutdown in flight, or a
-        // previous aborted turn's context still current. A cancel-correct
-        // runtime then cancels the spawned task at its FIRST await, so nothing
-        // the task awaits can report: the agent-lock failure that used to
-        // surface this never runs, and neither does an enqueue placed ahead of
-        // it. Verified directly — a synchronous probe at the top of the task
-        // fires, and the very next `enqueue_pi_event(..).await` never delivers.
-        //
-        // Left to run, the caller has already set `AgentState::Processing` and
-        // the UI sits there with no error, no completion and no way out. The
-        // only place that can still speak is here (bd-k01i6).
+        // A task in an already cancelled region may stop at its first await
+        // before it can report any error. Refuse synchronously (bd-k01i6).
         if task_cx.is_cancel_requested() {
+            self.agent_state = AgentState::Idle;
             self.status_message =
                 Some("Cancelled: the request was already cancelled, so no turn was started".into());
-            return None;
+            return;
         }
-
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+        let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
-
         self.agent_state = AgentState::Processing;
+        // Extensions may send steering while the first request is in backoff
+        // or awaiting an input hook, before the first AgentStart event.
+        self.extension_streaming.store(true, Ordering::SeqCst);
         self.scroll_to_bottom();
-
-        let runtime_handle_for_task = runtime_handle.clone();
-        runtime_handle.spawn(async move {
+        self.runtime_handle.spawn(async move {
             #[cfg(test)]
-            emit_submit_continue_deadline_probe(task_cx.budget().deadline);
-
-            if let Some(manager) = extensions.clone() {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
+            if input.is_none() {
+                emit_submit_continue_deadline_probe(task_cx.budget().deadline);
             }
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
-            }
-            let previous_len = agent_guard.messages().len();
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let result = agent_guard
-                .run_continue_with_abort(Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
+            let mut agent = match OwnedMutexGuard::lock(agent, &task_cx).await {
+                Ok(agent) => agent,
                 Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
+                    enqueue_pi_event(
                         &event_tx,
                         &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
                     )
                     .await;
                     return;
                 }
             };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
+            agent.set_magic_keyword_scan_override(keyword_scan_source);
+            let update_user = Arc::new(AtomicBool::new(input.is_some()));
+            let batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
+                event_tx.clone(),
+                tui_pressure_frame_p99_us,
+            )));
+            let output = Arc::clone(&batcher);
+            let terminal = Arc::new(StdMutex::new(None));
+            let callback_terminal = Arc::clone(&terminal);
+            let turn_abort = abort_signal.clone();
+            let result = agent
+                .handle
+                .run_recoverable_turn(input, abort_signal, move |event| {
+                    match &event {
+                        AgentEvent::AutoCompactionStart { .. } => {
+                            extension_compacting.store(true, Ordering::SeqCst);
+                        }
+                        AgentEvent::AutoCompactionEnd { .. } => {
+                            extension_compacting.store(false, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                    // A terminal UI event releases pending input. Retain it
+                    // until the complete logical turn has returned and its
+                    // Agent owner is unlocked, so queued input cannot race
+                    // the final save or be rejected as "Agent busy".
+                    if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                        *callback_terminal
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                        return;
+                    }
+                    let mut batcher = output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let AgentEvent::MessageStart {
+                        message: ModelMessage::User(user),
+                    } = &event
+                        && update_user.swap(false, Ordering::SeqCst)
+                    {
+                        let display = match &user.content {
+                            UserContent::Text(text) => text.clone(),
+                            UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+                        };
+                        batcher.send_immediate(PiMsg::UpdateLastUserMessage(display));
+                    }
+                    dispatch_agent_event_to_ui(&event, &mut batcher);
+                })
                 .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
+            // The handle remains installed in the same mutex through the
+            // final durable save and every recovery step; idle operations
+            // cannot observe half of a provider/session transition.
+            drop(agent);
+            if let Some(event) = terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
             {
-                let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(formatted),
-                )
-                .await;
+                let mut output = batcher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let persistence_error = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| error.is_session_persistence());
+                if let AgentEvent::AgentEnd { messages, .. } = &event
+                    && (persistence_error.is_some() || turn_abort.is_aborted())
+                {
+                    let mut done = build_agent_done_pi_msg(messages, output.retry_attempts);
+                    if let PiMsg::AgentDone {
+                        stop_reason,
+                        error_message,
+                        ..
+                    } = &mut done
+                    {
+                        // Aborting a request cannot hide an indeterminate
+                        // durable save: that failure still fences re-entry.
+                        *stop_reason = if persistence_error.is_some() {
+                            StopReason::Error
+                        } else {
+                            StopReason::Aborted
+                        };
+                        *error_message = persistence_error.map(ToString::to_string);
+                    }
+                    output.turn_error_surfaced = true;
+                    output.send_immediate(done);
+                } else {
+                    dispatch_agent_event_to_ui(&event, &mut output);
+                }
+            }
+            flush_ui_stream_batcher_with_backpressure(&batcher).await;
+            if let Err(error) = result
+                && !turn_error_already_surfaced(&batcher)
+            {
+                let message = crate::error_hints::format_error_with_hints(&error);
+                enqueue_pi_event(&event_tx, &Cx::for_request(), PiMsg::AgentError(message)).await;
             }
         });
-
-        None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3232,238 +3177,13 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
-        let content_for_agent = content;
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
-        let (abort_handle, abort_signal) = AbortHandle::new();
-        self.abort_handle = Some(abort_handle);
-
-        let runtime_handle_for_task = runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let mut content_for_agent = content_for_agent;
-            let base_system_prompt = {
-                let guard =
-                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let prompt = guard.system_prompt().map(str::to_string);
-                drop(guard);
-                prompt
-            };
-            let before_start = if let Some(manager) = extensions.clone() {
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                match dispatch_input_event(&manager, text, images).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        content_for_agent = build_content_blocks_for_input(&text, &images);
-                        let updated = content_blocks_to_text(&content_for_agent);
-                        if updated != display_owned {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(updated),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                dispatch_before_agent_start_event(
-                    &manager,
-                    &text,
-                    &images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await
-            } else {
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            };
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
+        let input = match content.as_slice() {
+            [ContentBlock::Text(text)] if keyword_scan_source.as_deref() == Some("") => {
+                UserContent::Text(text.text.clone())
             }
-            let BeforeAgentStartOutcome {
-                messages: before_messages,
-                system_prompt,
-            } = before_start;
-            let mut turn_agent =
-                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
-            let preserve_plain_text_shape = keyword_scan_source.as_deref() == Some("");
-            turn_agent.set_magic_keyword_scan_override(keyword_scan_source);
-            let previous_len = turn_agent.messages().len();
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let user_content = match content_for_agent.as_slice() {
-                [ContentBlock::Text(text)] if preserve_plain_text_shape => {
-                    UserContent::Text(text.text.clone())
-                }
-                _ => UserContent::Blocks(content_for_agent),
-            };
-            let user_message = ModelMessage::User(UserMessage {
-                content: user_content,
-                timestamp: Utc::now().timestamp_millis(),
-            });
-            let mut prompts = Vec::with_capacity(1 + before_messages.len());
-            prompts.push(user_message);
-            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
-
-            let result = turn_agent
-                .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            drop(turn_agent);
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
-                Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
-                .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
-            {
-                let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(formatted),
-                )
-                .await;
-            }
-        });
+            _ => UserContent::Blocks(content),
+        };
+        self.spawn_recoverable_turn(Some(input), keyword_scan_source);
 
         None
     }
@@ -3600,16 +3320,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 Some(keyword_scan_source),
             );
         }
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
-        let (abort_handle, abort_signal) = AbortHandle::new();
-        self.abort_handle = Some(abort_handle);
-
         // Add to history
         self.history.push(message_owned.clone());
 
@@ -3620,7 +3330,6 @@ After approving access in the browser, press Enter in Pi to complete login."
             thinking: None,
             collapsed: false,
         });
-        let displayed_message = message_for_agent.clone();
 
         // Clear input and reset to single-line mode
         self.input.reset();
@@ -3633,226 +3342,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
-        let runtime_handle = self.runtime_handle.clone();
-        let keyword_scan_source = message_owned;
-
-        // Spawn async task to run the agent
-        let runtime_handle_for_agent = runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let mut message_for_agent = message_for_agent;
-            let mut input_images = Vec::new();
-            let base_system_prompt = {
-                let guard =
-                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let prompt = guard.system_prompt().map(str::to_string);
-                drop(guard);
-                prompt
-            };
-            let before_start = if let Some(manager) = extensions.clone() {
-                match dispatch_input_event(&manager, message_for_agent.clone(), Vec::new()).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        message_for_agent = text;
-                        input_images = images;
-                        if message_for_agent != displayed_message {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(message_for_agent.clone()),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                dispatch_before_agent_start_event(
-                    &manager,
-                    &message_for_agent,
-                    &input_images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await
-            } else {
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            };
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
-            }
-            let BeforeAgentStartOutcome {
-                messages: before_messages,
-                system_prompt,
-            } = before_start;
-            let mut turn_agent =
-                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
-            let previous_len = turn_agent.messages().len();
-            turn_agent.set_magic_keyword_scan_override(Some(keyword_scan_source));
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let user_content = if input_images.is_empty() {
-                UserContent::Text(message_for_agent)
-            } else {
-                UserContent::Blocks(build_content_blocks_for_input(
-                    &message_for_agent,
-                    &input_images,
-                ))
-            };
-            let user_message = ModelMessage::User(UserMessage {
-                content: user_content,
-                timestamp: Utc::now().timestamp_millis(),
-            });
-            let mut prompts = Vec::with_capacity(1 + before_messages.len());
-            prompts.push(user_message);
-            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let result = turn_agent
-                .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            drop(turn_agent);
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
-                Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
-                .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
-            {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err.to_string()),
-                )
-                .await;
-            }
-        });
+        self.spawn_recoverable_turn(
+            Some(UserContent::Text(message_for_agent)),
+            Some(message_owned),
+        );
 
         None
     }
@@ -4131,40 +3624,6 @@ mod stream_delta_batcher_tests {
         assert_eq!(app.agent_state, AgentState::Idle);
     }
 
-    #[test]
-    fn turn_system_prompt_guard_restores_base_prompt_when_guard_is_dropped() {
-        let mut agent = Agent::new(
-            Arc::new(DummyProvider),
-            ToolRegistry::new(&[], Path::new("."), None),
-            AgentConfig::default(),
-        );
-        agent.set_system_prompt(Some("base-system".to_string()));
-        {
-            let turn_agent = TurnSystemPromptGuard::new(
-                &mut agent,
-                Some("base-system".to_string()),
-                Some("hook-system".to_string()),
-            );
-            assert_eq!(turn_agent.system_prompt(), Some("hook-system"));
-        }
-        assert_eq!(agent.system_prompt(), Some("base-system"));
-    }
-
-    #[test]
-    fn before_agent_start_payload_preserves_prompt_images_and_system_prompt() {
-        let image = ImageContent {
-            data: "aW1hZ2U=".to_string(),
-            mime_type: "image/png".to_string(),
-        };
-        let payload = before_agent_start_payload("hello", &[image], "base-system");
-        assert_eq!(payload["prompt"], json!("hello"));
-        assert_eq!(
-            payload["images"],
-            json!([{"data": "aW1hZ2U=", "mimeType": "image/png"}])
-        );
-        assert_eq!(payload["systemPrompt"], json!("base-system"));
-    }
-
     fn runtime() -> &'static asupersync::runtime::Runtime {
         static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
@@ -4222,7 +3681,39 @@ mod stream_delta_batcher_tests {
     }
 
     fn build_test_app_with_provider(provider: Arc<dyn Provider>) -> (PiApp, mpsc::Receiver<PiMsg>) {
-        let current = model_entry("continue-probe", "continue-probe-model");
+        let mut config = retry_config(0, 1);
+        config.retry.as_mut().expect("retry settings").enabled = Some(false);
+        build_test_app_with_recovery(provider, config, None)
+    }
+
+    fn build_test_app_with_recovery(
+        provider: Arc<dyn Provider>,
+        config: Config,
+        failover: Option<crate::sdk::FailoverOptions>,
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        build_test_app_with_session_configuration(provider, config, failover, |_| {})
+    }
+
+    fn build_test_app_with_session_configuration(
+        provider: Arc<dyn Provider>,
+        mut config: Config,
+        failover: Option<crate::sdk::FailoverOptions>,
+        configure: impl FnOnce(&mut AgentSession),
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        let current = failover
+            .as_ref()
+            .and_then(|options| {
+                options.available_models.iter().find(|entry| {
+                    entry.model.provider == provider.name()
+                        && entry.model.id == provider.model_id()
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| model_entry(provider.name(), provider.model_id()));
+        let available_models = failover.as_ref().map_or_else(
+            || vec![current.clone()],
+            |options| options.available_models.clone(),
+        );
         let agent = Agent::new(
             provider,
             ToolRegistry::new(&[], Path::new("."), None),
@@ -4241,32 +3732,42 @@ mod stream_delta_batcher_tests {
             theme_paths: Vec::new(),
         };
         let (event_tx, event_rx) = asupersync::channel::mpsc::channel(64);
-        let config = Config {
-            last_changelog_version: Some(crate::platform::VERSION.to_string()),
-            ..Config::default()
-        };
+        config.last_changelog_version = Some(crate::platform::VERSION.to_string());
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            crate::compaction::ResolvedCompactionSettings {
+                enabled: false,
+                ..crate::compaction::ResolvedCompactionSettings::default()
+            },
+        )
+        .with_runtime_handle(runtime_handle())
+        .with_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+            available_models.clone(),
+        ));
+        configure(&mut agent_session);
         (
-            PiApp::new(
-                agent,
-                session,
+            PiApp::from_agent_session(
+                agent_session,
                 config,
                 resources,
                 resource_cli,
                 Path::new(".").to_path_buf(),
                 current.clone(),
                 Vec::new(),
-                vec![current],
+                available_models,
                 None,
                 Vec::new(),
                 event_tx,
                 runtime_handle(),
                 true,
                 false,
-                None,
                 Some(KeyBindings::new()),
                 Vec::new(),
                 Usage::default(),
                 None,
+                failover,
             ),
             event_rx,
         )
@@ -4275,6 +3776,759 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
+    }
+
+    #[test]
+    fn configured_session_state_survives_classic_startup() {
+        let (app, _events) = build_test_app_with_session_configuration(
+            Arc::new(DummyProvider),
+            retry_config(0, 1),
+            None,
+            |session| {
+                session
+                    .agent
+                    .set_system_prompt(Some("configured system prompt".to_string()));
+                session.agent.stream_options_mut().api_key = Some("configured-key".to_string());
+                session.set_compaction_context_window(47_000);
+                session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    Arc::new(DummyProvider),
+                    "configured-advisor".to_string(),
+                ));
+            },
+        );
+        let agent = app.agent.try_lock().expect("configured AgentSession");
+        assert_eq!(agent.system_prompt(), Some("configured system prompt"));
+        assert_eq!(
+            agent.stream_options().api_key.as_deref(),
+            Some("configured-key")
+        );
+        assert_eq!(
+            agent
+                .handle
+                .session()
+                .compaction_settings()
+                .context_window_tokens,
+            47_000
+        );
+        assert!(agent.handle.session().advisor.is_some());
+    }
+
+    #[test]
+    fn classic_new_session_drops_secret_mappings_and_plan_state() {
+        let mut app = build_test_app();
+        let raw_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        {
+            let mut agent = app.agent.try_lock().expect("agent");
+            agent
+                .secrets_transform_outbound_text(raw_secret)
+                .expect("learn source Session secret");
+            assert_ne!(agent.mask_secrets_text(raw_secret), raw_secret);
+            agent.plan_state().enter_planning();
+        }
+        let _ = app.submit_message("/new");
+        let agent = app.agent.try_lock().expect("new Session agent");
+        assert_eq!(agent.mask_secrets_text(raw_secret), raw_secret);
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+    }
+
+    #[test]
+    fn abort_during_provider_stream_preserves_a_final_save_failure() {
+        struct AbortSaveProbe {
+            inner: ClassicRecoveryProvider,
+            save_blocked: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for AbortSaveProbe {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+
+            fn api(&self) -> &str {
+                self.inner.api()
+            }
+
+            fn model_id(&self) -> &str {
+                self.inner.model_id()
+            }
+
+            async fn stream(
+                &self,
+                context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+            > {
+                let _ = self.inner.stream(context, options).await?;
+                self.save_blocked.store(true, Ordering::SeqCst);
+                Ok(Box::pin(stream::pending()))
+            }
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("aborted-turn.jsonl");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let save_blocked = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(AbortSaveProbe {
+            inner: ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 0,
+                fail_save_path: Some(path.clone()),
+            },
+            save_blocked: Arc::clone(&save_blocked),
+        });
+        let (mut app, mut events) =
+            build_test_app_with_recovery(provider, retry_config(2, 1), None);
+        app.session.try_lock().expect("session").path = Some(path);
+        let _ = app.submit_message("one prompt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !save_blocked.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider was never admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.abort_agent();
+        let observed = drive_turn(&mut app, &mut events);
+        assert!(matches!(
+            observed.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Error,
+                error_message: Some(error),
+                ..
+            }) if error.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+        ));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)))
+                .count(),
+            1
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            app.agent
+                .try_lock()
+                .expect("terminal event releases Agent owner before UI input")
+                .handle
+                .session()
+                .provider_admission_gate()
+                .ensure_allowed()
+                .is_err_and(|error| error.is_session_persistence())
+        );
+    }
+
+    fn drive_turn(app: &mut PiApp, receiver: &mut mpsc::Receiver<PiMsg>) -> Vec<PiMsg> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    let done = matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_));
+                    let _ = app.handle_pi_message(event.clone());
+                    events.push(event);
+                    if done {
+                        assert!(
+                            app.agent.try_lock().is_ok(),
+                            "terminal UI events must not release pending input before Agent unlock"
+                        );
+                        return events;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        panic!("classic turn did not finish: {:?}", app.status_message);
+    }
+
+    fn retry_config(max_retries: u32, delay_ms: u32) -> Config {
+        Config {
+            retry: Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(max_retries),
+                base_delay_ms: Some(delay_ms),
+                max_delay_ms: Some(delay_ms),
+                ..crate::config::RetrySettings::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    struct ClassicRecoveryProvider {
+        calls: Arc<AtomicUsize>,
+        failures: usize,
+        fail_save_path: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ClassicRecoveryProvider {
+        fn name(&self) -> &'static str {
+            "continue-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "openai-completions"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "continue-probe-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, ModelMessage::User(_)))
+                    .count(),
+                1,
+                "recovery must reuse the original user message"
+            );
+            if call < self.failures {
+                return Err(crate::error::Error::provider(
+                    self.name(),
+                    "HTTP 529 overloaded; try again",
+                ));
+            }
+            if call == 0
+                && let Some(path) = &self.fail_save_path
+            {
+                std::fs::rename(path, path.with_extension("saved-before-fault"))
+                    .expect("retain initial durable transcript");
+                std::fs::create_dir(path).expect("make final save destination unwritable");
+            }
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("recovered"))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
+    }
+
+    #[test]
+    fn classic_text_content_and_continue_use_one_durable_retry_driver() {
+        for entrypoint in ["text", "content", "continue"] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 1,
+                fail_save_path: None,
+            });
+            let (mut app, mut receiver) =
+                build_test_app_with_recovery(provider, retry_config(1, 1), None);
+            app.session.try_lock().expect("session").session_dir =
+                Some(temp.path().join("sessions"));
+            match entrypoint {
+                "text" => {
+                    let _ = app.submit_message("one prompt");
+                }
+                "content" => {
+                    let _ = app.submit_content(vec![
+                        ContentBlock::Text(TextContent::new("one prompt")),
+                        ContentBlock::Image(ImageContent {
+                            data: "aW1hZ2U=".to_string(),
+                            mime_type: "image/png".to_string(),
+                        }),
+                    ]);
+                }
+                _ => {
+                    app.session
+                        .try_lock()
+                        .expect("session")
+                        .append_model_message(build_user_message("one prompt".to_string()));
+                    let _ = app.submit_continue();
+                }
+            }
+            let events = drive_turn(&mut app, &mut receiver);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{entrypoint}");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                PiMsg::ProviderRecovery {
+                    message,
+                    model: None,
+                    ..
+                }
+                    if message.starts_with("Retrying provider request")
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::AgentDone { .. }))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone {
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    ..
+                })
+            ));
+            let path = app
+                .session
+                .try_lock()
+                .expect("session")
+                .path
+                .clone()
+                .expect("saved session");
+            let saved = runtime()
+                .block_on(Session::open(path.to_str().expect("path")))
+                .expect("reopen session");
+            let messages = saved.to_messages_for_current_path();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, ModelMessage::User(_)))
+                    .count(),
+                1
+            );
+            assert!(!messages.iter().any(|message| matches!(
+                message,
+                ModelMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
+            )));
+            assert_eq!(app.agent_state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn classic_exhausted_retry_reports_the_attempts_on_one_terminal_card() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ClassicRecoveryProvider {
+            calls: Arc::clone(&calls),
+            failures: usize::MAX,
+            fail_save_path: None,
+        });
+        let (mut app, mut receiver) =
+            build_test_app_with_recovery(provider, retry_config(1, 1), None);
+        app.session.try_lock().expect("session").session_dir = Some(temp.path().join("sessions"));
+        let _ = app.submit_message("one prompt");
+        let events = drive_turn(&mut app, &mut receiver);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Error,
+                error_message: Some(error),
+                ..
+            }) if error.contains("auto-retried 1/1 before giving up")
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn classic_retry_disabled_and_abort_during_backoff_never_reenter_provider() {
+        for abort_during_backoff in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: usize::MAX,
+                fail_save_path: None,
+            });
+            let mut config = retry_config(2, 5_000);
+            config.retry.as_mut().expect("retry settings").enabled = Some(abort_during_backoff);
+            let (mut app, mut receiver) = build_test_app_with_recovery(provider, config, None);
+            app.session.try_lock().expect("session").session_dir =
+                Some(temp.path().join("sessions"));
+            let _ = app.submit_message("one prompt");
+            if abort_during_backoff {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "retry never began");
+                    if let Ok(event) = receiver.try_recv() {
+                        let retrying = matches!(event, PiMsg::ProviderRecovery { .. });
+                        assert!(!matches!(
+                            event,
+                            PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
+                        ));
+                        let _ = app.handle_pi_message(event);
+                        if retrying {
+                            assert_eq!(app.agent_state, AgentState::Processing);
+                            app.abort_agent();
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            let events = drive_turn(&mut app, &mut receiver);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let expected = if abort_during_backoff {
+                StopReason::Aborted
+            } else {
+                StopReason::Error
+            };
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone { stop_reason, .. }) if *stop_reason == expected
+            ));
+            assert_eq!(app.agent_state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn classic_save_failures_block_reentry_until_a_new_session_is_installed() {
+        for fail_final_save in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let path = temp.path().join("turn.jsonl");
+            if !fail_final_save {
+                std::fs::create_dir(&path).expect("block initial save");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 0,
+                fail_save_path: fail_final_save.then(|| path.clone()),
+            });
+            let (mut app, mut receiver) =
+                build_test_app_with_recovery(provider, retry_config(2, 1), None);
+            {
+                let mut session = app.session.try_lock().expect("session");
+                session.path = Some(path);
+                session.session_dir = Some(temp.path().join("new-sessions"));
+            }
+            let _ = app.submit_message("one prompt");
+            let events = drive_turn(&mut app, &mut receiver);
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentError(_))
+                    | Some(PiMsg::AgentDone {
+                        stop_reason: StopReason::Error,
+                        ..
+                    })
+            ));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, PiMsg::ProviderRecovery { .. }))
+            );
+            let expected_calls = usize::from(fail_final_save);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_some()
+            );
+
+            let _ = app.submit_message("do not send another request");
+            assert_eq!(app.agent_state, AgentState::Idle);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            let model = app.model_entry.clone();
+            assert!(
+                app.switch_active_model(
+                    &model,
+                    Arc::new(DummyProvider),
+                    Some("test-key"),
+                    "command",
+                )
+                .is_err()
+            );
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_some()
+            );
+
+            let _ = app.submit_message("/new");
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_none()
+            );
+            let _ = app.submit_message("fresh user prompt");
+            let events = drive_turn(&mut app, &mut receiver);
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone {
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    ..
+                })
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls + 1);
+        }
+    }
+
+    #[test]
+    fn classic_recovery_discards_only_the_failed_assistant_after_retry_restarts() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::AgentStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("completed tool explanation".to_string()));
+        let _ = app.handle_pi_message(PiMsg::AssistantMessageStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("incomplete response".to_string()));
+        let _ = app.handle_pi_message(PiMsg::ProviderRecovery {
+            message: "retrying".to_string(),
+            model: None,
+            discard_incomplete: true,
+        });
+        assert_eq!(
+            app.current_response,
+            "completed tool explanationincomplete response"
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        let _ = app.handle_pi_message(PiMsg::AssistantMessageStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("recovered response".to_string()));
+        assert_eq!(
+            app.current_response,
+            "completed tool explanationrecovered response"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_fails_over_and_restores_primary_through_real_http_and_persisted_turns() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let url = format!("http://{}/v1", listener.local_addr().expect("fixture address"));
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for attempt in 0..3 {
+                let mut connection = loop {
+                    match listener.accept() {
+                        Ok((connection, _)) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "provider never reached fixture");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                connection
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("write timeout");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let request = loop {
+                    assert!(bytes.len() < 256 * 1024, "oversized fixture request");
+                    let read = connection.read(&mut buffer).expect("request bytes");
+                    assert!(read > 0, "truncated request");
+                    bytes.extend_from_slice(&buffer[..read]);
+                    let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&bytes[..end]).expect("HTTP headers");
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().expect("request length"))
+                        })
+                        .expect("Content-Length");
+                    if bytes.len() < end + 4 + length {
+                        continue;
+                    }
+                    break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                        .expect("JSON request");
+                };
+                let requested_model = request["model"].as_str().expect("request model");
+                let (status, content_type, body) = if attempt == 0 {
+                    (
+                        "429 Too Many Requests",
+                        "application/json",
+                        json!({
+                            "error": {
+                                "message": "insufficient_quota",
+                                "type": "insufficient_quota"
+                            }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    let chunk = json!({
+                        "id": "classic-recovery",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": requested_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "Recovered"},
+                            "finish_reason": null
+                        }]
+                    });
+                    let done = json!({
+                        "id": "classic-recovery", "model": requested_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    });
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"),
+                    )
+                };
+                requests_tx.send(request).expect("record request");
+                write!(
+                    connection,
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+                .expect("HTTP fixture response");
+            }
+        });
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut primary = model_entry("openai", "classic-primary");
+        primary.model.base_url = url.clone();
+        let mut fallback = model_entry("openai", "classic-fallback");
+        fallback.model.base_url = url;
+        let options = crate::sdk::FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["openai/classic-fallback".to_string()],
+            )]),
+            available_models: vec![primary.clone(), fallback],
+            auth: crate::auth::AuthStorage::empty_at(temp.path().join("auth.json")),
+            cli_api_key: Some("test-key".to_string()),
+            cooldown_secs: 0,
+        };
+        let provider = providers::create_provider(&primary, None).expect("real OpenAI provider");
+        let (mut app, mut receiver) =
+            build_test_app_with_recovery(provider, retry_config(0, 1), Some(options));
+        app.session.try_lock().expect("session").session_dir = Some(temp.path().join("sessions"));
+        {
+            let mut agent = app.agent.try_lock().expect("agent");
+            agent.set_system_prompt(Some("Preserved classic system prompt".to_string()));
+        }
+
+        let _ = app.submit_message("first prompt");
+        let first = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(
+            first.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ));
+        assert!(first.iter().any(|event| matches!(
+            event,
+            PiMsg::ProviderRecovery { model: Some((provider, model)), .. }
+                if provider == "openai" && model == "classic-fallback"
+        )));
+        assert_eq!(app.model, "openai/classic-fallback");
+        assert_eq!(
+            app.model_entry_shared
+                .lock()
+                .expect("model indicator")
+                .model
+                .id,
+            "classic-fallback"
+        );
+        assert!(
+            app.session
+                .try_lock()
+                .expect("session")
+                .active_failover_provenance_for_current_path()
+                .is_some()
+        );
+
+        let _ = app.submit_message("second prompt");
+        let second = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(
+            second.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ));
+        assert!(second.iter().any(|event| matches!(
+            event,
+            PiMsg::ProviderRecovery { message, model: Some((_, model)), .. }
+                if message.starts_with("Primary model restored") && model == "classic-primary"
+        )));
+        assert_eq!(app.model, "openai/classic-primary");
+        worker.join().expect("fixture worker");
+        let requests: Vec<Value> = requests_rx.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["model"], "classic-primary");
+        assert_eq!(requests[1]["model"], "classic-fallback");
+        assert_eq!(requests[2]["model"], "classic-primary");
+        for (index, request) in requests.iter().enumerate() {
+            let messages = request["messages"].as_array().expect("messages");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .count(),
+                if index == 2 { 2 } else { 1 }
+            );
+            assert!(
+                messages.iter().any(|message| message["role"] == "system"
+                    && message["content"] == "Preserved classic system prompt")
+            );
+        }
+        let path = app
+            .session
+            .try_lock()
+            .expect("session")
+            .path
+            .clone()
+            .expect("saved path");
+        let saved = runtime()
+            .block_on(Session::open(path.to_str().expect("path")))
+            .expect("reopen final transcript");
+        assert_eq!(
+            saved.effective_model_for_current_path(),
+            Some(("openai".to_string(), "classic-primary".to_string()))
+        );
+        assert!(saved.active_failover_provenance_for_current_path().is_none());
+        assert_eq!(
+            saved
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::User(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -5099,10 +5353,10 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
                 .await
-                .expect("lock agent");
-            guard.add_message(ModelMessage::Custom(CustomMessage {
+                .expect("lock session");
+            guard.append_model_message(ModelMessage::Custom(CustomMessage {
                 content: "continue-now".to_string(),
                 custom_type: "note".to_string(),
                 display: true,
@@ -5188,6 +5442,12 @@ mod stream_delta_batcher_tests {
                 }]
             }),
         ));
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .extensions = app.extensions.clone().map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);
@@ -5224,6 +5484,12 @@ mod stream_delta_batcher_tests {
         app.extensions = Some(build_test_extension_manager_with_before_agent_start_output(
             &json!({}),
         ));
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .extensions = app.extensions.clone().map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);
@@ -5424,10 +5690,10 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
                 .await
-                .expect("lock agent");
-            guard.add_message(ModelMessage::Custom(CustomMessage {
+                .expect("lock session");
+            guard.append_model_message(ModelMessage::Custom(CustomMessage {
                 content: "continue-now".to_string(),
                 custom_type: "note".to_string(),
                 display: true,

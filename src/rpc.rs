@@ -32,6 +32,7 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, model_requires_configured_credential};
+use crate::plan::replayed_plan_mode;
 use crate::provider::InputType;
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
@@ -13326,34 +13327,6 @@ fn session_thinking_level(
                 },
                 Some,
             )
-        })
-}
-
-fn replayed_plan_mode(session: &crate::session::Session) -> crate::plan::PlanMode {
-    session
-        .entries_for_current_path()
-        .iter()
-        .filter_map(|entry| {
-            let SessionEntry::Custom(custom) = entry else {
-                return None;
-            };
-            if custom.custom_type != "plan_mode" {
-                return None;
-            }
-            custom
-                .data
-                .as_ref()
-                .and_then(|data| data.get("mode"))
-                .and_then(Value::as_str)
-        })
-        .fold(crate::plan::PlanMode::Off, |current, mode| match mode {
-            "off" => crate::plan::PlanMode::Off,
-            "planning" | "rejected" => crate::plan::PlanMode::Planning,
-            // Submitted plan text is memory-only. Resetting the Agent maps
-            // this unreconstructable state back to read-only Planning.
-            "pending_approval" => crate::plan::PlanMode::PendingApproval,
-            "approved" => crate::plan::PlanMode::Approved,
-            _ => current,
         })
 }
 

@@ -409,7 +409,7 @@ impl AgentSessionHandle {
             .await
     }
 
-    async fn run_recoverable_turn(
+    pub(crate) async fn run_recoverable_turn(
         &mut self,
         input: Option<UserContent>,
         abort_signal: AbortSignal,

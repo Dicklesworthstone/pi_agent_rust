@@ -522,20 +522,18 @@ This has NOT historically been uniform, so check the row for the way you run pi:
 | `-p` / `--print` | yes | yes | yes |
 | RPC server (`--mode rpc`) | yes | yes | yes |
 | Embedders using `pi::sdk` | opt-in | opt-in | opt-in |
-| Classic interactive stack | **no** | **no** | **no** |
+| Classic interactive stack (`--classic`) | yes | yes | yes |
 
-Two caveats worth knowing:
+Both interactive stacks use the SDK recovery driver. The classic UI keeps the
+turn active during retry backoff, reports retries and model swaps in the
+conversation, and updates its model indicator after a fallback or primary
+restoration. Escape cancels the whole turn, including an in-progress backoff.
+Text, attachments, and extension-triggered continuations share these rules.
 
-- **The classic interactive stack has none of this.** A `fallbackChains` entry
-  is silently inert there: the turn fails with the provider's error. Tracked as
-  bd-u2qv4.
-- **Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and
-  `failover` to `None`, so a host that builds its own session gets the old
-  behaviour until it sets them (`RetryPolicy::from_config` and
-  `FailoverOptions::from_config` read the same config block shown above).
-
-Until recently the default TUI was in the "no" row too, which is why this table
-exists rather than a sentence saying it always works.
+**Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and `failover`
+to `None`, so a host that builds its own session enables them explicitly
+(`RetryPolicy::from_config` and `FailoverOptions::from_config` read the same
+config block shown above).
 
 ---
 

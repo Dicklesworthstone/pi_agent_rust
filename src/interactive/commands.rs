@@ -1346,6 +1346,10 @@ impl PiApp {
                 return;
             }
         };
+        let adopted_runtime_key = self.agent.try_lock().ok().map(|mut agent| {
+            agent.handle.adopt_auth_storage(auth.clone());
+            agent.stream_options().api_key.clone()
+        });
 
         let provider_matches_changed =
             |provider: &str| normalize_auth_provider_input(provider) == changed_canonical;
@@ -1364,16 +1368,10 @@ impl PiApp {
             .and_then(|entry| normalize_api_key_opt(entry.api_key.clone()))
             .or_else(|| normalize_api_key_opt(self.model_entry.api_key.clone()));
 
-        let resolved_key_opt =
+        let resolved_key_opt = adopted_runtime_key.unwrap_or_else(|| {
             normalize_api_key_opt(auth.resolve_api_key(&changed_canonical, None))
-                .or(fallback_inline_key);
-
-        if let Ok(mut agent_guard) = self.agent.try_lock() {
-            agent_guard
-                .stream_options_mut()
-                .api_key
-                .clone_from(&resolved_key_opt);
-        }
+                .or(fallback_inline_key)
+        });
 
         self.model_entry.api_key.clone_from(&resolved_key_opt);
         if let Ok(mut shared_entry) = self.model_entry_shared.lock() {
@@ -1494,6 +1492,11 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
@@ -1506,7 +1509,12 @@ impl PiApp {
         let next_thinking = next.clamp_thinking_level(current_thinking);
         let previous_thinking = session_thinking_level(&session_guard);
 
+        agent_guard
+            .handle
+            .session_mut()
+            .invalidate_background_compaction();
         agent_guard.set_provider(provider_impl);
+        agent_guard.set_tool_call_dialect(next.tool_call_dialect());
         agent_guard.set_keyword_max_thinking_level(
             next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
@@ -1518,6 +1526,16 @@ impl PiApp {
         // over the previous model's limit.
         stream_options.max_tokens = Some(next.model.max_tokens);
         stream_options.thinking_level = Some(next_thinking);
+        if next.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(next.model.context_window);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
 
         session_guard.header.provider = Some(next.model.provider.clone());
         session_guard.header.model_id = Some(next.model.id.clone());
@@ -1580,6 +1598,11 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
@@ -1642,6 +1665,10 @@ impl PiApp {
 
             let provider_impl = providers::create_provider(&target_entry, self.extensions.as_ref())
                 .map_err(|err| err.to_string())?;
+            agent_guard
+                .handle
+                .session_mut()
+                .invalidate_background_compaction();
             agent_guard.set_provider(provider_impl);
             let stream_options = agent_guard.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key_opt);
@@ -1656,6 +1683,16 @@ impl PiApp {
         );
         agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
+        if target_entry.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(target_entry.model.context_window);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
         drop(agent_guard);
 
         let persist_needed = if thinking_sync.persist_needed {
@@ -2255,6 +2292,7 @@ impl PiApp {
                     let new_session_id = session_guard.header.id.clone();
                     agent_guard.replace_messages(Vec::new());
                     agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
+                    agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
                     drop(session_guard);
                     drop(agent_guard);
                     self.session_action_admission.advance_generation();

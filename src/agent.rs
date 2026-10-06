@@ -12954,6 +12954,19 @@ fn finish_turn_persistence<T>(
     }
 }
 
+/// Persist mutations already protected by their Session lock using the same
+/// interruption guard and returned-error fence as an AgentSession turn.
+/// Extension callbacks cannot acquire the Agent while owning Session-action
+/// authority, so they carry the shared admission gate to this boundary.
+pub(crate) async fn persist_session_mutations(
+    session: &mut Session,
+    admission: &ProviderAdmissionGate,
+    trigger: AutosaveFlushTrigger,
+) -> Result<()> {
+    let persist_result = flush_turn_autosave(session, admission, trigger).await;
+    finish_turn_persistence(admission, Ok(()), persist_result)
+}
+
 #[cfg(test)]
 mod finish_turn_persistence_tests {
     use super::*;

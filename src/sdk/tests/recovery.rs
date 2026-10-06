@@ -2022,3 +2022,63 @@ fn distinct_legacy_failover_entries_have_independent_cooldowns() {
     );
     assert!(events.lock().unwrap().is_empty());
 }
+
+#[test]
+fn interactive_auth_adoption_updates_fallback_credentials_and_preserves_cli_pin() {
+    for cli_pin in [None, Some("pinned-cli-key")] {
+        let dir = tempdir().unwrap();
+        let (mut handle, _) = flaky_handle_as(0, "auth-fixture", "auth-model");
+        handle
+            .session
+            .set_api_key_override(cli_pin.map(str::to_string));
+        handle = handle.with_failover(Some(FailoverOptions {
+            chains: HashMap::new(),
+            available_models: Vec::new(),
+            auth: AuthStorage::empty_at(dir.path().join("old-auth.json")),
+            cli_api_key: cli_pin.map(str::to_string),
+            cooldown_secs: 0,
+        }));
+        let mut auth = AuthStorage::empty_at(dir.path().join("new-auth.json"));
+        auth.set(
+            "auth-fixture",
+            crate::auth::AuthCredential::ApiKey {
+                key: "new-active-key".to_string(),
+            },
+        );
+        auth.set(
+            "fallback-fixture",
+            crate::auth::AuthCredential::ApiKey {
+                key: "new-fallback-key".to_string(),
+            },
+        );
+        handle.adopt_auth_storage(auth.clone());
+        assert_eq!(
+            handle.session.agent.stream_options().api_key.as_deref(),
+            Some(cli_pin.unwrap_or("new-active-key"))
+        );
+        let options = handle.failover.as_ref().expect("failover options");
+        assert_eq!(options.cli_api_key.as_deref(), cli_pin);
+        assert_eq!(
+            options.auth.api_key("fallback-fixture").as_deref(),
+            Some("new-fallback-key")
+        );
+
+        assert!(auth.remove("auth-fixture"));
+        assert!(auth.remove("fallback-fixture"));
+        handle.adopt_auth_storage(auth);
+        assert_eq!(
+            handle.session.agent.stream_options().api_key.as_deref(),
+            cli_pin,
+            "logout must remove stale credentials while retaining an explicit CLI pin"
+        );
+        assert!(
+            handle
+                .failover
+                .as_ref()
+                .expect("failover options")
+                .auth
+                .api_key("fallback-fixture")
+                .is_none()
+        );
+    }
+}
