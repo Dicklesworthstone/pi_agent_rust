@@ -466,8 +466,9 @@ impl ProxyConfig {
         }
     }
 
-    /// The proxy URL (credentials stripped) to advertise to child processes
-    /// for the given scheme, if one is configured.
+    /// The configured proxy URL with credentials stripped, for diagnostics.
+    /// A URL safe to display is not necessarily suitable for child-process
+    /// routing; use [`child_process_env`] for environment overrides.
     #[must_use]
     pub fn redacted_url_for(&self, https: bool) -> Option<String> {
         let endpoint = if https {
@@ -739,22 +740,29 @@ pub fn active() -> ProxyConfig {
         .clone()
 }
 
-/// Environment overrides to hand to a child process so tools Pi shells out to
-/// (`git`, `curl`, `npm`, …) reach the network the same way Pi does (#210).
+/// HTTP proxy overrides for tools Pi shells out to (`git`, `curl`, `npm`, …).
 ///
-/// Only returns entries when a proxy is actually configured; values are
-/// credential-free.
+/// SOCKS endpoints retain the child's inherited environment. Injecting a
+/// credential-free SOCKS URL into `HTTP_PROXY`/`HTTPS_PROXY` would override an
+/// authenticated `ALL_PROXY` for curl/git and force tools without SOCKS support
+/// through it.
+/// HTTP overrides remain credential-free and never mutate Pi's environment.
 #[must_use]
 pub fn child_process_env() -> Vec<(String, String)> {
-    let config = active();
+    child_process_env_for(&active())
+}
+
+fn child_process_env_for(config: &ProxyConfig) -> Vec<(String, String)> {
     let mut vars = Vec::new();
-    if let Some(url) = config.redacted_url_for(true) {
-        vars.push(("HTTPS_PROXY".to_string(), url.clone()));
-        vars.push(("https_proxy".to_string(), url));
-    }
-    if let Some(url) = config.redacted_url_for(false) {
-        vars.push(("HTTP_PROXY".to_string(), url.clone()));
-        vars.push(("http_proxy".to_string(), url));
+    for (endpoint, upper, lower) in [
+        (config.https.as_ref(), "HTTPS_PROXY", "https_proxy"),
+        (config.http.as_ref(), "HTTP_PROXY", "http_proxy"),
+    ] {
+        if let Some(endpoint) = endpoint.filter(|endpoint| endpoint.is_http()) {
+            let url = endpoint.redacted_url();
+            vars.push((upper.to_string(), url.clone()));
+            vars.push((lower.to_string(), url));
+        }
     }
     if !vars.is_empty() && !config.no_proxy_entries().is_empty() {
         let joined = config.no_proxy_entries().join(",");
@@ -1386,8 +1394,7 @@ mod tests {
             ..HttpSettings::default()
         };
         let config = resolve(Some(&settings), &[]);
-        install(config);
-        let vars = child_process_env();
+        let vars = child_process_env_for(&config);
         let lookup = |key: &str| {
             vars.iter()
                 .find(|(k, _)| k == key)
@@ -1404,10 +1411,98 @@ mod tests {
             "credentials must not leak into child environments: {vars:?}"
         );
 
-        install(ProxyConfig::default());
         assert!(
-            child_process_env().is_empty(),
+            child_process_env_for(&ProxyConfig::default()).is_empty(),
             "no proxy configured means no injected variables"
+        );
+    }
+
+    #[test]
+    fn socks_child_env_preserves_inherited_proxy_configuration() {
+        for scheme in ["socks5", "socks5h"] {
+            for credentials in ["", "user:secret@"] {
+                let url = format!("{scheme}://{credentials}127.0.0.1:1080");
+                for name in [
+                    "ALL_PROXY",
+                    "all_proxy",
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                ] {
+                    let config = resolve(None, &[(name, &url), ("NO_PROXY", "localhost,::1")]);
+                    assert!(!config.is_empty());
+                    assert!(
+                        child_process_env_for(&config).is_empty(),
+                        "SOCKS configuration from {name} must not replace child variables"
+                    );
+                }
+                let settings = HttpSettings {
+                    proxy: Some(url),
+                    no_proxy: Some(vec!["localhost".to_string()]),
+                    ignore_env_proxy: Some(true),
+                    ..HttpSettings::default()
+                };
+                assert!(
+                    child_process_env_for(&resolve(Some(&settings), &[])).is_empty(),
+                    "Pi-specific SOCKS settings do not opt child tools into SOCKS"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_child_proxy_configuration_overrides_only_http_endpoints() {
+        for http_for_https in [false, true] {
+            let http = "http://user:secret@web-proxy:3128".to_string();
+            let socks = "socks5h://user:secret@socks-proxy:1080".to_string();
+            let (https_proxy, http_proxy, upper, lower) = if http_for_https {
+                (http, socks, "HTTPS_PROXY", "https_proxy")
+            } else {
+                (socks, http, "HTTP_PROXY", "http_proxy")
+            };
+            let settings = HttpSettings {
+                https_proxy: Some(https_proxy),
+                http_proxy: Some(http_proxy),
+                no_proxy: Some(vec!["localhost".to_string(), "::1".to_string()]),
+                ignore_env_proxy: Some(true),
+                ..HttpSettings::default()
+            };
+            let vars = child_process_env_for(&resolve(Some(&settings), &[]));
+            assert_eq!(
+                vars,
+                vec![
+                    (upper.to_string(), "http://web-proxy:3128".to_string()),
+                    (lower.to_string(), "http://web-proxy:3128".to_string()),
+                    ("NO_PROXY".to_string(), "localhost,::1".to_string()),
+                    ("no_proxy".to_string(), "localhost,::1".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_socks_all_proxy_survives_actual_child_overrides() {
+        let proxy = "socks5h://fixture-user:fixture-password@127.0.0.1:1080";
+        let config = resolve(None, &[("ALL_PROXY", proxy), ("NO_PROXY", "localhost,::1")]);
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s\\n' \"$ALL_PROXY\" \"${HTTPS_PROXY-unset}\" \
+                 \"${https_proxy-unset}\" \"${HTTP_PROXY-unset}\" \
+                 \"${http_proxy-unset}\" \"$NO_PROXY\"",
+            ])
+            .env_clear()
+            .env("ALL_PROXY", proxy)
+            .env("NO_PROXY", "localhost,::1")
+            .envs(child_process_env_for(&config))
+            .output()
+            .expect("spawn child with effective proxy overrides");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 child environment"),
+            format!("{proxy}\nunset\nunset\nunset\nunset\nlocalhost,::1\n")
         );
     }
 

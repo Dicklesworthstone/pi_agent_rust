@@ -1043,13 +1043,17 @@ unusable ambient value
 (e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
 than failing requests.
 
-The resolved proxy is also injected into every process the `bash` tool spawns
-(as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase spellings), so
-`git`, `curl`, and `npm` invocations reach the network the same way Pi does.
-The injection is a per-child copy: Pi's own environment and the system
-environment are never modified. Proxy credentials are deliberately left out of
-that copy, so an authenticated proxy needs its own configuration for those
-tools (e.g. `git config --global http.proxy`).
+The `bash` tool's child environment overrides advertise only HTTP proxy
+endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
+spellings). Credentials are deliberately omitted from that per-child copy,
+so authenticated HTTP proxies need their own configuration in those tools
+(e.g. `git config --global http.proxy`). Pi's own environment and the system
+environment are never modified. SOCKS endpoints leave child proxy variables
+as inherited, including authenticated `ALL_PROXY` values and `NO_PROXY`.
+This preserves existing `curl`/`git` SOCKS configuration without forcing tools
+that lack SOCKS support to use it through HTTP-specific variables. A SOCKS
+proxy set only in Pi settings or `PI_*_PROXY` does not configure child tools;
+use their standard proxy environment variables or their own configuration.
 
 ### Configuration Precedence
 
