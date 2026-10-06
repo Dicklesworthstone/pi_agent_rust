@@ -486,6 +486,39 @@ impl AgentSessionHandle {
         self
     }
 
+    /// Extension selections and branch navigation update Session state without
+    /// going through the SDK's explicit model-selection method. Treat the active
+    /// branch's provenance as authoritative before consulting cached recovery
+    /// state. Callers hold provider and session-action admission through the
+    /// ensuing swap, in that order, so provider callbacks can finish first.
+    /// Returns false when the branch has selected a model that the runtime has
+    /// not installed yet; an error from the old model cannot replace that choice.
+    async fn reconcile_failover_state(
+        &mut self,
+        configured_cooldown_secs: u64,
+        cx: &crate::agent_cx::AgentCx,
+    ) -> Result<bool> {
+        let session = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))?;
+        let runtime = self.session.agent.provider();
+        let runtime_matches_session = session.effective_model_for_current_path().is_none_or(
+            |(provider, model)| {
+                crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
+                    && runtime.model_id().eq_ignore_ascii_case(&model)
+            },
+        );
+        self.failover_state.reconcile_from_session(
+            &session,
+            configured_cooldown_secs,
+            chrono::Utc::now(),
+        );
+        Ok(runtime_matches_session)
+    }
+
     /// A chain belongs to its original primary, not the currently installed
     /// fallback. Candidate preparation and durable installation remain shared
     /// with print and RPC in `AgentSession::try_failover`.
@@ -515,6 +548,17 @@ impl AgentSessionHandle {
         }) else {
             return Ok(false);
         };
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let session_action_permit = session_actions.acquire(cx.cx()).await?;
+        if !self
+            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .await?
+        {
+            return Ok(false);
+        }
         let live = {
             let provider = self.session.agent.provider();
             crate::failover::FailoverPrimary {
@@ -537,8 +581,6 @@ impl AgentSessionHandle {
         ) else {
             return Ok(false);
         };
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let admission = self.session.provider_admission_gate();
         admission.ensure_allowed()?;
         // The first durable record and the in-memory state must carry the
         // same identity. Generating this after persistence gives them two
@@ -562,7 +604,7 @@ impl AgentSessionHandle {
         };
         let outcome = self
             .session
-            .try_failover_swap(&cx, &attempt, Some(&admission))
+            .try_failover_with_authority(&cx, &attempt, &provider_authority)
             .await?;
         admission.ensure_allowed()?;
         let Some(committed) = outcome.committed else {
@@ -578,6 +620,8 @@ impl AgentSessionHandle {
             (committed.to_provider.clone(), committed.to_model.clone()),
             Instant::now(),
         );
+        drop(session_action_permit);
+        drop(provider_authority);
         if let Some(attempt) = retry_attempt_to_end {
             shared(AgentEvent::AutoRetryEnd {
                 success: false,
@@ -616,6 +660,17 @@ impl AgentSessionHandle {
         let Some(options) = self.failover.clone() else {
             return Ok(());
         };
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let session_action_permit = session_actions.acquire(cx.cx()).await?;
+        if !self
+            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .await?
+        {
+            return Ok(());
+        }
         let Some(active) = self.failover_state.active().cloned() else {
             return Ok(());
         };
@@ -632,12 +687,10 @@ impl AgentSessionHandle {
             strict_invariants: false,
             invalidate_background_compaction: true,
         };
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let admission = self.session.provider_admission_gate();
         admission.ensure_allowed()?;
         let restored = self
             .session
-            .restore_primary_swap(&cx, &request, Some(&admission))
+            .restore_primary_with_authority(&cx, &request, &provider_authority)
             .await?;
         // Lenient restoration may decline an unavailable primary, but it may
         // never turn an indeterminate save into permission to keep issuing.
@@ -647,6 +700,8 @@ impl AgentSessionHandle {
             return Ok(());
         };
         self.failover_state.clear();
+        drop(session_action_permit);
+        drop(provider_authority);
         shared(AgentEvent::FailoverEnd {
             success: true,
             provider: restored.provider,

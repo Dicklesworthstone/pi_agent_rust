@@ -561,6 +561,33 @@ pub struct FailoverState {
     active: Option<(String, String)>,
     chain_position: usize,
     lifecycle_id: Option<String>,
+    source: Option<FailoverSource>,
+}
+
+/// Process-local identity of the branch record that supplied a cooldown.
+/// Full provenance matters because sibling branches can share a lifecycle and
+/// cursor while recording different deadlines. Entry identity also separates
+/// older records without lifecycle IDs or usable deadlines.
+#[derive(Debug, PartialEq, Eq)]
+struct FailoverSource {
+    session_id: String,
+    entry_id: Option<String>,
+    entry_parent_id: Option<String>,
+    entry_timestamp: String,
+    provenance: crate::session::ModelChangeFailover,
+}
+
+impl FailoverSource {
+    fn from_session(session: &crate::session::Session) -> Option<Self> {
+        let change = session.active_failover_model_change_for_current_path()?;
+        Some(Self {
+            session_id: session.header.id.clone(),
+            entry_id: change.base.id.clone(),
+            entry_parent_id: change.base.parent_id.clone(),
+            entry_timestamp: change.base.timestamp.clone(),
+            provenance: change.failover.clone()?,
+        })
+    }
 }
 
 /// Constituent components of a `FailoverState`.
@@ -588,6 +615,7 @@ impl FailoverState {
             active: None,
             chain_position: 0,
             lifecycle_id: None,
+            source: None,
         }
     }
 
@@ -601,6 +629,7 @@ impl FailoverState {
             active: None,
             chain_position: 0,
             lifecycle_id: None,
+            source: None,
         }
     }
 
@@ -624,10 +653,31 @@ impl FailoverState {
         configured_cooldown_secs: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let Some(provenance) = session.active_failover_provenance_for_current_path() else {
-            return Self::with_cooldown_secs(configured_cooldown_secs);
+        let mut state = Self::with_cooldown_secs(configured_cooldown_secs);
+        state.reconcile_from_session(session, configured_cooldown_secs, now);
+        state
+    }
+
+    /// Keep a running monotonic timer only while its exact branch record is
+    /// unchanged. A manual selection clears recovery state; another branch's
+    /// failover record supplies its own cursor and restart-safe cooldown.
+    pub(crate) fn reconcile_from_session(
+        &mut self,
+        session: &crate::session::Session,
+        configured_cooldown_secs: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(source) = FailoverSource::from_session(session) else {
+            self.clear();
+            return;
         };
-        Self::reconstruct_from_provenance(provenance, configured_cooldown_secs, now)
+        if self.source.as_ref() == Some(&source)
+            && self.chain_position == source.provenance.chain_position.unwrap_or(0)
+        {
+            return;
+        }
+        *self = Self::reconstruct_from_provenance(&source.provenance, configured_cooldown_secs, now);
+        self.source = Some(source);
     }
 
     /// Reconstruct cross-turn failover bookkeeping from explicit provenance
@@ -680,6 +730,7 @@ impl FailoverState {
             active: Some(active),
             chain_position,
             lifecycle_id: provenance.lifecycle_id.clone(),
+            source: None,
         }
     }
 
@@ -716,6 +767,7 @@ impl FailoverState {
     /// Set or update the active failover lifecycle ID.
     pub fn set_lifecycle_id(&mut self, id: Option<String>) {
         self.lifecycle_id = id;
+        self.source = None;
     }
 
     /// Cooldown tracker, if configured.
@@ -754,6 +806,7 @@ impl FailoverState {
         active: (String, String),
         now: std::time::Instant,
     ) {
+        self.source = None;
         if self.primary.is_none() {
             self.primary = Some(primary);
         }
@@ -776,6 +829,7 @@ impl FailoverState {
 
     /// The primary is back; the chain starts over from the top next time.
     pub fn clear(&mut self) {
+        self.source = None;
         self.primary = None;
         self.active = None;
         self.chain_position = 0;

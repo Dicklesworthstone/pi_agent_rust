@@ -2344,7 +2344,11 @@ impl ExtensionSession for SessionHandle {
             }
             _ => (normalized_provider, model_id.clone(), true),
         };
-        if changed {
+        if changed || session.active_failover_provenance_for_current_path().is_some() {
+            // Selecting the current fallback explicitly retires automatic
+            // restoration just like selecting a different model. Keep one
+            // ordinary model-change record to distinguish that intent from
+            // continuing the existing failover cycle.
             session.append_model_change(stored_provider.clone(), stored_model_id.clone());
         }
         session.set_model_header(Some(stored_provider), Some(stored_model_id), None);
@@ -4859,12 +4863,16 @@ impl Session {
     /// this returns `None`.
     #[must_use]
     pub fn active_failover_provenance_for_current_path(&self) -> Option<&ModelChangeFailover> {
-        for entry in self.entries_for_current_path().iter().rev() {
+        self.active_failover_model_change_for_current_path()
+            .and_then(|change| change.failover.as_ref())
+    }
+
+    /// Include the entry identity when reconciling an in-memory cooldown: two
+    /// branch records may otherwise carry identical older failover metadata.
+    pub(crate) fn active_failover_model_change_for_current_path(&self) -> Option<&ModelChangeEntry> {
+        for entry in self.entries_for_current_path().into_iter().rev() {
             if let SessionEntry::ModelChange(change) = entry {
-                if change.role.as_deref() == Some("failover") {
-                    return change.failover.as_ref();
-                }
-                return None;
+                return (change.role.as_deref() == Some("failover")).then_some(change);
             }
         }
         None

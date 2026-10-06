@@ -6038,6 +6038,21 @@ impl ProviderAdmissionGate {
             .map_err(|err| Error::session(format!("provider admission lock failed: {err}")))
     }
 
+    /// Reserve provider admission before acquiring Session-action authority.
+    /// Preparing or declining a swap does not quarantine the session; the
+    /// shared transition code marks uncertainty at its persistence boundary.
+    pub(crate) async fn acquire_transition_authority(
+        &self,
+        cx: &asupersync::Cx,
+    ) -> Result<ProviderTransitionAuthority> {
+        let permit = self.acquire(cx).await?;
+        self.ensure_allowed()?;
+        Ok(ProviderTransitionAuthority {
+            gate: self.clone(),
+            _permit: permit,
+        })
+    }
+
     pub(crate) async fn begin_transition(
         &self,
         reason: String,
@@ -6047,6 +6062,44 @@ impl ProviderAdmissionGate {
         self.ensure_allowed()?;
         self.block(reason);
         Ok(permit)
+    }
+}
+
+/// Proof that a caller owns this gate's provider permit. Recovery keeps this
+/// authority while acquiring Session-action admission, then uses the same
+/// transition machinery without recursively acquiring the provider mutex.
+pub(crate) struct ProviderTransitionAuthority {
+    gate: ProviderAdmissionGate,
+    _permit: OwnedMutexGuard<()>,
+}
+
+#[derive(Clone, Copy)]
+enum ProviderSwapAdmission<'a> {
+    Gate(&'a ProviderAdmissionGate),
+    Held(&'a ProviderTransitionAuthority),
+}
+
+impl<'a> ProviderSwapAdmission<'a> {
+    const fn gate(self) -> &'a ProviderAdmissionGate {
+        match self {
+            Self::Gate(gate) => gate,
+            Self::Held(authority) => &authority.gate,
+        }
+    }
+
+    async fn begin_transition(
+        self,
+        reason: String,
+        cx: &asupersync::Cx,
+    ) -> Result<Option<OwnedMutexGuard<()>>> {
+        match self {
+            Self::Gate(gate) => gate.begin_transition(reason, cx).await.map(Some),
+            Self::Held(authority) => {
+                authority.gate.ensure_allowed()?;
+                authority.gate.block(reason);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -13630,6 +13683,27 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    pub(crate) async fn restore_primary_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap_admitted(cx, request, Some(ProviderSwapAdmission::Held(authority)))
+            .await
+    }
+
+    async fn restore_primary_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<Option<RestoredPrimary>> {
+        let gate = admission.map(ProviderSwapAdmission::gate);
         let (active_provider, active_model) = request.active;
 
         // The runtime must still be on the fallback the caller recorded.
@@ -13641,7 +13715,7 @@ impl AgentSession {
         {
             return Self::refuse_restore(
                 request,
-                admission,
+                gate,
                 format!(
                     "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
                     runtime_provider.name(),
@@ -13663,7 +13737,7 @@ impl AgentSession {
         if !session_matches_active {
             return Self::refuse_restore(
                 request,
-                admission,
+                gate,
                 format!(
                     "primary restore invariant failed: Session path does not match recorded fallback {active_provider}/{active_model}"
                 ),
@@ -13698,14 +13772,15 @@ impl AgentSession {
             self.invalidate_background_compaction();
         }
         let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "primary restore persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
+            Some(admission) => {
+                admission
+                    .begin_transition(
+                        "primary restore persistence was interrupted before live installation completed"
+                            .to_string(),
+                        cx,
+                    )
+                    .await?
+            }
             None => None,
         };
         if save_enabled
@@ -13717,7 +13792,7 @@ impl AgentSession {
             let reason = format!(
                 "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
+            if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
             if request.strict_invariants {
@@ -13729,7 +13804,7 @@ impl AgentSession {
         // No fallible operation remains after installing the candidate.
         *inner = candidate;
         self.install_restored_entry(&entry, provider_impl, key, target_thinking);
-        if let Some(gate) = admission {
+        if let Some(gate) = gate {
             gate.clear();
         }
         drop(inner);
@@ -13877,6 +13952,26 @@ impl AgentSession {
         attempt: &FailoverSwapAttempt<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap_admitted(cx, attempt, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    pub(crate) async fn try_failover_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap_admitted(cx, attempt, Some(ProviderSwapAdmission::Held(authority)))
+            .await
+    }
+
+    async fn try_failover_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<FailoverSwapOutcome> {
         let (from_provider, from_model) = {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
@@ -13921,7 +14016,8 @@ impl AgentSession {
                 cooldown_secs: attempt.cooldown_secs,
                 lifecycle_id: attempt.lifecycle_id,
             };
-            self.commit_failover_swap(cx, &request, admission).await?;
+            self.commit_failover_swap_admitted(cx, &request, admission)
+                .await?;
             return Ok(FailoverSwapOutcome {
                 next_position,
                 committed: Some(CommittedFailover {
@@ -14039,6 +14135,17 @@ impl AgentSession {
         request: &FailoverSwapRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<crate::model::ThinkingLevel> {
+        self.commit_failover_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    async fn commit_failover_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
             .await
@@ -14052,14 +14159,15 @@ impl AgentSession {
         let save_enabled = self.save_enabled();
         self.invalidate_background_compaction();
         let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "failover Session persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
+            Some(admission) => {
+                admission
+                    .begin_transition(
+                        "failover Session persistence was interrupted before live installation completed"
+                            .to_string(),
+                        cx,
+                    )
+                    .await?
+            }
             None => None,
         };
         if save_enabled
@@ -14069,7 +14177,7 @@ impl AgentSession {
             let reason = format!(
                 "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
+            if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
             return Err(Error::session_persistence(reason));
@@ -14103,7 +14211,7 @@ impl AgentSession {
                 .manager()
                 .set_current_model(Some(to_provider), Some(to_model));
         }
-        if let Some(gate) = admission {
+        if let Some(gate) = gate {
             gate.clear();
         }
         Ok(target_thinking)

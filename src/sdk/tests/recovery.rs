@@ -1326,3 +1326,372 @@ fn a_typed_transport_failure_can_fail_over_without_transient_words_in_display() 
         ]
     );
 }
+
+#[test]
+fn extension_selection_of_the_current_fallback_cancels_restoration() {
+    use crate::extensions::ExtensionSession as _;
+
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let selected = handle.model();
+    let extension = crate::session::SessionHandle(handle.session_store());
+    run_async(extension.set_model(selected.0.clone(), selected.1.clone(), None)).unwrap();
+    assert!(
+        handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .active_failover_provenance_for_current_path()
+            .is_none(),
+        "the same-model extension selection must record explicit intent"
+    );
+
+    let (events, callback) = event_log();
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(handle.model(), selected);
+    assert!(handle.failover_state.primary().is_none());
+    assert!(events.lock().unwrap().is_empty());
+    let result = run_async(handle.prompt("keep the selected model", move |event| {
+        callback(event);
+    }))
+    .unwrap();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert!(
+        reopened
+            .active_failover_provenance_for_current_path()
+            .is_none()
+    );
+    assert_eq!(reopened.effective_model_for_current_path(), Some(selected));
+}
+
+#[test]
+fn extension_selection_starts_the_next_failover_from_its_own_primary_and_cursor() {
+    use crate::extensions::ExtensionSession as _;
+
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let selected = handle.model();
+    let extension = crate::session::SessionHandle(handle.session_store());
+    run_async(extension.set_model(selected.0.clone(), selected.1.clone(), None)).unwrap();
+    let (events, callback) = event_log();
+    let failure = Err(Error::provider(&selected.0, "503 service unavailable"));
+    assert!(
+        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+        "the retired cycle's cursor cannot skip the new primary's first fallback"
+    );
+    let primary = handle.failover_state.primary().unwrap();
+    assert_eq!(
+        (&primary.provider, &primary.model_id),
+        (&selected.0, &selected.1)
+    );
+    assert_eq!(handle.failover_state.chain_position(), 1);
+    assert_ne!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "gpt-4o-mini".to_string())
+    );
+    let store = handle.session_store();
+    let session = store.try_lock().unwrap();
+    let provenance = session.active_failover_provenance_for_current_path().unwrap();
+    assert_eq!(
+        (&provenance.primary_provider, &provenance.primary_model_id),
+        (&selected.0, &selected.1)
+    );
+    assert_eq!(events.lock().unwrap()[0]["type"], "failover_start");
+}
+
+#[test]
+fn an_old_provider_error_cannot_fail_over_an_extension_model_selection() {
+    use crate::extensions::ExtensionSession as _;
+
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let old_runtime = handle.model();
+    let selected = ("openai".to_string(), "gpt-4.1-mini".to_string());
+    let extension = crate::session::SessionHandle(handle.session_store());
+    run_async(extension.set_model(selected.0.clone(), selected.1.clone(), None)).unwrap();
+    let store = handle.session_store();
+    let entries_before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+    let (events, callback) = event_log();
+    let failure = Err(Error::provider(&old_runtime.0, "503 service unavailable"));
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        old_runtime,
+        "normal entry will install the selection"
+    );
+    assert_eq!(
+        store.try_lock().unwrap().effective_model_for_current_path(),
+        Some(selected)
+    );
+    assert_eq!(
+        serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+        entries_before
+    );
+    assert!(handle.failover_state.primary().is_none());
+    assert!(events.lock().unwrap().is_empty());
+}
+
+fn install_reconciliation_provenance(
+    handle: &mut AgentSessionHandle,
+    provenance: crate::session::ModelChangeFailover,
+) {
+    let store = handle.session_store();
+    {
+        let mut session = store.try_lock().unwrap();
+        session.set_model_header(
+            Some(provenance.fallback_provider.clone()),
+            Some(provenance.fallback_model_id.clone()),
+            None,
+        );
+        session.append_model_change_with_role_and_failover(
+            provenance.fallback_provider.clone(),
+            provenance.fallback_model_id.clone(),
+            Some("failover".to_string()),
+            Some(provenance),
+        );
+    }
+    run_async(handle.session.persist_session()).unwrap();
+}
+
+#[test]
+fn unchanged_failover_provenance_keeps_its_running_monotonic_cooldown() {
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let mut provenance = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .active_failover_provenance_for_current_path()
+        .unwrap()
+        .clone();
+    // Older records have no wall deadline. Reconstructing one repeatedly
+    // restarts the interval and can prevent restoration indefinitely.
+    provenance.cooldown_deadline = None;
+    provenance.cooldown_secs = Some(300);
+    install_reconciliation_provenance(&mut handle, provenance.clone());
+    handle.failover_state = {
+        let store = handle.session_store();
+        let session = store.try_lock().unwrap();
+        crate::failover::FailoverState::reconstruct_from_session(&session, 300, chrono::Utc::now())
+    };
+    let started = handle.failover_state.cooldown().unwrap().failed_at();
+    let (events, callback) = event_log();
+    for _ in 0..2 {
+        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        assert_eq!(handle.failover_state.cooldown().unwrap().failed_at(), started);
+        assert!(
+            !handle
+                .failover_state
+                .should_restore_primary(std::time::Instant::now())
+        );
+    }
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn changed_branch_provenance_refreshes_only_the_affected_failover_cycle() {
+    for changed in ["lifecycle", "primary", "active", "cursor"] {
+        let dir = tempdir().unwrap();
+        let mut handle = saving_fallback_selection_handle(dir.path());
+        let mut provenance = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .active_failover_provenance_for_current_path()
+            .unwrap()
+            .clone();
+        provenance.cooldown_deadline = None;
+        provenance.cooldown_secs = Some(300);
+        match changed {
+            "lifecycle" => provenance.lifecycle_id = Some("other-cycle".to_string()),
+            "primary" => provenance.primary_model_id = "other-primary".to_string(),
+            "active" => provenance.fallback_model_id = "other-fallback".to_string(),
+            "cursor" => provenance.chain_position = Some(4),
+            _ => unreachable!(),
+        }
+        install_reconciliation_provenance(&mut handle, provenance.clone());
+        let (events, callback) = event_log();
+        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        let primary = handle.failover_state.primary().expect(changed);
+        assert_eq!(primary.provider, provenance.primary_provider, "{changed}");
+        assert_eq!(primary.model_id, provenance.primary_model_id, "{changed}");
+        assert_eq!(
+            handle.failover_state.active(),
+            Some(&(provenance.fallback_provider, provenance.fallback_model_id)),
+            "{changed}"
+        );
+        assert_eq!(
+            handle.failover_state.lifecycle_id(),
+            provenance.lifecycle_id.as_deref(),
+            "{changed}"
+        );
+        assert_eq!(
+            handle.failover_state.chain_position(),
+            provenance.chain_position.unwrap(),
+            "{changed}"
+        );
+        assert!(
+            !handle
+                .failover_state
+                .should_restore_primary(std::time::Instant::now())
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn recovery_waits_for_provider_callbacks_before_claiming_session_actions() {
+    use crate::extensions::ExtensionSession as _;
+
+    for restore in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut handle = saving_fallback_selection_handle(dir.path());
+        let extension = crate::session::SessionHandle(handle.session_store());
+        if !restore {
+            let selected = handle.model();
+            run_async(extension.set_model(selected.0, selected.1, None)).unwrap();
+        }
+        let provider_gate = handle.session.provider_admission_gate();
+        let action_gate = handle.session.session_action_admission_gate();
+        let (events, callback) = event_log();
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let provider_call = provider_gate.acquire(cx.cx()).await.unwrap();
+            let failure = Err(Error::provider("test-provider", "503 service unavailable"));
+            let recovery = async {
+                if restore {
+                    handle.maybe_restore_primary(&callback).await.map(|()| true)
+                } else {
+                    handle
+                        .try_chain_failover(&failure, false, None, 1, &callback)
+                        .await
+                }
+            };
+            futures::pin_mut!(recovery);
+            assert!(
+                futures::poll!(recovery.as_mut()).is_pending(),
+                "recovery must wait for the active provider"
+            );
+
+            let callback_action = action_gate.acquire(cx.cx());
+            futures::pin_mut!(callback_action);
+            let std::task::Poll::Ready(Ok(action_permit)) =
+                futures::poll!(callback_action.as_mut())
+            else {
+                panic!("a provider callback must still be able to enter Session actions");
+            };
+            extension
+                .set_name("provider callback completed".to_string(), None)
+                .await
+                .unwrap();
+            drop(action_permit);
+            drop(provider_call);
+            let outcome = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                recovery,
+            )
+            .await
+            .expect("recovery must not reacquire its own provider permit");
+            assert!(
+                outcome.unwrap(),
+                "the pre-held authority must complete the swap"
+            );
+            provider_gate.ensure_allowed().unwrap();
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["type"],
+            if restore {
+                "failover_end"
+            } else {
+                "failover_start"
+            }
+        );
+    }
+}
+
+#[test]
+fn another_branch_deadline_cannot_reuse_an_expired_cooldown() {
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let store = handle.session_store();
+    handle.failover_state = crate::failover::FailoverState::reconstruct_from_session(
+        &store.try_lock().unwrap(),
+        0,
+        chrono::Utc::now(),
+    );
+    assert!(
+        handle
+            .failover_state
+            .should_restore_primary(std::time::Instant::now())
+    );
+    let mut provenance = store
+        .try_lock()
+        .unwrap()
+        .active_failover_provenance_for_current_path()
+        .unwrap()
+        .clone();
+    provenance.cooldown_secs = Some(300);
+    provenance.cooldown_deadline =
+        Some((chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc3339());
+    install_reconciliation_provenance(&mut handle, provenance);
+    let selected = handle.model();
+    let (events, callback) = event_log();
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(handle.model(), selected);
+    assert!(
+        !handle
+            .failover_state
+            .should_restore_primary(std::time::Instant::now())
+    );
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn distinct_legacy_failover_entries_have_independent_cooldowns() {
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let store = handle.session_store();
+    let mut provenance = store
+        .try_lock()
+        .unwrap()
+        .active_failover_provenance_for_current_path()
+        .unwrap()
+        .clone();
+    provenance.lifecycle_id = None;
+    provenance.cooldown_deadline = None;
+    provenance.cooldown_secs = Some(300);
+    install_reconciliation_provenance(&mut handle, provenance.clone());
+    handle.failover_state = crate::failover::FailoverState::reconstruct_from_session(
+        &store.try_lock().unwrap(),
+        300,
+        chrono::Utc::now(),
+    );
+    let old_started = handle.failover_state.cooldown().unwrap().failed_at();
+    install_reconciliation_provenance(&mut handle, provenance);
+    let (events, callback) = event_log();
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    let new_started = handle.failover_state.cooldown().unwrap().failed_at();
+    assert_ne!(
+        old_started, new_started,
+        "the other entry starts its own interval"
+    );
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.failover_state.cooldown().unwrap().failed_at(),
+        new_started
+    );
+    assert!(events.lock().unwrap().is_empty());
+}
