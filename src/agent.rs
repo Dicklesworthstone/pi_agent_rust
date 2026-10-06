@@ -2659,14 +2659,17 @@ impl Agent {
                     &mut labels,
                 )?,
                 Message::Assistant(assistant) => {
+                    let same_origin = assistant.api == self.provider.api()
+                        && assistant.provider == self.provider.name()
+                        && assistant.model == self.provider.model_id();
                     // Paused server-tool responses and signed blocks must remain
-                    // byte/structure stable for provider replay. Block mode has
-                    // already refused any detection in them (discovery above);
-                    // obfuscate mode replays them as the provider produced them.
-                    // Refusing there wedged every later request in the session
-                    // (a signature can be a plain OpenAI item id, and model-made
-                    // text such as a DSN matches the detector).
-                    if assistant.stop_reason == StopReason::PauseTurn {
+                    // byte/structure stable when replayed to their original
+                    // provider, API and model. After a switch, these bytes are
+                    // ordinary history: screen them and discard signatures so
+                    // the new provider cannot receive a now-known raw secret
+                    // or a signature over rewritten content. Block mode has
+                    // already refused detections in either case above.
+                    if same_origin && assistant.stop_reason == StopReason::PauseTurn {
                         if mode == crate::secrets::SecretsMode::Block {
                             let original =
                                 serde_json::to_value(assistant.as_ref()).map_err(|_| {
@@ -2691,7 +2694,7 @@ impl Agent {
                     for block in &mut assistant_mut.content {
                         Self::secrets_transform_content_block(
                             block,
-                            true,
+                            same_origin,
                             &mut staged_vault,
                             mode,
                             &extra,
@@ -2924,9 +2927,9 @@ impl Agent {
         })
     }
 
-    /// `honor_signatures` is true only for assistant blocks: a provider signs
-    /// its own output. User and tool-result blocks are rewritten even when
-    /// they carry a signature field (an extension can set one on any JSON).
+    /// `honor_signatures` is true only for assistant output from the current
+    /// provider, API and model. Foreign history, user and tool-result blocks
+    /// are screened without signatures (an extension can set one on any JSON).
     fn secrets_transform_content_block(
         block: &mut ContentBlock,
         honor_signatures: bool,
@@ -2937,15 +2940,18 @@ impl Agent {
         labels: &mut Vec<String>,
     ) -> Result<()> {
         // A signed assistant block (a real provider signature, or a plain item
-        // id such as OpenAI's `fc_`/`msg_` that replay is keyed on) is never
-        // rewritten outside block mode: see the paused-turn comment in
-        // `apply_secrets_outbound`. Skipping the rewrite (not just discarding
-        // it) also keeps a type-changing replacement from refusing the request.
+        // id such as OpenAI's `fc_`/`msg_` that replay is keyed on) stays intact
+        // only for its original destination outside block mode. Skipping the
+        // rewrite (not just discarding it) also keeps a type-changing
+        // replacement from refusing the request.
         let keep_signed = honor_signatures && mode != crate::secrets::SecretsMode::Block;
         match block {
             ContentBlock::Text(text) => {
                 if keep_signed && text.text_signature.is_some() {
                     return Ok(());
+                }
+                if !honor_signatures {
+                    text.text_signature = None;
                 }
                 text.text =
                     Self::secrets_transform_text(&text.text, vault, mode, extra, total, labels)?;
@@ -2953,6 +2959,9 @@ impl Agent {
             ContentBlock::Thinking(thinking) => {
                 if keep_signed && thinking.thinking_signature.is_some() {
                     return Ok(());
+                }
+                if !honor_signatures {
+                    thinking.thinking_signature = None;
                 }
                 thinking.thinking = Self::secrets_transform_text(
                     &thinking.thinking,
@@ -2966,6 +2975,9 @@ impl Agent {
             ContentBlock::ToolCall(call) => {
                 if keep_signed && call.thought_signature.is_some() {
                     return Ok(());
+                }
+                if !honor_signatures {
+                    call.thought_signature = None;
                 }
                 call.arguments = Self::secrets_transform_json(
                     &call.arguments,

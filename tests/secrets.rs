@@ -74,6 +74,7 @@ fn first_text(output: &pi::tools::ToolOutput) -> &str {
 struct Capture {
     payloads: Vec<String>,
     tools: Vec<String>,
+    messages: Vec<Vec<pi::model::Message>>,
 }
 
 struct CaptureProvider {
@@ -114,6 +115,7 @@ impl pi::provider::Provider for CaptureProvider {
         }
         let mut capture = self.capture.lock().expect("capture"); // ubs:ignore test capture
         capture.payloads.push(payload);
+        capture.messages.push(context.messages.to_vec());
         capture
             .tools
             .extend(context.tools.iter().map(|tool| tool.name.clone()));
@@ -816,6 +818,9 @@ fn assistant(
     pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
         content,
         stop_reason,
+        api: "capture-api".to_string(),
+        provider: "capture".to_string(),
+        model: "capture-model".to_string(),
         timestamp: 0,
         ..pi::model::AssistantMessage::default()
     }))
@@ -1129,14 +1134,20 @@ fn signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses() {
 
     for message in messages() {
         let (mut agent, capture) = build_agent(&root, None);
+        let original = serde_json::to_value(&message).expect("original signed history");
         block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
             .expect("signed content must not wedge the default mode");
-        let payloads = capture.lock().expect("capture").payloads.clone();
-        assert_eq!(payloads.len(), 1);
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
         assert!(
-            payloads[0].contains(SECRET_IN_SIGNED_CONTENT),
+            capture.payloads[0].contains(SECRET_IN_SIGNED_CONTENT),
             "{}",
-            payloads[0]
+            capture.payloads[0]
+        );
+        assert_eq!(
+            serde_json::to_value(&capture.messages[0][0]).expect("replayed signed history"),
+            original,
+            "same-origin signed or paused content must replay verbatim"
         );
     }
     for message in messages() {
@@ -1145,5 +1156,81 @@ fn signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses() {
             .expect_err("block mode refuses detected secrets in signed content");
         assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
         assert!(capture.lock().expect("capture").payloads.is_empty());
+    }
+}
+
+#[test]
+fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() {
+    use pi::model::{ContentBlock, Message, StopReason, TextContent, ThinkingContent};
+
+    const OPAQUE: &str = "opaqueCredentialValue1234567890";
+    let harness = TestHarness::new(
+        "foreign_signed_and_paused_history_is_screened_without_mutating_the_session",
+    );
+    let root = harness.temp_path(".");
+
+    for mismatch in ["api", "provider", "model", "unknown"] {
+        for reason in [StopReason::ToolUse, StopReason::PauseTurn] {
+            let (mut agent, capture) = build_agent(&root, None);
+            let mut source = assistant(
+                vec![
+                    ContentBlock::Text(TextContent {
+                        text: OPAQUE.to_string(),
+                        text_signature: Some("msg_source".to_string()),
+                    }),
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking: OPAQUE.to_string(),
+                        thinking_signature: Some(format!("signature-{OPAQUE}")),
+                    }),
+                    tool_call("call_source", json!({"echo": OPAQUE}), Some("fc_source")),
+                ],
+                reason,
+            );
+            let Message::Assistant(message) = &mut source else {
+                unreachable!()
+            };
+            let message = Arc::make_mut(message);
+            match mismatch {
+                "api" => message.api = "other-api".to_string(),
+                "provider" => message.provider = "other-provider".to_string(),
+                "model" => message.model = "other-model".to_string(),
+                _ => {
+                    message.api.clear();
+                    message.provider.clear();
+                    message.model.clear();
+                }
+            }
+            let original = serde_json::to_value(&source).expect("original history");
+
+            // The later assignment teaches the vault about an earlier bare
+            // echo, including one that was signed by a previous provider.
+            block_on_local(agent.run_with_messages_with_abort(
+                vec![source, user_text(&format!("api_key={OPAQUE}"))],
+                None,
+                |_| {},
+            ))
+            .expect("screened foreign history reaches the provider");
+
+            let capture = capture.lock().expect("capture");
+            assert_eq!(capture.payloads.len(), 1);
+            assert!(!capture.payloads[0].contains(OPAQUE), "{mismatch} {reason:?}");
+            let Message::Assistant(screened) = &capture.messages[0][0] else {
+                panic!("expected screened assistant history")
+            };
+            assert_eq!(screened.stop_reason, reason);
+            assert!(matches!(&screened.content[0], ContentBlock::Text(text)
+                if text.text == "<pi-secret:000001>" && text.text_signature.is_none()));
+            assert!(matches!(&screened.content[1], ContentBlock::Thinking(thinking)
+                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none()));
+            assert!(matches!(&screened.content[2], ContentBlock::ToolCall(call)
+                if call.id == "call_source" && call.name == "fixture"
+                    && call.arguments == json!({"echo": "<pi-secret:000001>"})
+                    && call.thought_signature.is_none()));
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).expect("session history"),
+                original,
+                "outbound screening must retain original history for a switch back"
+            );
+        }
     }
 }
