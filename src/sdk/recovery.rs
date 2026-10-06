@@ -16,6 +16,21 @@ use std::time::{Duration, Instant};
 
 type EventCallback = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+/// A failed turn save is an admission failure, not just a failed SDK call.
+/// Keep the original error (including any provider/tool failure) and share the
+/// quarantine with extension completions and every later SDK entrypoint.
+fn fence_session_persistence<T>(
+    admission: &crate::agent::ProviderAdmissionGate,
+    result: Result<T>,
+) -> Result<T> {
+    if let Err(error) = &result
+        && error.is_session_persistence()
+    {
+        admission.block(error.to_string());
+    }
+    result
+}
+
 /// One logical SDK call owns its terminal event, not any provider attempt.
 /// In particular, the raw AgentEnd precedes AgentSession's persistence step.
 struct LogicalTurn {
@@ -226,6 +241,8 @@ impl AgentSessionHandle {
     ///
     /// Per-prompt callbacks, session subscribers and typed hooks share one event
     /// fan-out. With no retry policy the first outcome is returned unchanged.
+    /// A session-persistence error fences this handle: start a new or resumed
+    /// session before issuing another prompt, even after repairing the save path.
     pub async fn prompt(
         &mut self,
         input: impl Into<String>,
@@ -364,9 +381,14 @@ impl AgentSessionHandle {
                     .await
             }
         };
+        let admission = self.session.provider_admission_gate();
+        let first = fence_session_persistence(&admission, first);
         let result = self
             .apply_retry_policy(first, &abort_signal, &shared, &turn)
             .await;
+        // Also cover failures while preparing a retry/failover. Install the
+        // fence before observers receive the logical turn's terminal event.
+        let result = fence_session_persistence(&admission, result);
         turn.finish(&result);
         result
     }
@@ -609,9 +631,14 @@ impl AgentSessionHandle {
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(abort_signal)?;
         let forwarded = Arc::clone(shared);
-        self.session
+        let result = self
+            .session
             .run_continue_with_abort(Some(abort_signal.clone()), move |event| forwarded(event))
-            .await
+            .await;
+        // A continuation can finish its provider work but fail its own save.
+        // Fence before retry/failover terminal callbacks are dispatched, not
+        // only after the outer SDK call returns.
+        fence_session_persistence(&self.session.provider_admission_gate(), result)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -878,5 +905,99 @@ fn ensure_not_aborted(signal: &AbortSignal) -> Result<()> {
         Err(Error::Aborted)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod persistence_fence_tests {
+    use super::*;
+    use crate::agent::ProviderAdmissionGate;
+
+    #[test]
+    fn persistence_failure_fences_shared_admission_and_preserves_the_error() {
+        let admission = ProviderAdmissionGate::default();
+        let shared = admission.clone();
+        let error = Error::session_persistence(
+            "disk flush failed; primary provider/tool turn also failed: connection lost",
+        );
+        let expected = error.to_string();
+        let result = fence_session_persistence::<()>(&admission, Err(error));
+        let returned = result.expect_err("preserve the failed save");
+        assert!(returned.is_session_persistence());
+        assert_eq!(returned.to_string(), expected);
+        let refused = shared.ensure_allowed().expect_err("shared gate must fence");
+        assert!(refused.is_session_persistence());
+        assert!(refused.to_string().contains("disk flush failed"));
+        assert!(refused.to_string().contains("connection lost"));
+    }
+
+    #[test]
+    fn provider_errors_and_cancellation_do_not_become_persistence_failures() {
+        for error in [
+            Error::api("503 service unavailable"),
+            Error::session("ordinary session validation failed"),
+            Error::Aborted,
+        ] {
+            let admission = ProviderAdmissionGate::default();
+            let expected = error.to_string();
+            let returned = fence_session_persistence::<()>(&admission, Err(error))
+                .expect_err("original error");
+            assert!(!returned.is_session_persistence());
+            assert_eq!(returned.to_string(), expected);
+            assert!(admission.ensure_allowed().is_ok());
+        }
+    }
+
+    #[test]
+    fn successful_results_do_not_close_admission() {
+        let admission = ProviderAdmissionGate::default();
+        assert_eq!(fence_session_persistence(&admission, Ok(42)).unwrap(), 42);
+        assert!(admission.ensure_allowed().is_ok());
+    }
+
+    #[test]
+    fn a_later_success_cannot_clear_an_existing_persistence_fence() {
+        let admission = ProviderAdmissionGate::default();
+        let _ = fence_session_persistence::<()>(
+            &admission,
+            Err(Error::session_persistence("indeterminate save")),
+        );
+        let reason = admission.reason();
+        fence_session_persistence(&admission, Ok(())).unwrap();
+        assert_eq!(admission.reason(), reason);
+        assert!(admission.ensure_allowed().is_err());
+    }
+
+    #[test]
+    fn terminal_observers_see_the_fence_before_the_logical_turn_ends() {
+        let admission = ProviderAdmissionGate::default();
+        let observed = admission.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let turn = LogicalTurn::new(Arc::new(move |event| {
+            if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                assert!(
+                    observed
+                        .ensure_allowed()
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+            }
+            captured.lock().unwrap().push(event);
+        }));
+        turn.emit(AgentEvent::AgentStart {
+            session_id: Arc::from("persistence-fence-test"),
+        });
+        let result = fence_session_persistence::<AssistantMessage>(
+            &admission,
+            Err(Error::session_persistence("turn save failed")),
+        );
+        turn.finish(&result);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::AgentEnd { error: Some(error), .. })
+                if error.contains("turn save failed")
+        ));
     }
 }
