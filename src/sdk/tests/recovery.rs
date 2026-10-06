@@ -44,6 +44,281 @@ async fn invoke(
     }
 }
 
+#[derive(Default)]
+struct PromptObservations {
+    prompts: Vec<Option<String>>,
+    thinking_levels: Vec<Option<crate::model::ThinkingLevel>>,
+}
+
+struct PromptProbeProvider {
+    inner: Arc<dyn crate::provider::Provider>,
+    observations: Arc<Mutex<PromptObservations>>,
+    pending_call: Option<usize>,
+}
+
+#[async_trait::async_trait]
+impl crate::provider::Provider for PromptProbeProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn api(&self) -> &str {
+        self.inner.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    async fn stream(
+        &self,
+        context: &crate::provider::Context<'_>,
+        options: &crate::provider::StreamOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+    > {
+        let call = {
+            let mut observed = self.observations.lock().unwrap();
+            let call = observed.prompts.len();
+            observed
+                .prompts
+                .push(context.system_prompt.as_deref().map(str::to_string));
+            observed.thinking_levels.push(options.thinking_level);
+            call
+        };
+        if self.pending_call == Some(call) {
+            futures::future::pending::<()>().await;
+        }
+        self.inner.stream(context, options).await
+    }
+}
+
+fn record_system_prompts(
+    handle: &mut AgentSessionHandle,
+    pending_call: Option<usize>,
+) -> Arc<Mutex<PromptObservations>> {
+    let observations = Arc::new(Mutex::new(PromptObservations::default()));
+    let provider = PromptProbeProvider {
+        inner: handle.session.agent.provider(),
+        observations: Arc::clone(&observations),
+        pending_call,
+    };
+    handle.session.agent.set_provider(Arc::new(provider));
+    observations
+}
+
+/// Use the real native extension dispatcher. Its custom message is observable
+/// evidence that recovery has not replayed `before_agent_start` a second time.
+fn install_system_prompt_hook(handle: &mut AgentSessionHandle, prompt: Option<&str>) {
+    let manager = crate::extensions::ExtensionManager::new();
+    let temp = tempdir().unwrap();
+    let entry = temp.path().join("turn-system-prompt.native.json");
+    let output = prompt.map_or_else(
+        || serde_json::json!({}),
+        |prompt| {
+            serde_json::json!({
+                "systemPrompt": prompt,
+                "messages": [{
+                    "customType": "prompt-scope-hook",
+                    "content": "hook ran once",
+                    "display": false,
+                }],
+            })
+        },
+    );
+    let descriptor = serde_json::json!({
+        "id": "turn-system-prompt-test",
+        "name": "turn-system-prompt-test",
+        "version": "1.0.0",
+        "apiVersion": crate::extensions::PROTOCOL_VERSION,
+        "eventHooks": ["before_agent_start"],
+        "eventResponses": {"before_agent_start": output},
+    });
+    std::fs::write(&entry, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+    run_async(async {
+        manager.set_native_runtime(
+            crate::extensions::NativeRustExtensionRuntimeHandle::start()
+                .await
+                .unwrap(),
+        );
+        manager
+            .load_native_extensions(vec![
+                crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&entry).unwrap(),
+            ])
+            .await
+            .unwrap();
+    });
+    handle.session.extensions = Some(crate::extensions::ExtensionRegion::new(manager));
+}
+
+async fn prompt_with_optional_image(
+    handle: &mut AgentSessionHandle,
+    with_image: bool,
+) -> Result<AssistantMessage> {
+    if with_image {
+        handle
+            .prompt_with_images(
+                "ultrathink orchestrate one logical turn",
+                vec![ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }],
+                |_| {},
+            )
+            .await
+    } else {
+        handle
+            .prompt("ultrathink orchestrate one logical turn", |_| {})
+            .await
+    }
+}
+
+fn assert_prompt_hook_ran_once(handle: &AgentSessionHandle) {
+    let messages = run_async(handle.messages()).unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                Message::Custom(custom) if custom.custom_type == "prompt-scope-hook"
+            ))
+            .count(),
+        1,
+        "retry/failover must not replay the hook's custom message",
+    );
+}
+
+#[test]
+fn retry_preserves_extension_prompt_without_repeating_directives_or_leaking_to_next_input() {
+    for with_image in [false, true] {
+        for failures in [1, 2] {
+            let (handle, calls) = flaky_handle(failures);
+            let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+            handle
+                .session
+                .agent
+                .set_system_prompt(Some("base-system".to_string()));
+            let prompts = record_system_prompts(&mut handle, None);
+            install_system_prompt_hook(&mut handle, Some("hook-system"));
+
+            let result = run_async(prompt_with_optional_image(&mut handle, with_image)).unwrap();
+            assert_eq!(
+                result.stop_reason,
+                if failures == 1 {
+                    StopReason::Stop
+                } else {
+                    StopReason::Error
+                },
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let expected = format!(
+                "hook-system\n\n{}",
+                crate::magic_keywords::ORCHESTRATE_DIRECTIVE,
+            );
+            assert_eq!(
+                prompts.lock().unwrap().prompts,
+                vec![Some(expected.clone()), Some(expected)],
+            );
+            assert_eq!(handle.session.agent.system_prompt(), Some("base-system"));
+            assert_prompt_hook_ran_once(&handle);
+
+            // The next hook makes no mutation. Neither the old override nor
+            // its keyword directive may survive into this unrelated input.
+            install_system_prompt_hook(&mut handle, None);
+            run_async(handle.prompt("another question", |_| {})).unwrap();
+            assert_eq!(
+                prompts.lock().unwrap().prompts.last().unwrap().as_deref(),
+                Some("base-system"),
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_prompt_hook_ran_once(&handle);
+        }
+    }
+}
+
+#[test]
+fn dropping_first_or_retried_provider_future_restores_prompt_and_thinking() {
+    for with_image in [false, true] {
+        for pending_call in [0, 1] {
+            let (handle, _) = flaky_handle(pending_call);
+            let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+            handle
+                .session
+                .agent
+                .set_system_prompt(Some("base-system".to_string()));
+            let prompts = record_system_prompts(&mut handle, Some(pending_call));
+            handle.session.agent.stream_options_mut().thinking_level =
+                Some(crate::model::ThinkingLevel::Off);
+            handle
+                .session
+                .agent
+                .set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            install_system_prompt_hook(&mut handle, Some("hook-system"));
+            run_async(async {
+                let mut turn = Box::pin(prompt_with_optional_image(&mut handle, with_image));
+                let reached_provider = futures::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                    if prompts.lock().unwrap().prompts.len() == pending_call + 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                });
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    reached_provider,
+                )
+                .await
+                .expect("the production turn must reach its pending provider attempt");
+                drop(turn);
+            });
+            assert_eq!(handle.session.agent.system_prompt(), Some("base-system"));
+            assert_eq!(
+                handle.session.agent.stream_options().thinking_level,
+                Some(crate::model::ThinkingLevel::Off),
+                "dropping ultrathink must immediately restore the selected model baseline",
+            );
+            let expected = format!(
+                "hook-system\n\n{}",
+                crate::magic_keywords::ORCHESTRATE_DIRECTIVE,
+            );
+            assert_eq!(
+                prompts.lock().unwrap().prompts,
+                vec![Some(expected); pending_call + 1],
+            );
+            assert_eq!(
+                prompts.lock().unwrap().thinking_levels,
+                vec![Some(crate::model::ThinkingLevel::High); pending_call + 1],
+            );
+            assert_eq!(
+                handle
+                    .session
+                    .agent
+                    .messages()
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        Message::Custom(custom) if custom.custom_type == "prompt-scope-hook"
+                    ))
+                    .count(),
+                1,
+            );
+            install_system_prompt_hook(&mut handle, None);
+            let result = run_async(handle.prompt("after cancellation", |_| {})).unwrap();
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(
+                prompts.lock().unwrap().prompts.last().unwrap().as_deref(),
+                Some("base-system"),
+            );
+            assert_eq!(
+                prompts.lock().unwrap().thinking_levels.last().copied(),
+                Some(Some(crate::model::ThinkingLevel::Off)),
+            );
+        }
+    }
+}
+
 #[test]
 fn every_entrypoint_resumes_instead_of_replaying_user_input() {
     for entrypoint in ENTRYPOINTS {
@@ -1027,6 +1302,58 @@ fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsiz
             cooldown_secs: 300,
         }));
     (handle, calls)
+}
+
+#[test]
+fn every_failover_hop_keeps_the_extension_prompt_then_next_turn_restores_base() {
+    let mut server = RecoveryHttpFixture::new(vec![
+        capacity_response(),
+        completion_response(),
+        completion_response(),
+    ]);
+    let (mut handle, calls) = http_chain_handle(&server.url, 2);
+    handle
+        .session
+        .agent
+        .set_system_prompt(Some("base-system".to_string()));
+    let primary_prompts = record_system_prompts(&mut handle, None);
+    install_system_prompt_hook(&mut handle, Some("hook-system"));
+
+    let result = run_async(handle.prompt("orchestrate the recovery", |_| {})).unwrap();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.model().1, "fallback-b");
+    assert_eq!(handle.session.agent.system_prompt(), Some("base-system"));
+    assert_prompt_hook_ran_once(&handle);
+
+    install_system_prompt_hook(&mut handle, None);
+    run_async(handle.prompt("a separate question", |_| {})).unwrap();
+    server.finish();
+    assert_prompt_hook_ran_once(&handle);
+    assert_eq!(handle.session.agent.system_prompt(), Some("base-system"));
+
+    let expected = format!(
+        "hook-system\n\n{}",
+        crate::magic_keywords::ORCHESTRATE_DIRECTIVE,
+    );
+    assert_eq!(
+        primary_prompts.lock().unwrap().prompts,
+        vec![Some(expected.clone())],
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let expected_prompts = [expected.as_str(), expected.as_str(), "base-system"];
+    for (request, expected) in requests.iter().zip(expected_prompts) {
+        let system_prompt = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| {
+                matches!(message["role"].as_str(), Some("system" | "developer"))
+            })
+            .and_then(|message| message["content"].as_str());
+        assert_eq!(system_prompt, Some(expected));
+    }
 }
 
 #[test]

@@ -1840,6 +1840,34 @@ pub struct Agent {
     secrets_vault: crate::secrets::SecretVault,
 }
 
+/// Restore temporary keyword settings even if an in-flight run is dropped.
+/// Capture these only at agent-loop entry, after session model selection has
+/// installed the model's supported baseline thinking level.
+struct AgentTurnSettingsGuard<'a> {
+    agent: &'a mut Agent,
+    thinking_level: Option<crate::model::ThinkingLevel>,
+    system_prompt: Option<String>,
+}
+
+impl<'a> AgentTurnSettingsGuard<'a> {
+    fn new(agent: &'a mut Agent) -> Self {
+        let thinking_level = agent.config.stream_options.thinking_level;
+        let system_prompt = agent.config.system_prompt.clone();
+        Self {
+            agent,
+            thinking_level,
+            system_prompt,
+        }
+    }
+}
+
+impl Drop for AgentTurnSettingsGuard<'_> {
+    fn drop(&mut self) {
+        self.agent.config.stream_options.thinking_level = self.thinking_level;
+        self.agent.config.system_prompt = self.system_prompt.take();
+    }
+}
+
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
 struct ScopedRuleState {
     rules: Vec<crate::context_files::ForeignRule>,
@@ -3099,9 +3127,9 @@ impl Agent {
         if !prompts.is_empty() || initial_follow_up {
             self.retry_keyword_activations.clear();
         }
-        let saved_thinking = self.config.stream_options.thinking_level;
-        let saved_system_prompt = self.config.system_prompt.clone();
-        let result = self
+        let settings_scope = AgentTurnSettingsGuard::new(self);
+        let result = settings_scope
+            .agent
             .run_loop_inner(
                 prompts,
                 initial_follow_up,
@@ -3110,8 +3138,7 @@ impl Agent {
                 abort,
             )
             .await;
-        self.config.stream_options.thinking_level = saved_thinking;
-        self.config.system_prompt = saved_system_prompt;
+        drop(settings_scope);
         if result.as_ref().is_ok_and(|message| {
             !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
         }) {
@@ -5995,6 +6022,58 @@ pub struct AgentSession {
     /// replacement. The generation rejects an action that began before a
     /// replacement but only acquired the permit after the replacement.
     session_action_admission: SessionActionAdmissionGate,
+}
+
+/// Keep an extension-selected prompt local to one provider attempt, including
+/// when its future is dropped inside the agent loop or session persistence.
+/// Owning the session borrow lets `Drop` restore state without an async lock.
+struct SessionTurnPromptGuard<'a> {
+    session: &'a mut AgentSession,
+    base_system_prompt: Option<String>,
+}
+
+impl<'a> SessionTurnPromptGuard<'a> {
+    fn new(session: &'a mut AgentSession, system_prompt: Option<String>) -> Self {
+        let base_system_prompt = session.agent.system_prompt().map(str::to_string);
+        session.agent.set_system_prompt(system_prompt);
+        Self {
+            session,
+            base_system_prompt,
+        }
+    }
+}
+
+impl Drop for SessionTurnPromptGuard<'_> {
+    fn drop(&mut self) {
+        self.session
+            .agent
+            .set_system_prompt(self.base_system_prompt.take());
+        // The agent normally consumes this at loop entry. Early returns and
+        // cancellation must not hand this turn's provenance to another input.
+        let _ = self.session.agent.magic_keyword_scan_override.take();
+    }
+}
+
+/// Extension-generated idle turns temporarily change input provenance.
+struct SessionInputSourceGuard<'a> {
+    session: &'a mut AgentSession,
+    previous_source: InputSource,
+}
+
+impl<'a> SessionInputSourceGuard<'a> {
+    fn new(session: &'a mut AgentSession, source: InputSource) -> Self {
+        let previous_source = std::mem::replace(&mut session.input_source, source);
+        Self {
+            session,
+            previous_source,
+        }
+    }
+}
+
+impl Drop for SessionInputSourceGuard<'_> {
+    fn drop(&mut self) {
+        self.session.input_source = self.previous_source;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -11217,6 +11296,7 @@ mod abort_tests {
     struct PhasedProvider {
         pending_calls: usize,
         calls: AtomicUsize,
+        system_prompts: StdMutex<Vec<Option<String>>>,
     }
 
     impl PhasedProvider {
@@ -11224,6 +11304,7 @@ mod abort_tests {
             Self {
                 pending_calls,
                 calls: AtomicUsize::new(0),
+                system_prompts: StdMutex::new(Vec::new()),
             }
         }
 
@@ -11259,11 +11340,15 @@ mod abort_tests {
 
         async fn stream(
             &self,
-            _context: &Context<'_>,
+            context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
+            self.system_prompts
+                .lock()
+                .unwrap()
+                .push(context.system_prompt.as_deref().map(str::to_string));
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call < self.pending_calls {
                 return Ok(Box::pin(StartThenPending {
@@ -11456,6 +11541,108 @@ mod abort_tests {
                 .any(|event| event.as_str().eq("run2:agent_end")),
             "missing successful boundary for resumed run: {timeline:?}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dropping_extension_custom_turn_restores_prompt_and_activity() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().unwrap();
+            let entry = temp.path().join("custom-prompt.native.json");
+            let descriptor = json!({
+                "id": "custom-prompt-test",
+                "name": "custom-prompt-test",
+                "version": "1.0.0",
+                "apiVersion": crate::extensions::PROTOCOL_VERSION,
+                "eventHooks": ["before_agent_start"],
+                "eventResponses": {
+                    "before_agent_start": {"systemPrompt": "custom-hook-system"},
+                },
+            });
+            std::fs::write(&entry, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            let manager = ExtensionManager::new();
+            manager.set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+            manager
+                .load_native_extensions(vec![
+                    crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&entry)
+                        .unwrap(),
+                ])
+                .await
+                .unwrap();
+            let provider = Arc::new(PhasedProvider::new(1));
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig {
+                    system_prompt: Some("base-system".to_string()),
+                    ..AgentConfig::default()
+                },
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            agent_session.extensions = Some(ExtensionRegion::new(manager));
+            let active = Arc::clone(&agent_session.extensions_turn_active);
+            let streaming = Arc::clone(&agent_session.extensions_is_streaming);
+            let previous_source = agent_session.input_source;
+            let message = Message::Custom(CustomMessage {
+                content: "extension work".to_string(),
+                custom_type: "note".to_string(),
+                display: true,
+                details: None,
+                timestamp: 0,
+            });
+            agent_session
+                .extensions_pending_idle_actions
+                .lock()
+                .unwrap()
+                .push_back(PendingIdleAction::CustomMessage(message));
+            let mut turn = Box::pin(
+                agent_session.run_pending_idle_actions_with_abort(None, Arc::new(|_| {})),
+            );
+            let reached_provider = futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                if provider.calls.load(Ordering::SeqCst) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                reached_provider,
+            )
+            .await
+            .expect("custom turn must reach its pending provider");
+            assert!(active.load(Ordering::SeqCst));
+            assert!(streaming.load(Ordering::SeqCst));
+            drop(turn);
+            assert!(!active.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            assert_eq!(agent_session.agent.system_prompt(), Some("base-system"));
+            assert_eq!(agent_session.input_source.as_str(), previous_source.as_str());
+
+            agent_session.extensions = None;
+            let result = agent_session
+                .run_text("next input".to_string(), |_| {})
+                .await
+                .unwrap();
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(
+                *provider.system_prompts.lock().unwrap(),
+                vec![
+                    Some("custom-hook-system".to_string()),
+                    Some("base-system".to_string()),
+                ],
+            );
+        }));
     }
 
     #[test]
@@ -15651,9 +15838,24 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        let mut turn_system_prompt = None;
+        self.run_text_with_abort_capturing_prompt(input, abort, &mut turn_system_prompt, on_event)
+            .await
+    }
+
+    /// Capture the hook-selected base for the SDK's logical recovery turn.
+    /// Semantic context and keyword directives are applied later by the agent
+    /// and must not become part of the base reapplied on every attempt.
+    pub(crate) async fn run_text_with_abort_capturing_prompt(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
+        let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
+        async {
             // Consume the one-shot provenance before extension dispatch so a
             // blocked/failed input cannot leak it into the next user turn.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
@@ -15677,26 +15879,23 @@ impl AgentSession {
                     base_system_prompt.as_deref().unwrap_or(""),
                 )
                 .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-            self.agent.magic_keyword_scan_override = keyword_scan_override;
+            *turn_system_prompt = system_prompt.or(base_system_prompt);
+            let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
+            prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let result = if images.is_empty() {
-                self.run_agent_with_text(text, abort, on_event, custom_messages)
+                prompt_scope
+                    .session
+                    .run_agent_with_text(text, abort, on_event, custom_messages)
                     .await
             } else {
                 let content = Self::build_content_blocks_for_input(&text, &images);
-                self.run_agent_with_content(content, abort, on_event, custom_messages)
+                prompt_scope
+                    .session
+                    .run_agent_with_content(content, abort, on_event, custom_messages)
                     .await
             };
-            // `run_loop_inner` normally consumes this. Clear it here as the
-            // fail-closed fallback when setup/synchronization returns early.
-            let _ = self.agent.magic_keyword_scan_override.take();
-
-            self.agent.set_system_prompt(base_system_prompt);
+            drop(prompt_scope);
             match result {
                 Ok(message) => {
                     if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -15707,9 +15906,7 @@ impl AgentSession {
                 Err(err) => Err(err),
             }
         }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
+        .await
     }
 
     pub async fn run_with_content(
@@ -15727,9 +15924,26 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        let mut turn_system_prompt = None;
+        self.run_with_content_with_abort_capturing_prompt(
+            content,
+            abort,
+            &mut turn_system_prompt,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_with_content_with_abort_capturing_prompt(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
+        let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
+        async {
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
@@ -15754,20 +15968,16 @@ impl AgentSession {
                     base_system_prompt.as_deref().unwrap_or(""),
                 )
                 .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-            self.agent.magic_keyword_scan_override = keyword_scan_override;
+            *turn_system_prompt = system_prompt.or(base_system_prompt);
+            let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
+            prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
-            let result = self
+            let result = prompt_scope
+                .session
                 .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
                 .await;
-            let _ = self.agent.magic_keyword_scan_override.take();
-
-            self.agent.set_system_prompt(base_system_prompt);
+            drop(prompt_scope);
             match result {
                 Ok(message) => {
                     if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -15778,9 +15988,7 @@ impl AgentSession {
                 Err(err) => Err(err),
             }
         }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
+        .await
     }
 
     pub async fn revert_last_user_message(&mut self) -> Result<bool> {
@@ -16056,6 +16264,44 @@ impl AgentSession {
         }
     }
 
+    /// Re-project the last matching provenance record for the active provider.
+    /// A model swap can change both its budget and whether the bundle belongs
+    /// in a custom message or the system prompt. Replacing a history entry
+    /// keeps the durable provenance and message count stable across retries.
+    fn prepare_semantic_context_continuation(
+        &self,
+        history: &mut Vec<Message>,
+    ) -> Option<PreparedSemanticContextPrompt> {
+        let prepared = self.prepare_semantic_context_prompt()?;
+        let existing = history.iter().rposition(|message| {
+            matches!(message, Message::Custom(custom)
+                if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
+                    && custom.details.as_ref().is_some_and(|details| {
+                        details.get("schema").and_then(Value::as_str)
+                            == Some(SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1)
+                            && details.get("bundleRevision").and_then(Value::as_str)
+                                == Some(prepared.revision.as_str())
+                    }))
+        });
+        let timestamp = existing
+            .and_then(|index| match &history[index] {
+                Message::Custom(custom) => Some(custom.timestamp),
+                _ => None,
+            })
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let projected = Self::semantic_context_prompt_messages(&prepared, timestamp)
+            .into_iter()
+            .next()?;
+        if let Some(index) = existing {
+            history[index] = projected;
+        } else {
+            // An explicit continuation can start without an earlier bundle
+            // record. Persist its first representation with the new artifacts.
+            history.push(projected);
+        }
+        Some(prepared)
+    }
+
     fn semantic_context_system_prompt_for_turn(
         base_system_prompt: Option<String>,
         prepared: Option<&PreparedSemanticContextPrompt>,
@@ -16124,37 +16370,37 @@ impl AgentSession {
             return Ok(());
         }
 
-        let previous_source = self.input_source;
-        self.input_source = InputSource::Extension;
-        let result = async {
-            for action in actions {
-                match action {
-                    PendingIdleAction::CustomMessage(message) => {
-                        let handler = Arc::clone(&on_event);
-                        self.run_custom_message_with_abort(message, abort.clone(), move |event| {
+        let source_scope = SessionInputSourceGuard::new(self, InputSource::Extension);
+        for action in actions {
+            match action {
+                PendingIdleAction::CustomMessage(message) => {
+                    let handler = Arc::clone(&on_event);
+                    source_scope
+                        .session
+                        .run_custom_message_with_abort(message, abort.clone(), move |event| {
                             handler(event);
                         })
                         .await?;
-                    }
-                    PendingIdleAction::UserText(text) => {
-                        let handler = Arc::clone(&on_event);
-                        // Extension-authored user-shaped text is generated
-                        // input. An explicit empty override suppresses the
-                        // normal fallback scan of its provider-visible text.
-                        self.agent
-                            .set_magic_keyword_scan_override(Some(String::new()));
-                        self.run_text_with_abort(text, abort.clone(), move |event| {
+                }
+                PendingIdleAction::UserText(text) => {
+                    let handler = Arc::clone(&on_event);
+                    // Extension-authored user-shaped text is generated
+                    // input. An explicit empty override suppresses the
+                    // normal fallback scan of its provider-visible text.
+                    source_scope
+                        .session
+                        .agent
+                        .set_magic_keyword_scan_override(Some(String::new()));
+                    source_scope
+                        .session
+                        .run_text_with_abort(text, abort.clone(), move |event| {
                             handler(event);
                         })
                         .await?;
-                    }
                 }
             }
-            Ok(())
         }
-        .await;
-        self.input_source = previous_source;
-        result
+        Ok(())
     }
 
     async fn run_custom_message_with_abort(
@@ -16164,31 +16410,20 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
-            let base_system_prompt = self.agent.system_prompt().map(str::to_string);
-            let BeforeAgentStartOutcome {
-                messages: custom_messages,
-                system_prompt,
-            } = self
-                .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
-                .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-
-            let result = self
-                .run_agent_with_prompt_message(message, abort, on_event, custom_messages)
-                .await;
-
-            self.agent.set_system_prompt(base_system_prompt);
-            result
-        }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
+        let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
+        let base_system_prompt = self.agent.system_prompt().map(str::to_string);
+        let BeforeAgentStartOutcome {
+            messages: custom_messages,
+            system_prompt,
+        } = self
+            .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
+            .await;
+        let prompt_scope =
+            SessionTurnPromptGuard::new(self, system_prompt.or(base_system_prompt));
+        prompt_scope
+            .session
+            .run_agent_with_prompt_message(message, abort, on_event, custom_messages)
+            .await
     }
 
     async fn run_agent_with_prompt_message(
@@ -16470,6 +16705,22 @@ impl AgentSession {
             .await
     }
 
+    /// Reuse the first attempt's extension prompt without replaying its hooks.
+    /// The SDK owns this snapshot only for the duration of one logical turn.
+    pub(crate) async fn run_continue_with_abort_and_system_prompt(
+        &mut self,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let prompt_scope =
+            SessionTurnPromptGuard::new(self, turn_system_prompt.map(str::to_string));
+        prompt_scope
+            .session
+            .run_continue_with_abort(abort, on_event)
+            .await
+    }
+
     /// Resume from persisted history and optionally drain the registered
     /// follow-up fetchers before issuing the first provider request.
     pub(crate) async fn run_continue_with_follow_up_with_abort(
@@ -16485,7 +16736,7 @@ impl AgentSession {
 
         // Rehydrate the agent transcript from the (already reverted) session
         // path so the resume streams from the last completed state.
-        let history = {
+        let mut history = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
                 .session
@@ -16494,26 +16745,38 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.to_messages_for_current_path()
         };
+        let start_len = history.len();
+        let semantic_context = self.prepare_semantic_context_continuation(&mut history);
         self.agent.replace_messages(history);
-        let start_len = self.agent.messages().len();
+        let system_prompt = Self::semantic_context_system_prompt_for_turn(
+            self.agent.system_prompt().map(str::to_string),
+            semantic_context.as_ref(),
+        );
+        let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt);
 
-        let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
+        let streaming_guard =
+            AtomicBoolGuard::activate(&prompt_scope.session.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);
         let result = if follow_up_first {
-            self.agent
+            prompt_scope
+                .session
+                .agent
                 .run_continue_with_follow_up_on_ready_with_abort(abort, on_ready, move |event| {
                     on_event_for_run(event);
                 })
                 .await
         } else {
             on_ready();
-            self.agent
+            prompt_scope
+                .session
+                .agent
                 .run_continue_with_abort(abort, move |event| {
                     on_event_for_run(event);
                 })
                 .await
         };
         drop(streaming_guard);
+        drop(prompt_scope);
 
         // Persist any NEW messages generated by the resume, even on error.
         // No user message was added, so nothing to skip: persist from start_len.
@@ -19316,6 +19579,102 @@ mod tests {
             );
             assert_eq!(agent_session.agent.system_prompt(), Some("base prompt"));
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn semantic_context_continuation_preserves_bundle_across_provider_shapes_without_duplicate_entries() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            for initial_api in ["gitlab-chat", "test-api"] {
+                let bundle = sample_semantic_context_bundle();
+                let agent = Agent::new(
+                    Arc::new(CapturingProvider::new(initial_api)),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig {
+                        system_prompt: Some("base prompt".to_string()),
+                        ..AgentConfig::default()
+                    },
+                );
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                agent_session.set_semantic_context_bundle(Some(
+                    SemanticContextBundleInjection::enabled(bundle).with_prompt_budget(4, 2048),
+                ));
+                agent_session.run_text("first turn".to_string(), |_| {}).await.unwrap();
+
+                let semantic_entries = |stored: &Session| {
+                    stored
+                        .to_messages_for_current_path()
+                        .into_iter()
+                        .filter(|message| matches!(
+                            message,
+                            Message::Custom(custom)
+                                if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
+                        ))
+                        .map(|message| serde_json::to_value(message).unwrap())
+                        .collect::<Vec<_>>()
+                };
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let original = {
+                    let stored = session.lock(cx.cx()).await.unwrap();
+                    semantic_entries(&stored)
+                };
+                assert_eq!(original.len(), 1);
+
+                for target_api in ["bedrock-converse-stream", "test-api", "gitlab-chat"] {
+                    let provider = CapturingProvider::new(target_api);
+                    let calls = provider.calls();
+                    agent_session.agent.set_provider(Arc::new(provider));
+                    agent_session
+                        .run_continue_with_abort_and_system_prompt(
+                            None,
+                            Some("hook-system"),
+                            |_| {},
+                        )
+                        .await
+                        .unwrap();
+                    {
+                        let calls = calls.lock().unwrap();
+                        assert_eq!(calls.len(), 1);
+                        let request = &calls[0];
+                        let system = request.system_prompt.as_deref().unwrap();
+                        assert!(system.starts_with("hook-system"));
+                        let semantic_messages = request
+                            .messages
+                            .iter()
+                            .filter_map(|message| match message {
+                                Message::Custom(custom)
+                                    if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE =>
+                                {
+                                    Some(custom)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if target_api == "test-api" {
+                            assert_eq!(system, "hook-system");
+                            assert_eq!(semantic_messages.len(), 1);
+                            assert!(semantic_messages[0].content.contains("src/agent.rs"));
+                        } else {
+                            assert!(semantic_messages.is_empty());
+                            assert_eq!(system.matches("# Semantic Context Bundle").count(), 1);
+                            assert!(system.contains("src/agent.rs"));
+                        }
+                    }
+                    assert_eq!(agent_session.agent.system_prompt(), Some("base prompt"));
+                    let stored = session.lock(cx.cx()).await.unwrap();
+                    assert_eq!(semantic_entries(&stored), original);
+                }
+            }
+        }));
     }
 
     #[test]

@@ -430,35 +430,51 @@ impl AgentSessionHandle {
         let turn = LogicalTurn::new(shared);
         let shared = turn.callback();
         let forwarded = Arc::clone(&shared);
+        // Hooks run only for the first prompt. Keep their effective base in
+        // this logical turn so retries and provider swaps reuse it after the
+        // individual attempt has restored the session's ordinary prompt.
+        let mut turn_system_prompt = self.session.agent.system_prompt().map(str::to_string);
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
-                    .run_text_with_abort(input, Some(abort_signal.clone()), move |event| {
-                        forwarded(event);
-                    })
+                    .run_text_with_abort_capturing_prompt(
+                        input,
+                        Some(abort_signal.clone()),
+                        &mut turn_system_prompt,
+                        move |event| forwarded(event),
+                    )
                     .await
             }
             Some(UserContent::Blocks(content)) => {
                 self.session
-                    .run_with_content_with_abort(
+                    .run_with_content_with_abort_capturing_prompt(
                         content,
                         Some(abort_signal.clone()),
+                        &mut turn_system_prompt,
                         move |event| forwarded(event),
                     )
                     .await
             }
             None => {
                 self.session
-                    .run_continue_with_abort(Some(abort_signal.clone()), move |event| {
-                        forwarded(event);
-                    })
+                    .run_continue_with_abort_and_system_prompt(
+                        Some(abort_signal.clone()),
+                        turn_system_prompt.as_deref(),
+                        move |event| forwarded(event),
+                    )
                     .await
             }
         };
         let admission = self.session.provider_admission_gate();
         let first = fence_session_persistence(&admission, first);
         let result = self
-            .apply_retry_policy(first, &abort_signal, &shared, &turn)
+            .apply_retry_policy(
+                first,
+                &abort_signal,
+                turn_system_prompt.as_deref(),
+                &shared,
+                &turn,
+            )
             .await;
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
@@ -756,13 +772,18 @@ impl AgentSessionHandle {
     async fn resume_recovery_attempt(
         &mut self,
         abort_signal: &AbortSignal,
+        turn_system_prompt: Option<&str>,
         shared: &EventCallback,
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(abort_signal)?;
         let forwarded = Arc::clone(shared);
         let result = self
             .session
-            .run_continue_with_abort(Some(abort_signal.clone()), move |event| forwarded(event))
+            .run_continue_with_abort_and_system_prompt(
+                Some(abort_signal.clone()),
+                turn_system_prompt,
+                move |event| forwarded(event),
+            )
             .await;
         // A continuation can finish its provider work but fail its own save.
         // Fence before retry/failover terminal callbacks are dispatched, not
@@ -775,6 +796,7 @@ impl AgentSessionHandle {
         &mut self,
         first: Result<AssistantMessage>,
         abort_signal: &AbortSignal,
+        turn_system_prompt: Option<&str>,
         shared: &EventCallback,
         turn: &LogicalTurn,
     ) -> Result<AssistantMessage> {
@@ -827,7 +849,9 @@ impl AgentSessionHandle {
                         failed_over = true;
                         progress.failovers_this_turn += 1;
                         progress.retry_count = 0;
-                        current = self.resume_recovery_attempt(abort_signal, shared).await;
+                        current = self
+                            .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                            .await;
                         continue;
                     }
                     Ok(false) => {}
@@ -859,7 +883,9 @@ impl AgentSessionHandle {
                 return Err(error);
             }
             progress.retry_count = attempt;
-            current = self.resume_recovery_attempt(abort_signal, shared).await;
+            current = self
+                .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                .await;
         }
     }
 
