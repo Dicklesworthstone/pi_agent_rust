@@ -175,7 +175,7 @@ fn terminal_only_text_preserves_finish_reason_usage_and_signature() {
 }
 
 #[test]
-fn tool_execution_requires_explicit_consistent_tool_use_completion() {
+fn tool_execution_requires_a_valid_successful_terminal() {
     let mut stream_decoder = decoder();
     let terminal = stream_decoder
         .push(done(tool_message(StopReason::ToolUse), StopReason::ToolUse))
@@ -185,7 +185,6 @@ fn tool_execution_requires_explicit_consistent_tool_use_completion() {
         if matches!(&message.content[0], ContentBlock::ToolCall(call) if call.arguments["content"] == "complete"))
     );
     for reason in [
-        StopReason::Stop,
         StopReason::Length,
         StopReason::Refusal,
         StopReason::Error,
@@ -206,6 +205,56 @@ fn tool_execution_requires_explicit_consistent_tool_use_completion() {
 }
 
 #[test]
+fn successful_stop_with_complete_tool_calls_normalizes_both_terminal_reasons() {
+    for preview_first in [false, true] {
+        let mut message = (*tool_message(StopReason::Stop)).clone();
+        message.usage.output = 17;
+        if let ContentBlock::ToolCall(call) = &mut message.content[0] {
+            call.thought_signature = Some("tool-signature".into());
+        }
+        message
+            .content
+            .insert(0, ContentBlock::Text(TextContent::new("Writing the output")));
+        message.content.push(ContentBlock::ToolCall(ToolCall {
+            id: "call-2".into(),
+            name: "read".into(),
+            arguments: json!({"path": "input.txt"}),
+            thought_signature: None,
+        }));
+        let mut expected = message.clone();
+        expected.stop_reason = StopReason::ToolUse;
+        let message = Arc::new(message);
+        let mut decoder = decoder();
+        if preview_first {
+            let ContentBlock::ToolCall(call) = &message.content[1] else {
+                unreachable!()
+            };
+            decoder
+                .push(wire(AssistantMessageEvent::ToolCallEnd {
+                    content_index: 1,
+                    tool_call: call.clone(),
+                    partial: Arc::clone(&message),
+                }))
+                .unwrap();
+            assert!(!decoder.finished());
+        }
+        let terminal = decoder.push(done(message, StopReason::Stop)).unwrap();
+        let [StreamEvent::Done { reason, message }] = terminal.as_slice() else {
+            panic!("expected exactly one terminal event")
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(decoder.finished());
+        assert!(decoder.finish().unwrap().is_empty());
+        assert!(decoder.push(json!("late")).is_err());
+    }
+}
+
+#[test]
 fn paused_server_tool_payload_is_preserved_for_replay_not_local_dispatch() {
     let message = tool_message(StopReason::PauseTurn);
     let before = serde_json::to_value(&message).unwrap();
@@ -221,26 +270,27 @@ fn paused_server_tool_payload_is_preserved_for_replay_not_local_dispatch() {
 
 #[test]
 fn ambiguous_terminal_tool_arguments_and_duplicate_ids_are_rejected() {
-    for problem in 0..5 {
-        let mut message = (*tool_message(StopReason::ToolUse)).clone();
-        if problem == 4 {
-            message.content.push(message.content[0].clone());
-        } else {
-            let ContentBlock::ToolCall(call) = &mut message.content[0] else {
-                unreachable!()
-            };
-            match problem {
-                0 => call.id.clear(),
-                1 => call.name = "  ".into(),
-                2 => call.arguments = json!("not object arguments"),
-                _ => call.arguments = Value::Null,
+    for reason in [StopReason::Stop, StopReason::ToolUse] {
+        for problem in 0..5 {
+            let mut message = (*tool_message(reason)).clone();
+            if problem == 4 {
+                message.content.push(message.content[0].clone());
+            } else {
+                let ContentBlock::ToolCall(call) = &mut message.content[0] else {
+                    unreachable!()
+                };
+                match problem {
+                    0 => call.id.clear(),
+                    1 => call.name = "  ".into(),
+                    2 => call.arguments = json!("not object arguments"),
+                    _ => call.arguments = Value::Null,
+                }
             }
+            let mut decoder = decoder();
+            assert!(decoder.push(done(Arc::new(message), reason)).is_err());
+            assert!(decoder.finished());
+            assert!(decoder.finish().unwrap().is_empty());
         }
-        assert!(
-            decoder()
-                .push(done(Arc::new(message), StopReason::ToolUse))
-                .is_err()
-        );
     }
 }
 
@@ -258,6 +308,20 @@ fn failed_and_mismatched_done_payloads_never_become_success() {
             .push(done(text_message("text"), StopReason::Length))
             .is_err()
     );
+    for message_reason in [StopReason::ToolUse, StopReason::Error, StopReason::Aborted] {
+        assert!(
+            decoder()
+                .push(done(tool_message(message_reason), StopReason::Stop))
+                .is_err()
+        );
+    }
+    let mut failed_tool = (*tool_message(StopReason::Stop)).clone();
+    failed_tool.error_message = Some("PRIVATE-CANARY".into());
+    let error = decoder()
+        .push(done(Arc::new(failed_tool), StopReason::Stop))
+        .unwrap_err();
+    assert!(error.to_string().contains("PROTOCOL"));
+    assert!(!error.to_string().contains("PRIVATE-CANARY"));
 }
 
 #[test]

@@ -199,7 +199,20 @@ impl Decoder {
             event,
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
         );
-        let output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        let mut output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        // Some OpenAI-compatible backends finish complete tool calls with
+        // `stop`. Only normalize after validating the terminal message, so a
+        // failed, inconsistent or malformed call cannot become executable.
+        if let StreamEvent::Done { reason, message } = &mut output
+            && *reason == StopReason::Stop
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            *reason = StopReason::ToolUse;
+            message.stop_reason = StopReason::ToolUse;
+        }
         if terminal {
             self.mode = Mode::Finished;
         }
@@ -296,9 +309,12 @@ fn validate_event(event: &AssistantMessageEvent) -> Result<()> {
                 if let ContentBlock::ToolCall(call) = block {
                     // PauseTurn is a server-tool continuation, not local tool
                     // authorization. Preserve its payload for verbatim replay.
-                    if !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn) {
+                    if !matches!(
+                        reason,
+                        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn
+                    ) {
                         return Err(protocol(
-                            "tool calls require an explicit tool-use or paused-turn terminal reason",
+                            "tool calls require a successful stop, tool-use or paused-turn terminal reason",
                         ));
                     }
                     if call.id.trim().is_empty()
