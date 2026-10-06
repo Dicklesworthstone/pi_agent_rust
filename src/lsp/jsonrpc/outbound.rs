@@ -191,6 +191,166 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    #[test]
+    fn reader_retires_all_pending_work_when_a_server_reply_cannot_be_admitted() {
+        for byte_exhaustion in [false, true] {
+            let alive = Arc::new(AtomicBool::new(true));
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+            let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
+            lock(&pending).insert(1, first_tx);
+            lock(&pending).insert(2, second_tx);
+            let limit = if byte_exhaustion { 1 } else { 4096 };
+            let (mut queued, _outbound_rx) = QueuedWriter::channel(Arc::clone(&alive), 1, limit);
+            if !byte_exhaustion {
+                queued
+                    .write_all(&super::super::encode_frame(&serde_json::json!({
+                        "jsonrpc":"2.0", "method":"initialized"
+                    })))
+                    .expect("fill frame queue");
+            }
+            let writer = Arc::new(Mutex::new(queued));
+            let (reader, mut server_stdout) = std::io::pipe().expect("server stdout pipe");
+            let (notifications, _notification_rx) = std::sync::mpsc::sync_channel(1);
+            let handled = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&handled);
+            let handler: super::super::ServerRequestHandler = Arc::new(move |_, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Some(serde_json::json!({"applied":true}))
+            });
+            let reader_thread = std::thread::spawn(super::super::reader_loop(
+                reader,
+                Arc::clone(&pending),
+                Arc::clone(&alive),
+                Arc::clone(&writer),
+                Arc::new(Mutex::new(super::super::TailBuffer::default())),
+                notifications,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(Mutex::new(Some(handler))),
+            ));
+            server_stdout
+                .write_all(&super::super::encode_frame(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":"server/edit", "method":"workspace/applyEdit", "params":{}
+                })))
+                .expect("server request");
+            // Keep server stdout open. A failed reply must retire the reader
+            // now, not wait for a peer that is itself waiting for this reply.
+            for receiver in [first_rx, second_rx] {
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("retired promptly");
+                assert!(matches!(
+                    result, Err(TransportError::Closed(reason))
+                        if reason.contains("server reply queue failed")
+                ));
+            }
+            reader_thread.join().expect("reader stopped");
+            assert_eq!(
+                handled.load(Ordering::SeqCst),
+                1,
+                "never replay host effects"
+            );
+            assert!(!alive.load(Ordering::Acquire));
+            assert!(lock(&pending).is_empty());
+            assert_eq!(
+                lock(&writer).write(b"later").unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_queue_refuses_only_the_unposted_request_and_capacity_can_be_reused() {
+        for byte_exhaustion in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let client = super::super::JsonRpcClient::spawn("cat", &[], &[], root.path())
+                .expect("transport");
+            let first_frame = super::super::encode_frame(&serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "method":"test/first", "params":null
+            }));
+            let byte_limit = if byte_exhaustion {
+                first_frame.len()
+            } else {
+                4096
+            };
+            let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, byte_limit);
+            // Hold the real pump's sender so replacing admission for this
+            // deterministic stall does not close the original transport.
+            let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+            let (first_id, first_rx) = client.request("test/first", Value::Null).expect("first");
+            assert!(matches!(
+                client.request("test/rejected", Value::Null),
+                Err(TransportError::Io(_))
+            ));
+            assert!(
+                client.is_alive(),
+                "an unposted request cannot corrupt earlier traffic"
+            );
+            assert_eq!(lock(&client.pending).len(), 1);
+            assert!(lock(&client.pending).contains_key(&first_id));
+            assert!(matches!(
+                first_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let accepted = receiver.try_recv().expect("original request retained");
+            assert_eq!(accepted.bytes, first_frame);
+            drop(accepted);
+            assert!(
+                receiver.try_recv().is_err(),
+                "rejected request must not be queued"
+            );
+            let (next_id, next_rx) = client
+                .request("test/third", Value::Null)
+                .expect("capacity reusable");
+            assert_eq!(next_id, 3, "request identities are never reused");
+            let (notification_tx, _notification_rx) = std::sync::mpsc::sync_channel(1);
+            super::super::handle_message(
+                &serde_json::json!({"jsonrpc":"2.0", "id":first_id, "result":"completed"}),
+                &client.pending,
+                &client.writer,
+                &notification_tx,
+                &client.dropped_notifications,
+                &client.stderr_tail,
+                &client.server_request_handler,
+            )
+            .expect("earlier response still routable");
+            assert_eq!(
+                first_rx.try_recv().expect("response").expect("success"),
+                "completed"
+            );
+            client.kill();
+            assert!(matches!(
+                next_rx.try_recv(),
+                Ok(Err(TransportError::Closed(_)))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_document_notification_still_retires_the_transport() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let client =
+            super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).expect("transport");
+        let (queued, _receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, 4096);
+        let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+        let (_, response) = client
+            .request("test/pending", Value::Null)
+            .expect("request");
+        assert!(
+            client
+                .notify("textDocument/didChange", serde_json::json!({}))
+                .is_err()
+        );
+        assert!(!client.is_alive());
+        assert!(matches!(
+            response.try_recv(),
+            Ok(Err(TransportError::Closed(_)))
+        ));
+        assert!(lock(&client.pending).is_empty());
+    }
+
     fn lifecycle_burst() -> Vec<(Value, Option<u64>)> {
         let mut frames = Vec::new();
         for id in 1..=super::super::MAX_PENDING_REQUESTS {
