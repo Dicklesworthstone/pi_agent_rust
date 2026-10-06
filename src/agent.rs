@@ -12627,7 +12627,14 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 }
 
-fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> Result<T> {
+/// A failed turn save leaves durability uncertain for every caller, including
+/// surfaces that use [`AgentSession`] without the SDK recovery driver. Fence the
+/// shared admission gate before returning the typed persistence error.
+fn finish_turn_persistence<T>(
+    admission: &ProviderAdmissionGate,
+    result: Result<T>,
+    persist_result: Result<()>,
+) -> Result<T> {
     match persist_result {
         Ok(()) => result,
         Err(persist_err) => {
@@ -12637,6 +12644,7 @@ fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> 
                     format!("{persist_err}; primary provider/tool turn also failed: {primary_err}")
                 }
             };
+            admission.block(message.clone());
             Err(Error::session_persistence(message))
         }
     }
@@ -12648,7 +12656,9 @@ mod finish_turn_persistence_tests {
 
     #[test]
     fn persistence_failure_is_terminal_without_hiding_primary_turn_error() {
+        let admission = ProviderAdmissionGate::default();
         let err = finish_turn_persistence::<()>(
+            &admission,
             Err(Error::provider("test", "provider failed")),
             Err(Error::session("disk flush failed")),
         )
@@ -12658,6 +12668,11 @@ mod finish_turn_persistence_tests {
         let message = err.to_string();
         assert!(message.contains("disk flush failed"));
         assert!(message.contains("provider failed"));
+        let blocked = admission
+            .ensure_allowed()
+            .expect_err("every caller must retain the persistence fence");
+        assert!(blocked.is_session_persistence());
+        assert!(blocked.to_string().contains("provider failed"));
     }
 }
 
@@ -15986,7 +16001,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(prompt_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16022,7 +16038,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_text(
@@ -16076,7 +16092,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16106,7 +16123,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_content(
@@ -16160,7 +16177,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16190,7 +16208,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Resume the current turn after a transient failure WITHOUT adding a new
@@ -16267,7 +16285,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Persist the turn transcript and both audit ledgers under one session
