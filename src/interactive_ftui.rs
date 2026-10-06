@@ -1487,6 +1487,9 @@ pub enum UiCommand {
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
     ExtensionCommand { name: String, args: String },
+    /// A registered extension owned this token when it was submitted. If a
+    /// reload removes it, refuse instead of running a same-named template.
+    RegisteredExtensionCommand { name: String, args: String },
     /// Start a fresh session (`/new`): the driver builds a new session from
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
@@ -1832,6 +1835,12 @@ pub struct PiFtuiModel {
     /// state machine and the [`crate::autocomplete`] provider with the
     /// charmed stack, so both surfaces complete from the same command list.
     autocomplete: AutocompleteState,
+    /// Registered commands from the driver's current session. Routing must
+    /// consult this catalog before built-ins, not the filtered popup items.
+    extension_commands: Vec<crate::autocomplete::NamedEntry>,
+    /// Production routing reads the current manager directly; asynchronous
+    /// completion messages may still describe a replaced session.
+    extension_command_registry: Option<ExtensionCommandRegistry>,
     /// Where submitted user input goes. The launch path hands the sending
     /// half of the channel its agent loop consumes; tests read the receiver
     /// directly. `None` falls back to echoing into the transcript only.
@@ -1999,9 +2008,6 @@ async fn reload_driver_resources(
         Ok(loader) => {
             *catalog = AutocompleteCatalog::from_resources(&loader);
             *resources = Some(loader);
-            let mut completion = catalog.clone();
-            completion.extension_commands = extension_commands;
-            let _ = agent_tx.send(PiMsg::AutocompleteCatalog(completion));
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::System(format!(
@@ -2009,6 +2015,46 @@ async fn reload_driver_resources(
             )));
         }
     }
+    // The extension session has already been replaced even if loading a
+    // skill or prompt fails. Never keep its old command registrations.
+    catalog.extension_commands = extension_commands;
+    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
+}
+
+/// Publish registrations from the live session, including an empty set when
+/// extensions were removed. Called at startup and after every driver command:
+/// `/new`, `/resume`, `/fork`, and dynamic registration can change them too.
+fn refresh_extension_commands(
+    handle: &crate::sdk::AgentSessionHandle,
+    catalog: &mut AutocompleteCatalog,
+    agent_tx: &Sender<PiMsg>,
+) {
+    catalog.extension_commands = handle
+        .extension_manager()
+        .map(extension_commands_for_catalog)
+        .unwrap_or_default();
+    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
+}
+
+/// Preserve the runtime's registered spelling while accepting the same
+/// case-insensitive tokens as built-ins. An exact registration wins when
+/// an extension deliberately registers names that differ only in case.
+fn extension_command_name<'a>(
+    commands: &'a [crate::autocomplete::NamedEntry],
+    token: &str,
+) -> Option<&'a str> {
+    let name = token.trim_start_matches('/').trim();
+    if name.is_empty() {
+        return None;
+    }
+    let names = || {
+        commands
+            .iter()
+            .map(|entry| entry.name.trim_start_matches('/').trim())
+    };
+    names()
+        .find(|registered| *registered == name)
+        .or_else(|| names().find(|registered| registered.eq_ignore_ascii_case(name)))
 }
 
 /// Default popup height when settings don't override it (matches the
@@ -2144,6 +2190,8 @@ impl PiFtuiModel {
                 state.max_visible = DEFAULT_COMPLETION_ROWS;
                 state
             },
+            extension_commands: Vec::new(),
+            extension_command_registry: None,
             submit_tx: None,
         }
     }
@@ -2157,6 +2205,7 @@ impl PiFtuiModel {
         self.file_ref_cwd.clone_from(&launch.cwd);
         self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
+        self.extension_commands = launch.catalog.extension_commands.clone();
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
         self.autocomplete.close();
@@ -2169,6 +2218,23 @@ impl PiFtuiModel {
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
         self
+    }
+
+    fn with_extension_command_registry(mut self, registry: ExtensionCommandRegistry) -> Self {
+        self.extension_command_registry = Some(registry);
+        self
+    }
+
+    fn registered_extension_command(&self, token: &str) -> Option<String> {
+        if let Some(registry) = &self.extension_command_registry {
+            let manager = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()?;
+            let commands = extension_commands_for_catalog(&manager);
+            return extension_command_name(&commands, token).map(str::to_string);
+        }
+        extension_command_name(&self.extension_commands, token).map(str::to_string)
     }
 
     /// Whether thinking starts shown in full (`hideThinkingBlock` off) or
@@ -2970,6 +3036,7 @@ impl PiFtuiModel {
                 // list once the driver's session (and its extension
                 // runtime) exists. Any open popup was computed against the
                 // old list; drop it, the next keystroke recomputes.
+                self.extension_commands = catalog.extension_commands.clone();
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
@@ -3131,6 +3198,16 @@ impl PiFtuiModel {
             return;
         }
         let clean = sanitize(trimmed).into_owned();
+        let token = clean.split_whitespace().next().unwrap_or("");
+        if token.starts_with('/') && self.registered_extension_command(token).is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from(
+                    "Extension commands wait until the agent finishes; press Escape to abort it.",
+                ),
+            );
+            return;
+        }
         // /btw is the one command meant for mid-turn use.
         if let Some(question) = strip_command(&clean, "/btw") {
             let question = question.trim().to_string();
@@ -3317,6 +3394,21 @@ impl PiFtuiModel {
         if trimmed.is_empty() {
             return;
         }
+        // Routing and busy admission must inspect the same sanitized token:
+        // pasted terminal controls can otherwise hide a registered command.
+        let clean = sanitize(trimmed).into_owned();
+        if self.busy.is_some()
+            && clean.starts_with('/')
+            && self
+                .registered_extension_command(clean.split_whitespace().next().unwrap_or(""))
+                .is_some()
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Extension commands wait until the current operation finishes."),
+            );
+            return;
+        }
         if self.state == AgentUiState::Working {
             self.submit_mid_turn(false);
             return;
@@ -3324,9 +3416,6 @@ impl PiFtuiModel {
         // Sending anything dismisses the pinned error banner
         // (bd-cv653.9.2 dismiss-on-send semantics).
         self.error_banner = None;
-        // User input is the one text source the user typed themself, but it
-        // still goes through sanitize: paste can smuggle control sequences.
-        let clean = sanitize(trimmed).into_owned();
         self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
@@ -3366,6 +3455,17 @@ impl PiFtuiModel {
         // Token-exact: /model and /m route here; /mode or /modelx fall
         // through to the tail (extension dispatch), matching bubbletea.
         let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        // A registered command owns its token, including tokens that gained
+        // built-in behavior later (/plan, /todos, /status, /branch, ...).
+        // Completion filtering and prompt templates do not confer ownership.
+        if let Some(name) = self.registered_extension_command(token) {
+            self.begin_busy(format!("running /{name} ..."));
+            self.send_command(UiCommand::RegisteredExtensionCommand {
+                name,
+                args: rest.trim().to_string(),
+            });
+            return true;
+        }
         // OMP `/switch` is `/model` with a selector.
         if token.eq_ignore_ascii_case("/model")
             || token.eq_ignore_ascii_case("/m")
@@ -5685,6 +5785,9 @@ const EXT_UI_TIMEOUT_MS: u64 = 300_000;
 /// `AskTool::install_channel_ui`.
 struct FtuiExtensionUiHandler {
     agent_tx: Sender<PiMsg>,
+    // A manager can retain this UI handler through its hostcall bridge. Keep
+    // this reference weak so the routing slot cannot create an owner cycle.
+    command_registry: std::sync::Weak<Mutex<Option<crate::extensions::ExtensionManager>>>,
     reply_channel_open: std::sync::atomic::AtomicBool,
     pending: Mutex<
         std::collections::HashMap<
@@ -5698,8 +5801,18 @@ impl FtuiExtensionUiHandler {
     fn new(agent_tx: Sender<PiMsg>) -> Self {
         Self {
             agent_tx,
+            command_registry: std::sync::Weak::new(),
             reply_channel_open: std::sync::atomic::AtomicBool::new(true),
             pending: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn install_command_registry(&self, handle: &crate::sdk::AgentSessionHandle) {
+        if let Some(registry) = self.command_registry.upgrade() {
+            *registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                handle.extension_manager().cloned();
         }
     }
 
@@ -5888,6 +6001,10 @@ fn install_ask_bridges(
 /// (and with it the ask tool), so the long-lived reply pump resolves against
 /// whatever tool is current when the reply arrives.
 type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
+
+/// The UI and driver share the current session's command authority. Manager
+/// clones observe dynamic registrations; replacement swaps the whole source.
+type ExtensionCommandRegistry = Arc<Mutex<Option<crate::extensions::ExtensionManager>>>;
 
 /// Shared slot holding the abort handle for the driver's in-flight prompt
 /// turn (issue #205): the driver installs a handle per turn, the UI thread
@@ -6428,21 +6545,35 @@ async fn run_extension_command(
     cwd: &std::path::Path,
     name: &str,
     args: &str,
+    expected_registration: bool,
     agent_tx: &Sender<PiMsg>,
 ) {
+    let unavailable = |extensions_enabled| {
+        if expected_registration {
+            format!(
+                "Extension command '/{name}' is no longer registered; submit it again to use the current command."
+            )
+        } else {
+            unrouted_command_message(name, extensions_enabled)
+        }
+    };
     let manager = handle
         .session()
         .extensions
         .as_ref()
         .map(|region| region.manager().clone());
     let Some(manager) = manager else {
-        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, false)));
+        let _ = agent_tx.send(PiMsg::System(unavailable(false)));
         return;
     };
-    if !manager.has_command(name) {
-        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, true)));
+    // Re-resolve against the current runtime: the UI may have queued this
+    // command before a reload replaced or removed its registration. Never
+    // reinterpret that stale command as a built-in with different effects.
+    let commands = extension_commands_for_catalog(&manager);
+    let Some(name) = extension_command_name(&commands, name) else {
+        let _ = agent_tx.send(PiMsg::System(unavailable(true)));
         return;
-    }
+    };
     let Some(runtime) = manager.runtime() else {
         let _ = agent_tx.send(PiMsg::System(format!(
             "Extension command '/{name}' is not available (runtime not enabled)"
@@ -6818,6 +6949,7 @@ async fn new_session_command(
             // any later await can no longer leave a partially decommissioned
             // old handle installed as the current session.
             let old_handle = std::mem::replace(handle, new_handle);
+            ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
                 ask.close_channel_ui();
             }
@@ -8004,6 +8136,7 @@ async fn resume_session_command(
                 }
             };
             let old_handle = std::mem::replace(handle, new_handle);
+            ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
                 ask.close_channel_ui();
             }
@@ -8207,8 +8340,12 @@ async fn create_driver_session(
     agent_tx: &Sender<PiMsg>,
     ext_reply_rx: std::sync::mpsc::Receiver<ExtensionUiResponse>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
+    command_registry: &ExtensionCommandRegistry,
 ) -> Option<(crate::sdk::AgentSessionHandle, Arc<FtuiExtensionUiHandler>)> {
-    let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+    let ext_handler = Arc::new(FtuiExtensionUiHandler {
+        command_registry: Arc::downgrade(command_registry),
+        ..FtuiExtensionUiHandler::new(agent_tx.clone())
+    });
     session_options.extension_ui_handler =
         Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
     // The driver runtime is what extension observation events are dispatched
@@ -8218,7 +8355,10 @@ async fn create_driver_session(
     session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
-        Ok(handle) => Some((handle, ext_handler)),
+        Ok(handle) => {
+            ext_handler.install_command_registry(&handle);
+            Some((handle, ext_handler))
+        }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
             None
@@ -8372,6 +8512,8 @@ pub fn run(
     // follow-ups and aborts through it while the driver awaits the turn.
     let turn_control: TurnControlSlot = Arc::new(Mutex::new(None));
     let driver_turn_control = Arc::clone(&turn_control);
+    let command_registry: ExtensionCommandRegistry = Arc::default();
+    let driver_command_registry = Arc::clone(&command_registry);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -8401,21 +8543,17 @@ pub fn run(
                     &agent_tx,
                     ext_reply_rx,
                     &runtime_handle,
+                    &driver_command_registry,
                 ))
                 .await?;
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
+                // Publish extension ownership before the initial ready/reset
+                // event, so completion and routing use the live session.
+                let mut info_catalog = driver_catalog;
+                refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
                 Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
-                // Issue #208: extension-contributed slash commands become
-                // completable now that the extension runtime is up.
-                // Resource catalog for the info commands (/skills).
-                let mut info_catalog = driver_catalog.clone();
-                if let Some(manager) = handle.extension_manager() {
-                    let mut catalog = driver_catalog;
-                    catalog.extension_commands = extension_commands_for_catalog(manager);
-                    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog));
-                }
                 // Issue #200: a session opened named at launch (--session)
                 // titles the terminal tab after itself immediately.
                 if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await
@@ -8527,9 +8665,15 @@ pub fn run(
                                 )
                                 .await;
                             } else {
-                                run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
-                                    .await;
+                                run_extension_command(
+                                    &handle, &bash_cwd, &name, &args, false, &agent_tx,
+                                )
+                                .await;
                             }
+                        }
+                        Ok(UiCommand::RegisteredExtensionCommand { name, args }) => {
+                            run_extension_command(&handle, &bash_cwd, &name, &args, true, &agent_tx)
+                                .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
                             plans.clear_review();
@@ -8891,6 +9035,10 @@ pub fn run(
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
                     if refresh_status {
+                        // Session replacement does not require a resource
+                        // source. Refresh here as well as after /reload's
+                        // resource read, including new/removed registrations.
+                        refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
                         Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                 }
@@ -8966,6 +9114,7 @@ pub fn run(
     let model = PiFtuiModel::new(agent_rx)
         .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
+        .with_extension_command_registry(command_registry)
         .with_turn_abort(turn_abort)
         .with_turn_control(turn_control)
         .with_btw_client(btw_client)
@@ -11114,6 +11263,151 @@ mod tests {
                 .any(|e| e.role == EntryRole::System && e.text.contains("/model")),
             "help text missing"
         );
+    }
+
+    #[test]
+    fn registered_extension_commands_override_builtins_with_original_arguments() {
+        for name in [
+            "plan", "status", "todos", "branch", "model", "memory", "review", "commit",
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let mut sim =
+                ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AutocompleteCatalog(
+                AutocompleteCatalog {
+                    extension_commands: vec![crate::autocomplete::NamedEntry {
+                        name: name.to_string(),
+                        description: None,
+                    }],
+                    ..AutocompleteCatalog::default()
+                },
+            )));
+            type_str(
+                &mut sim,
+                &format!("/{} Keep  These ARGs", name.to_ascii_uppercase()),
+            );
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("registered command routed"),
+                UiCommand::RegisteredExtensionCommand {
+                    name: name.to_string(),
+                    args: String::from("Keep  These ARGs"),
+                },
+                "/{name} must reach its registered handler"
+            );
+            assert!(sim.model().picker.is_none());
+            assert_eq!(
+                sim.model().busy_label(),
+                Some(format!("running /{name} ...").as_str())
+            );
+            assert!(submit_rx.try_recv().is_err(), "no second built-in dispatch");
+        }
+    }
+
+    #[test]
+    fn live_extension_registration_wins_over_stale_completion_catalogs() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let manager = crate::extensions::ExtensionManager::new();
+        let registry = Arc::new(Mutex::new(Some(manager.clone())));
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(Arc::clone(&registry));
+
+        // Register after the UI is wired, without any completion delivery.
+        manager.register_command("Plan", None);
+        assert!(model.route_slash_command("/PLAN unsupported-by-built-in"));
+        assert_eq!(
+            submit_rx.try_recv().expect("live registration"),
+            UiCommand::RegisteredExtensionCommand {
+                name: String::from("Plan"),
+                args: String::from("unsupported-by-built-in"),
+            }
+        );
+        let _ = model.handle_agent(PiMsg::AutocompleteCatalog(AutocompleteCatalog {
+            extension_commands: vec![crate::autocomplete::NamedEntry {
+                name: String::from("status"),
+                description: None,
+            }],
+            ..AutocompleteCatalog::default()
+        }));
+        assert!(model.route_slash_command("/status"));
+        assert_eq!(
+            submit_rx
+                .try_recv()
+                .expect("stale completion is not authority"),
+            UiCommand::Info(info_commands::InfoCommand::Extensions)
+        );
+
+        // Replacing the manager immediately removes old ownership, even if
+        // an old completion message arrives afterwards.
+        *registry.lock().expect("registry") = None;
+        let _ = model.handle_agent(PiMsg::AutocompleteCatalog(AutocompleteCatalog {
+            extension_commands: vec![crate::autocomplete::NamedEntry {
+                name: String::from("Plan"),
+                description: None,
+            }],
+            ..AutocompleteCatalog::default()
+        }));
+        assert!(model.route_slash_command("/plan status"));
+        assert_eq!(
+            submit_rx.try_recv().expect("built-in restored"),
+            UiCommand::Plan {
+                action: String::from("status")
+            }
+        );
+    }
+
+    #[test]
+    fn busy_extension_commands_keep_the_draft_and_do_not_become_steering() {
+        for name in ["plan", "btw", "queue"] {
+            for modifiers in [Modifiers::empty(), Modifiers::ALT] {
+                let (_agent_tx, rx) = mpsc::channel();
+                let (submit_tx, submit_rx) = mpsc::channel();
+                let manager = crate::extensions::ExtensionManager::new();
+                manager.register_command(name, None);
+                let model = PiFtuiModel::new(rx)
+                    .with_submit_channel(submit_tx)
+                    .with_turn_control(Arc::default())
+                    .with_extension_command_registry(Arc::new(Mutex::new(Some(manager))));
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+                let draft = format!("/{name} Keep this draft");
+                type_str(&mut sim, &draft);
+                sim.inject_event(key(KeyCode::Enter, modifiers));
+                assert!(submit_rx.try_recv().is_err(), "busy /{name} must not dispatch");
+                assert_eq!(sim.model().input.text(), draft);
+                assert!(sim.model().transcript.iter().any(|entry| {
+                    entry.role == EntryRole::Error && entry.text.starts_with("Extension commands wait")
+                }));
+                assert!(sim.model().input_history.is_empty());
+            }
+        }
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let manager = crate::extensions::ExtensionManager::new();
+        manager.register_command("status", None);
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(Arc::new(Mutex::new(Some(manager))));
+        model.begin_busy("reloading resources ...");
+        model.input.set_text("/status Keep this draft");
+        model.submit_input();
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.input.text(), "/status Keep this draft");
+        assert_eq!(model.busy_label(), Some("reloading resources ..."));
+        let pasted = "\x1b[31m/status Keep this draft\x1b[0m";
+        assert!(sanitize(pasted).starts_with("/status"));
+        model.input.set_text(pasted);
+        let draft = model.input.text();
+        model.submit_input();
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.input.text(), draft);
+        assert_eq!(model.busy_label(), Some("reloading resources ..."));
     }
 
     #[test]
@@ -13644,16 +13938,25 @@ mod tests {
                 &extension,
                 format!(
                     "export default function init(pi) {{\n\
-                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async () => {{}} }});\n\
+                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async (args) => ({{command: \"{command}\", args}}) }});\n\
                      }}\n"
                 ),
             )
             .expect("write extension");
         };
-        write_extension("v1-cmd");
+        write_extension("Plan");
 
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
-        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let registry: ExtensionCommandRegistry = Arc::default();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler {
+            command_registry: Arc::downgrade(&registry),
+            ..FtuiExtensionUiHandler::new(agent_tx.clone())
+        });
+        let (_model_tx, model_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(model_rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(registry);
         let template = resume_template_from(&crate::sdk::SessionOptions {
             provider: Some(String::from("openai")),
             model: Some(String::from("gpt-4o")),
@@ -13677,8 +13980,34 @@ mod tests {
             assert!(
                 handle
                     .extension_manager()
-                    .is_some_and(|manager| manager.has_command("v1-cmd"))
+                    .is_some_and(|manager| manager.has_command("Plan"))
             );
+            ext_handler.install_command_registry(&handle);
+            let mut catalog = AutocompleteCatalog::default();
+            refresh_extension_commands(&handle, &mut catalog, &agent_tx);
+            assert!(
+                catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "Plan")
+            );
+            assert!(model.route_slash_command("/PLAN Keep  These ARGs"));
+            let UiCommand::RegisteredExtensionCommand { name, args } =
+                submit_rx.try_recv().expect("extension route")
+            else {
+                panic!("registered /plan must precede the built-in");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            assert!(
+                agent_rx.try_iter().any(|message| {
+                    matches!(message, PiMsg::SystemNote(text)
+                        if text.contains(r#""command":"Plan""#)
+                            && text.contains(r#""args":"Keep  These ARGs""#))
+                }),
+                "the real registered handler must receive its original arguments"
+            );
+            assert!(model.route_slash_command("/plan stale-before-reload"));
+            let stale = submit_rx.try_recv().expect("queued before reload");
 
             // A saved conversation to keep across the reload.
             let session_id = {
@@ -13693,7 +14022,7 @@ mod tests {
                 session.header.id.clone()
             };
 
-            write_extension("v2-cmd");
+            write_extension("status");
             reload_session_command(
                 &template,
                 &mut handle,
@@ -13706,8 +14035,42 @@ mod tests {
             .expect("reload");
 
             let manager = handle.extension_manager().expect("extensions after reload");
-            assert!(manager.has_command("v2-cmd"), "the edited extension must load");
-            assert!(!manager.has_command("v1-cmd"), "the old version must be gone");
+            assert!(
+                manager.has_command("status"),
+                "the edited extension must load"
+            );
+            assert!(!manager.has_command("Plan"), "the old version must be gone");
+            // No resource source and no catalog delivery: committed replacement
+            // alone must update routing, including newly shadowed built-ins.
+            assert!(model.route_slash_command("/status after reload"));
+            let UiCommand::RegisteredExtensionCommand { name, args } =
+                submit_rx.try_recv().expect("new live extension route")
+            else {
+                panic!("reloaded /status must precede the built-in");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            assert!(model.route_slash_command("/plan status"));
+            assert_eq!(
+                submit_rx
+                    .try_recv()
+                    .expect("removed override restores built-in"),
+                UiCommand::Plan {
+                    action: String::from("status")
+                }
+            );
+            refresh_extension_commands(&handle, &mut catalog, &agent_tx);
+            assert!(
+                catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "status")
+            );
+            assert!(
+                !catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "Plan")
+            );
             let (id, kept) = handle
                 .with_session(|session| {
                     let kept = session
@@ -13730,6 +14093,31 @@ mod tests {
                     .iter()
                     .any(|msg| matches!(msg, PiMsg::System(text) if text.starts_with("Reloaded"))),
                 "the user is told the reload happened"
+            );
+            assert!(
+                replies.iter().any(|message| {
+                    matches!(message, PiMsg::SystemNote(text)
+                        if text.contains(r#""command":"status""#)
+                            && text.contains(r#""args":"after reload""#))
+                }),
+                "the replacement runtime executes the newly registered command"
+            );
+            let UiCommand::RegisteredExtensionCommand { name, args } = stale else {
+                panic!("queued registration retains strict dispatch");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            let stale_replies = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                !stale_replies
+                    .iter()
+                    .any(|message| matches!(message, PiMsg::ToolStart { .. }))
+            );
+            assert!(
+                stale_replies.iter().any(|message| {
+                    matches!(message, PiMsg::System(text)
+                        if text.starts_with("Extension command '/Plan' is no longer registered"))
+                }),
+                "an obsolete queued command must be refused, not reinterpreted"
             );
 
             // The planted negative: an unsaved in-memory conversation.
@@ -15669,7 +16057,7 @@ mod tests {
     #[test]
     fn reload_picks_up_a_prompt_template_added_after_launch() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let source = ResourceSource {
+        let mut source = ResourceSource {
             package_manager: crate::package_manager::PackageManager::new(dir.path().to_path_buf()),
             config: crate::config::Config::default(),
             cli: crate::resources::ResourceCliOptions {
@@ -15720,6 +16108,33 @@ mod tests {
         };
         assert!(sent.prompt_templates.iter().any(|t| t.name == "triage"));
         assert!(sent.extension_commands.iter().any(|c| c.name == "ext-cmd"));
+
+        // A resource failure must not resurrect the replaced runtime's old
+        // commands. Retain the last good prompts while publishing removals.
+        source.cli.no_prompt_templates = true;
+        source.cli.prompt_paths = vec![String::new()];
+        runtime.block_on(reload_driver_resources(
+            &source,
+            dir.path(),
+            Vec::new(),
+            &mut resources,
+            &mut catalog,
+            &tx,
+        ));
+        let replies = rx.try_iter().collect::<Vec<_>>();
+        assert!(replies.iter().any(|message| {
+            matches!(message, PiMsg::System(text) if text.contains("were not re-read"))
+        }));
+        assert!(replies.iter().any(|message| {
+            matches!(message, PiMsg::AutocompleteCatalog(updated)
+                if updated.extension_commands.is_empty()
+                    && updated.prompt_templates.iter().any(|entry| entry.name == "triage"))
+        }));
+        assert!(catalog.extension_commands.is_empty());
+        assert_eq!(
+            template_prompt(resources.as_ref(), false, "triage", "#13").as_deref(),
+            Some("Triage issue #13")
+        );
     }
 
     /// ctrl+o expands a long tool result the card keeps and collapses it
