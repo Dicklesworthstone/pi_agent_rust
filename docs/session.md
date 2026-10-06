@@ -87,6 +87,25 @@ removing the primary session file. In-memory messages and RPC completion events
 still contain full payloads; this storage feature does not introduce lazy public
 message types or raise `media.maxBytes`.
 
+Context estimation uses recording duration when supported container metadata is
+available: MP4/MOV/M4A movie headers, WebM duration/timescale, PCM or float WAVE
+sample counts, FLAC STREAMINFO, MP3 Xing/Info frame counts, and Ogg Vorbis/Opus
+granule positions. Ogg inspection handles complete single streams, including
+Opus pre-skip and its fixed 48 kHz granule clock. Inspection reads bounded base64
+header ranges and skips the encoded audio/video bodies, including movie headers
+placed after large payloads. It does not run a decoder or an external program.
+`MediaContent::duration()` exposes the same optional estimate to SDK consumers.
+
+Audio contributes an estimated 32 tokens per second; video uses a conservative
+300 tokens per second, including audio and timestamp overhead. Both retain a
+256-token minimum. Measured provider usage takes precedence. Unsupported or
+malformed duration metadata retains the decoded-byte fallback, as do chained or
+multiplexed Ogg streams, ambiguous initial granule positions, and containers
+whose structure cannot be resolved within the bounded inspection budget. An
+unreadable hint cannot prevent a session from opening. These are context
+estimates rather than billing predictions; actual media resolution and provider
+behavior vary.
+
 ### Tree structure
 
 Pi supports conversation branching. Each entry has an `id` and an optional `parent_id`.

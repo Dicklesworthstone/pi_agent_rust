@@ -33,18 +33,37 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1200;
 /// Character-equivalent estimate for an image (IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE).
 const IMAGE_CHAR_ESTIMATE: usize = IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE;
 
-/// Decoded media bytes per estimated token (gh #212). Gemini bills video at
-/// roughly 260 tokens/s and audio at 32 tokens/s; at typical bitrates
-/// (~1 Mbit/s video, ~128 kbit/s audio) both land near 1 token per 512 bytes,
-/// which is what this divisor encodes. Floored at `MEDIA_TOKEN_ESTIMATE_MIN`.
+/// Fallback for containers without usable duration metadata. A file's encoded
+/// bitrate does not determine its context usage, so prefer duration below.
 const MEDIA_BYTES_PER_TOKEN_ESTIMATE: u64 = 512;
 /// Lower bound on a media block's token estimate.
 const MEDIA_TOKEN_ESTIMATE_MIN: u64 = 256;
+/// Gemini's documented static video estimate, including audio and timestamps.
+/// This conservative rate also covers its lower-resolution video path.
+/// https://ai.google.dev/gemini-api/docs/video-understanding
+const VIDEO_TOKENS_PER_SECOND: u64 = 300;
+/// https://ai.google.dev/gemini-api/docs/tokens
+const AUDIO_TOKENS_PER_SECOND: u64 = 32;
 
-/// Token estimate for an inline video/audio block, derived from its decoded
-/// size (the duration is not known without decoding the container).
+/// Duration, rather than compressed file size, determines normal media context
+/// usage. Container inspection reads bounded metadata without copying payloads.
+/// Actual provider usage still supersedes these estimates upstream.
 fn media_token_estimate(media: &crate::model::MediaContent) -> u64 {
-    (media.decoded_size_bytes() / MEDIA_BYTES_PER_TOKEN_ESTIMATE).max(MEDIA_TOKEN_ESTIMATE_MIN)
+    let rate = match media.input_type() {
+        Some(crate::provider::InputType::Video) => Some(VIDEO_TOKENS_PER_SECOND),
+        Some(crate::provider::InputType::Audio) => Some(AUDIO_TOKENS_PER_SECOND),
+        _ => None,
+    };
+    if let Some((duration, rate)) = media.duration().zip(rate) {
+        let tokens = (duration.as_nanos() * u128::from(rate)).div_ceil(1_000_000_000);
+        return u64::try_from(tokens)
+            .unwrap_or(u64::MAX)
+            .max(MEDIA_TOKEN_ESTIMATE_MIN);
+    }
+    media
+        .decoded_size_bytes()
+        .div_ceil(MEDIA_BYTES_PER_TOKEN_ESTIMATE)
+        .max(MEDIA_TOKEN_ESTIMATE_MIN)
 }
 
 /// Count the serialized JSON byte length of a [`Value`] without allocating a `String`.
@@ -4202,6 +4221,79 @@ mod tests {
         };
         // Image = 3600 chars (IMAGE_CHAR_ESTIMATE) -> ceil(3600/3) = 1200
         assert_eq!(estimate_tokens(&msg), 1200);
+    }
+
+    fn movie_media_fixture(duration_ms: u32, payload_bytes: usize) -> crate::model::MediaContent {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::try_from(payload_bytes + 8).unwrap().to_be_bytes());
+        bytes.extend_from_slice(b"mdat");
+        bytes.resize(payload_bytes + 8, 0);
+        // moov/mvhd with a 1 kHz movie timescale and a known duration.
+        bytes.extend_from_slice(&36_u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&28_u32.to_be_bytes());
+        bytes.extend_from_slice(b"mvhd");
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(&1_000_u32.to_be_bytes());
+        bytes.extend_from_slice(&duration_ms.to_be_bytes());
+        crate::model::MediaContent {
+            data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+            mime_type: "video/mp4".to_string(),
+            name: Some("recording.mp4".to_string()),
+        }
+    }
+
+    #[test]
+    fn media_context_estimate_depends_on_duration_and_not_compressed_payload_size() {
+        for payload_bytes in [8, 1024 * 1024] {
+            let media = movie_media_fixture(30_500, payload_bytes);
+            let user = SessionMessage::User {
+                content: UserContent::Blocks(vec![ContentBlock::Media(media.clone())]),
+                timestamp: None,
+            };
+            assert_eq!(estimate_tokens(&user), 9_150);
+            let mut tool_result = make_tool_result("");
+            let SessionMessage::ToolResult { content, .. } = &mut tool_result else {
+                panic!("tool result fixture");
+            };
+            *content = vec![ContentBlock::Media(media)];
+            assert_eq!(estimate_tokens(&tool_result), 9_150);
+        }
+    }
+
+    #[test]
+    fn media_duration_can_trigger_compaction_for_a_small_long_recording() {
+        let message = SessionMessage::User {
+            content: UserContent::Blocks(vec![ContentBlock::Media(movie_media_fixture(
+                180_000, 8,
+            ))]),
+            timestamp: None,
+        };
+        let usage = estimate_context_tokens(&[message]);
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 4_000,
+            ..Default::default()
+        };
+        assert_eq!(usage.tokens, 54_000);
+        assert!(should_compact(usage.tokens, 50_000, &settings));
+    }
+
+    #[test]
+    fn audio_duration_uses_its_own_rate_with_safe_unknown_metadata_fallback() {
+        let mut media = movie_media_fixture(60_000, 8);
+        media.mime_type = "audio/m4a".to_string();
+        assert_eq!(media_token_estimate(&media), 1_920);
+        media = movie_media_fixture(1, 8);
+        assert_eq!(media_token_estimate(&media), MEDIA_TOKEN_ESTIMATE_MIN);
+        media.data = "not valid media".to_string();
+        assert_eq!(media_token_estimate(&media), MEDIA_TOKEN_ESTIMATE_MIN);
+        media.data = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vec![0; 512 * 1_000],
+        );
+        assert_eq!(media_token_estimate(&media), 1_000);
     }
 
     #[test]
