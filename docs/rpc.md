@@ -46,12 +46,53 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 
 ### Chat
 - **prompt**: Send a user message.
-  - Params: `message` (string), `images` (optional array), `streamingBehavior` ("steer" or "follow-up").
+  - Params: `message` (string), `images` (optional array), `media` (optional array), `streamingBehavior` ("steer" or "follow-up").
 - **steer**: Interrupt current generation and steer.
-  - Params: `message`.
+  - Params: `message`, `images` (optional array), `media` (optional array).
 - **follow_up**: Queue a message to follow current turn.
-  - Params: `message`.
+  - Params: `message`, `images` (optional array), `media` (optional array).
+- **retry**: Rerun the last durable user turn, preserving its text, images, and media.
 - **abort**: Stop generation.
+
+Audio and video attachments use native content blocks in `media`. For example,
+replace the example payload with the standard base64 encoding of your file:
+
+```json
+{
+  "id": "clip-1",
+  "type": "prompt",
+  "message": "Describe this clip",
+  "media": [
+    {"type": "media", "mimeType": "video/mp4", "data": "YQ==", "name": "clip.mp4"}
+  ]
+}
+```
+
+`message` remains required and can be empty for an attachment-only turn. Images
+retain their existing shape:
+`{"type":"image","source":{"type":"base64","mediaType":"image/png","data":"..."}}`.
+The user message contains nonempty text first, then `images` in array order,
+then `media` in array order. Empty attachment arrays behave like text-only input.
+
+Each media item requires `type: "media"`, an `audio/*` or `video/*` `mimeType`,
+and nonempty canonical standard base64 `data`; padding is optional. `name` is
+an optional source label, sanitized and bounded before entering session state.
+URLs, file paths, and session-local blob references are not accepted as payloads.
+Malformed media is rejected before acknowledgment, queue mutation, or session
+recovery. The decoded per-file cap is `media.maxBytes` (5 MiB by default); RPC
+also limits a command to 32 media items and 64 MiB of decoded media in total.
+
+The same attachments work with `steer`, `follow_up`, and a streaming `prompt`
+that specifies `streamingBehavior`. Accepted attachments survive automatic
+retry and terminal queue recovery. Explicit `retry` preserves the original
+structured block order, including attachment-only turns. Large payloads use
+the session's content-addressed sidecar when saved and hydrate on resume.
+Extension commands reject image/media attachments because their command
+handlers have no attachment input path.
+
+Gemini-family providers receive native audio/video input through their media
+transport. Other providers receive the documented `[media omitted: ...]`
+placeholder. Session and RPC message events retain the native content blocks.
 
 ### Session
 - **new_session**: Start fresh.

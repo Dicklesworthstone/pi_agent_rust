@@ -29,7 +29,8 @@ use crate::extensions::{
     ExtensionUiResponse,
 };
 use crate::model::{
-    ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
+    ContentBlock, ImageContent, MediaContent, Message, StopReason, TextContent, UserContent,
+    UserMessage,
 };
 use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::plan::replayed_plan_mode;
@@ -267,8 +268,9 @@ fn command_payload_can_advance_rpc_session(
 ) -> bool {
     match command_type {
         "prompt" => {
+            // The command loop has already validated native attachments before
+            // this recovery preflight. Avoid cloning image payloads again.
             parsed.get("message").and_then(Value::as_str).is_some()
-                && parse_prompt_images(parsed.get("images")).is_ok()
                 && parse_streaming_behavior(streaming_behavior_value(parsed)).is_ok()
         }
         "steer" | "follow_up" => parsed
@@ -300,148 +302,165 @@ fn command_payload_can_advance_rpc_session(
 /// fork.
 type ForkCompletion = Option<(String, Option<String>, String, String)>;
 
-async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result<Option<String>> {
-    // Session is the durable authority. Truncating only Agent history is undone
-    // by `run_agent_with_text`, which rehydrates Agent from this path before it
-    // appends the retried prompt. Read the same retryable turn shape as
-    // checkpoint retry, then move the active leaf behind that user entry while
-    // retaining the original branch in the session tree.
+fn select_rpc_user_turn_for_retry<'a>(
+    session: &'a Session,
+) -> Result<Option<(&'a str, &'a UserContent)>> {
+    // Use the durable projection for both read-only command admission and the
+    // later rewind. Compaction and rewind markers must select the same user
+    // turn at both boundaries, without treating generated summaries as input.
     #[derive(Debug)]
-    enum ProjectedUserTurn {
-        Text { entry_id: String, text: String },
+    enum ProjectedUserTurn<'a> {
+        Input {
+            entry_id: &'a str,
+            content: &'a UserContent,
+        },
         Other,
         NotUser,
     }
 
+    let selected = {
+        let path = session.entries_for_current_path();
+        let last_compaction = path
+            .iter()
+            .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
+        let mut projected = if last_compaction.is_some() {
+            vec![ProjectedUserTurn::Other]
+        } else {
+            Vec::new()
+        };
+        let mut checkpoint_positions = HashMap::<String, usize>::new();
+
+        let mut append_entry = |entry: &'a SessionEntry| match entry {
+            SessionEntry::Message(message_entry) => {
+                let projected_turn = match &message_entry.message {
+                    SessionMessage::User { content, .. } => message_entry
+                        .base
+                        .id
+                        .as_deref()
+                        .map_or(ProjectedUserTurn::NotUser, |entry_id| {
+                            ProjectedUserTurn::Input { entry_id, content }
+                        }),
+                    SessionMessage::BashExecution { extra, .. }
+                        if !extra
+                            .get("excludeFromContext")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false) =>
+                    {
+                        ProjectedUserTurn::Other
+                    }
+                    SessionMessage::BranchSummary { .. }
+                    | SessionMessage::CompactionSummary { .. } => ProjectedUserTurn::Other,
+                    _ => ProjectedUserTurn::NotUser,
+                };
+                projected.push(projected_turn);
+            }
+            SessionEntry::BranchSummary(_) => projected.push(ProjectedUserTurn::Other),
+            SessionEntry::Custom(custom) if custom.custom_type == "checkpoint" => {
+                if let Some(id) = &custom.base.id {
+                    checkpoint_positions.insert(id.clone(), projected.len());
+                }
+            }
+            SessionEntry::Custom(custom) if custom.custom_type == "rewind" => {
+                let checkpoint_entry_id = custom
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("checkpointEntryId"))
+                    .and_then(Value::as_str);
+                let Some(boundary) = checkpoint_entry_id
+                    .and_then(|id| checkpoint_positions.get(id))
+                    .copied()
+                else {
+                    return;
+                };
+                projected.truncate(boundary);
+                checkpoint_positions.retain(|_, position| *position <= boundary);
+                let has_report = custom
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("summary"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| !summary.is_empty());
+                if has_report {
+                    projected.push(ProjectedUserTurn::NotUser);
+                }
+            }
+            _ => {}
+        };
+
+        if let Some(compaction_index) = last_compaction {
+            let SessionEntry::Compaction(compaction) = path[compaction_index] else {
+                return Err(Error::session("RPC retry compaction projection drifted"));
+            };
+            let has_kept_entry = path.iter().any(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|id| id == &compaction.first_kept_entry_id)
+            });
+            let mut keep = false;
+            let mut past_compaction = false;
+            for (index, entry) in path.iter().enumerate() {
+                if index == compaction_index {
+                    past_compaction = true;
+                }
+                if !keep {
+                    if has_kept_entry {
+                        if entry
+                            .base_id()
+                            .is_some_and(|id| id == &compaction.first_kept_entry_id)
+                        {
+                            keep = true;
+                        } else {
+                            continue;
+                        }
+                    } else if past_compaction {
+                        keep = true;
+                    } else {
+                        continue;
+                    }
+                }
+                append_entry(entry);
+            }
+        } else {
+            for entry in path {
+                append_entry(entry);
+            }
+        }
+
+        projected
+            .into_iter()
+            .rev()
+            .find(|turn| !matches!(turn, ProjectedUserTurn::NotUser))
+    };
+
+    let Some(ProjectedUserTurn::Input { entry_id, content }) = selected else {
+        return Ok(None);
+    };
+    if let UserContent::Blocks(blocks) = content {
+        AgentSession::validate_user_content_blocks(blocks)?;
+    }
+    Ok(Some((entry_id, content)))
+}
+
+async fn take_last_rpc_user_turn_for_retry(
+    session: &mut AgentSession,
+) -> Result<Option<UserContent>> {
+    // Rewind only after the command's fallible restoration steps. Re-select
+    // against current durable state, retaining the abandoned original branch.
     let provider_admission = session.provider_admission_gate();
     provider_admission.ensure_allowed()?;
     let save_enabled = session.save_enabled();
-    let (text, messages) = {
+    let (content, messages) = {
         let cx = AgentCx::for_request();
         let session_store = Arc::clone(&session.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         let mut candidate = inner.clone();
-
-        let selected = {
-            let path = candidate.entries_for_current_path();
-            let last_compaction = path
-                .iter()
-                .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
-            let mut projected = if last_compaction.is_some() {
-                // Session projection begins with the compaction summary, which
-                // is a non-text user message and therefore is not retryable.
-                vec![ProjectedUserTurn::Other]
-            } else {
-                Vec::new()
-            };
-            let mut checkpoint_positions = HashMap::<String, usize>::new();
-
-            let mut append_entry = |entry: &SessionEntry| match entry {
-                SessionEntry::Message(message_entry) => {
-                    let Some(message) =
-                        crate::session::session_message_to_model(&message_entry.message)
-                    else {
-                        return;
-                    };
-                    let projected_turn = match message {
-                        Message::User(UserMessage {
-                            content: UserContent::Text(text),
-                            ..
-                        }) => message_entry
-                            .base
-                            .id
-                            .clone()
-                            .map_or(ProjectedUserTurn::NotUser, |entry_id| {
-                                ProjectedUserTurn::Text { entry_id, text }
-                            }),
-                        Message::User(_) => ProjectedUserTurn::Other,
-                        _ => ProjectedUserTurn::NotUser,
-                    };
-                    projected.push(projected_turn);
-                }
-                SessionEntry::BranchSummary(_) => projected.push(ProjectedUserTurn::Other),
-                SessionEntry::Custom(custom) if custom.custom_type == "checkpoint" => {
-                    if let Some(id) = &custom.base.id {
-                        checkpoint_positions.insert(id.clone(), projected.len());
-                    }
-                }
-                SessionEntry::Custom(custom) if custom.custom_type == "rewind" => {
-                    let checkpoint_entry_id = custom
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("checkpointEntryId"))
-                        .and_then(Value::as_str);
-                    let Some(boundary) = checkpoint_entry_id
-                        .and_then(|id| checkpoint_positions.get(id))
-                        .copied()
-                    else {
-                        return;
-                    };
-                    projected.truncate(boundary);
-                    checkpoint_positions.retain(|_, position| *position <= boundary);
-                    let has_report = custom
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("summary"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|summary| !summary.is_empty());
-                    if has_report {
-                        projected.push(ProjectedUserTurn::NotUser);
-                    }
-                }
-                _ => {}
-            };
-
-            if let Some(compaction_index) = last_compaction {
-                let SessionEntry::Compaction(compaction) = path[compaction_index] else {
-                    return Err(Error::session("RPC retry compaction projection drifted"));
-                };
-                let has_kept_entry = path.iter().any(|entry| {
-                    entry
-                        .base_id()
-                        .is_some_and(|id| id == &compaction.first_kept_entry_id)
-                });
-                let mut keep = false;
-                let mut past_compaction = false;
-                for (index, entry) in path.iter().enumerate() {
-                    if index == compaction_index {
-                        past_compaction = true;
-                    }
-                    if !keep {
-                        if has_kept_entry {
-                            if entry
-                                .base_id()
-                                .is_some_and(|id| id == &compaction.first_kept_entry_id)
-                            {
-                                keep = true;
-                            } else {
-                                continue;
-                            }
-                        } else if past_compaction {
-                            keep = true;
-                        } else {
-                            continue;
-                        }
-                    }
-                    append_entry(entry);
-                }
-            } else {
-                for entry in path {
-                    append_entry(entry);
-                }
-            }
-
-            projected
-                .into_iter()
-                .rev()
-                .find(|turn| !matches!(turn, ProjectedUserTurn::NotUser))
-        };
-
-        let Some(ProjectedUserTurn::Text { entry_id, text }) = selected else {
+        let Some((entry_id, content)) = select_rpc_user_turn_for_retry(&candidate)? else {
             return Ok(None);
         };
+        let entry_id = entry_id.to_string();
+        let content = content.clone();
 
         if !candidate.navigate_to(&entry_id) || !candidate.revert_last_user_message() {
             return Err(Error::session(
@@ -469,36 +488,34 @@ async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result
         session.invalidate_background_compaction();
         *inner = candidate;
         provider_admission.clear();
-        (text, messages)
+        (content, messages)
     };
 
     session.agent.replace_messages(messages);
-    Ok(Some(text))
+    Ok(Some(content))
 }
 
-fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
+fn build_user_message(text: &str, attachments: &[ContentBlock]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
-    if images.is_empty() {
+    if attachments.is_empty() {
         return Message::User(UserMessage {
             content: UserContent::Text(text.to_string()),
             timestamp,
         });
     }
-    let blocks = build_prompt_content_blocks(text, images);
+    let blocks = build_prompt_content_blocks(text, attachments);
     Message::User(UserMessage {
         content: UserContent::Blocks(blocks),
         timestamp,
     })
 }
 
-fn build_prompt_content_blocks(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
+fn build_prompt_content_blocks(text: &str, attachments: &[ContentBlock]) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
     if !text.trim().is_empty() {
         blocks.push(ContentBlock::Text(TextContent::new(text.to_string())));
     }
-    for image in images {
-        blocks.push(ContentBlock::Image(image.clone()));
-    }
+    blocks.extend_from_slice(attachments);
     blocks
 }
 
@@ -1893,6 +1910,64 @@ pub async fn run(
 
         let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
 
+        // Validate once before recovery, model restoration, or queue mutation.
+        // A rejected attachment must never advance the durable session, and an
+        // extension command has no native attachment delivery path.
+        let attachments = if matches!(command_type, "prompt" | "steer" | "follow_up") {
+            match parse_prompt_attachments(&parsed, &options.config) {
+                Ok(attachments) => {
+                    if !attachments.is_empty()
+                        && parsed.get("message").and_then(Value::as_str).is_some_and(
+                            |message| {
+                                resolve_extension_command(
+                                    message,
+                                    rpc_extension_manager.as_ref(),
+                                )
+                                .is_some()
+                            },
+                        )
+                    {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            command_type,
+                            "Extension commands do not accept image or media attachments"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    attachments
+                }
+                Err(err) => {
+                    let _ = out_tx.send(response_error_with_hints(id, command_type, &err));
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        if command_type == "retry"
+            && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+        {
+            // Reject invalid persisted input before recovery or a cooldown
+            // restore can mutate session/provider state. The rewind later
+            // repeats this same projection under its mutation authority.
+            let preflight = async {
+                let inner = session_handle
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                select_rpc_user_turn_for_retry(&inner)?
+                    .ok_or_else(|| Error::validation("No user turn to retry"))?;
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(err) = preflight {
+                let _ = out_tx.send(response_error_with_hints(id, "retry", &err));
+                continue;
+            }
+        }
+
         // A cancelled or failed terminal writer can leave acknowledged input
         // authoritative in the shared queues after the turn flags return idle.
         // Recover it before any command can advance the live session or deliver
@@ -2028,15 +2103,6 @@ pub async fn run(
                     continue;
                 };
 
-                let images = match parse_prompt_images(parsed.get("images")) {
-                    Ok(images) => images,
-                    Err(err) => {
-                        let resp = response_error_with_hints(id, "prompt", &err);
-                        let _ = out_tx.send(resp);
-                        continue;
-                    }
-                };
-
                 let streaming_behavior =
                     match parse_streaming_behavior(streaming_behavior_value(&parsed)) {
                         Ok(value) => value,
@@ -2049,6 +2115,17 @@ pub async fn run(
 
                 let extension_command =
                     resolve_extension_command(&message, rpc_extension_manager.as_ref());
+                if extension_command.is_some() && !attachments.is_empty() {
+                    // Command registration can change while terminal recovery
+                    // awaits. Recheck the actual dispatch owner before ACK.
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "prompt",
+                        "Extension commands do not accept image or media attachments"
+                            .to_string(),
+                    ));
+                    continue;
+                }
 
                 match rpc_turn_phase(&is_streaming, &is_compacting) {
                     RpcTurnPhase::Compacting => {
@@ -2097,13 +2174,13 @@ pub async fn run(
                                 RpcTurnPhase::Streaming => match streaming_behavior {
                                     Some(StreamingBehavior::Steer) => {
                                         state.push_steering(QueuedAgentMessage::authored(
-                                            build_user_message(&expanded, &images),
+                                            build_user_message(&expanded, &attachments),
                                             message.clone(),
                                         ))
                                     }
                                     Some(StreamingBehavior::FollowUp) => {
                                         state.push_follow_up(QueuedAgentMessage::authored(
-                                            build_user_message(&expanded, &images),
+                                            build_user_message(&expanded, &attachments),
                                             message.clone(),
                                         ))
                                     }
@@ -2205,7 +2282,7 @@ pub async fn run(
                                 options,
                                 expanded,
                                 Some(message),
-                                images,
+                                attachments,
                                 prompt_cx,
                             )
                             .await;
@@ -2255,7 +2332,7 @@ pub async fn run(
                         let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
                             RpcTurnPhase::Streaming => {
                                 state.push_steering(QueuedAgentMessage::authored(
-                                    build_user_message(&expanded, &[]),
+                                    build_user_message(&expanded, &attachments),
                                     message.clone(),
                                 ))
                             }
@@ -2325,7 +2402,7 @@ pub async fn run(
                         options,
                         expanded,
                         Some(message),
-                        Vec::new(),
+                        attachments,
                         prompt_cx,
                     )
                     .await;
@@ -2374,7 +2451,7 @@ pub async fn run(
                         let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
                             RpcTurnPhase::Streaming => {
                                 state.push_follow_up(QueuedAgentMessage::authored(
-                                    build_user_message(&expanded, &[]),
+                                    build_user_message(&expanded, &attachments),
                                     message.clone(),
                                 ))
                             }
@@ -2445,7 +2522,7 @@ pub async fn run(
                         options,
                         expanded,
                         Some(message),
-                        Vec::new(),
+                        attachments,
                         prompt_cx,
                     )
                     .await;
@@ -3861,8 +3938,8 @@ pub async fn run(
                     };
                     take_last_rpc_user_turn_for_retry(&mut guard).await
                 };
-                let text = match retry_turn {
-                    Ok(Some(text)) => text,
+                let content = match retry_turn {
+                    Ok(Some(content)) => content,
                     Ok(None) => {
                         let _ = out_tx.send(response_error(
                             id,
@@ -3876,13 +3953,20 @@ pub async fn run(
                         continue;
                     }
                 };
+                let characters = extract_user_text(&content).map_or(0, |text| text.len());
+                // Preserve block ordering, including text between attachments.
+                // An empty prefix leaves the original blocks untouched.
+                let (text, attachments) = match content {
+                    UserContent::Text(text) => (text, Vec::new()),
+                    UserContent::Blocks(blocks) => (String::new(), blocks),
+                };
                 let _ = out_tx.send(response_ok(
                     id,
                     "retry",
                     Some(json!({
                         "schema": "pi.retry.v1",
                         "rerunning": true,
-                        "characters": text.len()
+                        "characters": characters
                     })),
                 ));
                 is_streaming.store(true, Ordering::SeqCst);
@@ -3910,8 +3994,12 @@ pub async fn run(
                             retry_abort,
                             options,
                             text,
+                            // Durable content may contain expanded/generated
+                            // text without the original authored provenance.
+                            // Keep it inert for keyword scanning; input hooks
+                            // still receive the SDK's full text projection.
                             Some(String::new()),
-                            Vec::new(),
+                            attachments,
                             prompt_cx,
                         )
                         .await;
@@ -5366,7 +5454,7 @@ async fn run_prompt_with_retry(
     options: RpcOptions,
     message: String,
     keyword_scan_source: Option<String>,
-    images: Vec<ImageContent>,
+    attachments: Vec<ContentBlock>,
     cx: AgentCx,
 ) {
     retry_abort.store(false, Ordering::SeqCst);
@@ -5519,12 +5607,12 @@ async fn run_prompt_with_retry(
                 guard
                     .agent
                     .set_magic_keyword_scan_override(keyword_scan_source.clone());
-                if images.is_empty() {
+                if attachments.is_empty() {
                     guard
                         .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
                         .await
                 } else {
-                    let blocks = build_prompt_content_blocks(&message, &images);
+                    let blocks = build_prompt_content_blocks(&message, &attachments);
                     guard
                         .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                         .await
@@ -7692,12 +7780,14 @@ mod retry_tests {
     #[derive(Debug)]
     struct FlakyProvider {
         calls: AtomicUsize,
+        contexts: std::sync::Mutex<Vec<Vec<Message>>>,
     }
 
     impl FlakyProvider {
         const fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                contexts: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -7748,7 +7838,7 @@ mod retry_tests {
 
         async fn stream(
             &self,
-            _context: &crate::provider::Context<'_>,
+            context: &crate::provider::Context<'_>,
             _options: &crate::provider::StreamOptions,
         ) -> crate::error::Result<
             Pin<
@@ -7758,6 +7848,10 @@ mod retry_tests {
                 >,
             >,
         > {
+            self.contexts
+                .lock()
+                .expect("capture retry context")
+                .push(context.messages.to_vec());
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
 
             let mut partial = AssistantMessage {
@@ -7910,7 +8004,7 @@ mod retry_tests {
     }
 
     #[test]
-    fn rpc_auto_retry_retries_then_succeeds() {
+    fn rpc_auto_retry_retries_then_succeeds_with_native_media() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
             .blocking_threads(1, 8)
             .build()
@@ -7968,6 +8062,18 @@ mod retry_tests {
                 ask_tool: None,
             };
 
+            let attachments = parse_prompt_attachments(
+                &json!({"media": [
+                    {"type": "media", "data": "YQ==", "mimeType": "audio/wav"},
+                    {"type": "media", "data": "Yg", "mimeType": "video/mp4"}
+                ]}),
+                &options.config,
+            )
+            .expect("parse retry attachments");
+            let expected = serde_json::to_value(UserContent::Blocks(
+                build_prompt_content_blocks("hello", &attachments),
+            ))
+            .expect("expected native user content");
             run_prompt_with_retry(
                 Arc::clone(&session),
                 Arc::clone(&shared_state),
@@ -7980,7 +8086,7 @@ mod retry_tests {
                 options,
                 "hello".to_string(),
                 None,
-                Vec::new(),
+                attachments,
                 AgentCx::for_request(),
             )
             .await;
@@ -8025,6 +8131,18 @@ mod retry_tests {
                 2,
                 "the production retry loop must make exactly one resumed provider call"
             );
+            let contexts = provider_probe.contexts.lock().expect("retry contexts");
+            for context in contexts.iter() {
+                let users: Vec<_> = context
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::User(user) => Some(serde_json::to_value(&user.content).unwrap()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(users, vec![expected.clone()]);
+            }
+            drop(contexts);
 
             let verify_cx = AgentCx::for_request();
             let guard = session.lock(&verify_cx).await.expect("agent session lock");
@@ -13263,6 +13381,106 @@ async fn run_bash_rpc(
     })
 }
 
+// Bound one RPC media batch independently of the configurable per-file cap.
+// Legacy images and full session entry size retain their existing validation.
+const MAX_RPC_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RPC_MEDIA_ATTACHMENTS: usize = 32;
+
+fn parse_prompt_attachments(parsed: &Value, config: &Config) -> Result<Vec<ContentBlock>> {
+    // Validate media before cloning legacy image payloads from the same input.
+    let media = parse_prompt_media(parsed.get("media"), config)?;
+    let mut attachments: Vec<_> = parse_prompt_images(parsed.get("images"))?
+        .into_iter()
+        .map(ContentBlock::Image)
+        .collect();
+    attachments.extend(media.into_iter().map(ContentBlock::Media));
+    Ok(attachments)
+}
+
+fn parse_prompt_media(value: Option<&Value>, config: &Config) -> Result<Vec<MediaContent>> {
+    use base64::Engine as _;
+
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::validation("media must be an array"))?;
+    if items.len() > MAX_RPC_MEDIA_ATTACHMENTS {
+        return Err(Error::validation(format!(
+            "media exceeds the {MAX_RPC_MEDIA_ATTACHMENTS} attachments per command limit"
+        )));
+    }
+    let max_bytes = config
+        .media
+        .as_ref()
+        .and_then(|settings| settings.max_bytes)
+        .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES)
+        .min(MAX_RPC_MEDIA_BYTES);
+    let max_encoded_bytes = max_bytes.saturating_add(2) / 3 * 4;
+    let mut total_bytes = 0_u64;
+    let mut media = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let invalid = |reason: &str| Error::validation(format!("media[{index}]: {reason}"));
+        if item.get("type").and_then(Value::as_str) != Some("media") {
+            return Err(invalid("type must be media"));
+        }
+        let data = item
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("data must be a base64 string"))?;
+        if data.is_empty() {
+            return Err(invalid("data must not be empty"));
+        }
+        if u64::try_from(data.len()).unwrap_or(u64::MAX) > max_encoded_bytes {
+            return Err(invalid(&format!(
+                "decoded payload exceeds media.maxBytes ({max_bytes} bytes)"
+            )));
+        }
+        let raw_mime = item
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("mimeType must be an audio or video MIME type"))?;
+        let mime_type = crate::model::sanitize_image_mime_type(raw_mime).to_ascii_lowercase();
+        if !mime_type.split_once('/').is_some_and(|(kind, subtype)| {
+            matches!(kind, "audio" | "video") && !subtype.is_empty() && !subtype.contains('/')
+        }) {
+            return Err(invalid("mimeType must be an audio or video MIME type"));
+        }
+        let name = match item.get("name") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(name)) => crate::model::sanitize_media_name(name),
+            Some(_) => return Err(invalid("name must be a string or null")),
+        };
+        let engine = if data.ends_with('=') {
+            &base64::engine::general_purpose::STANDARD
+        } else {
+            &base64::engine::general_purpose::STANDARD_NO_PAD
+        };
+        let bytes = engine
+            .decode(data)
+            .map_err(|_| invalid("data must be canonical standard base64 (padding optional)"))?;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > max_bytes {
+            return Err(invalid(&format!(
+                "decoded payload exceeds media.maxBytes ({max_bytes} bytes)"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > MAX_RPC_MEDIA_BYTES {
+            return Err(invalid(&format!(
+                "combined decoded media exceeds {MAX_RPC_MEDIA_BYTES} bytes"
+            )));
+        }
+        media.push(MediaContent {
+            data: data.to_string(),
+            mime_type,
+            name,
+        });
+    }
+    Ok(media)
+}
+
 fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -15633,10 +15851,13 @@ export default function init(pi) {
                 })),
             ]);
 
-            let text = take_last_rpc_user_turn_for_retry(&mut agent_session)
+            let content = take_last_rpc_user_turn_for_retry(&mut agent_session)
                 .await
                 .expect("rewind retry path")
                 .expect("retryable user turn");
+            let UserContent::Text(text) = content else {
+                panic!("text-only retry must remain text-only");
+            };
             assert_eq!(text, "[REWIND REPORT: literal user prompt");
 
             let cx = AgentCx::for_request();
@@ -15719,10 +15940,13 @@ export default function init(pi) {
             let mut agent_session = build_test_agent_session(inner);
             agent_session.agent.replace_messages(projected_messages);
 
-            let text = take_last_rpc_user_turn_for_retry(&mut agent_session)
+            let content = take_last_rpc_user_turn_for_retry(&mut agent_session)
                 .await
                 .expect("rewind-aware retry path")
                 .expect("retryable projected user turn");
+            let UserContent::Text(text) = content else {
+                panic!("text-only retry must remain text-only");
+            };
             assert_eq!(text, "retry before checkpoint");
 
             let cx = AgentCx::for_request();
@@ -15759,6 +15983,117 @@ export default function init(pi) {
         });
     }
 
+    #[test]
+    fn rpc_retry_preserves_interleaved_native_blocks_and_abandoned_branch() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let expected = json!([
+                {"type": "media", "data": "YQ==", "mimeType": "audio/wav"},
+                {"type": "text", "text": "between audio and image"},
+                {"type": "image", "data": "Yg==", "mimeType": "image/png"},
+                {"type": "text", "text": "before video"},
+                {"type": "media", "data": "Yw", "mimeType": "video/mp4", "name": "clip"}
+            ]);
+            let content: UserContent = serde_json::from_value(expected.clone()).unwrap();
+            let mut inner = Session::in_memory();
+            let original_id = inner.append_model_message(Message::User(UserMessage {
+                content,
+                timestamp: 0,
+            }));
+            inner.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            })));
+            let mut agent_session = build_test_agent_session(inner);
+            let recovered = take_last_rpc_user_turn_for_retry(&mut agent_session)
+                .await
+                .expect("native retry projection")
+                .expect("native retry content");
+            assert_eq!(serde_json::to_value(&recovered).unwrap(), expected);
+            let UserContent::Blocks(blocks) = recovered else {
+                panic!("retry must preserve native block content");
+            };
+            let rebuilt = build_user_message("", &blocks);
+            let Message::User(user) = &rebuilt else {
+                panic!("expected user");
+            };
+            assert_eq!(serde_json::to_value(&user.content).unwrap(), expected);
+            let cx = AgentCx::for_request();
+            let mut inner = agent_session.session.lock(&cx).await.expect("session lock");
+            assert!(inner.get_entry(&original_id).is_some());
+            assert!(inner.to_messages_for_current_path().is_empty());
+            inner.append_model_message(rebuilt);
+            assert_eq!(inner.entries.len(), 3, "the original branch must survive");
+            assert_eq!(inner.to_messages_for_current_path().len(), 1);
+        });
+    }
+
+    #[test]
+    fn rpc_retry_projection_does_not_promote_generated_user_shaped_messages() {
+        for generated in [
+            SessionMessage::BranchSummary {
+                summary: "generated branch summary".to_string(),
+                from_id: "branch".to_string(),
+            },
+            SessionMessage::CompactionSummary {
+                summary: "generated compaction summary".to_string(),
+                tokens_before: 100,
+            },
+            SessionMessage::BashExecution {
+                command: "echo output".to_string(),
+                output: "generated shell output".to_string(),
+                exit_code: 0,
+                cancelled: None,
+                truncated: None,
+                full_output_path: None,
+                timestamp: None,
+                extra: HashMap::new(),
+            },
+        ] {
+            let mut session = Session::in_memory();
+            session.append_model_message(build_user_message("authored earlier", &[]));
+            session.append_message(generated);
+            assert!(select_rpc_user_turn_for_retry(&session).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn rpc_retry_invalid_native_content_does_not_rewind_the_durable_path() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for blocks in [
+                Vec::new(),
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "not-user-input".to_string(),
+                    name: "bash".to_string(),
+                    arguments: json!({"command": "false"}),
+                    thought_signature: None,
+                })],
+            ] {
+                let mut inner = Session::in_memory();
+                inner.append_model_message(Message::User(UserMessage {
+                    content: UserContent::Blocks(blocks),
+                    timestamp: 0,
+                }));
+                let original_leaf = inner.leaf_id().map(str::to_string);
+                let mut agent_session = build_test_agent_session(inner);
+                let error = take_last_rpc_user_turn_for_retry(&mut agent_session)
+                    .await
+                    .expect_err("invalid native input must fail before rewind");
+                assert!(error.to_string().contains("PI_INPUT_CONTENT"));
+                let cx = AgentCx::for_request();
+                let inner = agent_session.session.lock(&cx).await.expect("session lock");
+                assert_eq!(inner.leaf_id(), original_leaf.as_deref());
+                assert_eq!(inner.entries.len(), 1);
+                assert_eq!(inner.to_messages_for_current_path().len(), 1);
+            }
+        });
+    }
+
     // -----------------------------------------------------------------------
     // build_user_message
     // -----------------------------------------------------------------------
@@ -15777,10 +16112,10 @@ export default function init(pi) {
 
     #[test]
     fn build_user_message_with_images() {
-        let images = vec![ImageContent {
+        let images = vec![ContentBlock::Image(ImageContent {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
-        }];
+        })];
         let msg = build_user_message("look at this", &images);
         match msg {
             Message::User(UserMessage {
@@ -15797,10 +16132,10 @@ export default function init(pi) {
 
     #[test]
     fn build_user_message_image_only_omits_empty_text_block() {
-        let images = vec![ImageContent {
+        let images = vec![ContentBlock::Image(ImageContent {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
-        }];
+        })];
         let msg = build_user_message("", &images);
         match msg {
             Message::User(UserMessage {
@@ -17337,6 +17672,386 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_invalid_retry_preflight_preserves_expired_failover_provenance() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(None),
+                first_call_gate: Mutex::new(None),
+                calls: Arc::clone(&calls),
+            });
+            let provenance = crate::session::ModelChangeFailover {
+                primary_provider: "openai".to_string(),
+                primary_model_id: "primary-model".to_string(),
+                primary_thinking_level: Some("off".to_string()),
+                fallback_provider: provider.name().to_string(),
+                fallback_model_id: provider.model_id().to_string(),
+                chain_position: Some(1),
+                cooldown_deadline: Some("2000-01-01T00:00:00Z".to_string()),
+                cooldown_secs: Some(1),
+                lifecycle_id: Some("invalid-media-retry".to_string()),
+            };
+            let mut inner = Session::in_memory();
+            inner.append_model_message(Message::User(UserMessage {
+                content: UserContent::Blocks(Vec::new()),
+                timestamp: 0,
+            }));
+            inner.append_model_change_with_role_and_failover(
+                provenance.fallback_provider.clone(),
+                provenance.fallback_model_id.clone(),
+                Some("failover".to_string()),
+                Some(provenance.clone()),
+            );
+            inner.set_model_header(
+                Some(provenance.fallback_provider.clone()),
+                Some(provenance.fallback_model_id.clone()),
+                Some("off".to_string()),
+            );
+            let original_leaf = inner.leaf_id().map(str::to_string);
+            let original_entries = serde_json::to_value(&inner.entries).unwrap();
+            let original_header = serde_json::to_value(&inner.header).unwrap();
+            let agent_session = build_test_agent_session_with_provider(inner, provider);
+            let inner_session = Arc::clone(&agent_session.session);
+            let admission = agent_session.provider_admission_gate();
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut primary = dummy_entry("primary-model", false);
+            primary.model.provider = "openai".to_string();
+            primary.model.api = "openai-completions".to_string();
+            primary.api_key = Some("test-key".to_string());
+            options.available_models.push(primary);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"invalid-retry","type":"retry"}"#,
+                "reject invalid retry before primary restore",
+            )
+            .await;
+            assert_eq!(response["success"], false);
+            assert!(response["error"].as_str().unwrap().contains("PI_INPUT_CONTENT"));
+            assert!(admission.reason().is_none());
+            assert!(calls.lock().unwrap().is_empty());
+            {
+                let cx = AgentCx::for_request();
+                let inner = inner_session.lock(&cx).await.expect("session lock");
+                assert_eq!(inner.leaf_id(), original_leaf.as_deref());
+                assert_eq!(serde_json::to_value(&inner.entries).unwrap(), original_entries);
+                assert_eq!(serde_json::to_value(&inner.header).unwrap(), original_header);
+                assert_eq!(
+                    inner.active_failover_provenance_for_current_path(),
+                    Some(&provenance)
+                );
+            }
+            drop(in_tx);
+            server.await.expect("RPC server run");
+        });
+    }
+
+    #[test]
+    fn rpc_media_preflight_rejects_before_admission_and_extension_dispatch() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (agent_session, mut options) =
+                build_queue_state_rpc_fixture(&runtime_handle, temp.path()).await;
+            let inner_session = Arc::clone(&agent_session.session);
+            agent_session
+                .provider_admission_gate()
+                .block("preflight must run before recovery".to_string());
+            options.config.media = Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(1),
+                ..Default::default()
+            });
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+            for command in ["prompt", "steer", "follow_up"] {
+                let invalid = json!({
+                    "id": command, "type": command, "message": "must not run",
+                    "media": [{"type": "media", "data": "YWE=", "mimeType": "audio/wav"}]
+                });
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &invalid.to_string(),
+                    "reject media before recovery",
+                )
+                .await;
+                assert_eq!(response["success"], false);
+                assert!(response["error"].as_str().unwrap().contains("media.maxBytes"));
+                let extension = json!({
+                    "id": command, "type": command, "message": "/report-queue-state",
+                    "media": [{"type": "media", "data": "YQ==", "mimeType": "audio/wav"}]
+                });
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &extension.to_string(),
+                    "reject extension attachments",
+                )
+                .await;
+                assert_eq!(response["success"], false);
+                assert!(response["error"].as_str().unwrap().contains("do not accept"));
+            }
+            let cx = AgentCx::for_request();
+            assert!(
+                inner_session.lock(&cx).await.expect("session lock").entries.is_empty()
+            );
+            drop(in_tx);
+            let error = server.await.expect_err("the preexisting quarantine must remain latched");
+            assert!(error.is_session_persistence());
+        });
+    }
+
+    #[test]
+    fn rpc_native_media_idle_commands_retry_and_durable_sidecar_round_trip() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(None),
+                first_call_gate: Mutex::new(None),
+                calls: Arc::clone(&calls),
+            });
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(
+                Session::create_with_dir(Some(temp.path().join("sessions"))),
+            ));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+            let data = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                vec![7_u8; 64 * 1024 + 1],
+            );
+            let media = json!([
+                {"type": "media", "data": data, "mimeType": "audio/wav", "name": "voice.wav"},
+                {"type": "media", "data": "Yg", "mimeType": "video/mp4", "name": "clip.mp4"}
+            ]);
+            let images = json!([{"type": "image", "source": {
+                "type": "base64", "mediaType": "image/png", "data": "YQ=="
+            }}]);
+            let expected = json!([
+                {"type": "image", "data": "YQ==", "mimeType": "image/png"},
+                media[0].clone(), media[1].clone()
+            ]);
+            for (index, command) in ["prompt", "steer", "follow_up", "retry"]
+                .iter()
+                .enumerate()
+            {
+                let payload = if *command == "retry" {
+                    json!({"id": index.to_string(), "type": command})
+                } else {
+                    json!({"id": index.to_string(), "type": command,
+                           "message": "", "images": images, "media": media})
+                };
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &payload.to_string(),
+                    "native attachment command",
+                )
+                .await;
+                assert_ok(&response, command);
+                loop {
+                    let line = recv_line(&out_rx, "native attachment completion")
+                        .await
+                        .expect("turn event");
+                    let value = parse_response(&line);
+                    if value["type"] == "agent_end" {
+                        assert!(value.get("error").is_none_or(Value::is_null), "{value}");
+                        break;
+                    }
+                }
+                let captured = calls.lock().expect("captured native turns");
+                assert_eq!(captured.len(), index + 1);
+                let users: Vec<_> = captured[index]
+                    .messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::User(user) => Some(serde_json::to_value(&user.content).unwrap()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(users.len(), (index + 1).min(3));
+                assert!(users.iter().all(|content| content == &expected));
+            }
+            let path = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("session lock")
+                .path
+                .clone()
+                .expect("durable path");
+            let wire = std::fs::read_to_string(&path).expect("session JSONL");
+            assert!(wire.contains("$piBlob"));
+            assert!(
+                !wire.contains(&data),
+                "large RPC media must use sidecar storage"
+            );
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen native RPC session");
+            let durable: Vec<_> = reopened
+                .to_messages_for_current_path()
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(serde_json::to_value(user.content).unwrap()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(durable, vec![expected; 3]);
+            drop(in_tx);
+            server.await.expect("RPC server run");
+        });
+    }
+
+    #[test]
+    fn rpc_native_media_streaming_routes_validate_before_queue_and_preserve_content() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for (command, behavior) in [
+                ("prompt", Some("steer")),
+                ("prompt", Some("follow-up")),
+                ("steer", None),
+                ("follow_up", None),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (entered, mut wait_for_entry) = asupersync::channel::oneshot::channel();
+                let (release, gate) = asupersync::channel::oneshot::channel();
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                    first_call_entered: Mutex::new(Some(entered)),
+                    first_call_gate: Mutex::new(Some(gate)),
+                    calls: Arc::clone(&calls),
+                });
+                let agent_session = build_test_agent_session_with_provider(
+                    Session::in_memory(),
+                    provider,
+                );
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = runtime_handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"initial","type":"prompt","message":"initial"}"#,
+                    "initial gated prompt",
+                )
+                .await;
+                assert_ok(&response, "prompt");
+                wait_for_entry
+                    .recv(AgentCx::for_request().cx())
+                    .await
+                    .expect("first provider call");
+                let mut payload = json!({
+                    "id": "invalid", "type": command, "message": "queued media",
+                    "media": [{"type": "media", "data": "YR==", "mimeType": "video/mp4"}]
+                });
+                if let Some(behavior) = behavior {
+                    payload["streamingBehavior"] = json!(behavior);
+                }
+                let rejected = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &payload.to_string(),
+                    "reject malformed queued media",
+                )
+                .await;
+                assert_eq!(rejected["success"], false);
+                assert!(rejected["error"].as_str().unwrap().contains("media[0]"));
+                payload["id"] = json!("valid");
+                payload["media"][0]["data"] = json!("YQ==");
+                let accepted = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &payload.to_string(),
+                    "accept queued native media",
+                )
+                .await;
+                assert_ok(&accepted, command);
+                release
+                    .send(AgentCx::for_request().cx(), ())
+                    .expect("release provider");
+                loop {
+                    let line = recv_line(&out_rx, "queued media completion")
+                        .await
+                        .expect("turn event");
+                    let value = parse_response(&line);
+                    if value["type"] == "agent_end" {
+                        assert!(value.get("error").is_none_or(Value::is_null), "{value}");
+                        break;
+                    }
+                }
+                drop(in_tx);
+                server.await.expect("RPC server run");
+                let captured = calls.lock().expect("captured queued native turns");
+                assert_eq!(captured.len(), 2, "{command} {behavior:?}");
+                let users: Vec<_> = captured[1]
+                    .messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::User(user) => Some(serde_json::to_value(&user.content).unwrap()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    users,
+                    vec![
+                        json!("initial"),
+                        json!([
+                            {"type": "text", "text": "queued media"},
+                            {"type": "media", "data": "YQ==", "mimeType": "video/mp4"}
+                        ])
+                    ]
+                );
+            }
+        });
+    }
+
+    #[test]
     fn streaming_rpc_queue_scans_raw_source_not_expanded_template() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -17519,10 +18234,18 @@ export default function init(pi) {
                 .await
                 .expect("terminal provider entered");
 
+            let follow_up_payload = json!({
+                "id": "2", "type": "follow_up", "message": "accepted during terminal turn",
+                "media": [{"type": "media", "data": "YQ==", "mimeType": "audio/wav"}]
+            });
+            let expected_content = json!([
+                {"type": "text", "text": "accepted during terminal turn"},
+                {"type": "media", "data": "YQ==", "mimeType": "audio/wav"}
+            ]);
             let follow_up = send_recv(
                 &in_tx,
                 &out_rx,
-                r#"{"id":"2","type":"follow_up","message":"accepted during terminal turn"}"#,
+                &follow_up_payload.to_string(),
                 "terminal follow-up acknowledgment",
             )
             .await;
@@ -17565,10 +18288,8 @@ export default function init(pi) {
                 .filter(|message| {
                     matches!(
                         message,
-                        Message::User(UserMessage {
-                            content: UserContent::Text(text),
-                            ..
-                        }) if text == "accepted during terminal turn"
+                        Message::User(user)
+                            if serde_json::to_value(&user.content).unwrap() == expected_content
                     )
                 })
                 .count();
@@ -17603,10 +18324,8 @@ export default function init(pi) {
                 .filter(|message| {
                     matches!(
                         message,
-                        Message::User(UserMessage {
-                            content: UserContent::Text(text),
-                            ..
-                        }) if text == "accepted during terminal turn"
+                        Message::User(user)
+                            if serde_json::to_value(&user.content).unwrap() == expected_content
                     )
                 })
                 .count();
@@ -19744,8 +20463,111 @@ export default function init(pi) {
     }
 
     // -----------------------------------------------------------------------
-    // parse_prompt_images
+    // Native RPC attachments
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_prompt_media_preserves_bytes_and_sanitizes_labels() {
+        let value = json!([
+            {"type": "media", "data": "YQ==", "mimeType": " AUDIO/WAV",
+             "name": " \u{202e}clip\n.wav "},
+            {"type": "media", "data": "Yg", "mimeType": "video/mp4"}
+        ]);
+        let media = parse_prompt_media(Some(&value), &Config::default()).unwrap();
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].data, "YQ==");
+        assert_eq!(media[0].mime_type, "audio/wav");
+        assert_eq!(media[0].name.as_deref(), Some("clip.wav"));
+        assert_eq!(media[1].data, "Yg");
+        assert_eq!(media[1].mime_type, "video/mp4");
+        assert!(media[1].name.is_none());
+    }
+
+    #[test]
+    fn parse_prompt_media_rejects_each_malformed_item_without_silent_skips() {
+        for value in [
+            Value::Null,
+            json!({}),
+            json!([null]),
+            json!([{"type": "image", "data": "YQ==", "mimeType": "audio/wav"}]),
+            json!([{"type": "media", "data": {"$piBlob": "sha256:bad"},
+                    "mimeType": "audio/wav"}]),
+            json!([{"type": "media", "data": "", "mimeType": "audio/wav"}]),
+            json!([{"type": "media", "data": "YQ==", "mimeType": "image/png"}]),
+            json!([{"type": "media", "data": "YQ==", "mimeType": "video/"}]),
+            json!([{"type": "media", "data": "YQ==", "mimeType": "audio/wav/path"}]),
+            json!([{"type": "media", "data": "YQ==", "mimeType": "audio/wav", "name": 1}]),
+        ] {
+            assert!(
+                parse_prompt_media(Some(&value), &Config::default()).is_err(),
+                "malformed attachment was accepted: {value}"
+            );
+        }
+        for data in ["not base64", "YQ=", "YR==", "_w==", "YQ==\n", "Y"] {
+            let value = json!([{"type": "media", "data": data, "mimeType": "audio/wav"}]);
+            let error = parse_prompt_media(Some(&value), &Config::default()).unwrap_err();
+            assert!(error.to_string().contains("media[0]"));
+        }
+    }
+
+    #[test]
+    fn parse_prompt_media_enforces_decoded_size_and_count_limits() {
+        let mut config = Config::default();
+        config.media = Some(crate::media_tools::MediaSettings {
+            max_bytes: Some(1),
+            ..Default::default()
+        });
+        for data in ["YQ==", "YQ"] {
+            let value = json!([{"type": "media", "data": data, "mimeType": "audio/wav"}]);
+            assert_eq!(parse_prompt_media(Some(&value), &config).unwrap().len(), 1);
+        }
+        // All are short enough to pass a naive encoded-length-only check.
+        for data in ["YWE=", "YWE", "YWFh"] {
+            let value = json!([{"type": "media", "data": data, "mimeType": "audio/wav"}]);
+            let error = parse_prompt_media(Some(&value), &config).unwrap_err();
+            assert!(error.to_string().contains("media.maxBytes"));
+        }
+        let too_many = json!(vec![
+            json!({"type": "media", "data": "YQ==", "mimeType": "audio/wav"});
+            MAX_RPC_MEDIA_ATTACHMENTS + 1
+        ]);
+        assert!(parse_prompt_media(Some(&too_many), &config).is_err());
+        config.media.as_mut().unwrap().max_bytes = Some(0);
+        let value = json!([{"type": "media", "data": "YQ==", "mimeType": "audio/wav"}]);
+        assert!(parse_prompt_media(Some(&value), &config).is_err());
+    }
+
+    #[test]
+    fn rpc_attachment_order_is_text_then_images_then_native_media() {
+        let payload = json!({
+            "images": [{"type": "image", "source": {
+                "type": "base64", "data": "YQ==", "mediaType": "image/png"
+            }}],
+            "media": [
+                {"type": "media", "data": "Yg==", "mimeType": "audio/wav"},
+                {"type": "media", "data": "Yw==", "mimeType": "video/mp4"}
+            ]
+        });
+        let attachments = parse_prompt_attachments(&payload, &Config::default()).unwrap();
+        let Message::User(user) = build_user_message("compare", &attachments) else {
+            panic!("expected user message");
+        };
+        let UserContent::Blocks(blocks) = user.content else {
+            panic!("expected structured content");
+        };
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text.text == "compare"));
+        assert!(matches!(&blocks[1], ContentBlock::Image(image) if image.data == "YQ=="));
+        assert!(matches!(&blocks[2], ContentBlock::Media(media) if media.data == "Yg=="));
+        assert!(matches!(&blocks[3], ContentBlock::Media(media) if media.data == "Yw=="));
+        for payload in [json!({}), json!({"images": [], "media": []})] {
+            let empty = parse_prompt_attachments(&payload, &Config::default()).unwrap();
+            assert!(matches!(
+                build_user_message("text only", &empty),
+                Message::User(UserMessage { content: UserContent::Text(_), .. })
+            ));
+        }
+    }
 
     #[test]
     fn parse_prompt_images_none() {
