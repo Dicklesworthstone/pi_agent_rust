@@ -2955,12 +2955,13 @@ impl Agent {
         })
     }
 
-    /// `honor_signatures` is true only for assistant output from the current
-    /// provider, API and model. Foreign history, user and tool-result blocks
-    /// are screened without signatures (an extension can set one on any JSON).
+    /// `same_origin_assistant` is true only for assistant output from the
+    /// current provider, API and model. Foreign history, user and tool-result
+    /// blocks receive neither signature nor primitive replay exceptions (an
+    /// extension can set a signature on any JSON).
     fn secrets_transform_content_block(
         block: &mut ContentBlock,
-        honor_signatures: bool,
+        same_origin_assistant: bool,
         vault: &mut crate::secrets::SecretVault,
         mode: crate::secrets::SecretsMode,
         extra: &[regex::Regex],
@@ -2972,13 +2973,13 @@ impl Agent {
         // only for its original destination outside block mode. Skipping the
         // rewrite (not just discarding it) also keeps a type-changing
         // replacement from refusing the request.
-        let keep_signed = honor_signatures && mode != crate::secrets::SecretsMode::Block;
+        let keep_signed = same_origin_assistant && mode != crate::secrets::SecretsMode::Block;
         match block {
             ContentBlock::Text(text) => {
                 if keep_signed && text.text_signature.is_some() {
                     return Ok(());
                 }
-                if !honor_signatures {
+                if !same_origin_assistant {
                     text.text_signature = None;
                 }
                 text.text =
@@ -2988,7 +2989,7 @@ impl Agent {
                 if keep_signed && thinking.thinking_signature.is_some() {
                     return Ok(());
                 }
-                if !honor_signatures {
+                if !same_origin_assistant {
                     thinking.thinking_signature = None;
                 }
                 thinking.thinking = Self::secrets_transform_text(
@@ -3004,17 +3005,28 @@ impl Agent {
                 if keep_signed && call.thought_signature.is_some() {
                     return Ok(());
                 }
-                if !honor_signatures {
+                if !same_origin_assistant {
                     call.thought_signature = None;
                 }
-                call.arguments = Self::secrets_transform_json(
-                    &call.arguments,
-                    vault,
-                    mode,
-                    extra,
-                    total,
-                    labels,
-                )?;
+                call.arguments = if same_origin_assistant {
+                    let (output, audit) = crate::secrets::transform_assistant_replay_json(
+                        &call.arguments,
+                        vault,
+                        mode,
+                        extra,
+                    )?;
+                    Self::secrets_add_audit(audit, total, labels);
+                    output
+                } else {
+                    Self::secrets_transform_json(
+                        &call.arguments,
+                        vault,
+                        mode,
+                        extra,
+                        total,
+                        labels,
+                    )?
+                };
             }
             ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
                 // Opaque signed/provider bytes and binary payloads are not

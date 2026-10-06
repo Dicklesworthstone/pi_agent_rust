@@ -173,6 +173,12 @@ fn rewrite_json_text(
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+enum PrimitivePolicy {
+    RefuseReplacement,
+    PreserveModelOutput,
+}
+
 fn rewrite_json_inner(
     value: &serde_json::Value,
     vault: &mut SecretVault,
@@ -180,6 +186,7 @@ fn rewrite_json_inner(
     extra_patterns: &[regex::Regex],
     audit: &mut TransformAudit,
     depth: usize,
+    primitive_policy: PrimitivePolicy,
 ) -> Result<serde_json::Value> {
     secret_json_depth(depth)?;
     match value {
@@ -192,7 +199,17 @@ fn rewrite_json_inner(
         )?)),
         serde_json::Value::Array(items) => items
             .iter()
-            .map(|item| rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1))
+            .map(|item| {
+                rewrite_json_inner(
+                    item,
+                    vault,
+                    mode,
+                    extra_patterns,
+                    audit,
+                    depth + 1,
+                    primitive_policy,
+                )
+            })
             .collect::<Result<Vec<_>>>()
             .map(serde_json::Value::Array),
         serde_json::Value::Object(map) => {
@@ -205,13 +222,30 @@ fn rewrite_json_inner(
                             .to_string(),
                     ));
                 }
-                let protected_value =
-                    rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1)?;
+                let protected_value = rewrite_json_inner(
+                    item,
+                    vault,
+                    mode,
+                    extra_patterns,
+                    audit,
+                    depth + 1,
+                    primitive_policy,
+                )?;
                 output.insert(protected_key, protected_value);
             }
             Ok(serde_json::Value::Object(output))
         }
         primitive => {
+            if mode == SecretsMode::Obfuscate
+                && matches!(primitive_policy, PrimitivePolicy::PreserveModelOutput)
+            {
+                // The originating model already produced these exact values.
+                // Replaying a number/bool/null without changing its type must
+                // not permanently wedge that model's own tool-use history.
+                // Discovery still learns these values so string echoes and
+                // unrelated outbound fields receive their usual protection.
+                return Ok(primitive.clone());
+            }
             let text = primitive.to_string();
             if rewrite_json_text(&text, vault, mode, extra_patterns, audit)? != text {
                 // Turning a numeric credential into a string placeholder and
@@ -246,6 +280,44 @@ pub fn transform_outbound_json(
     mode: SecretsMode,
     extra_patterns: &[regex::Regex],
 ) -> Result<(serde_json::Value, TransformAudit)> {
+    transform_json(
+        value,
+        vault,
+        mode,
+        extra_patterns,
+        PrimitivePolicy::RefuseReplacement,
+    )
+}
+
+/// Screen unsigned assistant tool arguments returning to their original model.
+///
+/// The caller must verify the assistant's provider, API and model all match the
+/// destination. Only obfuscate mode preserves model-authored JSON primitives;
+/// strings and keys are still screened, and block mode still refuses secrets.
+/// This exception must never apply to user input, tool results, tool schemas or
+/// assistant history sent to another origin.
+pub(crate) fn transform_assistant_replay_json(
+    value: &serde_json::Value,
+    vault: &mut SecretVault,
+    mode: SecretsMode,
+    extra_patterns: &[regex::Regex],
+) -> Result<(serde_json::Value, TransformAudit)> {
+    transform_json(
+        value,
+        vault,
+        mode,
+        extra_patterns,
+        PrimitivePolicy::PreserveModelOutput,
+    )
+}
+
+fn transform_json(
+    value: &serde_json::Value,
+    vault: &mut SecretVault,
+    mode: SecretsMode,
+    extra_patterns: &[regex::Regex],
+    primitive_policy: PrimitivePolicy,
+) -> Result<(serde_json::Value, TransformAudit)> {
     let mut audit = TransformAudit {
         schema: SECRETS_SCHEMA.to_string(),
         direction: "outbound".to_string(),
@@ -257,7 +329,15 @@ pub fn transform_outbound_json(
     }
     let mut staged = vault.clone();
     discover_outbound_json(value, &mut staged, mode, extra_patterns)?;
-    let output = rewrite_json_inner(value, &mut staged, mode, extra_patterns, &mut audit, 0)?;
+    let output = rewrite_json_inner(
+        value,
+        &mut staged,
+        mode,
+        extra_patterns,
+        &mut audit,
+        0,
+        primitive_policy,
+    )?;
     *vault = staged;
     Ok((output, audit))
 }
@@ -407,6 +487,60 @@ mod structured_outbound_tests {
             assert_eq!(vault.len(), 0);
         }
         assert!(input["token"].is_u64());
+    }
+
+    #[test]
+    fn assistant_replay_preserves_primitives_but_protects_strings_and_keys() {
+        let numeric = 123_456_789_012_345_678_u64;
+        let mut input = json!({
+            "a_echo": numeric.to_string(),
+            "flags": [true, false, null],
+            "token": numeric,
+            "secret": KEY,
+        });
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert(KEY.to_string(), json!("ordinary"));
+        let original = input.clone();
+        let patterns = [regex::Regex::new(r"^(?:true|false|null)$").unwrap()];
+        let mut vault = SecretVault::default();
+
+        let (output, _) = transform_assistant_replay_json(
+            &input,
+            &mut vault,
+            SecretsMode::Obfuscate,
+            &patterns,
+        )
+        .expect("model-authored primitive replay");
+
+        assert_eq!(output["token"].as_u64(), Some(numeric));
+        assert_eq!(output["flags"], input["flags"]);
+        assert_ne!(output["a_echo"], input["a_echo"]);
+        assert!(!output.to_string().contains(KEY));
+        assert_eq!(restore_value(&output, &vault), original);
+        assert_eq!(input, original, "only the outbound projection changes");
+
+        // The exception does not suppress discovery or block-mode policy.
+        // Check each primitive separately so the numeric assignment cannot
+        // hide an accidental bool/null exemption.
+        for protected in [
+            json!({"token": numeric}),
+            json!(true),
+            json!(false),
+            json!(null),
+        ] {
+            let mut blocked_vault = SecretVault::default();
+            let error = transform_assistant_replay_json(
+                &protected,
+                &mut blocked_vault,
+                SecretsMode::Block,
+                &patterns,
+            )
+            .expect_err("block mode still applies to every primitive");
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(blocked_vault.len(), 0);
+        }
     }
 
     #[test]

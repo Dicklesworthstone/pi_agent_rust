@@ -888,9 +888,10 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
 
-    // A numeric credential cannot be replaced without changing its JSON type,
-    // so obfuscate mode still refuses the whole request.
-    let numeric = assistant(
+    // Numeric credentials from another provider cannot use the model-origin
+    // replay exception. Refuse without changing their JSON type or learning
+    // any earlier secret from this request into the live vault.
+    let mut numeric = assistant(
         vec![tool_call(
             "numeric-call",
             json!({"token": 123_456_789_012_345_678_u64}),
@@ -898,6 +899,10 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
         )],
         pi::model::StopReason::ToolUse,
     );
+    let pi::model::Message::Assistant(message) = &mut numeric else {
+        unreachable!()
+    };
+    Arc::make_mut(message).provider = "other-provider".to_string();
     let error = block_on_local(agent.run_with_messages_with_abort(
         vec![user_text(&format!("remember {EARLY}")), numeric],
         None,
@@ -928,6 +933,191 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
             .expect("screen early credential after rollback"),
         "<pi-secret:000001>"
     );
+}
+
+#[test]
+fn unsigned_numeric_tool_arguments_survive_same_origin_continuations() {
+    use pi::model::{ContentBlock, Message, StopReason, TextContent, ToolResultMessage};
+
+    const NUMERIC: u64 = 123_456_789_012_345_678;
+    let harness =
+        TestHarness::new("unsigned_numeric_tool_arguments_survive_same_origin_continuations");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    let mut arguments = json!({
+        "token": NUMERIC,
+        "nested": [true, false, null, {"echo": NUMERIC.to_string(), "api_key": SECRET}],
+    });
+    arguments
+        .as_object_mut()
+        .expect("arguments object")
+        .insert(SECRET.to_string(), json!("ordinary"));
+    let history = vec![
+        user_text("page through the results"),
+        assistant(
+            vec![tool_call("unsigned-page", arguments.clone(), None)],
+            StopReason::ToolUse,
+        ),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "unsigned-page".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("page ready"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }),
+    ];
+    let original = serde_json::to_value(&history).expect("original history");
+    agent.replace_messages(history.clone());
+
+    block_on_local(agent.run_continue_with_abort(None, |_| {}))
+        .expect("unsigned numeric history must allow the continuation");
+    block_on_local(agent.run("next page".to_string(), |_| {}))
+        .expect("later prompts must also remain usable");
+
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 2);
+    for (payload, messages) in capture.payloads.iter().zip(&capture.messages) {
+        let replayed = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(message) => Some(&message.content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|block| match block {
+                ContentBlock::ToolCall(call) if call.id == "unsigned-page" => Some(call),
+                _ => None,
+            })
+            .expect("replayed unsigned tool call");
+        assert!(replayed.thought_signature.is_none());
+        assert_eq!(replayed.arguments["token"].as_u64(), Some(NUMERIC));
+        assert_eq!(replayed.arguments["nested"][0], true);
+        assert_eq!(replayed.arguments["nested"][1], false);
+        assert!(replayed.arguments["nested"][2].is_null());
+        assert_ne!(replayed.arguments["nested"][3]["echo"], NUMERIC.to_string());
+        assert!(
+            !payload.contains(SECRET),
+            "strings and keys still need protection"
+        );
+        assert_eq!(
+            agent.restore_secrets_inbound(replayed.clone()).arguments,
+            arguments,
+            "string placeholders still restore without changing primitive types"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&agent.messages()[..history.len()]).expect("retained history"),
+        original,
+        "the local transcript remains unchanged by outbound projection"
+    );
+}
+
+#[test]
+fn numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode() {
+    use pi::model::{Message, StopReason};
+
+    let harness = TestHarness::new(
+        "numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode",
+    );
+    let root = harness.temp_path(".");
+    for mismatch in ["same", "api", "provider", "model", "unknown"] {
+        for mode in ["obfuscate", "block"] {
+            if mismatch == "same" && mode == "obfuscate" {
+                continue;
+            }
+            let (mut agent, capture) = build_agent(
+                &root,
+                Some(SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: None,
+                }),
+            );
+            let mut numeric = assistant(
+                vec![tool_call(
+                    "numeric-origin",
+                    json!({"token": 123_456_789_012_345_678_u64}),
+                    None,
+                )],
+                StopReason::ToolUse,
+            );
+            let Message::Assistant(message) = &mut numeric else {
+                unreachable!()
+            };
+            let message = Arc::make_mut(message);
+            match mismatch {
+                "api" => message.api = "other-api".to_string(),
+                "provider" => message.provider = "other-provider".to_string(),
+                "model" => message.model = "other-model".to_string(),
+                "unknown" => {
+                    message.api.clear();
+                    message.provider.clear();
+                    message.model.clear();
+                }
+                _ => {}
+            }
+            agent.replace_messages(vec![user_text("continue the page"), numeric]);
+            let error = block_on_local(agent.run_continue_with_abort(None, |_| {}))
+                .expect_err("protected numeric history must refuse before provider entry");
+            assert!(
+                error.to_string().contains(if mode == "block" {
+                    "PI_SECRET_BLOCK"
+                } else {
+                    "PI_SECRET_JSON_PRIMITIVE"
+                }),
+                "{mismatch} {mode}: {error}"
+            );
+            assert!(
+                capture.lock().expect("capture").payloads.is_empty(),
+                "{mismatch} {mode} must not invoke the provider"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_and_tool_result_primitives_do_not_inherit_assistant_replay_exceptions() {
+    use pi::model::{
+        ContentBlock, Message, TextContent, ToolResultMessage, UserContent, UserMessage,
+    };
+
+    let harness = TestHarness::new(
+        "user_and_tool_result_primitives_do_not_inherit_assistant_replay_exceptions",
+    );
+    let root = harness.temp_path(".");
+    let arguments = json!({"token": 123_456_789_012_345_678_u64});
+    let messages = [
+        Message::User(UserMessage {
+            content: UserContent::Blocks(vec![tool_call("user-call", arguments.clone(), None)]),
+            timestamp: 0,
+        }),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "result-call".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![tool_call("nested-call", arguments.clone(), None)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "details-call".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("page ready"))],
+            details: Some(arguments),
+            is_error: false,
+            timestamp: 0,
+        }),
+    ];
+    for message in messages {
+        let (mut agent, capture) = build_agent(&root, None);
+        let error = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
+            .expect_err("only exact-origin assistant arguments may preserve detected primitives");
+        assert!(
+            error.to_string().contains("PI_SECRET_JSON_PRIMITIVE"),
+            "{error}"
+        );
+        assert!(capture.lock().expect("capture").payloads.is_empty());
+    }
 }
 
 #[test]
