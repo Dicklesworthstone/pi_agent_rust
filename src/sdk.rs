@@ -3026,7 +3026,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     agent_session.advisor = options
         .advisor
         .as_ref()
-        .map(crate::advisor::AdvisorOptions::runtime);
+        .map(|options| options.runtime().with_secrets_settings(config.secrets.as_ref()));
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent

@@ -3383,13 +3383,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// written to the session JSONL: the call builds a throwaway message
     /// list that shares nothing with the session writer.
     pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
-        // Lock scope computes the outcome; self mutations happen after the
-        // guard drops.
-        enum BtwPrepared {
-            Ready { context: String, question: String },
-            TransformRefused { message: String },
-            AgentBusy,
-        }
         let Some(client) = self.btw_client.clone() else {
             self.status_message = Some(
                 "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
@@ -3404,46 +3397,33 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        // Context + question get the SAME outbound hygiene as the main
-        // provider path: the live message list carries raw user text (the
-        // vault only rewrites the outbound clone), and the smol role can be
-        // a different vendor entirely. Block mode refuses here too.
-        let prepared = self.agent.try_lock().map_or(
-            // Contended agent lock: answer without context, but say so —
-            // a silent empty context reads as a model failure.
-            BtwPrepared::AgentBusy,
-            |mut agent| {
-                let snapshot = agent.messages().to_vec();
-                let summary = pi::btw::build_context_summary(&snapshot);
-                let transformed =
-                    agent
-                        .secrets_transform_outbound_text(&summary)
-                        .and_then(|context| {
-                            agent
-                                .secrets_transform_outbound_text(&question)
-                                .map(|question| (context, question))
-                        });
-                match transformed {
-                    Ok((context, question)) => BtwPrepared::Ready { context, question },
-                    Err(err) => BtwPrepared::TransformRefused {
-                        message: format!("/btw refused: {err}"),
-                    },
-                }
-            },
-        );
-        let (context, question) = match prepared {
-            BtwPrepared::Ready { context, question } => (context, question),
-            BtwPrepared::TransformRefused { message } => {
-                self.status_message = Some(message);
+        if question.len().saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
+            > pi::text_completion::MAX_INPUT_BYTES
+        {
+            self.status_message = Some(
+                "/btw refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
+                    .to_string(),
+            );
+            self.scroll_to_bottom();
+            return None;
+        }
+        // Screen complete source fields and the question before clipping;
+        // a busy agent defers preparation until its remembered credentials
+        // are available. Only bounded protected text reaches the provider.
+        let prepared = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|agent| client.prepare_with_agent(&agent, &question));
+        let agent_busy = prepared.is_none();
+        let request = match prepared {
+            Some(Ok(request)) => Some(request),
+            Some(Err(err)) => {
+                self.status_message = Some(format!("/btw refused: {err}"));
                 self.scroll_to_bottom();
                 return None;
             }
-            BtwPrepared::AgentBusy => {
-                self.status_message = Some(String::from(
-                    "(/btw) agent busy — answering without conversation context",
-                ));
-                (String::new(), question)
-            }
+            None => None,
         };
         // asupersync TryLockError carries the guard, so the match temporary
         // would pin the immutable borrow across self mutations (bd-9x70g
@@ -3459,15 +3439,42 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
-            content: format!("(/btw) {question}"),
+            content: if agent_busy {
+                format!("(/btw) {question} — queued until the current turn finishes")
+            } else {
+                format!("(/btw) {question}")
+            },
             thinking: None,
             collapsed: false,
         });
-        self.status_message = Some("(/btw) thinking...".to_string());
+        self.status_message = Some(if agent_busy {
+            "(/btw) waiting for the current turn...".to_string()
+        } else {
+            "(/btw) thinking...".to_string()
+        });
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let session = Arc::clone(&self.session);
         runtime.spawn(async move {
-            let result = client.ask(&context, &question).await;
+            let result = async {
+                let request = if let Some(request) = request {
+                    request
+                } else {
+                    let cx = Cx::for_request();
+                    let agent = OwnedMutexGuard::lock(agent, &cx).await?;
+                    let live_session = OwnedMutexGuard::lock(session, &cx).await?;
+                    if live_session.header.id != owner_session_id {
+                        return Err(pi::error::Error::validation(
+                            "PI_AUXILIARY_SESSION_CHANGED: side question cancelled after session switch",
+                        ));
+                    }
+                    drop(live_session);
+                    client.prepare_with_agent(&agent, &question)?
+                };
+                client.ask_prepared(request).await
+            }
+            .await;
             // Display-only delivery via the UI event channel; the session
             // writer never sees this message.
             // SessionSystemNote is display-only. PiMsg::System/AgentError

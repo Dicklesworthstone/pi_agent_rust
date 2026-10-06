@@ -2285,6 +2285,7 @@ async fn run(
                         &resolution.model_entry,
                         cli.api_key.as_deref(),
                         &auth,
+                        config.secrets.as_ref(),
                     )
                 }),
                 // ctrl+p cycles the same resolved scope the classic stack
@@ -2426,7 +2427,7 @@ async fn run(
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
         .as_ref()
-        .map(pi::advisor::AdvisorOptions::runtime);
+        .map(|options| options.runtime().with_secrets_settings(config.secrets.as_ref()));
     // Host authorization must not depend on granting the model the ask tool.
     // The registry picker is always handed to interactive/RPC hosts; only this
     // conditional extend adds ask to the provider-visible schema.
@@ -2462,16 +2463,23 @@ async fn run(
                     &resolution.model_entry,
                     cli.api_key.as_deref(),
                     &auth,
+                    config.secrets.as_ref(),
                 )
             });
     // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
+    let btw_secrets_settings = config.secrets.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
         let Ok(auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
             return None;
         };
-        pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
+        pi::btw::BtwClient::for_model_entry(
+            entry,
+            btw_api_key.as_deref(),
+            &auth,
+            btw_secrets_settings.as_ref(),
+        )
     });
 
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >

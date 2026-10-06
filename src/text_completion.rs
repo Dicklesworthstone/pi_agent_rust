@@ -26,16 +26,58 @@ pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 const MAX_INPUT_PARTS: usize = 256;
 pub const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan budget]";
 
+/// Compiled privacy policy for tool-free secondary model requests.
+///
+/// These requests never need executable credentials, so disabling the primary
+/// agent's reversible vault does not disable their existing privacy floor.
+/// Configured patterns extend that floor; block mode refuses the request.
+#[derive(Clone, Debug, Default)]
+pub struct AuxiliaryPrivacy {
+    mode: crate::secrets::SecretsMode,
+    extra_patterns: Vec<regex::Regex>,
+}
+
+impl AuxiliaryPrivacy {
+    #[must_use]
+    pub fn from_settings(settings: Option<&crate::secrets::SecretsSettings>) -> Self {
+        let mode = crate::secrets::SecretsMode::from_setting(
+            settings.and_then(|settings| settings.mode.as_deref()),
+        );
+        let extra_patterns = settings
+            .and_then(|settings| settings.extra_patterns.as_deref())
+            .map(crate::secrets::compile_extra_patterns)
+            .unwrap_or_default();
+        Self {
+            mode: if mode == crate::secrets::SecretsMode::Block {
+                mode
+            } else {
+                crate::secrets::SecretsMode::Obfuscate
+            },
+            extra_patterns,
+        }
+    }
+}
+
 /// Screen a complete set of text inputs before formatting or truncation.
 ///
 /// Tool-free side requests never need executable credentials. These context
-/// projections always apply the built-in detector, independently of the main
-/// agent's configurable, reversible tool workflow. Discovery spans every part
+/// projections apply the built-in detector and configured patterns; block
+/// mode refuses before provider admission. Discovery spans every part
 /// before any replacement, so a later assignment also protects earlier bare
 /// echoes. Disposable-vault IDs become non-restorable markers before a prompt
 /// reaches another model or a verdict is injected into the main conversation.
 /// Authentication headers and caller-owned text are not touched.
-pub fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
+pub fn redact_inputs(parts: &[&str], privacy: &AuxiliaryPrivacy) -> Result<Vec<String>> {
+    redact_inputs_with_vault(parts, privacy, &crate::secrets::SecretVault::default())
+}
+
+/// Preserve discoveries from the live conversation without sharing its
+/// mutable vault or exporting reversible IDs to a secondary model.
+pub(crate) fn redact_inputs_with_vault(
+    parts: &[&str],
+    privacy: &AuxiliaryPrivacy,
+    known_secrets: &crate::secrets::SecretVault,
+) -> Result<Vec<String>> {
     let bytes = parts
         .iter()
         .try_fold(0usize, |total, part| total.checked_add(part.len()));
@@ -44,12 +86,12 @@ pub fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
             "PI_AUXILIARY_INPUT_LIMIT: input exceeds the auxiliary privacy scan budget",
         ));
     }
-    let mut vault = crate::secrets::SecretVault::default();
+    let mut vault = known_secrets.clone();
     let (protected, _) = crate::secrets::transform_outbound_json(
         &serde_json::json!(parts),
         &mut vault,
-        crate::secrets::SecretsMode::Obfuscate,
-        &[],
+        privacy.mode,
+        &privacy.extra_patterns,
     )?;
     let serde_json::Value::Array(protected) = protected else {
         return Err(Error::validation(
@@ -202,7 +244,7 @@ mod tests {
         let secret = "r4nd0mCredentialValue123456";
         let assignment = format!("API_KEY={secret}");
         let parts = [secret, assignment.as_str(), "ordinary context"];
-        let protected = redact_inputs(&parts).unwrap();
+        let protected = redact_inputs(&parts, &AuxiliaryPrivacy::default()).unwrap();
         assert_eq!(
             protected,
             [
@@ -227,22 +269,89 @@ mod tests {
             "PRIVATE KEY-----\nprivate\\material\"here\n-----END PRIVATE KEY-----"
         );
         let clean = "  α\r\n  code: C:\\work\\file\t\"quoted\"  ";
-        let protected = redact_inputs(&[clean, key]).unwrap();
+        let protected = redact_inputs(&[clean, key], &AuxiliaryPrivacy::default()).unwrap();
         assert_eq!(protected, [clean, "<pi-secret:redacted>"]);
-        assert!(redact_inputs(&[]).unwrap().is_empty());
+        assert!(redact_inputs(&[], &AuxiliaryPrivacy::default()).unwrap().is_empty());
     }
 
     #[test]
     fn input_budget_refuses_without_exposing_or_slicing_the_input() {
         let input = "x".repeat(MAX_INPUT_BYTES);
         assert_eq!(
-            redact_inputs(&[&input]).unwrap(),
+            redact_inputs(&[&input], &AuxiliaryPrivacy::default()).unwrap(),
             std::slice::from_ref(&input)
         );
-        let error = redact_inputs(&[&input, "SECRET-CANARY"]).unwrap_err();
+        let error = redact_inputs(&[&input, "SECRET-CANARY"], &AuxiliaryPrivacy::default())
+            .unwrap_err();
         assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
         assert!(!error.to_string().contains("SECRET-CANARY"));
-        assert!(redact_inputs(&vec![""; MAX_INPUT_PARTS + 1]).is_err());
+        assert!(
+            redact_inputs(&vec![""; MAX_INPUT_PARTS + 1], &AuxiliaryPrivacy::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn configured_auxiliary_patterns_extend_the_privacy_floor_in_every_mode() {
+        let custom = "ACME-123456";
+        let built_in = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        for mode in [None, Some("obfuscate"), Some("off")] {
+            let settings = crate::secrets::SecretsSettings {
+                mode: mode.map(str::to_string),
+                extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+            };
+            let privacy = AuxiliaryPrivacy::from_settings(Some(&settings));
+            let protected = redact_inputs(&[custom, built_in, "clean context"], &privacy)
+                .expect("obfuscated auxiliary fields");
+            assert_eq!(
+                protected,
+                ["<pi-secret:redacted>", "<pi-secret:redacted>", "clean context"],
+            );
+        }
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+        }));
+        for secret in [custom, built_in] {
+            let error = redact_inputs(&["clean context", secret], &privacy).unwrap_err();
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert!(!error.to_string().contains(secret));
+        }
+        assert_eq!(
+            redact_inputs(&["clean context"], &privacy).unwrap(),
+            ["clean context"],
+        );
+    }
+
+    #[test]
+    fn seeded_projection_protects_known_values_without_mutating_the_live_vault() {
+        let known = "rememberedCredentialValue123456";
+        let later = "anotherCredentialValue654321";
+        let mut vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate(&format!("API_KEY={known}"), &mut vault, &[]);
+        let later_assignment = format!("API_KEY={later}");
+        let protected = redact_inputs_with_vault(
+            &[known, later, &later_assignment],
+            &AuxiliaryPrivacy::default(),
+            &vault,
+        )
+        .unwrap();
+        assert_eq!(
+            protected,
+            [
+                "<pi-secret:redacted>",
+                "<pi-secret:redacted>",
+                "API_KEY=<pi-secret:redacted>",
+            ],
+        );
+        assert_eq!(vault.mask(later), later, "new discoveries remain disposable");
+        assert_eq!(vault.mask(known), "<pi-secret:000001>");
+        let block = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            ..Default::default()
+        }));
+        let error = redact_inputs_with_vault(&[known], &block, &vault).unwrap_err();
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+        assert!(!error.to_string().contains(known));
     }
 
     #[test]

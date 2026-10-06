@@ -5362,6 +5362,17 @@ impl Agent {
         )
     }
 
+    /// Screen bounded auxiliary fields against both configured policy and
+    /// credentials learned earlier in this conversation. The disposable
+    /// projection never mutates the live vault or exports its reversible IDs.
+    pub(crate) fn project_auxiliary_inputs(
+        &self,
+        parts: &[&str],
+        privacy: &crate::text_completion::AuxiliaryPrivacy,
+    ) -> Result<Vec<String>> {
+        crate::text_completion::redact_inputs_with_vault(parts, privacy, &self.secrets_vault)
+    }
+
     /// Export hygiene (bd-cv653.7.9): mask known secret values in arbitrary
     /// text (e.g. transcript exports or shares) back to their placeholders.
     /// A no-op when the secrets vault is disabled or empty.
@@ -15569,17 +15580,20 @@ impl AgentSession {
     /// advisor configured → no digest built. Failures are isolated inside
     /// the runtime and never fail the run.
     async fn maybe_advise_turn(&mut self) {
-        if self.advisor.is_none() {
+        let Some(runtime) = self.advisor.as_mut() else {
             return;
-        }
-        let digest = crate::advisor::build_digest(self.agent.messages());
+        };
+        let Ok(digest) = runtime.build_digest_with_agent(&self.agent) else {
+            tracing::info!(
+                event = "pi.advisor.privacy_projection_refused",
+                "Advisor request omitted because the configured privacy policy refused its digest"
+            );
+            return;
+        };
         if digest.is_trivial() {
             return;
         }
         let turn_index = self.agent.messages().len() as u64;
-        let Some(runtime) = self.advisor.as_mut() else {
-            return;
-        };
         let outcome = runtime.review_turn(&digest, turn_index).await;
         if std::env::var_os("PI_DEBUG_ADVISOR").is_some() {
             eprintln!(
@@ -22804,6 +22818,70 @@ mod tests {
                 })
             };
             assert!(has_entry, "advisor_note session entry recorded");
+        });
+    }
+
+    #[test]
+    fn advisor_hook_blocks_configured_and_remembered_secrets_before_provider_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime build");
+        runtime.block_on(async {
+            let advisor = Arc::new(ScriptedDoerProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let known = "rememberedCredentialValue123456";
+            agent
+                .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                .unwrap();
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            session.advisor = Some(
+                crate::advisor::AdvisorRuntime::new(advisor.clone(), "privacy-test".to_string())
+                    .with_secrets_settings(Some(&crate::secrets::SecretsSettings {
+                        mode: Some("block".to_string()),
+                        extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+                    })),
+            );
+            for command in [
+                format!("{} ACME-123456", "x".repeat(300)),
+                "API_KEY=r4nd0mCredentialValue123456".to_string(),
+                format!("echo {known}"),
+            ] {
+                session.agent.replace_messages(vec![Message::Assistant(Arc::new(
+                    AssistantMessage {
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            id: "privacy-call".to_string(),
+                            name: "bash".to_string(),
+                            arguments: json!({"command": command}),
+                            thought_signature: None,
+                        })],
+                        ..Default::default()
+                    },
+                ))]);
+                let original = serde_json::to_value(session.agent.messages()).unwrap();
+                session.maybe_advise_turn().await;
+                assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(serde_json::to_value(session.agent.messages()).unwrap(), original);
+                assert!(!session.advisor.as_ref().unwrap().is_disabled());
+            }
+            // The zero-call assertions must not pass just because the hook is
+            // disabled or globally paused: a clean substantial turn is admitted.
+            session.agent.replace_messages(vec![Message::Assistant(Arc::new(
+                AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("x".repeat(500)))],
+                    ..Default::default()
+                },
+            ))]);
+            session.maybe_advise_turn().await;
+            assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }
 

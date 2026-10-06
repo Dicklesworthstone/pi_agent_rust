@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 use crate::model::{Message, UserContent, UserMessage};
 use crate::provider::Provider;
 use crate::text_completion::{
-    MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text, redact_inputs,
-    with_timeout,
+    AuxiliaryPrivacy, MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text,
+    redact_inputs, with_timeout,
 };
 
 /// System contract for side questions (omp btw-user.md semantics).
@@ -40,11 +40,34 @@ pub type BtwClientFactory = std::sync::Arc<
 pub struct BtwClient {
     provider: Arc<dyn Provider>,
     api_key: Option<String>,
+    privacy: Arc<AuxiliaryPrivacy>,
+}
+
+/// A bounded, screened side request ready for background execution. Fields
+/// remain private so callers cannot bypass preparation with unchecked text.
+pub struct PreparedBtwRequest {
+    system_prompt: String,
+    context_summary: String,
+    question: String,
+    privacy: Arc<AuxiliaryPrivacy>,
 }
 
 impl BtwClient {
     pub fn new(provider: Arc<dyn Provider>, api_key: Option<String>) -> Self {
-        Self { provider, api_key }
+        Self {
+            provider,
+            api_key,
+            privacy: Arc::new(AuxiliaryPrivacy::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_secrets_settings(
+        mut self,
+        settings: Option<&crate::secrets::SecretsSettings>,
+    ) -> Self {
+        self.privacy = Arc::new(AuxiliaryPrivacy::from_settings(settings));
+        self
     }
 
     /// Resolve provider + credentials for `entry` and build a client using
@@ -55,6 +78,7 @@ impl BtwClient {
         entry: &crate::models::ModelEntry,
         cli_api_key: Option<&str>,
         auth: &crate::auth::AuthStorage,
+        secrets: Option<&crate::secrets::SecretsSettings>,
     ) -> Option<std::sync::Arc<Self>> {
         let key = crate::models::resolve_model_key(cli_api_key, auth, entry);
         let credentialed =
@@ -64,23 +88,119 @@ impl BtwClient {
         }
         crate::providers::create_provider(entry, None)
             .ok()
-            .map(|provider| std::sync::Arc::new(Self::new(provider, key)))
+            .map(|provider| {
+                std::sync::Arc::new(Self::new(provider, key).with_secrets_settings(secrets))
+            })
     }
 
     /// Ask an ephemeral side question with compact context from the current
     /// conversation tail. Returns only a clean, complete answer, never a
     /// preview left behind by a failed or disconnected provider.
     ///
-    /// This tool-free projection always redacts built-in credential shapes,
-    /// including when a library caller supplies its own context summary. It
-    /// never exports reversible IDs from a disposable secret vault.
+    /// Configured patterns apply even when a library caller supplies its own
+    /// context summary, and block mode refuses before provider admission.
+    /// This never exports reversible IDs from a disposable secret vault.
     /// Owner cancellation and missing timer authority are reported separately
     /// from timeout, and neither admits a new provider request.
     pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
         let [system_prompt, context_summary, question]: [String; 3] =
-            redact_inputs(&[BTW_SYSTEM_PROMPT, context_summary, question])?
+            redact_inputs(&[BTW_SYSTEM_PROMPT, context_summary, question], &self.privacy)?
                 .try_into()
                 .map_err(|_| Error::validation("side-question privacy projection changed shape"))?;
+        self.ask_prepared(PreparedBtwRequest {
+            system_prompt,
+            context_summary,
+            question,
+            privacy: Arc::clone(&self.privacy),
+        })
+        .await
+    }
+
+    /// Screen complete selected transcript fields and the side question in
+    /// one projection before clipping context. A credential discovered after
+    /// the display cutoff still protects earlier echoes or refuses the call.
+    pub async fn ask_with_messages(&self, messages: &[Message], question: &str) -> Result<String> {
+        self.ask_prepared(self.prepare_with_messages(messages, question)?)
+            .await
+    }
+
+    /// Prepare only bounded text while the host borrows the live transcript.
+    /// Attachments and the full conversation never move to the background task.
+    pub fn prepare_with_messages(
+        &self,
+        messages: &[Message],
+        question: &str,
+    ) -> Result<PreparedBtwRequest> {
+        self.prepare_projected(messages, question, |inputs| {
+            redact_inputs(inputs, &self.privacy)
+        })
+    }
+
+    /// Preserve the live agent's knowledge of bare credential values, even
+    /// when their original assignments are outside the selected context.
+    pub fn prepare_with_agent(
+        &self,
+        agent: &crate::agent::Agent,
+        question: &str,
+    ) -> Result<PreparedBtwRequest> {
+        self.prepare_projected(agent.messages(), question, |inputs| {
+            agent.project_auxiliary_inputs(inputs, &self.privacy)
+        })
+    }
+
+    fn prepare_projected(
+        &self,
+        messages: &[Message],
+        question: &str,
+        screen: impl FnOnce(&[&str]) -> Result<Vec<String>>,
+    ) -> Result<PreparedBtwRequest> {
+        let reserved_bytes = BTW_SYSTEM_PROMPT
+            .len()
+            .checked_add(question.len())
+            .filter(|bytes| *bytes <= MAX_INPUT_BYTES)
+            .ok_or_else(|| {
+                Error::validation(
+                    "PI_AUXILIARY_INPUT_LIMIT: input exceeds the auxiliary privacy scan budget",
+                )
+            })?;
+        let pieces = collect_context_pieces(messages, reserved_bytes);
+        let inputs: Vec<&str> = std::iter::once(BTW_SYSTEM_PROMPT)
+            .chain(pieces.iter().flat_map(ContextPiece::inputs))
+            .chain(std::iter::once(question))
+            .collect();
+        let protected = screen(&inputs)?;
+        if protected.len() != inputs.len() {
+            return Err(Error::validation("side-question privacy projection changed shape"));
+        }
+        let mut protected = protected.into_iter();
+        let system_prompt = protected
+            .next()
+            .ok_or_else(|| Error::validation("side-question privacy projection lost system text"))?;
+        let question = protected
+            .next_back()
+            .ok_or_else(|| Error::validation("side-question privacy projection lost question"))?;
+        Ok(PreparedBtwRequest {
+            system_prompt,
+            context_summary: render_context_summary(pieces, protected),
+            question,
+            privacy: Arc::clone(&self.privacy),
+        })
+    }
+
+    /// Execute a previously screened request without scanning its redaction
+    /// markers again. Preparation is bound to this client's privacy policy.
+    pub async fn ask_prepared(&self, request: PreparedBtwRequest) -> Result<String> {
+        if !Arc::ptr_eq(&self.privacy, &request.privacy) {
+            return Err(Error::validation(
+                "PI_AUXILIARY_POLICY_MISMATCH: side question was prepared by another client",
+            ));
+        }
+        let PreparedBtwRequest {
+            system_prompt,
+            context_summary,
+            question,
+            ..
+        } = request;
         let user_text = if context_summary.is_empty() {
             question
         } else {
@@ -120,31 +240,57 @@ impl BtwClient {
 /// Retain a complete candidate before screening, not a raw prefix that may
 /// cut a credential below its detector's minimum length. Stop at a bounded
 /// raw scan budget and report an omission instead of sending uninspected data.
+struct ContextPiece {
+    prefix: &'static str,
+    tool_name: Option<String>,
+    text: String,
+    limit: usize,
+}
+
+impl ContextPiece {
+    fn inputs(&self) -> impl Iterator<Item = &str> {
+        self.tool_name
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.text.as_str()))
+    }
+}
+
 fn push_context_piece(
-    pieces: &mut Vec<(String, usize)>,
+    pieces: &mut Vec<ContextPiece>,
     raw_bytes: &mut usize,
-    prefix: &[&str],
+    prefix: &'static str,
+    tool_name: Option<&str>,
     text: &str,
     limit: usize,
 ) -> bool {
     if pieces.len() >= MAX_CONTEXT_PIECES {
         return false;
     }
-    let bytes = prefix
-        .iter()
-        .try_fold(text.len(), |total, part| total.checked_add(part.len()));
+    let bytes = text
+        .len()
+        .checked_add(prefix.len())
+        .and_then(|bytes| bytes.checked_add(tool_name.map_or(0, str::len)))
+        .and_then(|bytes| bytes.checked_add(if tool_name.is_some() { 2 } else { 0 }));
     let next = bytes.and_then(|bytes| raw_bytes.checked_add(bytes));
     let Some(next) = next.filter(|next| *next <= MAX_INPUT_BYTES) else {
         if OMITTED_INPUT.len() <= MAX_INPUT_BYTES.saturating_sub(*raw_bytes) {
-            pieces.push((OMITTED_INPUT.to_string(), OMITTED_INPUT.len()));
+            pieces.push(ContextPiece {
+                prefix: "",
+                tool_name: None,
+                text: OMITTED_INPUT.to_string(),
+                limit: OMITTED_INPUT.len(),
+            });
         }
         return false;
     };
     *raw_bytes = next;
-    let mut piece = prefix.concat();
-    let prefix_chars = piece.chars().count();
-    piece.push_str(text);
-    pieces.push((piece, limit.saturating_add(prefix_chars)));
+    pieces.push(ContextPiece {
+        prefix,
+        tool_name: tool_name.map(str::to_string),
+        text: text.to_string(),
+        limit,
+    });
     true
 }
 
@@ -156,13 +302,22 @@ fn push_context_piece(
 /// oversized source fields are omitted rather than partially disclosed.
 #[must_use]
 pub fn build_context_summary(messages: &[Message]) -> String {
+    let pieces = collect_context_pieces(messages, 0);
+    let inputs: Vec<&str> = pieces.iter().flat_map(ContextPiece::inputs).collect();
+    let Ok(protected) = redact_inputs(&inputs, &AuxiliaryPrivacy::default()) else {
+        return OMITTED_INPUT.to_string();
+    };
+    render_context_summary(pieces, protected)
+}
+
+fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<ContextPiece> {
     let mut pieces = Vec::new();
-    let mut raw_bytes = 0usize;
+    let mut raw_bytes = reserved_bytes;
     'messages: for message in messages.iter().rev() {
         match message {
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
-                    if !push_context_piece(&mut pieces, &mut raw_bytes, &["user: "], text, 400) {
+                    if !push_context_piece(&mut pieces, &mut raw_bytes, "user: ", None, text, 400) {
                         break;
                     }
                 }
@@ -172,7 +327,8 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                             && !push_context_piece(
                                 &mut pieces,
                                 &mut raw_bytes,
-                                &["user: "],
+                                "user: ",
+                                None,
                                 &text.text,
                                 400,
                             )
@@ -188,14 +344,16 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                         crate::model::ContentBlock::Text(text) => push_context_piece(
                             &mut pieces,
                             &mut raw_bytes,
-                            &["assistant: "],
+                            "assistant: ",
+                            None,
                             &text.text,
                             400,
                         ),
                         crate::model::ContentBlock::ToolCall(call) => push_context_piece(
                             &mut pieces,
                             &mut raw_bytes,
-                            &["assistant ran tool "],
+                            "assistant ran tool ",
+                            None,
                             &call.name,
                             400,
                         ),
@@ -214,7 +372,8 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                 if !push_context_piece(
                     &mut pieces,
                     &mut raw_bytes,
-                    &["tool ", &result.tool_name, ": "],
+                    "tool ",
+                    Some(&result.tool_name),
                     first.unwrap_or(""),
                     160,
                 ) {
@@ -224,14 +383,31 @@ pub fn build_context_summary(messages: &[Message]) -> String {
             Message::Custom(_) => {}
         }
     }
-    let inputs: Vec<&str> = pieces.iter().map(|(text, _)| text.as_str()).collect();
-    let Ok(protected) = redact_inputs(&inputs) else {
-        return OMITTED_INPUT.to_string();
-    };
+    pieces
+}
+
+fn render_context_summary(
+    pieces: Vec<ContextPiece>,
+    protected: impl IntoIterator<Item = String>,
+) -> String {
+    let mut protected = protected.into_iter();
     let mut rendered = Vec::new();
     let mut used = 0usize;
-    for (piece, (_, limit)) in protected.into_iter().zip(pieces) {
-        let piece = truncate(&piece, limit);
+    for piece in pieces {
+        let mut text = piece.prefix.to_string();
+        if piece.tool_name.is_some() {
+            let Some(tool_name) = protected.next() else {
+                return OMITTED_INPUT.to_string();
+            };
+            text.push_str(&tool_name);
+            text.push_str(": ");
+        }
+        let prefix_chars = text.chars().count();
+        let Some(content) = protected.next() else {
+            return OMITTED_INPUT.to_string();
+        };
+        text.push_str(&content);
+        let piece = truncate(&text, piece.limit.saturating_add(prefix_chars));
         if used + piece.len() + 1 > CONTEXT_BUDGET_CHARS {
             break;
         }
@@ -306,6 +482,70 @@ mod tests {
     }
 
     struct ScriptedProvider(Vec<crate::model::StreamEvent>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "btw-privacy-test"
+        }
+
+        fn api(&self) -> &str {
+            "btw-privacy-test"
+        }
+
+        fn model_id(&self) -> &str {
+            "btw-privacy-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(options.api_key.as_deref(), Some("test-key"));
+            assert!(context.tools.is_empty());
+            let Message::User(user) = &context.messages[0] else {
+                panic!("expected side-question user input");
+            };
+            let UserContent::Text(text) = &user.content else {
+                panic!("expected bounded side-question text");
+            };
+            self.prompts.lock().unwrap().push(text.clone());
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("safe answer"),
+                        )],
+                        ..Default::default()
+                    },
+                },
+            )])))
+        }
+    }
+
+    fn privacy_client(mode: &str) -> (BtwClient, Arc<RecordingProvider>) {
+        let provider = Arc::new(RecordingProvider::default());
+        let client = BtwClient::new(provider.clone(), Some("test-key".to_string()))
+            .with_secrets_settings(Some(&crate::secrets::SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+            }));
+        (client, provider)
+    }
 
     #[allow(clippy::unnecessary_literal_bound)]
     #[async_trait::async_trait]
@@ -425,7 +665,7 @@ mod tests {
         )
         .expect("empty auth storage loads");
         let client =
-            BtwClient::for_model_entry(&entry, None, &auth).expect("local provider builds");
+            BtwClient::for_model_entry(&entry, None, &auth, None).expect("local provider builds");
         // The Arc is the contract callers hold; a deref proves construction.
         let _arc: std::sync::Arc<BtwClient> = client;
     }
@@ -448,7 +688,7 @@ mod tests {
             std::process::id()
         )))
         .expect("empty auth storage loads");
-        assert!(BtwClient::for_model_entry(&entry, None, &auth).is_none());
+        assert!(BtwClient::for_model_entry(&entry, None, &auth, None).is_none());
     }
 
     fn user(text: impl Into<String>) -> Message {
@@ -541,6 +781,136 @@ mod tests {
                     .unwrap(),
                 "values omitted"
             );
+        });
+    }
+
+    #[test]
+    fn configured_side_questions_screen_complete_fields_before_clipping() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in ["obfuscate", "off"] {
+                let (client, provider) = privacy_client(mode);
+                let echo = "r4nd0mCredentialValue123456";
+                let messages = vec![
+                    user(format!("{}ACME-654321", "x".repeat(391))),
+                    user(format!("echo {echo}")),
+                ];
+                let original = serde_json::to_value(&messages).unwrap();
+                let question = format!("Does API_KEY={echo} match ACME-123456?");
+                assert_eq!(
+                    client.ask_with_messages(&messages, &question).await.unwrap(),
+                    "safe answer",
+                );
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let prompts = provider.prompts.lock().unwrap();
+                assert!(!prompts[0].contains("ACME-"), "no clipped credential prefix");
+                assert!(!prompts[0].contains(echo), "discovery spans question and history");
+                assert!(prompts[0].contains("echo <pi-secret:redacted>"));
+                assert!(prompts[0].contains("match <pi-secret:redacted>?"));
+                drop(prompts);
+                assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+            }
+        });
+    }
+
+    #[test]
+    fn block_policy_refuses_direct_and_history_requests_before_provider_admission() {
+        asupersync::test_utils::run_test(|| async {
+            let (client, provider) = privacy_client("block");
+            for (context, question) in [
+                ("", "What is ACME-123456?"),
+                ("ACME-123456", "explain this context"),
+                ("", "API_KEY=r4nd0mCredentialValue123456"),
+            ] {
+                let error = client.ask(context, question).await.unwrap_err();
+                assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+                assert!(!error.to_string().contains("ACME-123456"));
+                assert!(!error.to_string().contains("r4nd0mCredentialValue123456"));
+            }
+            for secret in ["ACME-123456", "API_KEY=r4nd0mCredentialValue123456"] {
+                let messages = vec![user(format!("{} {secret}", "x".repeat(500)))];
+                let error = client
+                    .ask_with_messages(&messages, "explain the earlier work")
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            }
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(provider.prompts.lock().unwrap().is_empty());
+            assert_eq!(client.ask("clean context", "why?").await.unwrap(), "safe answer");
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn anchored_patterns_apply_to_source_text_before_display_labels() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in ["obfuscate", "block"] {
+                let provider = Arc::new(RecordingProvider::default());
+                let client = BtwClient::new(provider.clone(), Some("test-key".to_string()))
+                    .with_secrets_settings(Some(&crate::secrets::SecretsSettings {
+                        mode: Some(mode.to_string()),
+                        extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+                    }));
+                let messages = vec![user("ACME-123456")];
+                let answer = client.ask_with_messages(&messages, "explain").await;
+                if mode == "block" {
+                    assert!(answer.unwrap_err().to_string().contains("PI_SECRET_BLOCK"));
+                    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                } else {
+                    assert_eq!(answer.unwrap(), "safe answer");
+                    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    let prompts = provider.prompts.lock().unwrap();
+                    assert!(prompts[0].contains("user: <pi-secret:redacted>"));
+                    assert!(!prompts[0].contains("ACME-"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn live_preparation_keeps_prior_vault_discoveries_and_block_mode() {
+        asupersync::test_utils::run_test(|| async {
+            let (client, provider) = privacy_client("obfuscate");
+            let mut agent = crate::agent::Agent::new(
+                provider.clone(),
+                crate::tools::ToolRegistry::from_tools(Vec::new()),
+                crate::agent::AgentConfig::default(),
+            );
+            let known = "rememberedCredentialValue123456";
+            agent
+                .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                .unwrap();
+            // The defining assignment has already fallen out of the history.
+            agent.replace_messages(vec![user(format!("echo {known}"))]);
+            let request = client.prepare_with_agent(&agent, "why?").unwrap();
+            assert_eq!(client.ask_prepared(request).await.unwrap(), "safe answer");
+            let prompts = provider.prompts.lock().unwrap();
+            assert!(!prompts[0].contains(known));
+            assert!(prompts[0].contains("echo <pi-secret:redacted>"));
+            assert!(!prompts[0].contains("<pi-secret:000001>"));
+            drop(prompts);
+            let (block_client, block_provider) = privacy_client("block");
+            let error = block_client
+                .prepare_with_agent(&agent, "why?")
+                .err()
+                .expect("known bare credential must block before clipping");
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(block_provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(agent.mask_secrets_text(known), "<pi-secret:000001>");
+        });
+    }
+
+    #[test]
+    fn prepared_request_cannot_be_sent_through_another_clients_privacy_policy() {
+        asupersync::test_utils::run_test(|| async {
+            let (source, _) = privacy_client("obfuscate");
+            let (destination, provider) = privacy_client("block");
+            let request = source
+                .prepare_with_messages(&[], "What is ACME-123456?")
+                .unwrap();
+            let error = destination.ask_prepared(request).await.unwrap_err();
+            assert!(error.to_string().contains("PI_AUXILIARY_POLICY_MISMATCH"));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
     }
 

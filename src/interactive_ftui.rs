@@ -1508,8 +1508,12 @@ pub enum UiCommand {
     Reload,
     /// `/btw <question>`: an ephemeral side question to the smol role model
     /// with a compact, vault-transformed summary of the conversation. The
-    /// answer is display-only and never enters the session.
-    Btw(String),
+    /// answer is display-only and never enters the session. Bind queued
+    /// questions to the session that was visible when they were submitted.
+    Btw {
+        question: String,
+        owner_session_id: String,
+    },
     /// `/fresh`: reset provider stream state (new stream session id and
     /// prompt cache key) without changing the transcript.
     Fresh,
@@ -1793,8 +1797,8 @@ pub struct PiFtuiModel {
     /// (`session_control`): Enter steers it, alt+enter queues a follow-up,
     /// Escape aborts it. Empty between turns.
     turn_control: Option<TurnControlSlot>,
-    /// `/btw` client, for side questions asked while the driver is busy
-    /// with a turn (answered without conversation context).
+    /// `/btw` availability. The driver prepares every side question against
+    /// its live transcript and remembered credentials after the active turn.
     btw_client: Option<Arc<crate::btw::BtwClient>>,
     /// Background answers that arrived mid-turn, rendered at the turn boundary.
     ///
@@ -3130,7 +3134,7 @@ impl PiFtuiModel {
         // /btw is the one command meant for mid-turn use.
         if let Some(question) = strip_command(&clean, "/btw") {
             let question = question.trim().to_string();
-            self.queue_btw_mid_turn(&question);
+            self.queue_btw(&question);
             return;
         }
         // OMP /queue <message>: a follow-up for after the agent yields, the
@@ -3205,39 +3209,46 @@ impl PiFtuiModel {
         }
     }
 
-    /// `/btw` while the agent works: the driver is inside the turn and cannot
-    /// build (or vault-transform) a conversation summary, so the question goes
-    /// out alone, as the classic stack does when its agent is busy, and says
-    /// so. The answer shows as soon as it arrives.
-    fn queue_btw_mid_turn(&mut self, question: &str) {
+    /// Every side question waits for the driver to screen it against the live
+    /// vault. Sending directly while a turn owns the Agent would miss bare
+    /// credentials learned earlier in the conversation.
+    fn queue_btw(&mut self, question: &str) {
         if question.is_empty() {
             self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
             return;
         }
-        let Some(client) = self.btw_client.clone() else {
+        if self.btw_client.is_none() {
             self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
+            return;
+        }
+        if question.len()
+            > crate::text_completion::MAX_INPUT_BYTES
+                .saturating_sub(crate::btw::BTW_SYSTEM_PROMPT.len())
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("/btw refused: question exceeds the auxiliary privacy scan budget"),
+            );
+            return;
+        }
+        let Some(owner_session_id) = self.displayed_session_id.clone() else {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("/btw: session is still loading; try again when it is ready"),
+            );
             return;
         };
         self.input.set_text("");
-        self.push_entry(
-            EntryRole::System,
-            format!("(/btw) {question} — agent busy, answering without conversation context"),
-        );
-        let question = question.to_string();
-        self.pending_task = Some(Box::new(move || {
-            let answer = asupersync::runtime::RuntimeBuilder::new()
-                .build()
-                .map_err(|err| err.to_string())
-                .and_then(|runtime| {
-                    runtime
-                        .block_on(client.ask("", &question))
-                        .map_err(|err| err.to_string())
-                });
-            PiFtuiMsg::Agent(PiMsg::System(match answer {
-                Ok(answer) => format!("(/btw) {answer}"),
-                Err(err) => format!("(/btw) failed: {err}"),
-            }))
-        }));
+        let note = if self.state == AgentUiState::Working {
+            format!("(/btw) {question} — queued until the current turn finishes")
+        } else {
+            format!("(/btw) {question}")
+        };
+        self.push_entry(EntryRole::System, note);
+        self.send_command(UiCommand::Btw {
+            question: question.to_string(),
+            owner_session_id,
+        });
     }
 
     /// alt+up: pull steering and follow-up messages the running turn has not
@@ -3789,15 +3800,7 @@ impl PiFtuiModel {
                 return true;
             }
             "/btw" => {
-                let question = cmd_args.trim();
-                if question.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
-                } else if self.btw_client.is_none() {
-                    self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
-                } else {
-                    self.push_entry(EntryRole::System, format!("(/btw) {question}"));
-                    self.send_command(UiCommand::Btw(question.to_string()));
-                }
+                self.queue_btw(cmd_args.trim());
                 return true;
             }
             "/tan" => {
@@ -5897,14 +5900,15 @@ const CTRL_C_EXIT_WINDOW: std::time::Duration = std::time::Duration::from_millis
 const BTW_UNAVAILABLE: &str =
     "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)";
 
-/// `/btw` in the driver: summarize the conversation tail, pass context and
-/// question through the secrets vault exactly as the main provider path
-/// does (a refusal stops it), and ask the smol role model off-thread. The
-/// answer is display-only and never enters the session.
+/// `/btw` in the driver: screen complete selected context fields and the
+/// question with the configured policy and live vault before clipping them.
+/// Only bounded, protected text crosses into the background provider task.
+/// The answer is display-only and never enters the session.
 async fn run_btw_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     client: Option<&Arc<crate::btw::BtwClient>>,
     question: String,
+    owner_session_id: String,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) {
@@ -5912,33 +5916,27 @@ async fn run_btw_command(
         let _ = agent_tx.send(PiMsg::AgentError(String::from(BTW_UNAVAILABLE)));
         return;
     };
-    let summary = crate::btw::build_context_summary(handle.session().agent.messages());
-    let agent = &mut handle.session_mut().agent;
-    let prepared = agent
-        .secrets_transform_outbound_text(&summary)
-        .and_then(|context| {
-            agent
-                .secrets_transform_outbound_text(&question)
-                .map(|question| (context, question))
-        });
-    let (context, question) = match prepared {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
-            return;
-        }
-    };
-    let Ok(owner_session_id) = handle
+    let Ok(current_session_id) = handle
         .with_session(|session| session.header.id.clone())
         .await
     else {
         let _ = agent_tx.send(PiMsg::AgentError(String::from("/btw: session busy")));
         return;
     };
+    if current_session_id != owner_session_id {
+        return;
+    }
+    let prepared = match client.prepare_with_agent(&handle.session().agent, &question) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
+            return;
+        }
+    };
     // ubs:ignore Sender clone per background question — the task must own it
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
-        let message = match client.ask(&context, &question).await {
+        let message = match client.ask_prepared(prepared).await {
             Ok(answer) => format!("(/btw) {answer}"),
             Err(err) => format!("(/btw) failed: {err}"),
         };
@@ -8708,11 +8706,15 @@ pub fn run(
                                 .await;
                             }
                         }
-                        Ok(UiCommand::Btw(question)) => {
+                        Ok(UiCommand::Btw {
+                            question,
+                            owner_session_id,
+                        }) => {
                             run_btw_command(
                                 &mut handle,
                                 driver_btw_client.as_ref(),
                                 question,
+                                owner_session_id,
                                 &agent_tx,
                                 &runtime_handle,
                             )
@@ -13798,16 +13800,20 @@ mod tests {
     fn slash_btw_routes_when_a_smol_client_exists_and_refuses_otherwise() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx)
+        let mut model = PiFtuiModel::new(rx)
             .with_submit_channel(submit_tx)
             .with_btw_client(Some(unroutable_btw_client()));
+        model.displayed_session_id = Some(String::from("btw-session"));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         type_str(&mut sim, "/btw what is a monad");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
-            UiCommand::Btw(String::from("what is a monad"))
+            UiCommand::Btw {
+                question: String::from("what is a monad"),
+                owner_session_id: String::from("btw-session"),
+            }
         );
 
         let (_agent_tx, rx) = mpsc::channel();
@@ -13829,35 +13835,225 @@ mod tests {
         );
     }
 
-    /// Mid-turn, /btw is the one command allowed: it is asked from the UI
-    /// thread without context (the driver is inside the turn) and never
-    /// reaches the steering lane or the command channel.
+    /// Mid-turn questions stay ephemeral and wait in the command lane until
+    /// the driver can screen them against the live vault. The UI must never
+    /// spawn an unseeded auxiliary request while the Agent is borrowed.
     #[test]
-    fn slash_btw_mid_turn_asks_without_context_instead_of_steering() {
+    fn slash_btw_mid_turn_waits_for_live_privacy_projection() {
         let slot: TurnControlSlot = Arc::new(Mutex::new(None));
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx)
+        let mut model = PiFtuiModel::new(rx)
             .with_submit_channel(submit_tx)
             .with_turn_control(slot)
             .with_btw_client(Some(unroutable_btw_client()));
+        model.displayed_session_id = Some(String::from("busy-session"));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         type_str(&mut sim, "/btw quick check");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            submit_rx.try_recv().is_err(),
-            "the busy driver is not asked"
+        assert_eq!(
+            submit_rx.try_recv().expect("question queued for the driver"),
+            UiCommand::Btw {
+                question: String::from("quick check"),
+                owner_session_id: String::from("busy-session"),
+            }
         );
+        assert!(sim.model().pending_task.is_none());
         assert!(sim.model().input.text().is_empty());
         assert!(
             sim.model()
                 .transcript
                 .iter()
-                .any(|entry| entry.text.starts_with("(/btw) quick check — agent busy")),
-            "the note says there is no conversation context"
+                .any(|entry| entry.text.contains("queued until the current turn finishes")),
+            "the note explains when the question will be answered"
         );
+    }
+
+    #[test]
+    fn side_question_queue_bounds_raw_input_and_requires_session_identity() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_btw_client(Some(unroutable_btw_client()));
+        model.queue_btw("a question before the session has loaded");
+        assert!(submit_rx.try_recv().is_err());
+        model.displayed_session_id = Some(String::from("busy-session"));
+        model.state = AgentUiState::Working;
+        model.queue_btw(&"x".repeat(crate::text_completion::MAX_INPUT_BYTES));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(model.pending_task.is_none());
+        assert!(
+            model
+                .transcript
+                .last()
+                .is_some_and(|entry| entry.text.contains("privacy scan budget"))
+        );
+    }
+
+    #[derive(Default)]
+    struct BtwPrivacyProbe {
+        prompts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for BtwPrivacyProbe {
+        fn name(&self) -> &str {
+            "btw-privacy"
+        }
+
+        fn api(&self) -> &str {
+            "test"
+        }
+
+        fn model_id(&self) -> &str {
+            "btw-privacy"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            assert!(context.tools.is_empty());
+            let crate::model::Message::User(user) = &context.messages[0] else {
+                panic!("expected auxiliary user message");
+            };
+            let crate::model::UserContent::Text(text) = &user.content else {
+                panic!("expected auxiliary text projection");
+            };
+            self.prompts.lock().unwrap().push(text.clone());
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("screened side answer"),
+                        )],
+                        ..Default::default()
+                    },
+                },
+            )])))
+        }
+    }
+
+    #[test]
+    fn side_question_driver_rejects_stale_owners_and_screens_remembered_credentials() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            let provider = Arc::new(BtwPrivacyProbe::default());
+            let known = "previouslyLearnedCredentialValue123456";
+            let mut agent = crate::agent::Agent::new(
+                provider.clone(),
+                crate::tools::ToolRegistry::from_tools(Vec::new()),
+                crate::agent::AgentConfig::default(),
+            );
+            agent
+                .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                .unwrap();
+            let session = crate::session::Session::in_memory();
+            let owner_session_id = session.header.id.clone();
+            let session = crate::agent::AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                session,
+                crate::sdk::EventListeners::default(),
+            );
+            let blocked_client = Arc::new(
+                crate::btw::BtwClient::new(provider.clone(), None).with_secrets_settings(Some(
+                    &crate::secrets::SecretsSettings {
+                        mode: Some(String::from("block")),
+                        extra_patterns: None,
+                    },
+                )),
+            );
+            let (agent_tx, agent_rx) = mpsc::channel();
+            run_btw_command(
+                &mut handle,
+                Some(&blocked_client),
+                String::from("a clean but stale question"),
+                String::from("replaced-session"),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            assert!(agent_rx.try_recv().is_err());
+            run_btw_command(
+                &mut handle,
+                Some(&blocked_client),
+                format!("Does {known} still work?"),
+                owner_session_id.clone(),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            assert!(matches!(
+                agent_rx.try_recv().expect("privacy refusal"),
+                PiMsg::AgentError(message)
+                    if message.starts_with("/btw refused:") && !message.contains(known)
+            ));
+            assert!(provider.prompts.lock().unwrap().is_empty());
+
+            // A permitted request must really reach the same provider, with
+            // the remembered value removed even though no assignment remains
+            // in the current transcript.
+            let redacting_client = Arc::new(crate::btw::BtwClient::new(provider.clone(), None));
+            run_btw_command(
+                &mut handle,
+                Some(&redacting_client),
+                format!("Does {known} still work?"),
+                owner_session_id.clone(),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            let answer = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                async {
+                    loop {
+                        if let Ok(message) = agent_rx.try_recv() {
+                            break message;
+                        }
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(1),
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await
+            .expect("screened side request completes");
+            assert!(matches!(
+                answer,
+                PiMsg::SessionSystemNote { owner_session_id: owner, message }
+                    if owner == owner_session_id && message == "(/btw) screened side answer"
+            ));
+            let prompts = provider.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].contains(known));
+            assert!(prompts[0].contains("<pi-secret:redacted>"));
+            assert!(handle.session().agent.messages().is_empty());
+            assert!(handle.session().session.try_lock().unwrap().entries.is_empty());
+        });
     }
 
     /// OMP's read-only info commands and aliases route on the default stack;
