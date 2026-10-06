@@ -7244,22 +7244,20 @@ pub(crate) async fn run_bash_command(
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
+    let child = spawn_command_with_job_discipline(&mut cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
-    attach_child_job_discipline(&child);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
-
-    // Wrap in ProcessGuard for cleanup (including tree kill)
     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
+
+    let stdout = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
+        .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
+    let stderr = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
+        .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
     // We use a bounded channel to provide backpressure. If the child process
     // produces output faster than the async loop can drain it (and spill to disk),
@@ -13688,9 +13686,20 @@ impl ProcessGuard {
     }
 
     pub(crate) fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child
+        let status = self
+            .child
             .as_mut()
-            .map_or(Ok(None), std::process::Child::try_wait)
+            .map_or(Ok(None), std::process::Child::try_wait)?;
+        #[cfg(windows)]
+        if status.is_some()
+            && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && let Some(child) = &self.child
+        {
+            // Descendants can retain stdout after their root exits. Close the
+            // retained Job before the output-drain phase waits for pipe EOF.
+            terminate_reaped_child_discipline(child.id());
+        }
+        Ok(status)
     }
 
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
@@ -13708,19 +13717,36 @@ impl ProcessGuard {
     }
 
     pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(mut child) = self.child.take() {
-            return child.wait();
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        // Keep ownership on wait errors so a later retry or Drop still has
+        // the child handle and its registered Windows Job available.
+        let status = child.wait()?;
+        #[cfg(windows)]
+        if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+            terminate_reaped_child_discipline(child.id());
         }
-        Err(std::io::Error::other("Already waited"))
+        drop(self.child.take());
+        Ok(status)
     }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) | Err(_) => return,
+            let status = child.try_wait();
+            #[cfg(windows)]
+            if !matches!(status, Ok(None))
+                && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            {
+                // Even an ambiguous wait error must release our owned Job.
+                // Do not infer that the root was reaped or walk its PID.
+                let _ = win_job::terminate(child.id());
+            }
+            if !matches!(status, Ok(None)) {
+                return;
             }
             let cleanup_mode = self.cleanup_mode;
             std::thread::spawn(move || {
@@ -13732,7 +13758,22 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// Attach a freshly-spawned child to platform tree-discipline bookkeeping.
+/// Spawn with Windows Job membership established before any child code runs.
+///
+/// Unix callers configure their process group on `command` before calling.
+/// A returned child owns exactly one registered Job on Windows; do not also
+/// call `attach_child_job_discipline`. The caller must immediately retain its
+/// existing cleanup guard and release the discipline when the root is reaped.
+pub(crate) fn spawn_command_with_job_discipline(
+    command: &mut Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    return win_job::spawn(command);
+    #[cfg(not(windows))]
+    command.spawn()
+}
+
+/// Attach an already-spawned child to platform tree-discipline bookkeeping.
 ///
 /// Windows assigns the child to a kill-on-close Job object so later
 /// `kill_process_group_tree` / `terminate_process_group_tree` calls reap the
@@ -13740,6 +13781,8 @@ impl Drop for ProcessGuard {
 /// snapshot and the kill (bd-9jgrt item 1). Unix needs nothing here: the
 /// child already leads its own process group. Hub PTY services are out of
 /// scope (portable-pty children keep the walk-based discipline).
+/// This cannot contain descendants created before attachment. New owned
+/// launch paths should use `spawn_command_with_job_discipline` instead.
 // Const only on unix where the body degenerates to `let _`; the windows
 // branch calls non-const job registration, so the lint cannot hold for both
 // targets at once.
@@ -13783,13 +13826,55 @@ mod win_job {
 
     use std::collections::HashMap;
     use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
+    use std::os::windows::process::{CommandExt as _, ProcThreadAttributeList};
+    use std::process::{Child, Command};
     use std::sync::{LazyLock, Mutex};
 
     use win32job::{ExtendedLimitInfo, Job};
 
     static REGISTRY: LazyLock<Mutex<HashMap<u32, Job>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000d;
+
+    pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+        spawn_in_registry(command, &REGISTRY, |_, _| Ok(()))
+    }
+
+    fn spawn_in_registry(
+        command: &mut Command,
+        registry: &Mutex<HashMap<u32, Job>>,
+        before_registration: impl FnOnce(&Child, &Job) -> std::io::Result<()>,
+    ) -> std::io::Result<Child> {
+        let mut map = registry
+            .lock()
+            .map_err(|_| std::io::Error::other("Windows Job registry is poisoned"))?;
+        prune_dead_entries(&mut map);
+        // Nothing fallible remains in registry publication after OS spawn.
+        map.try_reserve(1).map_err(std::io::Error::other)?;
+        let mut limits = ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        let job = Job::create_with_limit_info(&limits).map_err(std::io::Error::other)?;
+
+        // Windows 10 / Server 2016+: PROC_THREAD_ATTRIBUTE_JOB_LIST assigns
+        // membership inside CreateProcess, before the first thread can run.
+        // The owned Job and this actual HANDLE-sized array both outlive the
+        // attribute list and spawn. Passing the array itself (not a slice or
+        // pointer to a temporary) supplies the exact documented value size.
+        let job_handles = [job.handle()];
+        let attributes = ProcThreadAttributeList::build()
+            .attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)
+            .finish()?;
+        let mut child = command.spawn_with_attributes(&attributes)?;
+        drop(attributes);
+        if let Err(error) = before_registration(&child, &job) {
+            drop(job);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        map.insert(child.id(), job);
+        Ok(child)
+    }
 
     /// Assign `child` to a fresh kill-on-close job and remember it by pid.
     ///
@@ -13821,11 +13906,17 @@ mod win_job {
     /// existed. Dropping the stored `Job` closes the handle, and
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
     pub fn terminate(pid: u32) -> bool {
-        REGISTRY
+        terminate_in_registry(pid, &REGISTRY)
+    }
+
+    fn terminate_in_registry(pid: u32, registry: &Mutex<HashMap<u32, Job>>) -> bool {
+        // Refuse new spawns after a registry panic, but preserve cleanup of
+        // Jobs already owned by callers. Keep the mutex poisoned afterward.
+        let job = registry
             .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&pid))
-            .is_some()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pid);
+        job.is_some()
     }
 
     /// Drop entries whose root process no longer exists so the map (and its
@@ -13846,6 +13937,233 @@ mod win_job {
         for pid in dead {
             // Jobs whose root died are empty; dropping just reclaims the handle.
             map.remove(&pid);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::Path;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        const FIXTURE: &str = "tools::win_job::tests::atomic_job_child_fixture";
+        const ROLE_ENV: &str = "PI_TEST_ATOMIC_JOB_ROLE";
+        const PID_FILE_ENV: &str = "PI_TEST_ATOMIC_JOB_PID_FILE";
+
+        fn fixture_command(role: &str, pid_file: &Path) -> Command {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", FIXTURE, "--nocapture"])
+                .env(ROLE_ENV, role)
+                .env(PID_FILE_ENV, pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        }
+
+        #[test]
+        fn atomic_job_child_fixture() {
+            let Ok(role) = std::env::var(ROLE_ENV) else {
+                return;
+            };
+            let pid_file = std::env::var_os(PID_FILE_ENV).unwrap();
+            if role == "root" || role == "root-exit" {
+                // Deliberately spawn before any parent-side registration can
+                // run. This descendant must inherit containment at birth.
+                let mut descendant = fixture_command("descendant", Path::new(&pid_file))
+                    .spawn()
+                    .unwrap();
+                std::fs::write(&pid_file, descendant.id().to_string()).unwrap();
+                if role == "root-exit" {
+                    let exit_gate = Path::new(&pid_file).with_extension("exit");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !exit_gate.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(30));
+                let _ = descendant.kill();
+                let _ = descendant.wait();
+            } else {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        fn descendant_pid(path: &Path) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.parse()
+                {
+                    return pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not publish its descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_exit(child: &mut Child) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("contained process did not exit after its Job closed");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn child_and_first_descendant_are_contained_before_registration() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(
+                        members.contains(&usize::try_from(descendant).unwrap()),
+                        "the first descendant escaped before parent-side registration"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let job = registry.lock().unwrap().remove(&child.id()).unwrap();
+            drop(job);
+            wait_for_exit(&mut child);
+            assert!(registry.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn poisoned_registry_refuses_before_the_child_is_created() {
+            let registry = Mutex::new(HashMap::new());
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected registry poison");
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("must-not-run.pid");
+            let mut spawned = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |_, _| {
+                    spawned = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("registry is poisoned"));
+            assert!(!spawned);
+            assert!(!pid_file.exists());
+        }
+
+        #[test]
+        fn poisoned_registry_still_releases_an_owned_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected poison after owned spawn");
+            });
+            assert!(terminate_in_registry(child.id(), &registry));
+            wait_for_exit(&mut child);
+            assert!(!terminate_in_registry(child.id(), &registry));
+            assert!(registry.is_poisoned());
+            assert!(
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn failed_publication_reaps_the_child_and_does_not_register_a_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            // A separate nested Job keeps a queryable observer after the
+            // production Job closes, without relying on a recycled PID probe.
+            let observer = Job::create().unwrap();
+            let mut observed_spawn = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    observer
+                        .assign_process(child.as_raw_handle() as isize)
+                        .unwrap();
+                    observed_spawn = true;
+                    Err(std::io::Error::other("injected publication refusal"))
+                },
+            )
+            .unwrap_err();
+            assert!(observed_spawn);
+            assert_eq!(error.to_string(), "injected publication refusal");
+            assert!(registry.lock().unwrap().is_empty());
+            assert!(
+                observer.query_process_id_list().unwrap().is_empty(),
+                "the failed spawn must finish reaping before returning its error"
+            );
+        }
+
+        #[test]
+        fn process_guard_releases_the_job_when_its_root_exits() {
+            for completion in ["try_wait", "wait", "drop"] {
+                let directory = tempfile::tempdir().unwrap();
+                let pid_file = directory.path().join("descendant.pid");
+                let mut child = spawn(&mut fixture_command("root-exit", &pid_file)).unwrap();
+                let pid = child.id();
+                let descendant = descendant_pid(&pid_file);
+                assert!(
+                    REGISTRY.lock().unwrap()[&pid]
+                        .query_process_id_list()
+                        .unwrap()
+                        .contains(&usize::try_from(descendant).unwrap())
+                );
+                std::fs::write(pid_file.with_extension("exit"), "exit").unwrap();
+                wait_for_exit(&mut child);
+                let mut guard = super::super::ProcessGuard::new(
+                    child,
+                    super::super::ProcessCleanupMode::ProcessGroupTree,
+                );
+                match completion {
+                    "try_wait" => assert!(guard.try_wait_child().unwrap().is_some()),
+                    "wait" => assert!(guard.wait().unwrap().success()),
+                    _ => drop(guard),
+                }
+                assert!(!REGISTRY.lock().unwrap().contains_key(&pid));
+            }
         }
     }
 }

@@ -1565,23 +1565,12 @@ pub fn spawn_background(
     invoke_before_os_spawn_hook(owner_session_id);
     ensure_session_spawn_generation(owner_session_id, spawn_generation)
         .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
-    let mut child = cmd.spawn().map_err(|e| {
+    let child = crate::tools::spawn_command_with_job_discipline(&mut cmd).map_err(|e| {
         Error::tool(
             "bash",
             format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
         )
     })?;
-    if !crate::tools::attach_child_job_discipline(&child) {
-        crate::tools::kill_process_group_tree(Some(child.id()));
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(Error::tool(
-            "bash",
-            format!(
-                "Failed to attach background shell to platform process-tree discipline{cleanup_failure_context}"
-            ),
-        ));
-    }
     let pid = child.id();
     let mut child = BackgroundChild::new(child);
     let stdout = child

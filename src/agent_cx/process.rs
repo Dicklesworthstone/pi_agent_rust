@@ -135,9 +135,11 @@ impl AgentCommand {
             use std::os::unix::process::CommandExt as _;
             self.command.process_group(0);
         }
-        let child = self.owner.process().spawn_checked(&mut self.command)?;
+        let child = {
+            let _guard = self.owner.cx().clone().set_current_restricted();
+            crate::tools::spawn_command_with_job_discipline(&mut self.command)?
+        };
         let mut child = AgentChild::new(self.owner.clone(), child);
-        crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child"));
         // A cancellation concurrent with spawn cannot leave an unowned process.
         if self.owner.checkpoint().is_err() {
             let _ = child.terminate();
@@ -342,6 +344,81 @@ mod tests {
             command.spawn().err().unwrap().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_spawn_preserves_configuration_output_and_exit_status() {
+        use std::io::Read as _;
+        use std::time::Instant;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = AgentCommand::new(AgentCx::for_request(), "cmd.exe")
+            .args([
+                "/D",
+                "/C",
+                "echo %PI_TEST_ATOMIC_VALUE%&echo error-text 1>&2&exit /B 7",
+            ])
+            .current_dir(directory.path())
+            .env("PI_TEST_ATOMIC_VALUE", "owned-value")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned Windows process did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+        assert!(child.child.is_none());
+        assert!(child.descendants_stopped);
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .take_stdout()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .take_stderr()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(stdout.trim(), "owned-value");
+        assert_eq!(stderr.trim(), "error-text");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_spawn_cancellation_reaps_without_a_cli_launcher() {
+        let owner = AgentCx::for_request();
+        let mut child = AgentCommand::new(owner.clone(), "cmd.exe")
+            .args(["/D", "/C", "set /P ignored="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel contained Windows process"),
+        );
+        assert_eq!(
+            child.try_wait().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(child.child.is_none());
+        assert!(child.status.is_some());
+        assert!(child.descendants_stopped);
     }
 
     #[cfg(unix)]
