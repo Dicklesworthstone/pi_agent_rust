@@ -12692,6 +12692,47 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 }
 
+/// Dropping a save future does not stop its blocking filesystem work. Arm this
+/// guard only around the save itself: waiting for the Session lock or running a
+/// provider does not yet make persistence indeterminate. Do not hold a provider
+/// permit here; extension callbacks may already own it while awaiting Session.
+struct TurnPersistenceGuard<'a> {
+    admission: &'a ProviderAdmissionGate,
+    completed: bool,
+}
+
+impl Drop for TurnPersistenceGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut reason = self
+                .admission
+                .reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reason.get_or_insert_with(|| {
+                "turn persistence was interrupted before its durable result was observed"
+                    .to_string()
+            });
+        }
+    }
+}
+
+async fn flush_turn_autosave(
+    session: &mut Session,
+    admission: &ProviderAdmissionGate,
+    trigger: AutosaveFlushTrigger,
+) -> Result<()> {
+    let mut guard = TurnPersistenceGuard {
+        admission,
+        completed: false,
+    };
+    let result = session.flush_autosave(trigger).await;
+    // The caller handles an observed error with its original turn failure.
+    // Never clear admission here: another operation may own its quarantine.
+    guard.completed = true;
+    result
+}
+
 /// A failed turn save leaves durability uncertain for every caller, including
 /// surfaces that use [`AgentSession`] without the SDK recovery driver. Fence the
 /// shared admission gate before returning the typed persistence error.
@@ -12718,6 +12759,42 @@ fn finish_turn_persistence<T>(
 #[cfg(test)]
 mod finish_turn_persistence_tests {
     use super::*;
+
+    #[test]
+    fn pending_turn_save_does_not_block_or_replace_another_quarantine() {
+        let admission = ProviderAdmissionGate::default();
+        let guard = TurnPersistenceGuard {
+            admission: &admission,
+            completed: false,
+        };
+        admission
+            .ensure_allowed()
+            .expect("an active save must not reject an in-flight extension completion");
+        admission.block("a separate transition failed".to_string());
+        drop(guard);
+        assert_eq!(
+            admission.reason().as_deref(),
+            Some("a separate transition failed")
+        );
+    }
+
+    #[test]
+    fn completed_no_op_turn_flush_preserves_existing_quarantine() {
+        let admission = ProviderAdmissionGate::default();
+        admission.block("an earlier save was interrupted".to_string());
+        let mut session = Session::in_memory();
+        futures::executor::block_on(flush_turn_autosave(
+            &mut session,
+            &admission,
+            AutosaveFlushTrigger::Manual,
+        ))
+        .expect("an empty autosave queue needs no filesystem work");
+        assert_eq!(session.autosave_metrics().flush_started, 0);
+        assert_eq!(
+            admission.reason().as_deref(),
+            Some("an earlier save was interrupted")
+        );
+    }
 
     #[test]
     fn persistence_failure_is_terminal_without_hiding_primary_turn_error() {
@@ -15450,9 +15527,13 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session
-                .flush_autosave(AutosaveFlushTrigger::Periodic)
-                .await?;
+            let persist_result = flush_turn_autosave(
+                &mut session,
+                &self.provider_admission,
+                AutosaveFlushTrigger::Periodic,
+            )
+            .await;
+            finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
         }
         Ok(())
     }
@@ -15465,10 +15546,13 @@ impl AgentSession {
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
-        session
-            .flush_autosave(AutosaveFlushTrigger::Periodic)
-            .await?;
-        Ok(())
+        let persist_result = flush_turn_autosave(
+            &mut session,
+            &self.provider_admission,
+            AutosaveFlushTrigger::Periodic,
+        )
+        .await;
+        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)
     }
 
     pub async fn run_text(
@@ -16127,7 +16211,12 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(prompt_message.clone());
             if self.save_enabled {
-                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                let persist_result = flush_turn_autosave(
+                    &mut session,
+                    &self.provider_admission,
+                    AutosaveFlushTrigger::Manual,
+                )
+                .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
@@ -16218,7 +16307,12 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                let persist_result = flush_turn_autosave(
+                    &mut session,
+                    &self.provider_admission,
+                    AutosaveFlushTrigger::Manual,
+                )
+                .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
@@ -16303,7 +16397,12 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                let persist_result = flush_turn_autosave(
+                    &mut session,
+                    &self.provider_admission,
+                    AutosaveFlushTrigger::Manual,
+                )
+                .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
@@ -16455,9 +16554,12 @@ impl AgentSession {
                 session.append_model_message(message);
             }
             if self.save_enabled {
-                session
-                    .flush_autosave(AutosaveFlushTrigger::Periodic)
-                    .await?;
+                flush_turn_autosave(
+                    &mut session,
+                    &self.provider_admission,
+                    AutosaveFlushTrigger::Periodic,
+                )
+                .await?;
             }
         }
         Ok(())
