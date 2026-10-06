@@ -308,6 +308,8 @@ pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]
+pub mod session_workdir;
+#[doc(hidden)]
 pub mod skills_managed;
 pub mod sse;
 pub mod stats;
