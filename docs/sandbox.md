@@ -64,3 +64,34 @@ CLI 等价开关（优先级高于配置）：`pi --sandbox <off|auto|on>`。
 `Config.sandbox` 由 settings 文件驱动，经 `default_tool_registry` 自动生效，无需额外
 接线。端到端示例见 `examples/sandbox_e2e.rs`（off 零差异 / 凭据拒读 / 白名单拦截 /
 PTY 路径 / 双会话共享 manager）。
+
+## Windows 支持(2026-10 起)
+
+Windows 走 fork 的 `srt-win` 后端,**机制与 macOS/Linux 本质不同**:专用本地账户
+(`srt-sandbox`)+ WFP 内核围栏 + 会话级 NTFS ACL,两跳启动(broker →
+CreateProcessWithLogonW 拉起 runner → 受限 token + Job Object 拉起命令)。
+
+### 安装(一次性)
+
+```
+srt windows-install
+```
+
+弹一次 UAC(幂等;可 `--proxy-port-range LOW-HIGH` / `--sandbox-user`,须与
+`sandbox` 配置一致)。运行时**无需管理员**。srt 更新后若内嵌 helper 变化,首次使用会
+提示再装一次。
+
+### Windows 平台差距(相对 macOS/Linux)
+
+- **默认权限反转**:沙箱账户对用户目录**零读取权**。`~/.gitconfig`、`~/.cargo`、
+  `~/.npm` 等默认不可见——用 `sandbox.allowRead` 显式授予(Windows 专属字段);
+  项目目录本身已随 `allowWrite` 授予。
+- **bash/工具链必须机器级安装**(如 `choco install git` 到 `C:\Program Files\Git`);
+  per-user 安装对沙箱账户不可读,启动即报 `ShellNotReadable` 并给出指引。
+- **WSL shell 不支持**(会落到沙箱账户的空 WSL 环境)。
+- **PTY 永久禁用**:沙箱化命令一律无 TTY(isatty 型命令行为变化,自动回退管道)。
+- **每命令沙箱化启动较慢**(两跳 + 新登录会话)。
+- 系统解析器 DNS 不围栏(与 macOS 一致);schannel 证书吊销检查会被围栏拦截
+  (`CRYPT_E_REVOCATION_OFFLINE`,需按工具禁用吊销检查)。
+- 违规归因(violation store)在 Windows 不可用(无 Seatbelt 日志流等价物)。
+- `sandbox.allowRead/allowWrite/denyWrite` 现已全平台可配置(unix 上同样生效)。
