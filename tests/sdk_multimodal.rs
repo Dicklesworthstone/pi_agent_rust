@@ -9,7 +9,7 @@ use pi::sdk::{
     AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, AgentSessionHandle, ContentBlock,
     Error, EventListeners, FailoverOptions, ImageContent, InputType, Message,
     ResolvedCompactionSettings, Session, SessionPromptResult, SessionTransport,
-    SessionTransportEvent, StopReason, StreamOptions, ToolRegistry, UserContent,
+    SessionTransportEvent, StopReason, StreamEvent, StreamOptions, ToolRegistry, UserContent,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -339,6 +339,25 @@ fn reopen(handle: &AgentSessionHandle) -> Session {
     run_async(Session::open(&path.display().to_string())).expect("reopen session")
 }
 
+fn capture_stream_events(handle: &mut AgentSessionHandle) -> Arc<Mutex<Vec<StreamEvent>>> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    handle.listeners_mut().on_stream_event = Some(Arc::new(move |event| {
+        observed.lock().expect("stream event lock").push(event.clone());
+    }));
+    events
+}
+
+fn terminal_reasons(events: &[StreamEvent]) -> Vec<StopReason> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Done { reason, .. } | StreamEvent::Error { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
     for explicit_abort in [false, true] {
@@ -346,6 +365,15 @@ fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
         let mut server = ApiFixture::new(vec![503, 200]);
         let mut handle =
             handle(&server.url, root.path(), false).with_retry(Some(retry_policy(1, 0)));
+        let streams = capture_stream_events(&mut handle);
+        let subscribed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = Arc::clone(&subscribed);
+        handle.subscribe(move |event| {
+            observed
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+        });
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let callback = move |event| captured.lock().expect("event lock").push(event);
@@ -368,6 +396,31 @@ fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
         })
         .expect("image turn recovered");
         assert_eq!(message.stop_reason, StopReason::Stop);
+        {
+            let streams = streams.lock().unwrap();
+            assert_eq!(
+                terminal_reasons(&streams),
+                [StopReason::Error, StopReason::Stop]
+            );
+            let Some(StreamEvent::Done {
+                message: terminal, ..
+            }) = streams.last()
+            else {
+                panic!("typed stream must finish with the recovered response");
+            };
+            assert_eq!(
+                serde_json::to_value(terminal).unwrap(),
+                serde_json::to_value(&message).unwrap()
+            );
+            let text = streams
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(text, "Images received", "deltas must not be replayed");
+        }
         for request in server.finish(2) {
             assert_wire_images(&request, "compare these images");
         }
@@ -375,6 +428,14 @@ fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
         assert_stored_images(&stored);
         assert_eq!(stored.len(), 2, "only user and final assistant remain");
         let events = events.lock().expect("event lock").clone();
+        assert_eq!(
+            *subscribed.lock().unwrap(),
+            events
+                .iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect::<Vec<_>>(),
+            "typed terminal delivery must not alter generic SDK fan-out"
+        );
         assert_eq!(
             events
                 .iter()
@@ -430,6 +491,7 @@ fn sdk_mml_img_preabort_has_no_provider_or_session_side_effects() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![200]);
     let mut handle = handle(&server.url, root.path(), false);
+    let streams = capture_stream_events(&mut handle);
     let (abort, signal) = AbortHandle::new();
     abort.abort();
     let result = run_async(handle.prompt_with_images_with_abort(
@@ -439,6 +501,7 @@ fn sdk_mml_img_preabort_has_no_provider_or_session_side_effects() {
         |_| panic!("a pre-aborted prompt must not emit a started lifecycle"),
     ));
     assert!(matches!(result, Err(Error::Aborted)));
+    assert!(streams.lock().unwrap().is_empty());
     server.finish(0);
     assert!(run_async(handle.messages()).unwrap().is_empty());
     assert!(handle.session_store().try_lock().unwrap().path.is_none());
@@ -449,6 +512,7 @@ fn sdk_mml_img_backoff_abort_keeps_attachments_without_reissuing() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![503, 200]);
     let mut handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(2, 0)));
+    let streams = capture_stream_events(&mut handle);
     let (abort, signal) = AbortHandle::new();
     let result = run_async(handle.prompt_with_images_with_abort(
         "keep images",
@@ -461,7 +525,43 @@ fn sdk_mml_img_backoff_abort_keeps_attachments_without_reissuing() {
         },
     ));
     assert!(matches!(result, Err(Error::Aborted)));
+    assert_eq!(
+        terminal_reasons(&streams.lock().unwrap()),
+        [StopReason::Error]
+    );
     assert_wire_images(&server.finish(1)[0], "keep images");
+    assert_stored_images(&reopen(&handle).to_messages_for_current_path());
+}
+
+#[test]
+fn sdk_mml_img_stream_abort_delivers_one_error_terminal_and_no_success() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut server = ApiFixture::new(vec![200, 200]);
+    let mut handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(2, 0)));
+    let streams = capture_stream_events(&mut handle);
+    let (abort, signal) = AbortHandle::new();
+    let message = run_async(handle.prompt_with_images_with_abort(
+        "abort this response",
+        images(),
+        signal,
+        move |event| {
+            if matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: Message::Assistant(_)
+                }
+            ) {
+                abort.abort();
+            }
+        },
+    ))
+    .expect("stream cancellation returns its assistant outcome");
+    assert_eq!(message.stop_reason, StopReason::Aborted);
+    assert_eq!(
+        terminal_reasons(&streams.lock().unwrap()),
+        [StopReason::Aborted]
+    );
+    assert_wire_images(&server.finish(1)[0], "abort this response");
     assert_stored_images(&reopen(&handle).to_messages_for_current_path());
 }
 
@@ -510,36 +610,173 @@ fn sdk_mml_img_provider_image_blocking_still_applies() {
     assert!(!encoded.contains("image_url"));
 }
 
-#[test]
-fn sdk_mml_img_failed_retry_save_fences_later_image_prompts() {
+fn assert_turn_save_failure_fences_every_entrypoint(with_images: bool, retry: bool) {
     let root = tempfile::tempdir().expect("tempdir");
-    let mut server = ApiFixture::new(vec![503, 200]);
-    let mut handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(1, 0)));
+    // Keep an extra response available so an illegal later provider call is
+    // observable rather than disguised as an unavailable fixture server.
+    let statuses = if retry {
+        vec![503, 200, 200]
+    } else {
+        vec![200, 200]
+    };
+    let mut server = ApiFixture::new(statuses);
+    let policy = retry.then_some(retry_policy(1, 0));
+    let mut handle = handle(&server.url, root.path(), false).with_retry(policy);
+    let streams = capture_stream_events(&mut handle);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed_events = Arc::clone(&events);
     let blocked = root.path().join("directory-not-session.jsonl");
     std::fs::create_dir(&blocked).expect("blocked persistence path");
     let store = handle.session_store();
     let original = Arc::new(Mutex::new(None::<PathBuf>));
     let captured = Arc::clone(&original);
-    let result = run_async(
-        handle.prompt_with_images("persist once", images(), move |event| {
-            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
-                let mut session = store.try_lock().expect("between-attempt session lock");
-                *captured.lock().expect("path lock") = session.path.clone();
-                session.path = Some(blocked.clone());
-            }
-        }),
+    let callback = move |event| {
+        if matches!(
+            &event,
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(message)
+            } if message.stop_reason == StopReason::Stop
+        ) {
+            // Inject after the successful provider response, immediately
+            // before its turn artifacts are saved. In the retry case this is
+            // the continuation's save, NOT the failed-tail restoration save.
+            let mut session = store.try_lock().expect("before turn-save session lock");
+            let mut original = captured.lock().expect("path lock");
+            assert!(original.is_none(), "inject the fault exactly once");
+            *original = Some(session.path.clone().expect("user prompt was saved"));
+            session.path = Some(blocked.clone());
+        }
+        observed_events
+            .lock()
+            .unwrap()
+            .push(serde_json::to_value(event).unwrap());
+    };
+    let result = run_async(async {
+        if with_images {
+            handle
+                .prompt_with_images("persist once", images(), callback)
+                .await
+        } else {
+            handle.prompt("persist once", callback).await
+        }
+    });
+    assert!(
+        result.as_ref().is_err_and(Error::is_session_persistence),
+        "completed provider work must not hide failed persistence: {result:?}"
     );
-    assert!(result.as_ref().is_err_and(Error::is_session_persistence));
-    handle.session_store().try_lock().unwrap().path = original.lock().unwrap().clone();
-    let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
-    let again = run_async(handle.prompt_with_images("must not append", images(), |_| {}));
-    assert!(again.as_ref().is_err_and(Error::is_session_persistence));
+    let expected_terminals = if retry {
+        vec![StopReason::Error, StopReason::Stop]
+    } else {
+        vec![StopReason::Stop]
+    };
+    let stream_count = streams.lock().unwrap().len();
     assert_eq!(
-        before,
-        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap()
+        terminal_reasons(&streams.lock().unwrap()),
+        expected_terminals
     );
-    assert_stored_images(&reopen(&handle).to_messages_for_current_path());
-    server.finish(1);
+    {
+        let events = events.lock().unwrap();
+        let terminal = events.last().expect("logical terminal event");
+        assert_eq!(terminal["type"], "agent_end");
+        assert!(
+            terminal["error"]
+                .as_str()
+                .unwrap()
+                .contains(Error::SESSION_PERSISTENCE_PREFIX),
+            "provider Done is not a successful durability acknowledgement"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "agent_end")
+                .count(),
+            1
+        );
+    }
+    let original = original.lock().unwrap().clone().expect("fault was injected");
+    handle.session_store().try_lock().unwrap().path = Some(original.clone());
+    let disk_before = std::fs::read(&original).expect("read original durable transcript");
+    let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+    let expected_requests = if retry { 2 } else { 1 };
+    assert_eq!(server.requests.lock().unwrap().len(), expected_requests);
+
+    for entrypoint in 0..6 {
+        let (_abort, signal) = AbortHandle::new();
+        let callback = |_| panic!("quarantined entrypoint must not emit events");
+        let again = run_async(async {
+            match entrypoint {
+                0 => handle.prompt("must not append", callback).await,
+                1 => {
+                    handle
+                        .prompt_with_abort("must not append", signal, callback)
+                        .await
+                }
+                2 => {
+                    handle
+                        .prompt_with_images("must not append", images(), callback)
+                        .await
+                }
+                3 => {
+                    handle
+                        .prompt_with_images_with_abort(
+                            "must not append",
+                            images(),
+                            signal,
+                            callback,
+                        )
+                        .await
+                }
+                4 => handle.continue_turn(callback).await,
+                _ => handle.continue_turn_with_abort(signal, callback).await,
+            }
+        });
+        assert!(
+            again.as_ref().is_err_and(Error::is_session_persistence),
+            "entrypoint {entrypoint}: repaired paths must not clear quarantine: {again:?}"
+        );
+        assert_eq!(
+            before,
+            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+            "entrypoint {entrypoint}: live history must not change"
+        );
+        assert_eq!(
+            disk_before,
+            std::fs::read(&original).unwrap(),
+            "entrypoint {entrypoint}: durable history must not change"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), expected_requests);
+        assert_eq!(streams.lock().unwrap().len(), stream_count);
+    }
+    if with_images {
+        assert_stored_images(&reopen(&handle).to_messages_for_current_path());
+    }
+    for request in server.finish(expected_requests) {
+        if with_images {
+            assert_wire_images(&request, "persist once");
+        } else {
+            assert_eq!(user_wire_content(&request), "persist once");
+        }
+    }
+}
+
+#[test]
+fn sdk_mml_img_failed_retry_save_fences_later_image_prompts() {
+    assert_turn_save_failure_fences_every_entrypoint(true, true);
+}
+
+#[test]
+fn sdk_mml_img_failed_first_turn_save_fences_every_entrypoint() {
+    assert_turn_save_failure_fences_every_entrypoint(true, false);
+}
+
+#[test]
+fn sdk_mml_text_failed_retry_turn_save_fences_every_entrypoint() {
+    assert_turn_save_failure_fences_every_entrypoint(false, true);
+}
+
+#[test]
+fn sdk_mml_text_failed_first_turn_save_fences_every_entrypoint() {
+    assert_turn_save_failure_fences_every_entrypoint(false, false);
 }
 
 #[cfg(unix)]
