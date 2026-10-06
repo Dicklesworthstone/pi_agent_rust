@@ -13158,7 +13158,13 @@ impl AgentSession {
             .as_ref()
             .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
             != Some((target_provider_id.as_str(), target_model_id.as_str()))
+            || candidate
+                .active_failover_provenance_for_current_path()
+                .is_some()
         {
+            // Explicitly choosing the active fallback makes it the user's
+            // primary. Persist that intent even when its identity is unchanged,
+            // or reopening the session revives the old automatic restoration.
             candidate.append_model_change(target_provider_id.clone(), target_model_id.clone());
         }
         candidate.set_model_header(

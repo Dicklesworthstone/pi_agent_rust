@@ -347,6 +347,159 @@ fn saving_recovery_handle(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUsize>) 
     (handle, calls)
 }
 
+fn saving_fallback_selection_handle(dir: &Path) -> AgentSessionHandle {
+    let mut handle = saving_handle(dir);
+    let (provider, model) = handle.model();
+    let provenance = crate::session::ModelChangeFailover {
+        primary_provider: "anthropic".to_string(),
+        primary_model_id: "claude-3-5-haiku-latest".to_string(),
+        primary_thinking_level: Some("off".to_string()),
+        fallback_provider: provider.clone(),
+        fallback_model_id: model.clone(),
+        chain_position: Some(2),
+        cooldown_deadline: Some(chrono::Utc::now().to_rfc3339()),
+        cooldown_secs: Some(0),
+        lifecycle_id: Some("selection-fixture".to_string()),
+    };
+    let store = handle.session_store();
+    {
+        let mut session = store.try_lock().unwrap();
+        session.set_model_header(
+            Some(provider.clone()),
+            Some(model.clone()),
+            Some("off".into()),
+        );
+        session.append_model_change_with_role_and_failover(
+            provider,
+            model,
+            Some("failover".into()),
+            Some(provenance.clone()),
+        );
+    }
+    run_async(handle.session.persist_session()).expect("persist fallback provenance");
+    handle = handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec!["openai/gpt-4o-mini".to_string()],
+        )]),
+        available_models: Vec::new(),
+        auth: AuthStorage::empty_at(dir.join("auth.json")),
+        cli_api_key: Some("fixture-key".to_string()),
+        cooldown_secs: 0,
+    }));
+    handle.failover_state = crate::failover::FailoverState::reconstruct_from_provenance(
+        &provenance,
+        0,
+        chrono::Utc::now(),
+    );
+    handle
+}
+
+#[test]
+fn explicitly_selecting_the_fallback_cancels_restoration_durably() {
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let (provider, model) = handle.model();
+    assert!(
+        handle
+            .failover_state
+            .should_restore_primary(std::time::Instant::now())
+    );
+    run_async(handle.set_model(&provider, &model)).expect("choose the active fallback");
+
+    assert!(handle.failover_state.primary().is_none());
+    assert!(handle.failover_state.active().is_none());
+    assert!(handle.failover_state.lifecycle_id().is_none());
+    assert_eq!(handle.failover_state.chain_position(), 0);
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert!(
+        reopened
+            .active_failover_provenance_for_current_path()
+            .is_none()
+    );
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some((provider.clone(), model.clone()))
+    );
+    let model_changes = reopened
+        .entries_for_current_path()
+        .into_iter()
+        .filter(|entry| matches!(entry, crate::session::SessionEntry::ModelChange(_)))
+        .count();
+    assert_eq!(model_changes, 2, "one fallback and one explicit choice");
+
+    // A repeated selection stays a no-op once the automatic cycle is retired.
+    run_async(handle.set_model(&provider, &model)).expect("repeat explicit choice");
+    let repeated = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        repeated
+            .entries_for_current_path()
+            .into_iter()
+            .filter(|entry| matches!(entry, crate::session::SessionEntry::ModelChange(_)))
+            .count(),
+        model_changes
+    );
+
+    let (events, callback) = event_log();
+    let message = run_async(handle.prompt("continue on my selected model", move |event| {
+        callback(event);
+    }))
+    .expect("selected fixture model answers");
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(handle.model(), (provider, model));
+    assert!(
+        !events.lock().unwrap().iter().any(|event| {
+            matches!(event["type"].as_str(), Some("failover_start" | "failover_end"))
+        })
+    );
+}
+
+#[test]
+fn rejected_model_selection_keeps_the_previous_fallback_cycle() {
+    let dir = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(dir.path());
+    let original_model = handle.model();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let original_bytes = std::fs::read(&path).unwrap();
+    run_async(handle.set_model("missing-provider", "missing-model"))
+        .expect_err("invalid selection is refused");
+    assert_eq!(handle.model(), original_model);
+    assert_eq!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_eq!(handle.failover_state.chain_position(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+
+    let blocked = dir.path().join("blocked-selection.jsonl");
+    std::fs::create_dir(&blocked).unwrap();
+    handle.session_store().try_lock().unwrap().path = Some(blocked);
+    let result = run_async(handle.set_model(&original_model.0, &original_model.1));
+    assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+    assert_eq!(handle.model(), original_model);
+    assert_eq!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_eq!(handle.failover_state.chain_position(), 2);
+    assert!(
+        handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .active_failover_provenance_for_current_path()
+            .is_some()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+}
+
 fn assert_quarantined_entrypoints(handle: &mut AgentSessionHandle, calls: &AtomicUsize) {
     let before = calls.load(Ordering::SeqCst);
     for entrypoint in ENTRYPOINTS {

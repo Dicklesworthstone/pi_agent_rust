@@ -2056,8 +2056,14 @@ impl AgentSessionHandle {
     }
 
     /// Update the active provider/model pair and persist it to session metadata.
+    /// A successful explicit selection ends the previous fallback cycle, even
+    /// when the selected model is the fallback that is already running.
     pub async fn set_model(&mut self, provider: &str, model_id: &str) -> Result<()> {
-        self.session.set_provider_model(provider, model_id).await
+        self.session.set_provider_model(provider, model_id).await?;
+        // Clear only after the durable selection commits. A failed selection
+        // must leave the existing primary, cooldown and chain cursor intact.
+        self.failover_state.clear();
+        Ok(())
     }
 
     /// Return the currently configured thinking level.
