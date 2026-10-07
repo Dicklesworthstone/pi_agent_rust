@@ -11,12 +11,13 @@ use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, Message, StopReason, ThinkingLevel, UserContent, UserMessage};
+use crate::model::{Message, ThinkingLevel, UserContent, UserMessage};
 use crate::models::{ModelEntry, ModelRegistry};
 use crate::provider::{Context, Provider, StreamEvent, StreamOptions};
 use crate::provider_metadata::{provider_ids_match, split_provider_model_spec};
+use crate::text_completion::{AuxiliaryPrivacy, RequestStop, collect_text, redact_inputs};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ type ReflectionStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 pub struct ReflectTool {
     store: Arc<MemoryStore>,
     binding: Option<(Arc<dyn Provider>, StreamOptions)>,
+    privacy: Option<AuxiliaryPrivacy>,
 }
 
 impl ReflectTool {
@@ -45,6 +47,7 @@ impl ReflectTool {
         Self {
             store,
             binding: None,
+            privacy: None,
         }
     }
 
@@ -65,12 +68,29 @@ impl ReflectTool {
         Self {
             store,
             binding: Some((provider, options)),
+            privacy: None,
         }
     }
 
-    fn resolve_binding(&self) -> Result<(Arc<dyn Provider>, StreamOptions)> {
+    /// Configure direct tool calls, which do not have an Agent's live vault.
+    /// Agent-owned execution supplies its current policy and discoveries for
+    /// each invocation instead of retaining a stale shared vault snapshot.
+    #[must_use]
+    pub fn with_secrets_settings(
+        mut self,
+        settings: Option<&crate::secrets::SecretsSettings>,
+    ) -> Self {
+        self.privacy = Some(AuxiliaryPrivacy::from_settings(settings));
+        self
+    }
+
+    fn resolve_binding(&self) -> Result<(Arc<dyn Provider>, StreamOptions, AuxiliaryPrivacy)> {
         if let Some((provider, options)) = &self.binding {
-            return Ok((Arc::clone(provider), options.clone()));
+            return Ok((
+                Arc::clone(provider),
+                options.clone(),
+                self.privacy.clone().unwrap_or_default(),
+            ));
         }
         let root = self.store.project_root();
         let global_dir = Config::global_dir();
@@ -109,7 +129,11 @@ impl ReflectTool {
         let options = options_for_entry(&auth, &entry)?;
         let provider = crate::providers::create_provider(&entry, None)
             .map_err(|error| safe_error(&error.to_string(), &options))?;
-        Ok((provider, options))
+        let privacy = self
+            .privacy
+            .clone()
+            .unwrap_or_else(|| AuxiliaryPrivacy::from_settings(config.secrets.as_ref()));
+        Ok((provider, options, privacy))
     }
 
     fn gather(&self, question: &str) -> Result<Vec<Memory>> {
@@ -148,6 +172,61 @@ impl ReflectTool {
                 .map(|(_, memory)| memory)
                 .collect())
         })
+    }
+
+    async fn execute_reflection(
+        &self,
+        input: serde_json::Value,
+        protect: Option<&(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync)>,
+    ) -> Result<ToolOutput> {
+        let input: ReflectInput =
+            serde_json::from_value(input).map_err(|error| Error::validation(error.to_string()))?;
+        if input.question.trim().is_empty() || input.question.len() > MAX_QUESTION_BYTES {
+            return Err(Error::validation(
+                "Reflection requires a non-empty question of at most 8192 bytes",
+            ));
+        }
+        let owner = AgentCx::for_current_or_request();
+        checkpoint(&owner)?;
+        let corpus = self.gather(&input.question)?;
+        if corpus.is_empty() {
+            return Ok(text_output(
+                "No active memories match this question.".to_string(),
+                json!({"schema": MEMORY_SCHEMA, "citations": [], "sourceMemoryIds": []}),
+                false,
+            ));
+        }
+        let (provider, options, privacy) = self.resolve_binding()?;
+        let direct_protection = |parts: &[&str]| redact_inputs(parts, &privacy);
+        let (question, corpus) = screen_sources(
+            &input.question,
+            corpus,
+            protect.unwrap_or(&direct_protection),
+        )?;
+        let prompt = prompt_for(&question, &corpus)?;
+        let context = Context::owned(
+            Some("You synthesize evidence from project memory. Cite supplied ids; never invent sources.".to_string()),
+            vec![Message::User(UserMessage {
+                content: UserContent::Text(prompt),
+                timestamp: now_ms(),
+            })],
+            Vec::new(),
+        );
+        let answer = synthesize(provider.as_ref(), &options, &context, &owner).await?;
+        let citations = citations_in(&answer, &corpus)?;
+        Ok(text_output(
+            answer,
+            json!({
+                "schema": MEMORY_SCHEMA,
+                "question": question,
+                "citations": citations,
+                "sourceMemoryIds": corpus.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+                "memories": corpus,
+                "provider": provider.name(),
+                "model": provider.model_id(),
+            }),
+            false,
+        ))
     }
 }
 
@@ -269,6 +348,54 @@ fn safe_error(message: &str, options: &StreamOptions) -> Error {
     Error::tool("reflect", redacted)
 }
 
+/// Project all user-controlled source fields together, before JSON quoting.
+/// A credential assignment in a later memory or tag can protect an earlier
+/// bare echo. Only owned copies change: stored facts and the live Agent vault
+/// remain untouched, and the projection exports irreversible markers.
+fn screen_sources(
+    question: &str,
+    mut corpus: Vec<Memory>,
+    protect: &(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync),
+) -> Result<(String, Vec<Memory>)> {
+    let mut fields = vec![question];
+    for memory in &corpus {
+        if memory.content.len() > MAX_SOURCE_BYTES {
+            return Err(Error::tool(
+                "reflect",
+                "A relevant memory exceeds the reflection input budget",
+            ));
+        }
+        fields.extend([memory.content.as_str(), memory.kind.as_str()]);
+        fields.extend(memory.tags.iter().map(String::as_str));
+        if let Some(session_id) = &memory.session_id {
+            fields.push(session_id);
+        }
+    }
+    let protected = protect(&fields)?;
+    let malformed = || {
+        Error::tool(
+            "reflect",
+            "Reflection privacy projection changed the source field count",
+        )
+    };
+    if protected.len() != fields.len() {
+        return Err(malformed());
+    }
+    let mut protected = protected.into_iter();
+    let question = protected.next().ok_or_else(malformed)?;
+    for memory in &mut corpus {
+        memory.content = protected.next().ok_or_else(malformed)?;
+        memory.kind = protected.next().ok_or_else(malformed)?;
+        for tag in &mut memory.tags {
+            *tag = protected.next().ok_or_else(malformed)?;
+        }
+        if let Some(session_id) = &mut memory.session_id {
+            *session_id = protected.next().ok_or_else(malformed)?;
+        }
+    }
+    Ok((question, corpus))
+}
+
 fn prompt_for(question: &str, corpus: &[Memory]) -> Result<String> {
     let mut prompt = String::from(
         "Answer using ONLY the memories below. Cite their numeric ids as [id]. \
@@ -328,91 +455,16 @@ fn checkpoint(owner: &AgentCx) -> Result<()> {
 }
 
 async fn collect_answer(
-    mut stream: ReflectionStream,
+    stream: ReflectionStream,
     options: &StreamOptions,
     owner: &AgentCx,
 ) -> Result<String> {
-    let mut streamed_bytes = 0_usize;
-    while let Some(event) = stream.next().await {
-        checkpoint(owner)?;
-        match event.map_err(|error| safe_error(&error.to_string(), options))? {
-            StreamEvent::TextDelta { delta, .. } => {
-                streamed_bytes = streamed_bytes.saturating_add(delta.len());
-                if streamed_bytes > MAX_ANSWER_BYTES {
-                    return Err(Error::tool(
-                        "reflect",
-                        "Reflection exceeded its answer budget",
-                    ));
-                }
-            }
-            StreamEvent::Done { reason, message } => {
-                if reason != StopReason::Stop
-                    || message.stop_reason != StopReason::Stop
-                    || message.error_message.is_some()
-                {
-                    return Err(safe_error(
-                        message
-                            .error_message
-                            .as_deref()
-                            .unwrap_or("Reflection did not complete successfully"),
-                        options,
-                    ));
-                }
-                let mut answer = String::new();
-                for block in message.content {
-                    match block {
-                        ContentBlock::Text(text) => {
-                            if answer.len().saturating_add(text.text.len()) > MAX_ANSWER_BYTES {
-                                return Err(Error::tool(
-                                    "reflect",
-                                    "Reflection exceeded its answer budget",
-                                ));
-                            }
-                            answer.push_str(&text.text);
-                        }
-                        ContentBlock::ToolCall(_) => {
-                            return Err(Error::tool(
-                                "reflect",
-                                "Reflection cannot execute tool calls",
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                if answer.trim().is_empty() {
-                    return Err(Error::tool(
-                        "reflect",
-                        "Reflection completed without an answer",
-                    ));
-                }
-                // The terminal message is authoritative, including providers
-                // that deliver a full result without preliminary deltas.
-                return Ok(answer);
-            }
-            StreamEvent::Error { error, .. } => {
-                return Err(safe_error(
-                    error
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("Reflection provider failed"),
-                    options,
-                ));
-            }
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallDelta { .. }
-            | StreamEvent::ToolCallEnd { .. } => {
-                return Err(Error::tool(
-                    "reflect",
-                    "Reflection cannot execute tool calls",
-                ));
-            }
-            _ => {}
-        }
-    }
-    Err(Error::tool(
-        "reflect",
-        "Reflection stream ended before completion (unexpected EOF)",
-    ))
+    checkpoint(owner)?;
+    let answer = collect_text(stream, MAX_ANSWER_BYTES)
+        .await
+        .map_err(|error| safe_error(&error.to_string(), options))?;
+    checkpoint(owner)?;
+    Ok(answer)
 }
 
 async fn synthesize(
@@ -428,18 +480,30 @@ async fn synthesize(
             "Reflection requires I/O and bounded-timer capabilities",
         ));
     }
-    let now = owner
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
     let request = async {
         let stream = Box::pin(provider.stream(context, options))
             .await
             .map_err(|error| safe_error(&error.to_string(), options))?;
         collect_answer(stream, options, owner).await
     };
-    Box::pin(asupersync::time::timeout(now, REFLECTION_TIMEOUT, request))
+    owner
+        .with_current(crate::text_completion::with_timeout(
+            REFLECTION_TIMEOUT,
+            request,
+        ))
         .await
-        .map_err(|_| Error::tool("reflect", "Reflection timed out before completion"))?
+        .map_err(|stop| {
+            Error::tool(
+                "reflect",
+                match stop {
+                    RequestStop::TimedOut => "Reflection timed out before completion",
+                    RequestStop::Cancelled => "Reflection cancelled",
+                    RequestStop::TimeUnavailable => {
+                        "Reflection requires bounded-timer capabilities"
+                    }
+                },
+            )
+        })?
 }
 
 #[derive(serde::Deserialize)]
@@ -480,55 +544,24 @@ impl Tool for ReflectTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let input: ReflectInput =
-            serde_json::from_value(input).map_err(|error| Error::validation(error.to_string()))?;
-        if input.question.trim().is_empty() || input.question.len() > MAX_QUESTION_BYTES {
-            return Err(Error::validation(
-                "Reflection requires a non-empty question of at most 8192 bytes",
-            ));
-        }
-        let owner = AgentCx::for_current_or_request();
-        checkpoint(&owner)?;
-        let corpus = self.gather(&input.question)?;
-        if corpus.is_empty() {
-            return Ok(text_output(
-                "No active memories match this question.".to_string(),
-                json!({"schema": MEMORY_SCHEMA, "citations": [], "sourceMemoryIds": []}),
-                false,
-            ));
-        }
-        let prompt = prompt_for(&input.question, &corpus)?;
-        let (provider, options) = self.resolve_binding()?;
-        let context = Context::owned(
-            Some("You synthesize evidence from project memory. Cite supplied ids; never invent sources.".to_string()),
-            vec![Message::User(UserMessage {
-                content: UserContent::Text(prompt),
-                timestamp: now_ms(),
-            })],
-            Vec::new(),
-        );
-        let answer = synthesize(provider.as_ref(), &options, &context, &owner).await?;
-        let citations = citations_in(&answer, &corpus)?;
-        Ok(text_output(
-            answer,
-            json!({
-                "schema": MEMORY_SCHEMA,
-                "question": input.question,
-                "citations": citations,
-                "sourceMemoryIds": corpus.iter().map(|memory| memory.id).collect::<Vec<_>>(),
-                "memories": corpus,
-                "provider": provider.name(),
-                "model": provider.model_id(),
-            }),
-            false,
-        ))
+        self.execute_reflection(input, None).await
+    }
+
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        self.execute_reflection(input, Some(protect)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AssistantMessage, TextContent};
+    use crate::model::{AssistantMessage, ContentBlock, StopReason, TextContent};
 
     fn memory(id: i64, content: &str) -> Memory {
         Memory {
@@ -589,7 +622,7 @@ mod tests {
             delta: "partial".to_string(),
         })])
         .unwrap_err();
-        assert!(error.to_string().contains("unexpected EOF"));
+        assert!(error.to_string().contains("without Done event"));
     }
 
     #[test]
@@ -652,6 +685,163 @@ mod tests {
         assert!(prompt.contains("- [7]"));
         assert!(!prompt.contains("\n- [999]"));
         assert!(prompt_for("question", &[memory(7, &"x".repeat(MAX_SOURCE_BYTES + 1))]).is_err());
+    }
+
+    #[test]
+    fn source_projection_discovers_across_fields_before_formatting_and_keeps_storage_unchanged() {
+        const OPAQUE: &str = "opaqueReflectionCredential12345";
+        let mut source = memory(7, &format!("parser uses {OPAQUE}"));
+        source.tags = vec![format!("api_key={OPAQUE}")];
+        source.session_id = Some("ACME-123456".to_string());
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("off".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        }));
+        let protect = |parts: &[&str]| redact_inputs(parts, &privacy);
+        let (question, projected) = screen_sources(
+            "ACME-123456",
+            vec![source.clone()],
+            &protect,
+        )
+        .expect("project complete source set");
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(!question.contains("ACME-123456"));
+        assert!(!serialized.contains("ACME-123456"));
+        assert!(!serialized.contains(OPAQUE));
+        assert!(serialized.contains("<pi-secret:redacted>"));
+        assert!(
+            !regex::Regex::new(r"<pi-secret:[0-9a-f]{6}>")
+                .unwrap()
+                .is_match(&serialized)
+        );
+        assert_eq!(projected[0].id, source.id);
+        assert_eq!(source.content, format!("parser uses {OPAQUE}"));
+        assert_eq!(source.tags, [format!("api_key={OPAQUE}")]);
+    }
+
+    #[test]
+    fn source_projection_refuses_block_mode_and_malformed_projection_without_raw_fallback() {
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        }));
+        let mut source = memory(7, "parser is incremental");
+        source.tags = vec!["ACME-123456".to_string()];
+        let error = screen_sources("parser?", vec![source.clone()], &|parts| {
+            redact_inputs(parts, &privacy)
+        })
+        .expect_err("source metadata must participate in block mode");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+        let error = screen_sources("parser?", vec![source], &|_| Ok(Vec::new()))
+            .expect_err("projection cannot omit fields");
+        assert!(error.to_string().contains("field count"));
+    }
+
+    struct CancellationProvider {
+        idle: bool,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct CancellationStream {
+        idle: bool,
+        remaining: usize,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Stream for CancellationStream {
+        type Item = Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            use std::sync::atomic::Ordering;
+            use std::task::Poll;
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.idle {
+                Poll::Pending
+            } else if self.remaining == 0 {
+                Poll::Ready(None)
+            } else {
+                self.remaining -= 1;
+                Poll::Ready(Some(Ok(StreamEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: String::new(),
+                })))
+            }
+        }
+    }
+
+    impl Drop for CancellationStream {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for CancellationProvider {
+        fn name(&self) -> &str {
+            "reflection-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "reflection-fixture"
+        }
+
+        fn model_id(&self) -> &str {
+            "reflection-fixture"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<ReflectionStream> {
+            Ok(Box::pin(CancellationStream {
+                idle: self.idle,
+                // Finite even with the broken collector: the regression fails
+                // on its first poll instead of hanging the quality lane.
+                remaining: 100_000,
+                polls: Arc::clone(&self.polls),
+                dropped: Arc::clone(&self.dropped),
+            }))
+        }
+    }
+
+    #[test]
+    fn reflection_cancellation_drops_idle_and_continuously_ready_provider_streams() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for idle in [false, true] {
+            let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let provider = CancellationProvider {
+                idle,
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            };
+            runtime.block_on(async {
+                let context = Context::owned(None, Vec::new(), Vec::new());
+                let options = StreamOptions::default();
+                let mut request = std::pin::pin!(synthesize(&provider, &options, &context, &owner));
+                assert!(futures::poll!(&mut request).is_pending());
+                let admitted_polls = polls.load(Ordering::SeqCst);
+                assert!(admitted_polls > 0 && admitted_polls < 100_000);
+                owner.cancel_with(asupersync::types::CancelKind::User, Some("reflection test"));
+                let error = request.await.expect_err("cancel must stop the reflection");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+                assert_eq!(polls.load(Ordering::SeqCst), admitted_polls);
+                assert!(dropped.load(Ordering::SeqCst));
+                assert!(!asupersync::Cx::current().unwrap().is_cancel_requested());
+            });
+        }
     }
 
     #[test]

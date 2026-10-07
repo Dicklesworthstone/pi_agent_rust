@@ -32,6 +32,16 @@ fn first_text(output: &ToolOutput) -> &str {
         .unwrap_or("")
 }
 
+fn assert_irreversible_redaction(text: &str) {
+    assert!(text.contains("<pi-secret:redacted>"));
+    assert!(
+        !regex::Regex::new(r"<pi-secret:[0-9a-f]{6}>")
+            .unwrap()
+            .is_match(text),
+        "auxiliary context must not carry a restorable vault id"
+    );
+}
+
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
         .log()
@@ -158,6 +168,19 @@ impl ReflectionServer {
             .join()
             .expect("server thread")
             .expect("captured request")
+    }
+
+    fn assert_no_request(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        assert!(
+            self.join
+                .take()
+                .unwrap()
+                .join()
+                .expect("server thread")
+                .is_none(),
+            "privacy refusal must precede reflection provider admission"
+        );
     }
 }
 
@@ -328,6 +351,223 @@ fn reflect_cites_memory_ids_through_provider_http() {
 }
 
 #[test]
+fn reflect_screens_question_and_memories_before_http_without_changing_stored_facts() {
+    const OPAQUE: &str = "opaqueReflectionCredential12345";
+    let harness = TestHarness::new("reflect_privacy_http");
+    let root = project_dir(&harness, "proj");
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    let stored = store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            &format!("parser uses {OPAQUE}"),
+            &["ACME-123456".to_string()],
+            None,
+        )
+        .unwrap();
+    let settings = pi::secrets::SecretsSettings {
+        // Secondary calls retain their irreversible privacy floor even when
+        // reversible obfuscation is off for the main conversation.
+        mode: Some("off".to_string()),
+        extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+    };
+    let server = ReflectionServer::start(
+        200,
+        gemini_body(
+            &format!("The parser uses the configured value [{}].", stored.id),
+            Some("STOP"),
+        ),
+    );
+    let tool =
+        reflection_tool(Arc::clone(&store), &server).with_secrets_settings(Some(&settings));
+    let output = block_on_local(tool.execute(
+        "reflection-privacy",
+        json!({"question": format!("parser api_key={OPAQUE}")}),
+        None,
+    ))
+    .expect("screened reflection");
+    let request = server.finish();
+    let body = serde_json::to_string(&request.body).unwrap();
+    assert!(!body.contains(OPAQUE));
+    assert_irreversible_redaction(&body);
+    assert_eq!(request.headers["x-goog-api-key"], "reflection-fixture-key");
+    let details = serde_json::to_string(&output.details).unwrap();
+    assert!(!details.contains(OPAQUE));
+    assert!(!details.contains("ACME-123456"));
+    assert_irreversible_redaction(&details);
+    let original = store.recall("parser", None).unwrap();
+    assert_eq!(original[0].content, stored.content);
+    assert_eq!(original[0].tags, stored.tags);
+}
+
+#[test]
+fn reflect_block_mode_rejects_secret_source_metadata_before_http() {
+    let harness = TestHarness::new("reflect_privacy_block_http");
+    let root = project_dir(&harness, "proj");
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "parser is incremental",
+            &["ACME-123456".to_string()],
+            None,
+        )
+        .unwrap();
+    let server = ReflectionServer::start(200, gemini_body("must not be requested", Some("STOP")));
+    let tool = reflection_tool(store, &server).with_secrets_settings(Some(
+        &pi::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        },
+    ));
+    let error = block_on_local(tool.execute(
+        "reflection-block",
+        json!({"question": "parser?"}),
+        None,
+    ))
+    .expect_err("configured block mode must refuse source secrets");
+    assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
+    assert!(!error.to_string().contains("ACME-123456"));
+    server.assert_no_request();
+}
+
+struct ReflectionDriver {
+    via_xdev: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl pi::provider::Provider for ReflectionDriver {
+    fn name(&self) -> &str {
+        "reflection-driver"
+    }
+
+    fn api(&self) -> &str {
+        "reflection-driver"
+    }
+
+    fn model_id(&self) -> &str {
+        "reflection-driver"
+    }
+
+    async fn stream(
+        &self,
+        context: &pi::provider::Context<'_>,
+        _options: &StreamOptions,
+    ) -> pi::error::Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+        >,
+    > {
+        use pi::model::{
+            AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall,
+        };
+        let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(turn < 2, "unexpected extra primary request");
+        let mut message = AssistantMessage {
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            ..AssistantMessage::default()
+        };
+        if turn == 0 {
+            let payload = serde_json::to_string(context.messages.as_ref()).unwrap();
+            let start = payload.find("<pi-secret:").expect("live vault placeholder");
+            let end = start + payload[start..].find('>').unwrap() + 1;
+            let arguments = json!({"question": format!("parser {}", &payload[start..end])});
+            message.stop_reason = StopReason::ToolUse;
+            message.content = vec![ContentBlock::ToolCall(ToolCall {
+                id: "reflect-live-vault".to_string(),
+                name: if self.via_xdev { "xdev" } else { "reflect" }.to_string(),
+                arguments: if self.via_xdev {
+                    json!({"action":"run", "name":"reflect", "args":arguments})
+                } else {
+                    arguments
+                },
+                thought_signature: None,
+            })];
+        } else {
+            message.content = vec![ContentBlock::Text(TextContent::new("reflection complete"))];
+        }
+        Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+            reason: message.stop_reason,
+            message,
+        })])))
+    }
+}
+
+#[test]
+fn direct_and_xdev_reflection_use_the_current_agents_vault_and_patterns() {
+    const OPAQUE: &str = "opaqueLiveSessionCredential12345";
+    let harness = TestHarness::new("reflect_live_agent_privacy");
+    for via_xdev in [false, true] {
+        let root = project_dir(&harness, if via_xdev { "xdev" } else { "direct" });
+        let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+        let stored = store
+            .retain(
+                pi::memory::MemoryKind::Fact,
+                &format!("parser uses {OPAQUE} and ACME-123456"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let server = ReflectionServer::start(
+            200,
+            gemini_body(
+                &format!("Use the parser setting [{}].", stored.id),
+                Some("STOP"),
+            ),
+        );
+        let mut registry = ToolRegistry::new(&["xdev"], &root, Some(&memory_config("local")));
+        assert!(registry.is_discoverable("reflect"));
+        registry.push(Box::new(reflection_tool(Arc::clone(&store), &server)));
+        if !via_xdev {
+            registry.mark_promoted("reflect");
+        }
+        let provider = Arc::new(ReflectionDriver {
+            via_xdev,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = pi::agent::AgentConfig {
+            secrets: Some(pi::secrets::SecretsSettings {
+                mode: Some("obfuscate".to_string()),
+                extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+            }),
+            ..pi::agent::AgentConfig::default()
+        };
+        let mut agent = pi::agent::Agent::new(provider.clone(), registry, config);
+        let tool_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&tool_errors);
+        let answer = block_on_local(agent.run(
+            format!("api_key={OPAQUE}\nReflect on parser"),
+            move |event| {
+                if let pi::agent::AgentEvent::ToolExecutionEnd { result, .. } = event {
+                    captured.lock().unwrap().push(result);
+                }
+            },
+        ))
+        .expect("real reflection tool turn");
+        assert_eq!(answer.stop_reason, pi::model::StopReason::Stop);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let outputs = tool_errors.lock().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(!outputs[0].is_error, "{:?}", outputs[0]);
+        let request = server.finish();
+        let body = serde_json::to_string(&request.body).unwrap();
+        assert!(
+            !body.contains(OPAQUE),
+            "live secret leaked via xdev={via_xdev}"
+        );
+        assert!(!body.contains("ACME-123456"));
+        assert_irreversible_redaction(&body);
+        assert_eq!(
+            store.recall("parser", None).unwrap()[0].content,
+            stored.content
+        );
+    }
+}
+
+#[test]
 fn reflect_rejects_truncated_failed_and_invented_citation_responses() {
     let harness = TestHarness::new("reflect_terminal_errors");
     let root = project_dir(&harness, "proj");
@@ -341,9 +581,15 @@ fn reflect_rejects_truncated_failed_and_invented_citation_responses() {
         )
         .unwrap();
     for (body, expected) in [
-        (gemini_body("partial", None), "unexpected EOF"),
-        (gemini_body("blocked", Some("SAFETY")), "successfully"),
-        (gemini_body("truncated", Some("MAX_TOKENS")), "successfully"),
+        (gemini_body("partial", None), "without Done event"),
+        (
+            gemini_body("blocked", Some("SAFETY")),
+            "did not finish cleanly",
+        ),
+        (
+            gemini_body("truncated", Some("MAX_TOKENS")),
+            "did not finish cleanly",
+        ),
         (
             gemini_body(&format!("invented [{}]", memory.id + 1), Some("STOP")),
             "not supplied",

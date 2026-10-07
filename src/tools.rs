@@ -186,6 +186,21 @@ pub trait Tool: Send + Sync {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput>;
 
+    /// Execute with this invocation's live auxiliary-provider privacy policy.
+    /// Tools making a second model request use `protect` on complete source
+    /// fields before formatting or truncation. Ordinary tools retain their
+    /// normal execution path and do not capture session state in the registry.
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        let _ = protect;
+        self.execute(tool_call_id, input, on_update).await
+    }
+
     /// Declare the coarse side effects used by the agent scheduler.
     ///
     /// Defaults to local write effects so undeclared tools are serialized fail-closed.
@@ -5708,9 +5723,10 @@ impl ToolRegistry {
             tools.push(Box::new(crate::memory::RecallTool::new(
                 std::sync::Arc::clone(&store),
             )));
-            tools.push(Box::new(crate::memory::ReflectTool::new(
-                std::sync::Arc::clone(&store),
-            )));
+            tools.push(Box::new(
+                crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
+                    .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+            ));
             tools.push(Box::new(crate::memory::MemoryEditTool::new(
                 std::sync::Arc::clone(&store),
             )));

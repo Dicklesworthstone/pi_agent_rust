@@ -5628,8 +5628,14 @@ impl Agent {
                         true,
                     ));
                 };
+                let protect = |parts: &[&str]| {
+                    let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
+                        self.config.secrets.as_ref(),
+                    );
+                    self.project_auxiliary_inputs(parts, &privacy)
+                };
                 let mut output = inner
-                    .execute(&tool_call.id, inner_args, None)
+                    .execute_with_auxiliary_privacy(&tool_call.id, inner_args, None, &protect)
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
                 output.details = Some(json!({
@@ -5777,11 +5783,21 @@ impl Agent {
                     crate::tools::register_tool_output_artifact_session(&tool_call.id, session_id)
                 });
 
+        // Tool-free secondary requests need the discoveries from this exact
+        // Agent invocation. A shared tool handle must never retain another
+        // session's vault or a snapshot taken before its latest discoveries.
+        let protect = |parts: &[&str]| {
+            let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
+                self.config.secrets.as_ref(),
+            );
+            self.project_auxiliary_inputs(parts, &privacy)
+        };
         match tool
-            .execute(
+            .execute_with_auxiliary_privacy(
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 Some(Box::new(update_callback)),
+                &protect,
             )
             .await
         {
