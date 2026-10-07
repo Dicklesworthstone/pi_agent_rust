@@ -4226,16 +4226,17 @@ mod stream_delta_batcher_tests {
     #[test]
     fn classic_time_cap_lifecycle_never_publishes_before_successful_terminal_save() {
         let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
-        let message = ModelMessage::Assistant(AssistantMessage {
+        let message = ModelMessage::Assistant(Arc::new(AssistantMessage {
             content: vec![ContentBlock::Text(TextContent::new(marker))],
             api: String::new(),
             provider: String::new(),
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
-        });
+        }));
         for error in [None, Some("final session save failed".to_string())] {
             let (sender, mut receiver) = asupersync::channel::mpsc::channel(16);
             let mut batcher = UiStreamDeltaBatcher::new(sender);

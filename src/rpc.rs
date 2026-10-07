@@ -564,11 +564,27 @@ fn rpc_agent_event_handler(
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
     deferred_agent_end: Option<Arc<std::sync::Mutex<Option<AgentEvent>>>>,
+    defer_time_cap: bool,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
+        if defer_time_cap
+            && matches!(
+                &event,
+                AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message }
+                    if is_rpc_time_cap_message(message)
+            )
+        {
+            // The synthetic stop is an outcome of the whole RPC request.
+            // Publish it only after the completed turn is durable. Ordinary
+            // provider output keeps streaming normally.
+            if let Some(coalescer) = &coalescer {
+                coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
+            }
+            return;
+        }
         if matches!(event, AgentEvent::AgentEnd { .. })
             && let Some(deferred) = &deferred_agent_end
         {
@@ -611,6 +627,10 @@ fn rpc_agent_event_handler(
             coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
         }
     }
+}
+
+fn is_rpc_time_cap_message(message: &Message) -> bool {
+    matches!(message, Message::Assistant(message) if crate::agent::time_cap_marker(message).is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5509,6 +5529,7 @@ async fn run_prompt_with_retry(
     let mut expected_follow_up_fetch: Option<(Arc<AtomicU64>, u64)> = None;
     let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
     let mut success = false;
+    let mut stopped_at_time_cap = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
 
@@ -5557,6 +5578,7 @@ async fn run_prompt_with_retry(
                 runtime_for_events,
                 extensions,
                 Some(Arc::clone(&deferred_agent_end)),
+                true,
             );
 
             if first_attempt_done {
@@ -5652,6 +5674,14 @@ async fn run_prompt_with_retry(
 
         match result {
             Ok(message) => {
+                if crate::agent::time_cap_marker(&message).is_some() {
+                    // Retained input belongs to a later explicit request. An
+                    // automatic continuation here would start a new clock and
+                    // can even enter the provider with a zero-second cap.
+                    stopped_at_time_cap = true;
+                    success = true;
+                    break;
+                }
                 if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                     final_error = message
                         .error_message
@@ -5999,7 +6029,7 @@ async fn run_prompt_with_retry(
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
-        let terminal_messages = deferred_agent_end
+        let mut terminal_messages = deferred_agent_end
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -6008,6 +6038,7 @@ async fn run_prompt_with_retry(
                 _ => None,
             })
             .unwrap_or_default();
+        terminal_messages.retain(|message| !is_rpc_time_cap_message(message));
         let mut payload = json!({
             "type": "agent_end",
             "messages": terminal_messages,
@@ -6031,12 +6062,33 @@ async fn run_prompt_with_retry(
             _ => None,
         })
         .unwrap_or_default();
+    if stopped_at_time_cap
+        && let Some(message) = terminal_messages
+            .iter()
+            .find(|message| is_rpc_time_cap_message(message))
+    {
+        let _ = out_tx.send(agent_event(AgentEvent::MessageStart {
+            message: message.clone(),
+        }));
+        let _ = out_tx.send(agent_event(AgentEvent::MessageEnd {
+            message: message.clone(),
+        }));
+    }
     terminal_guard.disarm();
     let _ = out_tx.send(event(&json!({
         "type": "agent_end",
         "messages": terminal_messages,
         "error": Value::Null,
     })));
+
+    if stopped_at_time_cap {
+        // Compaction may make another provider call; a capped request ends at
+        // this durable boundary. Keep typed queued work owned for the next
+        // explicit provider action; existing EOF/session-transition recovery
+        // persists unconsumed deliveries before releasing that ownership.
+        is_streaming.store(false, Ordering::SeqCst);
+        return;
+    }
 
     // Claim the turn-finalization/compaction phase before any await. While the
     // previous provider turn has ended, its compaction decision and possible
@@ -6362,6 +6414,7 @@ async fn run_extension_command(
             runtime_handle,
             extensions,
             Some(Arc::clone(&deferred_agent_end)),
+            false,
         );
         guard
             .execute_extension_command_with_abort(
@@ -17733,6 +17786,351 @@ export default function init(pi) {
             texts,
             vec!["first steering", "middle follow-up", "last steering"]
         );
+    }
+
+    fn rpc_time_cap_user_count(messages: &[Message], expected: &str) -> usize {
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User(user) if matches!(
+                    &user.content, UserContent::Text(text) if text == expected
+                ))
+            })
+            .count()
+    }
+
+    fn assert_rpc_time_cap_boundary(fail_turn_save: bool) {
+        // A regressed zero-cap continuation can spin or block the output pipe;
+        // the watchdog must not depend on the affected async scheduler.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let body = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+                .build()
+                .expect("runtime build");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(async move {
+                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated fixture storage.
+                let blocked_path = temp.path().join("blocked.jsonl");
+                std::fs::create_dir(&blocked_path).expect("blocked save target"); // ubs:ignore[rust.ownership.unwrap-expect] -- Deliberate persistence fault.
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                    first_call_entered: Mutex::new(None),
+                    first_call_gate: Mutex::new(None),
+                    calls: Arc::clone(&calls),
+                });
+                let mut seeded = seed_auto_compaction_session(Session::create_with_dir(Some(
+                    temp.path().join("sessions"),
+                )));
+                seeded.header.provider = Some(provider.name().to_string());
+                seeded.header.model_id = Some(provider.model_id().to_string());
+                let history = seeded.to_messages_for_current_path();
+                let inner_session = Arc::new(asupersync::sync::Mutex::new(seeded));
+                let mut shared = RpcSharedState::new(&Config::default());
+                let steering = QueuedAgentMessage::from_authored_message(build_user_message(
+                    "retained steering",
+                    &[],
+                ));
+                shared // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission.
+                    .push_steering(steering.clone())
+                    .expect("queue steering");
+                shared // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission.
+                    .push_follow_up(QueuedAgentMessage::from_authored_message(build_user_message(
+                        "retained follow-up",
+                        &[],
+                    )))
+                    .expect("queue follow-up");
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(shared));
+                let fetch_state = Arc::clone(&shared_state);
+                let fetch_session = Arc::clone(&inner_session);
+                let fault_path = blocked_path.clone();
+                let steering_fetcher = move || {
+                    let state = Arc::clone(&fetch_state);
+                    let stored = Arc::clone(&fetch_session);
+                    let fault_path = fault_path.clone();
+                    Box::pin(async move {
+                        let cx = AgentCx::for_request();
+                        if fail_turn_save {
+                            // Input was already saved; fail the later save of
+                            // the actual core-generated cap marker.
+                            let mut inner = stored // ubs:ignore[rust.ownership.unwrap-expect] -- Deterministic fault injection.
+                                .lock(&cx)
+                                .await
+                                .expect("fault session lock");
+                            assert!(inner.path.is_some()); // ubs:ignore[rust.panic.assert-macros] -- Fault must occur after the user save.
+                            inner.path = Some(fault_path);
+                        }
+                        state // ubs:ignore[rust.ownership.unwrap-expect] -- Real RPC delivery lease.
+                            .lock(&cx)
+                            .await
+                            .expect("fetch state lock")
+                            .lease_steering(0)
+                    }) as futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>>
+                };
+                let mut agent = Agent::new(
+                    Arc::clone(&provider),
+                    ToolRegistry::without_builtins(None),
+                    AgentConfig {
+                        max_time: Some(Duration::ZERO),
+                        ..AgentConfig::default()
+                    },
+                );
+                agent.replace_messages(history);
+                agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
+                let follow_up_state = Arc::clone(&shared_state);
+                agent.register_initial_follow_up_fetcher(Arc::new(move || {
+                    let state = Arc::clone(&follow_up_state);
+                    Box::pin(async move {
+                        let cx = AgentCx::for_request();
+                        state // ubs:ignore[rust.ownership.unwrap-expect] -- Actual late-follow-up source.
+                            .lock(&cx)
+                            .await
+                            .expect("follow-up state lock")
+                            .lease_follow_up_for_fetch(0)
+                    })
+                }));
+                let session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        // Isolate the RPC post-turn compaction owner; AgentSession
+                        // has its own independent pre-turn compaction boundary.
+                        enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default()
+                    },
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry(provider.model_id(), false);
+                model.model.provider = provider.name().to_string();
+                model.model.api = provider.api().to_string();
+                model.model.context_window = 64;
+                options.available_models.push(model);
+                options.config.compaction = Some(crate::config::CompactionSettings {
+                    enabled: Some(true),
+                    reserve_tokens: Some(63),
+                    keep_recent_tokens: Some(1),
+                    mode: None,
+                });
+                let cx = AgentCx::for_request();
+                let admission = session // ubs:ignore[rust.ownership.unwrap-expect] -- Match production RPC admission ownership.
+                    .lock(&cx)
+                    .await
+                    .expect("session admission")
+                    .provider_admission_gate();
+                shared_state // ubs:ignore[rust.ownership.unwrap-expect] -- Match production RPC admission ownership.
+                    .lock(&cx)
+                    .await
+                    .expect("shared admission")
+                    .bind_provider_admission(admission);
+                for prompt in ["first capped request", "second explicit capped request"] {
+                    let is_streaming = Arc::new(AtomicBool::new(false));
+                    let is_compacting = Arc::new(AtomicBool::new(false));
+                    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                    run_prompt_with_retry(
+                        Arc::clone(&session),
+                        Arc::clone(&shared_state),
+                        Arc::clone(&is_streaming),
+                        Arc::clone(&is_compacting),
+                        Arc::new(Mutex::new(())),
+                        Arc::new(asupersync::sync::Mutex::new(None)),
+                        out_tx,
+                        Arc::new(AtomicBool::new(false)),
+                        options.clone(),
+                        prompt.to_string(),
+                        None,
+                        Vec::new(),
+                        cx.clone(),
+                    )
+                    .await;
+                    let events = out_rx
+                        .try_iter()
+                        .map(|line| { // ubs:ignore[rust.ownership.unwrap-expect] -- Wire frames must remain valid JSON.
+                            serde_json::from_str::<Value>(&line).expect("RPC frame")
+                        })
+                        .collect::<Vec<_>>();
+                    let terminals = events
+                        .iter()
+                        .filter(|event| {
+                            event.get("type").and_then(Value::as_str) == Some("agent_end")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(terminals.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Exactly one logical terminal.
+                    let terminal = terminals.first().expect("terminal"); // ubs:ignore[rust.ownership.unwrap-expect] -- Asserted terminal count.
+                    let cap_frames = events
+                        .iter()
+                        .filter(|event| event.to_string().contains("[time cap reached]"))
+                        .count();
+                    assert!(calls.lock().expect("calls lock").is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- No provider or compaction entry at zero cap.
+                    assert!(!is_streaming.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Terminal releases admission.
+                    assert!(!is_compacting.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Cap cannot leave compaction active.
+                    let state = shared_state.lock(&cx).await.expect("retained state"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect live ownership.
+                    assert_eq!(state.pending_count(), 2); // ubs:ignore[rust.panic.assert-macros] -- Both accepted controls remain owned.
+                    assert_eq!(state.steering_in_flight.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Original steering lease remains typed.
+                    assert_eq!(state.follow_up.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Follow-up must not be fetched automatically.
+                    drop(state);
+                    let guard = session // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect private restoration.
+                        .lock(&cx)
+                        .await
+                        .expect("retained AgentSession");
+                    assert!(guard.agent.has_staged_delivery(&steering)); // ubs:ignore[rust.panic.assert-macros] -- The same delivery remains staged.
+                    drop(guard);
+                    if fail_turn_save {
+                        assert!(terminal.get("error").and_then(Value::as_str).is_some()); // ubs:ignore[rust.panic.assert-macros] -- Failed persistence cannot report success.
+                        assert_eq!(cap_frames, 0); // ubs:ignore[rust.panic.assert-macros] -- No unsaved cap lifecycle or terminal marker.
+                        return;
+                    }
+                    assert!(terminal.get("error").is_some_and(Value::is_null)); // ubs:ignore[rust.panic.assert-macros] -- Durable cap is successful bounded completion.
+                    assert_eq!(cap_frames, 3); // ubs:ignore[rust.panic.assert-macros] -- One start, one end and one terminal containing the cap.
+                    assert!(events.iter().all(|event| { // ubs:ignore[rust.panic.assert-macros] -- Cap ends before automatic provider-backed compaction.
+                        event.get("type").and_then(Value::as_str) != Some("auto_compaction_start")
+                    }));
+                    let recovery_plan = // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect next explicit provider admission.
+                        terminal_rpc_recovery_plan(&session, &shared_state, true, &cx)
+                            .await
+                            .expect("resume plan");
+                    assert_eq!(recovery_plan, RpcTerminalRecoveryPlan::None); // ubs:ignore[rust.panic.assert-macros] -- Keep original executable queue semantics.
+                    let inner = inner_session.lock(&cx).await.expect("retry selection session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original retry ownership.
+                    let retry_target = select_rpc_user_turn_for_retry(&inner) // ubs:ignore[rust.ownership.unwrap-expect] -- Capped authored request remains retryable.
+                        .expect("retry target selection")
+                        .expect("authored retry target");
+                    assert!(matches!(retry_target.1, UserContent::Text(text) if text == prompt)); // ubs:ignore[rust.panic.assert-macros] -- Queued controls must not become the retry target.
+                    let entries = inner
+                        .entries_for_current_path()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert!( // ubs:ignore[rust.panic.assert-macros] -- The fixture is genuinely over the configured compaction threshold.
+                        prepare_compaction(
+                            &entries,
+                            ResolvedCompactionSettings {
+                                context_window_tokens: 64,
+                                reserve_tokens: 63,
+                                keep_recent_tokens: 1,
+                                ..ResolvedCompactionSettings::default()
+                            },
+                        )
+                        .is_some()
+                    );
+                }
+
+                // EOF recovery is transactional even if its first save fails.
+                let original_path = {
+                    let mut inner = inner_session.lock(&cx).await.expect("saved session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Capped turns already persisted.
+                    inner.path.replace(blocked_path).expect("saved path") // ubs:ignore[rust.ownership.unwrap-expect] -- Restore this exact target after the fault.
+                };
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- Failed candidate flush must retain authority.
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .is_err()
+                );
+                let pending_after_failure = shared_state // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect failed candidate ownership.
+                    .lock(&cx)
+                    .await
+                    .expect("failed recovery state")
+                    .pending_count();
+                assert_eq!(pending_after_failure, 2); // ubs:ignore[rust.panic.assert-macros] -- Neither delivery is discarded on save failure.
+                inner_session // ubs:ignore[rust.ownership.unwrap-expect] -- Restore the exact original persistence target.
+                    .lock(&cx)
+                    .await
+                    .expect("repair session path")
+                    .path = Some(original_path.clone());
+                preserve_terminal_rpc_input(&session, &shared_state, &cx) // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise real EOF recovery.
+                    .await
+                    .expect("EOF input preservation");
+                preserve_terminal_rpc_input(&session, &shared_state, &cx) // ubs:ignore[rust.ownership.unwrap-expect] -- Repeating terminal cleanup must not duplicate input.
+                    .await
+                    .expect("idempotent EOF recovery");
+                let recovered_pending = shared_state // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect durable ownership transfer.
+                    .lock(&cx)
+                    .await
+                    .expect("recovered state")
+                    .pending_count();
+                assert_eq!(recovered_pending, 0); // ubs:ignore[rust.panic.assert-macros] -- Durable history now owns the controls.
+                let reopened = Session::open(original_path.to_string_lossy().as_ref()) // ubs:ignore[rust.ownership.unwrap-expect] -- Verify disk, not only memory.
+                    .await
+                    .expect("reopen capped session");
+                for text in [
+                    "first capped request",
+                    "second explicit capped request",
+                    "retained steering",
+                    "retained follow-up",
+                ] {
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Every input survives exactly once.
+                        rpc_time_cap_user_count(&reopened.to_messages_for_current_path(), text),
+                        1
+                    );
+                }
+                let mut resumed_agent = Agent::new(
+                    provider,
+                    ToolRegistry::without_builtins(None),
+                    AgentConfig::default(),
+                );
+                resumed_agent.replace_messages(reopened.to_messages_for_current_path());
+                let resumed = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                    resumed_agent,
+                    Arc::new(asupersync::sync::Mutex::new(reopened)),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default()
+                    },
+                )));
+                let mut resumed_state = RpcSharedState::new(&Config::default());
+                resumed_state.auto_compaction_enabled = false;
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                run_prompt_with_retry(
+                    resumed,
+                    Arc::new(asupersync::sync::Mutex::new(resumed_state)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(())),
+                    Arc::new(asupersync::sync::Mutex::new(None)),
+                    out_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    options,
+                    "resume retained work".to_string(),
+                    None,
+                    Vec::new(),
+                    cx,
+                )
+                .await;
+                let recorded = calls.lock().expect("resumed provider calls"); // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Recording provider is the positive control.
+                assert_eq!(recorded.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- A fresh authorized run reaches the provider once.
+                let call = recorded.first().expect("resumed call"); // ubs:ignore[rust.ownership.unwrap-expect] -- Asserted positive-control count.
+                for text in [
+                    "retained steering",
+                    "retained follow-up",
+                    "resume retained work",
+                ] {
+                    assert_eq!(rpc_time_cap_user_count(&call.messages, text), 1); // ubs:ignore[rust.panic.assert-macros] -- Reopened work is neither lost nor replayed twice.
+                }
+                let resumed_terminals = out_rx
+                    .try_iter()
+                    .filter(|line| line.contains("\"type\":\"agent_end\""))
+                    .count();
+                assert_eq!(resumed_terminals, 1); // ubs:ignore[rust.panic.assert-macros] -- Ordinary positive-control request terminates once.
+            });
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                body.join().expect("RPC time-cap test body"); // ubs:ignore[rust.ownership.unwrap-expect] -- Propagate fixture assertions from the watchdog thread.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("RPC time-cap boundary failed to terminate within 120 seconds"); // ubs:ignore[rust.panic.panic-macro] -- Watchdog detects the original nonterminating continuation.
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_time_cap_stops_before_queued_continuation_and_preserves_resume() {
+        assert_rpc_time_cap_boundary(false);
+    }
+
+    #[test]
+    fn rpc_time_cap_save_failure_never_publishes_a_successful_pause() {
+        assert_rpc_time_cap_boundary(true);
     }
 
     #[test]
