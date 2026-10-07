@@ -2901,6 +2901,15 @@ impl PiFtuiModel {
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
             }
+            PiMsg::AgentTimeCap { usage, message } => {
+                let command = self.handle_agent(PiMsg::AgentDone {
+                    usage,
+                    stop_reason: crate::model::StopReason::Stop,
+                    error_message: None,
+                });
+                self.push_entry(EntryRole::System, sanitize(&message).into_owned());
+                return command;
+            }
             PiMsg::AgentDone {
                 usage,
                 error_message,
@@ -3123,6 +3132,24 @@ impl PiFtuiModel {
                 .is_none_or(|shown| shown == owner_session_id) =>
             {
                 self.input.set_text(&text);
+            }
+            PiMsg::RestorePendingInput {
+                owner_session_id,
+                text,
+            } if self
+                .displayed_session_id
+                .as_deref()
+                .is_none_or(|shown| shown == owner_session_id) =>
+            {
+                if !text.is_empty() {
+                    let draft = self.input.text();
+                    let restored = if draft.is_empty() {
+                        text
+                    } else {
+                        format!("{text}\n\n{draft}")
+                    };
+                    self.input.set_text(&restored);
+                }
             }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -6276,7 +6303,8 @@ async fn run_tan_command(
 /// Run one prompt as a controlled turn (`session_control`): its control lane
 /// is published for the UI thread, so the user can steer, queue follow-ups
 /// or abort (Escape, Ctrl-C) while it runs. Input the turn never claimed
-/// (typed as it was ending) is not lost: it runs as the next turn.
+/// (typed as it was ending) runs as the next turn after ordinary completion,
+/// or returns to the editor after an abort, failure, or run-time cap.
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -6293,13 +6321,13 @@ async fn run_prompt_turn(
         }
         let text = leftover.join("\n\n");
         if stopped {
-            // The turn was aborted or failed: hand unsent messages back
-            // rather than starting another turn nobody asked for.
+            // A cap is a pause too: starting a new turn here would reset its
+            // timer and immediately resume work the user asked us to stop.
             if let Ok(owner_session_id) = handle
                 .with_session(|session| session.header.id.clone())
                 .await
             {
-                let _ = agent_tx.send(PiMsg::SetEditorText {
+                let _ = agent_tx.send(PiMsg::RestorePendingInput {
                     owner_session_id,
                     text,
                 });
@@ -6319,7 +6347,7 @@ async fn run_prompt_turn(
 }
 
 /// One controlled turn; returns the text of inputs it never claimed and
-/// whether the turn was aborted or failed.
+/// whether completion requires a pause before those inputs may run.
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -6359,12 +6387,17 @@ async fn run_controlled_turn(
         .into_iter()
         .map(|input| input.text)
         .collect::<Vec<_>>();
-    // An aborted or failed turn hands unsent input back instead of running it.
-    let stopped = result.is_err()
-        || matches!(
-            &result,
-            Ok(message) if message.stop_reason == crate::model::StopReason::Aborted
-        );
+    // The SDK result is the durability boundary. A successful cap must stop
+    // the outer continuation loop just like an abort or terminal failure.
+    let stopped = match &result {
+        Err(_) => true,
+        Ok(message) => {
+            matches!(
+                message.stop_reason,
+                crate::model::StopReason::Aborted | crate::model::StopReason::Error
+            ) || crate::agent::time_cap_marker(message).is_some()
+        }
+    };
     report_turn_result(result, agent_tx);
     (leftover, stopped)
 }
@@ -6394,7 +6427,13 @@ fn report_turn_result(
                     .headline();
             let _ = agent_tx.send(PiMsg::AgentError(headline));
         }
-        Ok(_) => {}
+        Ok(message) => {
+            // Synthetic cap messages have no text delta. Their lifecycle
+            // events precede persistence, so show the reason only now.
+            if let Some(marker) = crate::agent::time_cap_marker(&message) {
+                let _ = agent_tx.send(PiMsg::System(marker.to_string()));
+            }
+        }
     }
 }
 
@@ -14873,6 +14912,48 @@ mod tests {
         assert_eq!(sim.model().input.text(), "reword me");
     }
 
+    #[test]
+    fn returned_control_input_preserves_draft_and_ignores_stale_sessions() {
+        let (_unused, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("current"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        type_str(&mut sim, "existing draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("previous"),
+            text: String::from("stale controls"),
+        }));
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "existing draft"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("current"),
+            text: String::from("first control\n\nsecond control"),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("current"),
+            text: String::new(),
+        }));
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "first control\n\nsecond control\n\nexisting draft"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("current"),
+            text: String::from("explicit replacement"),
+        }));
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "explicit replacement"
+        );
+    }
+
     /// The fork keeps everything before the selected user message, drops that
     /// message and what followed, and returns its text for the editor.
     #[test]
@@ -16092,6 +16173,249 @@ mod tests {
             session,
             crate::sdk::EventListeners::default(),
         )
+    }
+
+    #[test]
+    fn capped_turn_returns_pending_input_and_reports_only_a_durable_pause() {
+        use crate::agent::AgentEvent;
+        use crate::model::{ContentBlock, Message, UserContent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let reactor = asupersync::runtime::reactor::create_reactor() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+            .expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            for fail_save in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+                let path = dir.path().join("capped-turn.jsonl");
+                let mut stored = crate::session::Session::in_memory();
+                stored.header.cwd = dir.path().display().to_string();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(dir.path().to_path_buf());
+                let owner_session_id = stored.header.id.clone();
+                let provider = Arc::new(NativePromptProbe::default());
+                let agent = crate::agent::Agent::new(
+                    provider.clone(),
+                    crate::tools::ToolRegistry::from_tools(Vec::new()),
+                    crate::agent::AgentConfig {
+                        max_time: Some(Duration::ZERO),
+                        ..Default::default()
+                    },
+                );
+                let session = crate::agent::AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(stored)),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                );
+                let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                    session,
+                    crate::sdk::EventListeners::default(),
+                );
+                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let (tx, rx) = mpsc::channel();
+                send_conversation_reset(&handle, &tx, "cap regression").await;
+
+                let queued = Arc::new(AtomicBool::new(false));
+                let generated = Arc::new(AtomicUsize::new(0));
+                let queue_once = Arc::clone(&queued);
+                let generated_for_callback = Arc::clone(&generated);
+                let published_control = Arc::clone(&control);
+                let store = handle.session_store();
+                let invalid_save_path = dir.path().to_path_buf();
+                handle.subscribe(move |event| match event {
+                    AgentEvent::AgentStart { .. } if !queue_once.swap(true, Ordering::SeqCst) => {
+                        let current = published_control // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Fixture control must be published before AgentStart.
+                            .lock()
+                            .expect("control lock")
+                            .clone()
+                            .expect("active control");
+                        current // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission must succeed.
+                            .follow_up("first unclaimed follow-up")
+                            .expect("queue first follow-up");
+                        current // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission must succeed.
+                            .follow_up("second unclaimed follow-up")
+                            .expect("queue second follow-up");
+                    }
+                    AgentEvent::MessageEnd {
+                        message: Message::Assistant(message),
+                    } if message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text(text)
+                                if text.text.starts_with("[time cap reached] ")
+                        )
+                    }) => {
+                        generated_for_callback.fetch_add(1, Ordering::SeqCst);
+                        if fail_save {
+                            // The user input has already been saved. Fail only
+                            // the later save of the actual synthetic cap.
+                            store.try_lock().expect("idle session store").path = // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Inject the intended post-generation persistence failure.
+                                Some(invalid_save_path.clone());
+                        }
+                    }
+                    _ => {}
+                });
+
+                asupersync::time::timeout( // ubs:ignore[rust.ownership.unwrap-expect] -- A broken continuation loop must fail within the watchdog.
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(10),
+                    Box::pin(run_prompt_turn(
+                        &mut handle,
+                        "initial capped prompt".to_string(),
+                        Vec::new(),
+                        &tx,
+                        &control,
+                    )),
+                )
+                .await
+                .expect("capped driver watchdog");
+                assert!(queued.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    generated.load(Ordering::SeqCst),
+                    1,
+                    "pending work must not start another run with a fresh cap"
+                );
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    provider.calls.lock().expect("provider capture").is_empty() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
+                );
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    control.lock().expect("control lock").is_none() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
+                );
+
+                let events = rx.try_iter().collect::<Vec<_>>();
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events.iter().filter(|event| matches!(event, PiMsg::AgentStart)).count(),
+                    1
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events.iter().filter(|event| matches!(event, PiMsg::AgentDone { .. })).count(),
+                    1
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events.iter().any(|event| matches!(event, PiMsg::AgentError(_))),
+                    fail_save
+                );
+                let restored = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        PiMsg::RestorePendingInput {
+                            owner_session_id,
+                            text,
+                        } => {
+                            Some((owner_session_id.as_str(), text.as_str()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let pending_text = "first unclaimed follow-up\n\nsecond unclaimed follow-up";
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    restored,
+                    vec![(owner_session_id.as_str(), pending_text)]
+                );
+
+                let saved = crate::session::Session::open(&path.display().to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted input must remain durably readable.
+                    .await
+                    .expect("reopen original session");
+                let messages = saved.to_messages_for_current_path();
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                    1
+                );
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages.iter().any(|message| matches!(
+                        message,
+                        Message::User(user)
+                            if matches!(&user.content, UserContent::Text(text)
+                                if text == "initial capped prompt")
+                    ))
+                );
+                let expected_markers = if fail_save { 0 } else { 1 };
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages.iter().filter(|message| matches!(
+                        message,
+                        Message::Assistant(assistant)
+                            if crate::agent::time_cap_marker(assistant).is_some()
+                    )).count(),
+                    expected_markers
+                );
+
+                let (_unused, model) = new_model();
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                for event in events {
+                    if matches!(&event, PiMsg::RestorePendingInput { .. }) {
+                        // The user may start another draft after completion
+                        // but before the pending controls reach the editor.
+                        type_str(&mut sim, "new unsent draft");
+                    }
+                    sim.send(PiFtuiMsg::Agent(event));
+                }
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model().input.text(),
+                    format!("{pending_text}\n\nnew unsent draft")
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model().state,
+                    AgentUiState::Ready
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model().transcript.iter().filter(|entry| {
+                        entry.text.starts_with("[time cap reached] ")
+                    }).count(),
+                    expected_markers,
+                    "only a durably saved cap appears, exactly once"
+                );
+            }
+        }));
+    }
+
+    #[test]
+    fn provider_text_and_noncanonical_empty_identity_replies_do_not_report_a_pause() {
+        use crate::model::{AssistantMessage, ContentBlock, TextContent};
+
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        let (tx, rx) = mpsc::channel();
+        report_turn_result(
+            Ok(AssistantMessage {
+                api: "openai-responses".to_string(),
+                provider: "openai".to_string(),
+                model: "fixture".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(marker))],
+                ..Default::default()
+            }),
+            &tx,
+        );
+        for text in [
+            "[time cap reached] quoted documentation, not a runtime pause",
+            "[time cap reached] time cap reached after -1s (--max-time); stopping at the turn boundary",
+            "[time cap reached] time cap reached after 18446744073709551616s (--max-time); stopping at the turn boundary",
+        ] {
+            report_turn_result(
+                Ok(AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    ..Default::default()
+                }),
+                &tx,
+            );
+        }
+        report_turn_result(
+            Ok(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new(marker)),
+                    ContentBlock::Text(TextContent::new("additional provider content")),
+                ],
+                ..Default::default()
+            }),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
     }
 
     #[test]

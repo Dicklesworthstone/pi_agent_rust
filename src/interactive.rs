@@ -2025,6 +2025,11 @@ pub enum PiMsg {
         stop_reason: StopReason,
         error_message: Option<String>,
     },
+    /// A durably completed turn stopped at its time cap; queued input stays paused.
+    AgentTimeCap {
+        usage: Option<Usage>,
+        message: String,
+    },
     /// A background title was durably installed. The UI only acknowledges
     /// it while the same session and name remain current.
     SessionTitleSuggestion {
@@ -2085,6 +2090,11 @@ pub enum PiMsg {
     },
     /// Set the editor contents (used by /tree selection of user/custom messages).
     SetEditorText {
+        owner_session_id: String,
+        text: String,
+    },
+    /// Return unclaimed turn input without replacing a newer editor draft.
+    RestorePendingInput {
         owner_session_id: String,
         text: String,
     },
@@ -2753,6 +2763,7 @@ pub struct PiApp {
     history: HistoryList,
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
+    pending_inputs_paused_by_time_cap: bool,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
@@ -3304,6 +3315,7 @@ impl PiApp {
             history: HistoryList::new(),
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
+            pending_inputs_paused_by_time_cap: false,
             message_queue,
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,

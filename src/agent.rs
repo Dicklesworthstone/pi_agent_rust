@@ -686,6 +686,32 @@ pub fn iteration_handoff_steering_text(current: usize, max: usize) -> String {
     )
 }
 
+/// Recognize only the synthetic successful boundary message emitted by the
+/// run-time cap. Frontends must publish it after AgentSession persistence has
+/// succeeded, rather than rendering its pre-save MessageStart/MessageEnd.
+pub(crate) fn time_cap_marker(message: &AssistantMessage) -> Option<&str> {
+    if message.stop_reason != StopReason::Stop
+        || !message.api.is_empty()
+        || !message.provider.is_empty()
+        || !message.model.is_empty()
+        || message.error_message.is_some()
+    {
+        return None;
+    }
+    let [crate::model::ContentBlock::Text(text)] = message.content.as_slice() else {
+        return None;
+    };
+    let seconds = text
+        .text
+        .strip_prefix("[time cap reached] time cap reached after ")?
+        .strip_suffix("s (--max-time); stopping at the turn boundary")?;
+    if seconds.is_empty() || !seconds.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    seconds.parse::<u64>().ok()?;
+    Some(text.text.as_str())
+}
+
 /// Configuration for the agent.
 #[derive(Clone)]
 pub struct AgentConfig {

@@ -438,6 +438,22 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
                 }
                 batcher.turn_error_surfaced = *stop_reason == StopReason::Error;
             }
+            // This terminal event is held until the recoverable turn has
+            // returned successfully and its owner is unlocked. Synthetic cap
+            // messages have no streamed delta, so render their durable reason
+            // here and distinguish them from a turn that may drain more work.
+            if error.is_none()
+                && let Some(last) = last_assistant_message(messages)
+                && let Some(message) = crate::agent::time_cap_marker(&last)
+            {
+                done = match done {
+                    PiMsg::AgentDone { usage, .. } => PiMsg::AgentTimeCap {
+                        usage,
+                        message: message.to_string(),
+                    },
+                    other => other,
+                };
+            }
             batcher.send_immediate(done);
         }
         _ => {}
@@ -983,12 +999,21 @@ impl PiApp {
                 self.ask_ui_queue.push_back(request);
                 self.advance_ask_ui_queue();
             }
-            PiMsg::AgentDone {
-                usage,
-                stop_reason,
-                error_message,
-            } => {
-                let title_eligible = stop_reason == StopReason::Stop && error_message.is_none();
+            terminal @ (PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. }) => {
+                let (usage, stop_reason, error_message, time_cap_message) = match terminal {
+                    PiMsg::AgentDone {
+                        usage,
+                        stop_reason,
+                        error_message,
+                    } => (usage, stop_reason, error_message, None),
+                    PiMsg::AgentTimeCap { usage, message } => {
+                        (usage, StopReason::Stop, None, Some(message))
+                    }
+                    _ => return None,
+                };
+                let title_eligible = stop_reason == StopReason::Stop
+                    && error_message.is_none()
+                    && time_cap_message.is_none();
                 // Snapshot follow-tail *before* we mutate conversation state so
                 // we preserve the user's scroll intent.
                 let follow_tail = self.follow_stream_tail;
@@ -1035,6 +1060,14 @@ impl PiApp {
 
                 if stop_reason == StopReason::Aborted {
                     self.status_message = Some("Request aborted".to_string());
+                } else if let Some(message) = time_cap_message.as_ref() {
+                    self.pending_inputs_paused_by_time_cap = true;
+                    self.status_message = Some(message.clone());
+                    self.messages.push(ConversationMessage::new(
+                        MessageRole::System,
+                        message.clone(),
+                        None,
+                    ));
                 } else if stop_reason == StopReason::Error {
                     let message = error_message.unwrap_or_else(|| "Request failed".to_string());
                     // The status bar is one line: show the headline there and
@@ -1078,7 +1111,7 @@ impl PiApp {
                 // from this turn BEFORE idle input or RunPending runs.
                 self.invalidate_input_cards_for_turn_end();
 
-                if !self.pending_inputs.is_empty() {
+                if !self.pending_inputs_paused_by_time_cap && !self.pending_inputs.is_empty() {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
@@ -1316,8 +1349,15 @@ After approving access in the browser, press Enter in Pi to complete login."
                 if self.agent_state != AgentState::Idle {
                     return None;
                 }
-                self.pending_inputs
-                    .push_back(PendingInput::GeneratedText(text));
+                let retry_input = PendingInput::GeneratedText(text);
+                if self.pending_inputs_paused_by_time_cap {
+                    // A committed /retry owns the next foreground budget;
+                    // earlier unclaimed work stays queued behind that target.
+                    self.pending_inputs.push_front(retry_input);
+                } else {
+                    self.pending_inputs.push_back(retry_input);
+                }
+                self.pending_inputs_paused_by_time_cap = false;
                 return self.run_next_pending();
             }
             PiMsg::ConversationReset {
@@ -1364,6 +1404,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.abort_handle = None;
                 if is_replacement {
                     self.title_cancellation = None;
+                    self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
                     self.pending_oauth = None;
@@ -1399,6 +1440,35 @@ After approving access in the browser, press Enter in Pi to complete login."
                     }
                 }
                 self.input.set_value(&text);
+                self.input.focus();
+            }
+            PiMsg::RestorePendingInput {
+                owner_session_id,
+                text,
+            } => {
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::RestorePendingInput {
+                                owner_session_id,
+                                text,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                let combined = [text, self.input.value()]
+                    .into_iter()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.input.set_value(&combined);
+                if combined.contains('\n') {
+                    self.input_mode = InputMode::MultiLine;
+                    self.set_input_height(6);
+                }
                 self.input.focus();
             }
             PiMsg::OpenTree {
@@ -2783,7 +2853,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     fn run_next_pending(&mut self) -> Option<Cmd> {
         loop {
-            if self.agent_state != AgentState::Idle {
+            if self.agent_state != AgentState::Idle || self.pending_inputs_paused_by_time_cap {
                 return None;
             }
             let next = self.pending_inputs.pop_front()?;
@@ -2931,6 +3001,9 @@ After approving access in the browser, press Enter in Pi to complete login."
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+        // Only a new foreground submission/continue can renew the run budget.
+        // Automatic queue processing cannot reach this point while paused.
+        self.pending_inputs_paused_by_time_cap = false;
         let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
@@ -3854,7 +3927,12 @@ mod stream_delta_batcher_tests {
         while std::time::Instant::now() < deadline {
             match receiver.try_recv() {
                 Ok(event) => {
-                    let done = matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_));
+                    let done = matches!(
+                        event,
+                        PiMsg::AgentDone { .. }
+                            | PiMsg::AgentTimeCap { .. }
+                            | PiMsg::AgentError(_)
+                    );
                     let _ = app.handle_pi_message(event.clone());
                     events.push(event);
                     if done {
@@ -4037,6 +4115,176 @@ mod stream_delta_batcher_tests {
             )));
             assert_eq!(app.agent_state, AgentState::Idle);
         }
+    }
+
+    #[test]
+    fn classic_time_cap_is_saved_once_and_pauses_queued_startup_input() {
+        let temp = tempfile::TempDir::new().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated durable fixture storage is required.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(ClassicRecoveryProvider {
+            calls: Arc::clone(&calls),
+            failures: 0,
+            fail_save_path: None,
+        });
+        let capped_provider = Arc::clone(&provider);
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            provider,
+            retry_config(0, 1),
+            None,
+            move |session| {
+                session.agent = Agent::new(
+                    capped_provider,
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig {
+                        max_time: Some(std::time::Duration::ZERO),
+                        ..AgentConfig::default()
+                    },
+                );
+            },
+        );
+        app.session.try_lock().expect("session").session_dir = // ubs:ignore[rust.ownership.unwrap-expect] -- Configure the real session persistence destination before the turn.
+            Some(temp.path().join("sessions"));
+        app.pending_inputs.push_back(PendingInput::Text("queued startup input".to_string()));
+        let _ = app.submit_message("capped foreground input");
+        let events = drive_turn(&mut app, &mut receiver);
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- A zero budget must not call the provider.
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Exactly one successful terminal cap must reach the UI.
+            events.iter().filter(|event| matches!(event, PiMsg::AgentTimeCap { .. })).count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!( // ubs:ignore[rust.panic.assert-macros] -- A cap is one terminal outcome, never a duplicate ordinary completion or error.
+            event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
+        )));
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The durable marker appears exactly once in the transcript.
+            app.messages.iter().filter(|message| message.content == marker).count(),
+            1
+        );
+        assert_eq!(app.status_message.as_deref(), Some(marker)); // ubs:ignore[rust.panic.assert-macros] -- The stop reason remains visible at the input boundary.
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- Capping leaves the foreground ready for an explicit user action.
+        assert_eq!(app.pending_inputs.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Unclaimed startup work must remain queued.
+        assert!(app.handle_pi_message(PiMsg::RunPending).is_none()); // ubs:ignore[rust.panic.assert-macros] -- A previously posted automatic wakeup cannot renew the budget.
+        assert_eq!(app.pending_inputs.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- A suppressed wakeup cannot consume queued work.
+        let (session_id, path) = {
+            let stored = app.session.try_lock().expect("saved session"); // ubs:ignore[rust.ownership.unwrap-expect] -- The settled session must be available.
+            (stored.header.id.clone(), stored.path.clone().expect("saved path")) // ubs:ignore[rust.ownership.unwrap-expect] -- The successful cap must reach a real file.
+        };
+        let saved = runtime().block_on(Session::open(path.to_str().expect("path"))) // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the actual durable session to verify the marker.
+            .expect("reopen capped session");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Persistence and UI must agree on one synthetic cap.
+            saved.to_messages_for_current_path().iter().filter(|message| {
+                matches!(message, ModelMessage::Assistant(assistant) if crate::agent::time_cap_marker(assistant) == Some(marker))
+            }).count(),
+            1
+        );
+        assert!(app.handle_pi_message(PiMsg::EnqueuePendingInput { // ubs:ignore[rust.panic.assert-macros] -- A late admitted input is retained without automatic restart.
+            session_id: session_id.clone(),
+            input: PendingInput::Continue,
+        }).is_none());
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Both earlier and later queued work remain available.
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- Late queue admission cannot restart the capped turn.
+        assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Neither queue wakeup may call the provider.
+
+        // A deliberately submitted next foreground run receives its own cap;
+        // it is allowed to start, while another cap keeps old work unclaimed.
+        let _ = app.submit_message("explicit next foreground input");
+        assert!(!app.pending_inputs_paused_by_time_cap); // ubs:ignore[rust.panic.assert-macros] -- A user-owned foreground submission may start a new budget.
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::AgentTimeCap { .. }))); // ubs:ignore[rust.panic.assert-macros] -- The actual second run must reach its cap.
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- A second cap must preserve the same unclaimed work.
+
+        let messages = app.messages.clone();
+        let usage = app.total_usage.clone();
+        let _ = app.handle_pi_message(PiMsg::RetryCommitted {
+            session_id,
+            messages,
+            usage,
+            text: "explicit retry target".to_string(),
+            status: None,
+        });
+        assert!(!app.pending_inputs_paused_by_time_cap); // ubs:ignore[rust.panic.assert-macros] -- An explicitly committed retry may renew the budget.
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::AgentTimeCap { .. }))); // ubs:ignore[rust.panic.assert-macros] -- The actual retry must finish before inspecting its durable input.
+        let latest_user = app.session.try_lock().expect("retried session") // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the actual settled retry journal.
+            .to_messages_for_current_path()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ModelMessage::User(user) => Some(match &user.content {
+                    UserContent::Text(text) => text.clone(),
+                    UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+                }),
+                _ => None,
+            })
+            .expect("retry user input");
+        assert_eq!(latest_user, "explicit retry target"); // ubs:ignore[rust.panic.assert-macros] -- An older paused entry must not take the explicitly retried target's budget.
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Retrying must not discard the older paused work.
+        assert!(matches!(app.pending_inputs.front(), Some(PendingInput::Text(text)) if text == "queued startup input")); // ubs:ignore[rust.panic.assert-macros] -- Older queued input retains its relative order.
+        assert!(matches!(app.pending_inputs.back(), Some(PendingInput::Continue))); // ubs:ignore[rust.panic.assert-macros] -- The later queued continuation stays after the earlier input.
+    }
+
+    #[test]
+    fn classic_time_cap_lifecycle_never_publishes_before_successful_terminal_save() {
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        let message = ModelMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new(marker))],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        for error in [None, Some("final session save failed".to_string())] {
+            let (sender, mut receiver) = asupersync::channel::mpsc::channel(16);
+            let mut batcher = UiStreamDeltaBatcher::new(sender);
+            dispatch_agent_event_to_ui(&AgentEvent::MessageStart { message: message.clone() }, &mut batcher);
+            dispatch_agent_event_to_ui(&AgentEvent::MessageEnd { message: message.clone() }, &mut batcher);
+            while let Ok(event) = receiver.try_recv() {
+                assert!(matches!(event, PiMsg::AssistantMessageStart)); // ubs:ignore[rust.panic.assert-macros] -- Pre-save lifecycle events cannot publish a marker or terminal success.
+            }
+            dispatch_agent_event_to_ui(&AgentEvent::AgentEnd {
+                session_id: Arc::from("time-cap-fixture"),
+                messages: vec![message.clone()],
+                error: error.clone(),
+            }, &mut batcher);
+            let terminal = receiver.try_recv().expect("terminal UI outcome"); // ubs:ignore[rust.ownership.unwrap-expect] -- A terminal event must be delivered.
+            if error.is_some() {
+                assert!(matches!(terminal, PiMsg::AgentDone { // ubs:ignore[rust.panic.assert-macros] -- Failed persistence must remain an error and suppress the cap success.
+                    stop_reason: StopReason::Error,
+                    error_message: Some(_),
+                    ..
+                }));
+            } else {
+                assert!(matches!(terminal, PiMsg::AgentTimeCap { message, .. } if message == marker)); // ubs:ignore[rust.panic.assert-macros] -- Only successful terminal persistence publishes the cap.
+            }
+            assert!(receiver.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- A capped completion must have exactly one terminal outcome.
+        }
+    }
+
+    #[test]
+    fn returned_pending_input_preserves_current_draft_and_rejects_stale_session() {
+        let mut app = build_test_app();
+        app.input.set_value("newly typed draft");
+        let owner_session_id = app.session.try_lock().expect("session").header.id.clone(); // ubs:ignore[rust.ownership.unwrap-expect] -- Read the current fixture identity.
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id: owner_session_id.clone(),
+            text: "unclaimed queued input".to_string(),
+        });
+        assert_eq!(app.input.value(), "unclaimed queued input\n\nnewly typed draft"); // ubs:ignore[rust.panic.assert-macros] -- Restoring old work must preserve newer typing.
+        assert_eq!(app.input_mode, InputMode::MultiLine); // ubs:ignore[rust.panic.assert-macros] -- Both parts of the restored draft must remain editable.
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id: "replaced-session".to_string(),
+            text: "stale work".to_string(),
+        });
+        assert_eq!(app.input.value(), "unclaimed queued input\n\nnewly typed draft"); // ubs:ignore[rust.panic.assert-macros] -- A replaced session cannot alter the current draft.
+        app.input.set_value("  \n ");
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id,
+            text: String::new(),
+        });
+        assert_eq!(app.input.value(), "  \n "); // ubs:ignore[rust.panic.assert-macros] -- An empty restore cannot discard authored whitespace in a newer draft.
     }
 
     #[test]
