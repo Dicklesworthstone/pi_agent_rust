@@ -16,6 +16,7 @@ use std::time::Duration;
 use asupersync::time::{TimerDriverHandle, TimerHandle};
 use asupersync::types::Time;
 
+use super::execution::{CancelWait, cancellation};
 use super::{ControlledTurn, SessionControlHandle, control_error};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -250,6 +251,10 @@ pub struct DeadlineTurn<F> {
     deadline: TurnDeadline,
     timer_handle: Option<TimerHandle>,
     timer_fired: Arc<AtomicBool>,
+    /// The deadline may belong to a different owner than the native turn.
+    /// Register its cancellation lane too, so a silent stream is not left
+    /// waiting for provider I/O or the deadline timer to wake it.
+    cancellation: Option<CancelWait>,
     interruption: Option<Interruption>,
     monitored: bool,
     started: bool,
@@ -262,12 +267,14 @@ impl<F> ControlledTurn<F> {
     pub fn with_deadline(self, deadline: TurnDeadline) -> DeadlineTurn<F> {
         let control = self.control();
         let started = self.polled;
+        let cancellation = Some(cancellation(deadline.owner.clone()));
         DeadlineTurn {
             turn: Some(Box::pin(self)),
             control,
             deadline,
             timer_handle: None,
             timer_fired: Arc::new(AtomicBool::new(false)),
+            cancellation,
             interruption: None,
             monitored: true,
             started,
@@ -284,6 +291,9 @@ impl<F> DeadlineTurn<F> {
 
     fn disarm(&mut self) {
         self.monitored = false;
+        // Retire the owner's registered task waker on interruption, normal
+        // completion and drop; cleanup is driven by the native future.
+        drop(self.cancellation.take());
         if let Some(handle) = self.timer_handle.take() {
             let _ = self.deadline.timer.cancel(&handle);
         }
@@ -296,7 +306,7 @@ impl<F> DeadlineTurn<F> {
         self.disarm();
     }
 
-    fn poll_deadline(&mut self, cx: &Context<'_>) {
+    fn poll_deadline(&mut self, cx: &mut Context<'_>) {
         // A prior user abort owns cancellation. Its cleanup must not be relabeled
         // as a timeout just because it eventually crosses the former deadline.
         if !self.control.snapshot().accepting_input {
@@ -309,7 +319,12 @@ impl<F> DeadlineTurn<F> {
             self.interrupt(Interruption::Elapsed);
             return;
         }
-        if self.deadline.owner.checkpoint().is_err() {
+        if self.deadline.owner.checkpoint().is_err()
+            || self
+                .cancellation
+                .as_mut()
+                .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
+        {
             self.interrupt(Interruption::OwnerCancelled);
             return;
         }

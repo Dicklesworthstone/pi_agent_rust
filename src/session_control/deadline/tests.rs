@@ -234,20 +234,51 @@ fn prior_explicit_abort_is_not_reclassified_while_cleanup_drains() {
 }
 
 #[test]
-fn owner_cancellation_drains_without_claiming_deadline_expiry() {
+fn owner_cancellation_wakes_the_current_poller_then_drains_native_cleanup() {
     let (_, deadline) = clock_deadline();
     let owner = deadline.owner.clone();
     let native = turn(Err(Error::session("native cancellation")));
     let release = Arc::clone(&native.future.release);
+    let drops = Arc::clone(&native.future.drops);
+    let control = native.control();
+    let input = control.follow_up("recover after cancellation").unwrap();
     let mut limited = native.with_deadline(deadline);
-    assert!(poll(&mut limited).is_pending());
+    let old_wakes = Arc::new(WakeCount::default());
+    let old_waker = Waker::from(Arc::clone(&old_wakes));
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    assert!(
+        Pin::new(&mut limited)
+            .poll(&mut Context::from_waker(&old_waker))
+            .is_pending()
+    );
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+    // The native probe has no I/O/timer registration, and the virtual clock
+    // does not advance. Without a deadline-owner subscription this task is
+    // never scheduled again; manually polling after cancel would hide it.
     owner.cancel_with(asupersync::types::CancelKind::User, Some("test"));
-    assert!(poll(&mut limited).is_pending());
+    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+    assert_eq!(old_wakes.0.load(Ordering::SeqCst), 0);
+    assert!(!limited.deadline.is_elapsed());
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(!control.snapshot().accepting_input);
+    assert!(!control.snapshot().finished);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(control.take_pending()[0].id, input);
     release.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        poll(&mut limited),
-        Poll::Ready(Err(TurnDeadlineError::OwnerCancelled { .. }))
-    ));
+    let Poll::Ready(Err(error @ TurnDeadlineError::OwnerCancelled { .. })) =
+        Pin::new(&mut limited).poll(&mut cx)
+    else {
+        panic!("owner cancellation must finish through native cleanup");
+    };
+    assert!(matches!(error.completion(), Some(Err(Error::Session(_)))));
+    assert!(control.snapshot().finished);
+    assert!(limited.cancellation.is_none());
+    drop(limited);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -270,6 +301,60 @@ fn normal_completion_preserves_native_success_and_typed_error() {
         }
         assert!(control.snapshot().finished);
     }
+}
+
+#[test]
+fn completion_and_drop_retire_the_deadline_owner_waker() {
+    for complete in [false, true] {
+        let (clock, deadline) = clock_deadline();
+        let timer = deadline.timer.clone();
+        let owner = deadline.owner.clone();
+        let native = turn(Ok(AssistantMessage::default()));
+        native.future.release.store(complete, Ordering::SeqCst);
+        let mut limited = native.with_deadline(deadline);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let result = Pin::new(&mut limited).poll(&mut Context::from_waker(&waker));
+        assert_eq!(result.is_ready(), complete);
+        if complete {
+            // Verify retirement even while the completed wrapper stays alive.
+            assert!(limited.cancellation.is_none());
+            let before = wakes.0.load(Ordering::SeqCst);
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("after completion"));
+            assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+        }
+        drop(limited);
+        let before = wakes.0.load(Ordering::SeqCst);
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("after drop"));
+        clock.advance_to(Time::from_secs(10));
+        let _ = timer.process_timers();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+    }
+}
+
+#[test]
+fn explicit_abort_retires_owner_wait_without_reclassifying_cleanup() {
+    let (_, deadline) = clock_deadline();
+    let owner = deadline.owner.clone();
+    let native = turn(Err(Error::session("explicit abort cleanup")));
+    let release = Arc::clone(&native.future.release);
+    let control = native.control();
+    let mut limited = native.with_deadline(deadline);
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(control.abort());
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(limited.cancellation.is_none());
+    let before = wakes.0.load(Ordering::SeqCst);
+    owner.cancel_with(asupersync::types::CancelKind::User, Some("after explicit abort"));
+    assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+    release.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        Pin::new(&mut limited).poll(&mut cx),
+        Poll::Ready(Err(TurnDeadlineError::Turn(Error::Session(_))))
+    ));
 }
 
 #[test]
