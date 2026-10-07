@@ -287,7 +287,7 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let child = match owner.process().spawn_checked(&mut command) {
+        let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
             Ok(child) => child,
             Err(error) => {
                 attempt.result.fail(format!(
@@ -297,17 +297,7 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        // Guard ownership precedes platform attachment, which may itself fail
-        // or unwind. Every successfully spawned child already has a reaper.
-        let mut child = ChildProcessGuard::new(child);
         attempt.result.pid = Some(child.id());
-        if !crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child")) {
-            attempt.result.fail(
-                "PI_SUBAGENT_CONTAINMENT: failed to attach child process cleanup discipline"
-                    .to_string(),
-            );
-            return attempt;
-        }
         // Close the registration-to-spawn race. A kill observed after OS spawn
         // still owns a reaper and must not be announced as a new running task.
         if !check_budget(owner, self.deadline, &mut attempt.result) {
@@ -564,6 +554,13 @@ struct ChildProcessGuard {
 }
 
 impl ChildProcessGuard {
+    fn spawn(owner: &AgentCx, command: &mut Command) -> std::io::Result<Self> {
+        // Capability-checked dispatch establishes Windows Job membership
+        // before the child can run. Retain its reaper immediately, without a
+        // second attachment that would close the Job already owning the tree.
+        let child = owner.process().spawn_checked(command)?;
+        Ok(Self::new(child))
+    }
     const fn new(child: std::process::Child) -> Self {
         Self {
             child: Some(child),
@@ -754,6 +751,173 @@ async fn drain_until_reader_exit(
             return;
         }
         poll_pause(owner).await;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::path::Path;
+    use win32job::{ExtendedLimitInfo, Job};
+
+    const FIXTURE: &str = "subagents::execution::windows_process_tests::subagent_process_fixture";
+    const ROLE_ENV: &str = "PI_TEST_SUBAGENT_PROCESS_ROLE";
+    const DIRECTORY_ENV: &str = "PI_TEST_SUBAGENT_PROCESS_DIRECTORY";
+
+    fn fixture_command(role: &str, directory: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", FIXTURE, "--nocapture"])
+            .env(ROLE_ENV, role)
+            .env(DIRECTORY_ENV, directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    #[test]
+    fn subagent_process_fixture() {
+        let Ok(role) = std::env::var(ROLE_ENV) else {
+            return;
+        };
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY_ENV).unwrap());
+        if role == "descendant" {
+            std::fs::write(directory.join("descendant.ready"), "ready").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        assert_eq!(role, "root");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("start").exists() {
+            assert!(Instant::now() < deadline, "parent did not start the fixture");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut descendant = fixture_command("descendant", &directory).spawn().unwrap();
+        std::fs::write(directory.join("descendant.pid"), descendant.id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if directory.join("exit-root").exists() {
+                // Deliberately leave a live descendant to exercise cleanup
+                // after the root is reaped. The observer Job owns fallback
+                // cleanup if the parent's assertion fails.
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = descendant.kill();
+        let _ = descendant.wait();
+    }
+
+    struct Fixture {
+        child: ChildProcessGuard,
+        observer: Job,
+        directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = AgentCx::for_request();
+            // This is the exact dispatch and ownership transfer used by
+            // ChildRunner. Do not attach a Job after this call: doing so
+            // would hide the regression in spawn_checked.
+            let child = ChildProcessGuard::spawn(
+                &owner,
+                &mut fixture_command("root", directory.path()),
+            )
+            .unwrap();
+            let mut limits = ExtendedLimitInfo::new();
+            limits.limit_kill_on_job_close();
+            let observer = Job::create_with_limit_info(&limits).unwrap();
+            observer
+                .assign_process(child.child.as_ref().unwrap().as_raw_handle() as isize)
+                .unwrap();
+            // This separate nested Job only observes liveness and provides
+            // panic cleanup. It is never registered in Pi's Job registry.
+            std::fs::write(directory.path().join("start"), "start").unwrap();
+            let fixture = Self {
+                child,
+                observer,
+                directory,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let descendant = loop {
+                if fixture.directory.path().join("descendant.ready").exists()
+                    && let Ok(text) = std::fs::read_to_string(
+                        fixture.directory.path().join("descendant.pid"),
+                    )
+                    && let Ok(pid) = text.parse::<usize>()
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "descendant did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let members = fixture.observer.query_process_id_list().unwrap();
+            assert!(members.contains(&usize::try_from(fixture.child.id()).unwrap()));
+            assert!(members.contains(&descendant));
+            fixture
+        }
+
+        fn reap_root(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self
+                .child
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+            {
+                assert!(Instant::now() < deadline, "subagent root did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn assert_tree_stopped(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.observer.query_process_id_list().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "subagent descendants survived cleanup"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_dispatch_returns_a_subagent_tree_already_owned_by_its_job() {
+        let mut fixture = Fixture::start();
+        // Use registry-only termination before invoking the guard's fallback
+        // process walk. A raw spawn cannot pass by killing the same PIDs later.
+        crate::tools::terminate_reaped_child_discipline(fixture.child.id());
+        fixture.reap_root();
+        fixture.assert_tree_stopped();
+        fixture.child.disarm();
+    }
+
+    #[test]
+    fn subagent_guard_stops_the_tree_after_cancellation_and_natural_root_exit() {
+        for root_exits in [false, true] {
+            let mut fixture = Fixture::start();
+            if root_exits {
+                std::fs::write(fixture.directory.path().join("exit-root"), "exit").unwrap();
+                fixture.reap_root();
+                assert!(
+                    !fixture.observer.query_process_id_list().unwrap().is_empty(),
+                    "the fixture must leave a live descendant after root exit"
+                );
+                fixture.child.stop_descendants();
+                fixture.child.disarm();
+            } else {
+                fixture.child.terminate();
+            }
+            fixture.assert_tree_stopped();
+        }
     }
 }
 

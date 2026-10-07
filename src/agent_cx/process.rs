@@ -46,11 +46,13 @@ fn check_wait(owner: &AgentCx) -> io::Result<()> {
 impl AgentProcess<'_> {
     /// Dispatch for internal runners that already own process-group cleanup,
     /// pipe draining and reaping. The returned child must enter that guard
-    /// immediately; public callers use `command(...).spawn()` instead.
+    /// immediately and already belongs to its Windows Job; attaching it again
+    /// would replace and close the Job that owns its descendants. Public callers
+    /// use `command(...).spawn()` instead.
     pub(crate) fn spawn_checked(&self, command: &mut Command) -> io::Result<Child> {
         check_spawn(self.cx)?;
         let _guard = self.cx.cx().clone().set_current_restricted();
-        command.spawn()
+        crate::tools::spawn_command_with_job_discipline(command)
     }
 }
 
@@ -316,6 +318,17 @@ mod tests {
     }
 
     #[test]
+    fn internal_dispatch_cannot_use_the_callers_spawn_authority() {
+        let owner = restricted_owner();
+        let _caller = Cx::for_request().set_current_restricted();
+        let error = owner
+            .process()
+            .spawn_checked(&mut Command::new("must-not-be-executed"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied); // ubs:ignore: unit-test capability-isolation oracle
+    }
+
+    #[test]
     fn cancellation_between_construction_and_spawn_prevents_dispatch() {
         let owner = AgentCx::for_request();
         let mut command = AgentCommand::new(owner.clone(), "must-not-be-executed");
@@ -325,6 +338,20 @@ mod tests {
         );
         let error = command.spawn().err().expect("cancelled spawn");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelled_internal_owner_prevents_dispatch() {
+        let owner = AgentCx::for_request();
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel before internal spawn"),
+        );
+        let error = owner
+            .process()
+            .spawn_checked(&mut Command::new("must-not-be-executed"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted); // ubs:ignore: unit-test cancellation oracle
     }
 
     #[test]
@@ -419,6 +446,69 @@ mod tests {
         assert!(child.child.is_none());
         assert!(child.status.is_some());
         assert!(child.descendants_stopped);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_internal_spawn_restores_caller_and_allows_a_later_launch() {
+        use std::io::Read as _;
+        use std::time::Instant;
+
+        let directory = tempfile::tempdir().unwrap();
+        let owner = AgentCx::for_request();
+        let restricted = Cx::for_request().restrict::<asupersync::cx::cap::None>();
+        let _caller = restricted.set_current_restricted();
+        let error = owner
+            .process()
+            .spawn_checked(&mut Command::new(directory.path().join("missing-child.exe")))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let caller = Cx::current().unwrap();
+        assert!(!caller.capabilities().io);
+        assert!(!caller.capabilities().spawn);
+
+        let mut command = Command::new("cmd.exe");
+        command
+            .args([
+                "/D",
+                "/C",
+                "echo %PI_TEST_CHECKED_VALUE%&echo checked-error 1>&2&exit /B 7",
+            ])
+            .current_dir(directory.path())
+            .env("PI_TEST_CHECKED_VALUE", "checked-value")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = owner.process().spawn_checked(&mut command).unwrap();
+        let mut child = AgentChild::new(owner, child);
+        let caller = Cx::current().unwrap();
+        assert!(!caller.capabilities().io);
+        assert!(!caller.capabilities().spawn);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "checked child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert!(child.child.is_none());
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .take_stdout()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .take_stderr()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(stdout.trim(), "checked-value");
+        assert_eq!(stderr.trim(), "checked-error");
     }
 
     #[cfg(unix)]
