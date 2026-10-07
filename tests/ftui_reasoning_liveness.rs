@@ -1,8 +1,10 @@
 //! GH #255: mixed-width reasoning must not strand the FTUI event loop.
 //!
-//! Exercise Full-quality frames, not an injected degradation workaround.
-//! A supervised child bounds nontermination inside Line::wrap. Its deadline
-//! is not a render-performance claim or a runtime queue-fairness test.
+//! Direct model cases exercise Full-quality frames. Wire cases additionally
+//! drive the real provider, SDK persistence, subscription, Program and ANSI
+//! presentation paths with keyboard checkpoints during the reasoning stream.
+//! Supervised children bound nontermination; deadlines are not performance
+//! thresholds. The wire peer gates batches, not an unbounded producer flood.
 
 #![cfg(feature = "ftui")]
 #![forbid(unsafe_code)]
@@ -22,6 +24,9 @@ use pi::interactive_ftui::{PiFtuiModel, PiFtuiMsg, UiCommand};
 use pi::model::{AssistantMessage, ContentBlock, Message, StopReason, Usage, UserContent};
 use pi::session::{Session, SessionMessage};
 
+#[path = "ftui_reasoning_liveness/wire.rs"]
+mod wire;
+
 const CHILD_CASE: &str = "PI_GH255_CHILD_CASE";
 const WIDTH: u16 = 47;
 const HEIGHT: u16 = 12;
@@ -35,41 +40,55 @@ fn phase(label: &str) {
 #[test]
 fn gh255_reasoning_stream_and_persisted_resume_remain_live() {
     for case in ["word_char_progress", "stream_resume_abort"] {
-        let log = tempfile::NamedTempFile::new().expect("child diagnostic log");
-        let output = log.reopen().expect("open diagnostic output");
-        let mut child = Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "gh255_supervised_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(CHILD_CASE, case)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(output.try_clone().expect("clone output handle")))
-            .stderr(Stdio::from(output))
-            .spawn()
-            .expect("spawn supervised FTUI test");
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("poll supervised child") {
-                break status;
-            }
-            if started.elapsed() > Duration::from_secs(120) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let trace = std::fs::read_to_string(log.path()).unwrap_or_default();
-                panic!("GH255 {case} failed to return; last phase identifies the stall:\n{trace}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let trace = std::fs::read_to_string(log.path()).expect("read child trace");
-        assert!(status.success(), "GH255 {case} failed: {status}\n{trace}");
-        assert!(
-            trace.contains("GH255 complete"),
-            "child did not finish: {trace}"
-        );
+        supervise(case);
     }
+}
+
+#[test]
+fn gh255_wire_reasoning_stays_visible_and_cold_resume_completes() {
+    supervise("wire_complete_resume");
+}
+
+#[test]
+fn gh255_wire_escape_cancels_open_stream_and_same_session_recovers() {
+    supervise("wire_abort_recovery");
+}
+
+fn supervise(case: &str) {
+    let log = tempfile::NamedTempFile::new().expect("child diagnostic log");
+    let output = log.reopen().expect("open diagnostic output");
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "gh255_supervised_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD_CASE, case)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone().expect("clone output handle")))
+        .stderr(Stdio::from(output))
+        .spawn()
+        .expect("spawn supervised FTUI test");
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll supervised child") {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let trace = std::fs::read_to_string(log.path()).unwrap_or_default();
+            panic!("GH255 {case} failed to return; last phase identifies the stall:\n{trace}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let trace = std::fs::read_to_string(log.path()).expect("read child trace");
+    assert!(status.success(), "GH255 {case} failed: {status}\n{trace}");
+    assert!(
+        trace.contains("GH255 complete"),
+        "child did not finish: {trace}"
+    );
 }
 
 #[test]
@@ -81,6 +100,8 @@ fn gh255_supervised_child() {
     {
         "word_char_progress" => word_char_progress(),
         "stream_resume_abort" => stream_resume_abort(),
+        "wire_complete_resume" => wire::run(false),
+        "wire_abort_recovery" => wire::run(true),
         other => panic!("unknown GH255 case: {other}"),
     }
     phase("complete");
