@@ -3,6 +3,8 @@
 //! Only the first attempt may append user input. Recovery goes through the
 //! session's persisted continuation/transition APIs, never the bare Agent loop.
 
+mod ownership;
+
 use super::{
     AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, ContentBlock,
     Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
@@ -316,6 +318,9 @@ impl AgentSessionHandle {
     /// fan-out. With no retry policy the first outcome is returned unchanged.
     /// A session-persistence error fences this handle: start a new or resumed
     /// session before issuing another prompt, even after repairing the save path.
+    /// Dropping an admitted prompt future also fences the handle: it cannot run
+    /// its final save. To cancel and keep using the handle, signal its abort and
+    /// await the outcome so completed tool work can be persisted.
     pub async fn prompt(
         &mut self,
         input: impl Into<String>,
@@ -465,6 +470,7 @@ impl AgentSessionHandle {
         self.maybe_restore_primary(&shared).await?;
         ensure_not_aborted(&abort_signal)?;
         let turn = LogicalTurn::new(shared);
+        let _ownership = ownership::TurnGuard::new(&turn, self.session.provider_admission_gate());
         let shared = turn.callback();
         let forwarded = Arc::clone(&shared);
         // Hooks run only for the first prompt. Keep their effective base in
