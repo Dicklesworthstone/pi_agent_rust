@@ -44,6 +44,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{AssistantMessageEvent, ContentBlock};
 use crate::models::{ModelEntry, ModelRegistry};
+#[cfg(test)]
 use crate::provider::StreamOptions;
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
@@ -191,6 +192,9 @@ struct AcpSessionState {
     /// The agent session. Wrapped in Option so it can be temporarily taken
     /// out during prompt execution without holding the session lock.
     agent_session: Option<AgentSessionHandle>,
+    /// Ready launch catalog plus the admitted startup entry, retained across
+    /// model changes so a selected ad-hoc model remains available to return to.
+    available_models: Vec<ModelEntry>,
     cwd: PathBuf,
     /// Remains reachable during a turn so EOF/exit can close external tools.
     mcp: Option<Arc<mcp::SessionMcp>>,
@@ -200,10 +204,55 @@ struct AcpSessionState {
 // ACP Server
 // ============================================================================
 
+/// Model and credential choices supplied by the process launching the editor
+/// agent. These remain separate from persisted session settings: reopening a
+/// branch restores its own model and effort, while the key stays runtime-only.
+#[derive(Clone, Default)]
+pub struct AcpLaunchOptions {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub models: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl AcpLaunchOptions {
+    #[must_use]
+    pub fn from_cli(cli: &crate::cli::Cli) -> Self {
+        Self {
+            provider: cli.provider.clone(),
+            model: cli.model.clone(),
+            thinking: cli.thinking.clone(),
+            models: cli.models.clone(),
+            api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
+        }
+    }
+
+    fn selection_cli(&self) -> Result<crate::cli::Cli> {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        // The host already parsed its flags and environment once. Construct
+        // neutral defaults here: re-reading unrelated typed environment flags
+        // can reject a session even when the host overrode them successfully.
+        let matches = crate::cli::Cli::command()
+            .mut_args(|arg| arg.env(None::<&str>))
+            .try_get_matches_from(["pi"])
+            .map_err(|error| Error::config(error.to_string()))?;
+        let mut cli = crate::cli::Cli::from_arg_matches(&matches)
+            .map_err(|error| Error::config(error.to_string()))?;
+        cli.provider.clone_from(&self.provider);
+        cli.model.clone_from(&self.model);
+        cli.thinking.clone_from(&self.thinking);
+        cli.models.clone_from(&self.models);
+        cli.api_key = crate::models::normalize_api_key_opt(self.api_key.clone());
+        Ok(cli)
+    }
+}
+
 /// Options for starting the ACP server.
 #[derive(Clone)]
 pub struct AcpOptions {
     pub config: Config,
+    pub launch: AcpLaunchOptions,
     pub available_models: Vec<ModelEntry>,
     /// Full model registry (every known/loaded model, not just the ready ones in
     /// `available_models`). Used so a live session can switch to any registered
@@ -212,6 +261,9 @@ pub struct AcpOptions {
     /// the target model entry.
     pub model_registry: ModelRegistry,
     pub auth: AuthStorage,
+    /// Providers whose startup OAuth refresh failed. Keep only identities here;
+    /// remote refresh error bodies must not reach editor protocol responses.
+    pub oauth_refresh_failures: Vec<String>,
     pub runtime_handle: RuntimeHandle,
     /// When set (from the `--session-dir` CLI flag), ACP sessions persist to
     /// this directory and autosave is enabled. After an editor restart they
@@ -469,7 +521,7 @@ async fn run(
 
                 match handle_session_new(&request.params, &options, Some(&permission_client)) {
                     Ok((session_id, state)) => {
-                        let models: Vec<AcpModel> = options
+                        let models: Vec<AcpModel> = state
                             .available_models
                             .iter()
                             .map(|entry| AcpModel {
@@ -494,7 +546,7 @@ async fn run(
                             },
                         ];
 
-                        let config_options = config_options_for(&state, &options.available_models);
+                        let config_options = config_options_for(&state);
                         let mcp_state = state.mcp.clone();
                         let state_arc = Arc::new(Mutex::new(state));
                         {
@@ -784,15 +836,6 @@ async fn run(
                     continue;
                 };
 
-                let (provider, model) =
-                    match resolve_set_model_target(&request.params, &options.model_registry) {
-                        Ok(pair) => pair,
-                        Err(msg) => {
-                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                            continue;
-                        }
-                    };
-
                 let session_state = {
                     sessions
                         .lock(&cx)
@@ -808,7 +851,7 @@ async fn run(
                     continue;
                 };
 
-                match apply_set_model(&session_state, &provider, &model, &cx).await {
+                match apply_set_model_request(&session_state, &request.params, &cx).await {
                     Ok((provider, model)) => {
                         let _ = out_tx.send(json_rpc_ok(
                             id,
@@ -857,24 +900,9 @@ async fn run(
 
                 // `model` is the ACP model selector: same switch as
                 // session/set_model, with the value as `provider/id` or an id.
-                let model_target = if name.eq_ignore_ascii_case("model") {
-                    let target = value.as_str().map(str::trim).map(|raw| {
-                        let params = match raw.split_once('/') {
-                            Some((provider, model))
-                                if options.model_registry.find(provider, model).is_some() =>
-                            {
-                                json!({ "provider": provider, "model": model })
-                            }
-                            _ => json!({ "model": raw }),
-                        };
-                        resolve_set_model_target(&params, &options.model_registry)
-                    });
-                    match target {
-                        Some(Ok(pair)) => Some(pair),
-                        Some(Err(msg)) => {
-                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                            continue;
-                        }
+                let model_request = if name.eq_ignore_ascii_case("model") {
+                    match value.as_str() {
+                        Some(model) => Some(json!({ "model": model })),
                         None => {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
@@ -887,7 +915,7 @@ async fn run(
                 } else {
                     None
                 };
-                let option = if model_target.is_some() {
+                let option = if model_request.is_some() {
                     None
                 } else {
                     match parse_config_option(name, &value) {
@@ -914,9 +942,9 @@ async fn run(
                     continue;
                 };
 
-                let applied = match (model_target, option) {
-                    (Some((provider, model)), _) => {
-                        apply_set_model(&session_state, &provider, &model, &cx)
+                let applied = match (model_request, option) {
+                    (Some(params), _) => {
+                        apply_set_model_request(&session_state, &params, &cx)
                             .await
                             .map(drop)
                     }
@@ -929,7 +957,7 @@ async fn run(
                     Ok(()) => {
                         // ACP answers with the complete config state.
                         let config_options = session_state.lock(&cx).await.ok().and_then(|guard| {
-                            config_options_for(&guard, &options.available_models)
+                            config_options_for(&guard)
                         });
                         let _ = out_tx.send(json_rpc_ok(
                             id,
@@ -1318,6 +1346,113 @@ fn resolve_acp_thinking_level(
     model_entry.clamp_thinking_level(requested)
 }
 
+/// Resolve against the actual new/reopened session, without constructing a
+/// throwaway agent. ACP retains its configured-default selection when no model
+/// choice was supplied, and shares the CLI's explicit model/effort resolver.
+fn resolve_acp_selection(
+    session: &Session,
+    cwd: &std::path::Path,
+    options: &AcpOptions,
+    cli: &mut crate::cli::Cli,
+) -> Result<crate::app::ModelSelection> {
+    let mut registry = options.model_registry.clone();
+    let mut scoped_models = Vec::new();
+    if let Some((provider, model)) = session.effective_model_for_current_path() {
+        let entry = registry
+            .find(&provider, &model)
+            .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model))
+            .ok_or_else(|| {
+                Error::provider(
+                    "acp",
+                    format!("Saved session model is not registered: {provider}/{model}"),
+                )
+            })?;
+        cli.provider = Some(provider);
+        cli.model = Some(model);
+        // A launch option configures new conversations, never the loaded branch.
+        cli.thinking = Some(
+            match session.effective_thinking_level_for_current_path() {
+                Some(level) => entry
+                    .clamp_thinking_level(level.parse().map_err(|_| {
+                        Error::session("Saved session has an invalid thinking level")
+                    })?)
+                    .to_string(),
+                None => resolve_acp_thinking_level(&options.config, &entry).to_string(),
+            },
+        );
+        registry.merge_entries(vec![entry]);
+    } else if cli.provider.is_none() && cli.model.is_none() {
+        let scope_override = options
+            .config
+            .model_scope_overrides
+            .as_deref()
+            .and_then(|overrides| crate::failover::best_scope_override(overrides, cwd));
+        let patterns = cli
+            .models
+            .as_deref()
+            .map(crate::app::parse_models_arg)
+            .or_else(|| scope_override.and_then(|scope| scope.enabled_models.clone()))
+            .or_else(|| options.config.enabled_models.clone())
+            .unwrap_or_default();
+        let disabled = options
+            .config
+            .disabled_providers
+            .as_deref()
+            .unwrap_or_default();
+        scoped_models = crate::app::resolve_model_scope(&patterns, &registry, cli.api_key.is_some())
+            .into_iter()
+            .filter(|scoped| {
+                !crate::failover::provider_is_disabled(
+                    disabled,
+                    scope_override,
+                    &scoped.model.model.provider,
+                )
+            })
+            .collect();
+        let scoped = scoped_models
+            .iter()
+            .find(|scoped| {
+                options
+                    .config
+                    .default_provider
+                    .as_deref()
+                    .is_some_and(|provider| {
+                        provider_ids_match(provider, &scoped.model.model.provider)
+                    })
+                    && options.config.default_model.as_deref().is_some_and(|model| {
+                        model.eq_ignore_ascii_case(&scoped.model.model.id)
+                    })
+            })
+            .or_else(|| scoped_models.first());
+        let entry = if let Some(scoped) = scoped {
+            if cli.thinking.is_none() {
+                cli.thinking = scoped.thinking_level.map(|level| level.to_string());
+            }
+            scoped.model.clone()
+        } else {
+            if cli.api_key.is_some() {
+                return Err(Error::config(
+                    "--api-key requires a model to be specified via --provider/--model or --models",
+                ));
+            }
+            select_acp_model_entry(&options.config, &options.available_models)
+                .ok_or_else(|| Error::provider("acp", "No models available"))?
+        };
+        cli.provider = Some(entry.model.provider.clone());
+        cli.model = Some(entry.model.id.clone());
+        registry.merge_entries(vec![entry]);
+    }
+    crate::app::select_model_and_thinking(
+        cli,
+        &options.config,
+        session,
+        &registry,
+        &scoped_models,
+        &Config::global_dir(),
+    )
+    .map_err(|error| Error::config(error.to_string()))
+}
+
 /// The system prompt for an ACP session: pi's own prompt, as the CLI and
 /// the SDK build it (tool guidance, every context file including CLAUDE.md,
 /// the global AGENTS.md and ancestors, always-apply foreign workspace rules,
@@ -1492,7 +1627,7 @@ fn handle_session_new(
 /// auth resolution, system prompt, and persistence owner. Restore the selected
 /// branch's settings instead of another branch's header tip or startup defaults.
 fn build_acp_session(
-    session: Session,
+    mut session: Session,
     save_enabled: bool,
     cwd: PathBuf,
     options: &AcpOptions,
@@ -1504,22 +1639,36 @@ fn build_acp_session(
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
 
-    let model_entry = if let Some((provider, model)) = session.effective_model_for_current_path() {
-        options.model_registry.find(&provider, &model).ok_or_else(|| {
-            Error::provider("acp", format!("Saved session model is not registered: {provider}/{model}"))
-        })?
-    } else {
-        select_acp_model_entry(&options.config, &options.available_models)
-            .ok_or_else(|| Error::provider("acp", "No models available"))?
-    };
-    let thinking_level = match session.effective_thinking_level_for_current_path() {
-        Some(level) => model_entry.clamp_thinking_level(level.parse().map_err(|_| {
-            Error::session("Saved session has an invalid thinking level")
-        })?),
-        None => resolve_acp_thinking_level(&options.config, &model_entry),
-    };
+    let mut cli = options.launch.selection_cli()?;
+    let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
+    let model_entry = &selection.model_entry;
+    if cli.api_key.is_none()
+        && options
+            .oauth_refresh_failures
+            .iter()
+            .any(|provider| provider_ids_match(provider, &model_entry.model.provider))
+    {
+        return Err(Error::auth(format!(
+            "OAuth token refresh failed for {}; run `pi auth login {}` to renew it",
+            model_entry.model.provider, model_entry.model.provider,
+        )));
+    }
+    let api_key = crate::app::resolve_api_key(&options.auth, &cli, model_entry)
+        .map_err(|error| Error::provider("acp", error.to_string()))?;
+    let stream_options =
+        crate::app::build_stream_options(&options.config, api_key, &selection, &session);
+    crate::app::update_session_for_selection(&mut session, &selection);
+    let mut registry = options.model_registry.clone();
+    registry.merge_entries(vec![model_entry.clone()]);
+    let mut available_models = options.available_models.clone();
+    if !available_models.iter().any(|entry| {
+        provider_ids_match(&entry.model.provider, &model_entry.model.provider)
+            && entry.model.id.eq_ignore_ascii_case(&model_entry.model.id)
+    }) {
+        available_models.push(model_entry.clone());
+    }
 
-    let provider = providers::create_provider(&model_entry, None)
+    let provider = providers::create_provider(model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     let system_prompt = build_acp_system_prompt(
@@ -1528,27 +1677,6 @@ fn build_acp_session(
         &options.config,
         options.skills_prompt.as_deref(),
     );
-
-    // Resolve API key from auth storage and model entry.
-    let api_key = options
-        .auth
-        .resolve_api_key(&model_entry.model.provider, None)
-        .or_else(|| model_entry.api_key.clone())
-        .and_then(|k| {
-            let trimmed = k.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
-
-    let stream_options = StreamOptions {
-        api_key,
-        thinking_level: Some(thinking_level),
-        headers: model_entry.headers.clone(),
-        // Seed the per-request output cap from the model registry's `maxTokens`
-        // so ACP sessions honor the configured limit instead of the provider's
-        // hardcoded per-request default.
-        max_tokens: Some(model_entry.model.max_tokens),
-        ..StreamOptions::default()
-    };
 
     let agent_config = crate::agent::AgentConfig {
         system_prompt: Some(system_prompt),
@@ -1591,8 +1719,9 @@ fn build_acp_session(
     // needs the registry to find the target model and resolve its credentials).
     let agent_session = AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
         .with_runtime_handle(options.runtime_handle.clone())
-        .with_model_registry(options.model_registry.clone())
-        .with_auth_storage(options.auth.clone());
+        .with_model_registry(registry.clone())
+        .with_auth_storage(options.auth.clone())
+        .with_api_key_override(cli.api_key.clone());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
     // fallback state; rebuilding a handle per prompt would lose that state.
@@ -1601,15 +1730,16 @@ fn build_acp_session(
             .with_retry(crate::failover::RetryPolicy::from_config(&options.config))
             .with_failover(FailoverOptions::from_config(
                 &options.config,
-                options.model_registry.models().to_vec(),
+                registry.models().to_vec(),
                 options.auth.clone(),
-                None,
+                cli.api_key,
             ));
 
     Ok((
         session_id,
         AcpSessionState {
             agent_session: Some(agent_session),
+            available_models,
             cwd,
             mcp: None,
         },
@@ -1697,9 +1827,9 @@ fn session_config_options(
 
 /// [`session_config_options`] for a live session, or `None` while a prompt
 /// holds the agent session.
-fn config_options_for(state: &AcpSessionState, available_models: &[ModelEntry]) -> Option<Value> {
+fn config_options_for(state: &AcpSessionState) -> Option<Value> {
     let agent_session = state.agent_session.as_ref()?;
-    Some(config_options_for_handle(agent_session, available_models))
+    Some(config_options_for_handle(agent_session, &state.available_models))
 }
 
 fn config_options_for_handle(handle: &AgentSessionHandle, available_models: &[ModelEntry]) -> Value {
@@ -1725,13 +1855,10 @@ struct AcpRecoveryUpdates {
 impl AcpRecoveryUpdates {
     fn new(
         handle: &AgentSessionHandle,
+        available_models: Vec<ModelEntry>,
         out: &std::sync::mpsc::SyncSender<String>,
         session_id: &str,
     ) -> Arc<Self> {
-        let available_models = handle
-            .session()
-            .model_registry()
-            .map_or_else(Vec::new, ModelRegistry::get_available);
         let configuration = config_options_for_handle(handle, &available_models);
         Arc::new(Self {
             out: out.clone(),
@@ -1906,6 +2033,12 @@ fn resolve_set_model_target(
         return Ok((provider.to_string(), model.to_string()));
     }
 
+    if let Some((provider, model_id)) = model.split_once('/')
+        && let Some(entry) = registry.find(provider, model_id)
+    {
+        return Ok((entry.model.provider, entry.model.id));
+    }
+
     // No provider given — resolve it from the registry by model id.
     match registry.find_by_id(model) {
         Some(entry) => Ok((entry.model.provider, entry.model.id)),
@@ -1955,30 +2088,49 @@ fn parse_config_option(
     }
 }
 
-/// Apply a resolved `session/set_model` to a live session.
-///
-/// Returns the active `(provider, model)` on success. The agent session may be
-/// `None` if a prompt is currently in flight (it is taken out of the state
-/// during a turn); callers should surface that as a retryable error.
-async fn apply_set_model(
+/// Resolve and apply either editor model selector through the live session's
+/// registry. It includes ad-hoc startup entries that the process catalog lacks.
+async fn apply_set_model_request(
     session_state: &Arc<Mutex<AcpSessionState>>,
-    provider: &str,
-    model: &str,
+    params: &Value,
     cx: &AgentCx,
 ) -> std::result::Result<(String, String), String> {
-    // OwnedMutexGuard: the guard is held across the awaits below, and the
-    // borrowed MutexGuard is !Send (clippy::future_not_send).
     let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(session_state), cx).await else {
         return Err("session state lock unavailable".to_string());
     };
     let Some(agent_session) = guard.agent_session.as_mut() else {
         return Err("Cannot change model while a prompt is in progress".to_string());
     };
+    let registry = agent_session
+        .session()
+        .model_registry()
+        .ok_or_else(|| "session model registry unavailable".to_string())?;
+    let (provider, model) = resolve_set_model_target(params, registry)?;
     agent_session
-        .set_model(provider, model)
+        .set_model(&provider, &model)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok((provider.to_string(), model.to_string()))
+        .map_err(|error| error.to_string())?;
+    Ok(agent_session.model())
+}
+
+/// Apply a resolved `session/set_model` to a live session.
+///
+/// Returns the active `(provider, model)` on success. The agent session may be
+/// `None` if a prompt is currently in flight (it is taken out of the state
+/// during a turn); callers should surface that as a retryable error.
+#[cfg(test)]
+async fn apply_set_model(
+    session_state: &Arc<Mutex<AcpSessionState>>,
+    provider: &str,
+    model: &str,
+    cx: &AgentCx,
+) -> std::result::Result<(String, String), String> {
+    apply_set_model_request(
+        session_state,
+        &json!({ "provider": provider, "model": model }),
+        cx,
+    )
+    .await
 }
 
 /// Apply a parsed `session/set_config_option` to a live session.
@@ -2026,15 +2178,16 @@ async fn run_prompt(
         Ok(mut guard) => guard
             .agent_session
             .take()
-            .map(|agent| (agent, guard.mcp.clone()))
+            .map(|agent| (agent, guard.mcp.clone(), guard.available_models.clone()))
             .ok_or_else(|| Error::session("Agent session is unavailable while a prompt is active")),
         Err(error) => Err(Error::from(error)),
     };
-    let (mut agent_session, mcp_state) = match taken {
+    let (mut agent_session, mcp_state, available_models) = match taken {
         Ok(taken) => taken,
         Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
-    let recovery_updates = AcpRecoveryUpdates::new(&agent_session, &out_tx, &session_id);
+    let recovery_updates =
+        AcpRecoveryUpdates::new(&agent_session, available_models, &out_tx, &session_id);
     let recovery_callback = Arc::clone(&recovery_updates);
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
@@ -2460,6 +2613,7 @@ mod tests {
                 session,
                 EventListeners::default(),
             )),
+            available_models: Vec::new(),
             cwd: root.to_path_buf(),
             mcp: None,
         }));
@@ -3312,6 +3466,7 @@ mod tests {
                 agent_session,
                 EventListeners::default(),
             )),
+            available_models: registry.get_available(),
             cwd: PathBuf::from("."),
             mcp: None,
         }));

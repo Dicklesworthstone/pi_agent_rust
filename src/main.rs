@@ -1886,12 +1886,15 @@ async fn run(
     // for Zed editor integration. Sessions are created on-demand via the protocol
     // so we skip the normal session/model selection pipeline.
     if cli.acp {
-        let available_models = model_registry.get_available();
+        let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let acp_options = pi::acp::AcpOptions {
             config: config.clone(),
+            launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
             available_models,
             model_registry: model_registry.clone(),
             auth: auth.clone(),
+            oauth_refresh_failures: startup_oauth_refresh.failed_provider_ids()
+                .into_iter().map(str::to_string).collect(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
             // ACP sessions always carry the read tool, so skills are listed

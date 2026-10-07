@@ -594,6 +594,7 @@ mod tests {
                         session, crate::sdk::EventListeners::default(),
                     )),
                     cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
+                    available_models: Vec::new(),
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
                 let run = |command| {

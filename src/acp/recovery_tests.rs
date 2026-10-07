@@ -158,6 +158,7 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
         entry(FALLBACK_PROVIDER, FALLBACK_MODEL, false, 512),
     ];
     AcpOptions {
+        launch: AcpLaunchOptions::default(),
         config: Config {
             default_provider: Some(PRIMARY_PROVIDER.to_string()),
             default_model: Some(PRIMARY_MODEL.to_string()),
@@ -178,6 +179,7 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
         available_models: models.clone(),
         model_registry: ModelRegistry::from_entries_for_tests(models),
         auth: AuthStorage::load(root.join("auth.json")).unwrap(),
+        oauth_refresh_failures: Vec::new(),
         runtime_handle: runtime,
         session_dir: Some(root.to_path_buf()),
         skills_prompt: None,
@@ -249,6 +251,238 @@ fn configuration_updates(updates: &[Value]) -> Vec<&Value> {
 fn user_content(request: &Value) -> &Value {
     &request["messages"].as_array().unwrap().iter().rev()
         .find(|message| message["role"] == "user").unwrap()["content"]
+}
+
+#[test]
+fn launch_selection_reaches_the_configured_agent_and_session_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        for (provider, model, models, effort, expected_provider, expected_model, expected_effort) in [
+            (Some(PRIMARY_PROVIDER), Some(PRIMARY_MODEL.to_string()), None, "low", PRIMARY_PROVIDER, PRIMARY_MODEL, "low"),
+            (Some(FALLBACK_PROVIDER), None, None, "high", FALLBACK_PROVIDER, FALLBACK_MODEL, "off"),
+            (None, Some(format!("{PRIMARY_PROVIDER}/{PRIMARY_MODEL}")), None, "high", PRIMARY_PROVIDER, PRIMARY_MODEL, "high"),
+            (None, Some(PRIMARY_MODEL.to_string()), None, "off", PRIMARY_PROVIDER, PRIMARY_MODEL, "off"),
+            (None, None, Some(format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}:high")), "high", FALLBACK_PROVIDER, FALLBACK_MODEL, "off"),
+        ] {
+            let mut options = options(root.path(), "https://acp-launch.invalid/v1", runtime.handle(), 0);
+            // The ready-only catalog is empty: explicit selection and an
+            // explicit credential must still reach the registered model.
+            options.available_models.clear();
+            let mut entries = options.model_registry.models().to_vec();
+            for entry in &mut entries {
+                entry.api_key = None;
+                entry.auth_header = true;
+            }
+            options.model_registry = ModelRegistry::from_entries_for_tests(entries);
+            options.launch = AcpLaunchOptions {
+                provider: provider.map(str::to_string), model, models,
+                thinking: Some(effort.to_string()),
+                api_key: Some("  launch-fixture-key  ".to_string()),
+            };
+            let (id, state) = new_state(root.path(), &options);
+            let guard = state.try_lock().unwrap();
+            let handle = guard.agent_session.as_ref().unwrap();
+            let provider = handle.session().agent.provider();
+            assert_eq!((provider.name(), provider.model_id()), (expected_provider, expected_model));
+            let stream = handle.session().agent.stream_options();
+            assert_eq!(stream.api_key.as_deref(), Some("launch-fixture-key"));
+            assert_eq!(stream.session_id.as_deref(), Some(id.as_str()));
+            assert_eq!(stream.headers.get("x-acp-model").map(String::as_str), Some(expected_model));
+            assert_eq!(stream.thinking_level.unwrap().to_string(), expected_effort);
+            assert_eq!(stream.max_tokens, Some(if expected_model == PRIMARY_MODEL { 2_048 } else { 512 }));
+            let config = config_options_for_handle(handle, &options.available_models);
+            assert_eq!(config[0]["currentValue"], format!("{expected_provider}/{expected_model}"));
+            assert_eq!(config[1]["currentValue"], expected_effort);
+            assert!(!config.to_string().contains("launch-fixture-key"));
+            let store = handle.session_store();
+            let saved = store.try_lock().unwrap();
+            assert_eq!(saved.header.id, id);
+            assert_eq!(saved.effective_model_for_current_path(), Some((expected_provider.to_string(), expected_model.to_string())));
+            assert_eq!(saved.effective_thinking_level_for_current_path().as_deref(), Some(expected_effort));
+        }
+    });
+}
+
+#[test]
+fn launch_scope_uses_the_requested_workspace_and_preserves_scoped_effort() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), "https://acp-scope.invalid/v1", runtime.handle(), 0);
+        options.config.enabled_models = Some(vec![format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}")]);
+        options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+            path: project.path().display().to_string(),
+            enabled_models: Some(vec![format!("{PRIMARY_PROVIDER}/{PRIMARY_MODEL}:low")]),
+            disabled_providers: None,
+        }]);
+        options.launch.api_key = Some("workspace-fixture-key".to_string());
+        let (_, state) = new_state(project.path(), &options);
+        let guard = state.try_lock().unwrap();
+        let agent = &guard.agent_session.as_ref().unwrap().session().agent;
+        assert_eq!(agent.provider().model_id(), PRIMARY_MODEL);
+        assert_eq!(agent.stream_options().thinking_level, Some(crate::model::ThinkingLevel::Low));
+    });
+}
+
+#[test]
+fn invalid_launch_selection_and_missing_credentials_fail_before_a_session_is_installed() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), "https://acp-errors.invalid/v1", runtime.handle(), 0);
+        options.launch.provider = Some("unknown-acp-provider".to_string());
+        options.launch.model = Some("missing-model".to_string());
+        let params = json!({"cwd": root.path(), "mcpServers": []});
+        let error = handle_session_new(&params, &options, None).err().expect("reject unknown explicit model");
+        assert!(error.to_string().contains("not found"));
+        options.launch.provider = Some(PRIMARY_PROVIDER.to_string());
+        options.launch.model = Some(PRIMARY_MODEL.to_string());
+        options.launch.thinking = Some("invalid-effort".to_string());
+        assert!(handle_session_new(&params, &options, None).is_err());
+        options.launch.thinking = None;
+        let mut entries = options.model_registry.models().to_vec();
+        for entry in &mut entries {
+            entry.api_key = None;
+            entry.auth_header = true;
+        }
+        options.model_registry = ModelRegistry::from_entries_for_tests(entries);
+        options.auth = AuthStorage::empty_at(root.path().join("unreadable-auth"));
+        std::fs::create_dir(root.path().join("unreadable-auth")).unwrap();
+        options.launch.api_key = Some(" \t ".to_string());
+        let error = handle_session_new(&params, &options, None).err().expect("blank override supplies no credential");
+        assert!(error.to_string().contains("No API key found"));
+        options.launch.api_key = Some("explicit-fixture-key".to_string());
+        assert!(handle_session_new(&params, &options, None).is_ok(), "explicit key does not read the unavailable store");
+    });
+}
+
+#[test]
+fn reopening_preserves_the_selected_branch_over_conflicting_launch_options() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), "https://acp-restore.invalid/v1", runtime.handle(), 0);
+        options.launch = AcpLaunchOptions {
+            provider: Some(FALLBACK_PROVIDER.to_string()), model: Some(FALLBACK_MODEL.to_string()),
+            thinking: Some("high".to_string()), api_key: Some("restart-fixture-key".to_string()),
+            models: None,
+        };
+        let (mut saved, _) = new_acp_session(options.session_dir.as_ref(), &options.config, root.path());
+        saved.append_model_change(PRIMARY_PROVIDER.to_string(), PRIMARY_MODEL.to_string());
+        saved.append_thinking_level_change("low".to_string());
+        let selected = saved.leaf_id.clone().unwrap();
+        saved.append_model_change(FALLBACK_PROVIDER.to_string(), FALLBACK_MODEL.to_string());
+        saved.append_thinking_level_change("off".to_string());
+        assert!(saved.navigate_to(&selected));
+        saved.save().await.unwrap();
+        let path = saved.path.clone().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        let expected_id = reopened.header.id.clone();
+        let (id, state) = build_acp_session(reopened, true, root.path().to_path_buf(), &options, None).unwrap();
+        assert_eq!(id, expected_id);
+        let handle = state.agent_session.as_ref().unwrap();
+        assert_eq!(handle.session().agent.provider().model_id(), PRIMARY_MODEL);
+        assert_eq!(handle.session().agent.stream_options().thinking_level, Some(crate::model::ThinkingLevel::Low));
+        assert_eq!(handle.session().agent.stream_options().api_key.as_deref(), Some("restart-fixture-key"));
+        assert_eq!(handle.session_store().try_lock().unwrap().leaf_id.as_deref(), Some(selected.as_str()));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "opening a branch sends no provider request or disk write");
+    });
+}
+
+#[test]
+fn selected_ad_hoc_model_remains_registered_for_runtime_switching() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), "https://acp-ad-hoc.invalid/v1", runtime.handle(), 0);
+        options.launch.provider = Some("openai".to_string());
+        options.launch.model = Some("editor-ad-hoc-model".to_string());
+        options.launch.api_key = Some("ad-hoc-fixture-key".to_string());
+        let (_, state) = new_state(root.path(), &options);
+        assert!(state.try_lock().unwrap().agent_session.as_ref().unwrap().session()
+            .model_registry().unwrap().find("openai", "editor-ad-hoc-model").is_some());
+        let cx = AgentCx::for_current_or_request();
+        // Both wire shapes resolve through the same path as their dispatchers,
+        // including the registry lookup before the durable model transition.
+        apply_set_model_request(&state, &json!({ "provider": FALLBACK_PROVIDER, "model": FALLBACK_MODEL }), &cx).await.unwrap();
+        {
+            let guard = state.try_lock().unwrap();
+            let config = config_options_for(&guard).unwrap();
+            assert!(config[0]["options"].as_array().unwrap().iter().any(|entry| {
+                entry["value"] == "openai/editor-ad-hoc-model"
+            }));
+        }
+        apply_set_model_request(&state, &json!({ "model": "openai/editor-ad-hoc-model" }), &cx).await.unwrap();
+        let saved = reopen(&state).await;
+        assert_eq!(saved.effective_model_for_current_path(), Some(("openai".to_string(), "editor-ad-hoc-model".to_string())));
+        assert!(!std::fs::read_to_string(saved.path.unwrap()).unwrap().contains("ad-hoc-fixture-key"));
+    });
+}
+
+#[test]
+fn startup_refresh_failures_only_block_the_selected_provider_without_an_override() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), "https://acp-refresh.invalid/v1", runtime.handle(), 0);
+        let params = json!({"cwd": root.path(), "mcpServers": []});
+        options.oauth_refresh_failures = vec![FALLBACK_PROVIDER.to_string()];
+        assert!(handle_session_new(&params, &options, None).is_ok());
+        options.oauth_refresh_failures = vec![PRIMARY_PROVIDER.to_uppercase()];
+        let error = handle_session_new(&params, &options, None).err().expect("selected refresh failed");
+        assert!(error.to_string().contains("OAuth token refresh failed"));
+        options.launch.provider = Some(PRIMARY_PROVIDER.to_string());
+        options.launch.model = Some(PRIMARY_MODEL.to_string());
+        options.launch.api_key = Some("launch-fixture-key".to_string());
+        assert!(handle_session_new(&params, &options, None).is_ok());
+    });
+}
+
+#[test]
+fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = ProviderFixture::new(vec![503, 503, 200, 200]);
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(root.path(), &server.url, runtime.handle(), 1);
+        options.config.default_provider = Some(FALLBACK_PROVIDER.to_string());
+        options.config.default_model = Some(FALLBACK_MODEL.to_string());
+        options.launch = AcpLaunchOptions {
+            provider: Some(PRIMARY_PROVIDER.to_string()), model: Some(PRIMARY_MODEL.to_string()),
+            thinking: Some("high".to_string()), api_key: Some("  pinned-launch-key  ".to_string()),
+            models: None,
+        };
+        options.auth.set(PRIMARY_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-primary-key".to_string() });
+        options.auth.set(FALLBACK_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-fallback-key".to_string() });
+        let (id, state) = new_state(root.path(), &options);
+        let (_, signal) = AbortHandle::new();
+        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
+        apply_set_model(&state, PRIMARY_PROVIDER, PRIMARY_MODEL, &AgentCx::for_current_or_request()).await.unwrap();
+        let (_, signal) = AbortHandle::new();
+        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
+        let saved = reopen(&state).await;
+        let durable = std::fs::read_to_string(saved.path.unwrap()).unwrap();
+        assert!(!durable.contains("pinned-launch-key"));
+        assert!(!durable.contains("stored-primary-key"));
+        assert!(!durable.contains("stored-fallback-key"));
+    });
+    let requests = server.finish(4);
+    assert_eq!(requests.iter().map(|(_, body)| body["model"].as_str().unwrap()).collect::<Vec<_>>(),
+        [PRIMARY_MODEL, PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]);
+    for (headers, body) in requests {
+        assert!(headers.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer pinned-launch-key"
+            })
+        }));
+        let model = body["model"].as_str().unwrap();
+        assert!(headers.contains(&format!("x-acp-model: {model}")));
+        assert!(!headers.contains("stored-primary-key"));
+        assert!(!headers.contains("stored-fallback-key"));
+    }
 }
 
 #[test]

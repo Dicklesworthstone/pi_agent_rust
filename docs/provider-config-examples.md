@@ -539,6 +539,16 @@ Cancelling a prompt stops pending retry backoff. Explicitly choosing a model in
 the editor ends automatic restoration, including when choosing the active
 fallback again. Saved fallback state survives reopening the session.
 
+Editor launch arguments `--provider`, `--model`, `--models`, `--thinking`, and
+`--api-key` reach each new ACP session. Model scopes use the workspace requested
+by the editor; explicit effort is clamped to the selected model's capabilities.
+An explicit key works without stored credentials and remains the runtime
+override through retries, fallback, and editor model changes. It is never written
+to the session. Reopening a saved branch restores that branch's model and effort,
+while using the launch credential override if supplied. A failed startup OAuth
+refresh blocks only sessions selecting that provider, unless an explicit key
+supplies the credential.
+
 **Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and `failover`
 to `None`, so a host that builds its own session enables them explicitly
 (`RetryPolicy::from_config` and `FailoverOptions::from_config` read the same

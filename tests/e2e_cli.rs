@@ -1232,6 +1232,171 @@ fn read_catalog_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
     request
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
+    use std::io::BufRead as _;
+
+    let harness = CliTestHarness::new("e2e_acp_launch_options_reach_the_actual_stdio_session");
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent directory"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create agent directory");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write empty auth store");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": {
+                "acp-launch-fixture": {
+                    "api": "openai-completions",
+                    "baseUrl": "https://acp-launch.invalid/v1",
+                    "authHeader": true,
+                    "models": [
+                        { "id": "configured-default", "reasoning": false },
+                        { "id": "cli-selected", "reasoning": true }
+                    ]
+                }
+            }
+        }))
+        .expect("serialize launch models"),
+    )
+    .expect("write launch models");
+    fs::write(
+        harness.global_settings_path(),
+        serde_json::to_vec_pretty(&json!({
+            "defaultProvider": "acp-launch-fixture",
+            "defaultModel": "configured-default",
+            "defaultThinkingLevel": "off"
+        }))
+        .expect("serialize launch settings"),
+    )
+    .expect("write launch settings");
+
+    // No configured key makes this custom provider unready. The explicit
+    // launch key must enable selection without becoming protocol metadata.
+    // We never send a prompt, so no provider HTTP request is needed.
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let stderr_path = harness.harness.temp_path("acp.stderr.txt");
+    let stderr = fs::File::create(&stderr_path).expect("create ACP diagnostics");
+    harness
+        .harness
+        .record_artifact("acp.stderr.txt", &stderr_path);
+    let mut command = owner.process().command(&harness.binary_path);
+    command
+        .args([
+            "--acp",
+            "--provider",
+            "acp-launch-fixture",
+            "--model",
+            "cli-selected",
+            "--thinking",
+            "high",
+            "--api-key",
+            "acp-launch-fixture-key",
+            "--request-timeout",
+            "60",
+        ])
+        .env_clear()
+        .envs(harness.env.clone())
+        // A launch flag already overrides this invalid inherited value.
+        // Session construction must not reparse unrelated environment flags.
+        .env("PI_HTTP_REQUEST_TIMEOUT_SECS", "invalid")
+        .current_dir(harness.harness.temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr));
+    // AgentChild also kills and reaps on an assertion failure.
+    let mut child = command.spawn().expect("start ACP CLI");
+    let mut input = child.take_stdin().expect("ACP stdin");
+    let output = child.take_stdout().expect("ACP stdout");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+    let reader = std::thread::spawn(move || {
+        let mut output = std::io::BufReader::new(output);
+        loop {
+            let mut line = String::new();
+            // Bound each protocol frame, including the full model catalogue.
+            let read = (&mut output).take(8 * 1024 * 1024).read_line(&mut line);
+            let result = match read {
+                Ok(0) => break,
+                Ok(_) if !line.ends_with('\n') => {
+                    Err("ACP frame exceeded its bound or ended early".to_string())
+                }
+                Ok(_) => serde_json::from_str::<serde_json::Value>(&line)
+                    .map_err(|error| format!("invalid ACP JSON: {error}")),
+                Err(error) => Err(format!("ACP stdout read: {error}")),
+            };
+            let failed = result.is_err();
+            if sender.send(result).is_err() || failed {
+                break;
+            }
+        }
+    });
+    let mut exchange = |request: serde_json::Value| {
+        serde_json::to_writer(&mut input, &request).expect("write ACP request");
+        input.write_all(b"\n").expect("delimit ACP request");
+        input.flush().expect("flush ACP request");
+        let response = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("ACP response before deadline")
+            .expect("valid ACP protocol frame");
+        assert_eq!(response["id"], request["id"], "matching JSON-RPC response");
+        assert!(response.get("error").is_none(), "ACP error: {response}");
+        response
+    };
+
+    let initialized = exchange(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": 1, "clientCapabilities": {} }
+    }));
+    assert_eq!(initialized["result"]["protocolVersion"], 1);
+    let created = exchange(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": { "cwd": harness.harness.temp_dir(), "mcpServers": [] }
+    }));
+    assert!(created["result"]["sessionId"].as_str().is_some());
+    let selections = created["result"]["configOptions"]
+        .as_array()
+        .expect("ACP configuration selectors");
+    let selected = |id: &str| {
+        selections
+            .iter()
+            .find(|option| option["id"].as_str() == Some(id))
+            .and_then(|option| option["currentValue"].as_str())
+            .expect("selected ACP configuration value")
+    };
+    assert_eq!(selected("model"), "acp-launch-fixture/cli-selected");
+    assert_eq!(selected("thought_level"), "high");
+    assert!(
+        !serde_json::to_string(&created)
+            .expect("serialize ACP response")
+            .contains("acp-launch-fixture-key"),
+        "a launch credential must not appear in editor metadata"
+    );
+
+    // Keep stdin open until all replies arrive: this tests the real dispatcher,
+    // without a race between an early client EOF and response delivery.
+    let _ = exchange(json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" }));
+    input
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}\n")
+        .expect("send ACP exit notification");
+    input.flush().expect("flush ACP exit");
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll ACP exit") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "ACP did not stop after exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "ACP exited unsuccessfully: {status}");
+    reader.join().expect("ACP output reader stopped");
+}
+
 #[test]
 fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
     let harness =

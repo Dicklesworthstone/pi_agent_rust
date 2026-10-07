@@ -262,6 +262,7 @@ fn live_state(
             agent_session, crate::sdk::EventListeners::default(),
         )),
         cwd: cwd.into(), mcp: Some(Arc::clone(&mcp)),
+        available_models: Vec::new(),
     }));
     (id, state, mcp)
 }
@@ -379,8 +380,10 @@ fn options(root: &Path, handle: asupersync::runtime::RuntimeHandle) -> AcpOption
     let model_registry = ModelRegistry::load(&auth, None);
     let model = model_registry.find("anthropic", "claude-sonnet-4-5").unwrap();
     AcpOptions {
+        launch: crate::acp::AcpLaunchOptions::default(),
         config: crate::config::Config::default(), available_models: vec![model],
         model_registry, auth, runtime_handle: handle,
+        oauth_refresh_failures: Vec::new(),
         session_dir: Some(root.into()), skills_prompt: None,
     }
 }

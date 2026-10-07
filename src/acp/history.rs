@@ -215,7 +215,7 @@ pub(super) async fn load(
         return Err(HistoryError::invalid("Session belongs to a different workspace"));
     }
     let agent = guard.agent_session.as_ref().ok_or_else(HistoryError::busy)?;
-    let configuration = config_options_for(&guard, &options.available_models)
+    let configuration = config_options_for(&guard)
         .ok_or_else(HistoryError::busy)?;
     if replay {
         let session = OwnedMutexGuard::lock(agent.session_store(), cx).await
@@ -567,8 +567,10 @@ mod tests {
         let registry = crate::models::ModelRegistry::load(&auth, None);
         let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
         AcpOptions {
+            launch: crate::acp::AcpLaunchOptions::default(),
             config: crate::config::Config::default(), available_models: vec![entry],
             model_registry: registry, auth, runtime_handle: handle,
+            oauth_refresh_failures: Vec::new(),
             session_dir: Some(root.into()), skills_prompt: None,
         }
     }
@@ -694,6 +696,7 @@ mod tests {
             let sessions = Arc::new(Mutex::new(HashMap::from([(
                 "busy-session".to_string(), Arc::new(Mutex::new(super::super::AcpSessionState {
                     agent_session: None, cwd: cwd.clone(), mcp: None,
+                    available_models: Vec::new(),
                 })),
             )])));
             let cx = AgentCx::for_testing();
@@ -1033,8 +1036,10 @@ mod tests {
             let registry = crate::models::ModelRegistry::load(&auth, None);
             let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
             let options = AcpOptions {
+                launch: crate::acp::AcpLaunchOptions::default(),
                 config: crate::config::Config::default(), available_models: vec![entry],
                 model_registry: registry, auth, runtime_handle,
+                oauth_refresh_failures: Vec::new(),
                 session_dir: Some(root.path().into()), skills_prompt: None,
             };
             let sessions = Arc::new(Mutex::new(HashMap::new()));

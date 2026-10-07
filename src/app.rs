@@ -796,7 +796,14 @@ pub fn select_model_and_thinking(
     // none configured, prefer falling back to any ready model instead of forcing
     // an immediate setup prompt. (Explicit CLI selection should still error.)
     let explicit_model_selection = cli.provider.is_some() || cli.model.is_some();
-    let missing_creds = if explicit_model_selection {
+    // A scoped/configured entry can be unready in the catalog while --api-key
+    // already supplies this run's credential. Keep the selected destination;
+    // falling back here would send that explicit key to a different provider.
+    let has_api_key_override = cli
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let missing_creds = if explicit_model_selection || has_api_key_override {
         None
     } else {
         selected_model.as_ref().and_then(|entry| {
@@ -2838,6 +2845,44 @@ mod tests {
         assert_eq!(selection.model_entry.model.provider, "openrouter");
         assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
         assert_eq!(selection.thinking_level, model::ThinkingLevel::Low);
+    }
+
+    #[test]
+    fn scoped_cli_key_keeps_the_selected_provider_even_without_stored_credentials() {
+        let mut scoped_entry = test_model_entry("scoped-private", "scoped-provider", true);
+        scoped_entry.api_key = None;
+        scoped_entry.auth_header = true;
+        let registry = registry_with_entries(vec![
+            test_model_entry("ready-alternative", "other-provider", true),
+            scoped_entry.clone(),
+        ]);
+        let scope = vec![ScopedModel {
+            model: scoped_entry,
+            thinking_level: Some(model::ThinkingLevel::Low),
+        }];
+        for (key, expected_provider) in [
+            ("  explicit-fixture-key  ", "scoped-provider"),
+            (" \t ", "other-provider"),
+        ] {
+            let mut cli = cli::Cli::parse_from(["pi"]);
+            cli.provider = None;
+            cli.model = None;
+            cli.api_key = Some(key.to_string());
+            let selection = select_model_and_thinking(
+                &cli,
+                &Config::default(),
+                &Session::in_memory(),
+                &registry,
+                &scope,
+                Path::new("/tmp"),
+            )
+            .expect("select scoped model with credential precedence");
+            assert_eq!(selection.model_entry.model.provider, expected_provider);
+            if expected_provider == "scoped-provider" {
+                assert_eq!(selection.thinking_level, model::ThinkingLevel::Low);
+                assert!(selection.fallback_message.is_none());
+            }
+        }
     }
 
     #[test]
