@@ -4373,9 +4373,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             if !text.trim().is_empty() {
                 content.push(ContentBlock::Text(TextContent::new(text)));
             }
-            for image in processed.images {
-                content.push(ContentBlock::Image(image));
-            }
+            content.extend(processed.attachments);
 
             if content.is_empty() {
                 self.status_message =

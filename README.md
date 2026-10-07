@@ -880,11 +880,16 @@ pi [OPTIONS] [MESSAGE]...
 pi                              # Start interactive session
 pi "Hello"                      # Start with message
 pi @file.rs "Explain this"      # Include file as context
+pi @voice.wav @clip.mp4 "Compare these recordings"
 pi -p "Quick question"          # Print mode (no session)
 ```
 
 Interactive file references:
+
 - Type `@relative/path` in the editor to attach a file’s contents (autocomplete inserts the `@` form).
+- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 5 MiB per-file limit. Oversized files produce a visible notice and empty files are skipped.
+- File arguments use the current workspace roots, including roots added with `--add-dir` or `/add-dir`; `/remove-dir` revokes subsequent attachment reads. CLI startup files and messages are submitted by both terminal frontends, and FTUI `/retry` retains the original attachment bytes.
+- Gemini-family providers receive native audio/video. Providers without that transport receive a visible media-omission label; session history retains the attachment. See [native RPC content](docs/rpc.md#chat) and [SDK native prompts](docs/sdk.md#native-image-audio-and-video-prompts).
 
 ### Options
 

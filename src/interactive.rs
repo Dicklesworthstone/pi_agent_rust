@@ -2046,6 +2046,14 @@ pub enum PiMsg {
     },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
+    /// Display driver-submitted input that did not pass through the editor.
+    /// Startup prompts use this once, before the corresponding agent turn.
+    UserInputSubmitted {
+        owner_session_id: String,
+        text: String,
+        /// Authored input only; display text may include generated file bodies.
+        history_text: String,
+    },
     /// Bash command result (non-agent).
     BashResult {
         display: String,

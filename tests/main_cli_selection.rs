@@ -567,7 +567,7 @@ fn prepare_initial_message_wraps_files_and_appends_first_message() {
 
     harness.log().info_ctx("result", "Initial message", |ctx| {
         ctx.push(("text_len".into(), initial.text.len().to_string()));
-        ctx.push(("images".into(), initial.images.len().to_string()));
+        ctx.push(("attachments".into(), initial.attachments.len().to_string()));
     });
 
     assert!(messages.is_empty());
@@ -702,7 +702,7 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
         .log()
         .info_ctx("result", "Image initial message", |ctx| {
             ctx.push(("text_len".into(), initial.text.len().to_string()));
-            ctx.push(("images".into(), initial.images.len().to_string()));
+            ctx.push(("attachments".into(), initial.attachments.len().to_string()));
             ctx.push(("path".into(), image_path.display().to_string()));
         });
 
@@ -711,9 +711,11 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
             .text
             .contains(&format!("<file name=\"{}\"></file>", image_path.display()))
     );
-    assert_eq!(initial.images.len(), 1);
-    assert_eq!(initial.images[0].mime_type, "image/png");
-    assert!(!initial.images[0].data.is_empty());
+    let [ContentBlock::Image(image)] = initial.attachments.as_slice() else {
+        panic!("expected one image attachment");
+    };
+    assert_eq!(image.mime_type, "image/png");
+    assert!(!image.data.is_empty());
 
     let blocks = build_initial_content(&initial);
     assert_eq!(blocks.len(), 2);
@@ -752,7 +754,10 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("process file arguments");
-    assert_eq!(processed.images.len(), 1);
+    assert!(matches!(
+        processed.attachments.as_slice(),
+        [ContentBlock::Image(_)]
+    ));
     assert!(
         processed
             .text
@@ -902,7 +907,7 @@ fn prepare_initial_message_empty_file_returns_none() {
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
-    // Empty file produces no text and no images → returns None
+    // Empty file produces no text and no attachments → returns None
     assert!(result.is_none());
 }
 
@@ -928,7 +933,7 @@ fn process_file_arguments_multiple_text_files() {
     assert!(processed.text.contains("alpha"));
     assert!(processed.text.contains("bravo"));
     assert!(processed.text.contains("charlie"));
-    assert_eq!(processed.images.len(), 0);
+    assert!(processed.attachments.is_empty());
 
     // Each file gets its own <file> tag
     let file_tag_count = processed.text.matches("<file name=\"").count();
@@ -983,11 +988,301 @@ fn process_file_arguments_mixed_text_and_image() {
     .expect("ok");
 
     assert!(processed.text.contains("some notes"));
-    assert_eq!(processed.images.len(), 1);
-    assert_eq!(processed.images[0].mime_type, "image/png");
+    assert!(matches!(
+        processed.attachments.as_slice(),
+        [ContentBlock::Image(image)] if image.mime_type == "image/png"
+    ));
     // Both files produce <file> tags
     let file_tag_count = processed.text.matches("<file name=\"").count();
     assert_eq!(file_tag_count, 2);
+}
+
+#[test]
+fn prepare_initial_message_preserves_mixed_media_and_image_order() {
+    let harness =
+        TestHarness::new("prepare_initial_message_preserves_mixed_media_and_image_order");
+    let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(png_base64)
+        .expect("decode png");
+    let audio_bytes = b"RIFF\x00\xffWAVEbinary-audio";
+    let video_bytes = b"\x00\x00\x00\x18ftypisom\xff\x80binary-video";
+    let audio = harness.create_file("recording.WAV", audio_bytes);
+    let notes = harness.create_file("notes.txt", "Review both recordings and the image.\n");
+    let image = harness.create_file("image.png", &png);
+    let video = harness.create_file("clip.MP4", video_bytes);
+    let args: Vec<String> = [&audio, &notes, &image, &video]
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let mut messages = vec![
+        "Describe the differences.".to_string(),
+        "Then summarize.".to_string(),
+    ];
+
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare mixed attachments")
+    .expect("attachments create an initial message");
+    let blocks = build_initial_content(&initial);
+    let [
+        ContentBlock::Text(text),
+        ContentBlock::Media(audio),
+        ContentBlock::Image(image),
+        ContentBlock::Media(video),
+    ] = blocks.as_slice()
+    else {
+        panic!("text prefix must be followed by media and images in argument order");
+    };
+    assert!(text.text.contains("Review both recordings and the image."));
+    assert!(text.text.contains("Describe the differences."));
+    assert!(!text.text.contains("binary-audio"));
+    assert!(!text.text.contains("binary-video"));
+    assert!(!text.text.contains('\u{fffd}'));
+    assert_eq!(text.text.matches("<file name=\"").count(), 4);
+    assert_eq!(messages, vec!["Then summarize.".to_string()]);
+    assert_eq!(initial.attachments.len(), 3);
+    assert_eq!(audio.mime_type, "audio/wav");
+    assert_eq!(audio.name.as_deref(), Some("recording.WAV"));
+    assert_eq!(video.mime_type, "video/mp4");
+    assert_eq!(video.name.as_deref(), Some("clip.MP4"));
+    assert_eq!(image.mime_type, "image/png");
+    for (data, expected) in [
+        (&audio.data, audio_bytes.as_slice()),
+        (&image.data, png.as_slice()),
+        (&video.data, video_bytes.as_slice()),
+    ] {
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("attachment must contain valid base64"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn process_file_arguments_recognizes_all_media_extensions_case_insensitively() {
+    let harness = TestHarness::new(
+        "process_file_arguments_recognizes_all_media_extensions_case_insensitively",
+    );
+    let cases = [
+        ("clip.MP4", "video/mp4"),
+        ("clip.WebM", "video/webm"),
+        ("clip.MOV", "video/mov"),
+        ("audio.MP3", "audio/mpeg"),
+        ("audio.WaV", "audio/wav"),
+        ("audio.M4A", "audio/m4a"),
+        ("audio.OGG", "audio/ogg"),
+        ("audio.FLAC", "audio/flac"),
+    ];
+    let bytes = [0x00, 0xff, 0x80, 0x01, 0xfe];
+    let args: Vec<String> = cases
+        .iter()
+        .map(|(name, _)| {
+            harness
+                .create_file(*name, bytes)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("attach supported media extensions");
+
+    assert_eq!(processed.attachments.len(), cases.len());
+    assert!(!processed.text.contains('\u{fffd}'));
+    for (block, (name, mime_type)) in processed.attachments.iter().zip(cases) {
+        let ContentBlock::Media(media) = block else {
+            panic!("{name} must be native media, not text or an image");
+        };
+        assert_eq!(media.mime_type, mime_type);
+        assert_eq!(media.name.as_deref(), Some(name));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&media.data)
+                .expect("decode attached bytes"),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn process_file_arguments_skips_empty_media_and_reports_oversized_media() {
+    let harness = TestHarness::new(
+        "process_file_arguments_skips_empty_media_and_reports_oversized_media",
+    );
+    let empty = harness.create_file("empty.WAV", "");
+    let oversized = harness.temp_path("too-large.mp4");
+    std::fs::File::create(&oversized)
+        .expect("create oversized media")
+        .set_len(pi::media_tools::DEFAULT_MEDIA_MAX_BYTES + 1)
+        .expect("size oversized media");
+    let valid = harness.create_file("small.ogg", [0, 0xff, 1]);
+    let args: Vec<String> = [&empty, &oversized, &valid]
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("skip inadmissible media without losing subsequent files");
+
+    let [ContentBlock::Media(media)] = processed.attachments.as_slice() else {
+        panic!("only the nonempty media file below the cap may attach");
+    };
+    assert_eq!(media.name.as_deref(), Some("small.ogg"));
+    assert!(processed.text.contains("too-large.mp4"));
+    assert!(processed.text.contains(&format!(
+        "Max allowed is {} bytes",
+        pi::media_tools::DEFAULT_MEDIA_MAX_BYTES
+    )));
+    assert!(!processed.text.contains("empty.WAV"));
+    assert_eq!(processed.text.matches("<file name=\"").count(), 2);
+
+    let empty_only = process_file_arguments(
+        &[empty.to_string_lossy().into_owned()],
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("empty media follows empty-file behavior");
+    assert!(empty_only.text.is_empty());
+    assert!(empty_only.attachments.is_empty());
+}
+
+#[test]
+fn process_file_arguments_accepts_media_at_the_exact_inline_byte_cap() {
+    let harness =
+        TestHarness::new("process_file_arguments_accepts_media_at_the_exact_inline_byte_cap");
+    let cap = usize::try_from(pi::media_tools::DEFAULT_MEDIA_MAX_BYTES).expect("inline cap fits");
+    let bytes = vec![0xff; cap];
+    let path = harness.create_file("at-limit.flac", &bytes);
+    let processed = process_file_arguments(
+        &[path.to_string_lossy().into_owned()],
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("the inclusive media cap permits exactly that many bytes");
+
+    let [ContentBlock::Media(media)] = processed.attachments.as_slice() else {
+        panic!("media at the cap must attach");
+    };
+    assert_eq!(media.mime_type, "audio/flac");
+    assert_eq!(
+        media.decoded_size_bytes(),
+        pi::media_tools::DEFAULT_MEDIA_MAX_BYTES
+    );
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&media.data)
+            .expect("decode full media"),
+        bytes
+    );
+    assert!(!processed.text.contains("too large"));
+    assert!(!processed.text.contains('\u{fffd}'));
+}
+
+#[test]
+fn process_file_arguments_sanitizes_media_source_names() {
+    let harness = TestHarness::new("process_file_arguments_sanitizes_media_source_names");
+    let path = harness.create_file("clip\u{202e}\u{2066}.MP4", [0, 0xff, 1]);
+    let processed = process_file_arguments(
+        &[path.to_string_lossy().into_owned()],
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("attach media with an untrusted display label");
+
+    let [ContentBlock::Media(media)] = processed.attachments.as_slice() else {
+        panic!("expected one media attachment");
+    };
+    assert_eq!(media.name.as_deref(), Some("clip.MP4"));
+    assert_eq!(media.mime_type, "video/mp4");
+}
+
+#[test]
+fn process_file_arguments_observes_added_roots_and_shared_revocation() {
+    let harness =
+        TestHarness::new("process_file_arguments_observes_added_roots_and_shared_revocation");
+    let primary = harness.create_dir("primary");
+    let additional = harness.create_dir("additional");
+    let notes = harness.create_file("additional/notes.txt", "allowed workspace notes\n");
+    let media = harness.create_file("additional/recording.wav", [0, 0xff, 1]);
+    let outside = harness.create_file("outside/secret.mp4", "PRIVATE-OUTSIDE-CANARY");
+    let args: Vec<String> = [&notes, &media]
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&primary);
+    let reader = workspace.clone();
+
+    let denied = process_file_arguments(&args, &primary, false, &reader)
+        .expect_err("ungranted roots cannot be read");
+    assert!(denied.to_string().contains("outside the"));
+    workspace.add_root(&additional);
+    let processed = process_file_arguments(&args, &primary, false, &reader)
+        .expect("the actual file opener must honor the newly granted root");
+    assert!(processed.text.contains("allowed workspace notes"));
+    assert!(matches!(
+        processed.attachments.as_slice(),
+        [ContentBlock::Media(media)] if media.mime_type == "audio/wav"
+    ));
+
+    let denied = process_file_arguments(
+        &[outside.to_string_lossy().into_owned()],
+        &primary,
+        false,
+        &reader,
+    )
+    .expect_err("adding one root must not grant unrelated siblings");
+    assert!(denied.to_string().contains("outside the"));
+    assert!(!denied.to_string().contains("PRIVATE-OUTSIDE-CANARY"));
+    assert!(workspace.remove_root(&additional));
+    let revoked = process_file_arguments(&args, &primary, false, &reader)
+        .expect_err("removal must immediately revoke the reader clone's access");
+    assert!(revoked.to_string().contains("outside the"));
+}
+
+#[cfg(unix)]
+#[test]
+fn process_file_arguments_rejects_symlink_and_parent_escapes_from_added_roots() {
+    let harness = TestHarness::new(
+        "process_file_arguments_rejects_symlink_and_parent_escapes_from_added_roots",
+    );
+    let primary = harness.create_dir("primary");
+    let additional = harness.create_dir("additional");
+    let outside = harness.create_file("outside/secret.mp4", "PRIVATE-OUTSIDE-CANARY");
+    let link = additional.join("link.mp4");
+    std::os::unix::fs::symlink(&outside, &link).expect("create escape fixture");
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&primary);
+    workspace.add_root(&additional);
+
+    for path in [link, additional.join("../outside/secret.mp4")] {
+        let denied = process_file_arguments(
+            &[path.to_string_lossy().into_owned()],
+            &primary,
+            false,
+            &workspace,
+        )
+        .expect_err("file references must stay in the granted canonical roots");
+        assert!(denied.to_string().contains("outside the"));
+        assert!(!denied.to_string().contains("PRIVATE-OUTSIDE-CANARY"));
+    }
 }
 
 #[test]

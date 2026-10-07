@@ -10,7 +10,7 @@ use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent};
 use crate::platform::{
     EffectiveModeAccessContext, UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE,
     ensure_effective_mode_access,
@@ -4247,7 +4247,8 @@ fn enforce_read_scope(path: &Path, cwd: &Path, workspace: &WorkspaceHandle) -> R
 #[derive(Debug, Clone, Default)]
 pub struct ProcessedFiles {
     pub text: String,
-    pub images: Vec<ImageContent>,
+    /// Image and media blocks in the order of their source file arguments.
+    pub attachments: Vec<ContentBlock>,
 }
 
 fn normalize_dot_segments(path: &Path) -> PathBuf {
@@ -4920,7 +4921,7 @@ fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
     let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
 }
 
-fn append_image_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
+fn append_attachment_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
     let path_str = escaped_file_tag_name(path);
     match note {
         Some(text) => {
@@ -4992,10 +4993,10 @@ fn maybe_append_image_argument(
 
     let base64_data =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
-    out.images.push(ImageContent {
+    out.attachments.push(ContentBlock::Image(ImageContent {
         data: base64_data,
         mime_type: resized.mime_type.to_string(),
-    });
+    }));
 
     let note = if resized.resized {
         if let (Some(ow), Some(oh), Some(w), Some(h)) = (
@@ -5020,16 +5021,40 @@ fn maybe_append_image_argument(
     } else {
         None
     };
-    append_image_file_ref(&mut out.text, absolute_path, note.as_deref());
+    append_attachment_file_ref(&mut out.text, absolute_path, note.as_deref());
     Ok(true)
 }
 
-/// Process `@file` arguments into a single text prefix and image attachments.
+fn append_media_argument(
+    out: &mut ProcessedFiles,
+    absolute_path: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+) {
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let name = absolute_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::model::sanitize_media_name);
+    out.attachments.push(ContentBlock::Media(MediaContent {
+        data,
+        mime_type: mime_type.to_string(),
+        name,
+    }));
+    let note = format!(
+        "[Media: {mime_type}, {}]",
+        crate::model::format_media_size(bytes.len() as u64)
+    );
+    append_attachment_file_ref(&mut out.text, absolute_path, Some(&note));
+}
+
+/// Process `@file` arguments into a single text prefix and ordered attachments.
 ///
-/// Matches the legacy TypeScript behavior:
 /// - Resolves paths (including `~` expansion + macOS screenshot variants)
 /// - Skips empty files
 /// - For images: attaches image blocks and appends `<file name="...">...</file>` references
+/// - For supported video/audio extensions: attaches the unchanged bytes as media,
+///   bounded by the default inline media byte cap
 /// - For text: embeds the file contents inside `<file>` tags
 pub fn process_file_arguments(
     file_args: &[String],
@@ -5037,10 +5062,6 @@ pub fn process_file_arguments(
     auto_resize_images: bool,
     workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
-    // bd-cv653.3.12: the workspace handle is threaded through for
-    // multi-root confinement; file args are read-only today (reads confine
-    // through the tool layer), so the handle is accepted and unused here.
-    let _ = workspace;
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
@@ -5076,34 +5097,52 @@ pub fn process_file_arguments(
             continue;
         }
 
-        if meta.len() > READ_TOOL_MAX_BYTES {
+        let media_mime_type = absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(crate::media_tools::media_mime_type_for_extension);
+        let max_bytes = if media_mime_type.is_some() {
+            crate::media_tools::DEFAULT_MEDIA_MAX_BYTES
+        } else {
+            READ_TOOL_MAX_BYTES
+        };
+        if meta.len() > max_bytes {
             append_file_notice_block(
                 &mut out.text,
                 &absolute_path,
                 &format!(
                     "[File is too large ({} bytes). Max allowed is {} bytes.]",
                     meta.len(),
-                    READ_TOOL_MAX_BYTES
+                    max_bytes
                 ),
             );
             continue;
         }
 
-        let allowed_roots = [cwd.to_path_buf(), Config::global_dir()];
-        let bytes =
-            read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, READ_TOOL_MAX_BYTES)
-                .map_err(|e| {
-                    Error::tool(
-                        "read",
-                        format!("Could not read file {}: {e}", absolute_path.display()),
-                    )
-                })?;
+        // Snapshot immediately before the confined open so additions and
+        // revocations on shared workspace handles apply to the actual read.
+        let mut allowed_roots = workspace.snapshot_or(cwd).all();
+        allowed_roots.push(Config::global_dir());
+        let bytes = read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, max_bytes)
+            .map_err(|e| {
+                Error::tool(
+                    "read",
+                    format!("Could not read file {}: {e}", absolute_path.display()),
+                )
+            })?;
+        if bytes.is_empty() {
+            continue;
+        }
 
         if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
             continue;
         }
 
-        append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        if let Some(mime_type) = media_mime_type {
+            append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+        } else {
+            append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        }
     }
 
     Ok(out)

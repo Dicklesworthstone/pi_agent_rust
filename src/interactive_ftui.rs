@@ -1452,6 +1452,8 @@ impl std::fmt::Debug for LoginInput {
 pub enum UiCommand {
     /// Run an agent turn with this prompt.
     Prompt(String),
+    /// Consume the driver's prepared CLI attachment message exactly once.
+    InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
     /// Run a shell command. `!cmd` (exclude=false) shows the output AND
@@ -2958,6 +2960,19 @@ impl PiFtuiModel {
                     }
                 }
             }
+            PiMsg::UserInputSubmitted {
+                owner_session_id,
+                text,
+                history_text,
+            } => {
+                if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
+                    let text = sanitize(&text).into_owned();
+                    self.error_banner = None;
+                    self.record_history(&sanitize(&history_text));
+                    self.push_entry(EntryRole::User, text);
+                    self.scroll_from_tail = 0;
+                }
+            }
             PiMsg::ConversationReset {
                 session_id,
                 messages,
@@ -3248,7 +3263,7 @@ impl PiFtuiModel {
                 self.push_entry(
                     EntryRole::Error,
                     String::from(
-                        "Images attach once the agent finishes; the message is kept in the editor.",
+                        "Attachments send once the agent finishes; the message is kept in the editor.",
                     ),
                 );
                 return;
@@ -6260,14 +6275,14 @@ async fn run_tan_command(
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
-    images: Vec<crate::model::ImageContent>,
+    attachments: Vec<crate::model::ContentBlock>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
-    let mut next = Some((prompt, images));
-    while let Some((prompt, images)) = next.take() {
+    let mut next = Some((prompt, attachments));
+    while let Some((prompt, attachments)) = next.take() {
         let (leftover, stopped) =
-            run_controlled_turn(handle, prompt, images, agent_tx, turn_control).await;
+            run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
         if leftover.is_empty() {
             continue;
         }
@@ -6303,13 +6318,25 @@ async fn run_prompt_turn(
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
-    images: Vec<crate::model::ImageContent>,
+    attachments: Vec<crate::model::ContentBlock>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) -> (Vec<String>, bool) {
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
-    let turn = handle.prompt_controlled_with_images(prompt, images, move |event| {
+    let content = if attachments.is_empty() {
+        crate::model::UserContent::Text(prompt)
+    } else {
+        let mut blocks = Vec::with_capacity(attachments.len() + 1);
+        if !prompt.is_empty() {
+            blocks.push(crate::model::ContentBlock::Text(
+                crate::model::TextContent::new(prompt),
+            ));
+        }
+        blocks.extend(attachments);
+        crate::model::UserContent::Blocks(blocks)
+    };
+    let turn = handle.prompt_controlled_input(content, move |event| {
         for msg in agent_event_to_pi_msgs(&event) {
             let _ = tx.send(msg);
         }
@@ -6446,7 +6473,18 @@ fn prepare_prompt(
     cwd: &std::path::Path,
     workspace: Option<&crate::workspace::WorkspaceHandle>,
     auto_resize_images: bool,
-) -> std::result::Result<(String, Vec<crate::model::ImageContent>), String> {
+) -> std::result::Result<(String, Vec<crate::model::ContentBlock>), String> {
+    prepare_prompt_with_source(prompt, resources, cwd, workspace, auto_resize_images)
+        .map(|(text, attachments, _)| (text, attachments))
+}
+
+fn prepare_prompt_with_source(
+    prompt: &str,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    workspace: Option<&crate::workspace::WorkspaceHandle>,
+    auto_resize_images: bool,
+) -> std::result::Result<(String, Vec<crate::model::ContentBlock>, String), String> {
     let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
     let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
         crate::tools::resolve_read_path(path, cwd)
@@ -6454,7 +6492,7 @@ fn prepare_prompt(
             .then(|| path.to_string())
     });
     if refs.is_empty() {
-        return Ok((expand(prompt), Vec::new()));
+        return Ok((expand(prompt), Vec::new(), prompt.to_string()));
     }
     let single;
     #[allow(clippy::option_if_let_else)]
@@ -6468,11 +6506,12 @@ fn prepare_prompt(
     let processed = crate::tools::process_file_arguments(&refs, cwd, auto_resize_images, workspace)
         .map_err(|err| err.to_string())?;
     let mut text = processed.text;
-    let message = expand(without_refs.trim());
+    let keyword_scan_source = without_refs.trim().to_string();
+    let message = expand(&keyword_scan_source);
     if !message.trim().is_empty() {
         text.push_str(&message);
     }
-    Ok((text, processed.images))
+    Ok((text, processed.attachments, keyword_scan_source))
 }
 
 /// Run what the user typed as a turn: `@file` references, `/skill:name`
@@ -6489,16 +6528,34 @@ async fn run_typed_prompt(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
+    // Startup text reaches the driver before the editor's slash router.
+    // Resolve live extension ownership before expanding a same-name template
+    // or reading file-looking command arguments.
+    let registered = handle.extension_manager().and_then(|manager| {
+        registered_prompt_command(&extension_commands_for_catalog(manager), &prompt)
+    });
+    if let Some((name, args)) = registered {
+        run_extension_command(handle, cwd, &name, &args, true, agent_tx).await;
+        return;
+    }
     let workspace = handle.workspace();
-    match prepare_prompt(
+    match prepare_prompt_with_source(
         &prompt,
         resources,
         cwd,
         workspace.as_ref(),
         auto_resize_images,
     ) {
-        Ok((text, images)) => {
-            run_prompt_turn(handle, text, images, agent_tx, turn_control).await;
+        Ok((text, attachments, keyword_scan_source)) => {
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(Some(keyword_scan_source));
+            run_prompt_turn(handle, text, attachments, agent_tx, turn_control).await;
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(None);
         }
         Err(err) => {
             if let Ok(owner_session_id) = handle
@@ -6513,6 +6570,120 @@ async fn run_typed_prompt(
             let _ = agent_tx.send(PiMsg::AgentError(format!("Not sent: {err}")));
         }
     }
+}
+
+fn registered_prompt_command(
+    commands: &[crate::autocomplete::NamedEntry],
+    input: &str,
+) -> Option<(String, String)> {
+    let clean = input.trim();
+    if !clean.starts_with('/') {
+        return None;
+    }
+    let (token, args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+    extension_command_name(commands, token).map(|name| (name.to_string(), args.trim().to_string()))
+}
+
+/// Expand only the authored suffix. The prefix contains already-read file
+/// bodies and references; parsing it as fresh input would reread files and
+/// let generated content acquire command or magic-keyword authority.
+fn expand_initial_prompt(
+    mut initial: crate::app::InitialMessage,
+    resources: Option<&crate::resources::ResourceLoader>,
+) -> crate::app::InitialMessage {
+    if let Some(resources) = resources
+        && let Some(prefix_len) = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .map(str::len)
+    {
+        let expanded = resources.expand_input(&initial.keyword_scan_source);
+        initial.text.truncate(prefix_len);
+        initial.text.push_str(&expanded);
+    }
+    initial
+}
+
+/// Transcript-only rendering: attachment payloads never become display text.
+fn prompt_display(text: &str, attachments: &[crate::model::ContentBlock]) -> String {
+    use crate::model::ContentBlock;
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(text.to_string());
+    }
+    for block in attachments {
+        match block {
+            ContentBlock::Text(text) => parts.push(text.text.clone()),
+            ContentBlock::Image(image) => parts.push(format!("[Image: {}]", image.mime_type)),
+            ContentBlock::Media(media) => parts.push(format!(
+                "[Media: {}, {}, {}]",
+                media.name.as_deref().unwrap_or("unnamed"),
+                media.mime_type,
+                crate::model::format_media_size(media.decoded_size_bytes())
+            )),
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+async fn publish_submitted_input(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    text: String,
+    history_text: String,
+) -> bool {
+    match handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        Ok(owner_session_id) => agent_tx
+            .send(PiMsg::UserInputSubmitted {
+                owner_session_id,
+                text,
+                history_text,
+            })
+            .is_ok(),
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("startup input: {err}")));
+            false
+        }
+    }
+}
+
+async fn run_initial_prompt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    pending: &mut Option<crate::app::InitialMessage>,
+    resources: Option<&crate::resources::ResourceLoader>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let Some(initial) = pending.take() else {
+        return;
+    };
+    if !publish_submitted_input(
+        handle,
+        agent_tx,
+        prompt_display(&initial.text, &initial.attachments),
+        initial.keyword_scan_source.clone(),
+    )
+    .await
+    {
+        return;
+    }
+    let initial = expand_initial_prompt(initial, resources);
+    let content = crate::app::build_initial_content(&initial);
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(Some(initial.keyword_scan_source));
+    run_prompt_turn(handle, String::new(), content, agent_tx, turn_control).await;
+    // A rejection before the Agent loop consumes its one-shot provenance
+    // must not affect a later user-entered prompt.
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(None);
 }
 
 /// `/name args` as a prompt-template turn: the expanded text when `name` is
@@ -8168,18 +8339,22 @@ async fn resume_session_command(
 
 /// Snapshot the handle's conversation and reset the UI transcript from it.
 /// `/retry` driver half: branch the session back to before the last user
-/// turn and replay the history (with the turn's text) into the transcript.
-/// Returns the text to re-send, or `None` after reporting why not.
+/// turn and replay the history into the transcript. The display projection
+/// carries labels while the returned native content retains every payload.
 async fn prepare_retry_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     agent_tx: &Sender<PiMsg>,
-) -> Option<String> {
-    let text = match handle.prepare_retry().await {
-        Ok(text) => text,
+) -> Option<crate::model::UserContent> {
+    let content = match handle.prepare_retry_content().await {
+        Ok(content) => content,
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
             return None;
         }
+    };
+    let text = match &content {
+        crate::model::UserContent::Text(text) => text.clone(),
+        crate::model::UserContent::Blocks(blocks) => prompt_display("", blocks),
     };
     let snapshot = handle
         .with_session(|session| {
@@ -8193,16 +8368,43 @@ async fn prepare_retry_turn(
                 session_id,
                 messages,
                 usage,
-                text: text.clone(),
+                text,
                 status: Some(String::from("Retrying last turn")),
             });
-            Some(text)
+            Some(content)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
             None
         }
     }
+}
+
+async fn run_retry_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let Some(content) = prepare_retry_turn(handle, agent_tx).await else {
+        return;
+    };
+    let (text, attachments) = match content {
+        crate::model::UserContent::Text(text) => (text, Vec::new()),
+        crate::model::UserContent::Blocks(blocks) => {
+            // Persisted blocks have no surviving authored-source boundary;
+            // retry must not activate file-body or template keywords.
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(Some(String::new()));
+            (String::new(), blocks)
+        }
+    };
+    run_prompt_turn(handle, text, attachments, agent_tx, turn_control).await;
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(None);
 }
 
 async fn send_conversation_reset(
@@ -8438,6 +8640,39 @@ pub struct FtuiSettings {
     pub model_names: HashMap<String, String>,
     /// `--plan-mode`: start in planning, as the classic stack does.
     pub start_in_plan_mode: bool,
+    /// CLI files and their first authored message, already read and bounded.
+    pub initial_content: Option<crate::app::InitialMessage>,
+    /// Remaining CLI messages, routed through the ordinary prompt path.
+    pub initial_messages: Vec<String>,
+}
+
+fn queue_initial_commands(
+    submit_tx: &Sender<UiCommand>,
+    start_in_plan_mode: bool,
+    has_initial_content: bool,
+    messages: Vec<String>,
+) -> std::io::Result<usize> {
+    let send = |command| {
+        submit_tx
+            .send(command)
+            .map_err(|_| std::io::Error::other("FTUI startup command queue closed"))
+    };
+    if start_in_plan_mode {
+        send(UiCommand::Plan {
+            action: String::from("enter"),
+        })?;
+    }
+    if has_initial_content {
+        send(UiCommand::InitialPrompt)?;
+    }
+    let mut count = 0;
+    for message in messages {
+        if !message.trim().is_empty() {
+            send(UiCommand::Prompt(message))?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8462,6 +8697,8 @@ pub fn run(
         double_escape_action,
         model_names,
         start_in_plan_mode,
+        mut initial_content,
+        initial_messages,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -8487,13 +8724,14 @@ pub fn run(
         .is_none_or(|source| source.config.image_auto_resize());
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
-    // `--plan-mode` enters planning the way `/plan` does. Queued before the
-    // UI exists, the driver runs it as soon as its session is ready.
-    if start_in_plan_mode {
-        let _ = submit_tx.send(UiCommand::Plan {
-            action: String::from("enter"),
-        });
-    }
+    // Planning precedes every startup turn. Files have already been read by
+    // main; queue a one-shot marker and move their payload into the driver.
+    let mut initial_messages_remaining = queue_initial_commands(
+        &submit_tx,
+        start_in_plan_mode,
+        initial_content.is_some(),
+        initial_messages,
+    )?;
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
@@ -8572,12 +8810,35 @@ pub fn run(
                     let refresh_status = received.is_ok();
                     match received {
                         Ok(UiCommand::Prompt(prompt)) => {
+                            if initial_messages_remaining > 0 {
+                                initial_messages_remaining -= 1;
+                                if !publish_submitted_input(
+                                    &handle,
+                                    &agent_tx,
+                                    prompt.clone(),
+                                    prompt.clone(),
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                            }
                             run_typed_prompt(
                                 &mut handle,
                                 prompt,
                                 driver_resources.as_ref(),
                                 &bash_cwd,
                                 auto_resize_images,
+                                &agent_tx,
+                                &driver_turn_control,
+                            )
+                            .await;
+                        }
+                        Ok(UiCommand::InitialPrompt) => {
+                            run_initial_prompt(
+                                &mut handle,
+                                &mut initial_content,
+                                driver_resources.as_ref(),
                                 &agent_tx,
                                 &driver_turn_control,
                             )
@@ -8839,16 +9100,7 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::Retry) => {
-                            if let Some(text) = prepare_retry_turn(&mut handle, &agent_tx).await {
-                                run_prompt_turn(
-                                    &mut handle,
-                                    text,
-                                    Vec::new(),
-                                    &agent_tx,
-                                    &driver_turn_control,
-                                )
-                                .await;
-                            }
+                            run_retry_turn(&mut handle, &agent_tx, &driver_turn_control).await;
                         }
                         Ok(UiCommand::Btw {
                             question,
@@ -15695,6 +15947,462 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    #[derive(Clone)]
+    struct NativePromptCall {
+        content: crate::model::UserContent,
+        thinking: Option<crate::model::ThinkingLevel>,
+        system_prompt: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct NativePromptProbe {
+        calls: Mutex<Vec<NativePromptCall>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for NativePromptProbe {
+        fn name(&self) -> &str {
+            "ftui-native-input"
+        }
+
+        fn api(&self) -> &str {
+            "test"
+        }
+
+        fn model_id(&self) -> &str {
+            "ftui-native-input"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let content = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::model::Message::User(user) => Some(user.content.clone()),
+                    _ => None,
+                })
+                .expect("provider must receive a user input");
+            self.calls.lock().unwrap().push(NativePromptCall {
+                content,
+                thinking: options.thinking_level,
+                system_prompt: context.system_prompt.as_deref().map(str::to_string),
+            });
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("completed native input"),
+                        )],
+                        ..Default::default()
+                    },
+                },
+            )])))
+        }
+    }
+
+    fn native_prompt_handle(provider: Arc<NativePromptProbe>) -> crate::sdk::AgentSessionHandle {
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::from_tools(Vec::new()),
+            crate::agent::AgentConfig {
+                stream_options: crate::provider::StreamOptions {
+                    thinking_level: Some(crate::model::ThinkingLevel::Low),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        )
+    }
+
+    #[test]
+    fn startup_commands_queue_plan_before_one_native_turn_and_remaining_prompts() {
+        let (tx, rx) = mpsc::channel();
+        let count = queue_initial_commands(
+            &tx,
+            true,
+            true,
+            vec!["first".into(), " \n ".into(), "/triage second".into()],
+        )
+        .expect("startup queue");
+        assert_eq!(count, 2);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                UiCommand::Plan {
+                    action: "enter".into(),
+                },
+                UiCommand::InitialPrompt,
+                UiCommand::Prompt("first".into()),
+                UiCommand::Prompt("/triage second".into()),
+            ]
+        );
+        assert_eq!(
+            queue_initial_commands(&tx, false, false, Vec::new()).unwrap(),
+            0
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an empty launch must not submit a turn"
+        );
+    }
+
+    #[test]
+    fn startup_extension_resolution_preserves_registration_and_raw_arguments() {
+        let commands = vec![crate::autocomplete::NamedEntry {
+            name: "Review".into(),
+            description: None,
+        }];
+        assert_eq!(
+            registered_prompt_command(&commands, " /review\t@private.wav  keep spaces "),
+            Some(("Review".into(), "@private.wav  keep spaces".into()))
+        );
+        for input in [
+            "/reviewer",
+            "review",
+            "/unregistered @private.wav",
+            "see /review",
+        ] {
+            assert!(registered_prompt_command(&commands, input).is_none());
+        }
+    }
+
+    #[test]
+    fn startup_user_rows_require_current_session_and_keep_authored_history() {
+        let (_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        let submitted = |owner: &str| {
+            PiFtuiMsg::Agent(PiMsg::UserInputSubmitted {
+                owner_session_id: owner.to_string(),
+                text: "\x1b[31mvisible generated file body\x1b[0m".into(),
+                history_text: "authored prompt".into(),
+            })
+        };
+        sim.send(submitted("current"));
+        assert!(sim.model().input_history.is_empty());
+        assert!(sim.model().transcript.is_empty());
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "current".into(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(submitted("replaced"));
+        assert!(sim.model().input_history.is_empty());
+        assert!(sim.model().transcript.is_empty());
+        sim.send(submitted("current"));
+        assert_eq!(sim.model().transcript.len(), 1);
+        let user = &sim.model().transcript[0];
+        assert_eq!(user.role, EntryRole::User);
+        assert!(user.text.contains("visible generated file body"));
+        assert!(!user.text.contains('\x1b'));
+        assert_eq!(sim.model().input_history, vec!["authored prompt".to_string()]);
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "display must not enqueue another turn"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "replacement".into(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(submitted("current"));
+        assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    fn typed_prompt_scans_prose_without_file_names_bodies_or_template_bytes() {
+        use crate::model::{ThinkingLevel, UserContent};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ultrathink.txt"), "attached workflowz").unwrap();
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".into(),
+            description: String::new(),
+            content: "expanded template ultrathink".into(),
+            source: "user".into(),
+            file_path: dir.path().join("triage.md"),
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider.clone());
+            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let (tx, rx) = mpsc::channel();
+            for prompt in ["/triage @ultrathink.txt orchestrate", "ultrathink"] {
+                run_typed_prompt(
+                    &mut handle,
+                    prompt.into(),
+                    Some(&resources),
+                    dir.path(),
+                    false,
+                    &tx,
+                    &control,
+                )
+                .await;
+            }
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            let UserContent::Text(first) = &calls[0].content else {
+                panic!("text-only prompt must retain its text representation");
+            };
+            assert!(first.contains("attached workflowz"));
+            assert!(first.contains("expanded template ultrathink"));
+            assert_eq!(calls[0].thinking, Some(ThinkingLevel::Low));
+            let system = calls[0].system_prompt.as_deref().unwrap();
+            assert!(system.contains("invoked `orchestrate`"));
+            assert!(!system.contains("invoked `workflowz`"));
+            assert_eq!(calls[1].thinking, Some(ThinkingLevel::High));
+            assert!(matches!(&calls[1].content, UserContent::Text(text) if text == "ultrathink"));
+            assert!(!rx.try_iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+        });
+    }
+
+    #[test]
+    fn initial_native_prompt_keeps_prepared_bytes_order_and_authored_authority_once() {
+        use base64::Engine as _;
+        use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio = b"RIFF\x00\xffWAVEfrozen-audio";
+        let video = b"\x00\x00\x00\x18ftypisom\xff\x80frozen-video";
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(png_data)
+            .unwrap();
+        for (name, bytes) in [
+            ("clip.MP4", video.as_slice()),
+            ("image.png", png.as_slice()),
+            ("voice.WAV", audio.as_slice()),
+            (
+                "notes.txt",
+                b"frozen notes: ultrathink @mentioned.txt".as_slice(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("mentioned.txt"), "must not be read again").unwrap();
+        let source = "/triage orchestrate";
+        let mut messages = vec![source.to_string(), "remaining CLI turn".to_string()];
+        let mut pending = crate::app::prepare_initial_message(
+            dir.path(),
+            &[
+                "clip.MP4".into(),
+                "image.png".into(),
+                "voice.WAV".into(),
+                "notes.txt".into(),
+            ],
+            &mut messages,
+            false,
+            &crate::workspace::WorkspaceHandle::single(dir.path()),
+        )
+        .unwrap();
+        let prepared = pending.as_ref().expect("prepared initial turn");
+        let expanded = "Review the supplied files. workflowz";
+        let text = format!("{}{expanded}", prepared.text.strip_suffix(source).unwrap());
+        let mut expected = vec![ContentBlock::Text(TextContent::new(text))];
+        expected.extend_from_slice(&prepared.attachments);
+        assert!(matches!(
+            expected.as_slice(),
+            [
+                ContentBlock::Text(_),
+                ContentBlock::Media(_),
+                ContentBlock::Image(_),
+                ContentBlock::Media(_)
+            ]
+        ));
+        let expected = serde_json::to_value(UserContent::Blocks(expected)).unwrap();
+        for name in ["clip.MP4", "image.png", "voice.WAV", "notes.txt"] {
+            std::fs::write(dir.path().join(name), "changed after startup preparation").unwrap();
+        }
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".into(),
+            description: String::new(),
+            content: expanded.into(),
+            source: "user".into(),
+            file_path: dir.path().join("triage.md"),
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider.clone());
+            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let (tx, rx) = mpsc::channel();
+            send_conversation_reset(&handle, &tx, "startup").await;
+            run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
+            run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
+            assert!(pending.is_none());
+            assert!(control.lock().unwrap().is_none());
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "a duplicate startup marker must not replay input"
+            );
+            assert_eq!(serde_json::to_value(&calls[0].content).unwrap(), expected);
+            assert_eq!(calls[0].thinking, Some(ThinkingLevel::Low));
+            let system = calls[0]
+                .system_prompt
+                .as_deref()
+                .expect("authored directive");
+            assert!(system.contains("invoked `orchestrate`"));
+            assert!(!system.contains("invoked `workflowz`"));
+            drop(calls);
+
+            let events = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::UserInputSubmitted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::AgentStart))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+            let (_tx, model) = new_model();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            for event in events {
+                sim.send(PiFtuiMsg::Agent(event));
+            }
+            let users = sim
+                .model()
+                .transcript
+                .iter()
+                .filter(|entry| entry.role == EntryRole::User)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                users.len(),
+                1,
+                "agent events must not duplicate the startup user row"
+            );
+            assert!(users[0].text.contains("frozen notes"));
+            assert!(users[0].text.contains("video/mp4"));
+            assert!(!users[0].text.contains(png_data));
+            assert_eq!(sim.model().input_history, vec![source.to_string()]);
+            assert_eq!(sim.model().state, AgentUiState::Ready);
+        });
+        assert_eq!(messages, vec!["remaining CLI turn".to_string()]);
+    }
+
+    #[test]
+    fn retry_driver_preserves_interleaved_native_blocks_and_plain_text() {
+        use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent, UserContent};
+        let blocks = vec![
+            ContentBlock::Media(MediaContent {
+                data: "AP+A/w==".into(),
+                mime_type: "audio/wav".into(),
+                name: Some("voice.wav".into()),
+            }),
+            ContentBlock::Text(TextContent::new("first text ultrathink")),
+            ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".into(),
+                mime_type: "image/png".into(),
+            }),
+            ContentBlock::Text(TextContent::new("second text workflowz")),
+            ContentBlock::Media(MediaContent {
+                data: "AAECAw==".into(),
+                mime_type: "video/mp4".into(),
+                name: Some("clip.mp4".into()),
+            }),
+        ];
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for content in [
+                UserContent::Blocks(blocks),
+                UserContent::Text("plain authored prompt".into()),
+            ] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(provider.clone());
+                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let (tx, rx) = mpsc::channel();
+                let (text, attachments) = match &content {
+                    UserContent::Text(text) => (text.clone(), Vec::new()),
+                    UserContent::Blocks(blocks) => {
+                        handle
+                            .session_mut()
+                            .agent
+                            .set_magic_keyword_scan_override(Some(String::new()));
+                        (String::new(), blocks.clone())
+                    }
+                };
+                run_prompt_turn(&mut handle, text, attachments, &tx, &control).await;
+                run_retry_turn(&mut handle, &tx, &control).await;
+                assert!(control.lock().unwrap().is_none());
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), 2, "retry must start a real second turn");
+                let expected = serde_json::to_value(&content).unwrap();
+                for call in calls.iter() {
+                    assert_eq!(serde_json::to_value(&call.content).unwrap(), expected);
+                    assert_eq!(call.thinking, Some(crate::model::ThinkingLevel::Low));
+                    assert!(call.system_prompt.as_deref().is_none_or(str::is_empty));
+                }
+                let events = rx.try_iter().collect::<Vec<_>>();
+                assert!(!events.iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+                let text = events
+                    .iter()
+                    .find_map(|event| match event {
+                        PiMsg::RetryCommitted { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .expect("retry transcript update");
+                match &content {
+                    UserContent::Blocks(_) => {
+                        assert!(text.find("voice.wav").unwrap() < text.find("first text").unwrap());
+                        assert!(text.find("image/png").unwrap() < text.find("second text").unwrap());
+                        assert!(text.ends_with("[Media: clip.mp4, video/mp4, 4 B]"));
+                        for payload in ["AP+A/w==", "aW1hZ2U=", "AAECAw=="] {
+                            assert!(!text.contains(payload));
+                        }
+                    }
+                    UserContent::Text(expected) => assert_eq!(text, expected),
+                }
+            }
+        });
+    }
+
     /// `@file` references are read in: a text file is inlined ahead of the
     /// message, an image is attached, and the reference leaves the text. A
     /// prompt without references still expands templates.

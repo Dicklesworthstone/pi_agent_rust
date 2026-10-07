@@ -338,6 +338,12 @@ fn borrowed_handle_turn_steers_mid_tool_and_retires_its_control() {
     runtime.block_on(async {
         let turn = handle.prompt_controlled("and now?".to_string(), |_| {});
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+        let store = handle.session_store();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let state = store.lock(cx.cx()).await.unwrap();
+        assert!(state.to_messages_for_current_path().iter().all(|message| {
+            !matches!(message, Message::User(user) if !matches!(&user.content, UserContent::Text(_)))
+        }));
     });
     let requests = lock(&peer.requests);
     assert_eq!(requests.len(), 4);
@@ -346,6 +352,55 @@ fn borrowed_handle_turn_steers_mid_tool_and_retires_its_control() {
     assert!(request_has(&requests[2], "then explain tradeoffs"));
     assert!(request_has(&requests[3], "and now?"));
     assert!(!request_has(&requests[3], "late input"));
+}
+
+#[test]
+fn borrowed_handle_native_prompt_preserves_order_through_provider_and_session() {
+    use crate::model::{ContentBlock, ImageContent, TextContent};
+
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let peer = Peer::new(vec![Reply::Text]);
+    let mut handle = peer.handle(temp.path());
+    let content = vec![
+        ContentBlock::Text(TextContent::new("  inspect\n")),
+        ContentBlock::Image(ImageContent {
+            data: "YQ==".to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+        ContentBlock::Text(TextContent::new("\ntrailing context  ")),
+    ];
+    runtime.block_on(async {
+        let turn = handle.prompt_controlled_with_content(content.clone(), |_| {});
+        let control = turn.control();
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+        assert!(control.snapshot().finished);
+        let store = handle.session_store();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let state = store.lock(cx.cx()).await.unwrap();
+        let users: Vec<_> = state
+            .to_messages_for_current_path()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(serde_json::to_value(user.content).unwrap()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec![serde_json::to_value(&content).unwrap()]);
+    });
+    let requests = lock(&peer.requests);
+    assert_eq!(requests.len(), 1);
+    let user = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("native user request");
+    assert_eq!(user["content"], json!([
+        {"type": "text", "text": "  inspect\n"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+        {"type": "text", "text": "\ntrailing context  "}
+    ]));
 }
 
 #[test]

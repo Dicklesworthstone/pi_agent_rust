@@ -970,6 +970,7 @@ impl PiApp {
             | PiMsg::AutocompleteCatalog(_)
             | PiMsg::LoginPending { .. }
             | PiMsg::StatusSnapshot(_)
+            | PiMsg::UserInputSubmitted { .. }
             | PiMsg::MessagePicker { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
@@ -3307,9 +3308,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             if !text.trim().is_empty() {
                 content.push(ContentBlock::Text(TextContent::new(text)));
             }
-            for image in processed.images {
-                content.push(ContentBlock::Image(image));
-            }
+            content.extend(processed.attachments);
 
             self.history.push(message_owned.clone());
 

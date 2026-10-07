@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::auth::AuthStorage;
 use crate::cli;
 use crate::config::Config;
-use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
+use crate::model::{self, AssistantMessage, ContentBlock, TextContent};
 use crate::models::{
     ModelEntry, ModelRegistry, ModelRole, default_models_path, model_entry_is_ready,
     model_requires_configured_credential, normalize_api_key_opt,
@@ -29,7 +29,8 @@ use crate::tools::process_file_arguments;
 #[derive(Debug, Clone)]
 pub struct InitialMessage {
     pub text: String,
-    pub images: Vec<ImageContent>,
+    /// Native image/audio/video attachments in command-line argument order.
+    pub attachments: Vec<ContentBlock>,
     /// Prose eligible for behavior-changing magic-keyword scans. Generated
     /// attachment wrappers and file bytes are deliberately excluded.
     pub keyword_scan_source: String,
@@ -158,13 +159,13 @@ pub fn prepare_initial_message(
     };
     initial_message.push_str(&keyword_scan_source);
 
-    if initial_message.is_empty() && processed.images.is_empty() && !has_message {
+    if initial_message.is_empty() && processed.attachments.is_empty() && !has_message {
         return Ok(None);
     }
 
     Ok(Some(InitialMessage {
         text: initial_message,
-        images: processed.images,
+        attachments: processed.attachments,
         keyword_scan_source,
     }))
 }
@@ -172,9 +173,7 @@ pub fn prepare_initial_message(
 pub fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
     let mut content = Vec::new();
     content.push(ContentBlock::Text(TextContent::new(initial.text.clone())));
-    for image in &initial.images {
-        content.push(ContentBlock::Image(image.clone()));
-    }
+    content.extend_from_slice(&initial.attachments);
     content
 }
 

@@ -369,6 +369,36 @@ impl AgentSessionHandle {
         images: Vec<crate::model::ImageContent>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        let content = if images.is_empty() {
+            UserContent::Text(input)
+        } else {
+            let mut blocks = Vec::with_capacity(images.len() + 1);
+            if !input.is_empty() {
+                blocks.push(crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(input),
+                ));
+            }
+            blocks.extend(images.into_iter().map(crate::model::ContentBlock::Image));
+            UserContent::Blocks(blocks)
+        };
+        self.prompt_controlled_input(content, on_event)
+    }
+
+    /// Run ordered native text, image, audio and video input with the same
+    /// turn-scoped steering, cancellation, persistence and retry behavior.
+    pub fn prompt_controlled_with_content(
+        &mut self,
+        content: Vec<crate::model::ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        self.prompt_controlled_input(UserContent::Blocks(content), on_event)
+    }
+
+    pub(crate) fn prompt_controlled_input(
+        &mut self,
+        content: UserContent,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
         let active: ActiveRun = Arc::new(Mutex::new(Weak::new()));
         self.session_mut().agent.register_message_fetchers(
             Some(fetcher(&active, InputKind::Steering)),
@@ -383,9 +413,14 @@ impl AgentSessionHandle {
         let session = self;
         let future = async move {
             let _guard = guard;
-            session
-                .prompt_with_images_with_abort(input, images, signal, on_event)
-                .await
+            match content {
+                UserContent::Text(text) => session.prompt_with_abort(text, signal, on_event).await,
+                UserContent::Blocks(blocks) => {
+                    session
+                        .prompt_with_content_with_abort(blocks, signal, on_event)
+                        .await
+                }
+            }
         };
         ControlledTurn {
             future: Box::pin(execution::OwnedTurn::new(future, control.clone())),

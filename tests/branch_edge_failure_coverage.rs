@@ -263,7 +263,7 @@ fn process_file_arguments_empty_file_skipped() {
     )
     .unwrap();
     assert!(result.text.is_empty());
-    assert!(result.images.is_empty());
+    assert!(result.attachments.is_empty());
 }
 
 #[test]
@@ -364,8 +364,10 @@ fn process_file_arguments_png_image_detected() {
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
-    assert!(!result.images.is_empty());
-    assert_eq!(result.images[0].mime_type, "image/png");
+    assert!(matches!(
+        result.attachments.first(),
+        Some(ContentBlock::Image(image)) if image.mime_type == "image/png"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -820,7 +822,7 @@ fn validate_rpc_args_text_mode_with_files_is_ok() {
 fn build_initial_content_text_only() {
     let initial = app::InitialMessage {
         text: "hello world".to_string(),
-        images: vec![],
+        attachments: vec![],
         keyword_scan_source: "hello world".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
@@ -835,10 +837,10 @@ fn build_initial_content_text_only() {
 fn build_initial_content_with_images() {
     let initial = app::InitialMessage {
         text: "describe this".to_string(),
-        images: vec![ImageContent {
+        attachments: vec![ContentBlock::Image(ImageContent {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
-        }],
+        })],
         keyword_scan_source: "describe this".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
@@ -851,15 +853,15 @@ fn build_initial_content_with_images() {
 fn build_initial_content_multiple_images() {
     let initial = app::InitialMessage {
         text: "compare".to_string(),
-        images: vec![
-            ImageContent {
+        attachments: vec![
+            ContentBlock::Image(ImageContent {
                 data: "img1".to_string(),
                 mime_type: "image/png".to_string(),
-            },
-            ImageContent {
+            }),
+            ContentBlock::Image(ImageContent {
                 data: "img2".to_string(),
                 mime_type: "image/jpeg".to_string(),
-            },
+            }),
         ],
         keyword_scan_source: "compare".to_string(),
     };

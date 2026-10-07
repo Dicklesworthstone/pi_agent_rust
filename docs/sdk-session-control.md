@@ -84,6 +84,13 @@ complete; dropping all owners is not durable storage.
 
 ## Attachments and authored-source tracking
 
+For a borrowed handle, `prompt_controlled_with_content(content, on_event)`
+starts a controlled turn with ordered native text, image, audio, and video
+blocks. It uses the SDK's normal validation, persistence, retry, and cancellation
+path. `prompt_controlled` and image prompts without images retain ordinary
+text semantics. The FTUI frontend uses this same control lane for prepared
+file attachments and native retries.
+
 `steer_with_content(&UserContent, authored_source)` and
 `follow_up_with_content(&UserContent, authored_source)` preserve native text,
 image and media blocks in order. `authored_source` is the user's original
