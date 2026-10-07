@@ -234,11 +234,14 @@ mod diagnostic_cancellation_tests {
                 {"result": {"kind": "full", "items": []}}
             ]
         }));
-        let error = peer.runtime.block_on(peer.client.call(
-            "textDocument/diagnostic",
-            json!({"textDocument": {"uri": "file:///test.rs"}}),
-            Duration::from_secs(5),
-        )).unwrap_err();
+        let error = peer
+            .runtime
+            .block_on(peer.client.call(
+                "textDocument/diagnostic",
+                json!({"textDocument": {"uri": "file:///test.rs"}}),
+                Duration::from_secs(5),
+            ))
+            .unwrap_err();
         let LspCallError::Transport(TransportError::Server(error)) = error else {
             panic!("expected the original server cancellation");
         };
@@ -246,11 +249,18 @@ mod diagnostic_cancellation_tests {
         assert_eq!(error.data, Some(json!({"retriggerRequest": false})));
         let frames = peer.frames();
         assert_eq!(
-            frames.iter().filter(|frame| frame["method"] == "textDocument/diagnostic").count(),
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                .count(),
             1,
             "a server opt-out must not become an automatic second request"
         );
-        assert!(!frames.iter().any(|frame| frame["method"] == "$/cancelRequest"));
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["method"] == "$/cancelRequest")
+        );
         assert!(peer.client.is_alive());
     }
 
@@ -269,14 +279,20 @@ mod diagnostic_cancellation_tests {
             peer.configure(json!({
                 "textDocument/diagnostic": [{"error": error}, {"result": report}]
             }));
-            let result = peer.runtime.block_on(peer.client.call(
-                "textDocument/diagnostic",
-                json!({"textDocument": {"uri": "file:///test.rs"}}),
-                Duration::from_secs(5),
-            )).unwrap();
+            let result = peer
+                .runtime
+                .block_on(peer.client.call(
+                    "textDocument/diagnostic",
+                    json!({"textDocument": {"uri": "file:///test.rs"}}),
+                    Duration::from_secs(5),
+                ))
+                .unwrap();
             assert_eq!(result, report);
             assert_eq!(
-                peer.frames().iter().filter(|frame| frame["method"] == "textDocument/diagnostic").count(),
+                peer.frames()
+                    .iter()
+                    .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                    .count(),
                 2
             );
         }

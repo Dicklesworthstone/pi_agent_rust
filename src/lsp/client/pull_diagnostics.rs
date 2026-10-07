@@ -220,6 +220,7 @@ impl LspClient {
         owner
             .checkpoint()
             .map_err(|_| Error::from(super::LspCallError::Cancelled))?;
+        let budget = RequestBudget::new(wait);
         let uri =
             file_uri::normalize_uri(uri).ok_or_else(|| protocol_error("invalid document URI"))?;
         let (revision, source) = {
@@ -229,21 +230,14 @@ impl LspClient {
             })?;
             (Revision::from(doc), Arc::clone(&doc.text))
         };
-        let received = if self.has_pull_diagnostics() && !wait.is_zero() {
-            let budget = RequestBudget::new(wait);
+        let pulling = self.has_pull_diagnostics() && !wait.is_zero();
+        let received = if pulling {
             loop {
-                // Recomputed per iteration so the wait shrinks across retries
-                // and a cancelled or exhausted budget ends the loop, matching
-                // `refresh_document_diagnostics` itself.
-                let remaining = budget.remaining().map_err(Error::from)?;
-                match self.refresh_document_diagnostics(&uri, remaining).await {
-                    Ok(()) => {}
-                    Err(err)
-                        if err.to_string().contains("-32802")
-                            || err.to_string().contains("-32801")
-                            || err.to_string().contains("server cancelled") => {}
-                    Err(err) => return Err(err),
-                }
+                // The request layer owns typed retry decisions. A returned
+                // error is final, even when an earlier report is cached. Do
+                // not reinterpret error text or restart an exhausted budget.
+                self.refresh_document_diagnostics_with_budget(&uri, &budget)
+                    .await?;
                 self.poll_notifications();
                 let diags = Self::lock(&self.diagnostics)
                     .get(&uri)
@@ -255,7 +249,10 @@ impl LspClient {
                 if settled {
                     break;
                 }
-                if budget.remaining().is_err() || budget.remaining().unwrap() < WAIT_TICK * 2 {
+                // Read once: expiry between an is_err check and a second
+                // remaining().unwrap() used to panic at the deadline edge.
+                let remaining = budget.remaining().map_err(Error::from)?;
+                if remaining < WAIT_TICK * 2 {
                     break;
                 }
                 budget.pause(WAIT_TICK).await.map_err(Error::from)?;
@@ -290,10 +287,14 @@ impl LspClient {
                 "document changed or closed while waiting for diagnostics",
             ));
         }
-        Self::lock(&self.diagnostics)
+        let result = Self::lock(&self.diagnostics)
             .get(&uri)
             .cloned()
-            .ok_or_else(|| protocol_error("diagnostic report was invalidated before delivery"))
+            .ok_or_else(|| protocol_error("diagnostic report was invalidated before delivery"));
+        if pulling {
+            budget.remaining().map_err(Error::from)?;
+        }
+        result
     }
 
     /// Refresh diagnostics using the server's negotiated pull protocol.
@@ -307,6 +308,15 @@ impl LspClient {
     /// dropped request uses the client request layer's cancellation discipline.
     pub async fn refresh_document_diagnostics(&self, uri: &str, timeout: Duration) -> Result<()> {
         let budget = RequestBudget::new(timeout);
+        self.refresh_document_diagnostics_with_budget(uri, &budget)
+            .await
+    }
+
+    async fn refresh_document_diagnostics_with_budget(
+        &self,
+        uri: &str,
+        budget: &RequestBudget,
+    ) -> Result<()> {
         budget.remaining().map_err(Error::from)?;
         let uri = file_uri::normalize_uri(uri)
             .filter(|uri| uri.len() <= MAX_RESULT_ID_BYTES)
@@ -353,7 +363,7 @@ impl LspClient {
             params["previousResultId"] = json!(id);
         }
         let raw = self
-            .call_with_budget("textDocument/diagnostic", params, &budget)
+            .call_with_budget("textDocument/diagnostic", params, budget)
             .await
             .map_err(Error::from)?;
         let mut report = parse_report(&raw, revision, previous.as_ref())?;
@@ -377,6 +387,7 @@ impl LspClient {
             ));
         }
         let mut diagnostics = Self::lock(&self.diagnostics);
+        budget.remaining().map_err(Error::from)?;
         diagnostics.insert(uri.clone(), report.items.as_ref().clone());
         for evicted in cache.insert(uri, report) {
             diagnostics.remove(&evicted);
@@ -387,3 +398,101 @@ impl LspClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod delivery_failure_tests {
+    use super::super::test_server::Fixture;
+    use super::*;
+
+    #[test]
+    fn failed_refresh_cannot_deliver_a_cached_clean_or_nonempty_report() {
+        let diagnostic = json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}
+            },
+            "message": "previous diagnostic"
+        });
+        for items in [json!([]), json!([diagnostic])] {
+            for server_error in [
+                json!({
+                    "code": -32802,
+                    "message": "fixture diagnostic pull declined",
+                    "data": {"retriggerRequest": false}
+                }),
+                json!({
+                    "code": -32603,
+                    "message": "fixture internal failure mentions server cancelled (-32802)"
+                }),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let Some(peer) = Fixture::connect(
+                    temp.path(),
+                    json!({
+                        "textDocumentSync": 1,
+                        "diagnosticProvider": {
+                            "interFileDependencies": true,
+                            "workspaceDiagnostics": false
+                        }
+                    }),
+                ) else {
+                    return;
+                };
+                let path = temp.path().join("source.rs");
+                std::fs::write(&path, "source").unwrap();
+                let uri = peer.client.ensure_synced(&path, "rust").unwrap();
+                peer.configure(json!({
+                    "textDocument/diagnostic": [
+                        {"result": {"kind": "full", "resultId": "old", "items": items}},
+                        {"error": server_error},
+                        {"result": {"kind": "full", "resultId": "unexpected", "items": []}}
+                    ]
+                }));
+                peer.runtime
+                    .block_on(peer.client.refresh_document_diagnostics(
+                        &uri,
+                        Duration::from_secs(5),
+                    ))
+                    .unwrap();
+                peer.client.quiescent.store(true, Ordering::SeqCst);
+                let error = peer
+                    .runtime
+                    .block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5)))
+                    .unwrap_err();
+                assert!(error.to_string().contains("fixture"), "{error}");
+                assert_eq!(
+                    peer.client.diagnostics_snapshot()[&uri],
+                    *items.as_array().unwrap(),
+                    "failure retains the old UI snapshot but cannot return it as a fresh pull"
+                );
+                assert_eq!(
+                    peer.frames()
+                        .iter()
+                        .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                        .count(),
+                    2,
+                    "the delivery layer must not reinterpret errors or restart retries"
+                );
+                // Explicit cache inspection still works, and the same client
+                // can obtain a fresh report after the server recovers.
+                assert_eq!(
+                    peer.runtime
+                        .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                        .unwrap(),
+                    *items.as_array().unwrap()
+                );
+                peer.configure(json!({
+                    "textDocument/diagnostic": [
+                        {"result": {"kind": "full", "resultId": "recovered", "items": []}}
+                    ]
+                }));
+                assert!(
+                    peer.runtime
+                        .block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5)))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
