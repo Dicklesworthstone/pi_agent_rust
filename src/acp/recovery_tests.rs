@@ -28,6 +28,10 @@ struct ProviderFixture {
 
 impl ProviderFixture {
     fn new(statuses: Vec<u16>) -> Self {
+        Self::with_tool(statuses, None)
+    }
+
+    fn with_tool(statuses: Vec<u16>, tool: Option<&'static str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
         listener.set_nonblocking(true).expect("nonblocking accept");
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -36,7 +40,7 @@ impl ProviderFixture {
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
         let worker = std::thread::spawn(move || {
-            for status in statuses {
+            for (reply_index, status) in statuses.into_iter().enumerate() {
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut stream = loop {
                     if stop.load(Ordering::SeqCst) {
@@ -58,16 +62,34 @@ impl ProviderFixture {
                 let model = request["model"].as_str().unwrap().to_string();
                 captured.lock().unwrap().push((headers, request));
                 let (content_type, body) = if status == 200 {
+                    let delta = tool.map_or_else(
+                        || {
+                            json!({
+                                "role": "assistant",
+                                "content": "Recovered editor answer",
+                            })
+                        },
+                        |tool| {
+                            json!({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": format!("acp-tool-{reply_index}"),
+                                    "type": "function",
+                                    "function": { "name": tool, "arguments": "{}" },
+                                }],
+                            })
+                        },
+                    );
+                    let finish_reason = if tool.is_some() { "tool_calls" } else { "stop" };
                     let start = json!({
                         "id": "acp-completion", "object": "chat.completion.chunk",
                         "model": model,
-                        "choices": [{"index": 0, "delta": {
-                            "role": "assistant", "content": "Recovered editor answer"
-                        }, "finish_reason": null}],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
                     });
                     let end = json!({
                         "id": "acp-completion",
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                     });
                     ("text/event-stream", format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n"))
                 } else {
@@ -253,6 +275,422 @@ fn user_content(request: &Value) -> &Value {
         .find(|message| message["role"] == "user").unwrap()["content"]
 }
 
+async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
+    timeout(wall_now(), Duration::from_secs(15), Box::pin(work))
+        .await
+        .expect("ACP launch controls watchdog expired")
+}
+
+#[test]
+fn launch_prompt_and_no_tools_controls_reach_the_actual_provider_request() {
+    use clap::Parser as _;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("CLAUDE.md"), "EXCLUDED-ACP-PROJECT-CONTEXT").unwrap();
+    std::fs::write(
+        root.path().join(".cursorrules"),
+        "EXCLUDED-ACP-FOREIGN-CONTEXT",
+    )
+    .unwrap();
+    let mut server = ProviderFixture::new(vec![200]);
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let cli = crate::cli::Cli::try_parse_from([
+            "pi",
+            "--provider",
+            PRIMARY_PROVIDER,
+            "--model",
+            PRIMARY_MODEL,
+            "--tools",
+            "read,write,bash",
+            "--no-tools",
+            "--system-prompt",
+            "ACP-HOST-OWNED-PROMPT",
+            "--append-system-prompt",
+            "ACP-HOST-APPEND-PROMPT",
+            "--no-context-files",
+            "--hide-cwd-in-prompt",
+        ])
+        .unwrap();
+        let mut options = options(root.path(), &server.url, runtime.handle(), 0);
+        options.launch = AcpLaunchOptions::from_cli(&cli);
+        options.config.foreign_rules = Some(true);
+        options.config.media = Some(crate::media_tools::MediaSettings {
+            enable_tts: Some(true),
+            ..crate::media_tools::MediaSettings::default()
+        });
+        options.skills_prompt = Some("EXCLUDED-ACP-SKILLS".to_string());
+        let (id, state) = new_state(root.path(), &options);
+        {
+            let mut guard = state.try_lock().unwrap();
+            let context = guard
+                .agent_session
+                .as_mut()
+                .unwrap()
+                .session_mut()
+                .agent
+                .request_context_json();
+            assert_eq!(
+                context["tools"].as_array().unwrap().len(),
+                0,
+                "--no-tools removes automatic configured tools too"
+            );
+        }
+        let (_, signal) = AbortHandle::new();
+        let (reason, _) = prompt(&state, &id, text(), signal).await;
+        assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+    }));
+    let requests = server.finish(1);
+    let body = &requests[0].1;
+    assert!(
+        body.get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+        "--no-tools must reach the actual provider request"
+    );
+    let system_prompt = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(system_prompt.contains("ACP-HOST-OWNED-PROMPT"));
+    assert!(system_prompt.contains("ACP-HOST-APPEND-PROMPT"));
+    assert!(system_prompt.contains("via ACP (Agent Client Protocol)"));
+    for excluded in [
+        "EXCLUDED-ACP-PROJECT-CONTEXT",
+        "EXCLUDED-ACP-FOREIGN-CONTEXT",
+        "EXCLUDED-ACP-SKILLS",
+        "Current working directory:",
+        root.path().to_str().unwrap(),
+    ] {
+        assert!(
+            !system_prompt.contains(excluded),
+            "launch controls must exclude {excluded}"
+        );
+    }
+}
+
+#[test]
+fn launch_selected_tools_reach_the_live_registry_without_terminal_host_tools() {
+    use clap::Parser as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let cli = crate::cli::Cli::try_parse_from([
+            "pi",
+            "--provider",
+            PRIMARY_PROVIDER,
+            "--model",
+            PRIMARY_MODEL,
+            "--tools",
+            "read,ask,todo,submit_plan",
+        ])
+        .unwrap();
+        let mut options = options(
+            root.path(),
+            "https://acp-tools.invalid/v1",
+            runtime.handle(),
+            0,
+        );
+        options.launch = AcpLaunchOptions::from_cli(&cli);
+        options.skills_prompt = Some("INCLUDED-ACP-SKILLS".to_string());
+        let (_, state) = new_state(root.path(), &options);
+        let mut guard = state.try_lock().unwrap();
+        let context = guard
+            .agent_session
+            .as_mut()
+            .unwrap()
+            .session_mut()
+            .agent
+            .request_context_json();
+        let names = context["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read"));
+        assert!(
+            context["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .contains("INCLUDED-ACP-SKILLS")
+        );
+        for excluded in ["bash", "write", "edit", "ask", "todo", "submit_plan"] {
+            assert!(!names.contains(&excluded), "unexpected ACP tool: {excluded}");
+        }
+    }));
+}
+
+#[test]
+fn unreadable_explicit_prompt_inputs_reject_session_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let invalid_prompt = root.path().join("not-a-prompt-file");
+    std::fs::create_dir(&invalid_prompt).unwrap();
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        for append in [false, true] {
+            let mut options = options(
+                root.path(),
+                "https://acp-prompt.invalid/v1",
+                runtime.handle(),
+                0,
+            );
+            options.launch.no_context_files = true;
+            options.launch.hide_cwd_in_prompt = true;
+            let prompt_input = Some(invalid_prompt.display().to_string());
+            if append {
+                options.launch.append_system_prompt = prompt_input;
+            } else {
+                options.launch.system_prompt = prompt_input;
+            }
+            let error = handle_session_new(
+                &json!({ "cwd": root.path(), "mcpServers": [] }),
+                &options,
+                None,
+            )
+            .err()
+            .expect("an unreadable explicit prompt must reject the session");
+            let message = error.to_string();
+            assert!(message.contains("Cannot build ACP system prompt"));
+            assert!(message.contains("Could not read"));
+        }
+    }));
+}
+
+#[test]
+fn launch_zero_time_budget_publishes_the_boundary_marker_only_after_durable_success() {
+    use clap::Parser as _;
+
+    for fail_save in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = ProviderFixture::new(vec![200]);
+        let runtime = runtime();
+        runtime.block_on(bounded_launch_controls(async {
+            let cli = crate::cli::Cli::try_parse_from([
+                "pi",
+                "--provider",
+                PRIMARY_PROVIDER,
+                "--model",
+                PRIMARY_MODEL,
+                "--max-time",
+                "0",
+            ])
+            .unwrap();
+            let mut options = options(root.path(), &server.url, runtime.handle(), 0);
+            options.launch = AcpLaunchOptions::from_cli(&cli);
+            let (id, state) = new_state(root.path(), &options);
+            let fault_triggered = Arc::new(AtomicBool::new(false));
+            if fail_save {
+                let stored = session_store(&state);
+                let invalid = root.path().to_path_buf();
+                let triggered = Arc::clone(&fault_triggered);
+                state
+                    .try_lock()
+                    .unwrap()
+                    .agent_session
+                    .as_ref()
+                    .unwrap()
+                    .subscribe(move |event| {
+                        if let AgentEvent::MessageEnd {
+                            message: Message::Assistant(message),
+                        } = event
+                            && message.api.is_empty()
+                            && message.provider.is_empty()
+                            && message.model.is_empty()
+                            && message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text(text)
+                                        if text.text.starts_with("[time cap reached]")
+                                )
+                            })
+                        {
+                            stored.try_lock().unwrap().path = Some(invalid.clone());
+                            triggered.store(true, Ordering::SeqCst);
+                        }
+                    });
+            }
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = prompt(&state, &id, text(), signal).await;
+            let rendered = serde_json::to_string(&updates).unwrap();
+            if fail_save {
+                assert!(
+                    fault_triggered.load(Ordering::SeqCst),
+                    "the fault must occur after the synthetic marker is generated"
+                );
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert!(rendered.contains("Session persistence failed"));
+                assert!(
+                    !rendered.contains("[time cap reached]"),
+                    "failed persistence must not publish a successful pause"
+                );
+            } else {
+                assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+                let marker_updates = updates
+                    .iter()
+                    .filter(|update| {
+                        update["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.starts_with("[time cap reached]"))
+                    })
+                    .count();
+                assert_eq!(marker_updates, 1, "the editor receives one boundary marker");
+                let saved = reopen(&state).await;
+                let messages = saved.to_messages_for_current_path();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
+                    1
+                );
+                assert!(messages.iter().any(|message| {
+                    matches!(
+                        message,
+                        Message::Assistant(assistant)
+                            if assistant.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text(text)
+                                        if text.text.starts_with("[time cap reached]")
+                                )
+                            })
+                    )
+                }));
+            }
+        }));
+        server.finish(0);
+    }
+}
+
+#[test]
+fn launch_iteration_limit_stops_before_executing_the_next_provider_tool_call() {
+    use clap::Parser as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut server = ProviderFixture::with_tool(vec![200, 200, 200], Some("current_time"));
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let cli = crate::cli::Cli::try_parse_from([
+            "pi",
+            "--provider",
+            PRIMARY_PROVIDER,
+            "--model",
+            PRIMARY_MODEL,
+            "--tools",
+            "current_time",
+            "--max-tool-iterations",
+            "1",
+        ])
+        .unwrap();
+        let mut options = options(root.path(), &server.url, runtime.handle(), 0);
+        options.launch = AcpLaunchOptions::from_cli(&cli);
+        let cx = AgentCx::for_current_or_request();
+        let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel::<String>(8);
+        let permission_client = AcpPermissionClient {
+            out_tx: permission_tx,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            timeout: Duration::from_secs(5),
+            cx: cx.clone(),
+        };
+        let (id, state) = handle_session_new(
+            &json!({ "cwd": root.path(), "mcpServers": [] }),
+            &options,
+            Some(&permission_client),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(state));
+        let observed = events(&state);
+        let responder = async {
+            loop {
+                match permission_rx.try_recv() {
+                    Ok(line) => {
+                        let request: Value = serde_json::from_str(&line).unwrap(); // ubs:ignore[rust.parsing.serde-unwrap] -- Fixture permission requests must parse.
+                        assert_eq!(request["method"], "session/request_permission");
+                        assert_eq!(request["params"]["sessionId"], id);
+                        assert_eq!(request["params"]["toolCall"]["title"], "current_time");
+                        assert_eq!(request["params"]["toolCall"]["toolCallId"], "acp-tool-0");
+                        assert!(route_permission_response(
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "outcome": {
+                                        "outcome": "selected",
+                                        "optionId": ACP_PERMISSION_ALLOW_ONCE,
+                                    },
+                                },
+                            }),
+                            &permission_client.pending,
+                            &cx,
+                        ));
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.time().sleep(Duration::from_millis(2)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("ACP permission writer disconnected before approval"); // ubs:ignore[rust.ownership.panic-macro] -- Disconnection must fail the fixture.
+                    }
+                }
+            }
+        };
+        let (_, signal) = AbortHandle::new();
+        let ((reason, _), ()) = futures::join!(prompt(&state, &id, text(), signal), responder);
+        assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+        assert_eq!(
+            permission_client.request_counter.load(Ordering::SeqCst),
+            1,
+            "the blocked second call must not request editor approval"
+        );
+        // ubs:ignore[rust.async.lock-unwrap] -- The completed fixture must leave no pending permission request.
+        assert!(permission_client.pending.lock().unwrap().is_empty());
+        assert!(permission_rx.try_recv().is_err());
+        // ubs:ignore[rust.async.lock-unwrap] -- Inspect the fixture's completed event trace after both joined futures exit.
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
+                .count(),
+            1
+        );
+        assert!(observed.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    is_error: false,
+                    ..
+                } if tool_name == "current_time"
+            )
+        }));
+        assert!(observed.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentEnd {
+                    error: Some(error),
+                    ..
+                } if error.contains("Maximum tool iterations (1) exceeded")
+            )
+        }));
+    }));
+    let requests = server.finish(2);
+    assert!(
+        requests[1].1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"),
+        "the approved first tool result must reach the second provider request"
+    );
+}
+
 #[test]
 fn launch_selection_reaches_the_configured_agent_and_session_metadata() {
     let root = tempfile::tempdir().unwrap();
@@ -279,6 +717,7 @@ fn launch_selection_reaches_the_configured_agent_and_session_metadata() {
                 provider: provider.map(str::to_string), model, models,
                 thinking: Some(effort.to_string()),
                 api_key: Some("  launch-fixture-key  ".to_string()),
+                ..AcpLaunchOptions::default()
             };
             let (id, state) = new_state(root.path(), &options);
             let guard = state.try_lock().unwrap();
@@ -368,6 +807,7 @@ fn reopening_preserves_the_selected_branch_over_conflicting_launch_options() {
             provider: Some(FALLBACK_PROVIDER.to_string()), model: Some(FALLBACK_MODEL.to_string()),
             thinking: Some("high".to_string()), api_key: Some("restart-fixture-key".to_string()),
             models: None,
+            ..AcpLaunchOptions::default()
         };
         let (mut saved, _) = new_acp_session(options.session_dir.as_ref(), &options.config, root.path());
         saved.append_model_change(PRIMARY_PROVIDER.to_string(), PRIMARY_MODEL.to_string());
@@ -454,6 +894,7 @@ fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
             provider: Some(PRIMARY_PROVIDER.to_string()), model: Some(PRIMARY_MODEL.to_string()),
             thinking: Some("high".to_string()), api_key: Some("  pinned-launch-key  ".to_string()),
             models: None,
+            ..AcpLaunchOptions::default()
         };
         options.auth.set(PRIMARY_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-primary-key".to_string() });
         options.auth.set(FALLBACK_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-fallback-key".to_string() });

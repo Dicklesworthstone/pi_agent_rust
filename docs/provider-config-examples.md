@@ -549,6 +549,19 @@ while using the launch credential override if supplied. A failed startup OAuth
 refresh blocks only sessions selecting that provider, unless an explicit key
 supplies the credential.
 
+ACP also applies the host's `--tools` and `--no-tools` controls. Disabling
+built-ins removes configured automatic tools as well; separately supplied MCP
+servers retain their existing trust and permission flow. Terminal-only tools
+(`ask`, `todo`, and `submit_plan`) remain unavailable in ACP.
+
+`--system-prompt`, `--append-system-prompt`, `--no-context-files`, and
+`--hide-cwd-in-prompt` apply when each editor session is constructed. An
+unreadable explicit prompt file rejects session creation. Skills are advertised
+only when the read tool is enabled. `--max-tool-iterations` uses the normal CLI
+clamping and environment fallback, and `--max-time` stops at the existing safe
+turn boundary while preserving session state. The editor receives the time-cap
+marker only after persistence succeeds.
+
 **Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and `failover`
 to `None`, so a host that builds its own session enables them explicitly
 (`RetryPolicy::from_config` and `FailoverOptions::from_config` read the same

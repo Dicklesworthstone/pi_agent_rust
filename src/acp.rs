@@ -204,16 +204,25 @@ struct AcpSessionState {
 // ACP Server
 // ============================================================================
 
-/// Model and credential choices supplied by the process launching the editor
-/// agent. These remain separate from persisted session settings: reopening a
-/// branch restores its own model and effort, while the key stays runtime-only.
+/// Host settings supplied by the process launching the editor agent. Reopening
+/// a branch restores its own model and effort, while credentials and execution
+/// controls remain runtime-only.
 #[derive(Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AcpLaunchOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub models: Option<String>,
     pub api_key: Option<String>,
+    pub tools: Option<String>,
+    pub no_tools: bool,
+    pub system_prompt: Option<String>,
+    pub append_system_prompt: Option<String>,
+    pub no_context_files: bool,
+    pub hide_cwd_in_prompt: bool,
+    pub max_tool_iterations: Option<usize>,
+    pub max_time: Option<u64>,
 }
 
 impl AcpLaunchOptions {
@@ -225,6 +234,14 @@ impl AcpLaunchOptions {
             thinking: cli.thinking.clone(),
             models: cli.models.clone(),
             api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
+            tools: Some(cli.tools.clone()),
+            no_tools: cli.no_tools,
+            system_prompt: cli.system_prompt.clone(),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            no_context_files: cli.no_context_files,
+            hide_cwd_in_prompt: cli.hide_cwd_in_prompt,
+            max_tool_iterations: cli.max_tool_iterations,
+            max_time: cli.max_time,
         }
     }
 
@@ -244,6 +261,16 @@ impl AcpLaunchOptions {
         cli.thinking.clone_from(&self.thinking);
         cli.models.clone_from(&self.models);
         cli.api_key = crate::models::normalize_api_key_opt(self.api_key.clone());
+        if let Some(tools) = &self.tools {
+            cli.tools.clone_from(tools);
+        }
+        cli.no_tools = self.no_tools;
+        cli.system_prompt.clone_from(&self.system_prompt);
+        cli.append_system_prompt.clone_from(&self.append_system_prompt);
+        cli.no_context_files = self.no_context_files;
+        cli.hide_cwd_in_prompt = self.hide_cwd_in_prompt;
+        cli.max_tool_iterations = self.max_tool_iterations;
+        cli.max_time = self.max_time;
         Ok(cli)
     }
 }
@@ -1453,132 +1480,53 @@ fn resolve_acp_selection(
     .map_err(|error| Error::config(error.to_string()))
 }
 
-/// The system prompt for an ACP session: pi's own prompt, as the CLI and
-/// the SDK build it (tool guidance, every context file including CLAUDE.md,
-/// the global AGENTS.md and ancestors, always-apply foreign workspace rules,
-/// the discoverable-tool index), plus a note that pi is running inside an
-/// editor. ACP used a short hand-written prompt of its own before, which
-/// left all of that out. The short prompt remains the fallback if the
-/// builder fails (e.g. an unreadable prompt file).
+/// Build pi's shared system prompt with the host's explicit prompt, context,
+/// cwd, and tool controls, plus the editor note. An unreadable explicit prompt
+/// rejects session construction instead of silently replacing host instructions.
 fn build_acp_system_prompt(
+    cli: &crate::cli::Cli,
     cwd: &std::path::Path,
     enabled_tools: &[&str],
     config: &Config,
     skills_prompt: Option<&str>,
-) -> String {
-    use clap::Parser as _;
+) -> Result<String> {
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
-    let full = crate::cli::Cli::try_parse_from(["pi"])
-        .map_err(|err| err.to_string())
-        .and_then(|cli| {
-            let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
-                crate::context_files::discover_foreign_rules(cwd)
-            } else {
-                crate::context_files::ForeignRules::default()
-            };
-            let package_dir = crate::app::stable_package_dir(&Config::package_dir(), Some(cwd));
-            crate::app::build_system_prompt(
-                &cli,
-                cwd,
-                enabled_tools,
-                skills_prompt.filter(|block| !block.is_empty()),
-                &Config::global_dir(),
-                &package_dir,
-                test_mode,
-                true,
-                Some(&foreign_rules),
-                config,
-            )
-            .map_err(|err| err.to_string())
-        });
-    match full {
-        Ok(mut prompt) => {
-            prompt.push_str(
-                "\n\nYou are running inside the user's editor via ACP (Agent Client \
-                 Protocol). When making file changes, explain what you're doing.",
-            );
-            prompt
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "ACP: full system prompt unavailable; using the minimal one");
-            minimal_acp_system_prompt(cwd, enabled_tools)
-        }
-    }
-}
-
-/// The tools an ACP session gets: the CLI's default set, minus the tools a
-/// terminal host joins after construction (`ask`, `todo`, `submit_plan`),
-/// which have no ACP surface. ACP used to offer only the seven basic file
-/// and shell tools. Every call still goes through the client's permission
-/// prompt (ACP sessions carry no approval state, so the approval hook sees
-/// all tools), so the wider set gives the editor nothing it cannot veto.
-fn acp_enabled_tools() -> Vec<String> {
-    use clap::Parser as _;
-    const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
-    crate::cli::Cli::try_parse_from(["pi"]).map_or_else(
-        |_| {
-            ["read", "bash", "edit", "write", "grep", "find", "ls"]
-                .map(String::from)
-                .to_vec()
-        },
-        |cli| {
-            cli.enabled_tools()
-                .into_iter()
-                .filter(|name| !HOST_COUPLED.contains(name))
-                .map(String::from)
-                .collect()
-        },
+    let foreign_rules = if config.foreign_rules_enabled() && !test_mode && !cli.no_context_files {
+        crate::context_files::discover_foreign_rules(cwd)
+    } else {
+        crate::context_files::ForeignRules::default()
+    };
+    let package_dir = crate::app::stable_package_dir(&Config::package_dir(), Some(cwd));
+    let mut prompt = crate::app::build_system_prompt(
+        cli,
+        cwd,
+        enabled_tools,
+        skills_prompt.filter(|block| enabled_tools.contains(&"read") && !block.is_empty()),
+        &Config::global_dir(),
+        &package_dir,
+        test_mode,
+        !cli.hide_cwd_in_prompt,
+        Some(&foreign_rules),
+        config,
     )
+    .map_err(|error| Error::config(format!("Cannot build ACP system prompt: {error}")))?;
+    prompt.push_str(
+        "\n\nYou are running inside the user's editor via ACP (Agent Client \
+         Protocol). When making file changes, explain what you're doing.",
+    );
+    Ok(prompt)
 }
 
-/// The original hand-written ACP prompt, kept as a fallback.
-fn minimal_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
-    use std::fmt::Write as _;
-
-    let tool_descriptions = [
-        ("read", "Read file contents"),
-        ("bash", "Execute bash commands"),
-        ("edit", "Make surgical edits to files"),
-        ("write", "Write file contents"),
-        ("grep", "Search file contents with regex"),
-        ("find", "Find files by name pattern"),
-        ("ls", "List directory contents"),
-    ];
-
-    let mut prompt = String::from(
-        "You are a helpful AI coding assistant integrated into the user's editor via ACP (Agent Client Protocol). \
-         You have access to the following tools:\n\n",
-    );
-
-    for (name, description) in &tool_descriptions {
-        if enabled_tools.contains(name) {
-            let _ = writeln!(prompt, "- **{name}**: {description}");
-        }
-    }
-
-    prompt.push_str(
-        "\nUse these tools to help the user with coding tasks. \
-         Be concise and precise. When making file changes, explain what you're doing.\n",
-    );
-
-    // Load project context files (pi.md, AGENTS.md) if they exist.
-    for filename in &["pi.md", "AGENTS.md", ".pi"] {
-        let path = cwd.join(filename);
-        if path.is_file()
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
-        }
-    }
-
-    // Date only — no clock time. This is part of the cached system-prompt
-    // prefix; a per-second timestamp would bust the provider's prompt/KV cache
-    // on every request. (#103)
-    let date_time = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let _ = write!(prompt, "\nCurrent working directory: {}", cwd.display());
-
-    prompt
+/// Apply the host's requested tools or CLI defaults, excluding terminal-only
+/// tools with no ACP surface. Every call still reaches the editor's permission
+/// hook because ACP sessions carry no terminal approval state.
+fn acp_enabled_tools(cli: &crate::cli::Cli) -> Vec<String> {
+    const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
+    cli.enabled_tools()
+        .into_iter()
+        .filter(|name| !HOST_COUPLED.contains(name))
+        .map(String::from)
+        .collect()
 }
 
 /// Build the backing session for a new ACP session.
@@ -1635,11 +1583,15 @@ fn build_acp_session(
 ) -> Result<(String, AcpSessionState)> {
     let session_id = session.header.id.clone();
 
-    let enabled_tools = acp_enabled_tools();
-    let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
-
     let mut cli = options.launch.selection_cli()?;
+    let enabled_tools = acp_enabled_tools(&cli);
+    let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
+    let tools = if cli.no_tools {
+        ToolRegistry::without_builtins(Some(&options.config))
+    } else {
+        ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
+    };
+
     let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
     let model_entry = &selection.model_entry;
     if cli.api_key.is_none()
@@ -1672,15 +1624,19 @@ fn build_acp_session(
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     let system_prompt = build_acp_system_prompt(
+        &cli,
         &cwd,
         &enabled_tools,
         &options.config,
         options.skills_prompt.as_deref(),
-    );
+    )?;
 
     let agent_config = crate::agent::AgentConfig {
         system_prompt: Some(system_prompt),
-        max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+        max_tool_iterations: cli.max_tool_iterations.map_or_else(
+            crate::agent::resolved_max_tool_iterations_default,
+            |limit| crate::agent::clamp_max_tool_iterations(Some(limit)),
+        ),
         stream_options,
         block_images: options.config.image_block_images(),
         model_accepts_images: model_entry
@@ -1691,7 +1647,7 @@ fn build_acp_session(
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
         keyword_settings: options.config.keywords.clone(),
-        max_time: None,
+        max_time: cli.max_time.map(Duration::from_secs),
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
@@ -2214,7 +2170,36 @@ async fn run_prompt(
                 );
                 report_prompt_error(&out_tx, &session_id, &error).await
             }
-            Ok(message) => map_stop_reason(message.stop_reason),
+            Ok(message) => {
+                // Synthetic boundary messages have no provider stream. Publish
+                // only after the SDK completes this turn's durable persistence.
+                if message.api.is_empty()
+                    && message.provider.is_empty()
+                    && message.model.is_empty()
+                    && let Some(marker) = message.content.iter().find_map(|block| match block {
+                        ContentBlock::Text(text) if text.text.starts_with("[time cap reached]") => {
+                            Some(text.text.as_str())
+                        }
+                        _ => None,
+                    })
+                {
+                    let _ = history::send_line(
+                        &out_tx,
+                        json_rpc_notification(
+                            "session/update",
+                            json!({
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": marker },
+                                },
+                            }),
+                        ),
+                    )
+                    .await;
+                }
+                map_stop_reason(message.stop_reason)
+            }
             Err(error) => report_prompt_error(&out_tx, &session_id, &error).await,
         }
     };
@@ -2767,7 +2752,10 @@ mod tests {
 
     #[test]
     fn acp_offers_the_cli_default_tools_without_host_coupled_ones() {
-        let tools = acp_enabled_tools();
+        let cli = AcpLaunchOptions::default()
+            .selection_cli()
+            .expect("neutral ACP CLI");
+        let tools = acp_enabled_tools(&cli);
         for expected in [
             "read",
             "bash",
@@ -2796,12 +2784,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
         let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+        let cli = AcpLaunchOptions::default()
+            .selection_cli()
+            .expect("neutral ACP CLI");
         let prompt = build_acp_system_prompt(
+            &cli,
             dir.path(),
             &tools,
             &Config::default(),
             Some("\n\n<available_skills>acp-skill-marker</available_skills>"),
-        );
+        )
+        .expect("ACP system prompt");
         assert!(prompt.contains("acp-skill-marker"), "skills are listed");
         assert!(
             prompt.contains("Make surgical edits to files (find exact text and replace)"),
