@@ -86,6 +86,35 @@ fn now(owner: &AgentCx) -> Time {
         .map_or_else(asupersync::time::wall_now, |timer| timer.now())
 }
 
+fn is_retryable_request_error(method: &str, error: &LspCallError) -> bool {
+    // Only idempotent lookups participate in the warmup policy. A failed
+    // command is not evidence that its effects were undone.
+    let diagnostic = method == "textDocument/diagnostic";
+    if !diagnostic && !is_warmup_empty_retryable(method) {
+        return false;
+    }
+    let LspCallError::Transport(TransportError::Server(error)) = error else {
+        return false;
+    };
+    match error.code {
+        -32602 => error.message.contains("No references found"),
+        -32801 => true,
+        -32802 => {
+            // LSP 3.17 diagnostic cancellation can explicitly decline a new
+            // request (for example, the document no longer has a provider).
+            // Keep the bounded legacy retry for servers omitting this data.
+            !diagnostic
+                || error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("retriggerRequest"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+        }
+        _ => false,
+    }
+}
+
 /// A posted request remains owned even when its calling future is dropped.
 /// Declare this after the lane guard so cancellation happens before another
 /// request can enter the serialized lane.
@@ -123,16 +152,10 @@ impl LspClient {
         loop {
             let attempt = self.call_once(method, params.clone(), budget).await;
             self.poll_notifications();
-            // Only idempotent lookups participate in the warmup policy.
-            // A failed command is not evidence that its effects were undone.
-            let retryable = (is_warmup_empty_retryable(method)
-                || method == "textDocument/diagnostic")
-                && matches!(
-                    &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
-                        if (err.code == -32602 && err.message.contains("No references found"))
-                            || err.code == -32801
-                            || err.code == -32802
-                );
+            let retryable = attempt
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_retryable_request_error(method, error));
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
                 && is_warmup_empty_retryable(method)
                 && !self.quiescent.load(Ordering::SeqCst)
@@ -188,3 +211,74 @@ impl LspClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_cancellation_tests {
+    use super::super::test_server::Fixture;
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn diagnostic_cancellation_opt_out_preserves_error_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+            return;
+        };
+        peer.configure(json!({
+            "textDocument/diagnostic": [
+                {"error": {
+                    "code": -32802,
+                    "message": "diagnostic provider detached",
+                    "data": {"retriggerRequest": false}
+                }},
+                {"result": {"kind": "full", "items": []}}
+            ]
+        }));
+        let error = peer.runtime.block_on(peer.client.call(
+            "textDocument/diagnostic",
+            json!({"textDocument": {"uri": "file:///test.rs"}}),
+            Duration::from_secs(5),
+        )).unwrap_err();
+        let LspCallError::Transport(TransportError::Server(error)) = error else {
+            panic!("expected the original server cancellation");
+        };
+        assert_eq!(error.code, -32802);
+        assert_eq!(error.data, Some(json!({"retriggerRequest": false})));
+        let frames = peer.frames();
+        assert_eq!(
+            frames.iter().filter(|frame| frame["method"] == "textDocument/diagnostic").count(),
+            1,
+            "a server opt-out must not become an automatic second request"
+        );
+        assert!(!frames.iter().any(|frame| frame["method"] == "$/cancelRequest"));
+        assert!(peer.client.is_alive());
+    }
+
+    #[test]
+    fn retrigger_and_legacy_diagnostic_cancellations_retry_within_the_same_call() {
+        for data in [Some(json!({"retriggerRequest": true})), None] {
+            let temp = tempfile::tempdir().unwrap();
+            let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+                return;
+            };
+            let mut error = json!({"code": -32802, "message": "diagnostics recomputing"});
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            let report = json!({"kind": "full", "resultId": "ready", "items": []});
+            peer.configure(json!({
+                "textDocument/diagnostic": [{"error": error}, {"result": report}]
+            }));
+            let result = peer.runtime.block_on(peer.client.call(
+                "textDocument/diagnostic",
+                json!({"textDocument": {"uri": "file:///test.rs"}}),
+                Duration::from_secs(5),
+            )).unwrap();
+            assert_eq!(result, report);
+            assert_eq!(
+                peer.frames().iter().filter(|frame| frame["method"] == "textDocument/diagnostic").count(),
+                2
+            );
+        }
+    }
+}
