@@ -18,6 +18,7 @@ const HUB_MISSING: &str = "PI_SUBAGENT_HUB: registered child ownership was lost"
 const HUB_SETTLED: &str = "PI_SUBAGENT_HUB: child was already settled before result acceptance";
 const HUB_ACTIVATED: &str = "PI_SUBAGENT_HUB: child lease already activated";
 
+#[cfg(test)]
 fn register_in(
     hub: &Mutex<AgentHubRegistry>,
     name: &str,
@@ -95,9 +96,11 @@ pub(super) fn checkpoint(result: &mut SubagentResult) -> bool {
 fn settle_in(hub: &Mutex<AgentHubRegistry>, id: &str, status: ChildStatus) {
     // AgentHubRegistry::settle latches the first terminal outcome, so this
     // cannot turn Killed into Done or overwrite another terminal disposition.
-    hub.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .settle(id, status);
+    let mut hub = hub
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hub.settle(id, status);
+    hub.finish_native_execution(id);
 }
 
 /// Independent of process ownership: cancellation can drop a future before
@@ -116,6 +119,8 @@ impl HubLease {
         name: &str,
         task: &str,
         kind: ChildKind,
+        launch: crate::subagents::RevivalSpec,
+        revived_from: Option<&str>,
     ) -> Result<ChildEntry> {
         if self.id.is_some() {
             return Err(Error::tool(
@@ -123,7 +128,16 @@ impl HubLease {
                 "PI_SUBAGENT_HUB: child lease already registered",
             ));
         }
-        let entry = register_in(registry(), name, task, kind)?;
+        let entry = registry()
+            .lock()
+            .map_err(|_| Error::tool("subagent", HUB_POISONED))?
+            .register_native(name, task, kind, launch, revived_from)
+            .map_err(|error| {
+                Error::tool(
+                    "subagent",
+                    format!("PI_SUBAGENT_HUB: cannot register child: {error}"),
+                )
+            })?;
         self.id = Some(entry.id.clone());
         Ok(entry)
     }

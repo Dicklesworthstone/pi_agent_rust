@@ -13,7 +13,7 @@
 //! NTM layer distinction: this hub manages pi's OWN spawned children in this
 //! process. It does not rebuild ntm's cross-tmux fleet orchestration.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -137,6 +137,15 @@ pub struct AgentHubRegistry {
     /// Complete user assignments, separate from display previews and from
     /// generated continuation prompts. Kept for the lifetime of this hub.
     original_tasks: BTreeMap<String, String>,
+    /// Only the native executor can install a replayable launch policy. A
+    /// public roster registration alone must never authorize hub execution.
+    native_launches: BTreeMap<String, crate::subagents::RevivalSpec>,
+    /// Explicit revivals and corrective retries retain one lineage root so
+    /// an active grandchild also fences revival of an older ancestor.
+    native_lineages: BTreeMap<String, String>,
+    /// A terminal control request can precede process reap and worktree
+    /// disposition. Revival waits for the owning lease to finish both.
+    active_executions: BTreeSet<String>,
     seq: u64,
     /// Per-recipient delivered/queued bus messages (in-memory view; the
     /// on-disk steer files are the cross-process channel).
@@ -144,6 +153,20 @@ pub struct AgentHubRegistry {
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
+}
+
+pub(crate) struct RevivalSource {
+    pub(crate) entry: ChildEntry,
+    pub(crate) launch: crate::subagents::RevivalSpec,
+    original_task: String,
+    lineage_root: String,
+}
+
+impl RevivalSource {
+    /// Read the bounded transcript after releasing the registry mutex.
+    pub(crate) fn continuation_prompt(&self) -> Result<String> {
+        revival_prompt(&self.entry, &self.original_task)
+    }
 }
 
 impl std::fmt::Debug for AgentHubRegistry {
@@ -230,6 +253,88 @@ impl AgentHubRegistry {
         self.original_tasks.insert(id.clone(), task.to_string());
         self.entries.insert(id, entry.clone());
         Ok(entry)
+    }
+
+    pub(crate) fn register_native(
+        &mut self,
+        name: &str,
+        task: &str,
+        kind: ChildKind,
+        launch: crate::subagents::RevivalSpec,
+        revived_from: Option<&str>,
+    ) -> Result<ChildEntry> {
+        let lineage_root = if let Some(id) = revived_from {
+            let prior = self.native_revival_source(id)?;
+            if prior.entry.name != name || prior.entry.kind != kind {
+                return Err(Error::tool(
+                    "hub",
+                    "PI_HUB_REVIVAL_POLICY: replacement does not match its native source",
+                ));
+            }
+            Some(prior.lineage_root)
+        } else {
+            None
+        };
+        let mut entry = self.register_kind(name, task, kind)?;
+        entry.revived_from = revived_from.map(str::to_string);
+        self.entries.insert(entry.id.clone(), entry.clone());
+        self.native_launches.insert(entry.id.clone(), launch);
+        self.native_lineages.insert(
+            entry.id.clone(),
+            lineage_root.unwrap_or_else(|| entry.id.clone()),
+        );
+        self.active_executions.insert(entry.id.clone());
+        Ok(entry)
+    }
+
+    pub(crate) fn finish_native_execution(&mut self, id: &str) {
+        self.active_executions.remove(id);
+    }
+
+    /// Snapshot only execution-owned launch metadata. This performs no
+    /// transcript I/O and registers nothing, so a refused preparation leaves
+    /// no Starting entry behind.
+    pub(crate) fn native_revival_source(&self, id: &str) -> Result<RevivalSource> {
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
+        if !entry.status.settled() || self.active_executions.contains(id) {
+            return Err(Error::validation(format!(
+                "hub: cannot revive '{id}' — execution or cleanup is still active"
+            )));
+        }
+        let lineage_root = self.native_lineages.get(id).ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: original native launch policy is unavailable",
+            )
+        })?;
+        if self.active_executions.iter().any(|active| {
+            self.native_lineages.get(active) == Some(lineage_root)
+        }) {
+            return Err(Error::validation(format!(
+                "hub: cannot revive '{id}' — a replacement is already active"
+            )));
+        }
+        let launch = self.native_launches.get(id).cloned().ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: original native launch policy is unavailable",
+            )
+        })?;
+        let original_task = self.original_tasks.get(id).cloned().ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: complete original assignment is unavailable",
+            )
+        })?;
+        Ok(RevivalSource {
+            entry: entry.clone(),
+            launch,
+            original_task,
+            lineage_root: lineage_root.clone(),
+        })
     }
 
     /// Mark a newly spawned child running. A late spawn callback cannot
@@ -378,16 +483,7 @@ impl AgentHubRegistry {
                 "complete original assignment unavailable; refusing partial revival",
             )
         })?;
-        let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
-        let mut vault = crate::secrets::SecretVault::default();
-        let (tail, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
-        let task = format!(
-            "{}\n\n[Continuation of a prior run ({}). Its transcript tail follows; \
-             pick up where it left off and finish the task.]\n{}",
-            original_task,
-            prior.status.as_str(),
-            tail
-        );
+        let task = revival_prompt(&prior, &original_task)?;
         // Keep the original assignment as this run's revival source, not
         // the generated prompt containing the previous run's transcript.
         let mut entry = self.register_kind(&prior.name, &original_task, prior.kind)?;
@@ -403,6 +499,19 @@ impl AgentHubRegistry {
             .join(std::process::id().to_string());
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+fn revival_prompt(prior: &ChildEntry, original_task: &str) -> Result<String> {
+    let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
+    let mut vault = crate::secrets::SecretVault::default();
+    let (tail, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
+    Ok(format!(
+        "{}\n\n[Continuation of a prior run ({}). Its transcript tail follows; \
+         pick up where it left off and finish the task.]\n{}",
+        original_task,
+        prior.status.as_str(),
+        tail
+    ))
 }
 
 /// The lock inode must never be renamed with the queue: otherwise a writer

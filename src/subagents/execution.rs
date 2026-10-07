@@ -10,7 +10,8 @@
 
 use super::deadline::Deadline;
 use super::{
-    AgentDefinition, SchemaMode, SubagentResult, SubagentStatus, SubagentTask, UpdateCallback,
+    AgentDefinition, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
+    UpdateCallback,
     append_bounded_line, child_args, child_depth, compile_output_schema, corrective_retry_task,
     emit_progress, protocol, validate_child_output,
 };
@@ -47,6 +48,7 @@ pub(super) struct ChildRunner {
     role_model_spec: Option<String>,
     hub_kind: ChildKind,
     deadline: Deadline,
+    revival: Option<(String, RevivalSpec)>,
 }
 
 impl ChildRunner {
@@ -65,7 +67,13 @@ impl ChildRunner {
             role_model_spec,
             hub_kind,
             deadline,
+            revival: None,
         }
+    }
+
+    pub(super) fn with_revival(mut self, source: String, launch: RevivalSpec) -> Self {
+        self.revival = Some((source, launch));
+        self
     }
 
     /// At most one fresh corrective run. The first attempt's isolated edits
@@ -101,8 +109,35 @@ impl ChildRunner {
         }
         let owner = AgentCx::for_current_or_request();
         let update = on_update.as_ref();
+        // Capture before execution spends the budget. A later explicit
+        // revival must not inherit a zero budget from a timed-out settlement.
+        // Schema retries share this authored task and launch policy instead
+        // of retaining their generated corrective prompt as a new assignment.
+        let launch = self.revival.as_ref().map_or_else(
+            || RevivalSpec {
+                agent: agent.clone(),
+                task: task.clone(),
+                step,
+                cwd: self.cwd.clone(),
+                global_dir: self.global_dir.clone(),
+                child_binary: self.child_binary.clone(),
+                role_model_spec: self.role_model_spec.clone(),
+                timeout: self.deadline.remaining(),
+                depth: child_depth(),
+            },
+            |(_, launch)| launch.clone(),
+        );
         let mut attempt = self
-            .run_child_process(agent, task.clone(), step, update, schema.as_ref(), &owner)
+            .run_child_process(
+                agent,
+                task.clone(),
+                step,
+                update,
+                schema.as_ref(),
+                &owner,
+                &launch,
+                self.revival.as_ref().map(|(id, _)| id.as_str()),
+            )
             .await;
         if attempt.result.is_error || schema.is_none() {
             return attempt.finish(&owner, true, update);
@@ -146,12 +181,21 @@ impl ChildRunner {
             ..task.clone()
         };
         let mut retry = self
-            .run_child_process(agent, corrective, step, update, Some(schema), &owner)
+            .run_child_process(
+                agent,
+                corrective,
+                step,
+                update,
+                Some(schema),
+                &owner,
+                &launch,
+                previous.hub_id.as_deref(),
+            )
             .await;
         retry.result.schema_retries = Some(1);
         // Keep the public assignment stable; corrective prompt text is a
         // transport detail, not a replacement for the user's original task.
-        retry.result.task.clone_from(&task.task);
+        retry.result.task.clone_from(&launch.task.task);
         if let Some(iso) = previous.iso {
             retry.result.preserved_worktrees.push(iso);
         }
@@ -188,6 +232,8 @@ impl ChildRunner {
         update: Option<&UpdateCallback>,
         schema: Option<&Value>,
         owner: &AgentCx,
+        launch: &RevivalSpec,
+        revived_from: Option<&str>,
     ) -> Attempt {
         let cwd = task.cwd.as_ref().map_or_else(
             || self.cwd.clone(),
@@ -205,6 +251,7 @@ impl ChildRunner {
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
+        attempt.result.task.clone_from(&launch.task.task);
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
@@ -234,7 +281,13 @@ impl ChildRunner {
         // registration must never leave an unsteerable/uncontrollable child.
         let hub_entry = match attempt
             .hub
-            .register(&agent.name, &attempt.result.task, self.hub_kind)
+            .register(
+                &agent.name,
+                &launch.task.task,
+                self.hub_kind,
+                launch.clone(),
+                revived_from,
+            )
         {
             Ok(entry) => entry,
             Err(error) => {
@@ -275,7 +328,7 @@ impl ChildRunner {
             .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
-            .env("PI_SUBAGENT_DEPTH", child_depth().to_string())
+            .env("PI_SUBAGENT_DEPTH", launch.depth.max(child_depth()).to_string())
             .env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &hub_entry.id);
         #[cfg(unix)]

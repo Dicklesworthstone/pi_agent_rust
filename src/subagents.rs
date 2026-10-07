@@ -124,6 +124,84 @@ pub struct SubagentTool {
     timeout: Option<Duration>,
 }
 
+/// Private execution policy retained for an explicit hub revival. In
+/// particular, the enabled-by-default hub cannot turn a synthetic roster
+/// entry into a new delegation or rediscover a more permissive definition.
+#[derive(Clone)]
+pub(crate) struct RevivalSpec {
+    agent: AgentDefinition,
+    task: SubagentTask,
+    step: Option<usize>,
+    cwd: PathBuf,
+    global_dir: PathBuf,
+    child_binary: PathBuf,
+    role_model_spec: Option<String>,
+    timeout: Duration,
+    depth: usize,
+}
+
+/// Execute one explicitly requested replacement through the ordinary native
+/// child runner. A fresh request gets a fresh clock bounded by its original
+/// launch ceiling and the current caller's inherited deadline/capabilities.
+pub(crate) async fn revive_child(
+    id: &str,
+    on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+) -> Result<ToolOutput> {
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    if owner.checkpoint().is_err() {
+        return Err(Error::tool("hub", "PI_HUB_REVIVAL_CANCELLED: caller is cancelled"));
+    }
+    let capabilities = owner.capabilities();
+    if !capabilities.io || !capabilities.spawn || !capabilities.time {
+        return Err(Error::tool(
+            "hub",
+            "PI_SUBAGENT_PERMISSION: child execution requires I/O, spawn and timer capabilities",
+        ));
+    }
+    if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
+        return Err(Error::tool(
+            "subagent",
+            format!("Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}"),
+        ));
+    }
+    let source = crate::agent_hub::registry()
+        .lock()
+        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+        .native_revival_source(id)?;
+    let prompt = source.continuation_prompt()?;
+    let launch = source.launch;
+    let deadline = Deadline::for_request(Some(launch.timeout), None)?;
+    let mut task = launch.task.clone();
+    task.task = prompt;
+    let agents = BTreeMap::from([(launch.agent.name.clone(), launch.agent.clone())]);
+    let runner = ChildRunner::new(
+        launch.cwd.clone(),
+        launch.global_dir.clone(),
+        launch.child_binary.clone(),
+        launch.role_model_spec.clone(),
+        source.entry.kind,
+        deadline,
+    )
+    .with_revival(id.to_string(), launch.clone());
+    let mut result = owner
+        .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
+        .await;
+    // Continuation and schema-correction prompts are transport details. The
+    // returned assignment and any later revival keep the authored source.
+    result.task = launch.task.task;
+    let text = render_results(std::slice::from_ref(&result));
+    Ok(ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(text))],
+        details: Some(json!({
+            "schema": "pi.agent-hub.revive/v1",
+            "id": result.hub_id,
+            "revivedFrom": id,
+            "result": result,
+        })),
+        is_error: result.is_error,
+    })
+}
+
 impl SubagentTool {
     #[must_use]
     pub fn new(cwd: &Path) -> Self {

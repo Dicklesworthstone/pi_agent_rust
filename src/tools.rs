@@ -8791,7 +8791,9 @@ impl Tool for HubTool {
          keys, signals), `stop` (graceful tree termination), `restart` \
          (retained launch spec), `describe` (full descriptor), `jobs` \
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
-         roster/transcript/steer/kill/revive/send/inbox)."
+         roster/transcript/steer/kill/revive/send/inbox; revive executes a \
+         settled native child's original assignment with its retained launch \
+         policy and transcript context, and waits for the replacement result)."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -8848,28 +8850,43 @@ impl Tool for HubTool {
         &self,
         _tool_call_id: &str,
         input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = self.dispatch(&op, &input).await;
-        let (text, details, is_error) = match dispatched {
-            Ok((text, details)) => (text, details, false),
+        let dispatched = if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
+        {
+            match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
+                Some(id) => crate::subagents::revive_child(id, on_update).await,
+                None => Err(Error::validation(
+                    "hub agent revive requires name (child run id)",
+                )),
+            }
+        } else {
+            self.dispatch(&op, &input)
+                .await
+                .map(|(text, details)| ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    details: Some(details),
+                    is_error: false,
+                })
+        };
+        Ok(match dispatched {
+            Ok(output) => output,
             Err(err) => {
                 // Domain refusals (PI_HUB_*) surface as tool results the
                 // model can read, matching the jobs capacity contract.
-                (
-                    err.to_string(),
-                    serde_json::json!({ "error": err.to_string() }),
-                    true,
-                )
+                ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                    details: Some(serde_json::json!({ "error": err.to_string() })),
+                    is_error: true,
+                }
             }
-        };
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(details),
-            is_error,
         })
     }
 }
@@ -9240,24 +9257,6 @@ impl HubTool {
                     "killedBy": from,
                 });
                 (format!("Child {id} killed by operator."), details)
-            }
-            "revive" => {
-                let id = id_required("revive")?;
-                let (entry, _task) = crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .revive(&id)?;
-                // The revived task is queued as a steering continuation: the
-                // next subagent tool call can launch it; the registry entry
-                // already records the lineage so the roster shows it.
-                let details = serde_json::to_value(&entry)?;
-                (
-                    format!(
-                        "Revival registered as {} (continues {id}); relaunch via the subagent tool with the recorded task.",
-                        entry.id
-                    ),
-                    details,
-                )
             }
             "inbox" => {
                 let id = id_required("inbox")?;
