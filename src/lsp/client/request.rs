@@ -20,6 +20,8 @@ use super::{
 };
 use crate::agent_cx::AgentCx;
 
+mod workspace_diagnostics;
+
 pub(super) struct RequestBudget {
     owner: AgentCx,
     start: Time,
@@ -89,7 +91,7 @@ fn now(owner: &AgentCx) -> Time {
 fn is_retryable_request_error(method: &str, error: &LspCallError) -> bool {
     // Only idempotent lookups participate in the warmup policy. A failed
     // command is not evidence that its effects were undone.
-    let diagnostic = method == "textDocument/diagnostic";
+    let diagnostic = matches!(method, "textDocument/diagnostic" | "workspace/diagnostic");
     if !diagnostic && !is_warmup_empty_retryable(method) {
         return false;
     }
