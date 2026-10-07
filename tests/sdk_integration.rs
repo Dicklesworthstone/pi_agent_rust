@@ -18,7 +18,7 @@ mod common;
 
 use async_trait::async_trait;
 use common::{TestHarness, run_async};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use pi::agent::{AgentConfig, AgentEvent, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::error::{Error, Result};
@@ -159,6 +159,59 @@ impl Provider for ScriptedProvider {
     }
 }
 
+/// Keep the SDK's selected identity while scripting only its network transport.
+/// Session-header synchronization must retain this provider on every prompt.
+struct IdentityPreservingScriptedProvider {
+    identity: Arc<dyn Provider>,
+    scripted: Arc<ScriptedProvider>,
+}
+
+#[async_trait]
+impl Provider for IdentityPreservingScriptedProvider {
+    fn name(&self) -> &str {
+        self.identity.name()
+    }
+
+    fn api(&self) -> &str {
+        self.identity.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.identity.model_id()
+    }
+
+    fn model_cost(&self) -> Option<pi::provider::ModelCost> {
+        self.identity.model_cost()
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let events = self.scripted.stream(context, options).await?;
+        let api = self.api().to_string();
+        let provider = self.name().to_string();
+        let model = self.model_id().to_string();
+        Ok(Box::pin(events.map(move |event| {
+            event.map(|mut event| {
+                let message = match &mut event {
+                    StreamEvent::Start { partial } => Some(partial),
+                    StreamEvent::Done { message, .. } => Some(message),
+                    StreamEvent::Error { error, .. } => Some(error),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    message.api.clone_from(&api);
+                    message.provider.clone_from(&provider);
+                    message.model.clone_from(&model);
+                }
+                event
+            })
+        })))
+    }
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -255,6 +308,146 @@ fn sdk_basic_session_creation() {
         ctx.push(("provider".to_string(), provider.name().to_string()));
         ctx.push(("model".to_string(), provider.model_id().to_string()));
     });
+}
+
+#[test]
+fn sdk_run_limit_reaches_the_live_agent_and_persists_its_terminal_turn() {
+    let harness =
+        TestHarness::new("sdk_run_limit_reaches_the_live_agent_and_persists_its_terminal_turn");
+    for (label, limit, capped) in [
+        ("zero", Some(std::time::Duration::ZERO), true),
+        ("unbounded", None, false),
+        ("remaining", Some(std::time::Duration::from_secs(60)), false),
+    ] {
+        let options = SessionOptions {
+            no_session: false,
+            session_dir: Some(harness.temp_dir().join(label)),
+            max_time: limit,
+            compaction_settings: Some(ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            }),
+            ..default_session_options(&harness)
+        };
+        run_async(async move {
+            // Exercise the SDK constructor and prompt driver. Only replace the
+            // network transport, retaining the constructed Agent and its config.
+            let mut handle = create_agent_session(options).await.expect("create session");
+            let provider = Arc::new(ScriptedProvider::new(Script::SingleText(
+                "Provider completed the run".to_string(),
+            )));
+            let expected_model = handle.model();
+            let scripted_transport = Arc::new(IdentityPreservingScriptedProvider {
+                identity: handle.session().agent.provider(),
+                scripted: Arc::clone(&provider),
+            });
+            handle.session_mut().agent.set_provider(scripted_transport);
+            let events = handle
+                .prompt("Run with the configured time budget")
+                .await
+                .expect("successful terminal turn");
+            assert_eq!(handle.model(), expected_model);
+            assert_eq!(
+                provider.call_count.load(Ordering::SeqCst),
+                usize::from(!capped)
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "agent_end")
+                    .count(),
+                1,
+                "exactly one terminal event for {label}"
+            );
+            // ubs:ignore rust.panic.assert-macros -- Regression assertion: a terminal time cap must not enter provider retry.
+            assert!(events.iter().all(|event| event["type"] != "auto_retry_start"));
+            let path = handle
+                .with_session(|session| session.path.clone())
+                .await
+                .expect("session path")
+                .expect("saved session");
+            drop(handle);
+            let reopened = Session::open(&path.to_string_lossy())
+                .await
+                .expect("reopen saved turn");
+            let messages = reopened.to_messages_for_current_path();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::User(_)))
+                    .count(),
+                1
+            );
+            let assistants: Vec<_> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(message) => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(assistants.len(), 1, "one durable assistant result for {label}");
+            let text = assistants
+                .first()
+                .expect("one durable assistant result")
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(text.contains("[time cap reached]"), capped);
+            if !capped {
+                assert_eq!(text, "Provider completed the run");
+            }
+        });
+    }
+}
+
+#[test]
+fn sdk_model_scope_selects_the_requested_destination_and_effort() {
+    let harness = TestHarness::new("sdk_model_scope_selects_the_requested_destination_and_effort");
+    for (spec, thinking, expected_provider, expected_model, expected_thinking) in [
+        (
+            "openai/gpt-4o:high",
+            None,
+            "openai",
+            "gpt-4o",
+            pi::model::ThinkingLevel::Off,
+        ),
+        (
+            "anthropic/claude-opus-4-5:low",
+            None,
+            "anthropic",
+            "claude-opus-4-5",
+            pi::model::ThinkingLevel::Low,
+        ),
+        (
+            "anthropic/claude-opus-4-5:low",
+            Some(pi::model::ThinkingLevel::High),
+            "anthropic",
+            "claude-opus-4-5",
+            pi::model::ThinkingLevel::High,
+        ),
+    ] {
+        let options = SessionOptions {
+            provider: None,
+            model: None,
+            model_scope: Some(vec![spec.to_string()]),
+            thinking,
+            ..default_session_options(&harness)
+        };
+        let handle = run_async(create_agent_session(options)).expect("create scoped session");
+        assert_eq!(
+            handle.model(),
+            (expected_provider.to_string(), expected_model.to_string()),
+        );
+        assert_eq!(handle.thinking_level(), Some(expected_thinking));
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some(TEST_API_KEY),
+        );
+    }
 }
 
 // ============================================================================

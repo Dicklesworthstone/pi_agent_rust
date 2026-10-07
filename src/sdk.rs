@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
@@ -357,6 +358,10 @@ impl FailoverOptions {
 pub struct SessionOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Ordered model patterns, including optional `:thinking` suffixes, as
+    /// supplied by `--models`. `None` uses the matching workspace scope or
+    /// configured enabled models; an empty vector explicitly clears that scope.
+    pub model_scope: Option<Vec<String>>,
     pub api_key: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
     pub system_prompt: Option<String>,
@@ -391,6 +396,11 @@ pub struct SessionOptions {
     /// AGENTS.md / CLAUDE.md and no foreign workspace rules are loaded.
     pub no_context_files: bool,
     pub max_tool_iterations: usize,
+    /// Wall-clock run limit, checked at agent turn boundaries. An admitted
+    /// provider/tool call finishes before the agent emits its time-cap marker
+    /// and saves the turn. `None` keeps the run unbounded; zero stops before
+    /// the first provider call. Mirrors the CLI's `--max-time` option.
+    pub max_time: Option<Duration>,
 
     /// Provider retry for turns driven through this session.
     ///
@@ -550,6 +560,7 @@ impl Default for SessionOptions {
         Self {
             provider: None,
             model: None,
+            model_scope: None,
             api_key: None,
             thinking: None,
             system_prompt: None,
@@ -571,6 +582,7 @@ impl Default for SessionOptions {
             skills_prompt: None,
             no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            max_time: None,
             retry: None,
             failover: None,
             mcp: None,
@@ -2915,6 +2927,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     cli.no_session = options.no_session;
     cli.provider = options.provider.clone();
     cli.model = options.model.clone();
+    cli.models = options.model_scope.as_ref().map(|patterns| patterns.join(","));
     cli.api_key = options.api_key.clone();
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
@@ -2985,15 +2998,25 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     if resolved_session_path.is_none() {
         session.header.cwd = cwd.display().to_string();
     }
+    let scope_override = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| crate::failover::best_scope_override(overrides, &cwd));
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         app::parse_models_arg(models_arg)
+    } else if let Some(patterns) = scope_override.and_then(|scope| scope.enabled_models.clone()) {
+        patterns
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
-        app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
+        app::resolve_model_scope(
+            &scoped_patterns,
+            &model_registry,
+            cli.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()),
+        )
     };
 
     // The session owns the extension runtime, so registration must precede
@@ -3088,7 +3111,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: options.tool_approval.clone(),
         keyword_settings: config.keywords.clone(),
-        max_time: None,
+        max_time: options.max_time,
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),

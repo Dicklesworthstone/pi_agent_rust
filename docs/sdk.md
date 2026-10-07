@@ -376,6 +376,8 @@ fn main() -> pi::sdk::Result<()> {
 ## Compatibility Notes for Migrating Integrators
 
 - `SessionOptions::default().no_session` is `true` (ephemeral by default).
+- `SessionOptions::model_scope` accepts the ordered patterns and optional `:thinking` suffixes used by `--models`. Explicit provider/model and thinking choices take precedence; reopening retains the saved model when no explicit provider/model is supplied. With no scope override, the session uses its workspace's model scope before global enabled models.
+- `SessionOptions::max_time` sets the wall-clock run limit (`None` by default). The agent checks it at turn boundaries, allows admitted tools to finish, and saves its time-cap marker with the conversation. The default TUI forwards `--max-time` to this option.
 - In-process `AgentSessionHandle` currently exposes prompt/state/model/thinking/compaction flows; queue controls like `steer`/`follow_up` are on `RpcTransportClient`.
 - `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(Box<AssistantMessage>)` or `RpcEvents(Vec<Value>)` depending on backend.
 - Extension loading is opt-in via `extension_paths`, with `extension_policy`/`repair_policy` controls.

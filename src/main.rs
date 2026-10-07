@@ -1897,8 +1897,8 @@ async fn run(
                 .into_iter().map(str::to_string).collect(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
-            // ACP sessions always carry the read tool, so skills are listed
-            // as on the terminal stacks.
+            // The ACP prompt builder advertises skills only when this launch
+            // enables the read tool, as on the terminal stacks.
             skills_prompt: Some(resources.format_skills_for_prompt()),
         };
         return run_acp_mode(acp_options).await;
@@ -2128,6 +2128,7 @@ async fn run(
         let options = pi::sdk::SessionOptions {
             provider: cli.provider.clone(),
             model: cli.model.clone(),
+            model_scope: cli.models.as_deref().map(pi::app::parse_models_arg),
             api_key: cli.api_key.clone(),
             working_directory: Some(cwd.clone()),
             workspace_trusted,
@@ -2170,6 +2171,7 @@ async fn run(
                 .contains(&"read")
                 .then(|| resources.format_skills_for_prompt()),
             max_tool_iterations,
+            max_time: cli.max_time.map(std::time::Duration::from_secs),
             package_dir: Some(package_dir.clone()),
             mcp: Some(pi::sdk::McpSessionOptions {
                 config_paths: cli.mcp_config.clone(),
