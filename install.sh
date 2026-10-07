@@ -1183,6 +1183,14 @@ resolve_version() {
     return 0
   fi
 
+  # A local checkout is not a published release. Requiring GitHub metadata
+  # here breaks air-gapped installs and feature branches with no release tag.
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    VERSION="local-source"
+    info "Using local source directory; skipping release tag resolution"
+    return 0
+  fi
+
   if [ -n "$ARTIFACT_URL" ] && [ "$FROM_SOURCE" -eq 0 ]; then
     VERSION="custom-artifact"
     info "Using custom artifact URL; skipping release tag resolution"
@@ -1373,6 +1381,11 @@ check_existing_install() {
 }
 
 check_network_preflight() {
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    info "Local source directory selected; skipping GitHub preflight"
+    return 0
+  fi
+
   if [ "$OFFLINE" -eq 1 ]; then
     info "Offline mode enabled; skipping network preflight"
     return 0
@@ -1544,8 +1557,8 @@ check_dependencies() {
   fi
 
   if [ "$FROM_SOURCE" -eq 1 ]; then
-    if ! command -v git >/dev/null 2>&1; then
-      err "git is required for --from-source installs"
+    if [ -z "${SOURCE_DIR:-}" ] && ! command -v git >/dev/null 2>&1; then
+      err "git is required for --from-source installs without --source-dir"
       exit 1
     fi
     if ! command -v cargo >/dev/null 2>&1; then
@@ -3697,6 +3710,12 @@ write_state() {
 }
 
 should_skip_reinstall() {
+  # Release labels cannot identify a mutable checkout: a new commit, branch,
+  # or uncommitted edit must be rebuilt even when Cargo.toml is unchanged.
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    return 1
+  fi
+
   if [ "$FORCE_INSTALL" -eq 1 ]; then
     return 1
   fi
