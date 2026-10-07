@@ -8630,6 +8630,9 @@ pub struct FtuiSettings {
     /// `/btw` side-question client for the smol role model, when it resolves
     /// with credentials.
     pub btw_client: Option<Arc<crate::btw::BtwClient>>,
+    /// Optional tiny/smol client for naming a new saved session after its
+    /// first successful exchange.
+    pub title_client: Option<Arc<crate::session_title::TitleClient>>,
     /// The `hideThinkingBlock` setting: start with thinking collapsed to
     /// one line (ctrl+t still shows it). Off, as in OMP and classic, shows
     /// thinking in full.
@@ -8693,6 +8696,7 @@ pub fn run(
         subagent_role_spec,
         cycle_models,
         btw_client,
+        title_client,
         hide_thinking_block,
         double_escape_action,
         model_names,
@@ -8798,6 +8802,12 @@ pub fn run(
                 {
                     let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
                 }
+                let mut auto_title = Box::new(
+                    handle
+                        .with_session(crate::session_title::AutoTitleController::for_session)
+                        .await
+                        .unwrap_or_default(),
+                );
                 let mut plans = plan_commands::PlanController::default();
                 let mut replacement_failure = None;
                 // The `/login` waiting for input, if any (boxed: the driver
@@ -8807,7 +8817,7 @@ pub fn run(
                     let received = submit_rx.try_recv();
                     // Every handled command may change what the status line
                     // shows (model, thinking, mode, session, usage).
-                    let refresh_status = received.is_ok();
+                    let mut refresh_status = received.is_ok();
                     match received {
                         Ok(UiCommand::Prompt(prompt)) => {
                             if initial_messages_remaining > 0 {
@@ -8937,6 +8947,7 @@ pub fn run(
                                 .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
+                            auto_title.cancel_pending();
                             plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(resume_session_command(
@@ -8955,6 +8966,7 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::DeleteSession) => {
+                            auto_title.cancel_pending();
                             // Only a file that exists: a new or in-memory
                             // session has nothing to delete.
                             let doomed = handle
@@ -9020,6 +9032,7 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::NewSession) => {
+                            auto_title.cancel_pending();
                             plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(new_session_command(
@@ -9215,6 +9228,7 @@ pub fn run(
                             .await;
                         }
                         Ok(UiCommand::Reload) => {
+                            auto_title.cancel_pending();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(reload_session_command(
                                 &resume_template,
@@ -9246,6 +9260,7 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::Fork { args }) => {
+                            auto_title.cancel_pending();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(fork_session_command(
                                 &args,
@@ -9286,6 +9301,16 @@ pub fn run(
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
+                    if let Some(title) = Box::pin(auto_title.tick(
+                        handle.session(),
+                        title_client.as_ref(),
+                        &runtime_handle,
+                    ))
+                    .await
+                    {
+                        let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {title}")));
+                        refresh_status = true;
+                    }
                     if refresh_status {
                         // Session replacement does not require a resource
                         // source. Refresh here as well as after /reload's
@@ -9294,6 +9319,7 @@ pub fn run(
                         Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                 }
+                auto_title.cancel_pending();
                 let session_store = handle.session_store();
                 let shutdown = if replacement_failure.is_some() {
                     handle.discard_uncommitted_resources().await

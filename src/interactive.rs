@@ -1666,7 +1666,7 @@ pub async fn run_interactive(
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
-    title_model_entry: Option<ModelEntry>,
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
     resources: ResourceLoader,
@@ -1810,7 +1810,7 @@ pub async fn run_interactive(
             model_entry,
             model_scope,
             available_models,
-            title_model_entry,
+            title_client,
             pending_inputs,
             event_tx,
             runtime_handle,
@@ -2025,8 +2025,8 @@ pub enum PiMsg {
         stop_reason: StopReason,
         error_message: Option<String>,
     },
-    /// Auto-titling result: a tiny/smol-role model suggested a session name
-    /// (bd-cv653.3.1). Applied only if the session is still unnamed.
+    /// A background title was durably installed. The UI only acknowledges
+    /// it while the same session and name remain current.
     SessionTitleSuggestion {
         owner_session_id: String,
         title: String,
@@ -2889,11 +2889,12 @@ pub struct PiApp {
     /// role-aware features (advisor, plan mode, titling) as they land.
     role_model_overrides: std::collections::HashMap<crate::models::ModelRole, (String, String)>,
 
-    /// Model used for automatic session titling (tiny/smol role), or None
-    /// when titling is disabled/unresolvable (bd-cv653.3.1).
-    title_model_entry: Option<ModelEntry>,
+    /// Bounded, authenticated tiny/smol completion for automatic naming.
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
     /// Guard so titling fires at most once per session.
     title_requested: bool,
+    /// Dropping the UI or replacing its session cancels provider work.
+    title_cancellation: Option<crate::session_title::TitleCancellation>,
 
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
@@ -3050,7 +3051,7 @@ impl PiApp {
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
-        title_model_entry: Option<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
         pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::Sender<PiMsg>,
         runtime_handle: RuntimeHandle,
@@ -3090,7 +3091,7 @@ impl PiApp {
             model_entry,
             model_scope,
             available_models,
-            title_model_entry,
+            title_client,
             pending_inputs,
             event_tx,
             runtime_handle,
@@ -3114,7 +3115,7 @@ impl PiApp {
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
-        title_model_entry: Option<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
         pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::Sender<PiMsg>,
         runtime_handle: RuntimeHandle,
@@ -3286,6 +3287,9 @@ impl PiApp {
             .try_lock()
             .ok()
             .map(|session| session.header.id.clone());
+        // A resumed conversation already has an established topic. Automatic
+        // naming is admitted only for a new session's first exchange.
+        let title_requested = !agent_session.agent.messages().is_empty();
         let agent = InteractiveAgent {
             handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
                 agent_session,
@@ -3367,8 +3371,9 @@ impl PiApp {
             mcp_manager,
             keybindings,
             role_model_overrides: std::collections::HashMap::new(),
-            title_model_entry,
-            title_requested: false,
+            title_client,
+            title_requested,
+            title_cancellation: None,
             last_ctrlc_time: None,
             last_escape_time: None,
             autocomplete,

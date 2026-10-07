@@ -2277,6 +2277,16 @@ async fn run(
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.
                 subagent_role_spec: pi::app::subagent_role_spec(&config),
+                title_client: pi::app::titling_model_entry(&cli, &config, &model_registry)
+                    .and_then(|entry| {
+                        pi::session_title::TitleClient::for_model_entry(
+                            &entry,
+                            &selection.model_entry,
+                            cli.api_key.as_deref(),
+                            &auth,
+                            config.secrets.as_ref(),
+                        )
+                    }),
                 // /btw answers with the smol role model, resolved exactly as
                 // the classic stack resolves it; `None` without credentials.
                 btw_client: pi::app::resolve_role_model(
@@ -2836,7 +2846,16 @@ async fn run(
                 )
             })
             .collect::<Vec<_>>();
-        let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
+        let title_client = pi::app::titling_model_entry(&cli, &config, &model_registry)
+            .and_then(|entry| {
+                pi::session_title::TitleClient::for_model_entry(
+                    &entry,
+                    &selection.model_entry,
+                    cli.api_key.as_deref(),
+                    &auth,
+                    config.secrets.as_ref(),
+                )
+            });
         let failover = pi::sdk::FailoverOptions::from_config(
             &config,
             available_models.clone(),
@@ -2852,7 +2871,7 @@ async fn run(
             selection.model_entry.clone(),
             model_scope,
             available_models,
-            title_model_entry,
+            title_client,
             !cli.no_session,
             resources,
             resource_cli,
@@ -9997,7 +10016,7 @@ async fn run_interactive_mode(
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
-    title_model_entry: Option<ModelEntry>,
+    title_client: Option<Arc<pi::session_title::TitleClient>>,
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
@@ -10037,7 +10056,7 @@ async fn run_interactive_mode(
         model_entry,
         model_scope,
         available_models,
-        title_model_entry,
+        title_client,
         pending,
         save_enabled,
         resources,

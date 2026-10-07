@@ -2309,6 +2309,7 @@ impl PiApp {
                     self.pending_tool_output = None;
                     self.abort_handle = None;
                     self.pending_oauth = None;
+                    self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
                     self.displayed_session_id = Some(new_session_id);

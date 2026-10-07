@@ -311,6 +311,9 @@ pub mod session_picker;
 pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
+#[cfg(feature = "tui")]
+#[doc(hidden)]
+pub mod session_title;
 #[doc(hidden)]
 pub mod session_workdir;
 #[doc(hidden)]
