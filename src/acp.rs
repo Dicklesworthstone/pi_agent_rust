@@ -30,6 +30,8 @@
 mod content;
 mod history;
 mod mcp;
+#[cfg(test)]
+mod recovery_tests;
 
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
@@ -45,6 +47,7 @@ use crate::models::{ModelEntry, ModelRegistry};
 use crate::provider::StreamOptions;
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
+use crate::sdk::{AgentSessionHandle, EventListeners, FailoverOptions};
 use crate::session::{Session, SessionStoreKind};
 use crate::tools::ToolRegistry;
 use asupersync::channel::oneshot;
@@ -187,7 +190,7 @@ struct AcpMode {
 struct AcpSessionState {
     /// The agent session. Wrapped in Option so it can be temporarily taken
     /// out during prompt execution without holding the session lock.
-    agent_session: Option<AgentSession>,
+    agent_session: Option<AgentSessionHandle>,
     cwd: PathBuf,
     /// Remains reachable during a turn so EOF/exit can close external tools.
     mcp: Option<Arc<mcp::SessionMcp>>,
@@ -1479,7 +1482,7 @@ fn handle_session_new(
     let (id, mut state) = build_acp_session(session, save_enabled, cwd.clone(), options, permission_client)?;
     let mcp_state = mcp::prepare(&cwd, &Config::global_dir(), servers);
     if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
-        mcp::mount(agent, mcp_state);
+        mcp::mount(agent.session_mut(), mcp_state);
     }
     state.mcp = mcp_state;
     Ok((id, state))
@@ -1590,6 +1593,18 @@ fn build_acp_session(
         .with_runtime_handle(options.runtime_handle.clone())
         .with_model_registry(options.model_registry.clone())
         .with_auth_storage(options.auth.clone());
+    // Keep the exact configured AgentSession for the lifetime of the editor
+    // session. The SDK owns one durable recovery driver and its cross-turn
+    // fallback state; rebuilding a handle per prompt would lose that state.
+    let agent_session =
+        AgentSessionHandle::from_session_with_listeners(agent_session, EventListeners::default())
+            .with_retry(crate::failover::RetryPolicy::from_config(&options.config))
+            .with_failover(FailoverOptions::from_config(
+                &options.config,
+                options.model_registry.models().to_vec(),
+                options.auth.clone(),
+                None,
+            ));
 
     Ok((
         session_id,
@@ -1684,18 +1699,148 @@ fn session_config_options(
 /// holds the agent session.
 fn config_options_for(state: &AcpSessionState, available_models: &[ModelEntry]) -> Option<Value> {
     let agent_session = state.agent_session.as_ref()?;
-    let provider = agent_session.agent.provider();
-    let thinking = agent_session
-        .agent
-        .stream_options()
-        .thinking_level
-        .unwrap_or_default()
-        .to_string();
-    Some(session_config_options(
-        (provider.name(), provider.model_id()),
-        &thinking,
+    Some(config_options_for_handle(agent_session, available_models))
+}
+
+fn config_options_for_handle(handle: &AgentSessionHandle, available_models: &[ModelEntry]) -> Value {
+    let (provider, model) = handle.model();
+    session_config_options(
+        (&provider, &model),
+        &handle.thinking_level().unwrap_or_default().to_string(),
         available_models,
-    ))
+    )
+}
+
+/// ACP does not expose Pi's retry/failover event types. Keep the editor informed
+/// with bounded status text and the standard complete config-option update.
+/// Provider error bodies stay out of these notices, just as on final errors.
+struct AcpRecoveryUpdates {
+    out: std::sync::mpsc::SyncSender<String>,
+    session_id: String,
+    session: Arc<Mutex<Session>>,
+    available_models: Vec<ModelEntry>,
+    last_configuration: StdMutex<Value>,
+}
+
+impl AcpRecoveryUpdates {
+    fn new(
+        handle: &AgentSessionHandle,
+        out: &std::sync::mpsc::SyncSender<String>,
+        session_id: &str,
+    ) -> Arc<Self> {
+        let available_models = handle
+            .session()
+            .model_registry()
+            .map_or_else(Vec::new, ModelRegistry::get_available);
+        let configuration = config_options_for_handle(handle, &available_models);
+        Arc::new(Self {
+            out: out.clone(),
+            session_id: session_id.to_string(),
+            session: handle.session_store(),
+            available_models,
+            last_configuration: StdMutex::new(configuration),
+        })
+    }
+
+    fn observe(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                ..
+            } => self.notice(format!(
+                "Retrying provider request (attempt {attempt}/{max_attempts}, in {delay_ms} ms)."
+            )),
+            AgentEvent::FailoverStart {
+                from_provider,
+                from_model,
+                to_provider,
+                to_model,
+                ..
+            } => {
+                self.notice(format!(
+                    "Provider fallback: {from_provider}/{from_model} → {to_provider}/{to_model}."
+                ));
+                self.committed_model(to_provider, to_model);
+            }
+            AgentEvent::FailoverEnd {
+                success: true,
+                provider,
+                model,
+                restored_primary: true,
+            } => {
+                self.notice(format!("Restored primary provider: {provider}/{model}."));
+                self.committed_model(provider, model);
+            }
+            _ => {}
+        }
+    }
+
+    fn notice(&self, text: String) {
+        let _ = self.out.send(json_rpc_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("\n\n{text}\n\n") },
+                },
+            }),
+        ));
+    }
+
+    fn committed_model(&self, provider: &str, model: &str) {
+        let configuration = {
+            // Recovery publishes the event after its durable transition has
+            // released Session. If another reader currently owns the store,
+            // finish() reconciles the actual runtime selection before reply.
+            let Ok(session) = self.session.try_lock() else {
+                return;
+            };
+            let Some((active_provider, active_model)) = session.effective_model_for_current_path()
+            else {
+                return;
+            };
+            if !provider_ids_match(provider, &active_provider)
+                || !model.eq_ignore_ascii_case(&active_model)
+            {
+                return;
+            }
+            let thinking = session
+                .effective_thinking_level_for_current_path()
+                .unwrap_or_else(|| "off".to_string());
+            session_config_options((provider, model), &thinking, &self.available_models)
+        };
+        self.configuration(configuration);
+    }
+
+    fn configuration(&self, configuration: Value) {
+        {
+            let mut previous = self
+                .last_configuration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *previous == configuration {
+                return;
+            }
+            previous.clone_from(&configuration);
+        }
+        let _ = self.out.send(json_rpc_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": configuration,
+                },
+            }),
+        ));
+    }
+
+    fn finish(&self, handle: &AgentSessionHandle) {
+        self.configuration(config_options_for_handle(handle, &self.available_models));
+    }
 }
 
 /// The option id of a `session/set_config_option` request: ACP's `configId`,
@@ -1830,7 +1975,7 @@ async fn apply_set_model(
         return Err("Cannot change model while a prompt is in progress".to_string());
     };
     agent_session
-        .set_provider_model(provider, model)
+        .set_model(provider, model)
         .await
         .map_err(|e| e.to_string())?;
     Ok((provider.to_string(), model.to_string()))
@@ -1873,8 +2018,6 @@ async fn run_prompt(
     if abort_signal.is_aborted() || cx.is_cancel_requested() {
         return ACP_STOP_REASON_CANCELLED;
     }
-    let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
-
     // Take the agent_session out of the lock, run the prompt, then put it back.
     // Holding the session mutex across the whole turn would block session/cancel
     // and session/list. The concurrent-prompt guard upstream guarantees only one
@@ -1891,16 +2034,22 @@ async fn run_prompt(
         Ok(taken) => taken,
         Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
+    let recovery_updates = AcpRecoveryUpdates::new(&agent_session, &out_tx, &session_id);
+    let recovery_callback = Arc::clone(&recovery_updates);
+    let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
     let prepared = mcp::before_prompt(
-        mcp_state.as_ref(), &mut agent_session, mcp_command,
+        mcp_state.as_ref(), agent_session.session_mut(), mcp_command,
         &abort_signal, &cx, &out_tx, &session_id,
     ).await;
     let stop_reason = if let Some(reason) = prepared {
         reason
     } else {
         match agent_session
-            .run_with_content_with_abort(message, Some(abort_signal), event_handler)
+            .prompt_with_content_with_abort(message, abort_signal, move |event| {
+                recovery_callback.observe(&event);
+                event_handler(event);
+            })
             .await
         {
             Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
@@ -1917,7 +2066,13 @@ async fn run_prompt(
         }
     };
 
-    if let Ok(mut guard) = session_state.lock(&cx).await {
+    // Even a failed/aborted fallback can have committed a different model.
+    // Publish the final selections before returning the prompt response.
+    recovery_updates.finish(&agent_session);
+    // Cancellation ends provider work, not the obligation to return its owner
+    // to the editor session. Cleanup must not use a cancelled request context.
+    let cleanup_cx = AgentCx::for_request();
+    if let Ok(mut guard) = session_state.lock(&cleanup_cx).await {
         guard.agent_session = Some(agent_session);
     }
 
@@ -2301,7 +2456,10 @@ mod tests {
             },
         );
         let state = Arc::new(Mutex::new(AcpSessionState {
-            agent_session: Some(session),
+            agent_session: Some(AgentSessionHandle::from_session_with_listeners(
+                session,
+                EventListeners::default(),
+            )),
             cwd: root.to_path_buf(),
             mcp: None,
         }));
@@ -3150,7 +3308,10 @@ mod tests {
         .with_auth_storage(auth.clone());
 
         let state = Arc::new(Mutex::new(AcpSessionState {
-            agent_session: Some(agent_session),
+            agent_session: Some(AgentSessionHandle::from_session_with_listeners(
+                agent_session,
+                EventListeners::default(),
+            )),
             cwd: PathBuf::from("."),
             mcp: None,
         }));
@@ -3263,7 +3424,7 @@ mod tests {
             // The live agent now reports the new provider/model.
             let guard = state.lock(&cx).await.expect("lock state");
             let agent_session = guard.agent_session.as_ref().expect("session present");
-            let active = agent_session.agent.provider();
+            let active = agent_session.session().agent.provider();
             assert_eq!(active.name(), "openai");
             assert_eq!(active.model_id(), "gpt-4o");
         });
@@ -3289,7 +3450,7 @@ mod tests {
             let guard = state.lock(&cx).await.expect("lock state");
             let agent_session = guard.agent_session.as_ref().expect("session present");
             assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
+                agent_session.session().agent.stream_options().thinking_level,
                 Some(crate::model::ThinkingLevel::Off)
             );
         });
@@ -3317,7 +3478,7 @@ mod tests {
             // Active model is unchanged after a failed switch.
             let guard = state.lock(&cx).await.expect("lock state");
             let agent_session = guard.agent_session.as_ref().expect("session present");
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
+            assert_eq!(agent_session.session().agent.provider().name(), "anthropic");
         });
     }
 }

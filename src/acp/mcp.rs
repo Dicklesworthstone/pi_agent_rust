@@ -590,7 +590,10 @@ mod tests {
                 let host_snapshot = shared.snapshot();
                 assert!(host_snapshot.is_discoverable("lsp"));
                 let state = Arc::new(asupersync::sync::Mutex::new(super::super::AcpSessionState {
-                    agent_session: Some(session), cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
+                    agent_session: Some(crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                        session, crate::sdk::EventListeners::default(),
+                    )),
+                    cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
                 let run = |command| {

@@ -199,7 +199,7 @@ pub(super) async fn load(
             &cwd, &crate::config::Config::global_dir(), supplied.unwrap_or_default(),
         );
         if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
-            super::mcp::mount(agent, mcp_state);
+            super::mcp::mount(agent.session_mut(), mcp_state);
         }
         state.mcp = mcp_state;
         let state = Arc::new(Mutex::new(state));
@@ -218,7 +218,7 @@ pub(super) async fn load(
     let configuration = config_options_for(&guard, &options.available_models)
         .ok_or_else(HistoryError::busy)?;
     if replay {
-        let session = OwnedMutexGuard::lock(Arc::clone(&agent.session), cx).await
+        let session = OwnedMutexGuard::lock(agent.session_store(), cx).await
             .map_err(|_| HistoryError::internal("Session history is unavailable"))?;
         replay_session(&session, id, out).await?;
     }
@@ -506,7 +506,7 @@ pub(super) async fn list(
         });
         row.cwd = cwd;
         if let Some(agent) = state.agent_session.as_ref() {
-            let session = OwnedMutexGuard::lock(Arc::clone(&agent.session), cx).await
+            let session = OwnedMutexGuard::lock(agent.session_store(), cx).await
                 .map_err(|_| HistoryError::internal("Live session metadata is unavailable"))?;
             row.title = session.entries.iter().rev().find_map(|entry| match entry {
                 SessionEntry::SessionInfo(info) => info.name.clone(),

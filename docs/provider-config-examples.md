@@ -477,7 +477,8 @@ Common auth issues and their fixes: [provider-auth-troubleshooting.md](provider-
 
 When a provider returns a transient failure — a 429, a quota rejection, a 529 or
 another overload — pi can retry the same model, and then continue the turn on a
-different one. Both are off unless you configure them.
+different one. Same-model retry is enabled by default; switching models requires
+a configured fallback chain.
 
 ```jsonc
 {
@@ -521,6 +522,7 @@ This has NOT historically been uniform, so check the row for the way you run pi:
 | Default interactive TUI | yes | yes | yes |
 | `-p` / `--print` | yes | yes | yes |
 | RPC server (`--mode rpc`) | yes | yes | yes |
+| ACP editors (`--acp`, including Zed) | yes | yes | yes |
 | Embedders using `pi::sdk` | opt-in | opt-in | opt-in |
 | Classic interactive stack (`--classic`) | yes | yes | yes |
 
@@ -529,6 +531,13 @@ turn active during retry backoff, reports retries and model swaps in the
 conversation, and updates its model indicator after a fallback or primary
 restoration. Escape cancels the whole turn, including an in-progress backoff.
 Text, attachments, and extension-triggered continuations share these rules.
+
+ACP editors also use the shared recovery driver. Retry and fallback notices
+exclude provider error bodies, and complete `config_option_update` notifications
+keep the editor's model and thinking selectors aligned with committed changes.
+Cancelling a prompt stops pending retry backoff. Explicitly choosing a model in
+the editor ends automatic restoration, including when choosing the active
+fallback again. Saved fallback state survives reopening the session.
 
 **Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and `failover`
 to `None`, so a host that builds its own session enables them explicitly

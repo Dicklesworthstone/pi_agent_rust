@@ -258,7 +258,10 @@ fn live_state(
     let mcp = prepare(cwd, root, servers).unwrap();
     mount(&mut agent_session, &mcp);
     let state = Arc::new(Mutex::new(AcpSessionState {
-        agent_session: Some(agent_session), cwd: cwd.into(), mcp: Some(Arc::clone(&mcp)),
+        agent_session: Some(crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            agent_session, crate::sdk::EventListeners::default(),
+        )),
+        cwd: cwd.into(), mcp: Some(Arc::clone(&mcp)),
     }));
     (id, state, mcp)
 }
@@ -305,7 +308,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             assert_eq!(reason, "end_turn");
             assert_eq!(provider.turns.load(Ordering::Acquire), 0, "host commands do not start provider turns");
             assert_eq!(server.count("tools/call"), 0);
-            assert!(state.lock(&cx).await.unwrap().agent_session.as_ref().unwrap().agent.has_tool(TOOL));
+            assert!(state.lock(&cx).await.unwrap().agent_session.as_ref().unwrap().has_tool(TOOL));
             let mut seen = rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
             let (_, signal) = AbortHandle::new();
             let prompt = crate::acp::run_prompt(Arc::clone(&state), text("Call echo"), None,
