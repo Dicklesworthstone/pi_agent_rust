@@ -366,6 +366,14 @@ pub struct SessionOptions {
     pub thinking: Option<crate::model::ThinkingLevel>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Built-in selection. `None` keeps CLI defaults; an empty vector disables
+    /// all built-ins, including implicit configuration-driven tools.
+    ///
+    /// Explicit extensions and MCP tools remain available. A custom
+    /// [`ToolFactory`] controls its own registry; [`default_tool_registry`]
+    /// with an empty list retains the disabled-builtins policy.
+    /// Plan entry and checkpoint restoration report `PLAN_TOOLS_DISABLED`
+    /// under that policy; opening a saved conversation remains available.
     pub enabled_tools: Option<Vec<String>>,
     pub working_directory: Option<PathBuf>,
     /// Whether project-local configuration under the working directory may
@@ -633,7 +641,11 @@ pub trait ToolFactory: Send + Sync {
 /// (e.g. wrap each tool with an approval gate, or add a `Task` tool
 /// that spawns a nested session).
 pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
-    ToolRegistry::new(enabled, cwd, Some(config))
+    if enabled.is_empty() {
+        ToolRegistry::without_builtins(Some(config))
+    } else {
+        ToolRegistry::new(enabled, cwd, Some(config))
+    }
 }
 
 /// Lightweight handle for programmatic embedding.
@@ -3126,6 +3138,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
         || {
+            if cli.no_tools {
+                return ToolRegistry::without_builtins(Some(&config));
+            }
             ToolRegistry::with_mutation_recorder(
                 &enabled_tools,
                 &cwd,
@@ -5958,6 +5973,250 @@ export default function init(pi) {
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
     }
+    #[test]
+    fn empty_default_tool_registry_disables_configured_builtins() {
+        let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let config: Config = serde_json::from_value(serde_json::json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture settings must deserialize.
+            "askPolicy": "recommended",
+            "memory": {"backend": "local"},
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            },
+            "computer": {"enableComputer": true},
+            "browser": {"enableBrowser": true}
+        }))
+        .expect("configured builtins");
+        let registry = default_tool_registry(&[], tmp.path(), &config);
+        assert!(registry.tools().is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+
+        // The host still owns its configured picker, even with no model tools.
+        let picker = registry.host_ask_tool();
+        let output = run_async(crate::tools::Tool::execute( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture host picker must execute.
+            &picker,
+            "host-picker",
+            serde_json::json!({
+                "questions": [{
+                    "question": "Choose a host action",
+                    "recommended": 0,
+                    "options": [{"label": "Continue"}, {"label": "Wait"}]
+                }]
+            }),
+            None,
+        ))
+        .expect("configured host picker remains usable");
+        assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("autoAnswered"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sdk_no_builtins_keeps_explicit_extension_tools_executable() {
+        let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let extension_path = tmp.path().join("kept_custom.js");
+        std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be written.
+            &extension_path,
+            r#"
+export default function init(pi) {
+    pi.registerTool({
+        name: "sdk_kept_custom",
+        label: "Custom tool",
+        description: "Explicitly configured extension tool",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({
+            content: [{ type: "text", text: "kept custom tool" }],
+            isError: false
+        })
+    });
+}
+"#,
+        )
+        .expect("write custom extension");
+        let options = SessionOptions {
+            enabled_tools: Some(Vec::new()),
+            extension_paths: vec![extension_path],
+            extension_policy: Some("safe".to_string()),
+            persist_extension_permissions: false,
+            ..hermetic_session_options(tmp.path())
+        };
+
+        run_async(async {
+            let handle = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture session must open.
+                .await
+                .expect("create session");
+            assert!(handle.ask_tool().is_some()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let names: Vec<_> = registry.tools().iter().map(|tool| tool.name()).collect();
+            assert_eq!(names, ["sdk_kept_custom"]); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+
+            let output = registry // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be registered and executable.
+                .get("sdk_kept_custom")
+                .expect("explicit extension remains registered")
+                .execute("custom-call", serde_json::json!({}), None)
+                .await
+                .expect("execute explicit extension");
+            assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let text: Vec<_> = output
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, ["kept custom tool"]); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let shutdown = handle.shutdown_owned_resources().await;
+            assert!(shutdown.completed_cleanly()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        });
+    }
+
+    #[test]
+    fn disabled_builtins_survive_extension_mount_and_plan_checkpoint_restore() {
+        run_async(async {
+            let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated fixture storage is required.
+            let mut options = hermetic_session_options(tmp.path());
+            options.no_session = false;
+            options.session_dir = Some(tmp.path().join("sessions"));
+            let mut enabled = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Build the real enabled SDK session used to save the checkpoint.
+                .await
+                .expect("create enabled session");
+            let owner = crate::agent_cx::AgentCx::for_request();
+            let entered = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The enabled fixture must enter planning through the public SDK.
+                .enter_plan_mode(&owner)
+                .await
+                .expect("enter enabled plan mode");
+            assert_eq!(entered.persistence, crate::plan::PlanPersistence::Saved); // ubs:ignore[rust.panic.assert-macros] -- The initial plan transition must reach disk.
+            let installed = enabled.session().agent.shared_tools().snapshot();
+            let submit = installed.get("submit_plan").expect("mounted submit_plan"); // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise the tool mounted by the actual SDK transition.
+            let output = submit // ubs:ignore[rust.ownership.unwrap-expect] -- The valid fixture proposal must be submitted successfully.
+                .execute(
+                    "saved-proposal",
+                    serde_json::json!({
+                        "plan": "Goal: update code. Steps: edit the selected source, then verify it.",
+                        "files": ["src/fixture.rs"],
+                    }),
+                    None,
+                )
+                .await
+                .expect("submit persisted proposal");
+            assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- The fixture must save a real submitted proposal.
+            drop(installed);
+            let review = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The submitted proposal must be available for explicit review.
+                .pending_plan_review()
+                .expect("read pending review")
+                .expect("submitted review");
+            let approved = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- Save approval through the real SDK lifecycle.
+                .approve_plan_review(&owner, &review)
+                .await
+                .expect("approve fixture plan");
+            assert_eq!(approved.persistence, crate::plan::PlanPersistence::Saved); // ubs:ignore[rust.panic.assert-macros] -- The approved checkpoint must be durable before reopening.
+            let path = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The persistent fixture must expose its saved session path.
+                .with_session(|session| session.path.clone())
+                .await
+                .expect("read saved session path")
+                .expect("saved session path");
+            drop(enabled);
+
+            let extension_path = tmp.path().join("disabled-plan-probe.mjs");
+            std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Install an explicit extension fixture to exercise live registry publication.
+                &extension_path,
+                r#"export default function (pi) {
+  pi.registerTool({
+    name: "sdk_disabled_plan_probe",
+    label: "Plan policy probe",
+    description: "Explicit extension retained when built-ins are disabled",
+    parameters: {type: "object", properties: {}},
+    execute: async () => ({
+      content: [{type: "text", text: "extension retained"}],
+      isError: false
+    })
+  });
+}
+"#,
+            )
+            .expect("write extension fixture");
+            let mut options = hermetic_session_options(tmp.path());
+            options.no_session = false;
+            options.session_path = Some(path.clone());
+            options.enabled_tools = Some(Vec::new());
+            options.extension_paths = vec![extension_path];
+            options.extension_policy = Some("safe".to_string());
+            options.persist_extension_permissions = false;
+            let mut disabled = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Opening saved history must succeed with built-ins disabled.
+                .await
+                .expect("reopen without built-ins");
+            let shared = disabled.session().agent.shared_tools();
+            let names_before = shared
+                .snapshot()
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>();
+            assert!(disabled.has_tool("sdk_disabled_plan_probe")); // ubs:ignore[rust.panic.assert-macros] -- An actual extension mount must exercise the shared-registry clone path.
+            assert!(!disabled.has_tool("submit_plan")); // ubs:ignore[rust.panic.assert-macros] -- Resuming history cannot mount a disabled built-in.
+            let state = disabled.session().agent.plan_state();
+            assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- Saved approval cannot reactivate planning during SDK startup.
+            assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- Startup must leave the saved proposal inactive.
+            let prompt_before = disabled.session().agent.system_prompt().map(str::to_string);
+            let entries_before = disabled // ubs:ignore[rust.ownership.unwrap-expect] -- Capture the loaded fixture journal before rejected controls.
+                .with_session(|session| session.entries.clone())
+                .await
+                .expect("read restored journal");
+            assert!(entries_before.iter().any(|entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- The reopened conversation must retain its real saved checkpoint.
+                entry,
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "plan_checkpoint"
+            )));
+            let journal_before = serde_json::to_value(&entries_before) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture history must serialize for exact comparison.
+                .expect("serialize journal before rejection");
+            let disk_before = std::fs::read(&path).expect("read saved checkpoint"); // ubs:ignore[rust.ownership.unwrap-expect] -- The durable fixture must remain readable.
+
+            for restore in [false, true] {
+                let result = if restore {
+                    disabled.restore_plan_checkpoint(&owner).await
+                } else {
+                    disabled.enter_plan_mode(&owner).await
+                };
+                let error = result.err().expect("disabled planning must be rejected"); // ubs:ignore[rust.ownership.unwrap-expect] -- Both public controls must reject disabled built-ins.
+                assert!(error.to_string().contains("[PLAN_TOOLS_DISABLED]")); // ubs:ignore[rust.panic.assert-macros] -- Rejection must identify the explicit tool policy.
+                assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- A rejected control cannot activate planning.
+                assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- A rejected restore cannot install the saved proposal.
+                assert!(!disabled.has_tool("submit_plan")); // ubs:ignore[rust.panic.assert-macros] -- Rejected controls cannot mount a built-in.
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection must preserve every currently mounted extension.
+                    shared
+                        .snapshot()
+                        .tools()
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect::<Vec<_>>(),
+                    names_before,
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection cannot install or remove prompt context.
+                    disabled.session().agent.system_prompt(),
+                    prompt_before.as_deref(),
+                );
+                let journal_after = disabled // ubs:ignore[rust.ownership.unwrap-expect] -- Read and serialize the actual post-control journal.
+                    .with_session(|session| serde_json::to_value(&session.entries))
+                    .await
+                    .expect("read journal after rejection")
+                    .expect("serialize journal after rejection");
+                assert_eq!(journal_after, journal_before); // ubs:ignore[rust.panic.assert-macros] -- Rejection must not append a plan transition or checkpoint.
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection must leave durable checkpoint bytes unchanged.
+                    std::fs::read(&path).expect("reread saved checkpoint"), // ubs:ignore[rust.ownership.unwrap-expect] -- Read the same durable fixture after the rejected operation.
+                    disk_before,
+                );
+            }
+        });
+    }
+
     #[test]
     fn session_without_model_ask_still_exposes_host_picker() {
         let tmp = tempdir().expect("tempdir");

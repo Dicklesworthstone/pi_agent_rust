@@ -5437,6 +5437,9 @@ pub struct ToolRegistry {
     /// the model schema: host authorization must not disappear merely because
     /// the model cannot ask arbitrary questions.
     host_ask: crate::ask::AskTool,
+    /// Invocation policy retained when extension/MCP mounts publish a snapshot.
+    /// Set only when the host explicitly disables its built-in tool set.
+    builtins_disabled: bool,
     /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
     /// so a hostcall holding only a snapshot can publish an update.
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
@@ -5490,6 +5493,24 @@ impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
         Self::with_mutation_recorder(enabled, cwd, config, None, None)
+    }
+
+    /// Construct an empty built-in set while retaining the host's picker policy.
+    /// Extensions and MCP tools may still be mounted afterward.
+    pub fn without_builtins(config: Option<&Config>) -> Self {
+        let mut registry = Self::from_tools(Vec::new());
+        registry.builtins_disabled = true;
+        registry.host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
+        registry
+    }
+
+    /// Whether this invocation explicitly disabled host-provided built-in tools.
+    /// Extension and MCP mounts do not change this policy.
+    #[must_use]
+    pub const fn builtins_disabled(&self) -> bool {
+        self.builtins_disabled
     }
 
     /// The undo recorder attached at construction, if any.
@@ -5884,6 +5905,7 @@ impl ToolRegistry {
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
+            builtins_disabled: false,
             shared: None,
         }
     }
@@ -5912,6 +5934,7 @@ impl ToolRegistry {
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
             host_ask,
+            builtins_disabled: false,
             shared: None,
         }
     }
@@ -5928,6 +5951,7 @@ impl ToolRegistry {
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
+            builtins_disabled: self.builtins_disabled,
             shared: self.shared.clone(),
         }
     }

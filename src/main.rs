@@ -1729,13 +1729,17 @@ async fn run(
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
         eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
-        &shared_enabled_tools,
-        &cwd,
-        Some(&config),
-        Some(Arc::clone(&session_mutation_recorder)),
-        Some(&workspace),
-    ));
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.no_tools {
+        ToolRegistry::without_builtins(Some(&config))
+    } else {
+        ToolRegistry::with_mutation_recorder(
+            &shared_enabled_tools,
+            &cwd,
+            Some(&config),
+            Some(Arc::clone(&session_mutation_recorder)),
+            Some(&workspace),
+        )
+    });
 
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
@@ -2421,17 +2425,19 @@ async fn run(
         ]);
     }
     // submit_plan shares the agent's plan-mode state (bd-cv653.3.5); it is
-    // always registered — the tool self-errors outside plan mode.
+    // registered when built-ins are enabled, and self-errors outside plan mode.
     {
         let plan_state = agent_session.agent.plan_state();
         let auto_approve = cli.plan_yolo || config.plan_auto_approve();
-        agent_session
-            .agent
-            .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
-                plan_state.clone(),
-                auto_approve,
-            )) as Box<dyn pi::tools::Tool>]);
-        if cli.plan_mode {
+        if !cli.no_tools {
+            agent_session
+                .agent
+                .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
+                    plan_state.clone(),
+                    auto_approve,
+                )) as Box<dyn pi::tools::Tool>]);
+        }
+        if cli.plan_mode && !cli.no_tools {
             plan_state.enter_planning();
             let cx = pi::agent_cx::AgentCx::for_request();
             if let Ok(mut inner) = agent_session.session.lock(cx.cx()).await {
@@ -2440,6 +2446,8 @@ async fn run(
                     Some(serde_json::json!({"mode": "planning", "via": "--plan-mode"})),
                 );
             }
+        } else if cli.plan_mode {
+            eprintln!("Warning: --plan-mode is unavailable while --no-tools is enabled");
         }
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)

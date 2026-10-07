@@ -3219,13 +3219,23 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
         let sub = args.trim().to_ascii_lowercase();
-        let plan_state = {
+        let (plan_state, builtins_disabled) = {
             let Ok(agent_guard) = self.agent.try_lock() else {
                 self.status_message = Some("Agent busy; try again".to_string());
                 return None;
             };
-            agent_guard.plan_state()
+            (
+                agent_guard.plan_state(),
+                agent_guard.shared_tools().snapshot().builtins_disabled(),
+            )
         };
+        if builtins_disabled && matches!(sub.as_str(), "" | "on" | "start") {
+            self.status_message = Some(
+                "[PLAN_TOOLS_DISABLED] Plan mode is unavailable while built-in tools are disabled"
+                    .to_string(),
+            );
+            return None;
+        }
         match sub.as_str() {
             "" | "on" | "start" => self.enter_plan_mode(&plan_state),
             "status" => {

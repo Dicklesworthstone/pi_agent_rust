@@ -170,6 +170,22 @@ fn prompt_changed() -> Error {
     )
 }
 
+fn check_plan_tools(handle: &AgentSessionHandle) -> Result<()> {
+    if handle
+        .session()
+        .agent
+        .shared_tools()
+        .snapshot()
+        .builtins_disabled()
+    {
+        return Err(control_error(
+            "PLAN_TOOLS_DISABLED",
+            "plan mode is unavailable while built-in tools are disabled",
+        ));
+    }
+    Ok(())
+}
+
 fn check_owner(owner: &AgentCx, save_enabled: bool) -> Result<()> {
     owner.checkpoint().map_err(|_| {
         control_error(
@@ -261,6 +277,7 @@ impl AgentSessionHandle {
     /// replacing any tool with that reserved name. This also repairs an already
     /// Planning session's binding without adding a redundant mode journal entry.
     pub async fn enter_plan_mode(&mut self, owner: &AgentCx) -> Result<PlanChange> {
+        check_plan_tools(self)?;
         change(self, owner, Change::Enter).await
     }
 
@@ -608,6 +625,7 @@ impl AgentSessionHandle {
     /// superseded or off-branch checkpoints are not used. On Err no state was
     /// changed; callers must not continue execution as though recovery succeeded.
     pub async fn restore_plan_checkpoint(&mut self, owner: &AgentCx) -> Result<PlanChange> {
+        check_plan_tools(self)?;
         let save_enabled = self.session().save_enabled();
         check_owner(owner, save_enabled)?;
         let store = self.session_store();
