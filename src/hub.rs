@@ -19,7 +19,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -43,6 +44,8 @@ const TRUNCATED_LINE_PREFIX: &str = "[...truncated...] ";
 
 /// Grace window between TERM and KILL on stop, mirroring the bash tool.
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+const SETTLEMENT_BUDGET: Duration = Duration::from_secs(8);
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Keep service identifiers portable and bounded before deriving artifact
 /// names from them.
@@ -79,6 +82,7 @@ pub struct LaunchSpec {
 pub enum ServiceStatus {
     Starting,
     Running,
+    Stopping,
     Exited,
     Killed,
     Failed,
@@ -89,6 +93,7 @@ impl ServiceStatus {
         match self {
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Exited => "exited",
             Self::Killed => "killed",
             Self::Failed => "failed",
@@ -96,7 +101,66 @@ impl ServiceStatus {
     }
 
     const fn live(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+
+    const fn accepts_input(self) -> bool {
         matches!(self, Self::Starting | Self::Running)
+    }
+}
+
+/// Requests never signal a copied PID. The monitor retains the child handle
+/// through escalation and reap; completion belongs to this exact incarnation,
+/// even when another caller has already restarted the retained service name.
+#[derive(Default)]
+struct ServiceControl {
+    stop_requested: AtomicBool,
+    force_requested: AtomicBool,
+    completion: Mutex<Option<ServiceSnapshot>>,
+    completed: Condvar,
+}
+
+impl ServiceControl {
+    fn request_stop(&self, force: bool) {
+        if force {
+            self.force_requested.store(true, Ordering::Release);
+        }
+        self.stop_requested.store(true, Ordering::Release);
+    }
+
+    fn finish(&self, snapshot: ServiceSnapshot) {
+        let mut completion = self
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if completion.is_none() {
+            *completion = Some(snapshot);
+        }
+        self.completed.notify_all();
+    }
+
+    fn wait_until(&self, name: &str, deadline: Instant) -> Result<ServiceSnapshot> {
+        let completion = self
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (completion, _) = self
+            .completed
+            .wait_timeout_while(
+                completion,
+                deadline.saturating_duration_since(Instant::now()),
+                |completion| completion.is_none(),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        completion.clone().ok_or_else(|| {
+            Error::tool(
+                "hub",
+                format!(
+                    "PI_HUB_STOP_TIMEOUT: service '{name}' has not finished cleanup; \
+                     its name remains reserved until the process is reaped"
+                ),
+            )
+        })
     }
 }
 
@@ -246,6 +310,7 @@ struct ServiceEntry {
     /// portable-pty's `UnixMasterWriter::drop` sends `\n`+VEOF, so caching
     /// the writer is what keeps the child's stdin open across sends.
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    control: Arc<ServiceControl>,
 }
 
 /// Serializable service descriptor.
@@ -332,6 +397,7 @@ impl ServiceRegistry {
                 log_path: log_path.to_path_buf(),
                 ring: Arc::clone(ring),
                 writer: Arc::new(Mutex::new(None)),
+                control: Arc::new(ServiceControl::default()),
             },
         );
         Ok(())
@@ -353,7 +419,7 @@ impl ServiceRegistry {
         let entry = self
             .current_mut(name, ring)
             .ok_or_else(|| stale_service(name))?;
-        if !entry.status.live() {
+        if !entry.status.accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!(
@@ -370,7 +436,9 @@ impl ServiceRegistry {
         let Some(entry) = self.current_mut(name, ring) else {
             return false;
         };
-        if entry.status.live() {
+        if entry.status == ServiceStatus::Stopping {
+            entry.status = ServiceStatus::Killed;
+        } else if entry.status.live() {
             entry.status = if code == 0 {
                 ServiceStatus::Exited
             } else {
@@ -379,17 +447,19 @@ impl ServiceRegistry {
         }
         entry.exit_code = Some(code);
         entry.pid = None;
+        entry.control.finish(ServiceSnapshot::from_entry(entry));
         true
     }
 
     /// A stale timeout has no authority over the current service's PID.
-    fn time_out(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<u32> {
+    fn time_out(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<Arc<ServiceControl>> {
         let entry = self.current_mut(name, ring)?;
         if !entry.status.live() {
             return None;
         }
-        entry.status = ServiceStatus::Killed;
-        entry.pid
+        entry.status = ServiceStatus::Stopping;
+        entry.control.request_stop(true);
+        Some(Arc::clone(&entry.control))
     }
 }
 
@@ -405,6 +475,7 @@ fn stale_service(name: &str) -> Error {
 struct PendingService {
     name: String,
     ring: Arc<Mutex<Ring>>,
+    control: Arc<ServiceControl>,
     armed: bool,
 }
 
@@ -416,10 +487,16 @@ impl PendingService {
     ) -> Result<Self> {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         reg.reserve(spec, ring, log_path)?;
+        let control = Arc::clone(
+            &reg.current(&spec.name, ring)
+                .ok_or_else(|| stale_service(&spec.name))?
+                .control,
+        );
         drop(reg);
         Ok(Self {
             name: spec.name.clone(),
             ring: Arc::clone(ring),
+            control,
             armed: true,
         })
     }
@@ -427,11 +504,13 @@ impl PendingService {
 
 impl Drop for PendingService {
     fn drop(&mut self) {
-        if self.armed
-            && let Ok(mut reg) = registry().lock()
-            && reg.settle(&self.name, &self.ring, -1)
-        {
-            persist_detached_state(&reg);
+        if self.armed {
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reg.settle(&self.name, &self.ring, -1) {
+                persist_detached_state(&reg);
+            }
         }
     }
 }
@@ -445,15 +524,66 @@ struct ServiceChild {
 }
 
 impl ServiceChild {
+    fn monitor(mut self, control: &ServiceControl) -> i32 {
+        let mut terminate_at: Option<Instant> = None;
+        let pid = self.child.process_id();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    if let Some(pid) = pid {
+                        crate::tools::terminate_reaped_child_discipline(pid);
+                    }
+                    return i32::try_from(status.exit_code()).unwrap_or(-1);
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // Wait errors do not prove that a numeric PID is still
+                    // ours. The retained child handle is safe to terminate.
+                    let _ = self.child.kill();
+                    return self.wait();
+                }
+            }
+            let now = Instant::now();
+            if control.force_requested.load(Ordering::Acquire)
+                || terminate_at.is_some_and(|deadline| now >= deadline)
+            {
+                crate::tools::kill_process_group_tree(self.child.process_id());
+                let _ = self.child.kill();
+                return self.wait();
+            }
+            if terminate_at.is_none() && control.stop_requested.load(Ordering::Acquire) {
+                crate::tools::terminate_process_group_tree(self.child.process_id());
+                terminate_at = Some(Instant::now() + TERMINATE_GRACE);
+            }
+            std::thread::sleep(MONITOR_POLL_INTERVAL);
+        }
+    }
+
     fn wait(mut self) -> i32 {
+        self.wait_for_reap()
+    }
+
+    fn wait_for_reap(&mut self) -> i32 {
+        let pid = self.child.process_id();
         loop {
             match self.child.wait() {
                 Ok(status) => {
                     self.reaped = true;
+                    if let Some(pid) = pid {
+                        crate::tools::terminate_reaped_child_discipline(pid);
+                    }
                     return i32::try_from(status.exit_code()).unwrap_or(-1);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return -1,
+                Err(_) => {
+                    // A failed wait is not evidence of reap. Retain ownership
+                    // and keep retrying; bounded callers can report stopping,
+                    // but cannot free the service name or claim completion.
+                    let _ = self.child.kill();
+                    std::thread::sleep(MONITOR_POLL_INTERVAL);
+                }
             }
         }
     }
@@ -464,12 +594,7 @@ impl Drop for ServiceChild {
         if !self.reaped {
             crate::tools::kill_process_group_tree(self.child.process_id());
             let _ = self.child.kill();
-            loop {
-                match self.child.wait() {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    _ => break,
-                }
-            }
+            let _ = self.wait_for_reap();
         }
     }
 }
@@ -631,7 +756,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
         let entry = reg
             .current_mut(&name, &ring)
             .ok_or_else(|| stale_service(&name))?;
-        if !entry.status.live() {
+        if !entry.status.accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!("PI_HUB_NOT_READY: service '{name}' was stopped during startup"),
@@ -661,16 +786,18 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
 
     let monitor_name = name.clone();
     let monitor_ring = Arc::clone(&ring);
+    let monitor_control = Arc::clone(&pending.control);
     std::thread::Builder::new()
         .name(format!("hub-monitor-{name}"))
         .spawn(move || {
             // Keep the PTY owner alive for the whole child lifetime, not just
             // the readiness call. Reader/writer handles need not own it.
             let _master = master;
-            let code = child.wait();
-            if let Ok(mut reg) = registry().lock()
-                && reg.settle(&monitor_name, &monitor_ring, code)
-            {
+            let code = child.monitor(&monitor_control);
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reg.settle(&monitor_name, &monitor_ring, code) {
                 persist_detached_state(&reg);
             }
         })
@@ -695,7 +822,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
                 .ok_or_else(|| stale_service(&name))?
                 .status
         };
-        if !status.live() {
+        if !status.accepts_input() {
             let tail = ring_tail(&ring, 20);
             return Err(Error::tool(
                 "hub",
@@ -726,20 +853,27 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
             return Ok(snapshot);
         }
         if Instant::now() >= deadline {
-            let pid = {
+            let control = {
                 let mut reg = registry().lock().map_err(|_| registry_err())?;
-                let pid = reg.time_out(&name, &ring);
+                let control = reg.time_out(&name, &ring);
                 persist_detached_state(&reg);
-                pid
+                control
             };
-            crate::tools::kill_process_group_tree(pid);
+            let cleanup = control
+                .as_ref()
+                .map(|control| control.wait_until(&name, Instant::now() + SETTLEMENT_BUDGET))
+                .transpose();
+            let cleanup_message = cleanup.map_or_else(
+                |error| format!("Startup is stopping. {error}"),
+                |_| "Startup was stopped.".to_string(),
+            );
             let tail = ring_tail(&ring, 20);
             return Err(Error::tool(
                 "hub",
                 format!(
                     "PI_HUB_NOT_READY: service '{name}' failed readiness within {}s \
                      (log gate passed: {log_passed}, port gate passed: {port_passed}). \
-                     Startup was stopped.\nLog tail:\n{tail}",
+                     {cleanup_message}\nLog tail:\n{tail}",
                     budget.as_secs()
                 ),
             ));
@@ -996,7 +1130,7 @@ fn write_to_master(
                 format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
             ));
         };
-        if !entry.status.live() {
+        if !entry.status.accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!(
@@ -1025,8 +1159,8 @@ fn write_to_master(
 #[allow(clippy::significant_drop_tightening)]
 pub fn send_signal(name: &str, signal: sysinfo::Signal) -> Result<()> {
     let pid = {
-        let reg = registry().lock().map_err(|_| registry_err())?;
-        let Some(entry) = reg.services.get(name) else {
+        let mut reg = registry().lock().map_err(|_| registry_err())?;
+        let Some(entry) = reg.services.get_mut(name) else {
             return Err(Error::tool(
                 "hub",
                 format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
@@ -1040,6 +1174,12 @@ pub fn send_signal(name: &str, signal: sysinfo::Signal) -> Result<()> {
                     entry.status.as_str()
                 ),
             ));
+        }
+        if matches!(signal, sysinfo::Signal::Term | sysinfo::Signal::Kill) {
+            entry.status = ServiceStatus::Stopping;
+            entry.control.request_stop(signal == sysinfo::Signal::Kill);
+            persist_detached_state(&reg);
+            return Ok(());
         }
         entry.pid
     };
@@ -1082,10 +1222,12 @@ fn signal_pid_tree(pid: u32, signal: sysinfo::Signal) {
 /// (same discipline as the bash tool).
 ///
 /// # Errors
-/// `PI_HUB_UNKNOWN_SERVICE` / `PI_HUB_NOT_RUNNING`.
+/// `PI_HUB_UNKNOWN_SERVICE` / `PI_HUB_NOT_RUNNING`; `PI_HUB_STOP_TIMEOUT`
+/// if cleanup is still pending after the bounded wait. Such services remain
+/// `stopping`, retain their name, and may be awaited by another `stop` call.
 #[allow(clippy::significant_drop_tightening)]
 pub fn stop(name: &str) -> Result<ServiceSnapshot> {
-    let pid = {
+    let control = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         let Some(entry) = reg.services.get_mut(name) else {
             return Err(Error::tool(
@@ -1102,19 +1244,11 @@ pub fn stop(name: &str) -> Result<ServiceSnapshot> {
                 ),
             ));
         }
-        entry.status = ServiceStatus::Killed;
-        entry.pid
+        entry.status = ServiceStatus::Stopping;
+        entry.control.request_stop(false);
+        Arc::clone(&entry.control)
     };
-    crate::tools::terminate_process_group_tree(pid);
-    // The exit monitor records the settle; give it the grace window.
-    std::thread::sleep(TERMINATE_GRACE.min(Duration::from_millis(500)));
-    if let Some(pid) = pid {
-        let still_alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
-        if still_alive {
-            crate::tools::kill_process_group_tree(Some(pid));
-        }
-    }
-    describe(name)
+    control.wait_until(name, Instant::now() + SETTLEMENT_BUDGET)
 }
 
 /// Restart reuses the retained launch spec. Running services are stopped
@@ -1124,18 +1258,25 @@ pub fn stop(name: &str) -> Result<ServiceSnapshot> {
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names; start errors otherwise.
 #[allow(clippy::significant_drop_tightening)]
 pub fn restart(name: &str) -> Result<ServiceSnapshot> {
-    let (spec, was_live) = {
-        let reg = registry().lock().map_err(|_| registry_err())?;
-        let Some(entry) = reg.services.get(name) else {
+    let (spec, control) = {
+        let mut reg = registry().lock().map_err(|_| registry_err())?;
+        let Some(entry) = reg.services.get_mut(name) else {
             return Err(Error::tool(
                 "hub",
                 format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
             ));
         };
-        (entry.spec.clone(), entry.status.live())
+        let control = if entry.status.live() {
+            entry.status = ServiceStatus::Stopping;
+            entry.control.request_stop(false);
+            Some(Arc::clone(&entry.control))
+        } else {
+            None
+        };
+        (entry.spec.clone(), control)
     };
-    if was_live {
-        let _ = stop(name);
+    if let Some(control) = control {
+        control.wait_until(name, Instant::now() + SETTLEMENT_BUDGET)?;
     }
     start(&spec)
 }
@@ -1159,24 +1300,28 @@ pub fn describe(name: &str) -> Result<ServiceSnapshot> {
 /// Kill every non-detached service (session exit). Called once from the
 /// main shutdown chokepoint next to `jobs::kill_all`.
 pub fn kill_session_services() {
-    let pids: Vec<(String, Option<u32>)> = {
-        let Ok(mut reg) = registry().lock() else {
-            return;
-        };
-        let victims: Vec<(String, Option<u32>)> = reg
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    let controls = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let victims: Vec<_> = reg
             .services
             .values_mut()
             .filter(|entry| entry.status.live() && !entry.spec.detached)
             .map(|entry| {
-                entry.status = ServiceStatus::Killed;
-                (entry.spec.name.clone(), entry.pid)
+                entry.status = ServiceStatus::Stopping;
+                entry.control.request_stop(true);
+                (entry.spec.name.clone(), Arc::clone(&entry.control))
             })
             .collect();
         persist_detached_state(&reg);
         victims
     };
-    for (_, pid) in pids {
-        crate::tools::kill_process_group_tree(pid);
+    for (name, control) in controls {
+        // All victims receive their request before any wait. A foreign OS
+        // wait that exceeds the shared bound remains truthfully `stopping`.
+        let _ = control.wait_until(&name, deadline);
     }
 }
 
@@ -1407,6 +1552,48 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_timeout_keeps_name_reserved_until_incarnation_completes() {
+        let mut reg = ServiceRegistry::default();
+        let launch = spec("hub-cleanup-pending", "unused", &[], None);
+        let old = Arc::new(Mutex::new(Ring::new(8)));
+        let new = Arc::new(Mutex::new(Ring::new(8)));
+        reg.reserve(&launch, &old, &PathBuf::from("old.log"))
+            .expect("old reservation");
+        reg.current_mut(&launch.name, &old).expect("entry").pid = Some(42);
+        let control = reg.time_out(&launch.name, &old).expect("stop request");
+        let error = control
+            .wait_until(&launch.name, Instant::now())
+            .expect_err("cleanup has not completed");
+        assert!(error.to_string().contains("PI_HUB_STOP_TIMEOUT"));
+        let pending = reg.current(&launch.name, &old).expect("old entry");
+        assert_eq!(pending.status, ServiceStatus::Stopping);
+        assert_eq!(pending.pid, Some(42));
+        assert_eq!(pending.exit_code, None);
+        assert!(reg.mark_ready(&launch.name, &old).is_err());
+        assert!(
+            reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+                .unwrap_err()
+                .to_string()
+                .contains("PI_HUB_NAME_TAKEN")
+        );
+
+        assert!(reg.settle(&launch.name, &old, 137));
+        reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+            .expect("reaped service releases its name");
+        let completed = control
+            .wait_until(&launch.name, Instant::now())
+            .expect("completion survives replacement");
+        assert_eq!(completed.status, "killed");
+        assert_eq!(completed.exit_code, Some(137));
+        assert_eq!(completed.pid, None);
+        assert_eq!(completed.log_path, "old.log");
+        assert_eq!(
+            reg.current(&launch.name, &new).expect("new entry").status,
+            ServiceStatus::Starting
+        );
+    }
+
+    #[test]
     fn stale_exit_readiness_and_timeout_cannot_mutate_replacement() {
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-generation", "unused", &[], None);
@@ -1415,6 +1602,7 @@ mod tests {
         reg.reserve(&launch, &old, &PathBuf::from("old.log"))
             .expect("old");
         reg.time_out(&launch.name, &old);
+        assert!(reg.settle(&launch.name, &old, 137));
         reg.reserve(&launch, &new, &PathBuf::from("new.log"))
             .expect("new");
         reg.current_mut(&launch.name, &new).expect("new entry").pid = Some(42);
@@ -1426,7 +1614,7 @@ mod tests {
                 .to_string()
                 .contains("PI_HUB_STALE_SERVICE")
         );
-        assert_eq!(reg.time_out(&launch.name, &old), None);
+        assert!(reg.time_out(&launch.name, &old).is_none());
         let current = reg.current(&launch.name, &new).expect("replacement");
         assert_eq!(current.status, ServiceStatus::Running);
         assert_eq!(current.pid, Some(42));
@@ -1437,6 +1625,7 @@ mod tests {
     #[test]
     fn readiness_cannot_resurrect_any_terminal_status() {
         for terminal in [
+            ServiceStatus::Stopping,
             ServiceStatus::Exited,
             ServiceStatus::Failed,
             ServiceStatus::Killed,
@@ -1463,7 +1652,13 @@ mod tests {
         reg.reserve(&launch, &ring, &PathBuf::from("killed.log"))
             .expect("reserve");
         reg.current_mut(&launch.name, &ring).expect("entry").pid = Some(42);
-        assert_eq!(reg.time_out(&launch.name, &ring), Some(42));
+        let control = reg.time_out(&launch.name, &ring).expect("stop requested");
+        assert!(control.stop_requested.load(Ordering::Acquire));
+        assert!(control.force_requested.load(Ordering::Acquire));
+        assert_eq!(
+            reg.current(&launch.name, &ring).expect("stopping").status,
+            ServiceStatus::Stopping
+        );
         assert!(reg.settle(&launch.name, &ring, 137));
         let settled = reg.current(&launch.name, &ring).expect("entry");
         assert_eq!(settled.status, ServiceStatus::Killed);
@@ -1483,6 +1678,10 @@ mod tests {
             .lock()
             .expect("registry")
             .time_out(&launch.name, &old);
+        registry() // ubs:ignore[rust.async.lock-unwrap] -- Synchronous fixture injects completed cleanup for the old incarnation.
+            .lock()
+            .expect("registry")
+            .settle(&launch.name, &old, -1);
         let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"))
             .expect("new reservation");
         drop(pending_old);
@@ -1607,6 +1806,7 @@ mod tests {
 
     impl portable_pty::Child for RecordingChild {
         fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            self.events.lock().expect("events").push("try_wait"); // ubs:ignore[rust.async.lock-unwrap] -- Synchronous fake-child observation; poisoning fails the test.
             Ok(None)
         }
 
@@ -1654,6 +1854,32 @@ mod tests {
     }
 
     #[test]
+    fn child_guard_retries_wait_failure_before_releasing_ownership() {
+        let (child, events) = recording_child(&[
+            WaitStep::Failed,
+            WaitStep::Interrupted,
+            WaitStep::Exit(137),
+        ]);
+        drop(child);
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["kill", "wait", "kill", "wait", "wait"]
+        );
+    }
+
+    #[test]
+    fn forced_monitor_uses_owned_handle_and_reaps_before_returning() {
+        let (child, events) = recording_child(&[WaitStep::Interrupted, WaitStep::Exit(137)]);
+        let control = ServiceControl::default();
+        control.request_stop(true);
+        assert_eq!(child.monitor(&control), 137);
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["try_wait", "kill", "wait", "wait"]
+        );
+    }
+
+    #[test]
     fn child_monitor_retries_interruption_without_killing_a_reaped_child() {
         let (child, events) = recording_child(&[WaitStep::Interrupted, WaitStep::Exit(7)]);
         assert_eq!(child.wait(), 7);
@@ -1663,7 +1889,7 @@ mod tests {
     #[test]
     fn child_monitor_wait_failure_still_kills_and_reaps() {
         let (child, events) = recording_child(&[WaitStep::Failed, WaitStep::Exit(137)]);
-        assert_eq!(child.wait(), -1);
+        assert_eq!(child.wait(), 137);
         assert_eq!(
             *events.lock().expect("events"),
             vec!["wait", "kill", "wait"]
@@ -1726,6 +1952,10 @@ mod tests {
             err.to_string().contains("PI_HUB_NOT_READY"),
             "expected not-ready error, got: {err}"
         );
+        let settled = describe("hub-test-dead").expect("readiness cleanup settled");
+        assert_eq!(settled.status, "killed");
+        assert_eq!(settled.pid, None);
+        assert!(settled.exit_code.is_some());
     }
 
     #[cfg(unix)]
@@ -1846,15 +2076,13 @@ mod tests {
         let pid = snapshot.pid.expect("pid");
         let stopped = stop(name).expect("stop");
         assert_eq!(stopped.status, "killed");
-        std::thread::sleep(Duration::from_millis(500));
-        // A reaped-away process is dead; a not-yet-reaped zombie (state Z)
-        // is dead too — only a live state fails the assertion.
-        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit(')').next()?.trim().chars().next());
+        assert_eq!(stopped.pid, None);
+        assert!(stopped.exit_code.is_some());
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
+            .expect("positive child pid");
         assert!(
-            state.is_none() || state == Some('Z'),
-            "process {pid} survived stop (state {state:?})"
+            rustix::process::test_kill_process(pid).is_err(),
+            "stop must return after reap, without a surviving process or zombie"
         );
     }
 

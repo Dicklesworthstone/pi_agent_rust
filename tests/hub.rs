@@ -85,6 +85,120 @@ fn proc_state(pid: u32) -> Option<char> {
         .and_then(|stat| stat.rsplit(')').next()?.trim().chars().next())
 }
 
+#[cfg(unix)]
+fn assert_reaped(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
+        .expect("positive child pid");
+    assert!( // ubs:ignore[rust.panic.assert-macros] -- The fixture requires actual process absence after successful stop.
+        rustix::process::test_kill_process(pid).is_err(),
+        "service must be reaped before successful settlement, including on platforms without /proc"
+    );
+}
+
+#[cfg(unix)]
+struct ServiceCleanup(&'static str);
+
+#[cfg(unix)]
+impl Drop for ServiceCleanup {
+    fn drop(&mut self) {
+        let _ = pi::hub::send_signal(self.0, sysinfo::Signal::Kill);
+        let _ = pi::hub::stop(self.0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn graceful_stop_preserves_cleanup_and_returns_reaped_exit_metadata() {
+    let _guard = hub_test_guard();
+    let case = "graceful_stop_preserves_cleanup_and_returns_reaped_exit_metadata";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-graceful-cleanup";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import pathlib, signal, sys, time
+def terminate(*_):
+    time.sleep(1)
+    pathlib.Path('grace-completed').write_text('clean shutdown')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, terminate)
+print('graceful-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "graceful-ready", "timeoutSecs": 20}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started)); // ubs:ignore[rust.panic.assert-macros] -- Real service startup must succeed before exercising cleanup.
+    let pid = u32::try_from(
+        started.details.as_ref().expect("start details")["pid"] // ubs:ignore[rust.panic.direct-indexing] -- Successful service descriptor must carry its child PID.
+            .as_u64()
+            .expect("child pid"),
+    )
+    .expect("pid fits u32");
+    let stopped = hub_exec(&root, json!({"op": "stop", "name": name}));
+    assert!(!stopped.is_error, "{}", first_text(&stopped)); // ubs:ignore[rust.panic.assert-macros] -- Stop must finish the real child lifecycle.
+    let details = stopped.details.as_ref().expect("stop details");
+    assert_eq!(details["status"], "killed"); // ubs:ignore[rust.panic.assert-macros] -- Requested termination must have settled.
+    assert_eq!(details["exitCode"], 0); // ubs:ignore[rust.panic.assert-macros] -- Graceful handler exited successfully.
+    assert!(details["pid"].is_null()); // ubs:ignore[rust.panic.assert-macros] -- Reaped children no longer publish a PID.
+    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The grace window must preserve the child's cleanup work.
+        std::fs::read_to_string(root.join("grace-completed")).expect("graceful cleanup ran"),
+        "clean shutdown"
+    );
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_escalates_term_ignoring_service_before_rebinding_its_port() {
+    let _guard = hub_test_guard();
+    let case = "restart_escalates_term_ignoring_service_before_rebinding_its_port";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-stubborn-restart";
+    let _cleanup = ServiceCleanup(name);
+    let port = free_port();
+    let script = r"import signal, socket, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('127.0.0.1', int(sys.argv[1])))
+server.listen()
+print('stubborn-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let first = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script, port.to_string()],
+            "ready": {"log": "stubborn-ready", "port": port, "timeoutSecs": 20}
+        }),
+    );
+    assert!(!first.is_error, "{}", first_text(&first)); // ubs:ignore[rust.panic.assert-macros] -- Real listening service is the restart precondition.
+    let first_details = first.details.as_ref().expect("first details");
+    let old_pid = u32::try_from(first_details["pid"].as_u64().expect("first pid")) // ubs:ignore[rust.panic.direct-indexing] -- Capture the actual first incarnation before restart.
+        .expect("pid fits u32");
+    let restart_started = std::time::Instant::now();
+    let restarted = hub_exec(&root, json!({"op": "restart", "name": name}));
+    assert!(!restarted.is_error, "{}", first_text(&restarted)); // ubs:ignore[rust.panic.assert-macros] -- Replacement must bind after the previous process is gone.
+    assert!(restart_started.elapsed() >= Duration::from_secs(3)); // ubs:ignore[rust.panic.assert-macros] -- TERM-ignoring child must receive the full grace window.
+    let details = restarted.details.as_ref().expect("restart details");
+    assert_eq!(details["status"], "running"); // ubs:ignore[rust.panic.assert-macros] -- New service reached readiness.
+    assert_eq!(details["ready"], true); // ubs:ignore[rust.panic.assert-macros] -- Both readiness gates passed.
+    assert_ne!(first_details["pid"], details["pid"]); // ubs:ignore[rust.panic.assert-macros] -- Restart created a distinct process.
+    assert_ne!(first_details["logPath"], details["logPath"]); // ubs:ignore[rust.panic.assert-macros] -- Incarnations retain separate logs.
+    assert_reaped(old_pid);
+    finish_case(&harness, case);
+}
+
 #[test]
 fn fixture_server_readiness_conjunction_and_lifecycle() {
     let _guard = hub_test_guard();
@@ -341,9 +455,17 @@ fn session_exit_kills_non_detached_services() {
         .info("verify", format!("service pids: {pid_a}, {pid_b}"));
 
     pi::hub::kill_session_services();
-    std::thread::sleep(Duration::from_millis(500));
+
+    for name in ["svc-a", "svc-b"] {
+        let settled = pi::hub::describe(name).expect("settled service");
+        assert_eq!(settled.status, "killed"); // ubs:ignore[rust.panic.assert-macros] -- Session cleanup must settle every service.
+        assert!(settled.pid.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Cleanup returns only after reap.
+        assert!(settled.exit_code.is_some()); // ubs:ignore[rust.panic.assert-macros] -- Terminal exit metadata is already available.
+    }
 
     for pid in [pid_a, pid_b] {
+        #[cfg(unix)]
+        assert_reaped(pid);
         let state = proc_state(pid);
         harness.log().info(
             "verify",
