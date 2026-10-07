@@ -122,6 +122,7 @@ pub(super) fn prepare(
 
 pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     let shared = agent.agent.shared_tools();
+    shared.bind_mcp_manager(&state.manager);
     let current = shared.snapshot();
     let host = state.host_registry.get_or_init(|| current.clone_shallow());
     let mut next = host.clone_shallow();

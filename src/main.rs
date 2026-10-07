@@ -2708,10 +2708,8 @@ async fn run(
     // The classic/RPC session owns this manager; FTUI's SDK-owned manager
     // performs its own connect-and-mount pass after that session's
     // extensions load (bd-vjfol).
-    let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(&mcp_manager).await;
-    if !mcp_wrappers.is_empty() {
-        agent_session.agent.extend_tools(mcp_wrappers);
-    }
+    mcp_manager.connect_trusted().await;
+    pi::mcp::reconcile_tools(&mcp_manager, &agent_session.agent.shared_tools());
 
     if has_extensions {
         let session_snapshot = {

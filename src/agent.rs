@@ -4200,6 +4200,9 @@ impl Agent {
         abort: Option<AbortSignal>,
         checkpoint_cx: &crate::agent_cx::AgentCx,
     ) -> Result<AssistantMessage> {
+        // Refresh admitted MCP catalogs before capturing the provider's tool
+        // schema, under the same owner and cancellation as this request.
+        crate::mcp::refresh_agent_tools(&self.tools, abort.as_ref(), checkpoint_cx).await;
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
         let mut stream_options = self.config.stream_options.clone();

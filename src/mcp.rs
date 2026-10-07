@@ -128,6 +128,10 @@ impl Tool for McpTool {
         self.schema.clone()
     }
 
+    fn mcp_manager(&self) -> Option<&std::sync::Arc<McpManager>> {
+        Some(&self.manager)
+    }
+
     fn effects(&self) -> ToolEffects {
         // MCP servers are external processes/network endpoints; calls may
         // mutate remote state, so they are scheduling barriers.
@@ -393,6 +397,10 @@ fn completion_output(result: Value) -> ToolOutput {
 
 #[async_trait]
 impl Tool for McpContextTool {
+    fn mcp_manager(&self) -> Option<&std::sync::Arc<McpManager>> {
+        Some(&self.manager)
+    }
+
     fn name(&self) -> &str {
         &self.mounted
     }
@@ -582,6 +590,50 @@ pub async fn connect_trusted_and_mount_tools(
     mount_tools(manager)
 }
 
+/// Bind this manager even when its catalog is empty, then publish the current
+/// admitted catalog. Only this exact manager's wrappers may be removed or
+/// replaced; in-flight calls keep their previous immutable registry snapshot.
+/// Returns the number of added, replaced, or removed wrappers.
+pub fn reconcile_tools(
+    manager: &std::sync::Arc<McpManager>,
+    registry: &crate::tools::SharedToolRegistry,
+) -> usize {
+    registry.bind_mcp_manager(manager);
+    registry.reconcile_mcp_tools(manager, mount_tools(manager))
+}
+
+/// Refresh stale catalogs at the provider-request boundary, including requests
+/// following tool-triggered reconnects in the same turn. Healthy fresh catalogs
+/// do no network work and unchanged definitions do not invalidate the schema
+/// cache. Cancellation abandons refresh before a provider can be contacted.
+pub(crate) async fn refresh_agent_tools(
+    registry: &crate::tools::SharedToolRegistry,
+    abort: Option<&crate::agent::AbortSignal>,
+    owner: &crate::agent_cx::AgentCx,
+) {
+    for manager in registry.mcp_managers() {
+        if owner.checkpoint().is_err() || abort.is_some_and(crate::agent::AbortSignal::is_aborted) {
+            return;
+        }
+        if let Some(abort) = abort {
+            let refresh = std::pin::pin!(owner.with_current(manager.refresh_stale_tools()));
+            let cancelled = std::pin::pin!(abort.wait());
+            if matches!(
+                futures::future::select(refresh, cancelled).await,
+                futures::future::Either::Right(_)
+            ) {
+                return;
+            }
+        } else {
+            owner.with_current(manager.refresh_stale_tools()).await;
+        }
+        if owner.checkpoint().is_err() {
+            return;
+        }
+        reconcile_tools(&manager, registry);
+    }
+}
+
 /// Bring MCP servers that extensions registered after startup into a live
 /// agent (bd-8m21l).
 ///
@@ -590,8 +642,9 @@ pub async fn connect_trusted_and_mount_tools(
 /// only updates the extension manager's snapshot. This drains that snapshot:
 /// every definition whose name the manager does not know yet is registered
 /// under the same trust gate as at startup, and when anything was new the
-/// trusted servers are connected and only tool names the agent does not
-/// already have are mounted. Returns the number of newly registered
+/// trusted servers are connected and their owned wrappers are reconciled,
+/// including changed or removed definitions. Unrelated names are preserved.
+/// Returns the number of newly registered
 /// definitions; cheap when nothing changed, so callers run it at every turn
 /// start (SDK/FrankenTUI prompts and the classic TUI's turn task).
 pub async fn sync_extension_registrations(
@@ -627,9 +680,8 @@ pub async fn sync_extension_registrations(
             registered,
             "registered extension MCP servers contributed after startup"
         );
-        let mut wrappers = connect_trusted_and_mount_tools(manager).await;
-        wrappers.retain(|tool| !agent.has_tool(tool.name()));
-        agent.extend_tools(wrappers);
+        manager.connect_trusted().await;
+        reconcile_tools(manager, &agent.shared_tools());
     }
     registered
 }

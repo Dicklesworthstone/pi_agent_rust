@@ -4242,18 +4242,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 "test" => manager.test(&name).await,
                 _ => manager.trust(&name).await,
             };
+            // A refreshed catalog replaces old definitions and removes tools
+            // no longer admitted, including deny and failed discovery. Take
+            // the Agent lock so publication occurs between its active turns.
+            let changed = if let Ok(agent) = agent.lock(&task_cx).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools())
+            } else {
+                0
+            };
             let message = match outcome {
                 Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
                 Ok(tools) => {
-                    // Mount any newly available tools into the live agent
-                    // (extend_tools invalidates the def cache).
-                    let wrappers = crate::mcp::mount_tools(&manager);
-                    let mounted = wrappers.len();
-                    if mounted > 0
-                        && let Ok(mut agent) = agent.lock(&task_cx).await
-                    {
-                        agent.extend_tools(wrappers);
-                    }
                     let verb = if subcommand == "test" {
                         "tested"
                     } else {
@@ -4269,10 +4268,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     if tools.len() > 12 {
                         let _ = writeln!(line, "  … and {} more", tools.len() - 12);
                     }
-                    if mounted > 0 {
+                    if changed > 0 {
                         let _ = writeln!(
                             line,
-                            "Mounted {mounted} mcp__* tool(s) into the live session."
+                            "Updated {changed} MCP tool definition(s) in the live session."
                         );
                     }
                     line

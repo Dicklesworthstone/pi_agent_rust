@@ -219,6 +219,12 @@ pub trait Tool: Send + Sync {
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::BuiltIn
     }
+
+    /// Exact owner of a mounted MCP wrapper. Names alone cannot establish
+    /// ownership: an extension or caller may deliberately use the same name.
+    fn mcp_manager(&self) -> Option<&Arc<crate::mcp::McpManager>> {
+        None
+    }
 }
 
 /// Provenance of a registered tool.
@@ -6053,6 +6059,54 @@ impl ToolRegistry {
         }
     }
 
+    /// Reconcile one manager's authoritative catalog without replacing any
+    /// unrelated tool, including a currently shelved extension registration.
+    /// Old snapshots retain their Arc handles for calls already in flight.
+    pub(crate) fn reconcile_mcp_tools(
+        &mut self,
+        manager: &Arc<crate::mcp::McpManager>,
+        mut replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        let owned = |tool: &dyn Tool| {
+            tool.mcp_manager()
+                .is_some_and(|owner| Arc::ptr_eq(owner, manager))
+        };
+        let mut changed = 0usize;
+        self.tools.retain_mut(|tool| {
+            if !owned(tool.as_ref()) {
+                return true;
+            }
+            let Some(index) = replacements
+                .iter()
+                .position(|next| next.name() == tool.name())
+            else {
+                changed += 1;
+                return false;
+            };
+            let mut next = replacements.remove(index);
+            if next.description() != tool.description() || next.parameters() != tool.parameters() {
+                next.bind_job_session_scope(self.job_session_scope.clone());
+                *tool = Arc::from(next);
+                changed += 1;
+            }
+            true
+        });
+        for mut next in replacements {
+            if self
+                .tools
+                .iter()
+                .chain(&self.inactive)
+                .any(|tool| tool.name() == next.name())
+            {
+                continue;
+            }
+            next.bind_job_session_scope(self.job_session_scope.clone());
+            self.tools.push(Arc::from(next));
+            changed += 1;
+        }
+        changed
+    }
+
     /// The shared scope captured by the job completion fetcher.
     #[must_use]
     pub fn job_session_scope(&self) -> crate::jobs::JobSessionScope {
@@ -6096,6 +6150,9 @@ pub struct SharedToolRegistry {
 /// rebuilt from a snapshot observes and bumps the same version.
 pub struct SharedToolRegistryInner {
     registry: std::sync::RwLock<Arc<ToolRegistry>>,
+    /// Retained independently of wrappers, including an empty or denied
+    /// catalog, so a later successful refresh can mount newly added tools.
+    mcp_managers: std::sync::Mutex<Vec<Arc<crate::mcp::McpManager>>>,
     /// Bumped on every published update; the agent folds it into its tool
     /// schema cache key so a swap made from a hostcall (for example
     /// `setActiveTools`) reaches the next provider request without any
@@ -6106,10 +6163,21 @@ pub struct SharedToolRegistryInner {
 impl SharedToolRegistry {
     #[must_use]
     pub fn new(mut registry: ToolRegistry) -> Self {
+        let mut mcp_managers = registry
+            .shared_handle()
+            .map_or_else(Vec::new, |shared| shared.mcp_managers());
+        for tool in registry.tools() {
+            if let Some(manager) = tool.mcp_manager()
+                && !mcp_managers.iter().any(|bound| Arc::ptr_eq(bound, manager))
+            {
+                mcp_managers.push(Arc::clone(manager));
+            }
+        }
         let inner = Arc::new_cyclic(|weak| {
             registry.shared = Some(weak.clone());
             SharedToolRegistryInner {
                 registry: std::sync::RwLock::new(Arc::new(registry)),
+                mcp_managers: std::sync::Mutex::new(mcp_managers),
                 version: std::sync::atomic::AtomicU64::new(0),
             }
         });
@@ -6136,6 +6204,46 @@ impl SharedToolRegistry {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.inner.version.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn bind_mcp_manager(&self, manager: &Arc<crate::mcp::McpManager>) {
+        let mut managers = self
+            .inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !managers.iter().any(|bound| Arc::ptr_eq(bound, manager)) {
+            managers.push(Arc::clone(manager));
+        }
+    }
+
+    pub(crate) fn mcp_managers(&self) -> Vec<Arc<crate::mcp::McpManager>> {
+        self.inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn reconcile_mcp_tools(
+        &self,
+        manager: &Arc<crate::mcp::McpManager>,
+        replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let changed = next.reconcile_mcp_tools(manager, replacements);
+        if changed > 0 {
+            *guard = Arc::new(next);
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        changed
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply

@@ -18,6 +18,8 @@ use crate::error::{Error, Result};
 mod calls;
 mod catalog;
 mod connection;
+#[cfg(test)]
+mod live_catalog_tests;
 mod output_schema;
 
 pub use output_schema::McpOutputSchema;
@@ -1448,6 +1450,31 @@ impl McpManager {
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
     #[allow(clippy::significant_drop_in_scrutinee)]
     async fn connect_trusted_with_budget(&self, budget: Duration) {
+        self.connect_trusted_with_policy(budget, false).await;
+    }
+
+    /// Reuse the bounded, trust-gated connection owner at a request boundary.
+    /// Fresh catalogs are left untouched; failed or expired discovery cannot
+    /// keep advertising the prior catalog as current.
+    pub(crate) async fn refresh_stale_tools(&self) {
+        self.connect_trusted_with_policy(STARTUP_CONNECT_BUDGET, true)
+            .await;
+    }
+
+    fn catalog_is_fresh(entry: &ServerEntry) -> bool {
+        let transport = Self::lock(&entry.transport);
+        transport
+            .as_ref()
+            .is_some_and(|transport| transport.is_alive())
+            && matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. })
+            && Self::lock(&entry.tools_cache)
+                .as_ref()
+                .is_some_and(|(at, _)| at.elapsed() <= TOOL_CACHE_TTL)
+    }
+
+    // Generation capture and catalog publication retain the connection lane.
+    #[allow(clippy::significant_drop_in_scrutinee)]
+    async fn connect_trusted_with_policy(&self, budget: Duration, stale_only: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let Ok(store) = self.trust_store() else {
@@ -1459,6 +1486,7 @@ impl McpManager {
         for entry in servers.values().filter(|entry| {
             store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
                 == TrustDecision::Acknowledged
+                && (!stale_only || !Self::catalog_is_fresh(entry))
         }) {
             let entry = Arc::clone(entry);
             let completed = Arc::new(AtomicBool::new(false));
@@ -1476,7 +1504,9 @@ impl McpManager {
                 )
                 .await;
                 if let Ok(connect_guard) = connect_guard {
-                    if self.ensure_ready_in_lane(&entry).await.is_ok() {
+                    if (!stale_only || !Self::catalog_is_fresh(&entry))
+                        && self.ensure_ready_in_lane(&entry).await.is_ok()
+                    {
                         // Capture and list one exact generation while retaining
                         // the same lane. Timeout cleanup can then safely compare
                         // this snapshot with the transport whose request hung.
@@ -2151,7 +2181,7 @@ mod tests {
             .expect("acknowledge fixture execution");
     }
 
-    fn trusted_fixture_manager(temp: &tempfile::TempDir) -> (McpManager, Arc<ServerEntry>) {
+    pub(super) fn trusted_fixture_manager(temp: &tempfile::TempDir) -> (McpManager, Arc<ServerEntry>) {
         let cwd = temp.path().join("project");
         let global = temp.path().join("global");
         std::fs::create_dir_all(&cwd).expect("project directory");

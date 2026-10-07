@@ -6882,10 +6882,10 @@ async fn run_mcp_command(
             return;
         }
     };
+    let changed = crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
     let message = match outcome {
         Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
         Ok(tools) => {
-            let mounted = handle.mount_mcp_server_tools_if_absent(name);
             let verb = if subcommand == "test" {
                 "tested"
             } else {
@@ -6901,10 +6901,10 @@ async fn run_mcp_command(
             if tools.len() > 12 {
                 let _ = writeln!(line, "  … and {} more", tools.len() - 12);
             }
-            if mounted > 0 {
+            if changed > 0 {
                 let _ = writeln!(
                     line,
-                    "Mounted {mounted} new mcp__* tool(s) into the live session."
+                    "Updated {changed} MCP tool definition(s) in the live session."
                 );
             }
             line

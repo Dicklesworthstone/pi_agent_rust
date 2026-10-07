@@ -1985,21 +1985,21 @@ impl AgentSessionHandle {
             .await
     }
 
-    /// Mount cached tools for one MCP server, skipping exact names already
-    /// present in this Agent. Returns the number of wrappers added.
+    /// Synchronize MCP tools after a named server's trust/test operation.
+    /// Returns the number of wrappers added, replaced, or removed.
     ///
-    /// Runtime trust/test controls use this shared seam so repeated commands
-    /// cannot duplicate provider-visible tool definitions (bd-vjfol).
+    /// Existing names receive their current schemas, withdrawn tools disappear,
+    /// and unrelated registrations are preserved. Repeated unchanged catalogs
+    /// return zero.
     #[must_use]
-    pub fn mount_mcp_server_tools_if_absent(&mut self, server_name: &str) -> usize {
+    pub fn refresh_mcp_server_tools(&mut self, server_name: &str) -> usize {
         let Some(manager) = self.mcp_manager.clone() else {
             return 0;
         };
-        let mut wrappers = crate::mcp::mount_server_tools(&manager, server_name);
-        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
-        let mounted = wrappers.len();
-        self.session.agent.extend_tools(wrappers);
-        mounted
+        if !manager.list().iter().any(|server| server.name == server_name) {
+            return 0;
+        }
+        crate::mcp::reconcile_tools(&manager, &self.session.agent.shared_tools())
     }
 
     /// Start acknowledged MCP servers and mount their cached tools into this
@@ -2009,9 +2009,8 @@ impl AgentSessionHandle {
         let Some(manager) = self.mcp_manager.clone() else {
             return;
         };
-        let mut wrappers = crate::mcp::connect_trusted_and_mount_tools(&manager).await;
-        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
-        self.session.agent.extend_tools(wrappers);
+        manager.connect_trusted().await;
+        crate::mcp::reconcile_tools(&manager, &self.session.agent.shared_tools());
     }
 
     /// Bring MCP servers that extensions registered after startup into the
@@ -2023,9 +2022,9 @@ impl AgentSessionHandle {
     /// unreachable until restart. This drains the snapshot: every definition
     /// whose name the MCP manager does not know yet is registered under the
     /// same trust gate as at startup, and when anything was new the trusted
-    /// servers are connected and only tool names not already mounted are
-    /// added. Returns the number of newly registered definitions. Called at
-    /// the start of every prompt; cheap when nothing changed.
+    /// servers are connected and their owned tool catalogs are reconciled.
+    /// Returns the number of newly registered definitions. Called at the start
+    /// of every prompt; cheap when nothing changed.
     pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
         let Some(manager) = self.mcp_manager.clone().or_else(|| self.session.mcp_manager()) else {
             return 0;
