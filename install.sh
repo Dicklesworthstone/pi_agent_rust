@@ -1198,10 +1198,17 @@ resolve_version() {
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag=""
   if command -v curl >/dev/null 2>&1; then
-    tag=$(fetch_url_to_stdout "$latest_url" "release metadata" 2>/dev/null \
-      | grep '"tag_name":' \
-      | sed -E 's/.*"([^"]+)".*/\1/' \
-      || true)
+    local metadata=""
+    if metadata=$(fetch_url_to_stdout "$latest_url" "release metadata" 2>/dev/null); then
+      # GitHub also sends compact JSON. Extract the value belonging to the
+      # key, not the last quoted value on its line (usually the release body).
+      # Escaped key mentions in the body are not metadata. Fold JSON whitespace
+      # so a pretty-printed key, colon and value may span multiple lines.
+      tag=$(printf '%s\n' "$metadata" \
+        | tr '\n' ' ' \
+        | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"\\]+)".*/\1/p' \
+        || true)
+    fi
     if [ -z "$tag" ]; then
       local redirect_target=""
       redirect_target=$(fetch_effective_url "https://github.com/${OWNER}/${REPO}/releases/latest" "release redirect" 2>/dev/null || true)
