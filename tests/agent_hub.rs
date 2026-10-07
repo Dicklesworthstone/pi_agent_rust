@@ -70,9 +70,9 @@ fn kill_terminates_real_process_tree() {
     // The operator kill path: tree signal + registry settle (mirrors
     // HubTool::dispatch_agent "kill").
     pi::tools::kill_process_group_tree(Some(pid));
-    reg.mark_killed(&entry.id);
-    // Reap the killed child so the probe below sees no zombie.
+    // Reap the killed child so the pid probe below cannot see a zombie.
     let _ = child.wait();
+    reg.mark_killed(&entry.id);
 
     let settled = reg.get(&entry.id).expect("get");
     assert_eq!(settled.status, ChildStatus::Killed);
