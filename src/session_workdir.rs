@@ -6,7 +6,11 @@
 //! These helpers do not change the process cwd or move/delete session files.
 //!
 //! Bindings are session-wide custom entries, not model messages. The original
-//! header cwd remains immutable. Callers must supply a fully hydrated session.
+//! header cwd remains immutable. In-memory helpers require a fully hydrated
+//! session; `inspect_saved_session_workdir` also supports lazily loaded stores.
+
+mod persisted;
+pub use persisted::{SavedSessionWorkdir, inspect_saved_session_workdir};
 
 use std::io;
 use std::path::{Path, PathBuf};
