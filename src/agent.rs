@@ -1656,6 +1656,9 @@ pub struct CommittedFailover {
     pub to_provider: String,
     /// Model now installed.
     pub to_model: String,
+    /// Exact durable branch record captured before releasing the commit lock.
+    /// Recovery callers use it to preserve the live monotonic cooldown.
+    pub(crate) source: Option<crate::failover::FailoverSource>,
 }
 
 /// The result of a chain walk, swapped or not.
@@ -14392,7 +14395,7 @@ impl AgentSession {
                 cooldown_secs: attempt.cooldown_secs,
                 lifecycle_id: attempt.lifecycle_id,
             };
-            self.commit_failover_swap_admitted(cx, &request, admission)
+            let (_, source) = self.commit_failover_swap_admitted(cx, &request, admission)
                 .await?;
             return Ok(FailoverSwapOutcome {
                 next_position,
@@ -14402,6 +14405,7 @@ impl AgentSession {
                     from_model,
                     to_provider,
                     to_model,
+                    source,
                 }),
             });
         }
@@ -14513,6 +14517,7 @@ impl AgentSession {
     ) -> Result<crate::model::ThinkingLevel> {
         self.commit_failover_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
             .await
+            .map(|(thinking_level, _)| thinking_level)
     }
 
     async fn commit_failover_swap_admitted(
@@ -14520,7 +14525,7 @@ impl AgentSession {
         cx: &crate::agent_cx::AgentCx,
         request: &FailoverSwapRequest<'_>,
         admission: Option<ProviderSwapAdmission<'_>>,
-    ) -> Result<crate::model::ThinkingLevel> {
+    ) -> Result<(crate::model::ThinkingLevel, Option<crate::failover::FailoverSource>)> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
@@ -14559,6 +14564,9 @@ impl AgentSession {
             return Err(Error::session_persistence(reason));
         }
 
+        // Capture provenance before releasing this lock. Reading it back
+        // afterwards would add a fallible step after a committed transition.
+        let source = crate::failover::FailoverSource::from_session(&candidate);
         // No fallible operation remains after installing the candidate.
         *inner = candidate;
         self.agent.replace_messages(restored_messages);
@@ -14590,7 +14598,7 @@ impl AgentSession {
         if let Some(gate) = gate {
             gate.clear();
         }
-        Ok(target_thinking)
+        Ok((target_thinking, source))
     }
 
     async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {

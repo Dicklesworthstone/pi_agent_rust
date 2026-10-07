@@ -865,6 +865,9 @@ struct RpcSharedState {
     failover_chain_position: Option<usize>,
     /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
     failover_lifecycle_id: Option<String>,
+    /// Exact branch record behind the running monotonic cooldown. A session
+    /// switch or extension selection must not retain another branch's state.
+    failover_source: Option<crate::failover::FailoverSource>,
     /// Shared with AgentSession and extension hostcalls: every RPC admission
     /// and transition observes the same permanent quarantine authority.
     provider_admission: ProviderAdmissionGate,
@@ -1031,6 +1034,7 @@ impl RpcSharedState {
             active_failover_model: None,
             failover_chain_position: None,
             failover_lifecycle_id: None,
+            failover_source: None,
             provider_admission,
         }
     }
@@ -1201,6 +1205,7 @@ impl RpcSharedState {
         self.active_failover_model = None;
         self.failover_chain_position = None;
         self.failover_lifecycle_id = None;
+        self.failover_source = None;
         if let Some(tracker) = self.failover_cooldown.as_mut() {
             tracker.reset();
         }
@@ -1212,22 +1217,28 @@ impl RpcSharedState {
         configured_cooldown_secs: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        if let Some(provenance) = session.active_failover_provenance_for_current_path() {
-            let reconstructed = crate::failover::FailoverState::reconstruct_from_provenance(
-                provenance,
-                configured_cooldown_secs,
-                now,
-            );
-            let (cooldown, primary, active, chain_position, lifecycle_id) =
-                reconstructed.into_parts();
-            self.failover_primary = primary;
-            self.active_failover_model = active;
-            self.failover_chain_position = Some(chain_position);
-            self.failover_lifecycle_id = lifecycle_id;
-            if cooldown.is_some() {
-                self.failover_cooldown = cooldown;
-            }
+        let Some(source) = crate::failover::FailoverSource::from_session(session) else {
+            self.clear_failover_lifecycle();
+            return;
+        };
+        if self.failover_source.as_ref() == Some(&source) {
+            // Re-reading an unchanged record must not restart legacy timers
+            // or move a running cooldown when the wall clock changes.
+            return;
         }
+        let reconstructed = crate::failover::FailoverState::reconstruct_from_session(
+            session,
+            configured_cooldown_secs,
+            now,
+        );
+        let (cooldown, primary, active, chain_position, lifecycle_id) =
+            reconstructed.into_parts();
+        self.failover_primary = primary;
+        self.active_failover_model = active;
+        self.failover_chain_position = Some(chain_position);
+        self.failover_lifecycle_id = lifecycle_id;
+        self.failover_cooldown = cooldown;
+        self.failover_source = Some(source);
     }
 }
 
@@ -1706,36 +1717,22 @@ pub async fn run(
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        let (initial_plan_mode, failover_provenance) = {
+        let initial_plan_mode = {
+            let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                .await
+                .map_err(|err| Error::session(format!("shared state lock failed: {err}")))?;
             let inner = guard
                 .session
                 .lock(&cx)
                 .await
                 .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-            (
-                replayed_plan_mode(&inner),
-                inner.active_failover_provenance_for_current_path().cloned(),
-            )
-        };
-        if let Some(provenance) = failover_provenance {
-            let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                .await
-                .map_err(|err| Error::session(format!("shared state lock failed: {err}")))?;
-            let reconstructed = crate::failover::FailoverState::reconstruct_from_provenance(
-                &provenance,
+            state.reconstruct_failover_from_session(
+                &inner,
                 options.config.failover_cooldown_secs(),
                 chrono::Utc::now(),
             );
-            let (cooldown, primary, active, chain_position, lifecycle_id) =
-                reconstructed.into_parts();
-            state.failover_primary = primary;
-            state.active_failover_model = active;
-            state.failover_chain_position = Some(chain_position);
-            state.failover_lifecycle_id = lifecycle_id;
-            if cooldown.is_some() {
-                state.failover_cooldown = cooldown;
-            }
-        }
+            replayed_plan_mode(&inner)
+        };
         guard.agent.reset_session_scoped_state(initial_plan_mode);
         guard.set_queue_modes(
             options.config.steering_queue_mode(),
@@ -4386,6 +4383,11 @@ pub async fn run(
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
+                            state.reconstruct_failover_from_session(
+                                &new_session,
+                                options.config.failover_cooldown_secs(),
+                                chrono::Utc::now(),
+                            );
                             *inner_session = new_session;
                             session_transition_permit.commit_session_change();
                             drop(inner_session);
@@ -4424,7 +4426,6 @@ pub async fn run(
                                 );
                             }
                             state.clear_all_pending();
-                            state.clear_failover_lifecycle();
                             Ok((previous_session_file, session_id))
                         }
                         .await;
@@ -4653,6 +4654,11 @@ pub async fn run(
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        state.reconstruct_failover_from_session(
+                            &new_session,
+                            options.config.failover_cooldown_secs(),
+                            chrono::Utc::now(),
+                        );
                         *inner = new_session;
                         session_transition_permit.commit_session_change();
                         drop(inner);
@@ -4688,7 +4694,6 @@ pub async fn run(
                             );
                         }
                         state.clear_all_pending();
-                        state.clear_failover_lifecycle();
                         session_id
                     };
 
@@ -6122,6 +6127,36 @@ async fn sync_runtime_before_rpc_ack(
     guard.sync_runtime_selection_from_session_header().await
 }
 
+/// Reconcile under provider and session-action authority so an extension
+/// cannot replace the branch between this snapshot and the ensuing swap.
+/// A pending runtime synchronization belongs to that newer selection; an
+/// error from the previous provider must not overwrite it with a fallback.
+async fn reconcile_rpc_failover_state(
+    guard: &AgentSession,
+    state: &mut RpcSharedState,
+    configured_cooldown_secs: u64,
+    cx: &AgentCx,
+) -> Result<bool> {
+    let inner = guard
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))?;
+    let runtime = guard.agent.provider();
+    let runtime_matches_session = inner.effective_model_for_current_path().is_none_or(
+        |(provider, model)| {
+            provider_ids_match(runtime.name(), &provider)
+                && runtime.model_id().eq_ignore_ascii_case(&model)
+        },
+    );
+    state.reconstruct_failover_from_session(
+        &inner,
+        configured_cooldown_secs,
+        chrono::Utc::now(),
+    );
+    Ok(runtime_matches_session)
+}
+
 /// Cooldown restore (bd-cv653.3.2): when a previous turn failed over and the
 /// cooldown elapsed, durably restore the explicitly recorded primary before
 /// changing the live provider or shared failover state.
@@ -6132,17 +6167,31 @@ async fn maybe_restore_primary(
     options: &RpcOptions,
     cx: &AgentCx,
 ) -> Result<()> {
-    // Transition lock order is AgentSession -> shared state -> inner Session.
-    // Keep all three through the synchronous install so direct Session readers
-    // cannot observe a new header before the Agent/shared state changes.
+    // The outer AgentSession excludes other RPC commands. Acquire provider
+    // authority before session-action authority, matching SDK recovery, so
+    // extension callbacks can finish before their branch is inspected.
     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx)
         .await
         .map_err(|err| Error::session(format!("primary restore session lock failed: {err}")))?;
+    let admission = guard.provider_admission_gate();
+    let provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+    let session_actions = guard.session_action_admission_gate();
+    let session_action_permit = session_actions.acquire(cx.cx()).await?;
     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("primary restore state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
+    if !reconcile_rpc_failover_state(
+        &guard,
+        &mut state,
+        options.config.failover_cooldown_secs(),
+        cx,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let Some((active_provider, active_model)) = state.active_failover_model.clone() else {
         return Ok(());
     };
@@ -6176,7 +6225,7 @@ async fn maybe_restore_primary(
         invalidate_background_compaction: true,
     };
     let Some(restored) = guard
-        .restore_primary_swap(cx, &request, Some(&state.provider_admission))
+        .restore_primary_with_authority(cx, &request, &provider_authority)
         .await?
     else {
         return Ok(());
@@ -6184,6 +6233,8 @@ async fn maybe_restore_primary(
     state.clear_failover_lifecycle();
 
     drop(state);
+    drop(session_action_permit);
+    drop(provider_authority);
     drop(guard);
     let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
         success: true,
@@ -6224,21 +6275,33 @@ async fn try_failover_to_next_chain_entry(
         return Ok(false);
     };
 
-    // Hold both transition authorities until the staged Session candidate is
-    // durable and the infallible in-memory install is complete. The lock order
-    // matches the other RPC session->shared-state paths.
+    // Keep extension model/branch actions excluded through reconciliation,
+    // persistence and installation, using the same authority order as SDK.
     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx)
         .await
         .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
-    let provider = guard.agent.provider();
-    let (current_provider, current_model) =
-        (provider.name().to_string(), provider.model_id().to_string());
-
+    let admission = guard.provider_admission_gate();
+    let provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+    let session_actions = guard.session_action_admission_gate();
+    let session_action_permit = session_actions.acquire(cx.cx()).await?;
     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("failover state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
+    if !reconcile_rpc_failover_state(
+        &guard,
+        &mut state,
+        options.config.failover_cooldown_secs(),
+        cx,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    let provider = guard.agent.provider();
+    let (current_provider, current_model) =
+        (provider.name().to_string(), provider.model_id().to_string());
     let primary_model = match (
         state.active_failover_model.as_ref(),
         state.failover_primary.as_ref(),
@@ -6295,6 +6358,10 @@ async fn try_failover_to_next_chain_entry(
     // persisted transition are all AgentSession::try_failover_swap, shared with
     // print mode (bd-u2qv4). What stays here is RPC's own: the admission gate
     // it passes in, its shared-state bookkeeping, and its event frames.
+    let lifecycle_id = state
+        .failover_lifecycle_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let attempt = crate::agent::FailoverSwapAttempt {
         chain: &chain,
         start_position: state.failover_chain_position.unwrap_or(0),
@@ -6310,11 +6377,10 @@ async fn try_failover_to_next_chain_entry(
         require_incomplete_tail,
         primary: Some(&primary_model),
         cooldown_secs: Some(options.config.failover_cooldown_secs()),
-        lifecycle_id: state.failover_lifecycle_id.as_deref(),
+        lifecycle_id: Some(&lifecycle_id),
     };
-    let admission = state.provider_admission.clone();
     let outcome = guard
-        .try_failover_swap(cx, &attempt, Some(&admission))
+        .try_failover_with_authority(cx, &attempt, &provider_authority)
         .await?;
     let Some(committed) = outcome.committed else {
         // Deliberately NOT recorded on an exhausted chain: the next turn
@@ -6330,16 +6396,17 @@ async fn try_failover_to_next_chain_entry(
         // half, which nothing did while it was merely a convention.
         return Ok(false);
     };
-    if state.failover_lifecycle_id.is_none() {
-        state.failover_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
-    }
+    state.failover_lifecycle_id = Some(lifecycle_id);
+    state.failover_source = committed.source.clone();
     state.failover_chain_position = Some(outcome.next_position);
 
     state.failover_primary = Some(primary_model.clone());
     state.active_failover_model = Some((committed.to_provider.clone(), committed.to_model.clone()));
-    if let Some(tracker) = state.failover_cooldown.as_mut() {
-        tracker.record_primary_failure(std::time::Instant::now());
-    }
+    // A resumed record may carry an older policy. This newly committed hop
+    // persisted the current duration, so its live timer must use that too.
+    let mut cooldown = crate::failover::CooldownTracker::new(options.config.failover_cooldown_secs());
+    cooldown.record_primary_failure(std::time::Instant::now());
+    state.failover_cooldown = Some(cooldown);
     state.provider_admission.clear();
 
     let event = agent_event(AgentEvent::FailoverStart {
@@ -6354,6 +6421,8 @@ async fn try_failover_to_next_chain_entry(
         chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
     });
     drop(state);
+    drop(session_action_permit);
+    drop(provider_authority);
     drop(guard);
     if let Some(attempt) = retry_attempt_to_end {
         let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
@@ -8985,6 +9054,524 @@ mod retry_tests {
                 "unexpected extra failover event"
             );
         });
+    }
+
+    fn rpc_recovery_entry(model_id: &str) -> ModelEntry {
+        let mut entry = dummy_entry(model_id, false);
+        entry.model.provider = "rpc-recovery-fixture".to_string();
+        entry.model.api = "rpc-recovery-test-api".to_string();
+        entry.model.base_url = "http://127.0.0.1:1/unreachable".to_string();
+        entry.model.context_window = 64_000;
+        entry.model.max_tokens = 777;
+        entry
+    }
+
+    fn seed_rpc_recovery_session(
+        mut session: Session,
+        primary: &ModelEntry,
+        fallback: &ModelEntry,
+        cooldown_secs: u64,
+    ) -> (Session, String) {
+        session.set_model_header(
+            Some(primary.model.provider.clone()),
+            Some(primary.model.id.clone()),
+            Some("off".to_string()),
+        );
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("original request before failover".to_string()),
+            timestamp: Some(0),
+        });
+        session.set_model_header(
+            Some(fallback.model.provider.clone()),
+            Some(fallback.model.id.clone()),
+            Some("off".to_string()),
+        );
+        let deadline = if cooldown_secs == 0 {
+            chrono::Utc::now() - chrono::Duration::seconds(1)
+        } else {
+            chrono::Utc::now() + chrono::Duration::hours(1)
+        };
+        session.append_model_change_with_role_and_failover(
+            fallback.model.provider.clone(),
+            fallback.model.id.clone(),
+            Some("failover".to_string()),
+            Some(crate::session::ModelChangeFailover {
+                primary_provider: primary.model.provider.clone(),
+                primary_model_id: primary.model.id.clone(),
+                primary_thinking_level: Some("off".to_string()),
+                fallback_provider: fallback.model.provider.clone(),
+                fallback_model_id: fallback.model.id.clone(),
+                chain_position: Some(1),
+                cooldown_deadline: Some(deadline.to_rfc3339()),
+                cooldown_secs: Some(cooldown_secs),
+                lifecycle_id: Some("navigation-cycle".to_string()),
+            }),
+        );
+        let entry_id = session.append_message(SessionMessage::User {
+            content: UserContent::Text("prompt selected for fork".to_string()),
+            timestamp: Some(1),
+        });
+        (session, entry_id)
+    }
+
+    fn assert_rpc_navigation_recovers_failover(is_fork: bool, cooldown_secs: u64) {
+        // Navigation and the next real provider turn share the RPC command
+        // loop. A scheduler regression must fail without hanging libtest.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let body = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+                .build()
+                .expect("runtime build");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(Box::pin(async move {
+                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated persistent sessions.
+                let extension_path = temp.path().join("recovery-provider.mjs");
+                std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Real extension provider used by both model destinations.
+                    &extension_path,
+                    r#"
+                    export default function (pi) {
+                      pi.registerProvider("rpc-recovery-fixture", {
+                        api: "rpc-recovery-test-api",
+                        baseUrl: "http://127.0.0.1:1/unreachable",
+                        models: ["primary", "fallback"].map(id => ({
+                          id, name: id, reasoning: false, input: ["text"],
+                          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                          contextWindow: 64000, maxTokens: 777
+                        })),
+                        streamSimple: async function* (model) {
+                          yield `served:${model.id}`;
+                        }
+                      });
+                    }
+                    "#,
+                )
+                .expect("write recovery provider");
+                let primary = rpc_recovery_entry("primary");
+                let fallback = rpc_recovery_entry("fallback");
+                let (mut target, entry_id) = seed_rpc_recovery_session(
+                    Session::create_with_dir(Some(temp.path().join("targets"))),
+                    &primary,
+                    &fallback,
+                    cooldown_secs,
+                );
+                target.save().await.expect("persist target"); // ubs:ignore[rust.ownership.unwrap-expect] -- Actual on-disk resume target.
+                let target_path = target.path.clone().expect("target path"); // ubs:ignore[rust.ownership.unwrap-expect] -- Saving creates the target path.
+                let source = if is_fork {
+                    target
+                } else {
+                    let mut source = Session::create_with_dir(Some(temp.path().join("sources")));
+                    source.set_model_header(
+                        Some(primary.model.provider.clone()),
+                        Some(primary.model.id.clone()),
+                        Some("off".to_string()),
+                    );
+                    source
+                };
+                let source_id = source.header.id.clone();
+                let history = source.to_messages_for_current_path();
+                let inner_session = Arc::new(Mutex::new(source));
+                let mut agent = Agent::new(
+                    Arc::new(FlakyProvider::new()),
+                    ToolRegistry::without_builtins(None),
+                    AgentConfig::default(),
+                );
+                agent.replace_messages(history);
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                );
+                agent_session // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise registered JS streamSimple rather than a fabricated terminal event.
+                    .enable_extensions(&[], temp.path(), None, &[extension_path])
+                    .await
+                    .expect("enable recovery provider");
+                let manager = agent_session.extensions.as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- The real extension runtime was initialized.
+                    .expect("extensions")
+                    .manager();
+                let initial = if is_fork { &fallback } else { &primary };
+                let provider = providers::create_provider(initial, Some(manager)).expect("provider"); // ubs:ignore[rust.ownership.unwrap-expect] -- Construct through the production extension provider factory.
+                agent_session.agent.set_provider(provider);
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                options.available_models = vec![primary.clone(), fallback];
+                options.config.compaction = Some(crate::config::CompactionSettings {
+                    enabled: Some(false),
+                    ..Default::default()
+                });
+                options.config.retry = Some(crate::config::RetrySettings {
+                    enabled: Some(false),
+                    fallback_chains: Some(HashMap::from([(
+                        "rpc-recovery-fixture/primary".to_string(),
+                        vec!["rpc-recovery-fixture/fallback".to_string()],
+                    )])),
+                    failover_cooldown_secs: Some(cooldown_secs),
+                    ..Default::default()
+                });
+                let mut registry = crate::models::ModelRegistry::load(&options.auth, None);
+                registry.merge_entries(options.available_models.clone());
+                agent_session.set_model_registry(registry);
+                agent_session.set_auth_storage(options.auth.clone());
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+                let send_cx = asupersync::Cx::for_testing();
+                let command = if is_fork { "fork" } else { "switch_session" };
+                let navigation = if is_fork {
+                    json!({"id": "navigate", "type": command, "entryId": entry_id})
+                } else {
+                    json!({"id": "navigate", "type": command, "sessionPath": target_path})
+                };
+                in_tx.send(&send_cx, navigation.to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- Enter through the actual RPC navigation command.
+                    .await
+                    .expect("navigate");
+                in_tx // ubs:ignore[rust.ownership.unwrap-expect] -- The next prompt must enter the recovered destination.
+                    .send(
+                        &send_cx,
+                        json!({"id": "next", "type": "prompt", "message": "after navigation"})
+                            .to_string(),
+                    )
+                    .await
+                    .expect("next prompt");
+                drop(in_tx);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+                Box::pin(run(agent_session, options, in_rx, out_tx)) // ubs:ignore[rust.ownership.unwrap-expect] -- Drive navigation, provider streaming, persistence and EOF.
+                    .await
+                    .expect("RPC run");
+                let frames = out_rx // ubs:ignore[rust.ownership.unwrap-expect] -- RPC frames must remain valid JSON.
+                    .try_iter()
+                    .map(|line| serde_json::from_str::<Value>(&line).expect("RPC JSON"))
+                    .collect::<Vec<_>>();
+                for id in ["navigate", "next"] {
+                    let response = frames.iter() // ubs:ignore[rust.ownership.unwrap-expect] -- Every accepted command must answer.
+                        .find(|frame| frame["type"] == "response" && frame["id"] == id)
+                        .expect("response");
+                    assert_eq!(response["success"], true, "{response}"); // ubs:ignore[rust.panic.assert-macros] -- Both navigation and subsequent prompt must be accepted.
+                }
+                let terminals = frames
+                    .iter()
+                    .filter(|frame| frame["type"] == "agent_end")
+                    .collect::<Vec<_>>();
+                assert_eq!(terminals.len(), 1, "{frames:?}"); // ubs:ignore[rust.panic.assert-macros] -- The actual turn terminates exactly once.
+                assert!(terminals[0]["error"].is_null(), "{frames:?}"); // ubs:ignore[rust.panic.assert-macros] -- An error cannot masquerade as successful recovery.
+                let restored = frames
+                    .iter()
+                    .filter(|frame| {
+                        frame["type"] == "failover_end" && frame["restoredPrimary"] == true
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(restored.len(), usize::from(cooldown_secs == 0)); // ubs:ignore[rust.panic.assert-macros] -- Expired and holding cooldowns are mutual negative controls.
+                if let Some(event) = restored.first() {
+                    assert_eq!(event["provider"], primary.model.provider); // ubs:ignore[rust.panic.assert-macros] -- Restoration names the captured original provider.
+                    assert_eq!(event["model"], "primary"); // ubs:ignore[rust.panic.assert-macros] -- Restoration never identifies the temporary fallback as primary.
+                }
+                let expected_model = if cooldown_secs == 0 {
+                    "primary"
+                } else {
+                    "fallback"
+                };
+                let cx = AgentCx::for_request();
+                let inner = inner_session.lock(&cx).await.expect("live session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the session actually owned by RPC after EOF.
+                assert_ne!(inner.header.id, source_id); // ubs:ignore[rust.panic.assert-macros] -- Navigation must actually install a distinct session.
+                let replies = inner
+                    .to_messages_for_current_path()
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        Message::Assistant(message) => Some(message),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(replies.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Exactly one real provider response is durable.
+                assert_eq!(replies[0].model, expected_model); // ubs:ignore[rust.panic.assert-macros] -- The provider request used the correct restored or held model.
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- streamSimple actually executed for the selected model.
+                    matches!(&replies[0].content[..], [ContentBlock::Text(text)]
+                        if text.text == format!("served:{expected_model}"))
+                );
+                let path = inner.path.clone().expect("live path"); // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted turn must have persisted the installed session.
+                drop(inner);
+                let reopened = Session::open(&path.display().to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- Validate persisted navigation and restoration with a fresh read.
+                    .await
+                    .expect("reopen");
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Live and reopened model identity must agree.
+                    reopened.effective_model_for_current_path(),
+                    Some(("rpc-recovery-fixture".to_string(), expected_model.to_string()))
+                );
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Only an active cooldown retains recovery provenance.
+                    reopened.active_failover_provenance_for_current_path().is_some(),
+                    cooldown_secs != 0
+                );
+            }));
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                body.join().expect("RPC navigation test body"); // ubs:ignore[rust.ownership.unwrap-expect] -- Propagate any assertion from the bounded worker.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("RPC failover navigation did not finish within 120 seconds"); // ubs:ignore[rust.panic.panic-macro] -- A stuck transition must fail the test rather than stall the suite.
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_switch_session_restores_expired_primary_before_the_next_provider_call() {
+        assert_rpc_navigation_recovers_failover(false, 0);
+    }
+
+    #[test]
+    fn rpc_switch_session_preserves_a_pending_failover_cooldown() {
+        assert_rpc_navigation_recovers_failover(false, 3600);
+    }
+
+    #[test]
+    fn rpc_fork_restores_expired_primary_before_the_next_provider_call() {
+        assert_rpc_navigation_recovers_failover(true, 0);
+    }
+
+    #[test]
+    fn rpc_fork_preserves_a_pending_failover_cooldown() {
+        assert_rpc_navigation_recovers_failover(true, 3600);
+    }
+
+    struct RpcRecoveryFixture {
+        session: Arc<Mutex<AgentSession>>,
+        state: Arc<Mutex<RpcSharedState>>,
+        options: RpcOptions,
+    }
+
+    async fn rpc_native_recovery_fixture(
+        root: &Path,
+        runtime_handle: &RuntimeHandle,
+        cooldown_secs: u64,
+    ) -> RpcRecoveryFixture {
+        let mut models = ["primary", "fallback", "after-manual"].map(|id| dummy_entry(id, false));
+        for entry in &mut models {
+            entry.api_key = Some("rpc-recovery-fixture-key".to_string());
+        }
+        let (mut stored, _) = seed_rpc_recovery_session(
+            Session::create_with_dir(Some(root.join("sessions"))),
+            &models[0],
+            &models[1],
+            cooldown_secs,
+        );
+        stored.save().await.expect("seed recovery session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Real durable provenance seeds the fixture.
+        let provider = providers::create_provider(&models[1], None).expect("fallback provider"); // ubs:ignore[rust.ownership.unwrap-expect] -- Construct the live recorded fallback.
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::without_builtins(None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        let mut options = build_test_rpc_options(runtime_handle, root.join("auth.json"));
+        options.config.retry = Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                (
+                    "anthropic/primary".to_string(),
+                    vec!["anthropic/fallback".to_string()],
+                ),
+                (
+                    "anthropic/fallback".to_string(),
+                    vec!["anthropic/after-manual".to_string()],
+                ),
+            ])),
+            failover_cooldown_secs: Some(cooldown_secs),
+            ..Default::default()
+        });
+        options.available_models = Vec::from(models);
+        let mut state = RpcSharedState::new(&options.config);
+        state.reconstruct_failover_from_session(&stored, cooldown_secs, chrono::Utc::now());
+        let mut agent_session = AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            true,
+            crate::compaction::ResolvedCompactionSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let mut registry = crate::models::ModelRegistry::load(&options.auth, None);
+        registry.merge_entries(options.available_models.clone());
+        agent_session.set_model_registry(registry);
+        agent_session.set_auth_storage(options.auth.clone());
+        RpcRecoveryFixture {
+            session: Arc::new(Mutex::new(agent_session)),
+            state: Arc::new(Mutex::new(state)),
+            options,
+        }
+    }
+
+    #[test]
+    fn rpc_extension_selection_starts_a_new_durable_cycle_with_a_stable_cooldown() {
+        use crate::extensions::ExtensionSession as _;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime initialization.
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated durable recovery fixture.
+            let mut fixture = rpc_native_recovery_fixture(temp.path(), &runtime_handle, 0).await;
+            // The resumed cycle used a different duration from today's
+            // policy. A new hop must not retain the old zero-length timer.
+            fixture.options.config.retry.as_mut() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture has a configured chain.
+                .expect("retry policy")
+                .failover_cooldown_secs = Some(3600);
+            let cx = AgentCx::for_request();
+            let store = fixture.session.lock(&cx).await // ubs:ignore[rust.ownership.unwrap-expect] -- Access the live Session owned by RPC.
+                .expect("agent lock")
+                .session.clone();
+            let extension = crate::session::SessionHandle(Arc::clone(&store));
+            extension // ubs:ignore[rust.ownership.unwrap-expect] -- Execute the real extension Session mutation path.
+                .set_model("anthropic".to_string(), "fallback".to_string(), None)
+                .await
+                .expect("extension selection");
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            maybe_restore_primary( // ubs:ignore[rust.ownership.unwrap-expect] -- A stale cycle must not quarantine or undo an explicit model selection.
+                Arc::clone(&fixture.session),
+                Arc::clone(&fixture.state),
+                out_tx.clone(),
+                &fixture.options,
+                &cx,
+            )
+            .await
+            .expect("respect explicit selection");
+            assert!(out_rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Explicitly selecting the fallback suppresses automatic restoration.
+            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The obsolete primary and cursor are retired before the next error.
+                fixture.state.lock(&cx).await.expect("state").failover_primary.is_none()
+            );
+            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The selected fallback owns a new chain with a fresh cursor.
+                try_failover_to_next_chain_entry(
+                    Arc::clone(&fixture.session),
+                    Arc::clone(&fixture.state),
+                    out_tx,
+                    &fixture.options,
+                    Some("503 service unavailable"),
+                    false,
+                    None,
+                    0,
+                    &cx,
+                )
+                .await
+                .expect("new selection failover")
+            );
+            let mut state = fixture.state.lock(&cx).await.expect("state"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect committed recovery bookkeeping.
+            let primary = state.failover_primary.as_ref().expect("new primary"); // ubs:ignore[rust.ownership.unwrap-expect] -- A committed swap records its primary.
+            assert_eq!(primary.model_id, "fallback"); // ubs:ignore[rust.panic.assert-macros] -- The retired chain cannot reclaim its former primary.
+            assert_eq!(state.failover_chain_position, Some(1)); // ubs:ignore[rust.panic.assert-macros] -- The new chain starts at its first candidate.
+            let inner = store.lock(&cx).await.expect("Session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Compare durable provenance with the live transaction.
+            let provenance = inner.active_failover_provenance_for_current_path() // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted transition must be restart-safe.
+                .expect("provenance");
+            assert_eq!(provenance.primary_model_id, "fallback"); // ubs:ignore[rust.panic.assert-macros] -- Reopening retains the new primary identity.
+            assert_eq!(provenance.fallback_model_id, "after-manual"); // ubs:ignore[rust.panic.assert-macros] -- The selected model's own chain supplied the target.
+            assert_eq!(provenance.cooldown_secs, Some(3600)); // ubs:ignore[rust.panic.assert-macros] -- The new durable cycle records the current policy rather than the resumed one.
+            assert_eq!(provenance.lifecycle_id, state.failover_lifecycle_id); // ubs:ignore[rust.panic.assert-macros] -- One UUID must identify both durable and live lifecycle state.
+            assert_ne!(provenance.lifecycle_id.as_deref(), Some("navigation-cycle")); // ubs:ignore[rust.panic.assert-macros] -- Explicit selection starts a distinct lifecycle.
+            let started = state.failover_cooldown.as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- Capture the clock established by the actual committed swap.
+                .expect("live timer")
+                .failed_at();
+            state.reconstruct_failover_from_session(
+                &inner,
+                3600,
+                chrono::Utc::now() + chrono::Duration::hours(2),
+            );
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A wall-clock jump before the next prompt cannot replace the just-committed monotonic timer.
+                state.failover_cooldown.as_ref().expect("live timer").failed_at(),
+                started
+            );
+            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The fresh live cooldown still holds after the wall clock advances.
+                !state.failover_cooldown.as_ref().expect("live timer")
+                    .should_use_primary(std::time::Instant::now())
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_old_provider_failure_cannot_overwrite_an_extension_model_selection() {
+        use crate::extensions::ExtensionSession as _;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime initialization.
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated Session data.
+            let fixture = rpc_native_recovery_fixture(temp.path(), &runtime_handle, 0).await;
+            let cx = AgentCx::for_request();
+            let store = fixture.session.lock(&cx).await // ubs:ignore[rust.ownership.unwrap-expect] -- Reach the Session through the owned agent.
+                .expect("agent")
+                .session.clone();
+            crate::session::SessionHandle(Arc::clone(&store)) // ubs:ignore[rust.ownership.unwrap-expect] -- The new selection is deliberately awaiting normal runtime synchronization.
+                .set_model("anthropic".to_string(), "after-manual".to_string(), None)
+                .await
+                .expect("extension selection");
+            let before = serde_json::to_value( // ubs:ignore[rust.ownership.unwrap-expect] -- Capture exact branch bytes before recovery tries to mutate them.
+                &store.lock(&cx).await.expect("Session").entries,
+            ).expect("snapshot");
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- An error from the old runtime cannot replace the newer Session choice.
+                !try_failover_to_next_chain_entry(
+                    Arc::clone(&fixture.session),
+                    Arc::clone(&fixture.state),
+                    out_tx.clone(),
+                    &fixture.options,
+                    Some("503 service unavailable"),
+                    false,
+                    None,
+                    0,
+                    &cx,
+                )
+                .await
+                .expect("refuse stale failure")
+            );
+            maybe_restore_primary( // ubs:ignore[rust.ownership.unwrap-expect] -- Restoration must let normal synchronization install the choice.
+                Arc::clone(&fixture.session),
+                Arc::clone(&fixture.state),
+                out_tx,
+                &fixture.options,
+                &cx,
+            )
+            .await
+            .expect("defer to new selection");
+            assert!(out_rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Neither stale recovery path may emit a successful transition.
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Declining recovery leaves the selected branch untouched.
+                serde_json::to_value(&store.lock(&cx).await.expect("Session").entries)
+                    .expect("snapshot"),
+                before
+            );
+            sync_runtime_before_rpc_ack(&fixture.session, &cx) // ubs:ignore[rust.ownership.unwrap-expect] -- Continue through the actual RPC pre-ACK synchronization path.
+                .await
+                .expect("install new selection");
+            let guard = fixture.session.lock(&cx).await.expect("agent"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the installed runtime after synchronization.
+            assert_eq!(guard.agent.provider().model_id(), "after-manual"); // ubs:ignore[rust.panic.assert-macros] -- The next request enters the user's selected model.
+            assert!(guard.provider_admission_gate().reason().is_none()); // ubs:ignore[rust.panic.assert-macros] -- A legitimate extension choice must not quarantine the session.
+        });
+    }
+
+    #[test]
+    fn rpc_reconciliation_preserves_unchanged_timers_and_uses_each_branch_record() {
+        let primary = rpc_recovery_entry("primary");
+        let fallback = rpc_recovery_entry("fallback");
+        let (mut session, _) = seed_rpc_recovery_session(Session::in_memory(), &primary, &fallback, 3600);
+        let mut legacy = session.active_failover_provenance_for_current_path().expect("provenance").clone(); // ubs:ignore[rust.ownership.unwrap-expect] -- Seed an older record whose cooldown has no wall deadline.
+        legacy.cooldown_deadline = None;
+        let shared_parent = session.append_model_change_with_role_and_failover(fallback.model.provider.clone(), fallback.model.id.clone(), Some("failover".to_string()), Some(legacy.clone()));
+        let mut state = RpcSharedState::new(&Config::default());
+        let wall = chrono::Utc::now();
+        state.reconstruct_failover_from_session(&session, 3600, wall);
+        let started = state.failover_cooldown.as_ref().expect("timer").failed_at(); // ubs:ignore[rust.ownership.unwrap-expect] -- Record the existing monotonic anchor.
+        session.append_custom_entry("unrelated-observation".to_string(), None);
+        state.reconstruct_failover_from_session(&session, 3600, wall + chrono::Duration::hours(2));
+        assert_eq!(state.failover_cooldown.as_ref().expect("timer").failed_at(), started); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Appends and wall-clock changes cannot restart the same recovery record.
+        legacy.cooldown_deadline = Some((wall - chrono::Duration::seconds(1)).to_rfc3339());
+        session.append_model_change_with_role_and_failover(fallback.model.provider.clone(), fallback.model.id.clone(), Some("failover".to_string()), Some(legacy.clone()));
+        state.reconstruct_failover_from_session(&session, 3600, wall);
+        assert!(state.failover_cooldown.as_ref().expect("timer").should_use_primary(std::time::Instant::now())); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A distinct expired branch record permits restoration.
+        session._test_set_leaf_id(Some(shared_parent));
+        legacy.cooldown_deadline = Some((wall + chrono::Duration::hours(1)).to_rfc3339());
+        session.append_model_change_with_role_and_failover(fallback.model.provider, fallback.model.id, Some("failover".to_string()), Some(legacy));
+        state.reconstruct_failover_from_session(&session, 3600, wall);
+        assert!(!state.failover_cooldown.as_ref().expect("timer").should_use_primary(std::time::Instant::now())); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Matching lifecycle and cursor do not justify reusing another record's expired timer.
     }
 
     #[test]

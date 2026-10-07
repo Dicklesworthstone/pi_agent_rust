@@ -568,8 +568,8 @@ pub struct FailoverState {
 /// Full provenance matters because sibling branches can share a lifecycle and
 /// cursor while recording different deadlines. Entry identity also separates
 /// older records without lifecycle IDs or usable deadlines.
-#[derive(Debug, PartialEq, Eq)]
-struct FailoverSource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailoverSource {
     session_id: String,
     entry_id: Option<String>,
     entry_parent_id: Option<String>,
@@ -578,7 +578,7 @@ struct FailoverSource {
 }
 
 impl FailoverSource {
-    fn from_session(session: &crate::session::Session) -> Option<Self> {
+    pub(crate) fn from_session(session: &crate::session::Session) -> Option<Self> {
         let change = session.active_failover_model_change_for_current_path()?;
         Some(Self {
             session_id: session.header.id.clone(),
