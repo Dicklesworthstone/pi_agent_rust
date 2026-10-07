@@ -1421,21 +1421,15 @@ fn resolve_acp_selection(
             .or_else(|| scope_override.and_then(|scope| scope.enabled_models.clone()))
             .or_else(|| options.config.enabled_models.clone())
             .unwrap_or_default();
-        let disabled = options
-            .config
-            .disabled_providers
-            .as_deref()
-            .unwrap_or_default();
-        scoped_models = crate::app::resolve_model_scope(&patterns, &registry, cli.api_key.is_some())
-            .into_iter()
-            .filter(|scoped| {
-                !crate::failover::provider_is_disabled(
-                    disabled,
-                    scope_override,
-                    &scoped.model.model.provider,
-                )
-            })
-            .collect();
+        scoped_models = crate::app::resolve_startup_model_scope(
+            cli,
+            session,
+            &patterns,
+            &registry,
+            &options.config,
+            cwd,
+        )
+        .map_err(|error| Error::config(error.to_string()))?;
         let scoped = scoped_models
             .iter()
             .find(|scoped| {
@@ -2173,16 +2167,7 @@ async fn run_prompt(
             Ok(message) => {
                 // Synthetic boundary messages have no provider stream. Publish
                 // only after the SDK completes this turn's durable persistence.
-                if message.api.is_empty()
-                    && message.provider.is_empty()
-                    && message.model.is_empty()
-                    && let Some(marker) = message.content.iter().find_map(|block| match block {
-                        ContentBlock::Text(text) if text.text.starts_with("[time cap reached]") => {
-                            Some(text.text.as_str())
-                        }
-                        _ => None,
-                    })
-                {
+                if let Some(marker) = crate::agent::time_cap_marker(&message) {
                     let _ = history::send_line(
                         &out_tx,
                         json_rpc_notification(

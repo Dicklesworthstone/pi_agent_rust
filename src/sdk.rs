@@ -3021,20 +3021,25 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
-    let scoped_models = if scoped_patterns.is_empty() {
-        Vec::new()
-    } else {
-        app::resolve_model_scope(
-            &scoped_patterns,
-            &model_registry,
-            cli.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()),
-        )
-    };
-
     // The session owns the extension runtime, so registration must precede
     // final provider selection. Do not persist a provisional model: resumed
     // extension identities and explicit selectors must survive registration.
     let has_extensions = !options.extension_paths.is_empty();
+    let scoped_models = if has_extensions {
+        // An allowed extension model may not exist in the native catalog yet.
+        // Validate the complete scoped pool after registration instead.
+        Vec::new()
+    } else {
+        app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &scoped_patterns,
+            &model_registry,
+            &config,
+            &cwd,
+        )
+        .map_err(|error| Error::validation(error.to_string()))?
+    };
     let selection = if has_extensions {
         extension_bootstrap::provisional_selection(&model_registry)?
     } else {
@@ -3262,6 +3267,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             extension_bootstrap::SelectionInputs {
                 cli: &cli,
                 config: &config,
+                cwd: &cwd,
                 scoped_patterns: &scoped_patterns,
                 global_dir: &global_dir,
                 oauth_refresh: &oauth_refresh,

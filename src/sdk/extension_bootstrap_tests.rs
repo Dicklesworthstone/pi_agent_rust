@@ -201,7 +201,7 @@ fn configured_model_scope_can_resolve_extension_only_models() {
     std::fs::create_dir_all(dir.path().join(".pi")).expect("project config dir");
     std::fs::write(
         dir.path().join(".pi/settings.json"),
-        r#"{"enabledModels":["sdk-extension-fixture/second"]}"#,
+        r#"{"enabledModels":["openai/gpt-4o","sdk-extension-fixture/second"],"disabledProviders":["openai"]}"#,
     )
     .expect("project settings");
     let mut options = options(dir.path());
@@ -457,11 +457,198 @@ fn selection_inputs<'a>(
     super::SelectionInputs {
         cli,
         config,
+        cwd: dir,
         scoped_patterns: &[],
         global_dir: dir,
         oauth_refresh: refresh,
         preserve_compaction_window: false,
     }
+}
+
+#[test]
+fn final_scoped_selection_filters_registered_and_native_providers_with_an_explicit_key() {
+    let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture startup must succeed.
+            .await
+            .expect("initial extension session");
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        let mut request = cli(&["--api-key", "scoped-selection-key"]);
+        request.provider = None;
+        request.model = None;
+        let patterns = vec![
+            "sdk-extension-fixture/second:high".to_string(),
+            "openai/gpt-4o:low".to_string(),
+        ];
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        for (disabled_provider, disabled_model, expected, thinking) in [
+            (
+                "SDK-EXTENSION-FIXTURE",
+                "second",
+                ("openai", "gpt-4o"),
+                ThinkingLevel::Off,
+            ),
+            (
+                "OPENAI",
+                "gpt-4o",
+                ("sdk-extension-fixture", "second"),
+                ThinkingLevel::High,
+            ),
+        ] {
+            // In each direction the configured default is disabled. Selection
+            // must use the other scoped provider after extension registration.
+            let config = crate::config::Config {
+                default_provider: Some(disabled_provider.to_ascii_lowercase()),
+                default_model: Some(disabled_model.to_string()),
+                disabled_providers: Some(vec![disabled_provider.to_string()]),
+                ..Default::default()
+            };
+            let mut inputs = selection_inputs(&request, &config, temp.path(), &refresh);
+            inputs.scoped_patterns = &patterns;
+            super::finish_selection_inner( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+                &mut handle.session,
+                &mut registry,
+                &mut auth,
+                inputs,
+            )
+            .await
+            .expect("an allowed scoped provider remains");
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                handle.model(),
+                (expected.0.to_string(), expected.1.to_string())
+            );
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                handle.thinking_level(),
+                Some(thinking)
+            );
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some("scoped-selection-key")
+            );
+            handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture state must be readable.
+                .with_session(|stored| {
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                        (
+                            stored.header.provider.as_deref(),
+                            stored.header.model_id.as_deref(),
+                        ),
+                        (Some(expected.0), Some(expected.1))
+                    );
+                })
+                .await
+                .expect("installed session identity");
+        }
+
+        // The allowed extension uses the same runtime that registered it; no
+        // native request is made and registration/startup are not repeated.
+        let message = handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture prompt must succeed.
+            .prompt("use the permitted scoped extension", |_| {})
+            .await
+            .expect("extension prompt");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            text(&message),
+            "loads:1 starts:1 model:second"
+        );
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            handle.shutdown_owned_resources().await.completed_cleanly()
+        );
+    });
+}
+
+#[test]
+fn fully_disabled_registered_scope_does_not_publish_a_fallback_or_new_credentials() {
+    let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+    run_async(async {
+        let mut handle = create_agent_session(options(temp.path())) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture startup must succeed.
+            .await
+            .expect("initial extension session");
+        // A new startup has loaded its runtime but has not committed a model
+        // identity. Keep the original live provider/key as rejection witnesses,
+        // while recreating that unnamed store with the same session id and cwd.
+        {
+            let owner = crate::agent_cx::AgentCx::for_request();
+            let mut stored = handle.session.session.lock(owner.cx()).await // ubs:ignore[rust.ownership.unwrap-expect] -- Prepare the real unnamed startup store before final selection.
+                .expect("lock startup store");
+            let session_id = stored.header.id.clone();
+            let session_cwd = stored.header.cwd.clone();
+            *stored = crate::session::Session::in_memory();
+            stored.header.id = session_id;
+            stored.header.cwd = session_cwd;
+        }
+        let mut auth = crate::auth::AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = crate::models::ModelRegistry::load(&auth, None);
+        let before = registry_identity(&registry);
+        let mut request = cli(&["--api-key", "must-not-publish"]);
+        request.provider = None;
+        request.model = None;
+        let patterns = vec![
+            "sdk-extension-fixture/second:high".to_string(),
+            "openai/gpt-4o:low".to_string(),
+        ];
+        // The saved header still names the original directory. Policy must
+        // follow the live invocation cwd passed to final selection.
+        let live_cwd = temp.path().join("live-selection-root");
+        let config = crate::config::Config {
+            disabled_providers: Some(vec!["OPENAI".to_string()]),
+            model_scope_overrides: Some(vec![crate::config::ModelScopeOverride {
+                path: live_cwd.display().to_string(),
+                enabled_models: None,
+                disabled_providers: Some(vec!["SDK-EXTENSION-FIXTURE".to_string()]),
+            }]),
+            ..Default::default()
+        };
+        let refresh = crate::auth::OAuthRefreshReport::default();
+        let mut inputs = selection_inputs(&request, &config, temp.path(), &refresh);
+        inputs.scoped_patterns = &patterns;
+        inputs.cwd = &live_cwd;
+        let error = super::finish_selection_inner( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+            &mut handle.session,
+            &mut registry,
+            &mut auth,
+            inputs,
+        )
+        .await
+        .expect_err("global and workspace policy remove every registered candidate");
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            error.to_string().contains("[MODEL_SCOPE_DISABLED]")
+        );
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            registry_identity(&registry),
+            before
+        );
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            handle.model(),
+            ("sdk-extension-fixture".to_string(), "fixture".to_string())
+        );
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("sdk-explicit-test-key")
+        );
+        handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture state must be readable.
+            .with_session(|stored| {
+                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    (
+                        stored.header.provider.as_deref(),
+                        stored.header.model_id.as_deref(),
+                    ),
+                    (None, None)
+                );
+            })
+            .await
+            .expect("unchanged session identity");
+        let message = handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture prompt must succeed.
+            .prompt("the original session remains usable", |_| {})
+            .await
+            .expect("prompt after rejected selection");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            text(&message),
+            "loads:1 starts:1 model:fixture"
+        );
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            handle.shutdown_owned_resources().await.completed_cleanly()
+        );
+    });
 }
 
 #[test]

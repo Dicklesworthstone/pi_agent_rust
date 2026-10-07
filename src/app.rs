@@ -1488,6 +1488,62 @@ pub fn parse_models_arg(models: &str) -> Vec<String> {
         .collect()
 }
 
+/// Resolve scoped startup candidates under the current directory's provider policy.
+///
+/// Explicit and resumed identities remain the normal selector's responsibility,
+/// while disabled providers are removed from the scoped selection/cycling pool.
+/// A new automatic selection must not turn a scope emptied by policy into an
+/// unrestricted fallback.
+pub fn resolve_startup_model_scope(
+    cli: &cli::Cli,
+    session: &Session,
+    patterns: &[String],
+    registry: &ModelRegistry,
+    config: &Config,
+    cwd: &Path,
+) -> Result<Vec<ScopedModel>> {
+    let allow_missing_keys = cli
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let resolved = resolve_model_scope(patterns, registry, allow_missing_keys);
+    let had_candidates = !resolved.is_empty();
+    let scope_override = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| crate::failover::best_scope_override(overrides, cwd));
+    let disabled = config.disabled_providers.as_deref().unwrap_or_default();
+    let scoped_models: Vec<_> = resolved
+        .into_iter()
+        .filter(|scoped| {
+            !crate::failover::provider_is_disabled(
+                disabled,
+                scope_override,
+                &scoped.model.model.provider,
+            )
+        })
+        .collect();
+    if had_candidates
+        && scoped_models.is_empty()
+        && cli.provider.is_none()
+        && cli.model.is_none()
+        // Resume flags can open an empty/new session. Preserve only a model
+        // the normal selector can actually restore from this branch, before
+        // its unrelated-default fallback. Match restore_model_from_session.
+        && !model_from_session_state(session).is_some_and(|(provider, model_id)| {
+            registry
+                .find(&provider, &model_id)
+                .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id))
+                .is_some()
+        })
+    {
+        bail!(
+            "[MODEL_SCOPE_DISABLED] All models matching the requested scope are disabled by provider settings"
+        );
+    }
+    Ok(scoped_models)
+}
+
 pub fn resolve_model_scope(
     patterns: &[String],
     registry: &ModelRegistry,
@@ -1772,6 +1828,263 @@ mod tests {
 
     fn registry_with_entries(entries: Vec<ModelEntry>) -> ModelRegistry {
         ModelRegistry::from_entries_for_tests(entries)
+    }
+
+    #[test]
+    fn startup_scope_combines_global_and_winning_workspace_provider_policy() {
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-override"]);
+        cli.provider = None;
+        cli.model = None;
+        let entries = [
+            ("openai/gpt-4o-mini", "openrouter"),
+            ("gpt-4o", "openai"),
+            ("first", "anthropic"),
+            ("second", "anthropic"),
+        ]
+        .into_iter()
+        .map(|(id, provider)| {
+            let mut entry = test_model_entry(id, provider, true);
+            // The explicit key makes these candidates available, but must not
+            // exempt their providers from either disabled-provider list.
+            entry.api_key = None;
+            entry
+        })
+        .collect();
+        let registry = registry_with_entries(entries);
+        let config = Config {
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-4o".to_string()),
+            disabled_providers: Some(vec![" OPEN-ROUTER ".to_string()]),
+            model_scope_overrides: Some(vec![
+                crate::config::ModelScopeOverride {
+                    path: "/scope-policy".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["anthropic".to_string()]),
+                },
+                crate::config::ModelScopeOverride {
+                    path: "/scope-policy/project".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["OpEnAi".to_string()]),
+                },
+            ]),
+            ..Default::default()
+        };
+        let patterns = vec![
+            "openrouter/*:low".to_string(),
+            "anthropic/second:high".to_string(),
+            "openai/*:medium".to_string(),
+            "anthropic/first:low".to_string(),
+        ];
+        let cwd = Path::new("/scope-policy/project/src");
+        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli, &Session::in_memory(), &patterns, &registry, &config, cwd,
+        )
+        .expect("allowed workspace candidates");
+
+        // The parent override is replaced by the more specific workspace
+        // override; the global alias remains disabled in both workspaces.
+        let identities = scoped
+            .iter()
+            .map(|entry| {
+                (
+                    entry.model.model.provider.as_str(),
+                    entry.model.model.id.as_str(),
+                    entry.thinking_level,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            identities,
+            vec![
+                ("anthropic", "second", Some(model::ThinkingLevel::High)),
+                ("anthropic", "first", Some(model::ThinkingLevel::Low)),
+            ]
+        );
+        let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli,
+            &config,
+            &Session::in_memory(),
+            &registry,
+            &scoped,
+            cwd,
+        )
+        .expect("automatic selection respects the filtered scope");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            (
+                selection.model_entry.model.provider.as_str(),
+                selection.model_entry.model.id.as_str(),
+                selection.thinking_level,
+            ),
+            ("anthropic", "second", model::ThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn startup_scope_cannot_fall_back_when_provider_policy_removes_every_candidate() {
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-override"]);
+        cli.provider = None;
+        cli.model = None;
+        let registry = registry_with_entries(vec![
+            test_model_entry("scoped", "openai", true),
+            test_model_entry("outside-scope", "anthropic", true),
+        ]);
+        let config = Config {
+            default_provider: Some("anthropic".to_string()),
+            default_model: Some("outside-scope".to_string()),
+            disabled_providers: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let patterns = vec!["openai/scoped".to_string()];
+        let cwd = Path::new("/scope-policy");
+        let error = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+            &cli, &Session::in_memory(), &patterns, &registry, &config, cwd,
+        )
+        .expect_err("a disabled requested scope must not select an unrelated default");
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            error.to_string().contains("[MODEL_SCOPE_DISABLED]")
+        );
+
+        // An absent or explicitly cleared scope is different: ordinary
+        // configured-default selection must remain available.
+        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli, &Session::in_memory(), &[], &registry, &config, cwd,
+        )
+        .expect("an empty requested scope remains unrestricted");
+        assert!(scoped.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli,
+            &config,
+            &Session::in_memory(),
+            &registry,
+            &scoped,
+            cwd,
+        )
+        .expect("configured default without a scope");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            selection.model_entry.model.id,
+            "outside-scope"
+        );
+    }
+
+    #[test]
+    fn startup_scope_preserves_explicit_and_resumed_model_selection() {
+        let registry = registry_with_entries(vec![test_model_entry("fixture", "openai", true)]);
+        let config = Config {
+            disabled_providers: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let patterns = vec!["openai/fixture:high".to_string()];
+        let mut session = Session::in_memory();
+        session.header.provider = Some("openai".to_string());
+        session.header.model_id = Some("fixture".to_string());
+        let cwd = Path::new("/scope-policy");
+        for args in [
+            vec!["pi", "--provider", "openai", "--model", "fixture"],
+            vec!["pi", "--provider", "openai"],
+            vec!["pi", "--model", "openai/fixture"],
+            vec!["pi", "--continue"],
+            vec!["pi", "--resume"],
+            vec!["pi", "--session", "saved-scope.jsonl"],
+        ] {
+            let explicit_provider = args.contains(&"--provider");
+            let explicit_model = args.contains(&"--model");
+            let mut cli = cli::Cli::parse_from(args);
+            if !explicit_provider {
+                cli.provider = None;
+            }
+            if !explicit_model {
+                cli.model = None;
+            }
+            cli.api_key = Some("scope-override".to_string());
+            let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+                &cli, &session, &patterns, &registry, &config, cwd,
+            )
+            .expect("explicit and resumed identities retain their selection precedence");
+            assert!(scoped.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+                &cli, &config, &session, &registry, &scoped, cwd,
+            )
+            .expect("the selected or saved identity remains usable");
+            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                (
+                    selection.model_entry.model.provider.as_str(),
+                    selection.model_entry.model.id.as_str(),
+                ),
+                ("openai", "fixture")
+            );
+        }
+    }
+
+    #[test]
+    fn startup_scope_requires_an_actual_restorable_branch_identity() {
+        let registry = registry_with_entries(vec![
+            test_model_entry("scoped", "openai", true),
+            test_model_entry("outside-scope", "anthropic", true),
+        ]);
+        let config = Config {
+            default_provider: Some("anthropic".to_string()),
+            default_model: Some("outside-scope".to_string()),
+            disabled_providers: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let patterns = vec!["openai/scoped".to_string()];
+        let cwd = Path::new("/scope-policy");
+        let empty = Session::in_memory();
+        let mut missing = Session::in_memory();
+        missing.header.provider = Some("removed-custom-provider".to_string());
+        missing.header.model_id = Some("gone".to_string());
+        let mut stale_header = Session::in_memory();
+        stale_header.header.provider = Some("openai".to_string());
+        stale_header.header.model_id = Some("scoped".to_string());
+        stale_header.append_model_change(
+            "removed-custom-provider".to_string(),
+            "gone".to_string(),
+        );
+
+        for args in [
+            vec!["pi", "--continue"],
+            vec!["pi", "--resume"],
+            vec!["pi", "--session", "new-session.jsonl"],
+        ] {
+            let mut cli = cli::Cli::parse_from(args);
+            cli.provider = None;
+            cli.model = None;
+            cli.api_key = Some("scope-override".to_string());
+            for session in [&empty, &missing, &stale_header] {
+                let error = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+                    &cli, session, &patterns, &registry, &config, cwd,
+                )
+                .expect_err("resume intent must not authorize an unrelated default");
+                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    error.to_string().contains("[MODEL_SCOPE_DISABLED]")
+                );
+            }
+        }
+
+        // The current branch, not a stale header or a resume flag, owns the
+        // restore destination. Native ad-hoc identities remain restorable.
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-override"]);
+        cli.provider = None;
+        cli.model = None;
+        let mut restored = Session::in_memory();
+        restored.header.provider = Some("removed-custom-provider".to_string());
+        restored.header.model_id = Some("gone".to_string());
+        restored.append_model_change("openai".to_string(), "saved-ad-hoc".to_string());
+        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli, &restored, &patterns, &registry, &config, cwd,
+        )
+        .expect("a restorable branch keeps its exact destination");
+        let selected = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli, &config, &restored, &registry, &scoped, cwd,
+        )
+        .expect("restore the native ad-hoc branch identity");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            (
+                selected.model_entry.model.provider.as_str(),
+                selected.model_entry.model.id.as_str(),
+            ),
+            ("openai", "saved-ad-hoc")
+        );
     }
 
     #[test]

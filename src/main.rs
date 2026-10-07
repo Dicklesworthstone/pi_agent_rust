@@ -563,6 +563,7 @@ async fn resolve_selection_with_auth(
     cli: &mut cli::Cli,
     config: &Config,
     session: &Session,
+    cwd: &Path,
     model_registry: &mut ModelRegistry,
     scoped_patterns: &[String],
     auth: &mut AuthStorage,
@@ -572,15 +573,14 @@ async fn resolve_selection_with_auth(
     extra_entries: &[ModelEntry],
 ) -> Result<Option<(pi::app::ModelSelection, Option<String>)>> {
     loop {
-        let scoped_models = if scoped_patterns.is_empty() {
-            Vec::new()
-        } else {
-            pi::app::resolve_model_scope(
-                scoped_patterns,
-                model_registry,
-                has_cli_api_key_override(cli.api_key.as_deref()),
-            )
-        };
+        let scoped_models = pi::app::resolve_startup_model_scope(
+            cli,
+            session,
+            scoped_patterns,
+            model_registry,
+            config,
+            cwd,
+        )?;
 
         let selection = match pi::app::select_model_and_thinking(
             cli,
@@ -642,11 +642,20 @@ fn should_retry_selection_after_extensions(
     err: &anyhow::Error,
     has_extensions: bool,
 ) -> bool {
-    if !has_extensions || (cli.provider.is_none() && cli.model.is_none()) {
+    if !has_extensions {
         return false;
     }
 
     let message = err.to_string().to_ascii_lowercase();
+    // The complete scope may contain an allowed extension model that has
+    // not been registered yet. Defer this decision once; final selection
+    // after extension loading must pass the same provider policy.
+    if message.contains("[model_scope_disabled]") {
+        return true;
+    }
+    if cli.provider.is_none() && cli.model.is_none() {
+        return false;
+    }
     message.contains(" not found") || message.contains("no models available for provider")
 }
 
@@ -1976,6 +1985,8 @@ async fn run(
         config.enabled_models.clone().unwrap_or_default()
     };
     let disabled_providers = config.disabled_providers.clone().unwrap_or_default();
+    // This pre-registration view feeds the initial picker and key check.
+    // resolve_selection_with_auth validates the final scope on every pass.
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
@@ -2034,6 +2045,7 @@ async fn run(
         &mut cli,
         &config,
         &session,
+        &cwd,
         &mut model_registry,
         &scoped_patterns,
         &mut auth,
@@ -2057,17 +2069,16 @@ async fn run(
             }
         }
     };
-    // gh #218: now that the model is known, a failed refresh matters only if
-    // this run would actually send that provider's stale OAuth token.
-    if !has_cli_api_key_override(cli.api_key.as_deref())
-        && let Some(failure) =
-            startup_oauth_refresh.failure_for(&selection.model_entry.model.provider)
-    {
-        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
-            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
-            failure.provider, failure.error, failure.provider
-        ))));
-    }
+    // Extensions can replace this preliminary selection, including the native
+    // bootstrap used while an allowed scoped extension model is unregistered.
+    // The SDK validates its final destination; classic/RPC does so below.
+    validate_startup_oauth_refresh(
+        &cli,
+        &startup_oauth_refresh,
+        &selection.model_entry.model.provider,
+        &[],
+        has_extensions,
+    )?;
 
     let enabled_tools = cli.enabled_tools();
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
@@ -2717,6 +2728,7 @@ async fn run(
             &mut cli,
             &config,
             &session_snapshot,
+            &cwd,
             &mut model_registry,
             &scoped_patterns,
             &mut auth,
@@ -2730,6 +2742,13 @@ async fn run(
             return Ok(());
         };
 
+        validate_startup_oauth_refresh(
+            &cli,
+            &startup_oauth_refresh,
+            &updated_selection.model_entry.model.provider,
+            &extension_bindings,
+            false,
+        )?;
         selection = updated_selection;
         resolved_key = updated_key;
 
@@ -8820,6 +8839,33 @@ fn has_cli_api_key_override(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Reject stale native OAuth credentials only after the final destination is
+/// known. A pending extension pass may change both the model and its auth flow.
+fn validate_startup_oauth_refresh(
+    cli: &cli::Cli,
+    refresh: &pi::auth::OAuthRefreshReport,
+    selected_provider: &str,
+    extension_bindings: &[ExtensionProviderBinding],
+    extensions_pending: bool,
+) -> Result<()> {
+    if extensions_pending
+        || has_cli_api_key_override(cli.api_key.as_deref())
+        || extension_bindings.iter().any(|binding| {
+            pi::provider_metadata::provider_ids_match(&binding.provider, selected_provider)
+                && binding.oauth_config.is_some()
+        })
+    {
+        return Ok(());
+    }
+    if let Some(failure) = refresh.failure_for(selected_provider) {
+        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
+            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
+            failure.provider, failure.error, failure.provider
+        ))));
+    }
+    Ok(())
+}
+
 /// Whether startup should touch the stored OAuth credentials at all (gh #218).
 ///
 /// An explicit `--api-key` for an explicit `--provider`/`--model` satisfies
@@ -11175,6 +11221,168 @@ mod tests {
             "anthropic/claude-sonnet-4-6"
         ])));
         assert!(startup_oauth_refresh_required(&parse(&[])));
+    }
+
+    #[test]
+    fn startup_oauth_failure_waits_for_the_final_scoped_extension_destination() {
+        use clap::Parser as _;
+
+        let temp = TempDir::new().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let auth = AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = ModelRegistry::load(&auth, None);
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        cli.provider = None;
+        cli.model = None;
+        cli.api_key = None;
+        let mut config = Config::default();
+        let bootstrap = build_extension_bootstrap_selection( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture bootstrap must resolve.
+            &config,
+            &registry,
+            &temp.path().join("models.json"),
+        )
+        .expect("native construction model");
+        let refresh = pi::auth::OAuthRefreshReport {
+            failed: vec![pi::auth::OAuthRefreshFailure {
+                provider: bootstrap.model_entry.model.provider.clone(),
+                error: "expired native login".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &bootstrap.model_entry.model.provider,
+                &[],
+                true,
+            )
+            .is_ok(),
+            "a preliminary native identity must not block extension registration"
+        );
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &bootstrap.model_entry.model.provider,
+                &[],
+                false,
+            )
+            .is_err(),
+            "the same failed identity must still be rejected when final"
+        );
+
+        // Model registration adds an allowed, credentialed extension row.
+        // Resolve its actual scope/selection before validating the destination.
+        config.disabled_providers = Some(vec![bootstrap.model_entry.model.provider.clone()]);
+        let mut registered = bootstrap.model_entry.clone();
+        registered.model.provider = "startup-oauth-extension".to_string();
+        registered.model.id = "scoped".to_string();
+        registered.model.name = "Scoped extension".to_string();
+        registered.api_key = Some("configured-extension-key".to_string());
+        registry.merge_entries(vec![registered]);
+        let session = pi::session::Session::in_memory();
+        let patterns = vec!["startup-oauth-extension/scoped".to_string()];
+        let scoped = pi::app::resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture scope must resolve.
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect("allowed registered scope");
+        let selection = pi::app::select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must resolve.
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped,
+            temp.path(),
+        )
+        .expect("registered extension destination");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            selection.model_entry.model.provider,
+            "startup-oauth-extension"
+        );
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &selection.model_entry.model.provider,
+                &[],
+                false,
+            )
+            .is_ok(),
+            "an unrelated stale native login must not block the final scoped provider"
+        );
+    }
+
+    #[test]
+    fn final_oauth_validation_requires_a_key_or_matching_extension_auth_override() {
+        use clap::Parser as _;
+
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        let refresh = pi::auth::OAuthRefreshReport {
+            failed: vec![pi::auth::OAuthRefreshFailure {
+                provider: "OPEN-ROUTER".to_string(),
+                error: "expired native login".to_string(),
+            }],
+            ..Default::default()
+        };
+        for key in [None, Some(" \t ")] {
+            cli.api_key = key.map(str::to_string);
+            let error = validate_startup_oauth_refresh( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+                &cli, &refresh, "openrouter", &[], false,
+            )
+            .expect_err("provider aliases and blank keys cannot evade the final OAuth failure");
+            assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                error
+                    .to_string()
+                    .contains("OAuth token refresh failed for: OPEN-ROUTER")
+            );
+        }
+        cli.api_key = Some(" explicit-run-key ".to_string());
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(&cli, &refresh, "openrouter", &[], false).is_ok()
+        );
+        cli.api_key = None;
+
+        let mut binding = ExtensionProviderBinding {
+            provider: "Open-Router".to_string(),
+            oauth_config: None,
+        };
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+            )
+            .is_err(),
+            "registering a provider without replacement OAuth leaves its native failure relevant"
+        );
+        binding.oauth_config = Some(pi::models::OAuthConfig {
+            auth_url: "https://extension.invalid/authorize".to_string(),
+            token_url: "https://extension.invalid/token".to_string(),
+            client_id: "extension-oauth-fixture".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: None,
+        });
+        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+            )
+            .is_ok(),
+            "the selected provider's extension OAuth supersedes its native refresh result"
+        );
+        binding.provider = "unrelated-extension".to_string();
+        for oauth in [binding.oauth_config.clone(), None] {
+            binding.oauth_config = oauth;
+            assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                validate_startup_oauth_refresh(
+                    &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+                )
+                .is_err(),
+                "an unrelated extension cannot suppress the selected provider's native failure"
+            );
+        }
     }
 
     #[test]
