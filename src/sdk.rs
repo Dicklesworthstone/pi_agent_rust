@@ -2327,18 +2327,22 @@ impl AgentSessionHandle {
         }
         // Keyless providers (replay/test/local) summarize fine without a key.
         let api_key = agent.stream_options().api_key.clone().unwrap_or_default();
+        let privacy = agent.compaction_privacy();
         let settings = crate::compaction::ResolvedCompactionSettings {
             enabled: true,
             ..Default::default()
         };
-        let summary =
-            crate::checkpoint::summarize_span(&span, agent.provider(), &api_key, &settings)
-                .await
-                .unwrap_or_else(|err| {
-                    format!(
-                        "(summarization failed: {err}; the span was collapsed without a report)"
-                    )
-                });
+        let summary = crate::checkpoint::summarize_span(
+            &span,
+            agent.provider(),
+            &api_key,
+            &settings,
+            &privacy,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            format!("(summarization failed: {err}; the span was collapsed without a report)")
+        });
         let outcome = crate::checkpoint::apply_rewind_to_active(
             &mut self.session.agent,
             &checkpoint,
@@ -3441,6 +3445,58 @@ mod tests {
         crate::test_current_dir_lock()
     }
 
+    struct RewindPrivacyProvider {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for RewindPrivacyProvider {
+        fn name(&self) -> &str {
+            "rewind-privacy"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let request = serde_json::to_string(context.messages.as_ref())?;
+            self.requests
+                .lock()
+                .map_err(|_| Error::session("fixture request lock poisoned"))?
+                .push(request);
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("privacy-aware rewind report"),
+                )],
+                stop_reason: crate::model::StopReason::Stop,
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
     /// Fails its first `failures` calls with a retryable provider error, then
     /// answers normally. Counts calls so a test can prove how many were made.
     struct FlakyThenOkProvider {
@@ -4063,6 +4119,94 @@ mod tests {
             entry,
             crate::session::SessionEntry::Custom(custom) if custom.custom_type == "rewind"
         )));
+    }
+
+    fn assert_rewind_privacy(mode: &str) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(RewindPrivacyProvider {
+            requests: Arc::clone(&requests),
+        });
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::without_builtins(None),
+            crate::agent::AgentConfig {
+                secrets: Some(crate::secrets::SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: Some(vec!["ACME-[0-9]{6}".to_string()]),
+                }),
+                ..Default::default()
+            },
+        );
+        let learned = "historicalValue482610";
+        if mode == "obfuscate" {
+            let masked = agent // ubs:ignore[rust.ownership.unwrap-expect] -- Seed a secret through the real live-vault API.
+                .secrets_transform_outbound_text(&format!("API_KEY={learned}"))
+                .expect("learn earlier credential");
+            assert!(!masked.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Fixture must learn the credential before its bare reuse.
+        }
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::in_memory())),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        let raw = format!("Explore customer ACME-123456 and prior reference {learned}.");
+        let message = crate::model::Message::User(crate::model::UserMessage {
+            content: crate::model::UserContent::Text(raw.clone()),
+            timestamp: 0,
+        });
+        let outcome = run_async(async {
+            handle // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise public checkpoint/rewind operations.
+                .mark_checkpoint("start", None)
+                .await
+                .expect("mark checkpoint");
+            handle.session.agent.add_message(message.clone());
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            {
+                let mut stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Populate original durable history.
+                stored.append_message(crate::session::SessionMessage::from(message));
+            }
+            let outcome = handle // ubs:ignore[rust.ownership.unwrap-expect] -- Public rewind preserves its local fallback on a refused summary.
+                .rewind_to_checkpoint(Some("start"))
+                .await
+                .expect("rewind");
+            let stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original entries after context replacement.
+            assert!(stored.entries.iter().any(|entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
+                entry,
+                crate::session::SessionEntry::Message(entry)
+                    if matches!(&entry.message,
+                        crate::session::SessionMessage::User {
+                            content: crate::model::UserContent::Text(text), ..
+                        } if text == &raw)
+            )));
+            outcome
+        });
+        let requests = requests.lock().expect("recorded provider requests"); // ubs:ignore[rust.ownership.unwrap-expect] -- Observe what crossed the provider boundary.
+        if mode == "block" {
+            assert!(requests.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Configured blocking must prevent any provider dispatch.
+            assert!(outcome.summary.contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- Refusal is visible in the existing rewind fallback.
+        } else {
+            assert_eq!(requests.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- One real summarization request.
+            let request = requests.first().expect("summarization request"); // ubs:ignore[rust.ownership.unwrap-expect] -- Count was asserted above.
+            assert!(request.contains("Explore customer")); // ubs:ignore[rust.panic.assert-macros] -- Useful non-secret context reaches the summarizer.
+            assert!(!request.contains("ACME-123456")); // ubs:ignore[rust.panic.assert-macros] -- User-defined pattern is applied.
+            assert!(!request.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Bare reuse is protected by the live session vault.
+            assert!(!request.contains("<pi-secret:000")); // ubs:ignore[rust.panic.assert-macros] -- Neither remembered nor newly allocated reversible IDs cross this fixture's provider boundary.
+            assert!(outcome.summary.contains("privacy-aware rewind report")); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
+        }
+    }
+
+    #[test]
+    fn rewind_screens_configured_patterns_and_live_vault_secrets() {
+        assert_rewind_privacy("obfuscate");
+    }
+
+    #[test]
+    fn rewind_block_mode_refuses_provider_dispatch_and_preserves_history() {
+        assert_rewind_privacy("block");
     }
 
     /// OMP `/retry`: the re-sent turn is a sibling of the abandoned one. On

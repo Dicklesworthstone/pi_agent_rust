@@ -1867,6 +1867,9 @@ pub struct Agent {
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
+    /// Extension compaction cannot borrow the running Agent. Its shared
+    /// snapshot is refreshed at each successful vault update and Session reset.
+    compaction_privacy_state: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
 /// Restore temporary keyword settings even if an in-flight run is dropped.
@@ -1960,6 +1963,9 @@ impl Agent {
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
         let job_session_scope = tools.snapshot().job_session_scope();
+        let compaction_privacy_state = Arc::new(StdMutex::new(
+            compaction::CompactionPrivacy::from_settings(config.secrets.as_ref()),
+        ));
         Self {
             provider,
             tools,
@@ -1986,6 +1992,7 @@ impl Agent {
             magic_keyword_scan_override: None,
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
+            compaction_privacy_state,
         }
     }
 
@@ -2081,6 +2088,7 @@ impl Agent {
     /// state is shared with the submit-plan tool and must be reset in place.
     pub fn reset_session_scoped_state(&mut self, plan_mode: crate::plan::PlanMode) {
         self.secrets_vault = crate::secrets::SecretVault::default();
+        self.refresh_compaction_privacy();
         self.plan_state.reset_for_session(plan_mode);
     }
 
@@ -2855,6 +2863,7 @@ impl Agent {
         }
 
         self.secrets_vault = staged_vault;
+        self.refresh_compaction_privacy();
         if total > 0 {
             tracing::info!(
                 event = "pi.secrets.outbound",
@@ -5454,14 +5463,35 @@ impl Agent {
         );
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
-        Self::secrets_transform_text(
+        let result = Self::secrets_transform_text(
             text,
             &mut self.secrets_vault,
             mode,
             &extra,
             &mut total,
             &mut labels,
+        );
+        if result.is_ok() {
+            self.refresh_compaction_privacy();
+        }
+        result
+    }
+
+    /// Capture the policy and remembered values for one compaction request.
+    #[must_use]
+    pub fn compaction_privacy(&self) -> compaction::CompactionPrivacy {
+        compaction::CompactionPrivacy::with_vault(
+            self.config.secrets.as_ref(),
+            &self.secrets_vault,
         )
+    }
+
+    fn refresh_compaction_privacy(&self) {
+        if let Ok(mut privacy) = self.compaction_privacy_state.lock() {
+            *privacy = self.compaction_privacy();
+        }
+        // A poisoned snapshot is never used: extension callers propagate the
+        // lock error before either provider entry point is admitted.
     }
 
     /// Screen bounded auxiliary fields against both configured policy and
@@ -6481,6 +6511,7 @@ struct ExtensionAiCompletionHostState {
     provider: Arc<dyn Provider>,
     stream_options: StreamOptions,
     models: Vec<Value>,
+    compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
 impl AgentSessionHostActions {
@@ -6692,17 +6723,25 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // `dispatch_before_compact` holds neither when awaiting extension
         // handlers -- so an extension calling compact() from inside
         // `session_before_compact` cannot deadlock.
-        let (provider, api_key) = {
+        let (provider, api_key, privacy) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
             (
                 Arc::clone(&state.provider),
                 state.stream_options.api_key.clone().unwrap_or_default(),
+                Arc::clone(&state.compaction_privacy),
             )
         };
 
-        let result = crate::compaction::compact(preparation, provider, &api_key, None).await?;
+        let privacy = privacy
+            .lock()
+            .map_err(|_| {
+                Error::extension("extension compaction privacy state mutex poisoned".to_string())
+            })?
+            .clone();
+        let result =
+            crate::compaction::compact(preparation, provider, &api_key, None, &privacy).await?;
         serde_json::to_value(&result).map_err(|err| {
             Error::extension(format!("serialize extension compaction result: {err}"))
         })
@@ -6718,13 +6757,17 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // POST happens inside the provider with the session's credentials.
         // Every failure is an `Err` so the calling extension fails open to
         // pi's default compaction (never a fabricated result).
-        let preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
+        let mut preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
 
-        let (provider, stream_options) = {
+        let (provider, stream_options, privacy) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
-            (Arc::clone(&state.provider), state.stream_options.clone())
+            (
+                Arc::clone(&state.provider),
+                state.stream_options.clone(),
+                Arc::clone(&state.compaction_privacy),
+            )
         };
 
         if provider.api() != "openai-responses" {
@@ -6735,17 +6778,25 @@ impl ExtensionHostActions for AgentSessionHostActions {
         }
 
         let sanitized = sanitize_native_compact_request(&request, provider.model_id())?;
+        let mut privacy = privacy
+            .lock()
+            .map_err(|_| {
+                Error::extension("extension compaction privacy state mutex poisoned".to_string())
+            })?
+            .clone();
+        let sanitized = privacy.screen_native_request(&mut preparation, &sanitized)?;
         let response = provider.compact_native(&sanitized, &stream_options).await?;
 
         let (read_files, modified_files) =
             crate::compaction::compute_file_lists(&preparation.file_ops);
-        shape_native_compact_result(
+        let result = shape_native_compact_result(
             &response,
             &preparation.first_kept_entry_id,
             preparation.tokens_before,
             read_files,
             modified_files,
-        )
+        )?;
+        privacy.screen_native_result(result)
     }
 }
 
@@ -8613,6 +8664,9 @@ mod extensions_integration_tests {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_privacy: Arc::new(StdMutex::new(
+                        compaction::CompactionPrivacy::default(),
+                    )),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
                 session_action_admission,
@@ -8679,6 +8733,9 @@ mod extensions_integration_tests {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_privacy: Arc::new(StdMutex::new(
+                        compaction::CompactionPrivacy::default(),
+                    )),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
                 session_action_admission: session_action_admission.clone(),
@@ -8873,6 +8930,9 @@ mod extensions_integration_tests {
                         "provider": "capturing-provider",
                         "api": "test-api",
                     })],
+                    compaction_privacy: Arc::new(StdMutex::new(
+                        compaction::CompactionPrivacy::default(),
+                    )),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
@@ -8977,6 +9037,9 @@ mod extensions_integration_tests {
                     provider,
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_privacy: Arc::new(StdMutex::new(
+                        compaction::CompactionPrivacy::default(),
+                    )),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
@@ -9047,6 +9110,329 @@ mod extensions_integration_tests {
                     .contains("compaction preparation must be a JSON object"),
                 "unexpected error: {err}"
             );
+        });
+    }
+
+    struct NativePrivacyCapture {
+        requests: Arc<StdMutex<Vec<Value>>>,
+        response: Arc<StdMutex<Value>>,
+    }
+
+    #[async_trait]
+    impl Provider for NativePrivacyCapture {
+        fn name(&self) -> &'static str {
+            "native-privacy"
+        }
+
+        fn api(&self) -> &'static str {
+            "openai-responses"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "native-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+            Err(Error::api(
+                "native privacy fixture only supports native compaction",
+            ))
+        }
+
+        async fn compact_native(&self, body: &Value, options: &StreamOptions) -> Result<Value> {
+            assert_eq!(options.api_key.as_deref(), Some("auth-kept"));
+            self.requests.lock().expect("requests").push(body.clone());
+            Ok(self
+                .response
+                .lock()
+                .expect("scripted native response") // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture response ownership must remain intact.
+                .clone())
+        }
+    }
+
+    #[test]
+    fn native_compaction_host_screens_configured_patterns_and_fresh_live_vault() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in ["obfuscate", "block"] {
+                let requests = Arc::new(StdMutex::new(Vec::new()));
+                let provider = Arc::new(NativePrivacyCapture {
+                    requests: Arc::clone(&requests),
+                    response: Arc::new(StdMutex::new(json!({"output": [{
+                        "type": "compaction", "id": "opaque-window", "encrypted_content": "opaque-data"
+                    }]}))),
+                });
+                let agent = Agent::new(
+                    provider,
+                    ToolRegistry::without_builtins(None),
+                    AgentConfig {
+                        secrets: Some(crate::secrets::SecretsSettings {
+                            mode: Some(mode.to_string()),
+                            extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+                        }),
+                        stream_options: StreamOptions {
+                            api_key: Some("auth-kept".to_string()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let mut session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                let actions = AgentSessionHostActions {
+                    session: Arc::clone(&session.session),
+                    injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                    is_streaming: Arc::new(AtomicBool::new(false)),
+                    is_turn_active: Arc::new(AtomicBool::new(false)),
+                    pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                    ai_completion: Arc::clone(&session.extension_ai_completion),
+                    provider_admission: session.provider_admission_gate(),
+                    session_action_admission: session.session_action_admission_gate(),
+                };
+                let known = "rememberedNativeCredential123456789";
+                if mode == "obfuscate" {
+                    // Learn AFTER the host action is constructed. A one-time
+                    // host-state snapshot would leak this otherwise bare echo.
+                    session
+                        .agent
+                        .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                        .expect("learn current-session credential");
+                }
+                let preparation = compaction::compaction_preparation_to_value(
+                    &compaction::CompactionPreparation {
+                        first_kept_entry_id: "anchor-kept".to_string(),
+                        messages_to_summarize: Vec::new(),
+                        turn_prefix_messages: Vec::new(),
+                        is_split_turn: false,
+                        tokens_before: 100,
+                        previous_summary: None,
+                        file_ops: compaction::FileOperations::default(),
+                        settings: ResolvedCompactionSettings::default(),
+                    },
+                );
+                let request = json!({
+                    "model": "native-model",
+                    "instructions": "summarize this work",
+                    "input": [
+                        {"role": "user", "content": [
+                            {"type": "input_text", "text": known},
+                            {"type": "input_text", "text": "ACME-123456"}
+                        ]},
+                        {"type": "function_call", "id": "item-kept", "call_id": "call-kept",
+                         "name": "configure", "arguments": "{\"project_token\":\"ACME-654321\"}"}
+                    ]
+                });
+                let result = actions
+                    .compact_session_native(preparation.clone(), request.clone())
+                    .await;
+                if mode == "block" {
+                    assert!(
+                        result
+                            .expect_err("block before native dispatch")
+                            .to_string()
+                            .contains("PI_SECRET_BLOCK")
+                    );
+                    assert!(requests.lock().expect("requests").is_empty());
+                    continue;
+                }
+                assert_eq!(
+                    result.expect("native result")["firstKeptEntryId"],
+                    "anchor-kept"
+                );
+                let captured = requests.lock().expect("requests")[0].clone();
+                let rendered = captured.to_string();
+                for secret in [known, "ACME-123456", "ACME-654321"] {
+                    assert!(!rendered.contains(secret));
+                }
+                assert!(rendered.contains("<pi-secret:redacted>"));
+                assert_eq!(captured["input"][1]["call_id"], "call-kept");
+                assert_eq!(captured["input"][1]["id"], "item-kept");
+                let arguments: Value = serde_json::from_str( // ubs:ignore[rust.parsing.serde-unwrap] -- Parsing provider-observed fixture arguments verifies preserved native wire syntax.
+                    captured["input"][1]["arguments"]
+                        .as_str()
+                        .expect("JSON arguments stay encoded"),
+                )
+                .expect("screened arguments remain valid JSON"); // ubs:ignore[rust.ownership.unwrap-expect] -- Malformed provider-observed fixture arguments must fail the regression.
+                assert_eq!(arguments["project_token"], "<pi-secret:redacted>");
+                assert_eq!(request["input"][0]["content"][0]["text"], known);
+
+                session
+                    .agent
+                    .reset_session_scoped_state(crate::plan::PlanMode::default());
+                actions
+                    .compact_session_native(
+                        preparation,
+                        json!({
+                            "model": "native-model",
+                            "input": [{"role": "user", "content": known}]
+                        }),
+                    )
+                    .await
+                    .expect("a new Session must not inherit the old vault");
+                assert_eq!(
+                    requests.lock().expect("requests")[1]["input"][0]["content"],
+                    known
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn native_compaction_screens_returned_windows_and_refuses_fragmented_text() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in ["obfuscate", "block"] {
+                let known = "rememberedNativeWindowCredential123456789";
+                let discovered = "requestDiscoveredCredential987654321";
+                let requests = Arc::new(StdMutex::new(Vec::new()));
+                let response = Arc::new(StdMutex::new(json!({"output": [
+                    {"type": "compaction", "id": "window-kept", "encrypted_content": "opaque-kept"},
+                    {"type": "message", "role": "assistant", "id": "message-kept", "content": [
+                        {"type": "output_text", "text": known},
+                        {"type": "output_text", "text": discovered},
+                        {"type": "output_text", "text": "ACME-123456"}
+                    ]}
+                ]})));
+                let mut session = AgentSession::new(
+                    Agent::new(
+                        Arc::new(NativePrivacyCapture {
+                            requests: Arc::clone(&requests),
+                            response: Arc::clone(&response),
+                        }),
+                        ToolRegistry::without_builtins(None),
+                        AgentConfig {
+                            secrets: Some(crate::secrets::SecretsSettings {
+                                mode: Some(mode.to_string()),
+                                extra_patterns: Some(vec![
+                                    r"^ACME-[0-9]{6}$".to_string(),
+                                    r"^ACME-\n[0-9]{6}$".to_string(),
+                                ]),
+                            }),
+                            stream_options: StreamOptions {
+                                api_key: Some("auth-kept".to_string()),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    ),
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                let actions = AgentSessionHostActions {
+                    session: Arc::clone(&session.session),
+                    injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                    is_streaming: Arc::new(AtomicBool::new(false)),
+                    is_turn_active: Arc::new(AtomicBool::new(false)),
+                    pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                    ai_completion: Arc::clone(&session.extension_ai_completion),
+                    provider_admission: session.provider_admission_gate(),
+                    session_action_admission: session.session_action_admission_gate(),
+                };
+                if mode == "obfuscate" {
+                    session
+                        .agent
+                        .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                        .expect("learn old-window credential"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture seeds a live credential before native replay.
+                }
+                let preparation = compaction::compaction_preparation_to_value(
+                    &compaction::CompactionPreparation {
+                        first_kept_entry_id: "ACME-654321".to_string(),
+                        messages_to_summarize: Vec::new(),
+                        turn_prefix_messages: Vec::new(),
+                        is_split_turn: false,
+                        tokens_before: 100,
+                        previous_summary: None,
+                        file_ops: compaction::FileOperations::default(),
+                        settings: ResolvedCompactionSettings::default(),
+                    },
+                );
+                let error = actions
+                    .compact_session_native(
+                        preparation.clone(),
+                        json!({"model": "native-model", "input": [{"role": "user", "content": [
+                            {"type": "input_text", "text": "ACME-"},
+                            {"type": "input_text", "text": "123456"}
+                        ]}]}),
+                    )
+                    .await
+                    .expect_err("independent native fragments must not dispatch"); // ubs:ignore[rust.ownership.unwrap-expect] -- Empty preparation must not hide a fragmented native request.
+                let refusal = if mode == "block" {
+                    "PI_SECRET_BLOCK"
+                } else {
+                    "PI_COMPACTION_FRAGMENTED"
+                };
+                assert!(error.to_string().contains(refusal)); // ubs:ignore[rust.panic.assert-macros] -- The named refusal identifies the actual privacy boundary.
+                assert!(requests.lock().expect("requests").is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Provider observation proves pre-dispatch refusal.
+
+                let mut input = vec![json!({
+                    "type": "compaction", "id": "old-window", "encrypted_content": "old-opaque"
+                })];
+                if mode == "obfuscate" {
+                    input.push(json!({
+                        "type": "function_call", "id": "call-item", "call_id": "call-kept",
+                        "name": "configure", "arguments": json!({"api_key": discovered}).to_string()
+                    }));
+                }
+                let result = actions
+                    .compact_session_native(
+                        preparation.clone(),
+                        json!({"model": "native-model", "input": input}),
+                    )
+                    .await;
+                assert_eq!(requests.lock().expect("requests").len(), 1); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Clean replay is admitted exactly once before output validation.
+                if mode == "block" {
+                    let error = result.expect_err("blocked output cannot become a replay window"); // ubs:ignore[rust.ownership.unwrap-expect] -- Returned plaintext from an old opaque window must be refused.
+                    assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- No native result is returned after blocked output.
+                } else {
+                    let result = result.expect("screen native replay result"); // ubs:ignore[rust.ownership.unwrap-expect] -- Safe native output remains usable after redaction.
+                    let visible = json!({
+                        "summary": result.get("summary"),
+                        "window": result.pointer("/details/compactedWindow")
+                    })
+                    .to_string();
+                    for secret in [known, discovered, "ACME-123456"] {
+                        assert!(!visible.contains(secret)); // ubs:ignore[rust.panic.assert-macros] -- Both human summary and replayable native text must be screened.
+                    }
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Cut-point IDs remain exact even when their spelling matches a pattern.
+                        result.get("firstKeptEntryId"),
+                        Some(&json!("ACME-654321"))
+                    );
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Native replay identifiers are immutable protocol metadata.
+                        result.pointer("/details/compactedWindow/0/id"),
+                        Some(&json!("window-kept"))
+                    );
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The opaque replay payload must not be rewritten.
+                        result.pointer("/details/compactedWindow/0/encrypted_content"),
+                        Some(&json!("opaque-kept"))
+                    );
+                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Request discoveries remain private to this compaction transaction.
+                        session.agent.mask_secrets_text(discovered),
+                        discovered
+                    );
+                }
+
+                *response.lock().expect("response") = json!({"output": [{ // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture switches to a fragmented native response after the first request.
+                    "type": "message", "role": "assistant", "id": "message-kept", "content": [
+                        {"type": "output_text", "text": "ACME-"},
+                        {"type": "output_text", "text": "123456"}
+                    ]
+                }]});
+                let error = actions
+                    .compact_session_native(
+                        preparation,
+                        json!({"model": "native-model", "input": [{"role": "user", "content": "clean"}]}),
+                    )
+                    .await
+                    .expect_err("fragmented native output cannot be replayed"); // ubs:ignore[rust.ownership.unwrap-expect] -- An unsafe assembled summary/window must not escape output validation.
+                assert!(error.to_string().contains(refusal)); // ubs:ignore[rust.panic.assert-macros] -- Output refusal matches the configured block or preserve-or-refuse mode.
+                assert_eq!(requests.lock().expect("requests").len(), 2); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Response refusal occurs after exactly one additional admitted request.
+            }
         });
     }
 
@@ -9196,6 +9582,9 @@ mod extensions_integration_tests {
                     provider,
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_privacy: Arc::new(StdMutex::new(
+                        compaction::CompactionPrivacy::default(),
+                    )),
                 })),
                 provider_admission: ProviderAdmissionGate::default(),
                 session_action_admission: SessionActionAdmissionGate::default(),
@@ -13210,6 +13599,7 @@ impl AgentSession {
             provider: agent.provider(),
             stream_options: agent.stream_options().clone(),
             models: Vec::new(),
+            compaction_privacy: Arc::clone(&agent.compaction_privacy_state),
         }));
 
         Self {
@@ -15027,6 +15417,7 @@ impl AgentSession {
                 provider,
                 credential,
                 None,
+                self.agent.compaction_privacy(),
             ) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -15096,7 +15487,7 @@ impl AgentSession {
         });
         let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
-        let result = compaction::compact_local(prep);
+        let result = compaction::compact_local(prep, &self.agent.compaction_privacy());
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
             Ok(provider_admission) => provider_admission,
@@ -15424,9 +15815,19 @@ impl AgentSession {
                 return Err(err);
             }
             let compaction_result = if shake {
-                Ok(compaction::compact_shake(prep))
+                Ok(compaction::compact_shake(
+                    prep,
+                    &self.agent.compaction_privacy(),
+                ))
             } else {
-                compaction::compact(prep, provider, &credential, None).await
+                compaction::compact(
+                    prep,
+                    provider,
+                    &credential,
+                    None,
+                    &self.agent.compaction_privacy(),
+                )
+                .await
             };
 
             match compaction_result {

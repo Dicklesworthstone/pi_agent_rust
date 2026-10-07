@@ -3603,11 +3603,13 @@ pub async fn run(
                         )
                     })?;
 
+                    let privacy = guard.agent.compaction_privacy();
                     let compact_res = compact(
                         prep,
                         provider,
                         &key,
                         custom_instructions.as_deref(),
+                        &privacy,
                     )
                     .await;
                     let result_data = compact_res?;
@@ -3768,12 +3770,18 @@ pub async fn run(
                         enabled: true,
                         ..Default::default()
                     };
-                    let summary =
-                        crate::checkpoint::summarize_span(&span, provider, &api_key, &settings)
-                            .await
-                            .unwrap_or_else(|err| {
-                                format!("(summarization failed: {err}; collapsed without a report)")
-                            });
+                    let privacy = guard.agent.compaction_privacy();
+                    let summary = crate::checkpoint::summarize_span(
+                        &span,
+                        provider,
+                        &api_key,
+                        &settings,
+                        &privacy,
+                    )
+                    .await
+                    .unwrap_or_else(|err| {
+                        format!("(summarization failed: {err}; collapsed without a report)")
+                    });
                     let mut agent_messages = messages;
                     agent_messages.truncate(checkpoint.message_count.min(agent_messages.len()));
                     let collapsed = span.len();
@@ -13044,7 +13052,8 @@ async fn maybe_auto_compact(
         return;
     };
     let provider = guard.agent.provider();
-    let result = compact_auto(prep, provider, &key, None).await;
+    let privacy = guard.agent.compaction_privacy();
+    let result = compact_auto(prep, provider, &key, None, &privacy).await;
 
     match result {
         Ok(result) => {

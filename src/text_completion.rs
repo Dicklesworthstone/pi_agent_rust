@@ -39,6 +39,15 @@ pub struct AuxiliaryPrivacy {
 }
 
 impl AuxiliaryPrivacy {
+    /// Provider-free checkpoints may redact locally even when outbound
+    /// requests are blocked. Preserve the same configured detector patterns.
+    pub(crate) fn local_redaction(&self) -> Self {
+        Self {
+            mode: crate::secrets::SecretsMode::Obfuscate,
+            extra_patterns: self.extra_patterns.clone(),
+        }
+    }
+
     #[must_use]
     pub fn from_settings(settings: Option<&crate::secrets::SecretsSettings>) -> Self {
         let mode = crate::secrets::SecretsMode::from_setting(
@@ -88,12 +97,7 @@ pub(crate) fn redact_inputs_with_vault(
         ));
     }
     let mut vault = known_secrets.clone();
-    let (protected, _) = crate::secrets::transform_outbound_json(
-        &serde_json::json!(parts),
-        &mut vault,
-        privacy.mode,
-        &privacy.extra_patterns,
-    )?;
+    let protected = redact_json_with_vault(&serde_json::json!(parts), privacy, &mut vault)?;
     let serde_json::Value::Array(protected) = protected else {
         return Err(Error::validation(
             "auxiliary privacy projection changed input shape",
@@ -102,12 +106,63 @@ pub(crate) fn redact_inputs_with_vault(
     protected
         .into_iter()
         .map(|part| match part {
-            serde_json::Value::String(text) => Ok(vault.redact_placeholders(&text)),
+            serde_json::Value::String(text) => Ok(text),
             _ => Err(Error::validation(
                 "auxiliary privacy projection changed text type",
             )),
         })
         .collect()
+}
+
+/// Screen an already bounded structured projection. Callers own the input
+/// budget: a full compaction has a larger allowance than a short side request.
+/// Keeping JSON structure preserves assignment context and anchored patterns.
+/// The supplied vault must be a private projection snapshot. Successful scans
+/// retain discoveries for subsequent projections without changing a live Agent.
+pub(crate) fn redact_json_with_vault(
+    value: &serde_json::Value,
+    privacy: &AuxiliaryPrivacy,
+    known_secrets: &mut crate::secrets::SecretVault,
+) -> Result<serde_json::Value> {
+    let mut vault = known_secrets.clone();
+    let (protected, _) = crate::secrets::transform_outbound_json(
+        value,
+        &mut vault,
+        privacy.mode,
+        &privacy.extra_patterns,
+    )?;
+    let protected = redact_json_placeholders(protected, &vault)?;
+    *known_secrets = vault;
+    Ok(protected)
+}
+
+fn redact_json_placeholders(
+    value: serde_json::Value,
+    vault: &crate::secrets::SecretVault,
+) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Ok(Value::String(vault.redact_placeholders(&text))),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| redact_json_placeholders(value, vault))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut protected = serde_json::Map::new();
+            for (key, value) in values {
+                let key = vault.redact_placeholders(&key);
+                let value = redact_json_placeholders(value, vault)?;
+                if protected.insert(key, value).is_some() {
+                    return Err(Error::validation(
+                        "PI_AUXILIARY_KEY_COLLISION: redaction would merge structured fields",
+                    ));
+                }
+            }
+            Ok(Value::Object(protected))
+        }
+        primitive => Ok(primitive),
+    }
 }
 
 /// Drain one tool-free completion without retaining cumulative previews.

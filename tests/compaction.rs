@@ -5,7 +5,7 @@ mod common;
 
 use common::{TestHarness, run_async};
 use pi::compaction::{
-    CompactionPreparation, CompactionResult, SEMANTIC_COMPACTION_QUALITY_SCHEMA,
+    CompactionPreparation, CompactionPrivacy, CompactionResult, SEMANTIC_COMPACTION_QUALITY_SCHEMA,
     SemanticCompactionLossClass, SemanticCompactionMarker, SemanticCompactionMarkerKind,
     SemanticCompactionMarkerObservation, SemanticCompactionMarkerSeverity,
     SemanticCompactionQualityVerdict, SemanticCompactionQualityView, compact,
@@ -13,8 +13,8 @@ use pi::compaction::{
     semantic_compaction_quality_report_to_jsonl, semantic_compaction_quality_report_to_value,
 };
 use pi::model::{
-    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent,
-    ThinkingContent, ToolCall, Usage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, ThinkingContent,
+    ToolCall, Usage, UserContent, UserMessage,
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::{
@@ -1021,12 +1021,391 @@ fn compact_non_split_turn_calls_provider_once() {
     let provider = Arc::new(ScriptedProvider::new(["SUMMARY"]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
 
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert!(result.summary.contains("SUMMARY"));
     assert_eq!(provider.prompts().len(), 1);
+}
+
+fn privacy_preparation() -> CompactionPreparation {
+    CompactionPreparation {
+        first_kept_entry_id: "ACME-654321".to_string(),
+        messages_to_summarize: vec![user_text("completed history")],
+        turn_prefix_messages: vec![user_text("ongoing turn")],
+        is_split_turn: true,
+        // Even beyond the local-fallback threshold, a privacy refusal must
+        // remain a refusal rather than dispatching or silently summarizing.
+        tokens_before: 600_000,
+        previous_summary: None,
+        file_ops: pi::compaction::FileOperations::default(),
+        settings: pi::compaction::ResolvedCompactionSettings::default(),
+    }
+}
+
+#[test]
+fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
+    run_async(async {
+        let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^ACME-[0-9]{6}(?:x{4096})?$".to_string()]),
+        }));
+        for location in 0..7 {
+            let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
+            let mut prep = privacy_preparation();
+            let mut custom = None;
+            match location {
+                0 => prep.messages_to_summarize = vec![user_text("ACME-123456")],
+                1 => prep.turn_prefix_messages = vec![user_text("ACME-123456")],
+                2 => prep.previous_summary = Some("ACME-123456".to_string()),
+                3 => custom = Some("ACME-123456"),
+                4 => {
+                    prep.turn_prefix_messages = vec![assistant_message(
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            id: "call-kept".to_string(),
+                            name: "inspect".to_string(),
+                            arguments: json!({"project_token": "ACME-123456"}),
+                            thought_signature: None,
+                        })],
+                        Usage::default(),
+                        StopReason::ToolUse,
+                    )];
+                }
+                5 => {
+                    prep.turn_prefix_messages =
+                        vec![user_text(format!("ACME-123456{}", "x".repeat(4096)))];
+                }
+                _ => {
+                    prep.file_ops.read.insert("ACME-123456".to_string());
+                }
+            }
+            let error = compact(prep, provider.clone(), "auth-kept", custom, &privacy)
+                .await
+                .expect_err("block mode must reject the full unsliced field");
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert!(!error.to_string().contains("ACME-123456"));
+            assert!(
+                provider.prompts().is_empty(),
+                "location {location} dispatched"
+            );
+        }
+    });
+}
+
+#[test]
+fn compaction_obfuscates_complete_fields_and_remembered_values_across_both_requests() {
+    run_async(async {
+        let known = "rememberedCredential123456789";
+        let discovered = "laterAssignmentCredential987654321";
+        let provider = Arc::new(ScriptedProvider::new(["HISTORY", "TURN"]));
+        let mut agent = pi::agent::Agent::new(
+            provider.clone(),
+            pi::tools::ToolRegistry::without_builtins(None),
+            pi::agent::AgentConfig {
+                secrets: Some(pi::secrets::SecretsSettings {
+                    mode: Some("obfuscate".to_string()),
+                    extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+                }),
+                ..Default::default()
+            },
+        );
+        agent
+            .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+            .expect("learn a credential outside the compacted span");
+        let privacy = agent.compaction_privacy();
+        assert!(!format!("{privacy:?}").contains(known));
+        let mut prep = privacy_preparation();
+        prep.messages_to_summarize = vec![
+            user_text(format!("earlier echoes: {known} {discovered}")),
+            user_text("ACME-123456"),
+            SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("laterAssignment")),
+                    ContentBlock::Text(TextContent::new("Credential987654321")),
+                ]),
+                timestamp: Some(0),
+            },
+        ];
+        prep.turn_prefix_messages = vec![assistant_message(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "unchanged-call-id".to_string(),
+                name: "configure".to_string(),
+                arguments: json!({"api_key": discovered, "project_token": "ACME-123456"}),
+                thought_signature: None,
+            })],
+            Usage::default(),
+            StopReason::ToolUse,
+        )];
+        prep.previous_summary = Some("ACME-123456".to_string());
+        prep.file_ops.read.insert("ACME-123456".to_string());
+        let original = pi::compaction::compaction_preparation_to_value(&prep);
+        let result = compact(
+            prep.clone(),
+            provider.clone(),
+            "auth-kept",
+            Some("ACME-123456"),
+            &privacy,
+        )
+        .await
+        .expect("screened split compaction");
+        assert_eq!(result.first_kept_entry_id, "ACME-654321");
+        assert!(!result.summary.contains("ACME-123456"));
+        assert_eq!(result.details.read_files, vec!["ACME-123456".to_string()]);
+        assert_eq!(
+            pi::compaction::compaction_preparation_to_value(&prep),
+            original
+        );
+        assert_eq!(
+            agent.mask_secrets_text(discovered),
+            discovered,
+            "projection must not learn into the live vault"
+        );
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 2);
+        for prompt in prompts {
+            for secret in [known, discovered, "ACME-123456"] {
+                assert!(!prompt.contains(secret), "secret reached the summarizer");
+            }
+            assert!(prompt.contains("<pi-secret:redacted>"));
+            assert!(!prompt.contains("<pi-secret:000001>"));
+            assert!(!prompt.contains("<pi-secret:000002>"));
+        }
+    });
+}
+
+#[test]
+fn compaction_screens_secrets_assembled_from_adjacent_text_blocks_before_dispatch() {
+    run_async(async {
+        for mode in ["obfuscate", "block"] {
+            let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+            }));
+            for tool_message in [false, true] {
+                for parts in [
+                    ["sk-abcdefghijklmn", "opqrstuvwxyz012345"],
+                    ["ACME-", "123456"],
+                ] {
+                    let secret = parts.concat();
+                    let blocks = parts
+                        .into_iter()
+                        .map(|part| ContentBlock::Text(TextContent::new(part)))
+                        .collect();
+                    let message = if tool_message {
+                        SessionMessage::ToolResult {
+                            tool_call_id: "unchanged-call".to_string(),
+                            tool_name: "read".to_string(),
+                            content: blocks,
+                            details: None,
+                            is_error: false,
+                            timestamp: Some(0),
+                        }
+                    } else {
+                        SessionMessage::User {
+                            content: UserContent::Blocks(blocks),
+                            timestamp: Some(0),
+                        }
+                    };
+                    let provider = Arc::new(ScriptedProvider::new(["HISTORY", "TURN"]));
+                    let mut prep = privacy_preparation();
+                    // Only the second request contains the assembled secret.
+                    prep.turn_prefix_messages = vec![message];
+                    let original = pi::compaction::compaction_preparation_to_value(&prep);
+                    let result = compact(
+                        prep.clone(),
+                        provider.clone(),
+                        "auth-kept",
+                        None,
+                        &privacy,
+                    )
+                    .await;
+                    if mode == "block" {
+                        let error = result.expect_err("assembled secret must block both requests");
+                        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+                        assert!(provider.prompts().is_empty());
+                    } else {
+                        result.expect("assembled secret must be obfuscated");
+                        let prompts = provider.prompts();
+                        assert_eq!(prompts.len(), 2);
+                        assert!(!prompts.iter().any(|prompt| prompt.contains(&secret)));
+                        assert!(prompts[1].contains("<pi-secret:redacted>"));
+                    }
+                    assert_eq!(
+                        pi::compaction::compaction_preparation_to_value(&prep),
+                        original
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn local_and_shake_compaction_keep_screened_snapshots_and_omit_blocked_pixels() {
+    for mode in ["obfuscate", "block"] {
+        let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+            mode: Some(mode.to_string()),
+            extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+        }));
+        for shake in [false, true] {
+            let mut prep = privacy_preparation();
+            prep.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
+            prep.messages_to_summarize = vec![user_text("ACME-123456")];
+            let result = if shake {
+                pi::compaction::compact_shake(prep, &privacy)
+            } else {
+                pi::compaction::compact_local(prep, &privacy)
+            };
+            assert!(!result.summary.is_empty());
+            assert_eq!(result.first_kept_entry_id, "ACME-654321");
+            assert!(!result.summary.contains("ACME-123456"));
+            assert!(result.summary.contains("<pi-secret:redacted>"));
+            if mode == "block" {
+                assert!(result.snap_payload.is_none());
+            } else {
+                assert_eq!(
+                    result.snap_payload,
+                    Some(pi::compaction_snap::SnapPayload::new(
+                        pi::compaction_snap::render_frames("[User]: <pi-secret:redacted>")
+                    ))
+                );
+            }
+
+            let mut clean = privacy_preparation();
+            clean.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
+            let result = if shake {
+                pi::compaction::compact_shake(clean, &privacy)
+            } else {
+                pi::compaction::compact_local(clean, &privacy)
+            };
+            assert!(
+                result.snap_payload.is_some(),
+                "clean snapshots remain supported"
+            );
+        }
+    }
+}
+
+#[test]
+fn compaction_fallback_screens_assembled_echoes_and_appended_file_lists() {
+    run_async(async {
+        let secret = "laterAssignmentCredential987654321";
+        let provider = Arc::new(ScriptedProvider::new([""]));
+        let mut prep = privacy_preparation();
+        prep.messages_to_summarize = vec![SessionMessage::User {
+            content: UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("laterAssignment")),
+                ContentBlock::Text(TextContent::new("Credential987654321")),
+            ]),
+            timestamp: Some(0),
+        }];
+        prep.turn_prefix_messages = vec![assistant_message(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "call-unchanged".to_string(),
+                name: "configure".to_string(),
+                arguments: json!({"api_key": secret}),
+                thought_signature: None,
+            })],
+            Usage::default(),
+            StopReason::ToolUse,
+        )];
+        prep.file_ops.read.insert(secret.to_string());
+        let privacy = CompactionPrivacy::default();
+        let result = compact(prep.clone(), provider.clone(), "auth-kept", None, &privacy)
+            .await
+            .expect("empty provider response uses a screened deterministic fallback");
+        assert!(result.summary.contains("deterministic fallback"));
+        assert!(!result.summary.contains(secret));
+        assert!(result.summary.contains("<pi-secret:redacted>"));
+        assert_eq!(result.details.read_files, vec![secret.to_string()]);
+        assert_eq!(provider.prompts().len(), 1);
+        assert!(!provider.prompts()[0].contains(secret));
+
+        let local = pi::compaction::compact_local(prep, &privacy);
+        assert!(!local.summary.contains(secret));
+        assert_eq!(local.details.read_files, vec![secret.to_string()]);
+    });
+}
+
+#[test]
+fn local_compaction_omits_unprojectable_content_without_appending_raw_file_lists() {
+    let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+        mode: Some("block".to_string()),
+        extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+    }));
+    for shake in [false, true] {
+        let mut prep = privacy_preparation();
+        prep.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
+        prep.file_ops.read.insert("ACME-123456".to_string());
+        prep.messages_to_summarize = vec![assistant_message(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "unchanged-call".to_string(),
+                name: "inspect".to_string(),
+                arguments: json!({"ACME-123456": "first", "ACME-654321": "second"}),
+                thought_signature: None,
+            })],
+            Usage::default(),
+            StopReason::ToolUse,
+        )];
+        let result = if shake {
+            pi::compaction::compact_shake(prep, &privacy)
+        } else {
+            pi::compaction::compact_local(prep, &privacy)
+        };
+        assert!(result.summary.contains("earlier context was omitted"));
+        assert!(!result.summary.contains("ACME-"));
+        assert!(!result.summary.contains("<read-files>"));
+        assert!(result.snap_payload.is_none());
+        assert_eq!(result.first_kept_entry_id, "ACME-654321");
+        assert_eq!(result.details.read_files, vec!["ACME-123456".to_string()]);
+    }
+}
+
+#[test]
+fn compaction_accepts_large_context_and_refuses_aggregate_scan_overflow() {
+    run_async(async {
+        let provider = Arc::new(ScriptedProvider::new(["large summary"]));
+        let mut prep = privacy_preparation();
+        prep.is_split_turn = false;
+        prep.turn_prefix_messages.clear();
+        prep.messages_to_summarize = vec![user_text("ordinary context ".repeat(32_768))];
+        compact(
+            prep,
+            provider.clone(),
+            "auth-kept",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+        .expect("normal large compaction exceeds the small auxiliary budget");
+        assert!(provider.prompts()[0].len() > pi::text_completion::MAX_INPUT_BYTES);
+
+        let refused = Arc::new(ScriptedProvider::new(["must not dispatch"]));
+        let mut prep = privacy_preparation();
+        prep.messages_to_summarize = vec![user_text("x".repeat(17 * 1024 * 1024))];
+        prep.turn_prefix_messages = vec![user_text("y".repeat(17 * 1024 * 1024))];
+        let error = compact(
+            prep,
+            refused.clone(),
+            "auth-kept",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+        .expect_err("aggregate input must be refused before cloning the projection");
+        assert!(error.to_string().contains("PI_COMPACTION_INPUT_LIMIT"));
+        assert!(refused.prompts().is_empty());
+    });
 }
 
 #[test]
@@ -1058,8 +1437,17 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
     ]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
 
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert!(result.summary.contains("HISTORY_SUMMARY"));
@@ -1095,8 +1483,17 @@ fn compact_appends_file_operations_and_sorts_lists() {
     log_preparation(&harness, &entries, &prep);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert!(result.summary.contains("<read-files>"));
@@ -1141,8 +1538,17 @@ fn compact_seeds_file_ops_from_previous_compaction_details() {
     log_preparation(&harness, &entries, &prep);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert_eq!(
@@ -1186,8 +1592,17 @@ fn compact_does_not_seed_file_ops_when_previous_compaction_from_hook() {
     log_preparation(&harness, &entries, &prep);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert_eq!(result.details.read_files, vec!["r2.txt".to_string()]);
@@ -1212,8 +1627,17 @@ fn compact_includes_previous_summary_in_prompt_for_incremental_update() {
 
     let provider = Arc::new(ScriptedProvider::new(["UPDATED"]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     let prompt = provider.prompts().first().expect("prompt").clone();
@@ -1357,8 +1781,17 @@ fn compact_prompt_includes_thinking_and_tool_calls_in_serialized_conversation() 
 
     let provider = Arc::new(ScriptedProvider::new(["S"]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
-    let _result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let _result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
 
     let prompts = provider.prompts();
     let prompt = prompts.first().expect("prompt");
@@ -1462,8 +1895,17 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
     assert_eq!(prep.first_kept_entry_id, "u1");
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["SUM1"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     let mut hasher = Sha256::new();
@@ -1554,8 +1996,17 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
     let prep1 = prepare_compaction(&entries, make_settings(4)).expect("prep1");
     assert_eq!(prep1.first_kept_entry_id, "u1");
     let provider1_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S1"]));
-    let result1 = run_async(async move { compact(prep1, provider1_dyn, "test-key", None).await })
-        .expect("compact1");
+    let result1 = run_async(async move {
+        compact(
+            prep1,
+            provider1_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact1");
 
     let details1 = pi::compaction::compaction_details_to_value(&result1.details).expect("details1");
 
@@ -1613,8 +2064,17 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
             .is_some_and(|s| s.contains("S1"))
     );
 
-    let result2 = run_async(async move { compact(prep2, provider2_dyn, "test-key", None).await })
-        .expect("compact2");
+    let result2 = run_async(async move {
+        compact(
+            prep2,
+            provider2_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact2");
     log_result(&harness, &result2);
 
     assert_eq!(
@@ -1705,8 +2165,17 @@ fn prepare_compaction_ignores_malformed_previous_compaction_details() {
     log_preparation(&harness, &entries, &prep);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert_eq!(
@@ -1778,8 +2247,17 @@ fn compact_returns_error_when_provider_stops_with_error() {
     prep.settings.context_window_tokens = 128_000;
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ErrorProvider);
-    let err = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect_err("compact should error");
+    let err = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect_err("compact should error");
 
     assert!(err.to_string().contains("provider failed"));
 }
@@ -1809,8 +2287,17 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
     assert_eq!(prep.turn_prefix_messages.len(), 3);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["TURN"]));
-    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
-        .expect("compact");
+    let result = run_async(async move {
+        compact(
+            prep,
+            provider_dyn,
+            "test-key",
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+    })
+    .expect("compact");
     log_result(&harness, &result);
 
     assert!(result.details.read_files.is_empty());

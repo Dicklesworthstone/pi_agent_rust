@@ -220,6 +220,557 @@ pub struct CompactionPreparation {
     pub settings: ResolvedCompactionSettings,
 }
 
+/// A compaction may cover a million-token context. Keep its scan bounded
+/// without imposing the much smaller side-question/advisor input allowance.
+const MAX_COMPACTION_PRIVACY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_COMPACTION_PRIVACY_FIELDS: usize = 262_144;
+
+/// Launch-time privacy policy and remembered credentials for a summarizer.
+/// The vault is a private snapshot; screening never changes the live Agent.
+/// SecretVault's Debug implementation reports only its entry count.
+#[derive(Clone, Debug, Default)]
+pub struct CompactionPrivacy {
+    policy: crate::text_completion::AuxiliaryPrivacy,
+    known_secrets: crate::secrets::SecretVault,
+}
+
+impl CompactionPrivacy {
+    #[must_use]
+    pub fn from_settings(settings: Option<&crate::secrets::SecretsSettings>) -> Self {
+        Self::with_vault(settings, &crate::secrets::SecretVault::default())
+    }
+
+    pub(crate) fn with_vault(
+        settings: Option<&crate::secrets::SecretsSettings>,
+        known_secrets: &crate::secrets::SecretVault,
+    ) -> Self {
+        Self {
+            policy: crate::text_completion::AuxiliaryPrivacy::from_settings(settings),
+            known_secrets: known_secrets.clone(),
+        }
+    }
+
+    fn screen(
+        &mut self,
+        preparation: &mut CompactionPreparation,
+        custom_instructions: &mut Option<String>,
+    ) -> Result<SummaryPrompts> {
+        let mut prompts = SummaryPrompts::default();
+        let mut fields = SummaryFields::default();
+        fields.preparation(preparation)?;
+        if let Some(custom) = custom_instructions {
+            fields.text(custom)?;
+        }
+        fields.text(&mut prompts.system)?;
+        fields.text(&mut prompts.summary)?;
+        fields.text(&mut prompts.update)?;
+        fields.text(&mut prompts.turn_prefix)?;
+        fields.screen(self)?;
+        Ok(prompts)
+    }
+
+    /// The native Responses bridge has its own provider entry point. Screen
+    /// its structured payload together with the source preparation so later
+    /// assignments protect earlier bare echoes in the extension's request.
+    pub(crate) fn screen_native_request(
+        &mut self,
+        preparation: &mut CompactionPreparation,
+        request: &Value,
+    ) -> Result<Value> {
+        let mut bytes = 0;
+        let mut count = 0;
+        compaction_json_budget(request, &mut bytes, &mut count, 0)?;
+        let mut protected = request.clone();
+        decode_native_arguments(&mut protected)?;
+        let mut fields = SummaryFields::default();
+        fields.preparation(preparation)?;
+        fields.native_content(&protected)?;
+        fields.json(&mut protected)?;
+        let mut privacy = self.clone();
+        fields.screen(&mut privacy)?;
+        privacy.ensure_native_fragments_screened(&protected)?;
+        ensure_native_protocol_preserved(request, &protected)?;
+        encode_native_arguments(request, &mut protected)?;
+        *self = privacy;
+        Ok(protected)
+    }
+
+    /// Native output can replay text from an older encrypted window. Screen
+    /// the visible checkpoint and replay window together, retaining request
+    /// discoveries without altering local cut-point/file-operation metadata.
+    pub(crate) fn screen_native_result(&mut self, mut result: Value) -> Result<Value> {
+        let mut bytes = 0;
+        let mut count = 0;
+        compaction_json_budget(&result, &mut bytes, &mut count, 0)?;
+        let mut summary = result
+            .get("summary")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::validation("native compaction result has no text summary"))?
+            .to_string();
+        let original_window = result
+            .get("details")
+            .and_then(|details| details.get("compactedWindow"))
+            .ok_or_else(|| Error::validation("native compaction result has no replay window"))?;
+        let mut protected = original_window.clone();
+        decode_native_arguments(&mut protected)?;
+        let mut fields = SummaryFields::default();
+        fields.text(&mut summary)?;
+        fields.native_content(&protected)?;
+        fields.json(&mut protected)?;
+        let mut privacy = self.clone();
+        fields.screen(&mut privacy)?;
+        privacy.ensure_native_fragments_screened(&protected)?;
+        ensure_native_protocol_preserved(original_window, &protected)?;
+        encode_native_arguments(original_window, &mut protected)?;
+        let result_fields = result
+            .as_object_mut()
+            .ok_or_else(|| Error::validation("native compaction result is not an object"))?;
+        result_fields.insert("summary".to_string(), Value::String(summary));
+        let details = result_fields
+            .get_mut("details")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::validation("native compaction result has no details"))?;
+        details.insert("compactedWindow".to_string(), protected);
+        *self = privacy;
+        Ok(result)
+    }
+
+    fn ensure_native_fragments_screened(&mut self, value: &Value) -> Result<()> {
+        let mut fragments = SummaryFields::default();
+        fragments.native_content(value)?;
+        if fragments.screen(self)? {
+            return Err(Error::validation(
+                "PI_COMPACTION_FRAGMENTED: native text fragments cannot be screened without changing their content layout",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct SummaryPrompts {
+    system: String,
+    summary: String,
+    update: String,
+    turn_prefix: String,
+}
+
+impl Default for SummaryPrompts {
+    fn default() -> Self {
+        Self {
+            system: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
+            summary: SUMMARIZATION_PROMPT.to_string(),
+            update: UPDATE_SUMMARIZATION_PROMPT.to_string(),
+            turn_prefix: TURN_PREFIX_SUMMARIZATION_PROMPT.to_string(),
+        }
+    }
+}
+
+enum SummaryField<'a> {
+    Text(&'a mut String),
+    Json(&'a mut Value),
+    Discovery(String),
+}
+
+#[derive(Default)]
+struct SummaryFields<'a> {
+    fields: Vec<SummaryField<'a>>,
+    bytes: usize,
+    count: usize,
+}
+
+fn compaction_privacy_limit() -> Error {
+    Error::validation(
+        "PI_COMPACTION_INPUT_LIMIT: input exceeds the compaction privacy scan budget",
+    )
+}
+
+fn compaction_text_budget(text: &str, bytes: &mut usize, count: &mut usize) -> Result<()> {
+    *bytes = bytes
+        .checked_add(text.len())
+        .ok_or_else(compaction_privacy_limit)?;
+    *count = count.checked_add(1).ok_or_else(compaction_privacy_limit)?;
+    if *bytes > MAX_COMPACTION_PRIVACY_BYTES || *count > MAX_COMPACTION_PRIVACY_FIELDS {
+        return Err(compaction_privacy_limit());
+    }
+    Ok(())
+}
+
+fn compaction_json_budget(
+    value: &Value,
+    bytes: &mut usize,
+    count: &mut usize,
+    depth: usize,
+) -> Result<()> {
+    if depth > 120 {
+        return Err(compaction_privacy_limit());
+    }
+    compaction_text_budget("", bytes, count)?;
+    match value {
+        Value::String(text) => compaction_text_budget(text, bytes, count)?,
+        Value::Array(values) => {
+            for value in values {
+                compaction_json_budget(value, bytes, count, depth + 1)?;
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                compaction_text_budget(key, bytes, count)?;
+                compaction_json_budget(value, bytes, count, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl<'a> SummaryFields<'a> {
+    fn text(&mut self, text: &'a mut String) -> Result<()> {
+        compaction_text_budget(text, &mut self.bytes, &mut self.count)?;
+        self.fields.push(SummaryField::Text(text));
+        Ok(())
+    }
+
+    fn json(&mut self, value: &'a mut Value) -> Result<()> {
+        compaction_json_budget(value, &mut self.bytes, &mut self.count, 0)?;
+        self.fields.push(SummaryField::Json(value));
+        Ok(())
+    }
+
+    fn discovery(&mut self, text: &str) -> Result<()> {
+        compaction_text_budget(text, &mut self.bytes, &mut self.count)?;
+        self.fields.push(SummaryField::Discovery(text.to_string()));
+        Ok(())
+    }
+
+    fn native_content(&mut self, value: &Value) -> Result<()> {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::Array(parts)) = object.get("content") {
+                    let texts = parts.iter().filter_map(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "output_text")
+                        )
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten()
+                    });
+                    let separator = if object.get("role").and_then(Value::as_str)
+                        == Some("assistant")
+                    {
+                        "\n"
+                    } else {
+                        ""
+                    };
+                    let mut bytes = 0usize;
+                    let mut count = 0usize;
+                    for text in texts.clone() {
+                        if count > 0 {
+                            bytes = bytes
+                                .checked_add(separator.len())
+                                .ok_or_else(compaction_privacy_limit)?;
+                        }
+                        compaction_text_budget(text, &mut bytes, &mut count)?;
+                    }
+                    if count > 1 {
+                        self.bytes = self
+                            .bytes
+                            .checked_add(bytes)
+                            .ok_or_else(compaction_privacy_limit)?;
+                        compaction_text_budget("", &mut self.bytes, &mut self.count)?;
+                        let mut joined = String::with_capacity(bytes);
+                        for (index, text) in texts.enumerate() {
+                            if index > 0 {
+                                joined.push_str(separator);
+                            }
+                            joined.push_str(text);
+                        }
+                        self.fields.push(SummaryField::Discovery(joined));
+                    }
+                }
+                for value in object.values() {
+                    self.native_content(value)?;
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.native_content(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn joined_blocks(
+        &mut self,
+        blocks: &[ContentBlock],
+        thinking: bool,
+        separator: &str,
+    ) -> Result<()> {
+        fn text_of(block: &ContentBlock, thinking: bool) -> Option<&str> {
+            match block {
+                ContentBlock::Text(text) if !thinking => Some(text.text.as_str()),
+                ContentBlock::Thinking(text) if thinking => Some(text.thinking.as_str()),
+                _ => None,
+            }
+        }
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for text in blocks.iter().filter_map(|block| text_of(block, thinking)) {
+            if count > 0 {
+                bytes = bytes
+                    .checked_add(separator.len())
+                    .ok_or_else(compaction_privacy_limit)?;
+            }
+            compaction_text_budget(text, &mut bytes, &mut count)?;
+        }
+        if count > 1 {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes)
+                .ok_or_else(compaction_privacy_limit)?;
+            compaction_text_budget("", &mut self.bytes, &mut self.count)?;
+            let mut joined = String::with_capacity(bytes);
+            for (index, text) in blocks
+                .iter()
+                .filter_map(|block| text_of(block, thinking))
+                .enumerate()
+            {
+                if index > 0 {
+                    joined.push_str(separator);
+                }
+                joined.push_str(text);
+            }
+            self.fields.push(SummaryField::Discovery(joined));
+        }
+        Ok(())
+    }
+
+    fn blocks(&mut self, blocks: &'a mut [ContentBlock], assistant: bool) -> Result<()> {
+        // Discover on the logical fields formed by the exact transcript
+        // separators, retaining anchored patterns across split source blocks.
+        self.joined_blocks(blocks, false, if assistant { "\n" } else { "" })?;
+        if assistant {
+            self.joined_blocks(blocks, true, "\n")?;
+        }
+        for block in blocks {
+            match block {
+                ContentBlock::Text(text) => self.text(&mut text.text)?,
+                ContentBlock::Thinking(thinking) if assistant => {
+                    self.text(&mut thinking.thinking)?;
+                }
+                ContentBlock::ToolCall(call) if assistant => {
+                    self.text(&mut call.name)?;
+                    self.json(&mut call.arguments)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn preparation(&mut self, preparation: &'a mut CompactionPreparation) -> Result<()> {
+        for message in preparation
+            .messages_to_summarize
+            .iter_mut()
+            .chain(&mut preparation.turn_prefix_messages)
+        {
+            match message {
+                SessionMessage::User { content, .. } => match content {
+                    UserContent::Text(text) => self.text(text)?,
+                    UserContent::Blocks(blocks) => self.blocks(blocks, false)?,
+                },
+                SessionMessage::Assistant { message } => {
+                    self.blocks(&mut message.content, true)?;
+                }
+                SessionMessage::ToolResult { content, .. } => self.blocks(content, false)?,
+                SessionMessage::Custom {
+                    custom_type,
+                    content,
+                    ..
+                } => {
+                    self.text(custom_type)?;
+                    self.text(content)?;
+                }
+                SessionMessage::BashExecution {
+                    command,
+                    output,
+                    full_output_path,
+                    extra,
+                    ..
+                } if !extra
+                    .get("excludeFromContext")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) =>
+                {
+                    self.text(command)?;
+                    self.text(output)?;
+                    if let Some(path) = full_output_path {
+                        self.text(path)?;
+                    }
+                }
+                SessionMessage::BranchSummary { summary, .. }
+                | SessionMessage::CompactionSummary { summary, .. } => self.text(summary)?,
+                SessionMessage::BashExecution { .. } => {}
+            }
+        }
+        if let Some(previous) = &mut preparation.previous_summary {
+            self.text(previous)?;
+        }
+        // File lists are appended to the summary after model generation.
+        // Discover on original path fields for anchored patterns, while the
+        // local file-operation metadata itself retains its original values.
+        for path in preparation
+            .file_ops
+            .read
+            .iter()
+            .chain(&preparation.file_ops.written)
+            .chain(&preparation.file_ops.edited)
+        {
+            self.discovery(path)?;
+        }
+        Ok(())
+    }
+
+    /// Return whether any discovery-only logical field needed rewriting.
+    fn screen(self, privacy: &mut CompactionPrivacy) -> Result<bool> {
+        let projection = Value::Array(
+            self.fields
+                .iter()
+                .map(|field| match field {
+                    SummaryField::Text(text) => Value::String((**text).clone()),
+                    SummaryField::Json(value) => (**value).clone(),
+                    SummaryField::Discovery(text) => Value::String(text.clone()),
+                })
+                .collect(),
+        );
+        let Value::Array(protected) = crate::text_completion::redact_json_with_vault(
+            &projection,
+            &privacy.policy,
+            &mut privacy.known_secrets,
+        )?
+        else {
+            return Err(Error::validation(
+                "compaction privacy projection changed shape",
+            ));
+        };
+        if protected.len() != self.fields.len() {
+            return Err(Error::validation(
+                "compaction privacy projection changed field count",
+            ));
+        }
+        let mut discovery_changed = false;
+        for (field, protected) in self.fields.into_iter().zip(protected) {
+            match (field, protected) {
+                (SummaryField::Text(text), Value::String(protected)) => *text = protected,
+                (SummaryField::Json(value), protected) => *value = protected,
+                (SummaryField::Discovery(original), Value::String(protected)) => {
+                    discovery_changed |= original != protected;
+                }
+                _ => {
+                    return Err(Error::validation(
+                        "compaction privacy projection changed text type",
+                    ));
+                }
+            }
+        }
+        Ok(discovery_changed)
+    }
+}
+
+fn ensure_native_protocol_preserved(original: &Value, protected: &Value) -> Result<()> {
+    match (original, protected) {
+        (Value::Object(original), Value::Object(protected)) => {
+            if original.keys().ne(protected.keys()) {
+                return Err(Error::validation(
+                    "PI_COMPACTION_PROTOCOL: privacy screening would change native field names",
+                ));
+            }
+            for (key, value) in original {
+                let screened = protected.get(key).ok_or_else(|| {
+                    Error::validation(
+                        "PI_COMPACTION_PROTOCOL: privacy screening removed a native field",
+                    )
+                })?;
+                if matches!(
+                    key.as_str(),
+                    "type" | "role" | "id" | "call_id" | "name" | "model" | "encrypted_content"
+                ) && value != screened
+                {
+                    return Err(Error::validation(
+                        "PI_COMPACTION_PROTOCOL: privacy screening would change a native identifier or opaque value",
+                    ));
+                }
+                ensure_native_protocol_preserved(value, screened)?;
+            }
+        }
+        (Value::Array(original), Value::Array(protected)) => {
+            for (original, protected) in original.iter().zip(protected) {
+                ensure_native_protocol_preserved(original, protected)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decode_native_arguments(value: &mut Value) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(Value::String(arguments)) = object.get("arguments")
+            {
+                let arguments = serde_json::from_str(arguments).map_err(|_| {
+                    Error::validation(
+                        "PI_COMPACTION_ARGUMENTS: native function arguments are not valid JSON",
+                    )
+                })?;
+                object.insert("arguments".to_string(), arguments);
+            }
+            for (key, value) in object {
+                if key != "arguments" {
+                    decode_native_arguments(value)?;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                decode_native_arguments(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn encode_native_arguments(original: &Value, protected: &mut Value) -> Result<()> {
+    match (original, protected) {
+        (Value::Object(original), Value::Object(protected)) => {
+            for (key, value) in protected {
+                if key == "arguments"
+                    && original.get("type").and_then(Value::as_str) == Some("function_call")
+                    && original.get(key).is_some_and(Value::is_string)
+                {
+                    *value = Value::String(serde_json::to_string(value).map_err(|_| {
+                        Error::validation(
+                            "PI_COMPACTION_ARGUMENTS: failed to encode screened native arguments",
+                        )
+                    })?);
+                } else if let Some(original) = original.get(key) {
+                    encode_native_arguments(original, value)?;
+                }
+            }
+        }
+        (Value::Array(original), Value::Array(protected)) => {
+            for (original, protected) in original.iter().zip(protected) {
+                encode_native_arguments(original, protected)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub const SEMANTIC_COMPACTION_QUALITY_SCHEMA: &str = "pi.session.semantic_compaction_quality.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1701,18 +2252,16 @@ async fn complete_simple(
     Ok(message)
 }
 
-async fn generate_summary(
+fn summary_prompt_text(
     messages: &[SessionMessage],
-    provider: Arc<dyn Provider>,
-    api_key: &str,
-    settings: &ResolvedCompactionSettings,
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
-) -> Result<String> {
+    prompts: &SummaryPrompts,
+) -> String {
     let base_prompt = if previous_summary.is_some() {
-        UPDATE_SUMMARIZATION_PROMPT
+        prompts.update.as_str()
     } else {
-        SUMMARIZATION_PROMPT
+        prompts.summary.as_str()
     };
 
     let mut prompt = base_prompt.to_string();
@@ -1735,13 +2284,39 @@ async fn generate_summary(
     }
     prompt_text.push_str(&prompt);
 
+    prompt_text
+}
+
+fn turn_prefix_prompt_text(
+    messages: &[SessionMessage],
+    prompts: &SummaryPrompts,
+) -> String {
+    let llm_messages = messages
+        .iter()
+        .filter_map(session_message_to_model)
+        .collect::<Vec<_>>();
+    let conversation_text = serialize_conversation(&llm_messages);
+    format!(
+        "<conversation>\n{conversation_text}\n</conversation>\n\n{}",
+        prompts.turn_prefix,
+    )
+}
+
+async fn complete_summary(
+    provider: Arc<dyn Provider>,
+    system_prompt: &str,
+    prompt: String,
+    api_key: &str,
+    settings: &ResolvedCompactionSettings,
+    max_tokens_factor: f64,
+) -> Result<String> {
     let assistant = complete_simple(
         provider,
-        SUMMARIZATION_SYSTEM_PROMPT,
-        prompt_text,
+        system_prompt,
+        prompt,
         api_key,
         settings.reserve_tokens,
-        0.8,
+        max_tokens_factor,
     )
     .await?;
 
@@ -1750,42 +2325,6 @@ async fn generate_summary(
     if text.trim().is_empty() {
         return Err(Error::api(
             "Summarization returned empty text; refusing to store empty compaction summary",
-        ));
-    }
-
-    Ok(text)
-}
-
-async fn generate_turn_prefix_summary(
-    messages: &[SessionMessage],
-    provider: Arc<dyn Provider>,
-    api_key: &str,
-    settings: &ResolvedCompactionSettings,
-) -> Result<String> {
-    let llm_messages = messages
-        .iter()
-        .filter_map(session_message_to_model)
-        .collect::<Vec<_>>();
-    let conversation_text = serialize_conversation(&llm_messages);
-    let prompt_text = format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
-    );
-
-    let assistant = complete_simple(
-        provider,
-        SUMMARIZATION_SYSTEM_PROMPT,
-        prompt_text,
-        api_key,
-        settings.reserve_tokens,
-        0.5,
-    )
-    .await?;
-
-    let text = collect_text_blocks(&assistant.content);
-
-    if text.trim().is_empty() {
-        return Err(Error::api(
-            "Turn prefix summarization returned empty text; refusing to store empty summary",
         ));
     }
 
@@ -2055,6 +2594,7 @@ pub async fn summarize_entries(
     api_key: &str,
     reserve_tokens: u32,
     custom_instructions: Option<&str>,
+    privacy: &CompactionPrivacy,
 ) -> Result<Option<String>> {
     let mut messages = Vec::new();
     for entry in entries {
@@ -2074,74 +2614,143 @@ pub async fn summarize_entries(
         ..Default::default()
     };
 
-    let summary = generate_summary(
-        &messages,
-        provider,
-        api_key,
-        &settings,
-        custom_instructions,
-        None,
-    )
-    .await?;
+    let mut preparation = CompactionPreparation {
+        first_kept_entry_id: String::new(),
+        messages_to_summarize: messages,
+        turn_prefix_messages: Vec::new(),
+        is_split_turn: false,
+        tokens_before: 0,
+        previous_summary: None,
+        file_ops: FileOperations::default(),
+        settings,
+    };
+    let mut custom_instructions = custom_instructions.map(str::to_string);
+    let mut privacy = privacy.clone();
+    let prompts = privacy.screen(&mut preparation, &mut custom_instructions)?;
+    let requests = prepare_summary_requests(
+        &preparation,
+        custom_instructions.as_deref(),
+        &prompts,
+        &mut privacy,
+    )?;
+    let mut summary = generate_llm_summary(&preparation.settings, provider, api_key, requests).await?;
+    let mut fields = SummaryFields::default();
+    fields.text(&mut summary)?;
+    fields.screen(&mut privacy)?;
 
     Ok(Some(summary))
 }
 
-/// Generate the LLM-written compaction summary for `preparation`.
-///
-/// Errors here (provider failures, oversized summarization prompts, empty
-/// responses) are recoverable once the session is past the forced-local
-/// threshold: [`compact`] then falls back to a deterministic local summary
-/// instead of propagating them.
-async fn generate_llm_summary(
+struct PreparedSummaryRequests {
+    system: String,
+    history: Option<String>,
+    turn_prefix: Option<String>,
+    snap_transcript: Option<String>,
+}
+
+/// Per-field screening preserves anchored patterns and JSON assignment
+/// semantics; this second preflight catches credentials formed by rendering
+/// adjacent blocks or adding wrappers. Both split requests are ready before
+/// either provider call, and snapcompact uses this same screened projection.
+fn prepare_summary_requests(
     preparation: &CompactionPreparation,
-    provider: Arc<dyn Provider>,
-    api_key: &str,
     custom_instructions: Option<&str>,
-) -> Result<String> {
-    if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let history_summary = if preparation.messages_to_summarize.is_empty() {
-            "No prior history.".to_string()
-        } else {
-            generate_summary(
+    prompts: &SummaryPrompts,
+    privacy: &mut CompactionPrivacy,
+) -> Result<PreparedSummaryRequests> {
+    let split = preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty();
+    let mut requests = PreparedSummaryRequests {
+        system: prompts.system.clone(),
+        history: (!split || !preparation.messages_to_summarize.is_empty()).then(|| {
+            summary_prompt_text(
                 &preparation.messages_to_summarize,
-                Arc::clone(&provider),
-                api_key,
-                &preparation.settings,
                 custom_instructions,
                 preparation.previous_summary.as_deref(),
+                prompts,
             )
-            .await?
-        };
+        }),
+        turn_prefix: split
+            .then(|| turn_prefix_prompt_text(&preparation.turn_prefix_messages, prompts)),
+        snap_transcript: matches!(
+            preparation.settings.render_mode,
+            CompactionRenderMode::SnapCompact
+        )
+        .then(|| {
+            let messages = preparation
+                .messages_to_summarize
+                .iter()
+                .filter_map(session_message_to_model)
+                .collect::<Vec<_>>();
+            serialize_conversation(&messages)
+        }),
+    };
+    let mut fields = SummaryFields::default();
+    fields.text(&mut requests.system)?;
+    for text in [
+        &mut requests.history,
+        &mut requests.turn_prefix,
+        &mut requests.snap_transcript,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fields.text(text)?;
+    }
+    fields.screen(privacy)?;
+    Ok(requests)
+}
 
-        let turn_prefix_summary = generate_turn_prefix_summary(
-            &preparation.turn_prefix_messages,
+/// Provider failures and empty replies remain eligible for local fallback.
+/// Privacy validation has already completed outside that recovery boundary.
+async fn generate_llm_summary(
+    settings: &ResolvedCompactionSettings,
+    provider: Arc<dyn Provider>,
+    api_key: &str,
+    requests: PreparedSummaryRequests,
+) -> Result<String> {
+    let history_summary = if let Some(history) = requests.history {
+        complete_summary(
             Arc::clone(&provider),
+            &requests.system,
+            history,
             api_key,
-            &preparation.settings,
+            settings,
+            0.8,
+        )
+        .await?
+    } else {
+        "No prior history.".to_string()
+    };
+    if let Some(turn_prefix) = requests.turn_prefix {
+        let turn_prefix_summary = complete_summary(
+            provider,
+            &requests.system,
+            turn_prefix,
+            api_key,
+            settings,
+            0.5,
         )
         .await?;
-
         Ok(format!(
             "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
         ))
     } else {
-        generate_summary(
-            &preparation.messages_to_summarize,
-            Arc::clone(&provider),
-            api_key,
-            &preparation.settings,
-            custom_instructions,
-            preparation.previous_summary.as_deref(),
-        )
-        .await
+        Ok(history_summary)
     }
 }
 
 /// Attach file-operation lists and cut-point metadata to a finished summary.
-fn finish_compaction(preparation: CompactionPreparation, mut summary: String) -> CompactionResult {
+fn finish_compaction(
+    preparation: &CompactionPreparation,
+    mut summary: String,
+    screened_snap_transcript: Option<String>,
+    privacy: &mut CompactionPrivacy,
+) -> Result<CompactionResult> {
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     summary.push_str(&format_file_operations(&read_files, &modified_files));
+    let mut fields = SummaryFields::default();
+    fields.text(&mut summary)?;
+    fields.screen(privacy)?;
     let details = CompactionDetails {
         read_files,
         modified_files,
@@ -2152,45 +2761,52 @@ fn finish_compaction(preparation: CompactionPreparation, mut summary: String) ->
         preparation.settings.render_mode,
         CompactionRenderMode::SnapCompact
     ) {
-        let model_messages: Vec<crate::model::Message> = preparation
-            .messages_to_summarize
-            .iter()
-            .filter_map(session_message_to_model)
-            .collect();
-        let transcript = serialize_conversation(&model_messages);
-        let frames = crate::compaction_snap::render_frames(&transcript);
-        (!frames.is_empty()).then(|| {
-            tracing::info!(
-                target: "snapcompact",
-                frame_count = frames.len(),
-                source_chars = transcript.chars().count(),
-                reason_code = "snapcompact_frames_generated",
-                "Rasterized compacted span into deterministic PNG frames"
-            );
-            crate::compaction_snap::SnapPayload::new(frames)
+        screened_snap_transcript.and_then(|transcript| {
+            let frames = crate::compaction_snap::render_frames(&transcript);
+            (!frames.is_empty()).then(|| {
+                tracing::info!(
+                    target: "snapcompact",
+                    frame_count = frames.len(),
+                    source_chars = transcript.chars().count(),
+                    reason_code = "snapcompact_frames_generated",
+                    "Rasterized compacted span into deterministic PNG frames"
+                );
+                crate::compaction_snap::SnapPayload::new(frames)
+            })
         })
     } else {
         None
     };
 
-    CompactionResult {
+    Ok(CompactionResult {
         summary,
-        first_kept_entry_id: preparation.first_kept_entry_id,
+        first_kept_entry_id: preparation.first_kept_entry_id.clone(),
         tokens_before: preparation.tokens_before,
         details,
         snap_payload,
-    }
+    })
 }
 
 pub async fn compact(
-    preparation: CompactionPreparation,
+    mut preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
     api_key: &str,
     custom_instructions: Option<&str>,
+    privacy: &CompactionPrivacy,
 ) -> Result<CompactionResult> {
-    let summary = match generate_llm_summary(&preparation, provider, api_key, custom_instructions)
-        .await
-    {
+    let mut custom_instructions = custom_instructions.map(str::to_string);
+    let mut privacy = privacy.clone();
+    // Screen both split-turn inputs in one transaction before any provider
+    // request. Privacy refusals do not enter the provider-failure fallback.
+    let prompts = privacy.screen(&mut preparation, &mut custom_instructions)?;
+    let mut requests = prepare_summary_requests(
+        &preparation,
+        custom_instructions.as_deref(),
+        &prompts,
+        &mut privacy,
+    )?;
+    let snap_transcript = requests.snap_transcript.take();
+    let summary = match generate_llm_summary(&preparation.settings, provider, api_key, requests).await {
         Ok(summary) => summary,
         Err(error) => {
             // An oversized session makes the summarization prompt itself
@@ -2214,7 +2830,7 @@ pub async fn compact(
         }
     };
 
-    Ok(finish_compaction(preparation, summary))
+    finish_compaction(&preparation, summary, snap_transcript, &mut privacy)
 }
 
 /// Provider-free compaction: summarize `preparation` with the deterministic
@@ -2223,9 +2839,76 @@ pub async fn compact(
 /// Used as a failsafe when background LLM compaction is quota-blocked but the
 /// session has grown far beyond the context window.
 #[must_use]
-pub fn compact_local(preparation: CompactionPreparation) -> CompactionResult {
-    let summary = build_fallback_summary(&preparation);
-    finish_compaction(preparation, summary)
+pub fn compact_local(
+    preparation: CompactionPreparation,
+    privacy: &CompactionPrivacy,
+) -> CompactionResult {
+    finish_local_compaction(preparation, privacy, build_fallback_summary)
+}
+
+fn finish_local_compaction(
+    mut preparation: CompactionPreparation,
+    privacy: &CompactionPrivacy,
+    summarize: fn(&CompactionPreparation) -> String,
+) -> CompactionResult {
+    let screened = (|| -> Result<CompactionResult> {
+        let mut privacy = privacy.clone();
+        let source_screen = privacy.screen(&mut preparation, &mut None);
+        let pixels_allowed = source_screen.is_ok();
+        privacy.policy = privacy.policy.local_redaction();
+        if let Err(error) = source_screen {
+            tracing::warn!(
+                error = %error,
+                reason_code = "snapcompact_privacy_refused",
+                "Omitting unsafe compaction frames; redacting the local text checkpoint"
+            );
+            privacy.screen(&mut preparation, &mut None)?;
+        }
+        let snap_transcript = if pixels_allowed
+            && preparation.settings.render_mode == CompactionRenderMode::SnapCompact
+        {
+            let messages = preparation
+                .messages_to_summarize
+                .iter()
+                .filter_map(session_message_to_model)
+                .collect::<Vec<_>>();
+            let mut transcript = serialize_conversation(&messages);
+            let mut fields = SummaryFields::default();
+            fields.text(&mut transcript)?;
+            fields.screen(&mut privacy)?;
+            Some(transcript)
+        } else {
+            None
+        };
+        let summary = summarize(&preparation);
+        finish_compaction(&preparation, summary, snap_transcript, &mut privacy)
+    })();
+    match screened {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                reason_code = "compaction_local_privacy_omitted",
+                "Local checkpoint privacy projection failed; retaining only cut-point metadata"
+            );
+            let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+            CompactionResult {
+                summary: "## Context Checkpoint\n\n\
+                    The earlier context was omitted because its privacy projection \
+                    could not be completed safely. Re-read needed files or ask for \
+                    the missing context."
+                    .to_string(),
+                first_kept_entry_id: preparation.first_kept_entry_id,
+                tokens_before: preparation.tokens_before,
+                details: CompactionDetails {
+                    read_files,
+                    modified_files,
+                    mode: None,
+                },
+                snap_payload: None,
+            }
+        }
+    }
 }
 
 // ── Shake compaction (bd-cv653.3.18) ────────────────────────────────
@@ -2261,15 +2944,15 @@ fn content_blocks_text(content: &[ContentBlock]) -> String {
     text
 }
 
-/// Deterministic no-LLM "shake" summary: conversation text preserved
-/// verbatim, bulky tool-result payloads dropped to one-line stubs. Cheap and
+/// Deterministic no-LLM "shake" summary: screened conversation text preserved,
+/// bulky tool-result payloads dropped to one-line stubs. Cheap and
 /// instant — the reclaim comes entirely from tool output bulk.
 #[must_use]
 pub fn build_shake_summary(preparation: &CompactionPreparation) -> String {
     let mut out = String::from(
         "## Context Checkpoint (shake)\n\n\
          Bulky tool results were dropped from this span; the conversation \
-         text below is verbatim. Re-run a tool if its full output is needed \
+         text below is retained with private values redacted. Re-run a tool if its full output is needed \
          again.",
     );
 
@@ -2341,9 +3024,11 @@ pub fn build_shake_summary(preparation: &CompactionPreparation) -> String {
 /// adjacency rules are inherited from [`prepare_compaction`], so no dangling
 /// tool-call/result pairs survive.
 #[must_use]
-pub fn compact_shake(preparation: CompactionPreparation) -> CompactionResult {
-    let summary = build_shake_summary(&preparation);
-    let mut result = finish_compaction(preparation, summary);
+pub fn compact_shake(
+    preparation: CompactionPreparation,
+    privacy: &CompactionPrivacy,
+) -> CompactionResult {
+    let mut result = finish_local_compaction(preparation, privacy, build_shake_summary);
     result.details.mode = Some("shake".to_string());
     result
 }
@@ -2365,6 +3050,7 @@ pub async fn compact_auto(
     provider: Arc<dyn Provider>,
     api_key: &str,
     custom_instructions: Option<&str>,
+    privacy: &CompactionPrivacy,
 ) -> Result<CompactionResult> {
     if matches!(preparation.settings.mode, AutoCompactionMode::ShakeFirst) {
         let projection = shake_projection(&preparation);
@@ -2374,10 +3060,10 @@ pub async fn compact_auto(
                 projected_tokens = projection.projected_tokens,
                 "auto-compaction: shake reclaims enough; skipping LLM summary"
             );
-            return Ok(compact_shake(preparation));
+            return Ok(compact_shake(preparation, privacy));
         }
     }
-    compact(preparation, provider, api_key, custom_instructions).await
+    compact(preparation, provider, api_key, custom_instructions, privacy).await
 }
 
 /// Estimate what the compacted span would shrink to under a shake.
@@ -4458,6 +5144,7 @@ mod tests {
                 Arc::new(PanickingProvider),
                 "unused",
                 None,
+                &CompactionPrivacy::default(),
             ))
             .expect("compact_auto");
         assert_eq!(result.details.mode.as_deref(), Some("shake"));
@@ -4511,7 +5198,7 @@ mod tests {
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let first_kept = prep.first_kept_entry_id.clone();
-        let result = compact_shake(prep);
+        let result = compact_shake(prep, &CompactionPrivacy::default());
 
         assert_eq!(result.details.mode.as_deref(), Some("shake"));
         assert_eq!(result.first_kept_entry_id, first_kept);
@@ -4553,7 +5240,7 @@ mod tests {
             render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
-        let result = compact_shake(prep);
+        let result = compact_shake(prep, &CompactionPrivacy::default());
         assert!(
             result.summary.contains("exit 0"),
             "small result kept: {}",
@@ -5061,9 +5748,15 @@ mod tests {
         #[test]
         fn provider_error_falls_back_to_deterministic_summary() {
             run_async(async {
-                let result = compact(make_preparation(), Arc::new(FailingProvider), "key", None)
-                    .await
-                    .expect("compact must not fail when the provider errors");
+                let result = compact(
+                    make_preparation(),
+                    Arc::new(FailingProvider),
+                    "key",
+                    None,
+                    &CompactionPrivacy::default(),
+                )
+                .await
+                .expect("compact must not fail when the provider errors");
 
                 // Cut-point metadata preserved.
                 assert_eq!(result.first_kept_entry_id, "entry-9");
@@ -5101,9 +5794,15 @@ mod tests {
                 prep.is_split_turn = true;
                 prep.turn_prefix_messages = vec![make_user_text("split turn prefix request")];
 
-                let result = compact(prep, Arc::new(FailingProvider), "key", None)
-                    .await
-                    .expect("split-turn compact must not fail when the provider errors");
+                let result = compact(
+                    prep,
+                    Arc::new(FailingProvider),
+                    "key",
+                    None,
+                    &CompactionPrivacy::default(),
+                )
+                .await
+                .expect("split-turn compact must not fail when the provider errors");
                 assert!(result.summary.contains("deterministic fallback"));
                 assert!(result.summary.contains("split turn prefix request"));
             });
@@ -5117,6 +5816,7 @@ mod tests {
                     Arc::new(FixedSummaryProvider),
                     "key",
                     None,
+                    &CompactionPrivacy::default(),
                 )
                 .await
                 .expect("compact with healthy provider");
@@ -5134,7 +5834,7 @@ mod tests {
             // Small reserve => small excerpt budget => elision must kick in.
             prep.settings.reserve_tokens = 1_024;
 
-            let result = compact_local(prep);
+            let result = compact_local(prep, &CompactionPrivacy::default());
             assert!(result.summary.contains("deterministic fallback"));
             assert!(result.summary.contains("older messages elided"));
             // Oldest and newest excerpts are retained.
@@ -5153,9 +5853,15 @@ mod tests {
                 // must see it instead of storing a degraded local summary.
                 prep.tokens_before = 200_000;
 
-                let error = compact(prep, Arc::new(FailingProvider), "key", None)
-                    .await
-                    .expect_err("provider errors below the forced threshold must propagate");
+                let error = compact(
+                    prep,
+                    Arc::new(FailingProvider),
+                    "key",
+                    None,
+                    &CompactionPrivacy::default(),
+                )
+                .await
+                .expect_err("provider errors below the forced threshold must propagate");
                 assert!(error.to_string().contains("exceeds context window"));
             });
         }

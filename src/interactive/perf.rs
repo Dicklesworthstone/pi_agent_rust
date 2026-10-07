@@ -920,6 +920,7 @@ impl PiApp {
             .api_key
             .clone()
             .unwrap_or_default();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
         let name = args.trim().to_string();
@@ -995,13 +996,17 @@ impl PiApp {
                 enabled: true,
                 ..Default::default()
             };
-            let summary = crate::checkpoint::summarize_span(&span, provider, &api_key, &settings)
-                .await
-                .unwrap_or_else(|err| {
-                    format!(
-                        "(summarization failed: {err}; the span was collapsed without a report)"
-                    )
-                });
+            let summary = crate::checkpoint::summarize_span(
+                &span,
+                provider,
+                &api_key,
+                &settings,
+                &privacy,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                format!("(summarization failed: {err}; the span was collapsed without a report)")
+            });
 
             let outcome = {
                 let Ok(mut agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await
@@ -1326,6 +1331,7 @@ impl PiApp {
         };
         let provider = agent_guard.provider();
         let api_key_opt = agent_guard.stream_options().api_key.clone();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
         // Mode selection (bd-cv653.3.18): a leading `shake` drops bulky tool
@@ -1467,13 +1473,14 @@ impl PiApp {
                     )
                 } else {
                     let compact_outcome = if shake_mode {
-                        Ok(crate::compaction::compact_shake(prep))
+                        Ok(crate::compaction::compact_shake(prep, &privacy))
                     } else {
                         crate::compaction::compact(
                             prep,
                             Arc::clone(&provider),
                             api_key_opt.as_deref().unwrap_or_default(),
                             custom_instructions.as_deref(),
+                            &privacy,
                         )
                         .await
                     };

@@ -182,6 +182,7 @@ pub async fn summarize_span(
     provider: std::sync::Arc<dyn crate::provider::Provider>,
     api_key: &str,
     settings: &crate::compaction::ResolvedCompactionSettings,
+    privacy: &crate::compaction::CompactionPrivacy,
 ) -> Result<String> {
     if span.is_empty() {
         return Ok(String::new());
@@ -208,6 +209,7 @@ pub async fn summarize_span(
              what was decided, what remains open. Preserve file paths, \
              decisions, and constraints.",
         ),
+        privacy,
     )
     .await?;
     Ok(result.summary)

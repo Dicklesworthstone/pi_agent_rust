@@ -522,6 +522,7 @@ impl PiApp {
         };
         let provider = agent_guard.provider();
         let key_opt = agent_guard.stream_options().api_key.clone();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
         self.tree_ui = None;
@@ -575,6 +576,7 @@ impl PiApp {
                     key,
                     reserve_tokens,
                     custom_instructions.as_deref(),
+                    &privacy,
                 )
                 .await
                 {

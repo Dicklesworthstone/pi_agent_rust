@@ -152,6 +152,7 @@ fn mark_twenty_turns_rewind_tree_preserved() {
         Arc::new(SummaryProvider),
         "test-key",
         &settings,
+        &agent.compaction_privacy(),
     ))
     .expect("summarize");
     assert!(summary.contains("REPORT"));
