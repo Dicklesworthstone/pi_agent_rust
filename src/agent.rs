@@ -15867,7 +15867,10 @@ impl AgentSession {
     /// into the next turn via the steering queue. Zero-overhead gate: no
     /// advisor configured → no digest built. Failures are isolated inside
     /// the runtime and never fail the run.
-    async fn maybe_advise_turn(&mut self) {
+    async fn maybe_advise_turn(&mut self, abort: Option<&AbortSignal>) {
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return;
+        }
         let Some(runtime) = self.advisor.as_mut() else {
             return;
         };
@@ -15882,7 +15885,12 @@ impl AgentSession {
             return;
         }
         let turn_index = self.agent.messages().len() as u64;
-        let outcome = runtime.review_turn(&digest, turn_index).await;
+        let outcome = runtime
+            .review_turn_with_abort(&digest, turn_index, abort)
+            .await;
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return;
+        }
         if std::env::var_os("PI_DEBUG_ADVISOR").is_some() {
             eprintln!(
                 "[advisor] digest tools={} trivial={} outcome={}",
@@ -15919,10 +15927,12 @@ impl AgentSession {
             content: crate::model::UserContent::Text(injection.clone()),
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
-        self.agent.queue_generated_steering(message);
         // Session audit entry (replayable advisor trail).
         let cx = pi::agent_cx::AgentCx::for_request();
         if let Ok(mut inner) = self.session.lock(cx.cx()).await {
+            if abort.is_some_and(AbortSignal::is_aborted) {
+                return;
+            }
             inner.append_custom_entry(
                 "advisor_note".to_string(),
                 Some(serde_json::json!({
@@ -15931,6 +15941,28 @@ impl AgentSession {
                 })),
             );
         }
+        if !abort.is_some_and(AbortSignal::is_aborted) {
+            self.agent.queue_generated_steering(message);
+        }
+    }
+
+    /// Every execution entrypoint reaches this boundary once, after its
+    /// transcript save. Pauses and failed turns retain their existing queue;
+    /// only a durable completion can admit a new advisory provider request.
+    async fn finish_turn_with_advice(
+        &mut self,
+        result: Result<AssistantMessage>,
+        persist_result: Result<()>,
+        abort: Option<&AbortSignal>,
+    ) -> Result<AssistantMessage> {
+        let message = finish_turn_persistence(&self.provider_admission, result, persist_result)?;
+        if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+            && time_cap_marker(&message).is_none()
+            && !abort.is_some_and(AbortSignal::is_aborted)
+        {
+            self.maybe_advise_turn(abort).await;
+        }
+        Ok(message)
     }
 
     pub async fn run_text_with_abort(
@@ -15997,15 +16029,7 @@ impl AgentSession {
                     .await
             };
             drop(prompt_scope);
-            match result {
-                Ok(message) => {
-                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                        self.maybe_advise_turn().await;
-                    }
-                    Ok(message)
-                }
-                Err(err) => Err(err),
-            }
+            result
         }
         .await
     }
@@ -16084,15 +16108,7 @@ impl AgentSession {
                 .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
                 .await;
             drop(prompt_scope);
-            match result {
-                Ok(message) => {
-                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                        self.maybe_advise_turn().await;
-                    }
-                    Ok(message)
-                }
-                Err(err) => Err(err),
-            }
+            result
         }
         .await
     }
@@ -16668,7 +16684,7 @@ impl AgentSession {
         prompts.extend(semantic_context_messages);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16682,7 +16698,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(&self.provider_admission, result, persist_result)
+        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+            .await
     }
 
     pub(crate) async fn run_agent_with_text(
@@ -16756,7 +16773,7 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16772,7 +16789,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(&self.provider_admission, result, persist_result)
+        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+            .await
     }
 
     pub(crate) async fn run_agent_with_content(
@@ -16846,7 +16864,7 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16862,7 +16880,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(&self.provider_admission, result, persist_result)
+        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+            .await
     }
 
     /// Resume the current turn after a transient failure WITHOUT adding a new
@@ -16911,6 +16930,7 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
+        let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         let on_event: AgentEventHandler = Arc::new(on_event);
         self.sync_runtime_selection_from_session_header().await?;
 
@@ -16941,16 +16961,20 @@ impl AgentSession {
             prompt_scope
                 .session
                 .agent
-                .run_continue_with_follow_up_on_ready_with_abort(abort, on_ready, move |event| {
-                    on_event_for_run(event);
-                })
+                .run_continue_with_follow_up_on_ready_with_abort(
+                    abort.clone(),
+                    on_ready,
+                    move |event| {
+                        on_event_for_run(event);
+                    },
+                )
                 .await
         } else {
             on_ready();
             prompt_scope
                 .session
                 .agent
-                .run_continue_with_abort(abort, move |event| {
+                .run_continue_with_abort(abort.clone(), move |event| {
                     on_event_for_run(event);
                 })
                 .await
@@ -16967,7 +16991,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(&self.provider_admission, result, persist_result)
+        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+            .await
     }
 
     /// Persist the turn transcript and both audit ledgers under one session
@@ -23294,6 +23319,446 @@ mod tests {
         }
     }
 
+    struct AdvisorLifecycleDoer {
+        replies: StdMutex<VecDeque<Result<AssistantMessage>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        session: Arc<Mutex<Session>>,
+        fail_save_at_completion: StdMutex<Option<PathBuf>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for AdvisorLifecycleDoer {
+        fn name(&self) -> &str {
+            "doer"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "doer-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reply = self
+                .replies
+                .lock()
+                .expect("scripted doer replies") // ubs:ignore[rust.panic.expect] -- Fixture synchronization failure invalidates the regression.
+                .pop_front()
+                .expect("unexpected doer request")?; // ubs:ignore[rust.panic.expect] -- An extra request is the regression under test.
+            let blocked_path = self
+                .fail_save_at_completion
+                .lock()
+                .expect("save failure injection") // ubs:ignore[rust.panic.expect] -- The fixture must retain its one explicit fault.
+                .clone();
+            if reply.stop_reason == StopReason::Stop
+                && let Some(path) = blocked_path
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                    .await
+                    .map_err(|error| Error::session(error.to_string()))?;
+                session.path = Some(path);
+            }
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason: reply.stop_reason,
+                message: reply,
+            })])))
+        }
+    }
+
+    struct AdvisorLifecycleReview {
+        calls: std::sync::atomic::AtomicUsize,
+        session: Arc<Mutex<Session>>,
+        observed_durable_completion: AtomicBool,
+        abort_on_call: Option<AbortHandle>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for AdvisorLifecycleReview {
+        fn name(&self) -> &str {
+            "advisor"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "advisor-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let session = self
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .map_err(|error| Error::session(error.to_string()))?;
+                session
+                    .path
+                    .clone()
+                    .ok_or_else(|| Error::session("advisor ran before the first save"))?
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref()).await?;
+            self.observed_durable_completion.store(
+                reopened.to_messages_for_current_path().iter().any(|message| {
+                    matches!(
+                        message,
+                        Message::Assistant(assistant)
+                            if assistant.stop_reason == StopReason::Stop
+                                && assistant_text_content(&assistant.content)
+                                    == "durable doer completion"
+                    )
+                }),
+                Ordering::SeqCst,
+            );
+            if let Some(handle) = &self.abort_on_call {
+                handle.abort();
+            }
+            ScriptedAdvisorProvider.stream(context, options).await
+        }
+    }
+
+    fn advisor_lifecycle_reply(stop_reason: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("durable doer completion"))],
+            api: "test-api".to_string(),
+            provider: "doer".to_string(),
+            model: "doer-model".to_string(),
+            stop_reason,
+            error_message: (stop_reason == StopReason::Error)
+                .then(|| "temporary provider failure".to_string()),
+            ..AssistantMessage::default()
+        }
+    }
+
+    fn advisor_lifecycle_tool_call() -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "advisor-read".to_string(),
+                name: "read".to_string(),
+                arguments: json!({"path": "fixture.txt"}),
+                thought_signature: None,
+            })],
+            ..advisor_lifecycle_reply(StopReason::ToolUse)
+        }
+    }
+
+    fn advisor_lifecycle_session(
+        root: &Path,
+        replies: Vec<Result<AssistantMessage>>,
+        abort_on_review: Option<AbortHandle>,
+    ) -> (
+        AgentSession,
+        Arc<AdvisorLifecycleDoer>,
+        Arc<AdvisorLifecycleReview>,
+    ) {
+        std::fs::write(root.join("fixture.txt"), "fixture content")
+            .expect("write read fixture"); // ubs:ignore[rust.panic.expect] -- Real read-tool execution establishes a substantial turn.
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            root.join("sessions"),
+        ))));
+        let doer = Arc::new(AdvisorLifecycleDoer {
+            replies: StdMutex::new(replies.into()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            session: Arc::clone(&session),
+            fail_save_at_completion: StdMutex::new(None),
+        });
+        let advisor = Arc::new(AdvisorLifecycleReview {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            session: Arc::clone(&session),
+            observed_durable_completion: AtomicBool::new(false),
+            abort_on_call: abort_on_review,
+        });
+        let mut agent_session = AgentSession::new(
+            Agent::new(
+                doer.clone(),
+                ToolRegistry::new(&["read"], root, None),
+                AgentConfig::default(),
+            ),
+            session,
+            true,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        );
+        agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+            advisor.clone(),
+            "advisor/advisor-model".to_string(),
+        ));
+        (agent_session, doer, advisor)
+    }
+
+    #[test]
+    fn every_session_entrypoint_reviews_once_after_the_completed_turn_is_durable() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Each path exercises real AgentSession execution and persistence.
+        runtime.block_on(async {
+            for entrypoint in ["text", "content", "custom", "continue"] {
+                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Isolated durable session and read-tool fixture.
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                    ],
+                    None,
+                );
+                if entrypoint == "continue" {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("seed continuation") // ubs:ignore[rust.panic.expect] -- A continuation must start from an authored persisted-path input.
+                        .append_model_message(user_message("check the fixture"));
+                }
+                let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let captured_ends = Arc::clone(&ends);
+                let on_event = move |event| {
+                    if matches!(event, AgentEvent::AgentEnd { .. }) {
+                        captured_ends.fetch_add(1, Ordering::SeqCst);
+                    }
+                };
+                let result = match entrypoint {
+                    "text" => {
+                        session.run_text("check the fixture".to_string(), on_event).await
+                    }
+                    "content" => {
+                        session
+                            .run_with_content(
+                                vec![ContentBlock::Text(TextContent::new("check the fixture"))],
+                                on_event,
+                            )
+                            .await
+                    }
+                    "custom" => {
+                        session
+                            .run_custom_message_with_abort(
+                                Message::Custom(CustomMessage {
+                                    content: "check the fixture".to_string(),
+                                    custom_type: "extension-task".to_string(),
+                                    display: true,
+                                    details: None,
+                                    timestamp: Utc::now().timestamp_millis(),
+                                }),
+                                None,
+                                on_event,
+                            )
+                            .await
+                    }
+                    _ => session.run_continue_with_abort(None, on_event).await,
+                }
+                .expect("completed session turn"); // ubs:ignore[rust.panic.expect] -- All four actual execution entrypoints must complete.
+                assert_eq!(result.stop_reason, StopReason::Stop, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- The primary result remains unchanged by optional review.
+                assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advice is queued for a later explicit turn.
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Nested wrappers must neither omit nor duplicate review.
+                assert!(advisor.observed_durable_completion.load(Ordering::SeqCst), "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Independent disk reopen at provider admission sees the completed doer reply.
+                assert_eq!(ends.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advisory work adds no extra agent terminal.
+                assert_eq!(session.agent.message_queue.steering.len(), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Exactly one generated concern awaits the next turn.
+                assert!(!session.extensions_turn_active.load(Ordering::SeqCst), "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Completion releases turn ownership on every path.
+            }
+        });
+    }
+
+    #[test]
+    fn advisor_reviews_recovered_tool_work_once_without_reexecuting_it() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Exercise the same continuation path used by provider retry.
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Durable retry fixture.
+            let (mut session, doer, advisor) = advisor_lifecycle_session(
+                temp.path(),
+                vec![
+                    Ok(advisor_lifecycle_tool_call()),
+                    Ok(advisor_lifecycle_reply(StopReason::Error)),
+                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                ],
+                None,
+            );
+            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_tools = Arc::clone(&tool_starts);
+            let failed = session
+                .run_text("check the fixture".to_string(), move |event| {
+                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                        observed_tools.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await
+                .expect("provider terminal is returned"); // ubs:ignore[rust.panic.expect] -- The scripted failure is a completed Error terminal.
+            assert_eq!(failed.stop_reason, StopReason::Error); // ubs:ignore[rust.panic.assert-macros] -- Review must be withheld for the failed first attempt.
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Substantial but failed work never starts review.
+            assert!(session.revert_incomplete_response().await.expect("revert failed tail")); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect] -- Retry restores the real incomplete assistant tail.
+            let observed_tools = Arc::clone(&tool_starts);
+            let recovered = session
+                .run_continue_with_abort(None, move |event| {
+                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                        observed_tools.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await
+                .expect("retry completion"); // ubs:ignore[rust.panic.expect] -- The successful retry must reach the shared review boundary.
+            assert_eq!(recovered.stop_reason, StopReason::Stop); // ubs:ignore[rust.panic.assert-macros] -- Recovery returns the durable final reply.
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 3); // ubs:ignore[rust.panic.assert-macros] -- One tool request, one failed request, and one resumed request.
+            assert_eq!(tool_starts.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Completed tool effects are never replayed for review.
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Only the recovered completion is reviewed.
+            assert!(advisor.observed_durable_completion.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Recovered reply is durable before the advisor sees it.
+            assert_eq!(session.agent.message_queue.steering.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Recovery publishes one concern.
+        });
+    }
+
+    #[test]
+    fn durable_time_cap_skips_nontrivial_advice_until_explicit_continuation() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Exercise the actual zero-budget core boundary.
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- The capped conversation must survive an independent reopen.
+            let (mut session, doer, advisor) = advisor_lifecycle_session(
+                temp.path(),
+                vec![Ok(advisor_lifecycle_reply(StopReason::Stop))],
+                None,
+            );
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut inner = session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("seed tool work"); // ubs:ignore[rust.panic.expect] -- A completed tool cycle makes this digest nontrivial even at a zero cap.
+                inner.append_model_message(user_message("check the fixture"));
+                inner.append_model_message(Message::assistant(advisor_lifecycle_tool_call()));
+                inner.append_model_message(Message::tool_result(ToolResultMessage {
+                    tool_call_id: "advisor-read".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new("fixture content"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: Utc::now().timestamp_millis(),
+                }));
+            }
+            session.agent.config.max_time = Some(Duration::ZERO);
+            let capped = session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("durable capped turn"); // ubs:ignore[rust.panic.expect] -- The real cap is a successful bounded terminal.
+            assert!(time_cap_marker(&capped).is_some()); // ubs:ignore[rust.panic.assert-macros] -- The test must reach the exact synthetic time-cap path.
+            assert!(!crate::advisor::build_digest(session.agent.messages()).is_trivial()); // ubs:ignore[rust.panic.assert-macros] -- Zero calls must result from the cap gate rather than trivial-digest suppression.
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Exhausted budget admits no primary provider request.
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Exhausted budget also admits no optional review.
+            assert!(session.agent.message_queue.steering.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- A pause cannot create new generated work.
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("saved cap path") // ubs:ignore[rust.panic.expect] -- Capture the authoritative file after completed persistence.
+                    .path
+                    .clone()
+                    .expect("durable session path") // ubs:ignore[rust.panic.expect] -- Saving the cap must materialize a session file.
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen capped session"); // ubs:ignore[rust.panic.expect] -- Assert durable output rather than only the in-memory result.
+            assert!(reopened.to_messages_for_current_path().iter().any(|message| matches!( // ubs:ignore[rust.panic.assert-macros] -- The exact bounded terminal must survive reopen.
+                message, Message::Assistant(assistant) if time_cap_marker(assistant).is_some()
+            )));
+            session.agent.config.max_time = None;
+            session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("explicit continuation"); // ubs:ignore[rust.panic.expect] -- A subsequent authorized turn may complete the paused work.
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Only explicit continuation enters the primary provider.
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Review resumes after a fresh durable completion.
+            assert!(advisor.observed_durable_completion.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- The new completed reply is saved before review.
+        });
+    }
+
+    #[test]
+    fn advisor_omits_aborted_unsaved_and_cancelled_completions() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- All cases use the real session completion boundary.
+        runtime.block_on(async {
+            for case in ["aborted", "save_failed", "late_abort", "advisor_abort"] {
+                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Each fault owns a separate durable session.
+                let (handle, signal) = AbortHandle::new();
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(if case == "aborted" {
+                            StopReason::Aborted
+                        } else {
+                            StopReason::Stop
+                        })),
+                    ],
+                    (case == "advisor_abort").then(|| handle.clone()),
+                );
+                if case == "save_failed" {
+                    let blocked_path = temp.path().join("blocked.jsonl");
+                    std::fs::create_dir(&blocked_path).expect("block terminal save"); // ubs:ignore[rust.panic.expect] -- A directory at the final file path creates a real save failure.
+                    *doer
+                        .fail_save_at_completion
+                        .lock()
+                        .expect("inject save failure") // ubs:ignore[rust.panic.expect] -- Install the failure after the initial authored input is saved.
+                        = Some(blocked_path);
+                }
+                let result = session
+                    .run_text_with_abort(
+                        "check the fixture".to_string(),
+                        Some(signal),
+                        move |event| {
+                            if case == "late_abort"
+                                && matches!(event, AgentEvent::AgentEnd { .. })
+                            {
+                                handle.abort();
+                            }
+                        },
+                    )
+                    .await;
+                if case == "save_failed" {
+                    assert!(result.is_err()); // ubs:ignore[rust.panic.assert-macros] -- A failed durable completion cannot report success.
+                    assert!(session.ensure_provider_reentry_allowed().is_err()); // ubs:ignore[rust.panic.assert-macros] -- The existing persistence fence remains installed.
+                } else {
+                    let reply = result.expect("primary terminal remains available"); // ubs:ignore[rust.panic.expect] -- Optional review cancellation does not rewrite a completed main turn.
+                    assert_eq!(reply.stop_reason, if case == "aborted" { StopReason::Aborted } else { StopReason::Stop }); // ubs:ignore[rust.panic.assert-macros] -- Main-turn outcomes retain their original meaning.
+                }
+                assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Every fault occurs after substantive tool work.
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), usize::from(case == "advisor_abort"), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Only the deliberate in-review cancellation case enters the advisor.
+                assert!(session.agent.message_queue.steering.is_empty(), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- No cancelled or failed completion injects a late concern.
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let inner = session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("inspect advisor trail"); // ubs:ignore[rust.panic.expect] -- Publication is checked through the authoritative session path.
+                assert!(inner.entries_for_current_path().iter().all(|entry| !matches!( // ubs:ignore[rust.panic.assert-macros] -- Cancelled or withheld review creates no audit verdict.
+                    entry, crate::session::SessionEntry::Custom(custom) if custom.custom_type == "advisor_note"
+                )), "{case}");
+            }
+        });
+    }
+
     #[test]
     fn advisor_review_injects_concern_into_steering_queue() {
         let runtime = RuntimeBuilder::current_thread()
@@ -23406,7 +23871,7 @@ mod tests {
                     },
                 ))]);
                 let original = serde_json::to_value(session.agent.messages()).unwrap();
-                session.maybe_advise_turn().await;
+                session.maybe_advise_turn(None).await;
                 assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
                 assert_eq!(serde_json::to_value(session.agent.messages()).unwrap(), original);
                 assert!(!session.advisor.as_ref().unwrap().is_disabled());
@@ -23419,7 +23884,7 @@ mod tests {
                     ..Default::default()
                 },
             ))]);
-            session.maybe_advise_turn().await;
+            session.maybe_advise_turn(None).await;
             assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }

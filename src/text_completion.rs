@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, StopReason, StreamEvent};
 
 mod request;
+pub(crate) use request::with_timeout_and_abort;
 pub use request::{RequestStop, with_timeout};
 
 /// Auxiliary calls request only a few hundred tokens. Bound host-side output

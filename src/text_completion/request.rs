@@ -46,8 +46,25 @@ pub async fn with_timeout<F>(
 where
     F: Future,
 {
+    with_timeout_and_abort(timeout, None, future).await
+}
+
+/// Inline requests initiated by an agent turn also observe its explicit abort
+/// signal. Interactive cancellation uses that signal without cancelling the
+/// executor context, which must remain alive to persist and finish the turn.
+pub(crate) async fn with_timeout_and_abort<F>(
+    timeout: Duration,
+    abort: Option<&crate::agent::AbortSignal>,
+    future: F,
+) -> std::result::Result<F::Output, RequestStop>
+where
+    F: Future,
+{
     let owner = AgentCx::for_current_or_request();
-    if owner.checkpoint().is_err() {
+    let cancelled = || {
+        abort.is_some_and(crate::agent::AbortSignal::is_aborted) || owner.checkpoint().is_err()
+    };
+    if cancelled() {
         return Err(RequestStop::Cancelled);
     }
     if timeout.is_zero() {
@@ -67,7 +84,7 @@ where
             ));
             let mut future = std::pin::pin!(future);
             poll_fn(|task_cx| {
-                if owner.checkpoint().is_err() {
+                if cancelled() {
                     return Poll::Ready(Err(RequestStop::Cancelled));
                 }
                 if deadline.as_mut().poll(task_cx).is_ready() {
@@ -81,7 +98,7 @@ where
                 }
 
                 let output = future.as_mut().poll(task_cx);
-                if owner.checkpoint().is_err() {
+                if cancelled() {
                     return Poll::Ready(Err(RequestStop::Cancelled));
                 }
                 if deadline.as_mut().poll(task_cx).is_ready() {
@@ -107,6 +124,81 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn explicit_abort_refuses_provider_admission_without_cancelling_the_owner() {
+        let owner = Cx::for_request();
+        let (handle, signal) = crate::agent::AbortHandle::new();
+        handle.abort();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(Arc::clone(&dropped));
+        let polled = AtomicBool::new(false);
+        let mut request = std::pin::pin!(with_timeout_and_abort(
+            Duration::from_secs(30),
+            Some(&signal),
+            async {
+                let _guard = guard;
+                polled.store(true, Ordering::SeqCst);
+            },
+        ));
+        let _owner_guard = owner.clone().set_current_restricted();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- The aborted request must finish without provider admission.
+            request.as_mut().poll(&mut cx),
+            Poll::Ready(Err(RequestStop::Cancelled))
+        ));
+        assert!(!polled.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Provider future must remain untouched.
+        assert!(dropped.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- The refused request releases its resources.
+        assert!(!owner.is_cancel_requested()); // ubs:ignore[rust.panic.assert-macros] -- Turn persistence retains its live executor context.
+    }
+
+    #[test]
+    fn explicit_abort_racing_a_ready_response_discards_it() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Test runtime is required for the deadline boundary.
+        let (handle, signal) = crate::agent::AbortHandle::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = runtime.block_on(with_timeout_and_abort(
+            Duration::from_secs(30),
+            Some(&signal),
+            async {
+                handle.abort();
+                OnDrop(Arc::clone(&dropped))
+            },
+        ));
+        assert!(matches!(result, Err(RequestStop::Cancelled))); // ubs:ignore[rust.panic.assert-macros] -- Cancellation wins publication of a response completed in the same poll.
+        assert!(dropped.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Discarded successful output releases its resources.
+    }
+
+    #[test]
+    fn explicit_abort_wakes_and_drops_an_idle_cancellation_blind_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- The real timer wakes an otherwise idle request.
+        let (handle, signal) = crate::agent::AbortHandle::new();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_thread = std::thread::spawn(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request admitted"); // ubs:ignore[rust.panic.expect] -- Provider setup must run before this cancellation probe.
+            handle.abort();
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(Arc::clone(&dropped));
+        let result = runtime.block_on(with_timeout_and_abort(
+            Duration::from_secs(5),
+            Some(&signal),
+            async move {
+                let _guard = guard;
+                started_tx.send(()).expect("signal provider admission"); // ubs:ignore[rust.panic.expect] -- The cancellation thread remains alive until admission.
+                std::future::pending::<()>().await;
+            },
+        ));
+        cancel_thread.join().expect("cancellation thread"); // ubs:ignore[rust.panic.expect] -- Propagate failures from the test thread.
+        assert_eq!(result, Err(RequestStop::Cancelled)); // ubs:ignore[rust.panic.assert-macros] -- The explicit signal must win before the independent deadline.
+        assert!(dropped.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- No provider future survives cancellation.
     }
 
     #[test]

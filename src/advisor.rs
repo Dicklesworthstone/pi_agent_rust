@@ -14,7 +14,7 @@ use crate::model::Message;
 use crate::provider::Provider;
 use crate::text_completion::{
     AuxiliaryPrivacy, MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text,
-    redact_inputs, with_timeout,
+    redact_inputs,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -580,6 +580,18 @@ impl AdvisorRuntime {
     /// Owner cancellation suppresses the verdict without changing the failure
     /// streak or emission guard; it is not evidence of a broken provider.
     pub async fn review_turn(&mut self, digest: &TurnDigest, turn_index: u64) -> AdvisorOutcome {
+        self.review_turn_with_abort(digest, turn_index, None).await
+    }
+
+    pub(crate) async fn review_turn_with_abort(
+        &mut self,
+        digest: &TurnDigest,
+        turn_index: u64,
+        abort: Option<&crate::agent::AbortSignal>,
+    ) -> AdvisorOutcome {
+        if abort.is_some_and(crate::agent::AbortSignal::is_aborted) {
+            return AdvisorOutcome::Quiet;
+        }
         if self.is_disabled() || ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return AdvisorOutcome::Quiet;
         }
@@ -593,7 +605,9 @@ impl AdvisorRuntime {
             return AdvisorOutcome::Failed;
         };
         let call = self.call_advisor(&digest);
-        let reply = match with_timeout(self.timeout, call).await {
+        let reply = match crate::text_completion::with_timeout_and_abort(self.timeout, abort, call)
+            .await
+        {
             Ok(Ok(reply)) => reply,
             Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
             Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
@@ -641,6 +655,7 @@ impl AdvisorRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_completion::with_timeout;
 
     #[test]
     fn parse_verdict_levels() {
@@ -1362,6 +1377,36 @@ mod tests {
             ));
             assert_eq!(runtime.consecutive_failures, 0);
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn explicit_abort_preserves_advisor_health_and_next_turn_review() {
+        asupersync::test_utils::run_test(|| async {
+            let (mut runtime, provider) = scripted_runtime(vec![completed_reply(
+                "CONCERN\nCheck the preserved error path before continuing.",
+            )]);
+            runtime.consecutive_failures = 2;
+            let (handle, signal) = crate::agent::AbortHandle::new();
+            handle.abort();
+            for turn in 0..4 {
+                assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- User cancellation is quiet and must not spend the provider failure budget.
+                    runtime
+                        .review_turn_with_abort(&review_digest(), turn, Some(&signal))
+                        .await,
+                    AdvisorOutcome::Quiet
+                ));
+            }
+            assert_eq!(runtime.consecutive_failures, 2); // ubs:ignore[rust.panic.assert-macros] -- Cancellation leaves prior provider health unchanged.
+            assert!(!runtime.is_disabled()); // ubs:ignore[rust.panic.assert-macros] -- Repeated user aborts cannot disable a healthy advisor.
+            assert_eq!(runtime.guard.notes_in_window, 0); // ubs:ignore[rust.panic.assert-macros] -- Cancelled work does not consume emission allowance.
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- No cancelled review may enter the provider.
+            assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- A new uncancelled turn is a positive admission control.
+                runtime.review_turn(&review_digest(), 4).await,
+                AdvisorOutcome::Inject(_)
+            ));
+            assert_eq!(runtime.consecutive_failures, 0); // ubs:ignore[rust.panic.assert-macros] -- Successful review restores provider health.
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- The available verdict is consumed once by the new turn.
         });
     }
 
