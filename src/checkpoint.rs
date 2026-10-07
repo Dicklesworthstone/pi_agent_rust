@@ -305,6 +305,19 @@ pub struct RetryPlan {
     pub expected_parent_id: Option<String>,
 }
 
+/// Read-only retry plan retaining the complete native user input.
+#[derive(Debug, Clone)]
+pub struct RetryContentPlan {
+    /// The abandoned user turn, preserving block order and attachment data.
+    pub content: UserContent,
+    /// Tree entry id of the abandoned user entry.
+    pub abandoned_entry_id: String,
+    /// Leaf id observed while planning. Apply refuses if the live leaf moved.
+    pub original_leaf_id: Option<String>,
+    /// Parent of the abandoned user entry. The retried turn lands here.
+    pub expected_parent_id: Option<String>,
+}
+
 /// Why [`apply_retry_plan`] refused to move the leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryApplyError {
@@ -339,16 +352,20 @@ enum RetryDisposition {
 #[derive(Debug, Clone)]
 struct ProjectedPathMessage {
     disposition: RetryDisposition,
-    text: Option<String>,
+    content: Option<UserContent>,
     entry_id: Option<String>,
     parent_id: Option<String>,
 }
 
 impl ProjectedPathMessage {
-    const fn candidate(text: String, entry_id: String, parent_id: Option<String>) -> Self {
+    const fn candidate(
+        content: UserContent,
+        entry_id: String,
+        parent_id: Option<String>,
+    ) -> Self {
         Self {
             disposition: RetryDisposition::Candidate,
-            text: Some(text),
+            content: Some(content),
             entry_id: Some(entry_id),
             parent_id,
         }
@@ -357,7 +374,7 @@ impl ProjectedPathMessage {
     const fn barrier() -> Self {
         Self {
             disposition: RetryDisposition::Barrier,
-            text: None,
+            content: None,
             entry_id: None,
             parent_id: None,
         }
@@ -366,7 +383,7 @@ impl ProjectedPathMessage {
     const fn skip() -> Self {
         Self {
             disposition: RetryDisposition::Skip,
-            text: None,
+            content: None,
             entry_id: None,
             parent_id: None,
         }
@@ -389,21 +406,14 @@ impl RetryPathProjection {
     fn append(&mut self, entry: &SessionEntry) {
         match entry {
             SessionEntry::Message(message_entry) => match &message_entry.message {
-                SessionMessage::User {
-                    content: UserContent::Text(text),
-                    ..
-                } => match message_entry.base.id.clone() {
+                SessionMessage::User { content, .. } => match message_entry.base.id.clone() {
                     Some(entry_id) => self.projected.push(ProjectedPathMessage::candidate(
-                        text.clone(),
+                        content.clone(),
                         entry_id,
                         message_entry.base.parent_id.clone(),
                     )),
                     None => self.projected.push(ProjectedPathMessage::barrier()),
                 },
-                SessionMessage::User {
-                    content: UserContent::Blocks(_),
-                    ..
-                } => self.projected.push(ProjectedPathMessage::barrier()),
                 SessionMessage::BashExecution { extra, .. } => {
                     let excluded = extra
                         .get("excludeFromContext")
@@ -513,14 +523,33 @@ fn project_retry_path(session: &Session) -> Vec<ProjectedPathMessage> {
 /// a candidate because it is stored as a real user entry, not a rewind Custom.
 #[must_use]
 pub fn plan_retry(session: &Session) -> Option<RetryPlan> {
+    let plan = plan_retry_content(session)?;
+    let UserContent::Text(text) = plan.content else {
+        return None;
+    };
+    Some(RetryPlan {
+        text,
+        abandoned_entry_id: plan.abandoned_entry_id,
+        original_leaf_id: plan.original_leaf_id,
+        expected_parent_id: plan.expected_parent_id,
+    })
+}
+
+/// Select the latest durable user input without flattening native content.
+///
+/// Uses the same compaction, rewind, and non-user barriers as [`plan_retry`],
+/// while also accepting block-based user entries. Callers must validate the
+/// selected blocks before applying the plan or dispatching another turn.
+#[must_use]
+pub fn plan_retry_content(session: &Session) -> Option<RetryContentPlan> {
     let projected = project_retry_path(session);
     for item in projected.into_iter().rev() {
         match item.disposition {
             RetryDisposition::Skip => {}
             RetryDisposition::Barrier => return None,
             RetryDisposition::Candidate => {
-                return Some(RetryPlan {
-                    text: item.text?,
+                return Some(RetryContentPlan {
+                    content: item.content?,
                     abandoned_entry_id: item.entry_id?,
                     original_leaf_id: session.leaf_id().map(str::to_string),
                     expected_parent_id: item.parent_id,
@@ -537,16 +566,44 @@ pub fn apply_retry_plan(
     session: &mut Session,
     plan: &RetryPlan,
 ) -> std::result::Result<(), RetryApplyError> {
-    if session.leaf_id() != plan.original_leaf_id.as_deref() {
+    apply_retry_target(
+        session,
+        plan.original_leaf_id.as_deref(),
+        &plan.abandoned_entry_id,
+        plan.expected_parent_id.as_deref(),
+    )
+}
+
+/// Apply a native retry plan using the same leaf checks as [`apply_retry_plan`].
+/// Does not persist and leaves the abandoned entries in the session tree.
+pub fn apply_retry_content_plan(
+    session: &mut Session,
+    plan: &RetryContentPlan,
+) -> std::result::Result<(), RetryApplyError> {
+    apply_retry_target(
+        session,
+        plan.original_leaf_id.as_deref(),
+        &plan.abandoned_entry_id,
+        plan.expected_parent_id.as_deref(),
+    )
+}
+
+fn apply_retry_target(
+    session: &mut Session,
+    original_leaf_id: Option<&str>,
+    abandoned_entry_id: &str,
+    expected_parent_id: Option<&str>,
+) -> std::result::Result<(), RetryApplyError> {
+    if session.leaf_id() != original_leaf_id {
         return Err(RetryApplyError::LeafChanged);
     }
     let abandoned = session
-        .get_entry(&plan.abandoned_entry_id)
+        .get_entry(abandoned_entry_id)
         .ok_or(RetryApplyError::AbandonedMissing)?;
-    if abandoned.base().parent_id != plan.expected_parent_id {
+    if abandoned.base().parent_id.as_deref() != expected_parent_id {
         return Err(RetryApplyError::ParentMismatch);
     }
-    let navigated = if let Some(parent) = &plan.expected_parent_id {
+    let navigated = if let Some(parent) = expected_parent_id {
         session.navigate_to(parent)
     } else {
         session.reset_leaf();
@@ -850,6 +907,58 @@ mod tests {
     }
 
     #[test]
+    fn native_retry_uses_the_visible_turn_after_a_synthetic_rewind() {
+        use crate::model::{ContentBlock, MediaContent, TextContent};
+
+        let mut session = Session::in_memory();
+        session.append_message(session_user("earlier question"));
+        let parent = session.append_message(session_assistant("earlier answer"));
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("  listen\n")),
+            ContentBlock::Media(MediaContent {
+                data: "YQ==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            }),
+            ContentBlock::Text(TextContent::new(" \t\n")),
+        ]);
+        let native = session.append_message(SessionMessage::User {
+            content: content.clone(),
+            timestamp: Some(0),
+        });
+        session.append_message(session_assistant("native answer"));
+        let checkpoint = mark_checkpoint(&mut session, "keep native", None, &[]);
+        let hidden = session.append_message(session_user("hidden later question"));
+        session.append_message(session_assistant("hidden answer"));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint.entry_id,
+                "summary": "the hidden turn was summarized",
+            })),
+        );
+        let leaf = session.leaf_id().map(str::to_string);
+        assert!(prepare_retry_branch(&mut session).is_none());
+        assert_eq!(session.leaf_id(), leaf.as_deref());
+        let plan = plan_retry_content(&session).expect("visible native user turn");
+        assert_eq!(plan.abandoned_entry_id, native);
+        assert_eq!(plan.expected_parent_id.as_deref(), Some(parent.as_str()));
+        assert_eq!(
+            serde_json::to_value(&plan.content).unwrap(),
+            serde_json::to_value(&content).unwrap()
+        );
+        apply_retry_content_plan(&mut session, &plan).expect("native retry");
+        assert_eq!(session.leaf_id(), Some(parent.as_str()));
+        assert!(session.get_entry(&native).is_some());
+        assert!(session.get_entry(&hidden).is_some());
+        assert_eq!(
+            apply_retry_content_plan(&mut session, &plan),
+            Err(RetryApplyError::LeafChanged),
+            "a consumed retry plan cannot silently rewind another turn"
+        );
+    }
+
+    #[test]
     fn plan_retry_treats_bash_execution_as_barrier() {
         let mut session = Session::in_memory();
         session.append_message(session_user("older prompt"));
@@ -862,6 +971,7 @@ mod tests {
             None,
         );
         assert!(plan_retry(&session).is_none());
+        assert!(plan_retry_content(&session).is_none());
     }
 
     #[test]
@@ -870,6 +980,7 @@ mod tests {
         let older = session.append_message(session_user("older prompt"));
         session.append_branch_summary(older, "left a branch".to_string(), None, None);
         assert!(plan_retry(&session).is_none());
+        assert!(plan_retry_content(&session).is_none());
     }
 
     #[test]
@@ -884,6 +995,7 @@ mod tests {
             None,
         );
         assert!(plan_retry(&session).is_none());
+        assert!(plan_retry_content(&session).is_none());
     }
 
     #[test]

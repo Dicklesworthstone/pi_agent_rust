@@ -971,6 +971,40 @@ impl AgentSessionHandle {
 }
 
 impl SessionTransport {
+    /// Send ordered native text, image, audio, and video content over either
+    /// session transport.
+    ///
+    /// In-process sessions use [`AgentSessionHandle::prompt_with_content`],
+    /// including its durable retry and failover behavior. Subprocess sessions
+    /// send the RPC `content` field without flattening or regrouping blocks and
+    /// deliver acknowledged events live through the same callback contract as
+    /// [`Self::prompt_with_images`]. Empty or assistant-only input is rejected
+    /// before the session is advanced or a subprocess request is dispatched.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        on_event: impl Fn(SessionTransportEvent) + Send + Sync + 'static,
+    ) -> Result<SessionPromptResult> {
+        match self {
+            Self::InProcess(handle) => {
+                let assistant = handle
+                    .prompt_with_content(content, move |event| {
+                        on_event(SessionTransportEvent::InProcess(Box::new(event)));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::InProcess(Box::new(assistant)))
+            }
+            Self::RpcSubprocess(client) => {
+                let events = client
+                    .prompt_with_content_streaming(content, None, move |event| {
+                        on_event(SessionTransportEvent::Rpc(event));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::RpcEvents(events))
+            }
+        }
+    }
+
     /// Send text and image attachments over either session transport.
     ///
     /// In-process sessions use the same durable, recoverable path as

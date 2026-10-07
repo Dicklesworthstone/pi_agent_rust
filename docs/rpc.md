@@ -45,12 +45,13 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 ## Commands
 
 ### Chat
+
 - **prompt**: Send a user message.
-  - Params: `message` (string), `images` (optional array), `media` (optional array), `streamingBehavior` ("steer" or "follow-up").
+  - Params: `message` (string), `images` (optional array), `media` (optional array), or an exclusive `content` array; `streamingBehavior` ("steer" or "follow-up").
 - **steer**: Interrupt current generation and steer.
-  - Params: `message`, `images` (optional array), `media` (optional array).
+  - Params: `message`, `images` (optional array), `media` (optional array), or an exclusive `content` array.
 - **follow_up**: Queue a message to follow current turn.
-  - Params: `message`, `images` (optional array), `media` (optional array).
+  - Params: `message`, `images` (optional array), `media` (optional array), or an exclusive `content` array.
 - **retry**: Rerun the last durable user turn, preserving its text, images, and media.
 - **abort**: Stop generation.
 
@@ -68,11 +69,39 @@ replace the example payload with the standard base64 encoding of your file:
 }
 ```
 
-`message` remains required and can be empty for an attachment-only turn. Images
-retain their existing shape:
+When using separate attachment fields, `message` is required and can be empty
+for an attachment-only turn. Images accept the public SDK shape
+`{"data":"YQ==","mimeType":"image/png"}` as well as the existing shape:
 `{"type":"image","source":{"type":"base64","mediaType":"image/png","data":"..."}}`.
 The user message contains nonempty text first, then `images` in array order,
 then `media` in array order. Empty attachment arrays behave like text-only input.
+
+Use `content` to preserve arbitrary interleaving of text, images, audio, and
+video. It cannot be combined with `message`, `images`, or `media`, including
+null or empty values for those fields:
+
+```json
+{
+  "id": "compare-1",
+  "type": "prompt",
+  "content": [
+    {"type": "text", "text": "Listen to this first."},
+    {"type": "media", "data": "YQ==", "mimeType": "audio/wav", "name": "voice.wav"},
+    {"type": "image", "data": "Yg==", "mimeType": "image/png"},
+    {"type": "text", "text": "Compare it with this frame."}
+  ]
+}
+```
+
+These payload bytes are illustrative; replace them with your encoded files.
+Native content is literal: text whitespace and block order are retained, and
+text does not invoke slash commands, prompt templates, or magic keywords.
+Only user text/image/media blocks are accepted. The array must contain 1–256
+blocks, including at most 32 audio/video blocks, and the normalized content
+JSON must fit 64 MiB, counting text escaping, base64, metadata, and block syntax.
+Native images require canonical standard base64 and an `image/*` MIME type,
+with a 20 MiB decoded per-image limit. Direct SDK images in `images` also have
+aggregate bounds of 256 native images and 64 MiB of encoded image payloads.
 
 Each media item requires `type: "media"`, an `audio/*` or `video/*` `mimeType`,
 and nonempty canonical standard base64 `data`; padding is optional. `name` is
@@ -82,7 +111,7 @@ Malformed media is rejected before acknowledgment, queue mutation, or session
 recovery. The decoded per-file cap is `media.maxBytes` (5 MiB by default); RPC
 also limits a command to 32 media items and 64 MiB of decoded media in total.
 
-The same attachments work with `steer`, `follow_up`, and a streaming `prompt`
+Both input forms work with `steer`, `follow_up`, and a streaming `prompt`
 that specifies `streamingBehavior`. Accepted attachments survive automatic
 retry and terminal queue recovery. Explicit `retry` preserves the original
 structured block order, including attachment-only turns. Large payloads use

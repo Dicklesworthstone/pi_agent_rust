@@ -156,6 +156,24 @@ the media again or repeating input hooks. Media-only prompts are supported;
 an empty block list or an assistant-only block is rejected before appending
 the user message.
 
+`SessionTransport::prompt_with_content(content, on_event)` provides this input
+over either backend. `RpcTransportClient::prompt_with_content(content)` and
+`prompt_with_content_streaming(content, streaming_behavior, on_event)` send
+the ordered RPC `content` array. The subprocess path validates before assigning
+a request ID or writing input, including a 256-block limit, at most 32 audio/video
+blocks, and a 64 MiB serialized content limit that counts JSON escaping and
+metadata. The server also enforces its configured per-media limit (5 MiB by
+default). RPC native text is literal; use the ordinary text API when you want
+server-side template, extension-command, or magic-keyword processing.
+
+For an explicit retry, `prepare_retry_content().await` returns the abandoned
+turn as `UserContent::Text` or `UserContent::Blocks`. Submit it through `prompt`
+or `prompt_with_content` respectively. The abandoned branch remains in the
+session tree, and the parent leaf is persisted before the live context moves.
+Failed persistence preserves the live branch and fences further provider calls
+until recovery. The existing `prepare_retry()` accepts text-only stored input;
+it refuses structured input before mutation and directs callers to the native API.
+
 Input hooks retain their existing text/image interface. When a hook leaves
 those fields unchanged, the complete original block order is preserved. When
 it edits them, replacement text occupies the first original text position,
@@ -384,7 +402,9 @@ A server event that races ahead of the matching prompt acknowledgement is retain
 under explicit count and byte bounds, then delivered in order after a successful
 acknowledgement. A failed acknowledgement does not expose those speculative events.
 Prompt acknowledgements must match both request id and command. Individual
-line-delimited JSON frames are capped at 8 MiB; oversized or truncated frames fail
+line-delimited JSON frames are capped at 128 MiB; the pre-acknowledgement buffer
+is bounded to 256 events and 256 MiB, including room for native user-message
+echoes. Oversized or truncated frames fail
 the transport rather than allocating without bound. Public generic RPC requests
 cannot override the SDK-generated `type` or `id` fields.
 

@@ -7,9 +7,10 @@ use asupersync::sync::Mutex as AsyncMutex;
 use pi::failover::RetryPolicy;
 use pi::sdk::{
     AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, AgentSessionHandle, ContentBlock,
-    Error, EventListeners, FailoverOptions, ImageContent, InputType, Message,
+    Error, EventListeners, FailoverOptions, ImageContent, InputType, MediaContent, Message,
     ResolvedCompactionSettings, Session, SessionPromptResult, SessionTransport,
-    SessionTransportEvent, StopReason, StreamEvent, StreamOptions, ToolRegistry, UserContent,
+    SessionTransportEvent, StopReason, StreamEvent, StreamOptions, TextContent, ToolRegistry,
+    UserContent,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -34,6 +35,28 @@ fn images() -> Vec<ImageContent> {
             data: GIF.to_string(),
             mime_type: "image/gif".to_string(),
         },
+    ]
+}
+
+fn ordered_native_content() -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::Text(TextContent::new("  compare the opening\n")),
+        ContentBlock::Media(MediaContent {
+            data: "YQ==".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("voice.wav".to_string()),
+        }),
+        ContentBlock::Text(TextContent::new("with this frame")),
+        ContentBlock::Image(ImageContent {
+            data: PNG.to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+        ContentBlock::Media(MediaContent {
+            data: "Yg".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("motion.mp4".to_string()),
+        }),
+        ContentBlock::Text(TextContent::new(" \t\n")),
     ]
 }
 
@@ -583,6 +606,152 @@ fn sdk_mml_img_transport_supports_image_only_prompts() {
 }
 
 #[test]
+fn sdk_mml_native_transport_retries_preserve_order_and_one_durable_prompt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut server = ApiFixture::new(vec![503, 200]);
+    let handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(1, 0)));
+    let mut transport = SessionTransport::InProcess(Box::new(handle));
+    let content = ordered_native_content();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let result = run_async(transport.prompt_with_content(content.clone(), move |event| {
+        let SessionTransportEvent::InProcess(event) = event else {
+            panic!("in-process event expected");
+        };
+        observed.lock().unwrap().push(*event);
+    }))
+    .expect("native content prompt retries");
+    let SessionPromptResult::InProcess(message) = result else {
+        panic!("in-process result expected");
+    };
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    let expected_wire = json!([
+        {"type":"text", "text":"  compare the opening\n"},
+        {"type":"text", "text":"[media omitted: voice.wav, audio/wav, 1 B]"},
+        {"type":"text", "text":"with this frame"},
+        {"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{PNG}")}},
+        {"type":"text", "text":"[media omitted: motion.mp4, video/mp4, 1 B]"},
+        {"type":"text", "text":" \t\n"}
+    ]);
+    for request in server.finish(2) {
+        assert_eq!(user_wire_content(&request), &expected_wire);
+    }
+    let session = reopen(transport.as_in_process_mut().expect("in-process handle"));
+    let messages = session.to_messages_for_current_path();
+    let users = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(&user.content),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1, "recovery must persist native input once");
+    assert_eq!(
+        serde_json::to_value(users[0]).unwrap(),
+        serde_json::to_value(content).unwrap()
+    );
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+}
+
+#[test]
+fn sdk_mml_explicit_retry_keeps_native_content_and_the_abandoned_branch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut server = ApiFixture::new(vec![200, 200]);
+    let mut handle = handle(&server.url, root.path(), false);
+    let content = ordered_native_content();
+    run_async(handle.prompt_with_content(content.clone(), |_| {})).expect("original turn");
+    let original = reopen(&handle);
+    let original_leaf = original.leaf_id().map(str::to_string);
+    let original_users = original
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            pi::session::SessionEntry::Message(entry)
+                if matches!(&entry.message, pi::session::SessionMessage::User { .. }) =>
+            {
+                entry.base.id.clone()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(original_users.len(), 1);
+    let expected_parent = original
+        .get_entry(&original_users[0])
+        .expect("original user entry")
+        .base()
+        .parent_id
+        .clone();
+
+    let error = run_async(handle.prepare_retry()).expect_err("text API cannot drop media");
+    assert!(error.to_string().contains("prepare_retry_content"));
+    assert_eq!(
+        reopen(&handle).leaf_id(),
+        original_leaf.as_deref(),
+        "rejecting text-only retry must not move the durable leaf"
+    );
+    let prepared = run_async(handle.prepare_retry_content()).expect("native retry plan");
+    assert_eq!(
+        serde_json::to_value(&prepared).unwrap(),
+        serde_json::to_value(&content).unwrap()
+    );
+    let rewound = reopen(&handle);
+    assert_eq!(
+        rewound.leaf_id(),
+        expected_parent.as_deref(),
+        "the parent leaf is already durable"
+    );
+    assert!(rewound.to_messages_for_current_path().is_empty());
+    assert!(rewound.get_entry(&original_users[0]).is_some());
+    assert!(rewound.get_entry(original_leaf.as_deref().unwrap()).is_some());
+
+    let UserContent::Blocks(blocks) = prepared else {
+        panic!("native input must not flatten to text");
+    };
+    run_async(handle.prompt_with_content(blocks, |_| {})).expect("sibling retry turn");
+    let requests = server.finish(2);
+    assert_eq!(user_wire_content(&requests[0]), user_wire_content(&requests[1]));
+    let retried = reopen(&handle);
+    let users = retried
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            pi::session::SessionEntry::Message(entry) => match &entry.message {
+                pi::session::SessionMessage::User { content, .. } => {
+                    Some((&entry.base.parent_id, content))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 2, "both original and retried input stay in the file");
+    assert_eq!(users[0].0, users[1].0, "the retry must be a sibling");
+    for (_, stored_content) in users {
+        assert_eq!(
+            serde_json::to_value(stored_content).unwrap(),
+            serde_json::to_value(&content).unwrap()
+        );
+    }
+    assert_eq!(
+        retried
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        1,
+        "only the retried input remains in the active context"
+    );
+}
+
+#[test]
 fn sdk_mml_img_empty_attachments_preserve_plain_text_content() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![200]);
@@ -823,6 +992,230 @@ printf '{"type":"agent_end","sessionId":"vision-rpc","messages":[]}\n'
     assert_eq!(frame["images"], serde_json::to_value(images()).unwrap());
     assert_eq!(returned.last().unwrap()["type"], "agent_end");
     transport.shutdown().expect("shutdown transport");
+}
+
+#[cfg(unix)]
+mod native_rpc {
+    use super::*;
+    use pi::sdk::{RpcTransportClient, RpcTransportOptions, ThinkingContent, ToolCall};
+
+    fn client(script: &str) -> RpcTransportClient {
+        RpcTransportClient::connect(RpcTransportOptions {
+            // Bash's timed read bounds live-control regressions even when a
+            // broken callback never sends the frame the peer is waiting for.
+            binary_path: PathBuf::from("/bin/bash"),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+        })
+        .expect("native RPC fixture")
+    }
+
+    #[test]
+    fn ordered_content_keeps_its_wire_shape_and_live_control() {
+        let client = client(
+            r#"
+IFS= read -r -t 5 frame || exit 1
+printf '{"type":"agent_start","sessionId":"native-rpc"}\n'
+printf '{"type":"response","command":"prompt","id":"rpc-1","success":true}\n'
+printf '{"type":"fixture_input","frame":%s}\n' "$frame"
+IFS= read -r -t 5 control || exit 1
+printf '{"type":"response","command":"abort","id":"rpc-2","success":true}\n'
+printf '{"type":"agent_end","sessionId":"native-rpc","messages":[],"control":%s}\n' "$control"
+"#,
+        );
+        let control = client.control_handle();
+        let mut transport = SessionTransport::RpcSubprocess(client);
+        let content = ordered_native_content();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        let result = run_async(transport.prompt_with_content(content.clone(), move |event| {
+            let SessionTransportEvent::Rpc(event) = event else {
+                panic!("RPC event expected");
+            };
+            if event["type"] == "fixture_input" {
+                assert_eq!(control.abort().expect("live abort"), "rpc-2");
+            }
+            observed.lock().unwrap().push(event);
+        }))
+        .expect("native RPC turn");
+        let SessionPromptResult::RpcEvents(returned) = result else {
+            panic!("RPC result expected");
+        };
+        assert_eq!(*events.lock().unwrap(), returned);
+        assert_eq!(
+            returned
+                .iter()
+                .map(|event| event["type"].clone())
+                .collect::<Vec<_>>(),
+            [json!("agent_start"), json!("fixture_input"), json!("agent_end")]
+        );
+        assert_eq!(
+            returned[1]["frame"],
+            json!({"type":"prompt", "id":"rpc-1", "content":content})
+        );
+        assert_eq!(
+            returned[2]["control"],
+            json!({"type":"abort", "id":"rpc-2"})
+        );
+        transport.shutdown().expect("shutdown transport");
+    }
+
+    #[test]
+    fn media_only_content_is_normalized_and_streaming_options_are_preserved() {
+        for streaming in [false, true] {
+            let mut client = client(
+                r#"
+IFS= read -r -t 5 frame || exit 1
+printf '{"type":"response","command":"prompt","id":"rpc-1","success":true}\n'
+printf '{"type":"fixture_input","frame":%s}\n' "$frame"
+printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
+"#,
+            );
+            let content = vec![ContentBlock::Media(MediaContent {
+                data: "Yg".to_string(),
+                mime_type: "VIDEO/MP4".to_string(),
+                name: Some("  motion\n.mp4  ".to_string()),
+            })];
+            let mut delivered = Vec::new();
+            let events = if streaming {
+                run_async(client.prompt_with_content_streaming(
+                    content,
+                    Some("steer"),
+                    |event| {
+                        delivered.push(event);
+                    },
+                ))
+            } else {
+                run_async(client.prompt_with_content(content))
+            }
+            .expect("media-only prompt");
+            let mut expected = json!({
+                "type":"prompt", "id":"rpc-1",
+                "content":[{"type":"media", "data":"Yg", "mimeType":"video/mp4", "name":"motion.mp4"}]
+            });
+            if streaming {
+                expected["streamingBehavior"] = json!("steer");
+                assert_eq!(delivered, events);
+            }
+            assert_eq!(events[0]["frame"], expected);
+            assert_eq!(events.last().unwrap()["type"], "agent_end");
+            client.shutdown().expect("shutdown fixture");
+        }
+    }
+
+    #[test]
+    fn ordinary_media_echoes_fit_response_and_pre_ack_bounds() {
+        use base64::Engine as _;
+
+        // Both clips fit the default 5 MiB per-file policy. Their combined
+        // encoded prompt exceeds the old 8 MiB response-line bound and the old
+        // 4 MiB pre-ACK budget; testing it does not allocate near the new caps.
+        let audio = base64::engine::general_purpose::STANDARD.encode(vec![0_u8; 5 * 1024 * 1024]);
+        let video = base64::engine::general_purpose::STANDARD.encode(vec![1_u8; 1024 * 1024]);
+        let content = vec![
+            ContentBlock::Media(MediaContent {
+                data: audio.clone(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            }),
+            ContentBlock::Media(MediaContent {
+                data: video.clone(),
+                mime_type: "video/mp4".to_string(),
+                name: Some("motion.mp4".to_string()),
+            }),
+        ];
+        let mut client = client(
+            r#"
+IFS= read -r -t 30 frame || exit 1
+printf '{"type":"message_start","message":%s}\n' "$frame"
+printf '{"type":"response","command":"prompt","id":"rpc-1","success":true}\n'
+printf '{"type":"agent_end","messages":[%s]}\n' "$frame"
+"#,
+        );
+        let mut observed = Vec::new();
+        let events = run_async(client.prompt_with_content_streaming(content, None, |event| {
+            observed.push(event["type"].as_str().unwrap().to_string());
+        }))
+        .expect("bounded native media echoes must be readable");
+        assert_eq!(observed, ["message_start", "agent_end"]);
+        for frame in [&events[0]["message"], &events[1]["messages"][0]] {
+            assert_eq!(frame["content"].as_array().unwrap().len(), 2);
+            assert!(frame["content"][0]["data"].as_str() == Some(audio.as_str()));
+            assert!(frame["content"][1]["data"].as_str() == Some(video.as_str()));
+        }
+        client.shutdown().expect("shutdown fixture");
+    }
+
+    #[test]
+    fn invalid_content_never_writes_or_allocates_request_ids() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 5 frame || exit 1
+printf '{"type":"response","command":"probe","id":"rpc-1","success":true,"data":%s}\n' "$frame"
+"#,
+        );
+        let invalid = vec![
+            Vec::new(),
+            vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "assistant-only".to_string(),
+                thinking_signature: None,
+            })],
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "not-user-input".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({"command":"must not run"}),
+                thought_signature: None,
+            })],
+            vec![ContentBlock::Media(MediaContent {
+                data: "YR==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: None,
+            })],
+            vec![ContentBlock::Media(MediaContent {
+                data: "YQ==".to_string(),
+                mime_type: "application/json".to_string(),
+                name: None,
+            })],
+            vec![ContentBlock::Image(ImageContent {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            })],
+            vec![ContentBlock::Text(TextContent::new("bounded")); 257],
+        ];
+        for content in invalid {
+            assert!(run_async(client.prompt_with_content(content.clone())).is_err());
+            assert!(
+                run_async(client.prompt_with_content_streaming(content, None, |_| {
+                    panic!("invalid input must not deliver events");
+                }))
+                .is_err()
+            );
+        }
+        let frame = run_async(client.request("probe", serde_json::Map::new()))
+            .expect("invalid native content must not consume IDs or write stray frames");
+        assert_eq!(frame, json!({"type":"probe", "id":"rpc-1"}));
+        client.shutdown().expect("shutdown fixture");
+    }
+
+    #[test]
+    fn failed_native_prompt_ack_keeps_speculative_events_private() {
+        let client = client(
+            r#"
+IFS= read -r -t 5 frame || exit 1
+printf '{"type":"agent_start","sessionId":"not-admitted"}\n'
+printf '{"type":"response","command":"prompt","id":"rpc-1","success":false,"error":"media rejected"}\n'
+"#,
+        );
+        let mut transport = SessionTransport::RpcSubprocess(client);
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&invoked);
+        let result = run_async(transport.prompt_with_content(ordered_native_content(), move |_| {
+            observed.store(true, Ordering::SeqCst);
+        }));
+        assert!(result.is_err());
+        assert!(!invoked.load(Ordering::SeqCst));
+        transport.shutdown().expect("shutdown fixture");
+    }
 }
 
 #[cfg(unix)]

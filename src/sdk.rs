@@ -898,9 +898,15 @@ impl Default for RpcTransportOptions {
 }
 
 /// Subprocess-backed SDK transport for `pi --mode rpc`.
-const RPC_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+// Native prompts admit up to 64 MiB of normalized content JSON, including
+// escaped text, encoded attachment payloads, and metadata.
+// User-message events echo that content; keep bounded headroom for those
+// envelopes instead of killing a subprocess after it accepts a valid prompt.
+// The pre-acknowledgement aggregate accommodates both user-message echoes
+// together with their envelopes and other lifecycle events.
+const RPC_MAX_LINE_BYTES: usize = 128 * 1024 * 1024;
 const RPC_MAX_PRE_ACK_EVENTS: usize = 256;
-const RPC_MAX_PRE_ACK_BYTES: usize = 4 * 1024 * 1024;
+const RPC_MAX_PRE_ACK_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct RpcTransportClient {
     child: Child,
@@ -1387,6 +1393,49 @@ impl RpcTransportClient {
             .await
     }
 
+    /// Send ordered native text, image, audio, and video content over RPC.
+    ///
+    /// The RPC `content` field preserves block order without splitting text
+    /// from its attachments. Empty input and assistant-only blocks are rejected
+    /// before allocating a request ID or writing to the subprocess. The server
+    /// applies its configured media limits before acknowledging the prompt.
+    /// Native prompts are limited to 256 blocks and 64 MiB of normalized
+    /// content JSON, including escaped text, encoded attachment payloads, and
+    /// metadata, with at most 32 audio/video blocks. Received JSON lines have
+    /// a 128 MiB byte bound; buffered pre-acknowledgement events have a 256 MiB
+    /// aggregate bound. Oversized output fails without truncating history.
+    pub async fn prompt_with_content(&mut self, content: Vec<ContentBlock>) -> Result<Vec<Value>> {
+        self.prompt_with_content_streaming(content, None, |_| {})
+            .await
+    }
+
+    /// Send native content and deliver acknowledged events as they arrive.
+    ///
+    /// `streaming_behavior` has the same meaning as in
+    /// [`Self::prompt_with_options_streaming`]. Native content uses the same
+    /// bounded pre-acknowledgement buffer and terminal `agent_end` handling as
+    /// text and image prompts. Input is validated before dispatch.
+    #[allow(
+        clippy::unused_async,
+        reason = "SDK RPC transport keeps an async public API"
+    )]
+    pub async fn prompt_with_content_streaming(
+        &mut self,
+        content: Vec<ContentBlock>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<Vec<Value>> {
+        AgentSession::validate_user_content_blocks(&content)?;
+        let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
+        let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
+        let mut payload = Map::new();
+        payload.insert(
+            "content".to_string(),
+            serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
+        );
+        self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+    }
+
     /// Run one RPC prompt while delivering raw events as soon as they are read.
     ///
     /// Some servers can emit lifecycle events before the prompt response is
@@ -1402,12 +1451,9 @@ impl RpcTransportClient {
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
-        mut on_event: impl FnMut(Value),
+        on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
-        let request_id = self.next_request_id()?;
         let mut payload = Map::new();
-        payload.insert("type".to_string(), Value::String("prompt".to_string()));
-        payload.insert("id".to_string(), Value::String(request_id.clone()));
         payload.insert("message".to_string(), Value::String(message.into()));
         if let Some(images) = images {
             payload.insert(
@@ -1415,6 +1461,21 @@ impl RpcTransportClient {
                 serde_json::to_value(images).map_err(|err| Error::Json(Box::new(err)))?,
             );
         }
+        self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+    }
+
+    /// Dispatch an already validated prompt through the single response owner.
+    /// Public prompt methods choose their wire input shape before reaching
+    /// this boundary; only this method allocates the ID and reads stdout.
+    fn prompt_payload_streaming(
+        &mut self,
+        mut payload: Map<String, Value>,
+        streaming_behavior: Option<&str>,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Vec<Value>> {
+        let request_id = self.next_request_id()?;
+        payload.insert("type".to_string(), Value::String("prompt".to_string()));
+        payload.insert("id".to_string(), Value::String(request_id.clone()));
         if let Some(streaming_behavior) = streaming_behavior {
             payload.insert(
                 "streamingBehavior".to_string(),
@@ -1536,7 +1597,7 @@ impl RpcTransportClient {
             if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
                 if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
                     let _ = self.shutdown();
-                    return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+                    return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
                 }
                 line.extend_from_slice(&available[..newline]);
                 self.stdout.consume(newline + 1);
@@ -1544,7 +1605,7 @@ impl RpcTransportClient {
             }
             if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
                 let _ = self.shutdown();
-                return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+                return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
             }
             let available_len = available.len();
             line.extend_from_slice(available);
@@ -2279,22 +2340,80 @@ impl AgentSessionHandle {
     /// retryable user turn, so re-sending its text (returned) lands as a
     /// SIBLING branch. The abandoned turn stays in the tree for `/tree`. The
     /// agent's context is rebuilt from the new path before this returns.
+    /// Structured user input is refused before changing the session; use
+    /// [`Self::prepare_retry_content`] to retain its ordered content blocks.
     pub async fn prepare_retry(&mut self) -> Result<String> {
+        match self.prepare_retry_input(true).await? {
+            UserContent::Text(text) => Ok(text),
+            UserContent::Blocks(_) => Err(Error::session(
+                "Structured retry input requires prepare_retry_content",
+            )),
+        }
+    }
+
+    /// Prepare a sibling retry while preserving native text, images, audio,
+    /// and video in their original order. Re-send the returned `Text` through
+    /// [`Self::prompt`] or the returned `Blocks` through
+    /// [`Self::prompt_with_content`].
+    ///
+    /// The abandoned branch remains in the session tree. The parent leaf is
+    /// persisted before the live context changes. A failed save leaves the
+    /// live turn intact and fences subsequent provider calls until recovery.
+    pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
+        self.prepare_retry_input(false).await
+    }
+
+    async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let save_enabled = self.session.save_enabled();
         let cx = crate::agent_cx::AgentCx::for_request();
-        let (text, messages) = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let prepared = crate::checkpoint::prepare_retry_branch(&mut guard)
-                .ok_or_else(|| Error::session("No user turn to retry".to_string()))?;
-            (prepared.text, guard.to_messages_for_current_path())
-        };
+        // Provider callbacks may need Session actions and the store before
+        // releasing their provider permit. Match recovery's lock order and
+        // reserve authority without quarantining while validation is pending.
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = Arc::clone(&self.session.session);
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let plan = crate::checkpoint::plan_retry_content(&guard)
+            .ok_or_else(|| Error::session("No user turn to retry"))?;
+        if let UserContent::Blocks(blocks) = &plan.content {
+            if require_text {
+                return Err(Error::session(
+                    "The last user turn contains structured content; use prepare_retry_content to preserve its attachments",
+                ));
+            }
+            AgentSession::validate_user_content_blocks(blocks)?;
+        }
+        let mut candidate = guard.clone();
+        crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
+            .map_err(|error| Error::session(error.to_string()))?;
+        let messages = candidate.to_messages_for_current_path();
+        admission.ensure_allowed()?;
+        // The provider permit is already held. Mark uncertainty only at the
+        // persistence boundary; cancellation before this point changes nothing.
+        admission.block(
+            "SDK retry rewind persistence was interrupted before live installation completed"
+                .to_string(),
+        );
+        if save_enabled
+            && let Err(first_error) = candidate.save().await
+            && let Err(retry_error) = candidate.save().await
+        {
+            let reason = format!(
+                "SDK retry rewind persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
+            );
+            admission.block(reason.clone());
+            return Err(Error::session_persistence(reason));
+        }
+        self.session.invalidate_background_compaction();
+        *guard = candidate;
         self.session.agent.replace_messages(messages);
-        self.session.persist_session().await?;
-        Ok(text)
+        admission.clear();
+        Ok(plan.content)
     }
 
     /// OMP `/branch` and double-Esc rewind: move the session leaf to just
@@ -3952,6 +4071,174 @@ mod tests {
             .filter(|message| matches!(message, crate::model::Message::User(_)))
             .count();
         assert_eq!(users_on_path, 1, "the active path holds only the retry");
+    }
+
+    #[test]
+    fn prepare_retry_save_failure_preserves_live_context_and_fences_reentry() {
+        for native in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            let content = vec![ContentBlock::Media(MediaContent {
+                data: "YQ==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            })];
+            run_async(async {
+                if native {
+                    handle.prompt_with_content(content.clone(), |_| {}).await
+                } else {
+                    handle.prompt("original turn", |_| {}).await
+                }
+            })
+            .expect("original turn");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let store = handle.session_store();
+            let (original_path, original_leaf, original_entries) = {
+                let guard = store.try_lock().expect("original session");
+                (
+                    guard.path.clone().expect("saved path"),
+                    guard.leaf_id().map(str::to_string),
+                    serde_json::to_value(&guard.entries).unwrap(),
+                )
+            };
+            let original_file = std::fs::read(&original_path).expect("saved session bytes");
+            let blocked = dir.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block persistence");
+            store.try_lock().unwrap().path = Some(blocked);
+
+            let result = run_async(async {
+                if native {
+                    handle.prepare_retry_content().await
+                } else {
+                    handle.prepare_retry().await.map(UserContent::Text)
+                }
+            });
+            assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent,
+                "failed retry persistence must not rewind the live agent"
+            );
+            {
+                let mut guard = store.try_lock().expect("unchanged live session");
+                assert_eq!(guard.leaf_id(), original_leaf.as_deref());
+                assert_eq!(serde_json::to_value(&guard.entries).unwrap(), original_entries);
+                guard.path = Some(original_path.clone());
+            }
+            let blocked_prompt = run_async(handle.prompt_with_content(content, |_| {
+                panic!("quarantined retry must not begin another provider turn");
+            }));
+            assert!(
+                blocked_prompt
+                    .as_ref()
+                    .is_err_and(Error::is_session_persistence),
+                "repairing the path alone must not clear uncertain transition state"
+            );
+            assert_eq!(
+                std::fs::read(&original_path).unwrap(),
+                original_file,
+                "failed preparation and refused reentry must leave the durable branch intact"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_retry_content_refuses_invalid_latest_input_without_rewinding() {
+        let (mut handle, calls) = flaky_handle(0);
+        let store = handle.session_store();
+        let leaf = {
+            let mut guard = store.try_lock().expect("session");
+            guard.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("older valid input".to_string()),
+                timestamp: Some(0),
+            });
+            let leaf = guard.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Blocks(Vec::new()),
+                timestamp: Some(0),
+            });
+            handle
+                .session
+                .agent
+                .replace_messages(guard.to_messages_for_current_path());
+            leaf
+        };
+        let before = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let error = run_async(handle.prepare_retry_content()).expect_err("invalid native input");
+        assert!(error.to_string().contains("PI_INPUT_CONTENT"));
+        assert_eq!(store.try_lock().unwrap().leaf_id(), Some(leaf.as_str()));
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before
+        );
+        assert!(handle.session.provider_admission_gate().ensure_allowed().is_ok());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepare_retry_waits_for_provider_before_session_locks_and_cancels_cleanly() {
+        let (mut handle, calls) = flaky_handle(0);
+        let store = handle.session_store();
+        let original = store
+            .try_lock()
+            .unwrap()
+            .append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("original input".to_string()),
+                timestamp: Some(0),
+            });
+        let provider_gate = handle.session.provider_admission_gate();
+        let action_gate = handle.session.session_action_admission_gate();
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let provider_call = provider_gate.acquire(cx.cx()).await.unwrap();
+            let mut retry = Box::pin(handle.prepare_retry_content());
+            assert!(futures::poll!(retry.as_mut()).is_pending());
+
+            let mut callback_action = Box::pin(action_gate.acquire(cx.cx()));
+            let std::task::Poll::Ready(Ok(action_permit)) =
+                futures::poll!(callback_action.as_mut())
+            else {
+                panic!("provider callbacks must retain access to Session actions");
+            };
+            let callback_entry = store
+                .try_lock()
+                .expect("waiting retry must not hold the Session store")
+                .append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("input from provider callback".to_string()),
+                    timestamp: Some(0),
+                });
+            drop(action_permit);
+            drop(retry);
+            provider_gate.ensure_allowed().unwrap();
+            assert_eq!(
+                store.try_lock().unwrap().leaf_id(),
+                Some(callback_entry.as_str())
+            );
+            drop(provider_call);
+
+            let action_permit = action_gate.acquire(cx.cx()).await.unwrap();
+            let mut retry = Box::pin(handle.prepare_retry_content());
+            assert!(futures::poll!(retry.as_mut()).is_pending());
+            assert!(store.try_lock().is_ok());
+            provider_gate.ensure_allowed().unwrap();
+            drop(retry);
+            drop(action_permit);
+
+            let prepared = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                handle.prepare_retry_content(),
+            )
+            .await
+            .expect("cancelled preparation must release every admission permit")
+            .expect("retry after the callback finishes");
+            assert!(matches!(
+                prepared,
+                UserContent::Text(text) if text == "input from provider callback"
+            ));
+            assert_eq!(store.try_lock().unwrap().leaf_id(), Some(original.as_str()));
+            provider_gate.ensure_allowed().unwrap();
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// bd-9o9i2 criterion 3, and the half that matters for safety rather than

@@ -252,9 +252,7 @@ fn command_resumes_rpc_agent(
     manager: Option<&ExtensionManager>,
 ) -> bool {
     match command_type {
-        "prompt" => parsed
-            .get("message")
-            .and_then(Value::as_str)
+        "prompt" => rpc_prompt_message(parsed)
             .is_some_and(|message| resolve_extension_command(message, manager).is_none()),
         "steer" | "follow_up" | "retry" => true,
         _ => false,
@@ -270,12 +268,10 @@ fn command_payload_can_advance_rpc_session(
         "prompt" => {
             // The command loop has already validated native attachments before
             // this recovery preflight. Avoid cloning image payloads again.
-            parsed.get("message").and_then(Value::as_str).is_some()
+            rpc_prompt_message(parsed).is_some()
                 && parse_streaming_behavior(streaming_behavior_value(parsed)).is_ok()
         }
-        "steer" | "follow_up" => parsed
-            .get("message")
-            .and_then(Value::as_str)
+        "steer" | "follow_up" => rpc_prompt_message(parsed)
             .is_some_and(|message| resolve_extension_command(message, manager).is_none()),
         "set_model" => {
             parsed.get("provider").and_then(Value::as_str).is_some()
@@ -449,8 +445,15 @@ async fn take_last_rpc_user_turn_for_retry(
     let provider_admission = session.provider_admission_gate();
     provider_admission.ensure_allowed()?;
     let save_enabled = session.save_enabled();
+    let cx = AgentCx::for_request();
+    // Provider callbacks may acquire Session actions and the store. Reserve
+    // their outer authority first, without quarantining a read-only plan.
+    let _provider_authority = provider_admission
+        .acquire_transition_authority(cx.cx())
+        .await?;
+    let session_actions = session.session_action_admission_gate();
+    let _session_action_permit = session_actions.acquire(cx.cx()).await?;
     let (content, messages) = {
-        let cx = AgentCx::for_request();
         let session_store = Arc::clone(&session.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx.cx())
             .await
@@ -468,13 +471,11 @@ async fn take_last_rpc_user_turn_for_retry(
             ));
         }
         let messages = candidate.to_messages_for_current_path();
-        let _provider_transition = provider_admission
-            .begin_transition(
-                "retry rewind persistence was interrupted before live installation completed"
-                    .to_string(),
-                cx.cx(),
-            )
-            .await?;
+        provider_admission.ensure_allowed()?;
+        provider_admission.block(
+            "retry rewind persistence was interrupted before live installation completed"
+                .to_string(),
+        );
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -487,11 +488,11 @@ async fn take_last_rpc_user_turn_for_retry(
         }
         session.invalidate_background_compaction();
         *inner = candidate;
-        provider_admission.clear();
         (content, messages)
     };
 
     session.agent.replace_messages(messages);
+    provider_admission.clear();
     Ok(Some(content))
 }
 
@@ -517,6 +518,17 @@ fn build_prompt_content_blocks(text: &str, attachments: &[ContentBlock]) -> Vec<
     }
     blocks.extend_from_slice(attachments);
     blocks
+}
+
+/// Structured input is already authored content, not a slash command or a
+/// template. Its text stays in the original block positions; an empty prefix
+/// lets the existing durable queue and retry paths carry it without flattening.
+fn rpc_prompt_message(parsed: &Value) -> Option<&str> {
+    if parsed.get("content").is_some() {
+        Some("")
+    } else {
+        parsed.get("message").and_then(Value::as_str)
+    }
 }
 
 fn parse_extension_command_line(message: &str) -> Option<(String, String)> {
@@ -2093,10 +2105,7 @@ pub async fn run(
 
         match command_type {
             "prompt" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
                 else {
                     let resp = response_error(id, "prompt", "Missing message".to_string());
                     let _ = out_tx.send(resp);
@@ -2292,10 +2301,7 @@ pub async fn run(
             }
 
             "steer" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
                 else {
                     let resp = response_error(id, "steer", "Missing message".to_string());
                     let _ = out_tx.send(resp);
@@ -2410,10 +2416,7 @@ pub async fn run(
             }
 
             "follow_up" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
                 else {
                     let resp = response_error(id, "follow_up", "Missing message".to_string());
                     let _ = out_tx.send(resp);
@@ -13385,8 +13388,30 @@ async fn run_bash_rpc(
 // Legacy images and full session entry size retain their existing validation.
 const MAX_RPC_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RPC_MEDIA_ATTACHMENTS: usize = 32;
+const MAX_RPC_CONTENT_BLOCKS: usize = 256;
+const MAX_RPC_NATIVE_JSON_BYTES: usize = 64 * 1024 * 1024;
+
+fn rpc_media_max_bytes(config: &Config) -> u64 {
+    config
+        .media
+        .as_ref()
+        .and_then(|settings| settings.max_bytes)
+        .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES)
+        .min(MAX_RPC_MEDIA_BYTES)
+}
 
 fn parse_prompt_attachments(parsed: &Value, config: &Config) -> Result<Vec<ContentBlock>> {
+    if let Some(content) = parsed.get("content") {
+        if ["message", "images", "media"]
+            .iter()
+            .any(|field| parsed.get(*field).is_some())
+        {
+            return Err(Error::validation(
+                "content cannot be combined with message, images, or media",
+            ));
+        }
+        return parse_native_prompt_content(content, rpc_media_max_bytes(config));
+    }
     // Validate media before cloning legacy image payloads from the same input.
     let media = parse_prompt_media(parsed.get("media"), config)?;
     let mut attachments: Vec<_> = parse_prompt_images(parsed.get("images"))?
@@ -13397,26 +13422,149 @@ fn parse_prompt_attachments(parsed: &Value, config: &Config) -> Result<Vec<Conte
     Ok(attachments)
 }
 
-fn parse_prompt_media(value: Option<&Value>, config: &Config) -> Result<Vec<MediaContent>> {
+/// Shared with the typed subprocess SDK so invalid native input is rejected
+/// before a request ID is consumed or a command is written. The server passes
+/// its configured per-media cap; the client uses the hard transport bound.
+pub(crate) fn parse_native_prompt_content(
+    value: &Value,
+    max_media_bytes: u64,
+) -> Result<Vec<ContentBlock>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::validation("content must be an array"))?;
+    if items.is_empty() || items.len() > MAX_RPC_CONTENT_BLOCKS {
+        return Err(Error::validation(format!(
+            "content must contain 1..={MAX_RPC_CONTENT_BLOCKS} user content blocks"
+        )));
+    }
+    let mut content = Vec::with_capacity(items.len());
+    let mut media_count = 0;
+    let mut encoded_bytes = 0_u64;
+    for (index, item) in items.iter().enumerate() {
+        let invalid = |reason: &str| Error::validation(format!("content[{index}]: {reason}"));
+        // Count payloads before cloning or decoding; the whole native command
+        // is bounded even when it mixes many individually acceptable blocks.
+        let payload = match item.get("type").and_then(Value::as_str) {
+            Some("text") => item.get("text"),
+            Some("image" | "media") => item.get("data"),
+            _ => return Err(invalid("user content must be text, image, or media")),
+        }
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("content payload must be a string"))?;
+        encoded_bytes = encoded_bytes.saturating_add(payload.len() as u64);
+        if encoded_bytes > MAX_RPC_MEDIA_BYTES {
+            return Err(invalid("combined text and encoded attachments exceed 64 MiB"));
+        }
+        let block = match item.get("type").and_then(Value::as_str) {
+            Some("text") => ContentBlock::Text(TextContent::new(payload)),
+            Some("image") => ContentBlock::Image(parse_native_prompt_image(item)?),
+            Some("media") => {
+                media_count += 1;
+                if media_count > MAX_RPC_MEDIA_ATTACHMENTS {
+                    return Err(invalid("more than 32 media attachments"));
+                }
+                let mut media = parse_prompt_media_items(
+                    std::slice::from_ref(item),
+                    max_media_bytes.min(MAX_RPC_MEDIA_BYTES),
+                )?;
+                ContentBlock::Media(media.remove(0))
+            }
+            _ => unreachable!("content type was validated before allocation"),
+        };
+        content.push(block);
+    }
+    AgentSession::validate_user_content_blocks(&content)?;
+    validate_native_prompt_wire_budget(&content, MAX_RPC_NATIVE_JSON_BYTES)?;
+    Ok(content)
+}
+
+/// Account for JSON escaping and metadata without allocating a serialized copy.
+/// Native user messages are echoed by lifecycle events, so the normalized
+/// content itself must fit the transport budget before the prompt is accepted.
+fn validate_native_prompt_wire_budget(content: &[ContentBlock], max_bytes: usize) -> Result<()> {
+    struct ByteBudget(usize);
+
+    impl io::Write for ByteBudget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| io::Error::other("native content JSON exceeds wire budget"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(&mut ByteBudget(max_bytes), content).map_err(|_| {
+        Error::validation(format!(
+            "native content JSON exceeds the {max_bytes} byte wire limit"
+        ))
+    })
+}
+
+fn parse_native_prompt_image(item: &Value) -> Result<ImageContent> {
     use base64::Engine as _;
 
+    if item.get("source").is_some() {
+        return Err(Error::validation("ambiguous native image representation"));
+    }
+    let data = item
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| Error::validation("native image data must be a nonempty base64 string"))?;
+    let max_bytes = crate::media_tools::MAX_IMAGE_FILE_SIZE_BYTES;
+    if data.len() as u64 > max_bytes.saturating_add(2) / 3 * 4 {
+        return Err(Error::validation("native image exceeds the 20 MiB decoded limit"));
+    }
+    let raw_mime = item
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::validation("native image requires mimeType"))?;
+    let mime_type = crate::model::sanitize_image_mime_type(raw_mime).to_ascii_lowercase();
+    if !mime_type.split_once('/').is_some_and(|(kind, subtype)| {
+        kind == "image" && !subtype.is_empty() && !subtype.contains('/')
+    }) {
+        return Err(Error::validation("native image mimeType must be an image MIME type"));
+    }
+    let engine = if data.ends_with('=') {
+        &base64::engine::general_purpose::STANDARD
+    } else {
+        &base64::engine::general_purpose::STANDARD_NO_PAD
+    };
+    let bytes = engine
+        .decode(data)
+        .map_err(|_| Error::validation("native image data must be canonical standard base64"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::validation("native image exceeds the 20 MiB decoded limit"));
+    }
+    Ok(ImageContent {
+        data: data.to_string(),
+        mime_type,
+    })
+}
+
+fn parse_prompt_media(value: Option<&Value>, config: &Config) -> Result<Vec<MediaContent>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
     let items = value
         .as_array()
         .ok_or_else(|| Error::validation("media must be an array"))?;
+    parse_prompt_media_items(items, rpc_media_max_bytes(config))
+}
+
+fn parse_prompt_media_items(items: &[Value], max_bytes: u64) -> Result<Vec<MediaContent>> {
+    use base64::Engine as _;
+
     if items.len() > MAX_RPC_MEDIA_ATTACHMENTS {
         return Err(Error::validation(format!(
             "media exceeds the {MAX_RPC_MEDIA_ATTACHMENTS} attachments per command limit"
         )));
     }
-    let max_bytes = config
-        .media
-        .as_ref()
-        .and_then(|settings| settings.max_bytes)
-        .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES)
-        .min(MAX_RPC_MEDIA_BYTES);
     let max_encoded_bytes = max_bytes.saturating_add(2) / 3 * 4;
     let mut total_bytes = 0_u64;
     let mut media = Vec::with_capacity(items.len());
@@ -13490,10 +13638,37 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     };
 
     let mut images = Vec::new();
+    let mut native_count = 0_usize;
+    let mut native_encoded_bytes = 0_u64;
     for item in arr {
         let Some(obj) = item.as_object() else {
             continue;
         };
+        // ImageContent is the public SDK's established encoding. Keep the
+        // older source wrapper too; silently skipping native SDK images made
+        // subprocess prompts appear successful after losing every attachment.
+        if obj.contains_key("data") || obj.contains_key("mimeType") {
+            native_count += 1;
+            native_encoded_bytes = native_encoded_bytes.saturating_add(
+                obj.get("data")
+                    .and_then(Value::as_str)
+                    .map_or(0, |data| data.len() as u64),
+            );
+            if native_count > MAX_RPC_CONTENT_BLOCKS || native_encoded_bytes > MAX_RPC_MEDIA_BYTES {
+                return Err(Error::validation(
+                    "native images exceed 256 blocks or 64 MiB of encoded payloads",
+                ));
+            }
+            if obj.get("source").is_some()
+                || obj
+                    .get("type")
+                    .is_some_and(|kind| kind.as_str() != Some("image"))
+            {
+                return Err(Error::validation("ambiguous native image representation"));
+            }
+            images.push(parse_native_prompt_image(item)?);
+            continue;
+        }
         let item_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
         if item_type != "image" {
             continue;
@@ -15797,6 +15972,13 @@ export default function init(pi) {
             &json!({"message": "resume"}),
             None
         ));
+        let native = json!({"content": [
+            {"type": "media", "data": "YQ==", "mimeType": "audio/wav"}
+        ]});
+        assert!(command_resumes_rpc_agent("prompt", &native, None));
+        for command in ["prompt", "steer", "follow_up"] {
+            assert!(command_payload_can_advance_rpc_session(command, &native, None));
+        }
         for (command, payload) in [
             ("prompt", json!({})),
             ("set_model", json!({"provider": "test"})),
@@ -15898,6 +16080,41 @@ export default function init(pi) {
                 original_entry_count + 1,
                 "retry must append one new branch entry without deleting the original path"
             );
+        });
+    }
+
+    #[test]
+    fn rpc_retry_waiting_on_provider_keeps_session_available_and_cancels_cleanly() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut inner = Session::in_memory();
+            inner.append_model_message(build_user_message("original input", &[]));
+            let mut session = build_test_agent_session(inner);
+            let store = Arc::clone(&session.session);
+            let provider = session.provider_admission_gate();
+            let actions = session.session_action_admission_gate();
+            let cx = AgentCx::for_request();
+            let provider_call = provider.acquire(cx.cx()).await.unwrap();
+            let mut retry = Box::pin(take_last_rpc_user_turn_for_retry(&mut session));
+            assert!(futures::poll!(retry.as_mut()).is_pending());
+            let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+            let std::task::Poll::Ready(Ok(action_permit)) = futures::poll!(callback_action.as_mut()) else {
+                panic!("waiting retry must not hold Session actions");
+            };
+            assert!(store.try_lock().is_ok(), "provider callback must retain store access");
+            drop(action_permit);
+            drop(retry);
+            provider.ensure_allowed().unwrap();
+            drop(provider_call);
+            let content = take_last_rpc_user_turn_for_retry(&mut session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(content, UserContent::Text(text) if text == "original input"));
+            assert!(store.try_lock().unwrap().leaf_id().is_none());
+            provider.ensure_allowed().unwrap();
         });
     }
 
@@ -17820,6 +18037,15 @@ export default function init(pi) {
 
     #[test]
     fn rpc_native_media_idle_commands_retry_and_durable_sidecar_round_trip() {
+        assert_rpc_native_media_idle_commands_round_trip(false);
+    }
+
+    #[test]
+    fn rpc_ordered_content_idle_commands_retry_and_durable_sidecar_round_trip() {
+        assert_rpc_native_media_idle_commands_round_trip(true);
+    }
+
+    fn assert_rpc_native_media_idle_commands_round_trip(ordered: bool) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -17864,16 +18090,28 @@ export default function init(pi) {
             let images = json!([{"type": "image", "source": {
                 "type": "base64", "mediaType": "image/png", "data": "YQ=="
             }}]);
-            let expected = json!([
-                {"type": "image", "data": "YQ==", "mimeType": "image/png"},
-                media[0].clone(), media[1].clone()
-            ]);
+            let expected = if ordered {
+                json!([
+                    {"type": "text", "text": "  compare these clips\n"},
+                    media[0].clone(),
+                    {"type": "image", "data": "YQ==", "mimeType": "image/png"},
+                    {"type": "text", "text": "\nwith this frame  "},
+                    media[1].clone()
+                ])
+            } else {
+                json!([
+                    {"type": "image", "data": "YQ==", "mimeType": "image/png"},
+                    media[0].clone(), media[1].clone()
+                ])
+            };
             for (index, command) in ["prompt", "steer", "follow_up", "retry"]
                 .iter()
                 .enumerate()
             {
                 let payload = if *command == "retry" {
                     json!({"id": index.to_string(), "type": command})
+                } else if ordered {
+                    json!({"id": index.to_string(), "type": command, "content": expected})
                 } else {
                     json!({"id": index.to_string(), "type": command,
                            "message": "", "images": images, "media": media})
@@ -17947,11 +18185,15 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
-            for (command, behavior) in [
-                ("prompt", Some("steer")),
-                ("prompt", Some("follow-up")),
-                ("steer", None),
-                ("follow_up", None),
+            for (command, behavior, ordered) in [
+                ("prompt", Some("steer"), false),
+                ("prompt", Some("follow-up"), false),
+                ("steer", None, false),
+                ("follow_up", None, false),
+                ("prompt", Some("steer"), true),
+                ("prompt", Some("follow-up"), true),
+                ("steer", None, true),
+                ("follow_up", None, true),
             ] {
                 let temp = tempfile::tempdir().expect("tempdir");
                 let (entered, mut wait_for_entry) = asupersync::channel::oneshot::channel();
@@ -17986,10 +18228,28 @@ export default function init(pi) {
                     .recv(AgentCx::for_request().cx())
                     .await
                     .expect("first provider call");
-                let mut payload = json!({
-                    "id": "invalid", "type": command, "message": "queued media",
-                    "media": [{"type": "media", "data": "YR==", "mimeType": "video/mp4"}]
-                });
+                let expected = if ordered {
+                    json!([
+                        {"type": "media", "data": "YQ==", "mimeType": "video/mp4"},
+                        {"type": "text", "text": "  queued media\n"},
+                        {"type": "image", "data": "Yg==", "mimeType": "image/png"}
+                    ])
+                } else {
+                    json!([
+                        {"type": "text", "text": "queued media"},
+                        {"type": "media", "data": "YQ==", "mimeType": "video/mp4"}
+                    ])
+                };
+                let mut payload = if ordered {
+                    json!({"id": "invalid", "type": command, "content": expected})
+                } else {
+                    json!({
+                        "id": "invalid", "type": command, "message": "queued media",
+                        "media": [{"type": "media", "data": "YQ==", "mimeType": "video/mp4"}]
+                    })
+                };
+                let attachment_field = if ordered { "content" } else { "media" };
+                payload[attachment_field][0]["data"] = json!("YR==");
                 if let Some(behavior) = behavior {
                     payload["streamingBehavior"] = json!(behavior);
                 }
@@ -18003,7 +18263,7 @@ export default function init(pi) {
                 assert_eq!(rejected["success"], false);
                 assert!(rejected["error"].as_str().unwrap().contains("media[0]"));
                 payload["id"] = json!("valid");
-                payload["media"][0]["data"] = json!("YQ==");
+                payload[attachment_field][0]["data"] = json!("YQ==");
                 let accepted = send_recv(
                     &in_tx,
                     &out_rx,
@@ -18037,16 +18297,7 @@ export default function init(pi) {
                         _ => None,
                     })
                     .collect();
-                assert_eq!(
-                    users,
-                    vec![
-                        json!("initial"),
-                        json!([
-                            {"type": "text", "text": "queued media"},
-                            {"type": "media", "data": "YQ==", "mimeType": "video/mp4"}
-                        ])
-                    ]
-                );
+                assert_eq!(users, vec![json!("initial"), expected]);
             }
         });
     }
@@ -20467,6 +20718,41 @@ export default function init(pi) {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn native_prompt_wire_budget_counts_json_escaping_and_exact_boundary() {
+        let plain = vec![ContentBlock::Text(TextContent::new("xxxx"))];
+        let escaped = vec![ContentBlock::Text(TextContent::new("\0\0\0\0"))];
+        let plain_bytes = serde_json::to_vec(&plain).unwrap().len();
+        let escaped_bytes = serde_json::to_vec(&escaped).unwrap().len();
+        assert!(escaped_bytes > plain_bytes);
+        assert!(validate_native_prompt_wire_budget(&plain, plain_bytes).is_ok());
+        assert!(validate_native_prompt_wire_budget(&escaped, plain_bytes).is_err());
+        assert!(validate_native_prompt_wire_budget(&escaped, escaped_bytes).is_ok());
+        assert!(validate_native_prompt_wire_budget(&escaped, escaped_bytes - 1).is_err());
+        assert!(validate_native_prompt_wire_budget(&plain, 0).is_err());
+    }
+
+    #[test]
+    fn native_prompt_wire_budget_counts_normalized_attachment_metadata() {
+        let content = parse_native_prompt_content(
+            &json!([
+                {"type": "media", "data": "YQ==", "mimeType": " AUDIO/WAV",
+                 "name": " \u{202e}clip\n.wav "},
+                {"type": "image", "data": "Yg", "mimeType": " IMAGE/PNG"}
+            ]),
+            1,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&content).unwrap();
+        assert!(validate_native_prompt_wire_budget(&content, 6).is_err());
+        assert!(validate_native_prompt_wire_budget(&content, encoded.len()).is_ok());
+        assert!(validate_native_prompt_wire_budget(&content, encoded.len() - 1).is_err());
+        let serialized = serde_json::from_slice::<Value>(&encoded).unwrap();
+        assert_eq!(serialized[0]["mimeType"], "audio/wav");
+        assert_eq!(serialized[0]["name"], "clip.wav");
+        assert_eq!(serialized[1]["mimeType"], "image/png");
+    }
+
+    #[test]
     fn parse_prompt_media_preserves_bytes_and_sanitizes_labels() {
         let value = json!([
             {"type": "media", "data": "YQ==", "mimeType": " AUDIO/WAV",
@@ -20567,6 +20853,97 @@ export default function init(pi) {
                 Message::User(UserMessage { content: UserContent::Text(_), .. })
             ));
         }
+    }
+
+    #[test]
+    fn rpc_native_content_preserves_order_and_rejects_ambiguous_or_invalid_input() {
+        let config = Config::default();
+        let content = json!([
+            {"type": "media", "data": "YQ==", "mimeType": "audio/wav", "name": "voice.wav"},
+            {"type": "text", "text": "  compare\n"},
+            {"type": "image", "data": "Yg", "mimeType": "image/png"},
+            {"type": "text", "text": "\nnext  "},
+            {"type": "media", "data": "Yw==", "mimeType": "video/mp4"}
+        ]);
+        let payload = json!({"content": content});
+        let attachments = parse_prompt_attachments(&payload, &config).unwrap();
+        let Message::User(user) = build_user_message(rpc_prompt_message(&payload).unwrap(), &attachments) else {
+            panic!("expected native user message");
+        };
+        assert_eq!(serde_json::to_value(user.content).unwrap(), content);
+        for field in ["message", "images", "media"] {
+            let mut ambiguous = payload.clone();
+            ambiguous[field] = Value::Null;
+            assert!(
+                parse_prompt_attachments(&ambiguous, &config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot be combined")
+            );
+        }
+        for content in [
+            Value::Null,
+            json!({}),
+            json!([]),
+            json!([null]),
+            json!([{"type": "text", "text": 1}]),
+            json!([{"type": "thinking", "thinking": "private"}]),
+            json!([{"type": "toolCall", "name": "bash", "arguments": {}}]),
+            json!([{"type": "image", "data": "YR==", "mimeType": "image/png"}]),
+            json!([{"type": "image", "data": "YQ==", "mimeType": "video/mp4"}]),
+            json!([{"type": "image", "data": "YQ==", "mimeType": "image/png", "source": {}}]),
+            json!([{"type": "media", "data": "YQ==", "mimeType": "image/png"}]),
+        ] {
+            assert!(
+                parse_prompt_attachments(&json!({"content": content}), &config).is_err(),
+                "malformed native content was accepted: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_native_content_applies_media_limits_and_total_block_limit() {
+        let mut config = Config::default();
+        config.media = Some(crate::media_tools::MediaSettings {
+            max_bytes: Some(1),
+            ..Default::default()
+        });
+        let valid = json!({"type": "media", "data": "YQ==", "mimeType": "audio/wav"});
+        assert!(parse_prompt_attachments(&json!({"content": [valid.clone()]}), &config).is_ok());
+        assert!(parse_prompt_attachments(&json!({"content": [
+            {"type": "media", "data": "YWE=", "mimeType": "audio/wav"}
+        ]}), &config).is_err());
+        let media_overflow = json!({"content": vec![valid; MAX_RPC_MEDIA_ATTACHMENTS + 1]});
+        assert!(parse_prompt_attachments(&media_overflow, &config).is_err());
+        let block_overflow = json!({"content": vec![
+            json!({"type": "text", "text": "x"}); MAX_RPC_CONTENT_BLOCKS + 1
+        ]});
+        assert!(parse_prompt_attachments(&block_overflow, &config).is_err());
+    }
+
+    #[test]
+    fn rpc_images_accepts_the_public_sdk_shape_and_rejects_malformed_native_images() {
+        let native = json!([
+            {"data": "YQ==", "mimeType": " IMAGE/PNG"},
+            {"type": "image", "data": "Yg", "mimeType": "image/jpeg"}
+        ]);
+        let images = parse_prompt_images(Some(&native)).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].data, "YQ==");
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[1].data, "Yg");
+        for image in [
+            json!({"data": "YQ=="}),
+            json!({"data": "YR==", "mimeType": "image/png"}),
+            json!({"data": "YQ==", "mimeType": "image/png", "source": {}}),
+            json!({"type": "media", "data": "YQ==", "mimeType": "image/png"}),
+        ] {
+            assert!(parse_prompt_images(Some(&json!([image]))).is_err());
+        }
+        let too_many = json!(vec![
+            json!({"data": "YQ==", "mimeType": "image/png"}); MAX_RPC_CONTENT_BLOCKS + 1
+        ]);
+        assert!(parse_prompt_images(Some(&too_many)).is_err());
     }
 
     #[test]
