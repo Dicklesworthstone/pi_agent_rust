@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use ftui::core::geometry::Rect;
 use ftui::render::sanitize::sanitize;
-use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
+use ftui::runtime::subscription::{StopSignal, SubId, Subscription, SubscriptionSender};
 use ftui::text::{Text, WrapMode, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
@@ -359,7 +359,7 @@ impl LoopWatchdog {
 /// pass a plain closure and terminate via channel disconnect instead.
 fn drain_agent_events(
     rx: &Receiver<PiMsg>,
-    sender: &Sender<PiFtuiMsg>,
+    send: impl Fn(PiFtuiMsg) -> std::result::Result<(), std::sync::mpsc::SendError<PiFtuiMsg>>,
     stopped: impl Fn() -> bool,
 ) {
     loop {
@@ -368,8 +368,8 @@ fn drain_agent_events(
         }
         match rx.recv_timeout(AGENT_EVENT_POLL) {
             Ok(msg) => {
-                if sender.send(PiFtuiMsg::Agent(msg)).is_err() {
-                    // Runtime dropped its receiver: program is exiting.
+                if send(PiFtuiMsg::Agent(msg)).is_err() {
+                    // The runtime disconnected or cancelled a full-queue wait.
                     return;
                 }
             }
@@ -529,14 +529,19 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
         AGENT_EVENTS_SUB_ID
     }
 
-    fn run(&self, sender: Sender<PiFtuiMsg>, stop: StopSignal) {
+    fn run(&self, sender: SubscriptionSender<PiFtuiMsg>, stop: StopSignal) {
         let Some(rx) = self.rx.lock().ok().and_then(|mut slot| slot.take()) else {
             // Already consumed (or poisoned): nothing to drain. The runtime
             // only calls run() once per running subscription, so this is a
             // defensive no-op rather than an expected path.
             return;
         };
-        drain_agent_events(&rx, &sender, || stop.is_stopped());
+        // Forward through the runtime's bounded, stop-aware sender directly.
+        drain_agent_events(
+            &rx,
+            |message| sender.send(message),
+            || stop.is_stopped(),
+        );
     }
 }
 
@@ -11898,7 +11903,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             // Dropping the agent sender terminates the loop via Disconnected,
             // the same teardown path the bridge shutdown uses today.
-            drain_agent_events(&agent_rx, &msg_tx, || false);
+            drain_agent_events(&agent_rx, |message| msg_tx.send(message), || false);
         });
         agent_tx.send(PiMsg::AgentStart).unwrap();
         let bridged = msg_rx
@@ -11911,10 +11916,32 @@ mod tests {
 
     #[test]
     fn drain_loop_honors_stop_predicate() {
-        let (_agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, _msg_rx) = mpsc::channel::<PiFtuiMsg>();
+        agent_tx.send(PiMsg::AgentStart).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
         // stop=true up front: must return immediately without receiving.
-        drain_agent_events(&agent_rx, &msg_tx, || true);
+        drain_agent_events(&agent_rx, |message| msg_tx.send(message), || true);
+        assert!(matches!(agent_rx.try_recv(), Ok(PiMsg::AgentStart)));
+    }
+
+    #[test]
+    fn drain_loop_stops_consuming_when_the_runtime_sender_fails() {
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let (msg_tx, msg_rx) = mpsc::channel::<PiFtuiMsg>();
+        agent_tx.send(PiMsg::AgentStart).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
+        agent_tx // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
+            .send(PiMsg::TextDelta("still queued".to_string()))
+            .unwrap();
+        drop(agent_tx);
+        drop(msg_rx);
+
+        // SubscriptionSender returns the same SendError when disconnected or
+        // interrupted while its bounded queue is full. Stop after that failure.
+        drain_agent_events(&agent_rx, |message| msg_tx.send(message), || false);
+        assert!(matches!(
+            agent_rx.try_recv(),
+            Ok(PiMsg::TextDelta(text)) if text == "still queued"
+        ));
     }
 
     #[test]
