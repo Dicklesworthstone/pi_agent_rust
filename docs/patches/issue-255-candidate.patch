@@ -1,0 +1,397 @@
+diff --git a/src/interactive_ftui.rs b/src/interactive_ftui.rs
+--- a/src/interactive_ftui.rs
++++ b/src/interactive_ftui.rs
+@@ -60,3 +60,4 @@
++mod degraded;
+ mod info_commands;
+ mod plan_commands;
+ pub mod session_pins;
+@@ -5442,6 +5443,19 @@
+-    /// The real render pass. Split out of [`Model::view`] so the watchdog can
+-    /// time it without an extra guard type.
++    /// Keep essential text readable when the runtime requests lower fidelity.
++    /// Restore the requested level after rendering; the runtime still owns
++    /// its budget, recovery policy, and decision to skip calling view.
++    fn render_frame(&self, frame: &mut Frame) {
++        use ftui::render::budget::DegradationLevel;
++
++        let requested = frame.buffer.degradation;
++        let reduced = requested != DegradationLevel::Full;
++        if !requested.render_content() {
++            frame.buffer.degradation = DegradationLevel::NoStyling;
++        }
++        self.render_frame_with_mode(frame, reduced);
++        frame.buffer.degradation = requested;
++    }
++
+     #[allow(clippy::too_many_lines)]
+-    fn render_frame(&self, frame: &mut Frame) {
++    fn render_frame_with_mode(&self, frame: &mut Frame, reduced: bool) {
+         let area = Rect::new(0, 0, frame.width(), frame.height());
+         let regions = layout_regions(
+@@ -5472,10 +5486,22 @@
+-        let body_text = self.conversation_text(regions.body.width);
++        // Reduce the preparation work, not merely what Paragraph paints.
++        // The reduced path never wraps or clones the full thinking stream.
++        let body_text = if reduced {
++            self.degraded_conversation_tail(regions.body.width, regions.body.height)
++        } else {
++            self.conversation_text(regions.body.width)
++        };
+         let total_lines = body_text.lines().len();
+         let visible = usize::from(regions.body.height).max(1);
+-        // Record the authoritative total for update()'s scroll clamping
+-        // (issue #206); see `rendered_total_lines`.
+-        self.rendered_total_lines.set(total_lines);
+-        let from_tail = self
+-            .scroll_from_tail
+-            .min(total_lines.saturating_sub(visible));
++        // Only the full layout has an authoritative transcript line count.
++        // Keep the pinned scroll position for recovery; the reduced footer
++        // explicitly says that the temporary view shows the latest output.
++        if !reduced {
++            self.rendered_total_lines.set(total_lines);
++        }
++        let from_tail = if reduced {
++            0
++        } else {
++            self.scroll_from_tail
++                .min(total_lines.saturating_sub(visible))
++        };
+         let offset = total_lines.saturating_sub(visible + from_tail);
+@@ -5582,4 +5608,7 @@
+-        // Footer: scroll indicator wins; otherwise last-turn usage stats.
+-        let footer = if from_tail > 0 {
++        // A reduced frame is a temporary latest-output view, not the
++        // user's pinned full-history viewport.
++        let footer = if reduced {
++            String::from("reduced: latest output")
++        } else if from_tail > 0 {
+             format!("[{from_tail} lines up] End to follow")
+         } else if let Some(usage) = &self.usage_line {
+diff --git a/src/interactive_ftui/degraded.rs b/src/interactive_ftui/degraded.rs
+new file mode 100644
+index 0000000..e604fcc03aff5974882b9b8a2221e44366505b19
+--- /dev/null
++++ b/src/interactive_ftui/degraded.rs
+@@ -0,0 +1,320 @@
++//! Bounded plain-text rendering when the runtime requests lower fidelity.
++//!
++//! Preparing the entire transcript and only then letting Paragraph discard
++//! it at Skeleton quality saves none of the expensive layout work. Keep a
++//! readable, bounded tail instead. This is a presentation-only view, not a limit
++//! on thinking text, transcript entries, or session persistence.
++
++use std::collections::VecDeque;
++
++use ftui::text::wrap::graphemes;
++use ftui::text::{Line, Text, display_width};
++
++use super::{EntryRole, PiFtuiModel};
++
++const MAX_TAIL_BYTES: usize = 16 * 1024;
++const MAX_TAIL_BLOCKS: usize = 128;
++const HIDDEN_THINKING: &str = "(thinking hidden; Ctrl+T to expand)";
++
++/// Return at most `limit` bytes without slicing a UTF-8 code point. The
++/// caller trims and lays out only this slice, never the complete source.
++fn suffix(text: &str, limit: usize) -> &str {
++    let mut start = text.len().saturating_sub(limit);
++    while !text.is_char_boundary(start) {
++        start += 1;
++    }
++    &text[start..]
++}
++
++fn push_part(parts: &mut Vec<String>, remaining: &mut usize, prefix: &str, text: &str) {
++    let overhead = prefix.len().saturating_add(1);
++    if text.is_empty() || *remaining <= overhead {
++        return;
++    }
++    // Trim AFTER slicing: a provider may send a very long whitespace run.
++    let tail = suffix(text, *remaining - overhead).trim_end();
++    if tail.is_empty() {
++        return;
++    }
++    let mut part = String::with_capacity(prefix.len() + tail.len());
++    part.push_str(prefix);
++    part.push_str(tail);
++    *remaining -= part.len() + 1;
++    parts.push(part);
++}
++
++fn keep_row(rows: &mut VecDeque<String>, row: String, height: usize) {
++    if rows.len() == height {
++        rows.pop_front();
++    }
++    rows.push_back(row);
++}
++
++/// Deliberately simple, single-pass grapheme wrapping for the reduced view.
++/// Do not use Line::wrap here: the pinned styled long-word path repeatedly
++/// measures and copies the remaining suffix. Retain only a viewport of rows.
++fn wrap_tail(text: &str, width: usize, height: usize) -> Text<'static> {
++    if width == 0 || height == 0 {
++        return Text::from_lines(Vec::<Line<'static>>::new());
++    }
++    let mut rows = VecDeque::with_capacity(height.min(MAX_TAIL_BLOCKS));
++    for logical in text.lines() {
++        let mut row = String::new();
++        let mut cells = 0_usize;
++        for grapheme in graphemes(logical) {
++            let next = display_width(grapheme);
++            if cells.saturating_add(next) > width && !row.is_empty() {
++                keep_row(&mut rows, std::mem::take(&mut row), height);
++                cells = 0;
++            }
++            row.push_str(grapheme);
++            cells = cells.saturating_add(next);
++        }
++        keep_row(&mut rows, row, height);
++    }
++    Text::from_lines(rows.into_iter().map(Line::raw))
++}
++
++impl PiFtuiModel {
++    /// A bounded latest-output view. It intentionally does not claim a full
++    /// transcript line count or mutate the user's normal scroll position.
++    pub(super) fn degraded_conversation_tail(&self, width: u16, height: u16) -> Text<'static> {
++        if width == 0 || height == 0 {
++            return Text::from_lines(Vec::<Line<'static>>::new());
++        }
++        let width = usize::from(width);
++        let height = usize::from(height);
++        let mut remaining = width
++            .saturating_mul(height)
++            .saturating_mul(4)
++            .clamp(256, MAX_TAIL_BYTES);
++        let mut parts = Vec::new();
++
++        // Collect newest first, in reverse of normal conversation order.
++        push_part(&mut parts, &mut remaining, "", &self.streaming);
++        if !self.thinking.is_empty() {
++            let thinking = if self.show_thinking {
++                self.thinking.as_str()
++            } else {
++                HIDDEN_THINKING
++            };
++            push_part(&mut parts, &mut remaining, "thinking: ", thinking);
++        }
++        for entry in self.transcript.iter().rev().take(height.min(MAX_TAIL_BLOCKS)) {
++            if remaining == 0 {
++                break;
++            }
++            let text = if entry.role == EntryRole::Thinking && !self.show_thinking {
++                HIDDEN_THINKING
++            } else {
++                entry.text.as_str()
++            };
++            push_part(&mut parts, &mut remaining, entry.role.prefix(), text);
++        }
++        parts.reverse();
++        wrap_tail(&parts.join("\n"), width, height)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::interactive::{ConversationMessage, MessageRole, PiMsg};
++    use crate::interactive_ftui::{AgentUiState, PiFtuiMsg, UiCommand};
++    use crate::model::StopReason;
++    use ftui::render::budget::DegradationLevel;
++    use ftui::render::grapheme_pool::GraphemePool;
++    use ftui::{Cmd, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Model, Modifiers};
++    use std::sync::{Arc, Mutex, mpsc};
++
++    const WIDTH: u16 = 48;
++    const HEIGHT: u16 = 12;
++
++    fn new_model() -> PiFtuiModel {
++        let (_tx, rx) = mpsc::channel();
++        PiFtuiModel::new(rx).with_thinking_visible(true)
++    }
++
++    fn key(code: KeyCode, modifiers: Modifiers) -> PiFtuiMsg {
++        PiFtuiMsg::Term(Event::Key(KeyEvent {
++            code,
++            modifiers,
++            kind: KeyEventKind::Press,
++        }))
++    }
++
++    fn capture(model: &PiFtuiModel, level: DegradationLevel) -> String {
++        let mut pool = GraphemePool::new();
++        let mut frame = Frame::new(WIDTH, HEIGHT, &mut pool);
++        frame.buffer.degradation = level;
++        model.view(&mut frame);
++        assert_eq!(frame.buffer.degradation, level, "do not rewrite runtime policy");
++        let mut text = String::new();
++        for y in 0..HEIGHT {
++            for x in 0..WIDTH {
++                text.push(
++                    frame
++                        .buffer
++                        .get(x, y)
++                        .and_then(|cell| cell.content.as_char())
++                        .unwrap_or(' '),
++                );
++            }
++            text.push('\n');
++        }
++        text
++    }
++
++    fn without_whitespace(text: &str) -> String {
++        text.chars().filter(|ch| !ch.is_whitespace()).collect()
++    }
++
++    /// Deterministic MODEL-level overload injection, not a PTY/provider test.
++    /// The native runtime's budget transitions must be tested separately.
++    fn stream(model: &mut PiFtuiModel) -> String {
++        let _ = model.update(PiFtuiMsg::Agent(PiMsg::AgentStart));
++        // Install the UI control slot, as the driver does, to permit typing
++        // while Working. Abort delivery is tested with a real AbortHandle.
++        model.turn_control = Some(Arc::new(Mutex::new(None)));
++        model.push_entry(EntryRole::System, "previous conversation".to_string());
++        model.rendered_total_lines.set(123);
++        // Exactly 256 bytes per delta, with NO word or line boundaries:
++        // 4096 deltas make a 1 MiB token. This also exercises the expensive
++        // styled long-word splitter, not only growing transcript row count.
++        let token = "r".repeat(246);
++        let mut original = String::new();
++        let mut draft = String::new();
++        for index in 0..4096 {
++            let marker = format!("TAIL-{index:05}");
++            let delta = format!("{token}{marker}");
++            original.push_str(&delta);
++            let _ = model.update(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(delta)));
++            assert_eq!(model.scroll_from_tail, 0, "FTUI's follow-stream-tail state");
++            if index % 64 == 63 {
++                for level in [
++                    DegradationLevel::SimpleBorders,
++                    DegradationLevel::NoStyling,
++                    DegradationLevel::Skeleton,
++                ] {
++                    let frame = capture(model, level);
++                    assert!(
++                        without_whitespace(&frame).contains(&marker),
++                        "first missing tail: delta={index}, level={level:?}\n{frame}"
++                    );
++                    assert!(frame.contains("pi ·"), "missing header at delta {index}");
++                }
++                let _ = model.update(key(KeyCode::Char('x'), Modifiers::empty()));
++                draft.push('x');
++                assert_eq!(model.input.text(), draft, "editor at delta {index}");
++            }
++        }
++        assert_eq!(model.thinking, original, "rendering must never trim stored thinking");
++        assert!(model.render_cache.borrow().is_empty(), "no full-history preparation");
++        assert_eq!(model.rendered_total_lines.get(), 123, "no bogus full-history count");
++        original
++    }
++
++    #[test]
++    fn gh255_injected_overload_keeps_reasoning_and_quit_abort_reachable() {
++        let mut model = new_model();
++        let _ = stream(&mut model);
++        let (abort, signal) = crate::agent::AbortHandle::new();
++        let slot = Arc::new(Mutex::new(Some(abort)));
++        model.turn_abort = Some(Arc::clone(&slot));
++        let first = model.update(key(KeyCode::Char('c'), Modifiers::CTRL));
++        assert!(matches!(first, Cmd::None));
++        assert!(model.input.is_empty());
++        // Set the same timestamp that the first press records immediately
++        // before the second press, with no frame/workload between the keys.
++        model.last_ctrl_c = Some(std::time::Instant::now());
++        let second = model.update(key(KeyCode::Char('c'), Modifiers::CTRL));
++        assert!(matches!(second, Cmd::Quit));
++        assert!(signal.is_aborted(), "quit must cancel the in-flight turn");
++        assert!(slot.lock().expect("abort slot").is_none(), "abort handle was delivered");
++    }
++
++    #[test]
++    fn gh255_completed_thinking_survives_ui_resume_replay_and_next_prompt() {
++        let mut model = new_model();
++        let original = stream(&mut model);
++        let _ = model.update(PiFtuiMsg::Agent(PiMsg::TextDelta(
++            "ANSWER_DONE".to_string(),
++        )));
++        let _ = model.update(PiFtuiMsg::Agent(PiMsg::AgentDone {
++            usage: None,
++            stop_reason: StopReason::Stop,
++            error_message: None,
++        }));
++        assert_eq!(model.state, AgentUiState::Ready);
++        assert!(model.thinking.is_empty());
++        let completed = model
++            .transcript
++            .iter()
++            .find(|entry| entry.role == EntryRole::Thinking)
++            .expect("completed thinking");
++        assert_eq!(completed.text.trim(), original.trim());
++
++        let (submit_tx, submit_rx) = mpsc::channel();
++        let mut resumed = new_model().with_submit_channel(submit_tx);
++        resumed.apply_conversation_reset(
++            vec![ConversationMessage {
++                role: MessageRole::Assistant,
++                content: "ANSWER_DONE".to_string(),
++                thinking: Some(completed.text.clone()),
++                collapsed: false,
++            }],
++            None,
++        );
++        assert_eq!(resumed.scroll_from_tail, 0);
++        assert_eq!(resumed.state, AgentUiState::Ready);
++        let frame = capture(&resumed, DegradationLevel::Skeleton);
++        assert!(
++            without_whitespace(&frame).contains("TAIL-04095"),
++            "resumed tail missing: {frame}"
++        );
++        assert!(frame.contains("ANSWER_DONE"), "resumed answer missing");
++        assert!(resumed.render_cache.borrow().is_empty(), "cold replay stays bounded");
++        assert_eq!(resumed.transcript[0].text.trim(), original.trim());
++        for ch in "next".chars() {
++            let _ = resumed.update(key(KeyCode::Char(ch), Modifiers::empty()));
++        }
++        let _ = resumed.update(key(KeyCode::Enter, Modifiers::empty()));
++        assert_eq!(
++            submit_rx.try_recv().expect("next prompt"),
++            UiCommand::Prompt("next".to_string())
++        );
++    }
++
++    #[test]
++    fn gh255_reduced_render_preserves_pinned_scroll_and_hidden_thinking() {
++        let mut model = new_model();
++        model.show_thinking = false;
++        model.thinking = "PRIVATE-THINKING".repeat(100_000);
++        model.scroll_from_tail = 500;
++        model.rendered_total_lines.set(1000);
++        let frame = capture(&model, DegradationLevel::Skeleton);
++        assert!(!frame.contains("PRIVATE-THINKING"));
++        assert!(frame.contains("thinking hidden"));
++        assert!(frame.contains("reduced: latest output"));
++        assert_eq!(model.scroll_from_tail, 500);
++        assert_eq!(model.rendered_total_lines.get(), 1000);
++    }
++
++    #[test]
++    fn gh255_suffix_and_character_wrapping_are_bounded_and_utf8_safe() {
++        let text = format!("{}\nTAIL", "界🙂e\u{301}".repeat(100_000));
++        for limit in 0..32 {
++            let tail = suffix(&text, limit);
++            assert!(tail.len() <= limit);
++            assert!(text.ends_with(tail));
++        }
++        let wrapped = wrap_tail("abc界🙂def\ne\u{301}\nTAIL", 4, 3);
++        assert_eq!(wrapped.lines().len(), 3);
++        assert!(wrapped.to_plain_text().ends_with("TAIL"));
++        for line in wrapped.lines() {
++            assert!(line.width() <= 4);
++        }
++        assert!(wrap_tail("text", 0, 3).is_empty());
++        assert!(wrap_tail("text", 3, 0).is_empty());
++    }
++}
