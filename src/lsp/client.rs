@@ -219,6 +219,7 @@ impl LspClient {
                     }
                 },
                 "workspace":{
+                    "diagnostics":{"refreshSupport":false},
                     "applyEdit":true,"workspaceEdit":{
                         "documentChanges":true,"resourceOperations":["create","rename","delete"]
                     },
@@ -538,5 +539,123 @@ mod tests {
         assert!(!is_warmup_empty_retryable("codeAction/resolve"));
         assert!(is_warmup_empty_retryable("textDocument/definition"));
         assert!(is_warmup_empty_retryable("workspace/willRenameFiles"));
+    }
+
+    fn workspace_peer(root: &Path) -> Option<test_server::Fixture> {
+        test_server::Fixture::connect(
+            root,
+            serde_json::json!({"diagnosticProvider": {
+                "interFileDependencies": true, "workspaceDiagnostics": true
+            }}),
+        )
+    }
+
+    #[test]
+    fn workspace_diagnostic_handshake_advertises_pull_but_not_automatic_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        let frames = peer.frames();
+        let initialize = frames
+            .iter()
+            .find(|frame| frame["method"] == "initialize")
+            .unwrap();
+        assert_eq!(
+            initialize["params"]["capabilities"]["workspace"]["diagnostics"],
+            serde_json::json!({"refreshSupport": false})
+        );
+        assert_eq!(
+            initialize["params"]["capabilities"]["textDocument"]["diagnostic"]["dynamicRegistration"],
+            false
+        );
+    }
+
+    #[test]
+    fn workspace_pull_cancelled_owner_never_posts_a_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        let owner = AgentCx::for_request();
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancelled"));
+        let error = peer
+            .runtime
+            .block_on(owner.with_current(
+                peer.client.workspace_diagnostics(Duration::from_secs(5)),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("LSP_CANCELLED"), "{error}");
+        assert!(
+            !peer
+                .frames()
+                .iter()
+                .any(|frame| frame["method"] == "workspace/diagnostic")
+        );
+        assert!(peer.client.is_alive());
+    }
+
+    #[test]
+    fn abandoned_written_workspace_pull_cancels_once_and_releases_the_request_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        peer.configure(serde_json::json!({"workspace/diagnostic": [{"hold": true}]}));
+        peer.runtime.block_on(async {
+            let mut request = Box::pin(peer.client.workspace_diagnostics(Duration::from_secs(30)));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            // The first pending poll proves only queue admission. Obtain a
+            // real peer acknowledgement using an independent transport slot
+            // before dropping the owner of the written workspace request.
+            let (id, response) = peer.client.rpc.request("test/frames", Value::Null).unwrap();
+            let observed = crate::lsp::jsonrpc::await_completion(
+                response,
+                Duration::from_secs(5),
+                || peer.client.rpc.cancel_request(id),
+            )
+            .await
+            .expect("peer observation arrived")
+            .expect("peer observation succeeded");
+            assert!(
+                observed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["method"] == "workspace/diagnostic")
+            );
+            drop(request);
+            assert_eq!(
+                peer.client
+                    .call("test/success", Value::Null, Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+                serde_json::json!({"ok": true})
+            );
+        });
+        let frames = peer.frames();
+        let posted = frames
+            .iter()
+            .position(|frame| frame["method"] == "workspace/diagnostic")
+            .unwrap();
+        let cancelled = frames
+            .iter()
+            .position(|frame| frame["method"] == "$/cancelRequest")
+            .unwrap();
+        let successor = frames
+            .iter()
+            .position(|frame| frame["method"] == "test/success")
+            .unwrap();
+        assert!(posted < cancelled && cancelled < successor);
+        assert_eq!(frames[cancelled]["params"]["id"], frames[posted]["id"]);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "$/cancelRequest")
+                .count(),
+            1
+        );
+        assert!(peer.client.diagnostics_snapshot().is_empty());
+        assert!(peer.client.is_alive());
     }
 }
