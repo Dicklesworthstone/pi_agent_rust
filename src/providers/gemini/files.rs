@@ -29,9 +29,14 @@ const EXPIRY_MARGIN_SECS: i64 = 120;
 type ContentKey = [u8; 32];
 type FileSlot = Arc<AsyncMutex<Option<RemoteFile>>>;
 
-/// These are bandwidth policies, not advertised limits of the Google API.
-/// Retain the separate `read_media` admission cap until session-side blob
-/// storage is implemented; this path does not make inline JSONL storage cheap.
+/// These are staging policies, not generation request admission limits.
+/// Google's image/audio guides still recommend a 20 MB total inline request,
+/// while its general file-input guide documents 100 MB. Use the conservative
+/// media budget, including the serialized prompt, tools and system instruction:
+/// https://ai.google.dev/gemini-api/docs/generate-content/image-understanding
+/// https://ai.google.dev/gemini-api/docs/generate-content/file-input-methods
+/// Text-only requests retain the generation API's own limits. The separate
+/// `read_media` admission cap and session attachment limits remain independent.
 #[derive(Clone, Copy)]
 struct StagingPolicy {
     inline_part_bytes: usize,
@@ -44,7 +49,7 @@ impl Default for StagingPolicy {
     fn default() -> Self {
         Self {
             inline_part_bytes: 4 * 1024 * 1024,
-            inline_total_bytes: 32 * 1024 * 1024,
+            inline_total_bytes: 20_000_000,
             timeout: Duration::from_secs(300),
             poll_interval: Duration::from_secs(2),
         }
@@ -341,15 +346,29 @@ impl FileCache {
         body: &mut Value,
         candidates: Vec<Candidate>,
     ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut request_bytes = serialized_bytes(body)?;
         // Repeated parts in a single request share the already-validated URI,
         // without an extra files.get call for every occurrence.
         let mut prepared: BTreeMap<ContentKey, String> = BTreeMap::new();
         for candidate in candidates {
+            // Candidates are largest first. Once neither the per-part nor
+            // complete-request policy requires another upload, all remaining
+            // parts can stay inline. Include the actual returned URI in each
+            // update: removing just the base64 length undercounts fileData.
+            if candidate.encoded_bytes < self.policy.inline_part_bytes
+                && request_bytes <= self.policy.inline_total_bytes
+            {
+                break;
+            }
             checkpoint(context.owner)?;
             let part = body
                 .pointer_mut(&candidate.pointer)
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| files_error("media part changed during staging"))?;
+            let previous_part_bytes = serialized_bytes(part)?;
             let inline = part
                 .get(candidate.inline_key)
                 .ok_or_else(|| files_error("inline media disappeared during staging"))?;
@@ -376,7 +395,14 @@ impl FileCache {
                 "fileData".to_string(),
                 json!({"mimeType": mime, "fileUri": uri}),
             );
+            let replacement_part_bytes = serialized_bytes(part)?;
+            request_bytes = request_bytes
+                .checked_sub(previous_part_bytes)
+                .and_then(|bytes| bytes.checked_add(replacement_part_bytes))
+                .ok_or_else(|| files_error("generation request byte count overflow"))?;
         }
+        // If the prompt itself exceeds the media budget, every inline part
+        // has been staged. Do not impose a new limit on the remaining text.
         Ok(())
     }
 
@@ -512,21 +538,47 @@ fn staging_plan(body: &Value, policy: StagingPolicy) -> Result<Vec<Candidate>> {
             collect_candidates(content, &format!("/{key}"), &mut candidates)?;
         }
     }
-    let mut remaining = candidates
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+    if candidates
         .iter()
-        .fold(0_usize, |sum, item| sum.saturating_add(item.encoded_bytes));
+        .all(|item| item.encoded_bytes < policy.inline_part_bytes)
+        && serialized_bytes(body)? <= policy.inline_total_bytes
+    {
+        return Ok(Vec::new());
+    }
     // Largest first minimizes the number of Files API resources required to
-    // bring aggregate inline data under the bandwidth budget.
+    // bring the complete request under the inline budget. Keep smaller parts
+    // available until the exact size of each returned file URI is known.
     candidates.sort_by_key(|item| std::cmp::Reverse(item.encoded_bytes));
-    candidates.retain(|item| {
-        let upload =
-            item.encoded_bytes >= policy.inline_part_bytes || remaining > policy.inline_total_bytes;
-        if upload {
-            remaining = remaining.saturating_sub(item.encoded_bytes);
-        }
-        upload
-    });
     Ok(candidates)
+}
+
+/// Match `RequestBuilder::json`'s compact `serde_json` encoding without allocating
+/// another copy of a media-bearing body. Counting complete parts also includes
+/// escaped strings, MIME labels, thought signatures and file URI overhead.
+fn serialized_bytes(value: &impl serde::Serialize) -> Result<usize> {
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON byte count overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| files_error("generation request byte count overflow"))?;
+    Ok(counter.0)
 }
 
 fn collect_candidates(content: &Value, prefix: &str, out: &mut Vec<Candidate>) -> Result<()> {
@@ -565,7 +617,15 @@ fn decode_media(data: &str) -> Result<Vec<u8>> {
             "one media upload exceeds the 64 MiB staging limit",
         ));
     }
-    let bytes = base64::engine::general_purpose::STANDARD
+    // RPC/SDK native content and persisted attachments accept canonical
+    // standard base64 with optional padding. Crossing the staging threshold
+    // must not turn a previously accepted unpadded attachment into an error.
+    let engine = if data.ends_with('=') {
+        &base64::engine::general_purpose::STANDARD
+    } else {
+        &base64::engine::general_purpose::STANDARD_NO_PAD
+    };
+    let bytes = engine
         .decode(data)
         .map_err(|_| files_error("inline media is not valid base64"))?;
     if bytes.len() > MAX_UPLOAD_BYTES {
@@ -1147,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_policy_selects_largest_parts_without_rewriting_tool_arguments() {
+    fn aggregate_policy_orders_only_media_parts_without_rewriting_tool_arguments() {
         let body = json!({"contents": [{"parts": [
             {"inlineData": {"mimeType": "audio/wav", "data": "aaaaaaaa"}},
             {"inline_data": {"mime_type": "audio/wav", "data": "bbbb"}},
@@ -1164,8 +1224,40 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].pointer, "/contents/0/parts/0");
+        assert_eq!(plan[1].pointer, "/contents/0/parts/1");
+    }
+
+    #[test]
+    fn aggregate_budget_counts_serialized_prompts_tools_and_escape_expansion() {
+        let mut body = media_body(b"abc");
+        body["systemInstruction"] = json!({"parts": [{"text": "\u{0001}".repeat(100)}]});
+        body["tools"] = json!([{"functionDeclarations": [{
+            "name": "inspect", "description": "\n\"\\".repeat(100)
+        }]}]);
+        let bytes = serde_json::to_vec(&body).unwrap().len();
+        let policy = StagingPolicy {
+            inline_part_bytes: usize::MAX,
+            inline_total_bytes: bytes,
+            ..StagingPolicy::default()
+        };
+        assert!(staging_plan(&body, policy).unwrap().is_empty());
+        assert_eq!(
+            staging_plan(
+                &body,
+                StagingPolicy {
+                    inline_total_bytes: bytes - 1,
+                    ..policy
+                },
+            )
+            .unwrap()
+            .len(),
+            1,
+            "one extra byte of the whole request triggers media staging"
+        );
+        let text_only = json!({"contents": [{"parts": [{"text": "x".repeat(bytes)}]}]});
+        assert!(staging_plan(&text_only, policy).unwrap().is_empty());
     }
 
     #[test]
@@ -1183,8 +1275,10 @@ mod tests {
     #[test]
     fn media_decoder_and_mime_validation_fail_closed() {
         assert_eq!(decode_media("AAEC/w==").unwrap(), [0, 1, 2, 255]);
-        assert!(decode_media("").is_err());
-        assert!(decode_media("not-base64!").is_err());
+        assert_eq!(decode_media("AAEC/w").unwrap(), [0, 1, 2, 255]);
+        for data in ["", "not-base64!", "A", "AB==", "AB", "_w==", "AAEC/w=", "Y Q=="] {
+            assert!(decode_media(data).is_err(), "{data}");
+        }
         assert!(valid_mime("audio/x-wav"));
         assert!(valid_mime("application/pdf"));
         for mime in [
@@ -1245,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_reuses_content_across_parts_and_turns_and_keeps_other_fields() {
+    fn upload_reuses_padded_and_unpadded_content_across_parts_and_turns() {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
@@ -1258,7 +1352,9 @@ mod tests {
         let auth = auth("key-a");
         let original = media_body(&[0, 255, 128, 42]);
         let mut body = original.clone();
-        let duplicate = body["contents"][0]["parts"][1].clone();
+        let mut duplicate = body["contents"][0]["parts"][1].clone();
+        duplicate["inlineData"]["data"] =
+            json!(base64::engine::general_purpose::STANDARD_NO_PAD.encode([0, 255, 128, 42]));
         body["contents"][0]["parts"]
             .as_array_mut()
             .unwrap()
@@ -1268,6 +1364,8 @@ mod tests {
                 .await
                 .unwrap();
             let mut next_turn = original.clone();
+            next_turn["contents"][0]["parts"][1]["inlineData"]["data"] =
+                json!(base64::engine::general_purpose::STANDARD_NO_PAD.encode([0, 255, 128, 42]));
             stage(&cache, &client, &server.endpoint, &auth, &mut next_turn)
                 .await
                 .unwrap();
@@ -1309,6 +1407,103 @@ mod tests {
         assert!(!requests[1].headers.contains_key("authorization"));
         assert_eq!(requests[2].method, "GET");
         assert_eq!(requests[2].path, "/v1beta/files/one");
+    }
+
+    #[test]
+    fn aggregate_staging_accounts_for_file_uris_on_the_generation_wire() {
+        let large = vec![1; 1024];
+        let medium = vec![2; 769];
+        let small = vec![3; 96];
+        let long_name = "a".repeat(128);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(
+                    endpoint, &long_name, "ACTIVE", large.len()
+                )})),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(
+                    endpoint, "two", "ACTIVE", medium.len()
+                )})),
+                Reply::json(&json!({"candidates": []})),
+            ]
+        });
+        let mut body = media_body(&large);
+        body["contents"][0]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({"inline_data": {"mime_type": "audio/wav",
+                    "data": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&medium)}}),
+                json!({"inlineData": {"mimeType": "audio/wav",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&small)}}),
+            ]);
+        body["systemInstruction"] = json!({"parts": [{"text": "\u{0001}".repeat(300)}]});
+        body["tools"] = json!([{"functionDeclarations": [{
+            "name": "inspect", "description": "\n\"\\".repeat(150)
+        }]}]);
+        let original = body.clone();
+        let mut after_first = original.clone();
+        let part = after_first["contents"][0]["parts"][1]
+            .as_object_mut()
+            .unwrap();
+        part.remove("inlineData");
+        part.insert(
+            "fileData".into(),
+            json!({"mimeType": "audio/wav", "fileUri":
+                server.endpoint.metadata_url(&format!("files/{long_name}")).unwrap().as_str()}),
+        );
+        // Stop one byte below the real post-upload size. Subtracting only the
+        // original base64 length would incorrectly leave the medium part inline.
+        let budget = serde_json::to_vec(&after_first).unwrap().len() - 1;
+        assert!(budget > 4 * (large.len() + medium.len() + small.len()).div_ceil(3));
+        let cache = FileCache {
+            policy: StagingPolicy {
+                inline_part_bytes: usize::MAX,
+                inline_total_bytes: budget,
+                ..cache().policy
+            },
+            ..FileCache::default()
+        };
+        let client = Client::new();
+        let auth = auth("key-a");
+        let url = server
+            .endpoint
+            .base
+            .join("models/test:streamGenerateContent?alt=sse")
+            .unwrap();
+        run_async(async {
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
+            let request = client.post(url.as_str()).json(&body).unwrap();
+            let response = Box::pin(request.send()).await.unwrap();
+            assert_eq!(response.status(), 200);
+            response.text().await.unwrap();
+        });
+        assert!(body["contents"][0]["parts"][1].get("fileData").is_some());
+        assert!(body["contents"][0]["parts"][2].get("fileData").is_some());
+        assert_eq!(
+            body["contents"][0]["parts"][3],
+            original["contents"][0]["parts"][3]
+        );
+        assert_eq!(body["systemInstruction"], original["systemInstruction"]);
+        assert_eq!(body["tools"], original["tools"]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 5, "two uploads followed by generation");
+        assert_eq!(requests[1].body, large);
+        assert_eq!(requests[3].body, medium);
+        let generation = &requests[4];
+        assert_eq!(
+            generation.path,
+            "/v1beta/models/test:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(generation.body, serde_json::to_vec(&body).unwrap());
+        assert!(generation.body.len() <= budget);
+        assert_eq!(
+            generation.headers["content-length"],
+            generation.body.len().to_string()
+        );
     }
 
     #[test]
