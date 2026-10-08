@@ -385,7 +385,7 @@ impl FileCache {
             let uri = if let Some(uri) = prepared.get(&key) {
                 uri.clone()
             } else {
-                let uri = self.stage_one(context, key, &mime, bytes).await?;
+                let uri = self.stage_one(context, key, &mime, data, bytes).await?;
                 prepared.insert(key, uri.clone());
                 uri
             };
@@ -450,6 +450,7 @@ impl FileCache {
         context: &UploadContext<'_>,
         key: ContentKey,
         mime: &str,
+        encoded: &str,
         bytes: Vec<u8>,
     ) -> Result<String> {
         let slot = self.slot(key)?;
@@ -468,56 +469,64 @@ impl FileCache {
             })?;
         checkpoint(context.owner)?;
         let size = bytes.len();
-        if cached
-            .as_ref()
-            .is_some_and(|file| file.expires_soon(Utc::now()) || file.state == FileState::Failed)
-        {
-            *cached = None;
-        }
+        let mut had_remote_file = cached.is_some();
+        let mut replacement_used = false;
+        // The request body already retains the canonical encoded bytes. Move
+        // this decoded buffer into the first upload and decode again only for
+        // an actual replacement, rather than holding a second 64 MiB copy
+        // across every successful upload and processing poll.
+        let mut upload_bytes = Some(bytes);
         // Do not assume a still-live URI exists just because its TTL has not
         // elapsed: the user may have deleted the resource out of band.
-        if let Some(file) = cached.as_ref() {
+        if let Some(file) = cached.as_ref()
+            && !file.expires_soon(Utc::now())
+            && file.state != FileState::Failed
+        {
             let name = file.name.clone();
             *cached = get_metadata(context, &name, mime, size).await?;
         }
-        if cached
-            .as_ref()
-            .is_some_and(|file| file.expires_soon(Utc::now()) || file.state == FileState::Failed)
-        {
-            *cached = None;
-        }
-        if cached.is_none() {
-            let uploaded = upload(context, mime, bytes).await?;
-            // Install PROCESSING metadata before awaiting the next poll. A
-            // cancelled/timeout request can resume waiting instead of uploading
-            // the same media again on the next turn.
-            *cached = Some(uploaded);
-        }
         loop {
             checkpoint(context.owner)?;
-            let file = cached
-                .as_ref()
-                .ok_or_else(|| files_error("uploaded media disappeared"))?;
-            if file.expires_soon(Utc::now()) {
-                *cached = None;
-                return Err(files_error(
-                    "uploaded media expired before it became usable; retry the request",
-                ));
-            }
-            match file.state {
-                FileState::Active => return Ok(file.uri.clone()),
-                FileState::Failed => {
+            if let Some(file) = cached.as_ref() {
+                if file.state == FileState::Failed {
                     *cached = None;
                     return Err(files_error(
                         "media processing failed; generation was not started",
                     ));
                 }
-                FileState::Processing => {
+                if !file.expires_soon(Utc::now()) {
+                    if file.state == FileState::Active {
+                        return Ok(file.uri.clone());
+                    }
                     let name = file.name.clone();
                     context.owner.time().sleep(self.policy.poll_interval).await;
                     *cached = get_metadata(context, &name, mime, size).await?;
+                    continue;
                 }
+                *cached = None;
             }
+            // One replacement budget covers both initial cache validation and
+            // every processing poll. A cold upload is free; replacing any
+            // expired/deleted reference spends the budget. The outer staging
+            // timeout remains the same absolute deadline across replacements.
+            if had_remote_file {
+                if replacement_used {
+                    return Err(files_error(
+                        "media file disappeared or expired again after one replacement; generation was not started",
+                    ));
+                }
+                replacement_used = true;
+            }
+            let bytes = match upload_bytes.take() {
+                Some(bytes) => bytes,
+                None => decode_media(encoded)?,
+            };
+            let uploaded = upload(context, mime, bytes).await?;
+            // Install PROCESSING metadata before awaiting the next poll. A
+            // cancelled/timeout request can resume waiting instead of uploading
+            // the same media again on the next turn.
+            *cached = Some(uploaded);
+            had_remote_file = true;
         }
     }
 }
@@ -1527,6 +1536,177 @@ mod tests {
         .unwrap();
         assert!(body["contents"][0]["parts"][1].get("fileData").is_some());
         assert_eq!(server.finish().len(), 4);
+    }
+
+    #[test]
+    fn processing_reference_recovery_reuploads_identical_bytes_once() {
+        for expired in [false, true] {
+            let server = Server::start(|endpoint| {
+                let lost = if expired {
+                    let mut metadata = file_metadata(endpoint, "old", "PROCESSING", 3);
+                    metadata["expirationTime"] =
+                        json!((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+                    Reply::json(&metadata)
+                } else {
+                    Reply::status(404)
+                };
+                vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "old", "PROCESSING", 3)})),
+                    lost,
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "new", "PROCESSING", 3)})),
+                    Reply::json(&file_metadata(endpoint, "new", "ACTIVE", 3)),
+                ]
+            });
+            let original = media_body(b"abc");
+            let mut body = original.clone();
+            run_async(stage(
+                &cache(),
+                &Client::new(),
+                &server.endpoint,
+                &auth("same-credential"),
+                &mut body,
+            ))
+            .expect("a disappeared or expired processing file is replaced");
+            let part = &body["contents"][0]["parts"][1];
+            assert!(
+                part["fileData"]["fileUri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/new")
+            );
+            assert_eq!(part["thoughtSignature"], "keep-this-field");
+            assert!(part.get("inlineData").is_none());
+            assert_eq!(
+                original["contents"][0]["parts"][1]["inlineData"]["data"],
+                "YWJj"
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 6, "two uploads and two processing polls");
+            assert_eq!(requests[1].body.as_slice(), b"abc");
+            assert_eq!(
+                requests[4].body.as_slice(),
+                b"abc",
+                "replacement bytes are identical"
+            );
+            assert_eq!(requests[2].path, "/v1beta/files/old");
+            assert_eq!(requests[5].path, "/v1beta/files/new");
+            for index in [0, 2, 3, 5] {
+                assert_eq!(requests[index].headers["x-goog-api-key"], "same-credential");
+            }
+            for index in [1, 4] {
+                assert!(!requests[index].headers.contains_key("x-goog-api-key"));
+                assert!(!requests[index].headers.contains_key("authorization"));
+            }
+        }
+    }
+
+    #[test]
+    fn processing_recovery_shares_one_replacement_budget_with_cached_reference_recovery() {
+        for initial in ["cold", "expired_cache", "deleted_cache"] {
+            let server = Server::start(|endpoint| {
+                let mut replies = Vec::new();
+                if initial == "cold" {
+                    replies.push(Reply::start(endpoint));
+                    replies.push(Reply::json(&json!({
+                        "file": file_metadata(endpoint, "old", "PROCESSING", 3)
+                    })));
+                }
+                if initial != "expired_cache" {
+                    replies.push(Reply::status(404));
+                }
+                replies.extend([
+                    Reply::start(endpoint),
+                    Reply::json(&json!({
+                        "file": file_metadata(endpoint, "replacement", "PROCESSING", 3)
+                    })),
+                    Reply::status(404),
+                ]);
+                replies
+            });
+            let cache = cache();
+            let client = Client::new();
+            let auth = auth("a");
+            let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+            let original = media_body(b"abc");
+            let mut body = original.clone();
+            let error = run_async(async {
+                let owner = AgentCx::for_current_or_request();
+                if initial != "cold" {
+                    let mut old = RemoteFile::parse(
+                        &file_metadata(&server.endpoint, "old", "ACTIVE", 3),
+                        &server.endpoint,
+                        "audio/wav",
+                        3,
+                    )
+                    .unwrap();
+                    if initial == "expired_cache" {
+                        old.expires_at = Utc::now() - chrono::Duration::seconds(1);
+                    }
+                    let slot = cache.slot(key).unwrap();
+                    *slot.lock(owner.cx()).await.unwrap() = Some(old);
+                }
+                let error = stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .expect_err("a second unavailable reference must stop staging");
+                let slot = cache.slot(key).unwrap();
+                assert!(slot.lock(owner.cx()).await.unwrap().is_none());
+                error
+            });
+            assert!(
+                error.to_string().contains("after one replacement"),
+                "{initial}: {error}"
+            );
+            assert_eq!(
+                body, original,
+                "failure cannot publish an unusable file URI"
+            );
+            let requests = server.finish();
+            let expected = match initial {
+                "cold" => 6,
+                "expired_cache" => 3,
+                _ => 4,
+            };
+            assert_eq!(requests.len(), expected, "{initial}");
+            assert_eq!(requests.last().unwrap().path, "/v1beta/files/replacement");
+            assert_eq!(requests[requests.len() - 2].body.as_slice(), b"abc");
+        }
+    }
+
+    #[test]
+    fn processing_failure_and_authorization_refusal_never_trigger_reupload() {
+        for failed_state in [false, true] {
+            let server = Server::start(|endpoint| {
+                vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "one", "PROCESSING", 3)})),
+                    if failed_state {
+                        Reply::json(&file_metadata(endpoint, "one", "FAILED", 3))
+                    } else {
+                        Reply::status(403)
+                    },
+                ]
+            });
+            let original = media_body(b"abc");
+            let mut body = original.clone();
+            let error = run_async(stage(
+                &cache(),
+                &Client::new(),
+                &server.endpoint,
+                &auth("a"),
+                &mut body,
+            ))
+            .expect_err("a failed or forbidden file must not be reuploaded");
+            let expected = if failed_state {
+                "processing failed"
+            } else {
+                "HTTP 403"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(body, original);
+            assert_eq!(server.finish().len(), 3);
+        }
     }
 
     #[test]
