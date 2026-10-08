@@ -359,6 +359,7 @@ struct AuthFileRef<'a> {
 pub struct AuthStorage {
     path: PathBuf,
     entries: HashMap<String, AuthCredential>,
+    command_working_directory: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1454,10 +1455,15 @@ impl AuthStorage {
             return Ok(Self {
                 path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             });
         };
         let entries = parse_auth_entries(&path, &read);
-        Ok(Self { path, entries })
+        Ok(Self {
+            path,
+            entries,
+            command_working_directory: None,
+        })
     }
 
     /// Load auth.json asynchronously (creates empty if missing).
@@ -1475,7 +1481,23 @@ impl AuthStorage {
         Self {
             path,
             entries: HashMap::new(),
+            command_working_directory: None,
         }
+    }
+
+    /// Pin stored credential commands to this runtime's workspace.
+    ///
+    /// This context is retained by clones and is never written to auth.json.
+    /// Unscoped stores preserve the standalone command-resolution behavior.
+    /// Relative inputs are anchored now, so later lookups cannot reinterpret
+    /// them from another process working directory.
+    pub fn set_command_working_directory(&mut self, cwd: &Path) -> Result<()> {
+        self.command_working_directory = Some(if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(cwd)
+        });
+        Ok(())
     }
 
     /// Persist auth.json (atomic write + permissions).
@@ -1617,7 +1639,9 @@ impl AuthStorage {
     /// For `ServiceKey` this returns `None` because a token exchange is required first.
     pub fn api_key(&self, provider: &str) -> Option<String> {
         self.credential_for_provider(provider)
-            .and_then(api_key_from_credential)
+            .and_then(|credential| {
+                api_key_from_credential(credential, self.command_working_directory.as_deref())
+            })
     }
 
     /// Get only credentials that are safe to pass through the generic bearer/API-key lane.
@@ -1635,7 +1659,7 @@ impl AuthStorage {
         {
             return None;
         }
-        api_key_from_credential(credential)
+        api_key_from_credential(credential, self.command_working_directory.as_deref())
     }
 
     /// Return the names of all providers that have stored credentials.
@@ -1762,11 +1786,17 @@ impl AuthStorage {
                         .unwrap_or(provider)
                         .eq("anthropic") =>
                 {
-                    api_key_from_credential(credential)
-                        .map(|token| mark_anthropic_oauth_bearer_token(&token))
+                    api_key_from_credential(
+                        credential,
+                        self.command_working_directory.as_deref(),
+                    )
+                    .map(|token| mark_anthropic_oauth_bearer_token(&token))
                 }
                 AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. } => {
-                    api_key_from_credential(credential)
+                    api_key_from_credential(
+                        credential,
+                        self.command_working_directory.as_deref(),
+                    )
                 }
                 _ => None,
             }
@@ -2130,8 +2160,17 @@ impl AuthStorage {
 ///
 /// Returns `None` when the reference points at an unset/empty value.
 /// Returns `Err` for malformed references or command failures.
-pub(crate) fn resolve_secret_reference(raw: &str) -> std::result::Result<Option<String>, String> {
-    resolve_api_key_source(raw)
+/// Command references run in the server's selected workspace without changing
+/// the process cwd, matching the workspace recorded by MCP trust decisions.
+pub(crate) fn resolve_secret_reference(
+    raw: &str,
+    cwd: &Path,
+) -> std::result::Result<Option<String>, String> {
+    resolve_api_key_source_with_resolvers(
+        raw,
+        |var| std::env::var(var).ok(),
+        |command| run_bounded_secret_command(command, SECRET_CMD_DEADLINE, Some(cwd)),
+    )
 }
 
 /// Resolve an API key string that may contain a `$ENV:VAR_NAME` or
@@ -2151,6 +2190,16 @@ fn resolve_api_key_source(raw: &str) -> std::result::Result<Option<String>, Stri
         raw,
         |var| std::env::var(var).ok(),
         run_api_key_source_command,
+    )
+}
+
+fn resolve_api_key_source_in_cwd(
+    raw: &str,
+    cwd: Option<&Path>,
+) -> std::result::Result<Option<String>, String> {
+    cwd.map_or_else(
+        || resolve_api_key_source(raw),
+        |cwd| resolve_secret_reference(raw, cwd),
     )
 }
 
@@ -2316,15 +2365,19 @@ impl CappedCapture {
 }
 
 fn run_api_key_source_command(command: &str) -> std::result::Result<Option<String>, String> {
-    run_bounded_secret_command(command, SECRET_CMD_DEADLINE)
+    run_bounded_secret_command(command, SECRET_CMD_DEADLINE, None)
 }
 
 fn run_bounded_secret_command(
     command: &str,
     deadline: Duration,
+    cwd: Option<&Path>,
 ) -> std::result::Result<Option<String>, String> {
     let started = Instant::now();
     let mut cmd = build_api_key_command_shell(command);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     crate::tools::isolate_command_process_group(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2447,9 +2500,12 @@ fn build_api_key_command_shell(command: &str) -> std::process::Command {
     }
 }
 
-fn api_key_from_credential(credential: &AuthCredential) -> Option<String> {
+fn api_key_from_credential(
+    credential: &AuthCredential,
+    command_cwd: Option<&Path>,
+) -> Option<String> {
     match credential {
-        AuthCredential::ApiKey { key } => match resolve_api_key_source(key) {
+        AuthCredential::ApiKey { key } => match resolve_api_key_source_in_cwd(key, command_cwd) {
             Ok(resolved) => resolved,
             Err(err) => {
                 tracing::warn!(
@@ -2997,7 +3053,7 @@ fn resolve_stored_aws_credentials(
         Some(AuthCredential::ApiKey { key }) => {
             // Legacy: treat stored API key as bearer token for Bedrock.
             // Supports $ENV: and $CMD: prefixes for dynamically resolved keys.
-            match resolve_api_key_source(key) {
+            match resolve_api_key_source_in_cwd(key, auth.command_working_directory.as_deref()) {
                 Ok(Some(resolved)) => Some(AwsResolvedCredentials::Bearer {
                     token: resolved,
                     region,
@@ -3778,6 +3834,7 @@ pub(crate) async fn resolve_ambient_aws_credentials_async(
     let empty_auth = AuthStorage {
         path: PathBuf::new(),
         entries: HashMap::new(),
+        command_working_directory: None,
     };
     resolve_aws_credentials_async(&empty_auth, client).await
 }
@@ -4004,7 +4061,7 @@ fn stored_sap_candidate(auth: &AuthStorage, direct: bool) -> Option<String> {
             credential @ (AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. }),
         )
         | (false, credential @ AuthCredential::ApiKey { .. }) => {
-            api_key_from_credential(credential)
+            api_key_from_credential(credential, auth.command_working_directory.as_deref())
         }
         _ => None,
     }
@@ -4131,6 +4188,7 @@ where
     let empty_auth = AuthStorage {
         path: PathBuf::new(),
         entries: HashMap::new(),
+        command_working_directory: None,
     };
     let Some(material) = resolve_sap_auth_material_with_env(&empty_auth, None, env)? else {
         return Ok(None);
@@ -7046,6 +7104,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries
                 .insert("custom-stale".to_string(), oauth(bad_url));
@@ -7218,6 +7277,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path.clone(),
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.set(
                 "openai",
@@ -7394,6 +7454,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -7425,6 +7486,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         let now = chrono::Utc::now().timestamp_millis();
         auth.set(
@@ -7458,6 +7520,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         let now = chrono::Utc::now().timestamp_millis();
         auth.set(
@@ -7487,6 +7550,7 @@ mod tests {
         let auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         let resolved =
@@ -7729,6 +7793,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             // Insert an expired anthropic OAuth credential.
             let initial_access = next_token();
@@ -7776,6 +7841,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             // Insert a NOT expired credential.
             let initial_access_token = next_token();
@@ -7823,6 +7889,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             // Expired credential for a provider not in extension_configs.
             let initial_access_token = next_token();
@@ -7869,6 +7936,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path.clone(),
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "acme".to_string(),
@@ -8061,6 +8129,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path.clone(),
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.set(
                 "ext-provider",
@@ -8106,6 +8175,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "ext-provider",
@@ -8134,6 +8204,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "ext-provider",
@@ -8159,6 +8230,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "valid-oauth",
@@ -8218,6 +8290,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "google",
@@ -8257,6 +8330,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "gemini",
@@ -8276,6 +8350,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "Google",
@@ -8295,6 +8370,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "gemini",
@@ -8313,6 +8389,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "google",
@@ -8339,6 +8416,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "ext-provider",
@@ -8515,6 +8593,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -8536,6 +8615,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -8560,6 +8640,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "groq",
@@ -8580,6 +8661,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openrouter",
@@ -8602,6 +8684,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -8627,6 +8710,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -8646,6 +8730,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -8676,6 +8761,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai-codex",
@@ -8702,6 +8788,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "google",
@@ -8726,6 +8813,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "google",
@@ -8745,6 +8833,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "gemini",
@@ -8764,6 +8853,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "alibaba",
@@ -8788,6 +8878,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "moonshotai",
@@ -8812,6 +8903,7 @@ mod tests {
         let auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         let resolved = auth.resolve_api_key_with_env_lookup("alibaba", None, |var| match var {
@@ -8832,6 +8924,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         auth.set(
@@ -8851,6 +8944,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         auth.set(
@@ -8878,6 +8972,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         auth.set(
@@ -8924,6 +9019,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -8952,6 +9048,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -9109,6 +9206,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -9149,6 +9247,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -9171,6 +9270,7 @@ mod tests {
         let mut original = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         original.set(
             "anthropic",
@@ -9235,6 +9335,7 @@ mod tests {
         let mut oversized_auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         oversized_auth.set(
             "anthropic",
@@ -9280,6 +9381,7 @@ mod tests {
         let auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         assert!(auth.api_key("nonexistent").is_none());
     }
@@ -9291,6 +9393,7 @@ mod tests {
         let auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         assert!(auth.get("nonexistent").is_none());
     }
@@ -9608,6 +9711,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         auth.set(
@@ -9638,6 +9742,7 @@ mod tests {
             let mut auth = AuthStorage {
                 path: auth_path.clone(),
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.set(
                 "anthropic",
@@ -9675,6 +9780,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "anthropic",
@@ -10721,6 +10827,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "my-gateway",
@@ -10739,6 +10846,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "amazon-bedrock",
@@ -10762,6 +10870,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "sap-ai-core",
@@ -10934,6 +11043,7 @@ mod tests {
         AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         }
     }
 
@@ -11100,6 +11210,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "amazon-bedrock",
@@ -11163,6 +11274,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "amazon-bedrock",
@@ -11193,6 +11305,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "BedRock",
@@ -11223,6 +11336,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "amazon-bedrock",
@@ -11250,6 +11364,7 @@ mod tests {
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "amazon-bedrock",
@@ -12059,6 +12174,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "sap-ai-core",
@@ -12091,6 +12207,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: dir.path().join("auth.json"),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "SaP",
@@ -12521,6 +12638,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "KIMI-CODE".to_string(),
@@ -12571,6 +12689,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "copilot".to_string(),
@@ -12612,6 +12731,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "copilot".to_string(),
@@ -12655,6 +12775,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "copilot".to_string(),
@@ -12729,6 +12850,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "ext-custom".to_string(),
@@ -12768,6 +12890,7 @@ sso_region = us-east-1
             let mut auth = AuthStorage {
                 path: auth_path,
                 entries: HashMap::new(),
+                command_working_directory: None,
             };
             auth.entries.insert(
                 "copilot".to_string(),
@@ -12808,6 +12931,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         let now = chrono::Utc::now().timestamp_millis();
@@ -12883,6 +13007,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
 
         let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
@@ -13164,7 +13289,7 @@ sso_region = us-east-1
         let cred = AuthCredential::ApiKey {
             key: "sk-ant-plain-key".to_string(),
         };
-        let result = api_key_from_credential(&cred);
+        let result = api_key_from_credential(&cred, None);
         assert_eq!(result, Some("sk-ant-plain-key".to_string()));
     }
 
@@ -13211,6 +13336,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: auth_path.clone(),
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -13236,6 +13362,7 @@ sso_region = us-east-1
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
+            command_working_directory: None,
         };
         auth.set(
             "openai",
@@ -13256,6 +13383,104 @@ sso_region = us-east-1
         let resolved_with_override =
             auth.resolve_api_key_with_env_lookup("openai", Some("override-key"), |_| None);
         assert_eq!(resolved_with_override.as_deref(), Some("override-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_auth_commands_use_the_selected_workspace_and_survive_cloning() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let empty = root.path().join("empty");
+        for directory in [&first, &second, &empty] {
+            std::fs::create_dir(directory).expect("workspace directory");
+        }
+        std::fs::write(first.join("credential.txt"), "first-workspace-key\n")
+            .expect("first credential");
+        std::fs::write(second.join("credential.txt"), "second-workspace-key\n")
+            .expect("second credential");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let mut auth = AuthStorage::empty_at(root.path().join("auth.json"));
+        for provider in ["scoped-test-provider", "amazon-bedrock", "sap-ai-core"] {
+            auth.set(
+                provider,
+                AuthCredential::ApiKey {
+                    key: "$CMD:cat credential.txt".to_string(),
+                },
+            );
+        }
+        auth.set_command_working_directory(&first)
+            .expect("scope first workspace");
+        assert_eq!(
+            auth.api_key("scoped-test-provider").as_deref(),
+            Some("first-workspace-key")
+        );
+        let first_clone = auth.clone();
+        auth.set_command_working_directory(&second)
+            .expect("scope second workspace");
+        assert_eq!(
+            auth.resolve_api_key_with_env_lookup("scoped-test-provider", None, |_| None)
+                .as_deref(),
+            Some("second-workspace-key")
+        );
+        assert_eq!(
+            first_clone
+                .resolve_api_key_with_env_lookup("scoped-test-provider", None, |_| None)
+                .as_deref(),
+            Some("first-workspace-key")
+        );
+        assert!(matches!(
+            resolve_stored_aws_credentials(&first_clone, "us-east-1".to_string()),
+            Some(AwsResolvedCredentials::Bearer { token, .. }) if token == "first-workspace-key"
+        ));
+        assert_eq!(
+            stored_sap_candidate(&auth, false).as_deref(),
+            Some("second-workspace-key")
+        );
+        auth.set_command_working_directory(&empty)
+            .expect("scope workspace with no credential file");
+        assert!(
+            auth.api_key("scoped-test-provider").is_none(),
+            "relative command must not read another workspace's credential file"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("process cwd after commands"),
+            process_cwd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_command_workspace_is_not_persisted_and_missing_cwd_fails_closed() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let path = root.path().join("auth.json");
+        let mut auth = AuthStorage::empty_at(path.clone());
+        auth.set(
+            "scoped-test-provider",
+            AuthCredential::ApiKey {
+                key: "$CMD:printf available-key".to_string(),
+            },
+        );
+        auth.save().expect("save original credentials");
+        let original = std::fs::read(&path).expect("original persisted bytes");
+        auth.set_command_working_directory(&root.path().join("missing-workspace"))
+            .expect("record missing workspace");
+        assert!(
+            auth.api_key("scoped-test-provider").is_none(),
+            "missing selected cwd must not fall back to the process cwd"
+        );
+        auth.save().expect("save scoped credentials");
+        assert_eq!(
+            std::fs::read(&path).expect("scoped persisted bytes"),
+            original,
+            "runtime workspace context must not change auth.json"
+        );
+        let loaded = AuthStorage::load(path).expect("load standalone store");
+        assert_eq!(
+            loaded.api_key("scoped-test-provider").as_deref(),
+            Some("available-key"),
+            "a freshly loaded standalone store keeps ambient command defaults"
+        );
     }
 
     // ===== bd-wuswt: bounded, isolated $CMD: secret helpers =====
@@ -13284,6 +13509,7 @@ sso_region = us-east-1
         let resolved = run_bounded_secret_command(
             &format!("{} extra-arg", script.display()),
             Duration::from_secs(10),
+            None,
         )
         .expect("successful resolution");
         assert_eq!(resolved.as_deref(), Some("tok=abc123"));
@@ -13302,9 +13528,12 @@ sso_region = us-east-1
             "#!/bin/sh\ni=0\nwhile [ $i -lt 13000 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >&2; i=$((i+1)); done\n",
         );
         let started = Instant::now();
-        let error =
-            run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(20))
-                .expect_err("flood must fail closed");
+        let error = run_bounded_secret_command(
+            &script.display().to_string(),
+            Duration::from_secs(20),
+            None,
+        )
+        .expect_err("flood must fail closed");
         assert!(
             error.contains("OUTPUT_OVERFLOW"),
             "expected overflow diagnostic, got {error}"
@@ -13333,9 +13562,12 @@ sso_region = us-east-1
             ),
         );
         let started = Instant::now();
-        let error =
-            run_bounded_secret_command(&script.display().to_string(), Duration::from_secs(2))
-                .expect_err("must hit the bounded deadline");
+        let error = run_bounded_secret_command(
+            &script.display().to_string(),
+            Duration::from_secs(2),
+            None,
+        )
+        .expect_err("must hit the bounded deadline");
         assert!(error.contains("TIMEOUT"), "{error}");
         let elapsed = started.elapsed();
         assert!(
@@ -13366,6 +13598,7 @@ sso_region = us-east-1
         let builder_only = run_bounded_secret_command(
             &probe_script.display().to_string(),
             Duration::from_secs(10),
+            None,
         )
         .expect("allowlist run resolves")
         .expect("non-empty");

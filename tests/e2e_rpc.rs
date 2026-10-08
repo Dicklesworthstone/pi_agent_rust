@@ -291,6 +291,7 @@ fn build_options(
     let auth = AuthStorage::load(auth_path).expect("load auth storage");
     RpcOptions {
         config: Config::default(),
+        working_directory: None,
         resources: ResourceLoader::empty(false),
         available_models,
         scoped_models,

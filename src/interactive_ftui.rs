@@ -8608,7 +8608,85 @@ async fn create_driver_session(
     }
 }
 
-/// Working directory for `!` bash commands in the driver.
+/// Resolve the standalone frontend's workspace before the UI and driver copy
+/// launch options. The CLI already supplies both cwd and the shared root set;
+/// the SDK remains responsible for validating its actual session open.
+async fn prepare_driver_session_options(
+    mut options: crate::sdk::SessionOptions,
+) -> crate::error::Result<crate::sdk::SessionOptions> {
+    let process_cwd = std::env::current_dir()?;
+    let resolve = |path: &std::path::Path, base: &std::path::Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        }
+    };
+    let requested_cwd = options.working_directory.as_deref().map_or_else(
+        || process_cwd.clone(),
+        |path| resolve(path, &process_cwd),
+    );
+    // Locators belong to the caller's requested directory, even if their
+    // saved transcript is attached to another workspace.
+    options.session_path = options
+        .session_path
+        .as_deref()
+        .map(|path| resolve(path, &requested_cwd));
+    options.session_dir = options
+        .session_dir
+        .as_deref()
+        .map(|path| resolve(path, &requested_cwd));
+    if options.working_directory.is_some() && options.workspace.is_some() {
+        options.working_directory = Some(requested_cwd);
+        return Ok(options);
+    }
+
+    let mut cwd = requested_cwd.clone();
+    let mut additional_roots = Vec::new();
+    if !options.no_session
+        && let Some(path) = options.session_path.as_deref()
+        && crate::session::session_path_entry_exists(path)?
+    {
+        let saved = crate::session_workdir::inspect_saved_session_workdir(path).await?;
+        cwd = saved.resolve_runtime_cwd(
+            options
+                .working_directory
+                .as_ref()
+                .map(|_| requested_cwd.as_path()),
+        )?;
+        if let Some(workspace) = &options.workspace {
+            saved.check_runtime_cwd(workspace.snapshot_or(&cwd).primary())?;
+        }
+        let source = saved.source_path.to_str().ok_or_else(|| {
+            crate::error::Error::session(
+                "PI_SESSION_WORKDIR_INVALID_ENCODING: session path must be UTF-8",
+            )
+        })?;
+        let session = crate::session::Session::open(source).await?;
+        saved.check_loaded_session(&session)?;
+        saved.check_runtime_cwd(&cwd)?;
+        additional_roots = session.additional_roots();
+        options.session_path = Some(saved.source_path);
+    }
+    if options.workspace.is_none() {
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        for root in additional_roots {
+            if !root.is_absolute() {
+                tracing::warn!(path = %root.display(), "Skipping non-absolute saved workspace root");
+                continue;
+            }
+            match crate::workspace::validate_new_root(&root) {
+                Ok(canonical) => workspace.add_root(&canonical),
+                Err(error) => tracing::warn!(%error, "Skipping unavailable saved workspace root"),
+            }
+        }
+        options.workspace = Some(workspace);
+    }
+    options.working_directory = Some(cwd);
+    Ok(options)
+}
+
+/// Working directory for `!` bash commands in the prepared driver options.
 fn driver_bash_cwd(session_options: &crate::sdk::SessionOptions) -> std::path::PathBuf {
     session_options
         .working_directory
@@ -8726,9 +8804,26 @@ pub fn run(
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
     settings: FtuiSettings,
-    autocomplete: AutocompleteLaunch,
+    mut autocomplete: AutocompleteLaunch,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+    // This synchronous boundary precedes terminal ownership and driver
+    // creation. Native metadata I/O uses its own workers; no provider,
+    // extension or MCP startup is run on this thread.
+    let supplied_workspace =
+        session_options.working_directory.is_some() && session_options.workspace.is_some();
+    let session_options =
+        futures::executor::block_on(prepare_driver_session_options(session_options))
+            .map_err(std::io::Error::other)?;
+    let bash_cwd = driver_bash_cwd(&session_options);
+    let workspace = session_options.workspace.clone();
+    autocomplete.cwd.clone_from(&bash_cwd);
+    if !supplied_workspace
+        && let Some(source) = &mut autocomplete.resource_source
+    {
+        source.package_manager = crate::package_manager::PackageManager::new(bash_cwd.clone())
+            .with_project_trust(session_options.workspace_trusted);
+    }
     let FtuiSettings {
         markdown_spacing,
         gh_path,
@@ -8779,13 +8874,12 @@ pub fn run(
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
-    let bash_cwd = driver_bash_cwd(&session_options);
     let resume_cwd = bash_cwd.display().to_string();
     let bash_shell = resource_source
         .as_ref()
         .map(|source| BashUiShell::from_config(&source.config))
         .unwrap_or_default();
-    let resume_template = resume_template_from(&session_options);
+    let mut resume_template = resume_template_from(&session_options);
     // Issue #205: shared slot so Ctrl-C on the UI thread can abort the
     // driver's in-flight prompt turn instead of waiting it out.
     let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
@@ -8828,6 +8922,9 @@ pub fn run(
                     &driver_command_registry,
                 ))
                 .await?;
+                // Replacements must retain the exact live root set, including
+                // saved roots the SDK restored and later /remove-dir changes.
+                resume_template.workspace = handle.workspace();
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 // Publish extension ownership before the initial ready/reset
@@ -9429,7 +9526,7 @@ pub fn run(
         );
     }
 
-    let model = PiFtuiModel::new(agent_rx)
+    let mut model = PiFtuiModel::new(agent_rx)
         .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
         .with_extension_command_registry(command_registry)
@@ -9450,6 +9547,9 @@ pub fn run(
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
+    if let Some(workspace) = workspace {
+        model.autocomplete.provider.set_workspace(workspace);
+    }
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -9696,6 +9796,229 @@ mod tests {
             !options.no_session,
             "a replacement session is always persisted, whatever the launch flags said"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn standalone_launch_binds_shell_tools_and_replacements_to_the_saved_workspace() {
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let root = tempfile::tempdir_in(&process_cwd).expect("relative locator fixture");
+        let cwd = root.path().join("attached-workspace");
+        let additional = root.path().join("additional-workspace");
+        std::fs::create_dir(&cwd).expect("attached workspace");
+        std::fs::create_dir(&additional).expect("additional workspace");
+        std::fs::write(cwd.join("probe.txt"), "attached workspace content")
+            .expect("workspace probe");
+        let path = root.path().join("conversation.jsonl");
+        let sessions_dir = root.path().join("future-sessions");
+        let mut source = crate::session::Session::in_memory();
+        source.header.cwd = root.path().join("moved-away").display().to_string();
+        source.path = Some(path.clone());
+        source.session_dir = Some(root.path().to_path_buf());
+        source.set_additional_roots(std::slice::from_ref(&additional));
+        crate::session_workdir::attach_session_workdir(&mut source, &cwd)
+            .expect("attach saved workspace");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            source.save().await.expect("save source");
+            let original_bytes = std::fs::read(&path).expect("source bytes");
+            let options = crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("ftui-workspace-fixture-key")),
+                session_path: Some(path.strip_prefix(&process_cwd).unwrap().to_path_buf()),
+                session_dir: Some(
+                    sessions_dir.strip_prefix(&process_cwd).unwrap().to_path_buf(),
+                ),
+                enabled_tools: Some(vec![String::from("read"), String::from("write")]),
+                ..crate::sdk::SessionOptions::default()
+            };
+            let prepared = prepare_driver_session_options(options)
+                .await
+                .expect("prepare standalone launch");
+            let bound = cwd.canonicalize().expect("canonical workspace");
+            assert_eq!(driver_bash_cwd(&prepared), bound);
+            assert_eq!(prepared.session_path.as_deref(), Some(path.as_path()));
+            assert_eq!(prepared.session_dir.as_deref(), Some(sessions_dir.as_path()));
+            assert_eq!(
+                std::fs::read(&path).expect("source unchanged"),
+                original_bytes
+            );
+            let mut template = resume_template_from(&prepared);
+            let mut handle = crate::sdk::create_agent_session(prepared)
+                .await
+                .expect("start prepared session");
+            template.workspace = handle.workspace();
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let output = run_bash_ui_command(
+                &bound,
+                &BashUiShell::default(),
+                "cat probe.txt && printf shell-completed > shell-result.txt",
+                true,
+                &agent_tx,
+            )
+            .await
+            .expect("shell command output");
+            assert!(output.contains("attached workspace content"), "{output}");
+            assert_eq!(
+                std::fs::read_to_string(cwd.join("shell-result.txt")).expect("shell result"),
+                "shell-completed"
+            );
+            assert!(
+                agent_rx
+                    .try_iter()
+                    .any(|message| matches!(message, PiMsg::BashResult { .. }))
+            );
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let read = tools
+                .get("read")
+                .expect("read tool")
+                .execute(
+                    "ftui-workspace-read",
+                    serde_json::json!({"path": "probe.txt"}),
+                    None,
+                )
+                .await
+                .expect("read through SDK workspace");
+            assert!(!read.is_error);
+            assert!(
+                serde_json::to_string(&read)
+                    .unwrap()
+                    .contains("attached workspace content")
+            );
+            let extra_file = additional.join("continued.txt");
+            let write = tools
+                .get("write")
+                .expect("write tool")
+                .execute(
+                    "ftui-additional-write",
+                    serde_json::json!({"path": extra_file, "content": "saved extra root"}),
+                    None,
+                )
+                .await
+                .expect("write in restored additional root");
+            assert!(!write.is_error);
+            handle
+                .remove_workspace_root(&additional)
+                .await
+                .expect("revoke root");
+            assert!(
+                template
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+            assert!(
+                tools
+                    .get("write")
+                    .unwrap()
+                    .execute(
+                        "ftui-revoked-write",
+                        serde_json::json!({"path": extra_file, "content": "must not be written"}),
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(extra_file).unwrap(),
+                "saved extra root"
+            );
+            assert_eq!(template.working_directory.as_deref(), Some(bound.as_path()));
+            assert_eq!(template.session_dir.as_deref(), Some(sessions_dir.as_path()));
+            let next = crate::sdk::create_agent_session(template)
+                .await
+                .expect("create replacement in the same workspace");
+            assert_eq!(
+                next.with_session(|session| session.header.cwd.clone())
+                    .await
+                    .unwrap(),
+                bound.display().to_string()
+            );
+            assert!(next.shutdown_owned_resources().await.completed_cleanly());
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            assert_eq!(
+                std::env::current_dir().expect("unchanged process cwd"),
+                process_cwd
+            );
+        }));
+    }
+
+    #[test]
+    fn standalone_launch_rejects_mismatched_or_missing_saved_workspaces() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let cwd = root.path().join("saved-workspace");
+        let other = root.path().join("other-workspace");
+        std::fs::create_dir(&cwd).expect("saved workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let path = root.path().join("conversation.jsonl");
+        let mut source = crate::session::Session::in_memory();
+        source.header.cwd = cwd.display().to_string();
+        source.path = Some(path.clone());
+        futures::executor::block_on(async {
+            source.save().await.expect("save source");
+            let original_bytes = std::fs::read(&path).expect("source bytes");
+            for explicit_handle in [false, true] {
+                let mut options = crate::sdk::SessionOptions {
+                    session_path: Some(path.clone()),
+                    ..crate::sdk::SessionOptions::default()
+                };
+                if explicit_handle {
+                    options.workspace = Some(crate::workspace::WorkspaceHandle::single(&other));
+                } else {
+                    options.working_directory = Some(other.clone());
+                }
+                let error = prepare_driver_session_options(options)
+                    .await
+                    .err()
+                    .expect("mismatch");
+                assert!(
+                    error.to_string().contains("PI_SESSION_WORKDIR_MISMATCH"),
+                    "{error}"
+                );
+            }
+            std::fs::rename(&cwd, root.path().join("moved-workspace")).expect("move workspace");
+            let error = prepare_driver_session_options(crate::sdk::SessionOptions {
+                session_path: Some(path.clone()),
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .err()
+            .expect("missing workspace");
+            assert!(
+                error.to_string().contains("PI_SESSION_WORKDIR_UNAVAILABLE"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).expect("unchanged source"), original_bytes);
+        });
+    }
+
+    #[test]
+    fn standalone_no_session_ignores_an_invalid_saved_locator() {
+        let root = tempfile::tempdir().expect("workspace");
+        let path = root.path().join("invalid.jsonl");
+        std::fs::write(&path, "not a saved session").expect("invalid session fixture");
+        let options = futures::executor::block_on(prepare_driver_session_options(
+            crate::sdk::SessionOptions {
+                no_session: true,
+                working_directory: Some(root.path().to_path_buf()),
+                session_path: Some(std::path::PathBuf::from("invalid.jsonl")),
+                session_dir: Some(std::path::PathBuf::from("new-sessions")),
+                ..crate::sdk::SessionOptions::default()
+            },
+        ))
+        .expect("in-memory launch must ignore saved locator contents");
+        assert!(options.no_session);
+        assert_eq!(options.session_path.as_deref(), Some(path.as_path()));
+        assert_eq!(options.session_dir, Some(root.path().join("new-sessions")));
+        assert_eq!(driver_bash_cwd(&options), root.path());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a saved session");
     }
 
     #[test]

@@ -729,16 +729,16 @@ fn main_impl() -> Result<()> {
     };
 
     validate_fetch_models_is_standalone(&cli, &extension_flags, &raw_args)?;
+    if cli.session_workdir.is_some() && cli.command.is_some() {
+        bail!("--session-workdir requires resuming an existing --session");
+    }
 
     if cli.version {
         print_version();
         return Ok(());
     }
 
-    // Validate theme file paths.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
 
     // Crash capture (bd-cv653.7.12): bundles land under the agent dir;
     let crash_agent_dir = pi::config::Config::global_dir();
@@ -1437,6 +1437,121 @@ fn advisor_options(
     }
 }
 
+fn cli_uses_runtime_session(cli: &cli::Cli) -> bool {
+    cli.command.is_none()
+        && cli.fetch_models.is_none()
+        && cli.export.is_none()
+        && cli.list_models.is_none()
+        && !cli.acp
+}
+
+fn cli_session_path_exists(path: &Path) -> io::Result<bool> {
+    // A dangling symlink is an existing, invalid source, not a new session.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn invocation_path(path: &Path, invocation_cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        invocation_cwd.join(path)
+    }
+}
+
+fn cli_path_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Session selection requires a UTF-8 path: {path:?}"))
+}
+
+/// Select the original store before project trust, configuration or tools.
+/// Session locators are anchored to the invocation directory; runtime paths
+/// are resolved later, against the saved workspace. No process cwd is changed.
+#[allow(clippy::too_many_lines)]
+async fn resolve_cli_session_workdir(
+    cli: &mut cli::Cli,
+    invocation_cwd: &Path,
+) -> Result<Option<pi::session_workdir::SavedSessionWorkdir>> {
+    if !cli_uses_runtime_session(cli) {
+        if cli.session_workdir.is_some() {
+            bail!("--session-workdir requires resuming an existing --session");
+        }
+        return Ok(None);
+    }
+    if cli.no_session {
+        return Ok(None);
+    }
+    if let Some(path) = &cli.session_dir {
+        cli.session_dir = Some(cli_path_string(&invocation_path(
+            Path::new(path),
+            invocation_cwd,
+        ))?);
+    }
+    let selected = if let Some(path) = &cli.session {
+        Some(invocation_path(Path::new(path), invocation_cwd))
+    } else if cli.resume {
+        // The destination's project settings cannot be read until the picker
+        // has selected it. Only global picker preferences are safe here.
+        let picker_config = Config::load_global_only()?;
+        let input = picker_config
+            .session_picker_input
+            .filter(|value| *value > 0)
+            .map(|value| value.to_string());
+        Box::pin(Session::resume_with_picker(
+            cli.session_dir.as_deref().map(Path::new),
+            &picker_config,
+            input,
+        ))
+        .await?
+        .path
+    } else if cli.r#continue {
+        Session::recent_session_path_in_dir(cli.session_dir.as_deref().map(Path::new)).await?
+    } else {
+        None
+    };
+    // Do not scan or open a second picker after project startup. In particular,
+    // FTUI must receive exactly the same selected store as classic/RPC.
+    cli.resume = false;
+    cli.r#continue = false;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let path = invocation_path(&path, invocation_cwd);
+    cli.session = Some(cli_path_string(&path)?);
+    if !cli_session_path_exists(&path)? {
+        if cli.session_workdir.is_some() {
+            bail!("--session-workdir requires an existing --session file: {path:?}");
+        }
+        return Ok(None);
+    }
+
+    let mut saved = pi::session_workdir::inspect_saved_session_workdir(&path).await?;
+    let session_path = cli_path_string(&saved.source_path)?;
+    cli.session = Some(session_path.clone());
+    if let Some(target) = &cli.session_workdir {
+        let target = invocation_path(target, invocation_cwd);
+        let (mut session, diagnostics) =
+            Session::open_with_diagnostics(&session_path).await?;
+        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
+            bail!(
+                "PI_SESSION_RECOVERY_DIAGNOSTICS: inspect this session with --session-audit before workdir recovery"
+            );
+        }
+        saved.check_loaded_session(&session)?;
+        if pi::session_workdir::attach_session_workdir(&mut session, &target)? {
+            // Explicit consent only becomes effective after its provenance is
+            // durable. A save failure must not launch tools in the new project.
+            session.save().await?;
+        }
+        saved = pi::session_workdir::inspect_saved_session_workdir(&saved.source_path).await?;
+    }
+    Ok(Some(saved))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -1444,7 +1559,23 @@ async fn run(
     runtime_handle: RuntimeHandle,
     package_subcommand_trust: Option<bool>,
 ) -> Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let invocation_cwd = std::env::current_dir()?;
+    let requested_session = pi::app::requested_a_session(&cli);
+    if cli_uses_runtime_session(&cli)
+        && !requested_session
+        && (cli.print || matches!(cli.mode.as_deref(), Some("text" | "json")))
+    {
+        cli.no_session = true;
+    }
+    let saved_workdir = resolve_cli_session_workdir(&mut cli, &invocation_cwd).await?;
+    let cwd = match &saved_workdir {
+        Some(saved) => saved.resolve_runtime_cwd(None)?,
+        None => invocation_cwd,
+    };
+    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+    for path in &mut cli.mcp_config {
+        *path = invocation_path(path, &cwd);
+    }
 
     // Multi-root workspace (bd-cv653.3.12): shared handle threaded through
     // @-file processing, the tool registry, and the interactive host so
@@ -1452,15 +1583,15 @@ async fn run(
     // Arc<RwLock> is shared across clones).
     let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
 
-    // #210: install the effective proxy configuration before any HTTP client
-    // is constructed, so provider calls, OAuth, update checks, URL reads, and
-    // package fetches all take the same route. Settings-file failures are not
-    // fatal here (the ambient environment still applies) — the config load
-    // below reports them on its own path.
-    for warning in
-        pi::http::proxy::configure(Config::load().ok().and_then(|config| config.http).as_ref())
-    {
-        tracing::warn!("{warning}");
+    // Subcommands can use HTTP before the runtime configuration below. Normal
+    // session startup installs the selected workspace's trusted proxy settings
+    // after discovery instead of reading the invocation project's settings.
+    if cli.command.is_some() || cli.fetch_models.is_some() {
+        for warning in
+            pi::http::proxy::configure(Config::load().ok().and_then(|config| config.http).as_ref())
+        {
+            tracing::warn!("{warning}");
+        }
     }
 
     // Resolve the HTTP request timeout before any provider HTTP client is
@@ -1509,6 +1640,7 @@ async fn run(
         }
     }
 
+    let config_path = Config::config_path_override_from_env(&cwd);
     // Workspace trust (GH #151): before any project settings merge or
     // resource resolution, decide whether this workspace's project-local
     // configuration (.pi/settings.json packages, .pi/extensions/) may load
@@ -1529,10 +1661,15 @@ async fn run(
             && io::stdout().is_terminal();
         // trustAllWorkspaces is honored from the GLOBAL settings only: a
         // project file granting itself trust would defeat the gate.
-        let trust_all = Config::load_global_only()
-            .ok()
-            .and_then(|global| global.trust_all_workspaces)
-            .unwrap_or(false);
+        let trust_all = Config::load_with_roots_and_project_trust(
+            config_path.as_deref(),
+            &Config::global_dir(),
+            &cwd,
+            false,
+        )
+        .ok()
+        .and_then(|global| global.trust_all_workspaces)
+        .unwrap_or(false);
         let inputs = pi::workspace_trust::TrustInputs {
             cli_trust: cli.trust,
             trust_all_workspaces: trust_all,
@@ -1560,7 +1697,15 @@ async fn run(
         state.trusted
     };
 
-    let mut config = Config::load_with_project_trust(workspace_trusted)?;
+    let mut config = Config::load_with_roots_and_project_trust(
+        config_path.as_deref(),
+        &Config::global_dir(),
+        &cwd,
+        workspace_trusted,
+    )?;
+    for warning in pi::http::proxy::configure(config.http.as_ref()) {
+        tracing::warn!("{warning}");
+    }
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
@@ -1579,6 +1724,52 @@ async fn run(
     {
         pi::http::client::set_request_timeout_override(secs);
     }
+
+    // Open and verify the store before resource loading, auth refresh, tool
+    // construction or extension prewarm can act on the selected workspace.
+    let startup_session = if cli_uses_runtime_session(&cli) {
+        let mut session = Box::pin(Session::new(&cli, &config)).await?;
+        if let Some(saved) = &saved_workdir {
+            saved.check_loaded_session(&session)?;
+            saved.check_runtime_cwd(&cwd)?;
+        } else if !cli.no_session {
+            if let Some(path) = cli.session.as_deref()
+                && cli_session_path_exists(Path::new(path))?
+            {
+                bail!(
+                    "PI_SESSION_WORKDIR_SOURCE_CHANGED: session file appeared during startup; retry discovery before resuming"
+                );
+            }
+            session.header.cwd = cli_path_string(&cwd)?;
+        }
+        // All roots must be available to tools and to initial @file scope
+        // checks, including roots restored from the saved session header.
+        for dir in &cli.add_dir {
+            let path = invocation_path(dir, &cwd);
+            let canonical = pi::workspace::validate_new_root(&path)
+                .map_err(|error| anyhow::anyhow!("--add-dir: {error}"))?;
+            workspace.add_root(&canonical);
+        }
+        for root in session.additional_roots() {
+            if !root.is_absolute() {
+                eprintln!("Warning: skipping non-absolute saved workspace root: {root:?}");
+                continue;
+            }
+            if let Err(error) = pi::workspace::validate_new_root(&root) {
+                eprintln!("Warning: skipping restored workspace root: {error}");
+            } else {
+                workspace.add_root(&root);
+            }
+        }
+        let snapshot = workspace.snapshot_or(&cwd);
+        let additional = snapshot.additional();
+        if !additional.is_empty() || !cli.add_dir.is_empty() {
+            session.set_additional_roots(additional);
+        }
+        Some(session)
+    } else {
+        None
+    };
 
     let startup_mode = cli.mode.clone().unwrap_or_else(|| {
         if !cli.print && cli.export.is_none() {
@@ -1848,6 +2039,7 @@ async fn run(
         }
         Err(err) => return Err(err.into()),
     };
+    auth.set_command_working_directory(&cwd)?;
 
     // gh #218: refresh stored OAuth credentials without letting an unrelated
     // provider's stale login abort the run. An explicit `--api-key` for an
@@ -1884,7 +2076,7 @@ async fn run(
     }
 
     let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
+    let package_dir = invocation_path(&Config::package_dir(), &cwd);
     let models_path = default_models_path(&global_dir);
     let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
     if let Some(error) = model_registry.error() {
@@ -1929,16 +2121,6 @@ async fn run(
 
     pi::app::validate_rpc_args(&cli)?;
 
-    // Explicit --add-dir roots must be live BEFORE @file arguments are
-    // scope-checked below, or `pi --add-dir /extra "@/extra/notes.md"`
-    // fails with "Cannot read outside the working directory". Restored
-    // session roots are layered later (they need the session open).
-    for dir in &cli.add_dir {
-        let canonical =
-            pi::workspace::validate_new_root(dir).map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
-        workspace.add_root(&canonical);
-    }
-
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
     let initial = pi::app::prepare_initial_message(
@@ -1962,13 +2144,9 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    // `pi::app::normalize_cli` has already applied this for `--print`; this
-    // covers `--mode text|json` without `-p`, and keeps the policy stated at
-    // the point of use. The two conditions must stay identical, which is why
-    // both call the same predicate (bd-print-session-path-persists-nothing).
-    if is_print_mode && !pi::app::requested_a_session(&cli) {
-        cli.no_session = true;
-    }
+    // Persistence was decided before resolving --continue/--resume into an
+    // exact path, including the no-candidate case that creates a new session.
+    debug_assert!(!is_print_mode || requested_session || cli.no_session);
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
@@ -2022,27 +2200,8 @@ async fn run(
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let mut session = Box::pin(Session::new(&cli, &config)).await?;
-
-    // Multi-root roots (bd-cv653.3.12): restore persisted additional_roots on
-    // resume (explicit --add-dir flags were layered above, before @file
-    // scope checks) and persist the resulting canonical set for future
-    // resumes. A vanished restored root degrades to a warning rather than
-    // blocking resume; `add_root` dedups against the explicit flags.
-    {
-        for root in session.additional_roots() {
-            if let Err(err) = pi::workspace::validate_new_root(&root) {
-                eprintln!("Warning: skipping restored workspace root: {err}");
-            } else {
-                workspace.add_root(&root);
-            }
-        }
-        let snapshot = workspace.snapshot_or(&cwd);
-        let additional = snapshot.additional();
-        if !additional.is_empty() || !cli.add_dir.is_empty() {
-            session.set_additional_roots(additional);
-        }
-    }
+    let mut session = startup_session
+        .ok_or_else(|| anyhow::anyhow!("Runtime session was not initialized"))?;
 
     let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
         &mut cli,
@@ -2124,25 +2283,6 @@ async fn run(
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
-        // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
-        // Session::from_cli, which this path does not use; SessionOptions
-        // has no "reopen the latest" concept, so the flag was silently
-        // dropped and the user got a fresh session instead of their last
-        // one. Resolve it to a concrete path here, through the same lookup
-        // the classic stack uses, and hand it over as `session_path`.
-        //
-        // `--session` still wins, and `--no-session` short-circuits below,
-        // which is Session::from_cli's own precedence. `None` means this
-        // directory has nothing continuable, and a new session is exactly
-        // what the classic stack produces there too.
-        let continue_session_path = if cli.r#continue && cli.session.is_none() {
-            pi::session::Session::recent_session_path_in_dir(
-                cli.session_dir.as_ref().map(Path::new),
-            )
-            .await?
-        } else {
-            None
-        };
         let options = pi::sdk::SessionOptions {
             provider: cli.provider.clone(),
             model: cli.model.clone(),
@@ -2156,11 +2296,8 @@ async fn run(
             // creates its own session file; the bootstrap session was
             // dropped above without writing anything.
             no_session: cli.no_session,
-            session_path: cli
-                .session
-                .as_ref()
-                .map(PathBuf::from)
-                .or(continue_session_path),
+            // Startup already resolved --session, --continue and --resume.
+            session_path: cli.session.as_ref().map(PathBuf::from),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
             workspace: Some(workspace.clone()),
             // Extensions load with UI prompts bridged (bd-1eoh4): the
@@ -2513,10 +2650,12 @@ async fn run(
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
     let btw_secrets_settings = config.secrets.clone();
+    let btw_cwd = cwd.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
-        let Ok(auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
+        let Ok(mut auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
             return None;
         };
+        auth.set_command_working_directory(&btw_cwd).ok()?;
         pi::btw::BtwClient::for_model_entry(
             entry,
             btw_api_key.as_deref(),
@@ -2853,6 +2992,7 @@ async fn run(
         // enclosing future small.
         Box::pin(run_rpc_mode(
             agent_session,
+            cwd.clone(),
             resources,
             config.clone(),
             available_models,
@@ -8895,6 +9035,7 @@ fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> 
 #[allow(clippy::too_many_arguments)]
 async fn run_rpc_mode(
     session: AgentSession,
+    cwd: PathBuf,
     resources: ResourceLoader,
     config: Config,
     available_models: Vec<ModelEntry>,
@@ -8919,6 +9060,7 @@ async fn run_rpc_mode(
     let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
+            working_directory: Some(cwd),
             config,
             resources,
             available_models,
@@ -10221,8 +10363,193 @@ fn default_export_path(input: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use clap::Parser as _;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn run_cli_workdir_test<T>(future: impl std::future::Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(future))
+    }
+
+    async fn saved_cli_workdir_fixture(path: &Path, cwd: &Path) -> Session {
+        let mut session = Session::in_memory();
+        session.header.cwd = cwd.to_str().expect("UTF-8 workspace").to_owned();
+        session.header.parent_session = Some("original-parent.jsonl".to_owned());
+        session.session_dir = path.parent().map(Path::to_path_buf);
+        session.path = Some(path.to_path_buf());
+        session.append_model_message(pi::model::Message::User(pi::model::UserMessage {
+            content: pi::model::UserContent::Text("Keep this conversation".to_owned()),
+            timestamp: 1,
+        }));
+        session.save().await.expect("save source session");
+        session
+    }
+
+    #[test]
+    fn cli_saved_workspace_precedes_project_configuration_and_native_open() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let caller = root.path().join("caller");
+            let project = root.path().join("saved-project");
+            let global = root.path().join("global");
+            fs::create_dir_all(caller.join(".pi")).expect("caller workspace");
+            fs::create_dir_all(project.join(".pi")).expect("saved workspace");
+            fs::create_dir(&global).expect("global configuration root");
+            fs::write(caller.join(".pi/settings.json"), r#"{"requestTimeoutSecs":99}"#)
+                .expect("caller config");
+            fs::write(project.join(".pi/settings.json"), r#"{"requestTimeoutSecs":23}"#)
+                .expect("saved config");
+            let path = caller.join("saved.jsonl");
+            let original = saved_cli_workdir_fixture(&path, &project).await;
+            let before = fs::read(&path).expect("original bytes");
+            let process_cwd = std::env::current_dir().expect("process cwd");
+            let mut cli = cli::Cli::parse_from([
+                "pi", "--session", "saved.jsonl", "--continue", "--resume",
+            ]);
+            let saved = resolve_cli_session_workdir(&mut cli, &caller)
+                .await
+                .expect("resolve saved workspace")
+                .expect("existing session");
+            let cwd = saved.resolve_runtime_cwd(None).expect("runtime cwd");
+            assert_eq!(cwd, project.canonicalize().expect("canonical workspace"));
+            let canonical_path = path.canonicalize().expect("canonical source");
+            assert_eq!(cli.session.as_deref(), canonical_path.to_str());
+            assert!(!cli.resume && !cli.r#continue, "selection must happen once");
+            let config = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
+                .expect("selected project config");
+            assert_eq!(config.request_timeout_secs, Some(23));
+            let loaded = Session::new(&cli, &config).await.expect("native session open");
+            saved.check_loaded_session(&loaded).expect("same original source");
+            assert_eq!(loaded.header.id, original.header.id);
+            assert_eq!(loaded.header.cwd, original.header.cwd);
+            assert_eq!(loaded.header.parent_session, original.header.parent_session);
+            assert_eq!(fs::read(&path).expect("source after discovery"), before);
+            assert_eq!(std::env::current_dir().expect("unchanged process cwd"), process_cwd);
+        });
+    }
+
+    #[test]
+    fn cli_moved_workspace_requires_attachment_and_persists_provenance_before_resume() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let missing = root.path().join("moved-away");
+            let replacement = root.path().join("replacement");
+            fs::create_dir(&replacement).expect("replacement workspace");
+            let path = root.path().join("saved.jsonl");
+            let original = saved_cli_workdir_fixture(&path, &missing).await;
+            let before = fs::read(&path).expect("original bytes");
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "saved.jsonl"]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("metadata remains readable")
+                .expect("existing session");
+            assert!(
+                saved.resolve_runtime_cwd(None).unwrap_err().to_string()
+                    .contains("PI_SESSION_WORKDIR_UNAVAILABLE")
+            );
+            assert_eq!(fs::read(&path).expect("unchanged source"), before);
+
+            let mut cli = cli::Cli::parse_from([
+                "pi", "--session", "saved.jsonl", "--session-workdir", "replacement",
+            ]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("explicit attachment")
+                .expect("attached metadata");
+            let cwd = replacement.canonicalize().expect("canonical replacement");
+            assert_eq!(saved.resolve_runtime_cwd(None).expect("attached runtime"), cwd);
+            let reopened = Session::open(cli.session.as_deref().expect("selected source"))
+                .await
+                .expect("attachment was persisted before launch");
+            saved.check_loaded_session(&reopened).expect("fresh observation after save");
+            assert_eq!(reopened.header.id, original.header.id);
+            assert_eq!(reopened.header.cwd, original.header.cwd);
+            assert_eq!(reopened.header.parent_session, original.header.parent_session);
+            assert_eq!(
+                serde_json::to_value(reopened.entries.first()).expect("reopened entry"),
+                serde_json::to_value(original.entries.first()).expect("original entry")
+            );
+            let attachment = reopened.entries.iter().find_map(|entry| match entry {
+                pi::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == pi::session_workdir::WORKDIR_BINDING_TYPE =>
+                {
+                    custom.data.as_ref()
+                }
+                _ => None,
+            }).expect("persisted attachment");
+            assert_eq!(attachment["originalCwd"], original.header.cwd);
+            assert_eq!(attachment["previousCwd"], original.header.cwd);
+            assert_eq!(attachment["cwd"], cwd.to_str().expect("UTF-8 replacement"));
+
+            let attached_bytes = fs::read(&path).expect("attached bytes");
+            resolve_cli_session_workdir(&mut cli, root.path()).await.expect("idempotent attach");
+            assert_eq!(fs::read(&path).expect("after repeated attach"), attached_bytes);
+        });
+    }
+
+    #[test]
+    fn cli_attachment_rejects_missing_targets_and_new_session_paths() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let path = root.path().join("saved.jsonl");
+            saved_cli_workdir_fixture(&path, root.path()).await;
+            let before = fs::read(&path).expect("original bytes");
+            let mut cli = cli::Cli::parse_from([
+                "pi", "--session", "saved.jsonl", "--session-workdir", "missing",
+            ]);
+            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.is_err());
+            assert_eq!(fs::read(&path).expect("source after rejected target"), before);
+            let mut cli = cli::Cli::parse_from([
+                "pi", "--session", "new.jsonl", "--session-workdir", ".",
+            ]);
+            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.is_err());
+            assert!(!root.path().join("new.jsonl").exists());
+
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "new.jsonl"]);
+            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.unwrap().is_none());
+            assert_eq!(cli.session.as_deref(), root.path().join("new.jsonl").to_str());
+            assert!(!root.path().join("new.jsonl").exists());
+        });
+    }
+
+    #[test]
+    fn cli_read_only_and_ephemeral_modes_do_not_require_a_saved_workspace() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            for args in [
+                vec!["pi", "--export", "missing.jsonl"],
+                vec!["pi", "--acp", "--session", "missing.jsonl"],
+                vec!["pi", "--list-models", "--session", "missing.jsonl"],
+                vec!["pi", "--no-session", "--session", "missing.jsonl"],
+            ] {
+                let mut cli = cli::Cli::parse_from(args);
+                assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.unwrap().is_none());
+            }
+            assert!(!root.path().join("missing.jsonl").exists());
+        });
+    }
+
+    #[test]
+    fn cli_discovery_rejects_a_session_changed_before_native_open() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let path = root.path().join("saved.jsonl");
+            let mut original = saved_cli_workdir_fixture(&path, root.path()).await;
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "saved.jsonl"]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await.unwrap().expect("saved observation");
+            original.append_custom_entry("concurrent-update".to_owned(), Some(json!({"v": 1})));
+            original.save().await.expect("another writer updated the source");
+            let loaded = Session::open(cli.session.as_deref().expect("selected source"))
+                .await.expect("native open sees latest source");
+            assert!(saved.check_loaded_session(&loaded).unwrap_err().to_string()
+                .contains("PI_SESSION_WORKDIR_SOURCE_CHANGED"));
+        });
+    }
 
     // Print mode's retry classification moved into `pi::failover` (bd-u2qv4),
     // where RPC and the interactive stacks can reach it. These three aliases

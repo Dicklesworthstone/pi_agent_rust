@@ -57,6 +57,9 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct RpcOptions {
     pub config: Config,
+    /// Primary workspace already selected for this runtime's configuration and
+    /// tools. Defaults to the process cwd for existing programmatic callers.
+    pub working_directory: Option<PathBuf>,
     pub resources: ResourceLoader,
     pub available_models: Vec<ModelEntry>,
     pub scoped_models: Vec<RpcScopedModel>,
@@ -1686,11 +1689,17 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
 )]
 pub async fn run(
     session: AgentSession,
-    options: RpcOptions,
+    mut options: RpcOptions,
     mut in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
+    let requested_cwd = options
+        .working_directory
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)?;
+    let runtime_cwd = crate::workspace::validate_new_root(&requested_cwd)?;
+    options.auth.set_command_working_directory(&runtime_cwd)?;
     let session_handle = Arc::clone(&session.session);
     let provider_admission = session.provider_admission_gate();
     let session = Arc::new(Mutex::new(session));
@@ -3241,9 +3250,9 @@ pub async fn run(
                 let id_clone = id.clone();
                 let runtime_handle = options.runtime_handle.clone();
                 let bash_cx = cx.clone();
+                let cwd = runtime_cwd.clone();
 
                 runtime_handle.spawn(async move {
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let result = run_bash_rpc(&cwd, &command, abort_rx).await;
 
                     let response = match result {
@@ -4120,6 +4129,7 @@ pub async fn run(
                     } else {
                         crate::session::Session::in_memory()
                     };
+                    new_session.header.cwd = runtime_cwd.display().to_string();
                     new_session.header.parent_session = parent;
                     // Keep model fields in header for clients.
                     new_session.header.provider.clone_from(&provider);
@@ -4261,8 +4271,11 @@ pub async fn run(
                     }
                 }
 
-                let loaded =
-                    crate::session::Session::open(resolved_path.to_string_lossy().as_ref()).await;
+                let loaded = crate::session_workdir::open_session_for_runtime(
+                    &resolved_path,
+                    &runtime_cwd,
+                )
+                .await;
                 match loaded {
                     Ok(mut new_session) => {
                         let session_transition = match acquire_rpc_session_transition(
@@ -8177,6 +8190,7 @@ mod retry_tests {
 
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),
@@ -8385,6 +8399,7 @@ mod retry_tests {
             let auth_temp = tempfile::tempdir().expect("auth tempdir");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![fallback],
                 scoped_models: Vec::new(),
@@ -8524,6 +8539,7 @@ mod retry_tests {
             let auth_temp = tempfile::tempdir().expect("auth tempdir");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![fallback, keyless],
                 scoped_models: Vec::new(),
@@ -8692,6 +8708,7 @@ mod retry_tests {
             let auth_temp = tempfile::tempdir().expect("auth tempdir");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![entry("first-fallback"), entry("second-fallback")],
                 scoped_models: Vec::new(),
@@ -8829,6 +8846,7 @@ mod retry_tests {
                 .join("auth.json");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![fallback],
                 scoped_models: Vec::new(),
@@ -9804,6 +9822,7 @@ mod retry_tests {
             let auth_temp = tempfile::tempdir().expect("auth tempdir");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![primary, fallback, second_fallback],
                 scoped_models: Vec::new(),
@@ -10194,6 +10213,7 @@ mod retry_tests {
                 let auth_temp = tempfile::tempdir().expect("auth tempdir");
                 let options = RpcOptions {
                     config,
+                    working_directory: None,
                     resources: ResourceLoader::empty(false),
                     available_models: vec![primary.clone(), fallback.clone()],
                     scoped_models: Vec::new(),
@@ -10251,6 +10271,7 @@ mod retry_tests {
                 let auth_temp = tempfile::tempdir().expect("auth tempdir 2");
                 let options = RpcOptions {
                     config: config.clone(),
+                    working_directory: None,
                     resources: ResourceLoader::empty(false),
                     available_models: vec![primary.clone(), fallback.clone()],
                     scoped_models: Vec::new(),
@@ -10512,6 +10533,7 @@ mod retry_tests {
                 let auth_temp = tempfile::tempdir().expect("auth tempdir");
                 let options = RpcOptions {
                     config,
+                    working_directory: None,
                     resources: ResourceLoader::empty(false),
                     available_models: vec![primary.clone(), fallback.clone()],
                     scoped_models: Vec::new(),
@@ -10560,6 +10582,7 @@ mod retry_tests {
                 let auth_temp = tempfile::tempdir().expect("auth tempdir 2");
                 let options = RpcOptions {
                     config: config.clone(),
+                    working_directory: None,
                     resources: ResourceLoader::empty(false),
                     available_models: vec![primary.clone(), fallback.clone()],
                     scoped_models: Vec::new(),
@@ -10839,6 +10862,7 @@ mod retry_tests {
             );
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),
@@ -10967,6 +10991,7 @@ mod retry_tests {
             let auth_temp = tempfile::tempdir().expect("auth tempdir");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![fallback],
                 scoped_models: Vec::new(),
@@ -11098,6 +11123,7 @@ mod retry_tests {
             let prompt_task_handle = runtime_handle.clone();
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),
@@ -11293,6 +11319,7 @@ mod retry_tests {
 
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),
@@ -11412,6 +11439,7 @@ mod retry_tests {
                 let auth = AuthStorage::load(auth_path).expect("auth load");
                 let options = RpcOptions {
                     config,
+                    working_directory: None,
                     resources: ResourceLoader::empty(false),
                     available_models: Vec::new(),
                     scoped_models: Vec::new(),
@@ -11650,6 +11678,7 @@ mod retry_tests {
 
             let options = RpcOptions {
                 config: Config::default(),
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![model],
                 scoped_models: Vec::new(),
@@ -14891,6 +14920,7 @@ mod tests {
 
         RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models,
             scoped_models: Vec::new(),
@@ -15196,6 +15226,7 @@ mod tests {
         let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
         let options = RpcOptions {
             config,
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: vec![model],
             scoped_models: Vec::new(),
@@ -16052,6 +16083,7 @@ mod tests {
         let auth = AuthStorage::load(auth_path).expect("load auth storage");
         RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),
@@ -16060,6 +16092,145 @@ mod tests {
             runtime_handle: handle.clone(),
             ask_tool: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_bash_and_new_sessions_use_the_selected_runtime_workspace() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        std::fs::write(workspace.join("cwd-probe.txt"), "bound RPC workspace")
+            .expect("write workspace probe");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        assert_ne!(workspace, process_cwd);
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let mut stored = Session::in_memory();
+            stored.header.cwd = workspace.display().to_string();
+            let agent_session = build_test_agent_session(stored);
+            let session_store = Arc::clone(&agent_session.session);
+            let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+            options.working_directory = Some(workspace.clone());
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = handle.spawn(async move {
+                Box::pin(run(agent_session, options, in_rx, out_tx)).await
+            });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"bash","type":"bash","command":"cat cwd-probe.txt && printf completed > cwd-result.txt"}"#,
+                "bash in selected workspace",
+            )
+            .await;
+            assert_ok(&response, "bash");
+            assert_eq!(response["data"]["exitCode"], 0);
+            assert_eq!(response["data"]["output"], "bound RPC workspace");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("cwd-result.txt")).expect("bash output"),
+                "completed"
+            );
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"new","type":"new_session"}"#,
+                "new session in selected workspace",
+            )
+            .await;
+            assert_ok(&response, "new_session");
+            {
+                let cx = asupersync::Cx::for_testing();
+                let stored = session_store.lock(&cx).await.expect("session lock");
+                assert_eq!(stored.header.cwd, workspace.display().to_string());
+            }
+            assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
+            drop(in_tx);
+            assert!(server.await.is_ok());
+        }));
+    }
+
+    #[test]
+    fn rpc_switch_requires_the_target_attachment_to_match_the_live_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let workspace = temp.path().join("live-workspace");
+            let other = temp.path().join("other-workspace");
+            std::fs::create_dir(&workspace).expect("live workspace");
+            std::fs::create_dir(&other).expect("other workspace");
+            let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+            target.header.cwd = other.display().to_string();
+            target.header.provider = Some("anthropic".to_string());
+            target.header.model_id = Some("test-model".to_string());
+            target.header.thinking_level = Some("off".to_string());
+            target.save().await.expect("save target");
+            let target_path = target.path.clone().expect("target path");
+            let original_bytes = std::fs::read(&target_path).expect("target bytes");
+            let mut source = Session::in_memory();
+            source.header.cwd = workspace.display().to_string();
+            let source_id = source.header.id.clone();
+            let agent_session = build_test_agent_session(source);
+            let session_store = Arc::clone(&agent_session.session);
+            let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+            options.working_directory = Some(workspace.clone());
+            let mut model = dummy_entry("test-model", false);
+            model.api_key = Some("workdir-test-key".to_string());
+            options.available_models.push(model);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = handle.spawn(async move {
+                Box::pin(run(agent_session, options, in_rx, out_tx)).await
+            });
+            let request = json!({
+                "id": "switch",
+                "type": "switch_session",
+                "sessionPath": target_path,
+            })
+            .to_string();
+            let rejected = send_recv(&in_tx, &out_rx, &request, "reject another workspace").await;
+            assert_err(&rejected, "switch_session");
+            assert!(
+                rejected["error"]
+                    .as_str()
+                    .expect("workspace error")
+                    .contains("PI_SESSION_WORKDIR_MISMATCH"),
+                "{rejected}"
+            );
+            {
+                let cx = asupersync::Cx::for_testing();
+                let stored = session_store.lock(&cx).await.expect("session lock");
+                assert_eq!(stored.header.id, source_id);
+                assert!(stored.entries.is_empty());
+            }
+            assert_eq!(std::fs::read(&target_path).expect("unchanged target"), original_bytes);
+
+            crate::session_workdir::attach_session_workdir(&mut target, &workspace)
+                .expect("explicitly attach target");
+            target.save().await.expect("persist attachment");
+            let resumed = send_recv(&in_tx, &out_rx, &request, "resume attached target").await;
+            assert_ok(&resumed, "switch_session");
+            {
+                let cx = asupersync::Cx::for_testing();
+                let stored = session_store.lock(&cx).await.expect("session lock");
+                assert_eq!(stored.header.id, target.header.id);
+                assert_eq!(stored.header.cwd, other.display().to_string());
+                crate::session_workdir::check_session_workdir(&stored, &workspace)
+                    .expect("runtime remains bound to its workspace");
+            }
+            drop(in_tx);
+            assert!(server.await.is_ok());
+        }));
     }
 
     async fn load_test_prompt_template_resources(
@@ -21227,6 +21398,7 @@ export default function init(pi) {
             let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
             let options = RpcOptions {
                 config,
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: vec![model],
                 scoped_models: Vec::new(),

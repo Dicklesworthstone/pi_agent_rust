@@ -591,6 +591,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         let scenario = async {
             let options = RpcOptions {
                 config: Config::default(),
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),
@@ -718,6 +719,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
         let scenario = async {
             let options = RpcOptions {
                 config: Config::default(),
+                working_directory: None,
                 resources: ResourceLoader::empty(false),
                 available_models: Vec::new(),
                 scoped_models: Vec::new(),

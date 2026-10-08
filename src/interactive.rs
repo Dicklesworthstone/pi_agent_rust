@@ -1541,6 +1541,7 @@ impl PiApp {
         }
 
         let path = path.to_string();
+        let runtime_cwd = self.cwd.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
         let admission = self.session_action_admission.clone();
@@ -1587,7 +1588,12 @@ impl PiApp {
                 }
             }
 
-            let mut loaded_session = match Session::open(&path).await {
+            let mut loaded_session = match crate::session_workdir::open_session_for_runtime(
+                std::path::Path::new(&path),
+                &runtime_cwd,
+            )
+            .await
+            {
                 Ok(session) => session,
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(

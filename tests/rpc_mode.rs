@@ -187,6 +187,7 @@ fn rpc_get_state_and_prompt() {
 
         let options = RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),
@@ -497,6 +498,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
 
         let options = RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),

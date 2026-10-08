@@ -4492,7 +4492,7 @@ impl Session {
     /// Partial V2 hydration intentionally loads only a subset of entries for fast
     /// resume. Before any save path that could trigger a full JSONL rewrite, we
     /// must rehydrate all V2 entries to preserve non-active branches.
-    fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
+    pub(crate) fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
         if !self.v2_partial_hydration {
             return Ok(());
         }

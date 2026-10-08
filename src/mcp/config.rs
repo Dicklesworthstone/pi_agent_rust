@@ -208,7 +208,7 @@ impl ConfiguredServer {
             source.as_os_str().as_encoded_bytes(),
         );
         // HTTP headers can contain `$CMD:` references too, and their helper
-        // processes inherit the Pi process working directory. Bind cwd for all
+        // processes run in the server's selected working directory. Bind cwd for all
         // transports so global/CLI trust cannot authorize a different local
         // helper merely because Pi was launched from another project.
         let cwd = canonical_cwd(effective_cwd);

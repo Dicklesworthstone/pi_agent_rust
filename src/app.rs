@@ -192,10 +192,13 @@ pub fn build_system_prompt(
 ) -> Result<String> {
     use std::fmt::Write as _;
 
-    let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt")?;
+    let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt", cwd)?;
     let has_custom_prompt = custom_prompt.is_some();
-    let append_prompt =
-        resolve_prompt_input(cli.append_system_prompt.as_deref(), "append system prompt")?;
+    let append_prompt = resolve_prompt_input(
+        cli.append_system_prompt.as_deref(),
+        "append system prompt",
+        cwd,
+    )?;
     // `--no-context-files` (gh #216): the host owns the whole prompt, so no
     // AGENTS.md / CLAUDE.md from the global dir, the cwd, or any ancestor.
     let context_files = if test_mode || cli.no_context_files {
@@ -279,14 +282,28 @@ pub fn build_system_prompt(
     Ok(prompt)
 }
 
-fn resolve_prompt_input(input: Option<&str>, description: &str) -> Result<Option<String>> {
+fn resolve_prompt_input(
+    input: Option<&str>,
+    description: &str,
+    cwd: &Path,
+) -> Result<Option<String>> {
     let Some(value) = input else {
         return Ok(None);
     };
 
+    // An empty prompt is literal text. Joining it to the runtime cwd would
+    // turn it into an existing directory and incorrectly try to read it.
+    if value.is_empty() {
+        return Ok(Some(String::new()));
+    }
     let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
     if path.exists() {
-        let content = std::fs::read_to_string(path)
+        let content = std::fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("Could not read {description} file {value}: {err}"))?;
         Ok(Some(content))
     } else {
@@ -3583,6 +3600,72 @@ mod tests {
             assert!(models_equal(&left, &right));
         }
     }
+    #[test]
+    fn explicit_prompt_files_follow_runtime_workspace() {
+        let root = tempdir().expect("fixture root");
+        let cli = cli::Cli::parse_from([
+            "pi",
+            "--system-prompt",
+            "prompts/system.md",
+            "--append-system-prompt",
+            "prompts/append.md",
+        ]);
+        for name in ["first", "second"] {
+            let cwd = root.path().join(name);
+            std::fs::create_dir_all(cwd.join("prompts")).expect("prompt directory");
+            let system = format!("System instructions for {name}.");
+            let append = format!("Additional instructions for {name}.");
+            std::fs::write(cwd.join("prompts/system.md"), &system).expect("system file");
+            std::fs::write(cwd.join("prompts/append.md"), &append).expect("append file");
+
+            let prompt = build_system_prompt(
+                &cli,
+                &cwd,
+                &[],
+                None,
+                root.path(),
+                root.path(),
+                true,
+                false,
+                None,
+                &Config::default(),
+            )
+            .expect("build prompt against selected workspace");
+            assert!(prompt.starts_with(&system), "{prompt}");
+            assert!(prompt.contains(&append), "{prompt}");
+            assert!(!prompt.contains("prompts/system.md"), "{prompt}");
+            assert!(!prompt.contains("prompts/append.md"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn explicit_prompt_file_resolution_preserves_absolute_paths_and_literal_text() {
+        let cwd = tempdir().expect("runtime workspace");
+        let external = tempdir().expect("external prompt directory");
+        let file = external.path().join("instructions.md");
+        std::fs::write(&file, "Absolute prompt content.").expect("external prompt file");
+        assert_eq!(
+            resolve_prompt_input(file.to_str(), "system prompt", cwd.path())
+                .expect("absolute prompt")
+                .as_deref(),
+            Some("Absolute prompt content.")
+        );
+
+        for value in ["", "Literal prompt text.", "missing-prompt.md"] {
+            assert_eq!(
+                resolve_prompt_input(Some(value), "system prompt", cwd.path())
+                    .expect("literal prompt")
+                    .as_deref(),
+                Some(value)
+            );
+        }
+        assert!(
+            resolve_prompt_input(None, "system prompt", cwd.path())
+                .expect("absent prompt")
+                .is_none()
+        );
+    }
+
     /// gh #183 + bd-jtehj: the default prompt must list each documentation
     /// surface and topic file only when it actually exists.
     #[test]

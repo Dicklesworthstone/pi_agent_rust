@@ -64,21 +64,46 @@ impl SavedSessionWorkdir {
         Ok(())
     }
 
+    /// Resolve the saved workspace before loading project configuration or
+    /// constructing tools. An explicit runtime directory is a consistency
+    /// assertion, not permission to replace the session's attachment.
+    /// Neither this method nor discovery changes the process cwd.
+    pub fn resolve_runtime_cwd(&self, requested: Option<&Path>) -> Result<PathBuf> {
+        let expected = super::WorkdirHealth::inspect(&self.workdir.bound_cwd)
+            .into_directory(&self.workdir.bound_cwd)?;
+        if let Some(requested) = requested {
+            let actual = super::WorkdirHealth::inspect(requested).into_directory(requested)?;
+            if expected != actual {
+                return Err(Error::session(format!(
+                    "PI_SESSION_WORKDIR_MISMATCH: session is attached to {expected:?}, \
+                     but this runtime uses {actual:?}. Resume from the attached directory, \
+                     explicitly attach to this directory, or start a new session."
+                )));
+            }
+        }
+        Ok(expected)
+    }
+
     /// Require the selected runtime's primary directory, without changing cwd
     /// or treating an additional workspace root as a replacement attachment.
     pub fn check_runtime_cwd(&self, runtime_cwd: &Path) -> Result<()> {
-        let expected = super::WorkdirHealth::inspect(&self.workdir.bound_cwd)
-            .into_directory(&self.workdir.bound_cwd)?;
-        let actual = super::WorkdirHealth::inspect(runtime_cwd).into_directory(runtime_cwd)?;
-        if expected != actual {
-            return Err(Error::session(format!(
-                "PI_SESSION_WORKDIR_MISMATCH: session is attached to {expected:?}, \
-                 but this runtime uses {actual:?}. Resume from the attached directory, \
-                 explicitly attach to this directory, or start a new session."
-            )));
-        }
-        Ok(())
+        self.resolve_runtime_cwd(Some(runtime_cwd)).map(|_| ())
     }
+}
+
+/// Open a saved session for an existing runtime without changing its workspace.
+/// Discover session-wide metadata before native loading, then verify that the
+/// loaded transcript still belongs to that observation before installation.
+pub async fn open_session_for_runtime(path: &Path, runtime_cwd: &Path) -> Result<Session> {
+    let saved = inspect_saved_session_workdir(path).await?;
+    saved.check_runtime_cwd(runtime_cwd)?;
+    let source_path = saved.source_path.to_str().ok_or_else(|| {
+        Error::session("PI_SESSION_WORKDIR_INVALID_ENCODING: session path must be UTF-8")
+    })?;
+    let session = Session::open(source_path).await?;
+    saved.check_loaded_session(&session)?;
+    saved.check_runtime_cwd(runtime_cwd)?;
+    Ok(session)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -10,7 +10,9 @@
 //! session; `inspect_saved_session_workdir` also supports lazily loaded stores.
 
 mod persisted;
-pub use persisted::{SavedSessionWorkdir, inspect_saved_session_workdir};
+pub use persisted::{
+    SavedSessionWorkdir, inspect_saved_session_workdir, open_session_for_runtime,
+};
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -166,6 +168,8 @@ pub fn check_session_workdir(session: &Session, runtime_cwd: &Path) -> Result<()
 /// before launching a runtime. A rejected target leaves the session untouched;
 /// attaching to an equivalent symlink alias is a no-op. Neither session ID,
 /// original cwd, parent-session provenance nor persistence path is rewritten.
+/// Lazily loaded stores are hydrated before resolving the previous attachment,
+/// which may belong to another branch.
 pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bool> {
     let canonical = WorkdirHealth::inspect(target).into_directory(target)?;
     let cwd = canonical
@@ -174,6 +178,7 @@ pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bo
             Error::session("PI_SESSION_WORKDIR_INVALID_ENCODING: attachment requires a UTF-8 path")
         })?
         .to_owned();
+    session.ensure_full_v2_hydration_before_save()?;
     let previous = binding_path(session)?;
     if let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&previous)
         && canonical_path == canonical

@@ -2286,6 +2286,7 @@ impl PiApp {
                     let reset_thinking = self.new_session_thinking_level();
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
+                    session_guard.header.cwd = self.cwd.display().to_string();
                     session_guard.header.provider = Some(self.model_entry.model.provider.clone());
                     session_guard.header.model_id = Some(self.model_entry.model.id.clone());
                     session_guard.header.thinking_level = Some(reset_thinking.to_string());
@@ -2329,6 +2330,7 @@ impl PiApp {
                 };
 
                 let model_provider = self.model_entry.model.provider.clone();
+                let runtime_cwd = self.cwd.clone();
                 let model_id = self.model_entry.model.id.clone();
                 let model_label = self.model.clone();
                 let reset_thinking = self.new_session_thinking_level();
@@ -2373,6 +2375,7 @@ impl PiApp {
                     }
 
                     let mut new_session = Session::create_with_dir(session_dir);
+                    new_session.header.cwd = runtime_cwd.display().to_string();
                     new_session.header.provider = Some(model_provider);
                     new_session.header.model_id = Some(model_id);
                     new_session.header.thinking_level = Some(reset_thinking.to_string());
@@ -5184,6 +5187,78 @@ mod tests {
                 ..
             }) if text == "old-agent-history"
         ));
+    }
+
+    #[test]
+    fn new_session_keeps_the_live_workspace_with_or_without_extensions() {
+        let temp = TempDir::new().expect("tempdir");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        for with_extensions in [false, true] {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+            let original_id = current_session_id(&app);
+            if with_extensions {
+                app.extensions = Some(crate::extensions::ExtensionManager::default());
+            }
+            let _ = app.handle_slash_command(SlashCommand::New, "");
+            if with_extensions {
+                let terminal = runtime().block_on(async {
+                    let cx = Cx::for_testing();
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(10),
+                        event_rx.recv(&cx),
+                    )
+                    .await
+                    .expect("new-session event before timeout")
+                    .expect("new-session event")
+                });
+                assert!(matches!(terminal, PiMsg::ConversationReset { .. }));
+                let _ = app.handle_pi_message(terminal);
+            }
+            assert_ne!(current_session_id(&app), original_id);
+            assert_eq!(
+                app.session.try_lock().expect("session lock").header.cwd,
+                temp.path().display().to_string()
+            );
+            assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
+        }
+    }
+
+    #[test]
+    fn resume_rejects_another_workspace_without_replacing_the_active_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+        target.header.cwd = other.display().to_string();
+        runtime().block_on(target.save()).expect("save target");
+        let path = target.path.clone().expect("target path");
+        let original_bytes = std::fs::read(&path).expect("original target bytes");
+        let source = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, temp.path());
+        let original_id = current_session_id(&app);
+
+        let _ = app.load_session_from_path(path.to_str().expect("UTF-8 target path"));
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("resume event before timeout")
+            .expect("resume event")
+        });
+        assert!(matches!(
+            &terminal,
+            PiMsg::AgentError(message) if message.contains("PI_SESSION_WORKDIR_MISMATCH")
+        ));
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), original_id);
+        assert_eq!(std::fs::read(&path).expect("unchanged target"), original_bytes);
     }
 
     #[test]

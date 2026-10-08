@@ -1,19 +1,59 @@
 # Explicit session workdir recovery
 
-The `session_workdir` library module and `session_workdir` developer example
-provide an explicit inspect / locate-and-attach / resume / start-new flow for
-sessions whose workspace moved, disappeared, or is no longer accessible.
-This is an implementation slice of **bd-yutps**, not closure of the whole bead.
+The ordinary CLI and SDK resolve a saved session's workspace before loading
+project configuration or constructing tools and extensions. The
+`session_workdir` library module and developer example also provide read-only
+inspection and an explicit locate-and-attach flow for moved projects.
+This implements part of **bd-yutps**; the bead remains open pending executable
+validation and the remaining discovery and child-session integration.
 
-## Current integration boundary
+## Ordinary CLI and SDK use
 
-The frontend is an example executable, not an additional shipping binary.
-The ordinary `pi --session`, startup picker, in-app resume and RPC routes do
-**not yet call the new guard**. Use the recovery frontend to get its guarded
-launch behavior. Recent-session indexing under the new workspace and automatic
+```sh
+# Resume in the saved workspace, even when invoked from another directory.
+pi --session /absolute/session.jsonl
+
+# Explicitly persist a replacement workspace, then resume there.
+pi --session /absolute/session.jsonl --session-workdir /new/project
+
+# Existing selectors resolve once, before project startup.
+pi --continue
+pi --resume
+```
+
+`--session-workdir` requires an existing explicit `--session`. A missing target,
+an invalid session source, or a failed save prevents launch. The flag cannot be
+combined with ephemeral sessions, ACP, export, or model-listing modes. Without
+that flag, an unavailable saved workdir produces a recovery error; it does not
+silently select the invocation directory.
+
+Relative session locators, session storage directories, and attachment targets
+are resolved from the invocation directory. Project resources, prompt files,
+MCP configuration paths, additional roots supplied with `--add-dir`, and model
+tool paths are resolved from the selected workspace. Startup applies trust and
+project settings to that workspace. The process cwd itself remains unchanged.
+
+SDK callers can omit `SessionOptions.working_directory` when resuming an
+existing `session_path`; the saved attachment then selects the workspace.
+Supplying `working_directory` or a primary `workspace` root asserts that it
+matches the saved attachment. It does not grant permission to replace the
+attachment. Saved additional roots are restored when no workspace handle was
+supplied; unavailable roots are reported and skipped. An explicitly supplied
+handle remains authoritative, including live removal of a root.
+
+Classic and RPC live session switches require the target attachment to match
+the current runtime workspace. FTUI replacement sessions carry the same
+explicit workspace assertion. A refused switch preserves the active session;
+launch a new `pi --session ...` process to move to another project. RPC shell
+commands, new-session headers, prompt files, startup credential-command lookups,
+and MCP credential helpers use the selected workspace. Bedrock's provider-owned
+request-time reload of legacy `auth.json` command credentials still needs the
+runtime workspace threaded through it.
+
+Recent-session indexing under a replacement workspace and automatic
 propagation into newly created child sessions still require integration.
 
-## Build and use
+## Developer recovery example
 
 All Cargo work must use the repository's DSR validation/build route:
 
@@ -61,11 +101,13 @@ are not rewritten. Existing JSONL and optional SQLite persistence handle the
 entry; save failure prevents a success response. Equivalent canonical paths
 are idempotent, including symlink aliases.
 
-Bindings are session-wide, using the latest attachment in a fully hydrated
-session. A malformed latest attachment is an error, not permission to revive
-an older binding. Serialization retains the entry. Fork/child creation and
-bounded-hydration callers must deliberately preserve/load the binding before
-using the guard; these routes have not been retrofitted in this slice.
+Bindings are session-wide, using the latest attachment even when it belongs
+to another branch. Saved metadata discovery scans the original store rather
+than relying on a lazily loaded V2 tail. Native loading then validates the
+transcript, and startup checks that the source still matches the observation.
+An attachment request hydrates a lazy store before determining its previous
+binding. A malformed latest attachment is an error, not permission to revive
+an older binding. Fork/child creation must also preserve this metadata.
 
 Read-only export/import should remain possible for a missing workspace and
 must not require the launch guard. Recovery of a source with parsing warnings
@@ -74,9 +116,14 @@ is deliberately rejected by the example; inspect it with the existing
 
 ## Validation status and targets
 
-Regression tests were authored for workdir classification, moved directories,
+Regression tests cover workdir classification, moved directories,
 wrong-directory rejection, provenance preservation, idempotence, malformed
 metadata, symlink aliases, safe launch arguments, and JSONL/SQLite persistence.
+Startup regressions exercise real SDK read/write tools, lazy off-branch
+bindings, restored root access and revocation, native source-change rejection,
+project configuration, explicit CLI attachment, and ephemeral/read-only paths.
+Additional regressions cover RPC shell execution and session switching,
+classic resume and new sessions, prompt files, and credential command cwd.
 They were **not executed in the authoring environment** because DSR was absent.
 No compilation, formatting, Clippy or test pass is claimed.
 

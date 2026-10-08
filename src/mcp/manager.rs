@@ -1192,6 +1192,7 @@ impl McpManager {
                     &config.headers,
                     config.provenance,
                     super::config::validate_http_header_value,
+                    &cwd,
                 )?;
                 ensure_active()?;
                 return Ok(
@@ -1209,6 +1210,7 @@ impl McpManager {
                 &config.env,
                 config.provenance,
                 super::config::validate_env_value,
+                &cwd,
             )?;
             ensure_active()?;
             let transport =
@@ -1733,9 +1735,10 @@ fn resolve_server_secrets(
     entries: &[(String, String)],
     provenance: Provenance,
     validate_value: fn(&str) -> std::result::Result<(), String>,
+    cwd: &Path,
 ) -> Result<Vec<(String, String)>> {
     if provenance != Provenance::Acp {
-        return resolve_secrets(entries, validate_value);
+        return resolve_secrets(entries, validate_value, cwd);
     }
     entries
         .iter()
@@ -1766,6 +1769,7 @@ mod acp_literal_tests {
             &entries,
             Provenance::Acp,
             super::super::config::validate_env_value,
+            Path::new("."),
         )
         .expect("literal ACP values");
         assert_eq!(resolved, entries);
@@ -1774,9 +1778,37 @@ mod acp_literal_tests {
                 &[("TOKEN".into(), "bad\r\nvalue".into())],
                 Provenance::Acp,
                 super::super::config::validate_http_header_value,
+                Path::new("."),
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_commands_read_from_the_server_workspace_without_changing_process_cwd() {
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        std::fs::write(project.path().join("credential.txt"), "selected-workspace-token")
+            .expect("project credential fixture");
+        std::fs::write(other.path().join("credential.txt"), "different-workspace-token")
+            .expect("other credential fixture");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let entries = vec![("TOKEN".to_string(), "$CMD:cat credential.txt".to_string())];
+        for validate in [
+            super::super::config::validate_env_value as fn(&str) -> std::result::Result<(), String>,
+            super::super::config::validate_http_header_value,
+        ] {
+            let resolved =
+                resolve_server_secrets(&entries, Provenance::GlobalPi, validate, project.path())
+                    .expect("resolve in selected workspace");
+            assert_eq!(resolved[0].1, "selected-workspace-token");
+            let resolved =
+                resolve_server_secrets(&entries, Provenance::GlobalPi, validate, other.path())
+                    .expect("resolve in another selected workspace");
+            assert_eq!(resolved[0].1, "different-workspace-token");
+        }
+        assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
     }
 }
 
@@ -1784,9 +1816,10 @@ mod acp_literal_tests {
 fn resolve_secrets(
     entries: &[(String, String)],
     validate_value: fn(&str) -> std::result::Result<(), String>,
+    cwd: &Path,
 ) -> Result<Vec<(String, String)>> {
     resolve_secrets_with(entries, validate_value, |raw| {
-        crate::auth::resolve_secret_reference(raw)
+        crate::auth::resolve_secret_reference(raw, cwd)
     })
 }
 

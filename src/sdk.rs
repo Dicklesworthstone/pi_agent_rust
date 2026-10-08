@@ -375,6 +375,9 @@ pub struct SessionOptions {
     /// Plan entry and checkpoint restoration report `PLAN_TOOLS_DISABLED`
     /// under that policy; opening a saved conversation remains available.
     pub enabled_tools: Option<Vec<String>>,
+    /// Primary workspace for a new session. When resuming, an explicit value
+    /// must identify the saved workspace; omitting it selects the session's
+    /// latest workdir attachment rather than the caller's process cwd.
     pub working_directory: Option<PathBuf>,
     /// Whether project-local configuration under the working directory may
     /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
@@ -488,6 +491,8 @@ pub struct SessionOptions {
     /// Optional multi-root workspace handle (bd-cv653.3.12). When set, the
     /// session's tool registry confines paths to primary + additional roots
     /// and `/add-dir` // `/remove-dir` mutate the shared set live.
+    /// When omitted on resume, saved additional roots are restored if they
+    /// still exist; unavailable roots are reported and skipped.
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Session-level event listener invoked for every [`AgentEvent`].
@@ -2932,18 +2937,44 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 ) -> Result<AgentSessionHandle> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
-    let cwd = options.working_directory.as_deref().map_or_else(
+    let requested_cwd = options.working_directory.as_deref().map_or_else(
         || process_cwd.clone(),
         |path| resolve_path_for_cwd(path, &process_cwd),
     );
-    let resolved_session_path = options
+    // Resolve caller-supplied locations before discovering a saved workspace.
+    // A relative session path must not be reinterpreted inside its own saved
+    // cwd once metadata chooses the runtime's project directory.
+    let mut resolved_session_path = options
         .session_path
         .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
+        .map(|path| resolve_path_for_cwd(path, &requested_cwd));
     let resolved_session_dir = options
         .session_dir
         .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
+        .map(|path| resolve_path_for_cwd(path, &requested_cwd));
+    let saved_workdir = if !options.no_session
+        && let Some(path) = resolved_session_path.as_deref()
+        && crate::session::session_path_entry_exists(path)?
+    {
+        Some(crate::session_workdir::inspect_saved_session_workdir(path).await?)
+    } else {
+        None
+    };
+    let cwd = if let Some(saved) = &saved_workdir {
+        let cwd = saved.resolve_runtime_cwd(
+            options
+                .working_directory
+                .as_ref()
+                .map(|_| requested_cwd.as_path()),
+        )?;
+        if let Some(workspace) = &options.workspace {
+            saved.check_runtime_cwd(workspace.snapshot_or(&cwd).primary())?;
+        }
+        resolved_session_path = Some(saved.source_path.clone());
+        cwd
+    } else {
+        requested_cwd
+    };
 
     let mut cli = Cli::try_parse_from(["pi"])
         .map_err(|e| Error::validation(format!("CLI init failed: {e}")))?;
@@ -2983,6 +3014,50 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
+    let mut session = Session::new(&cli, &config).await?;
+    if let Some(saved) = &saved_workdir {
+        // Recheck the observation after native transcript validation and
+        // before credential refresh, providers, tools or extensions start.
+        // This covers source replacement during configuration loading too.
+        saved.check_loaded_session(&session)?;
+        saved.check_runtime_cwd(&cwd)?;
+    } else {
+        if !options.no_session
+            && let Some(path) = resolved_session_path.as_deref()
+            && crate::session::session_path_entry_exists(path)?
+        {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_SOURCE_CHANGED: session appeared during startup; \
+                 retry discovery before resuming. No workspace was substituted.",
+            ));
+        }
+        session.header.cwd = cwd.display().to_string();
+    }
+    let workspace = options.workspace.clone().or_else(|| {
+        let roots = session.additional_roots();
+        if roots.is_empty() {
+            return None;
+        }
+        let mut restored = crate::workspace::WorkspaceHandle::single(&cwd);
+        for root in roots {
+            if !root.is_absolute() {
+                tracing::warn!(path = %root.display(), "Skipping non-absolute saved workspace root");
+                continue;
+            }
+            match crate::workspace::validate_new_root(&root) {
+                Ok(canonical) => restored.add_root(&canonical),
+                Err(error) => tracing::warn!(%error, "Skipping unavailable saved workspace root"),
+            }
+        }
+        Some(restored)
+    });
+    if options.workspace.is_some()
+        && let Some(workspace) = &workspace
+    {
+        // An explicit live root set is authoritative and must survive the
+        // next save, including CLI --add-dir handed through the FTUI SDK.
+        session.set_additional_roots(&workspace.additional_roots());
+    }
     let auth_path = Config::auth_path();
     let auth_result = AuthStorage::load_async(auth_path.clone()).await;
     let mut auth = match auth_result {
@@ -3000,6 +3075,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         }
         Err(err) => return Err(err),
     };
+    auth.set_command_working_directory(&cwd)?;
     // gh #218: refresh per provider; only a failure for the provider this
     // session actually selects is an error (checked after selection below).
     let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
@@ -3020,10 +3096,6 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let models_path = default_models_path(&global_dir);
     let mut model_registry = ModelRegistry::load(&auth, Some(models_path));
 
-    let mut session = Session::new(&cli, &config).await?;
-    if resolved_session_path.is_none() {
-        session.header.cwd = cwd.display().to_string();
-    }
     let scope_override = config
         .model_scope_overrides
         .as_deref()
@@ -3167,7 +3239,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 Some(std::sync::Arc::new(
                     crate::undo::FileMutationRecorder::default(),
                 )),
-                options.workspace.as_ref(),
+                workspace.as_ref(),
             )
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
@@ -3401,7 +3473,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         session: agent_session,
         listeners,
         ask_tool: ask_tool_handle,
-        workspace: options.workspace.clone(),
+        workspace,
         mcp_manager,
         retry: options.retry,
         failover_state,

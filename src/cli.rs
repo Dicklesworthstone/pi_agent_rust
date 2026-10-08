@@ -119,6 +119,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "system-prompt"
         | "append-system-prompt"
         | "session"
+        | "session-workdir"
         | "session-dir"
         | "add-dir"
         | "session-durability"
@@ -427,6 +428,18 @@ pub struct Cli {
     /// Use specific session file path
     #[arg(long)]
     pub session: Option<String>,
+
+    /// Explicitly attach an existing --session to this workspace before resuming
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "session",
+        conflicts_with_all = [
+            "no_session", "export", "acp", "list_models", "list_providers",
+            "fetch_models", "explain_extension_policy", "explain_repair_policy"
+        ]
+    )]
+    pub session_workdir: Option<PathBuf>,
 
     /// Directory for session storage/lookup
     #[arg(long)]
@@ -761,6 +774,46 @@ mod tests {
     fn parse_session_path() {
         let cli = Cli::parse_from(["pi", "--session", "/tmp/session.jsonl"]);
         assert_eq!(cli.session.as_deref(), Some("/tmp/session.jsonl"));
+    }
+
+    #[test]
+    fn session_workdir_is_explicit_and_survives_extension_flag_parsing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "../moved project",
+                "--custom-feature",
+                "enabled",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .expect("parse explicit attachment with an extension flag");
+        assert_eq!(parsed.cli.session.as_deref(), Some("saved.jsonl"));
+        assert_eq!(
+            parsed.cli.session_workdir.as_deref(),
+            Some(std::path::Path::new("../moved project"))
+        );
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "custom-feature");
+        assert!(Cli::try_parse_from(["pi", "--session-workdir", "/new/project"]).is_err());
+        for conflicting in ["--no-session", "--acp"] {
+            assert!(
+                Cli::try_parse_from([
+                    "pi",
+                    "--session",
+                    "saved.jsonl",
+                    "--session-workdir",
+                    "/new/project",
+                    conflicting,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

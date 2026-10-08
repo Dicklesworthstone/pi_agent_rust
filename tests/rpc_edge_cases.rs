@@ -95,6 +95,7 @@ fn make_rpc_options(
     let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
     RpcOptions {
         config: Config::default(),
+        working_directory: None,
         resources: ResourceLoader::empty(false),
         available_models: Vec::new(),
         scoped_models: Vec::new(),
