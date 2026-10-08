@@ -695,6 +695,29 @@ pub struct AgentSessionHandle {
     event_runtime: Option<asupersync::runtime::Runtime>,
 }
 
+/// A provider may read or mutate Session through an extension callback while
+/// a rewind summary is running. Bind the result to the complete source view,
+/// including branch navigation and persistence destination, before installing
+/// a candidate derived from it. These bytes never leave this process.
+#[derive(PartialEq, Eq)]
+struct SessionEditSnapshot {
+    path: Option<PathBuf>,
+    session_dir: Option<PathBuf>,
+    leaf_id: Option<String>,
+    content: Vec<u8>,
+}
+
+impl SessionEditSnapshot {
+    fn capture(session: &Session) -> Result<Self> {
+        Ok(Self {
+            path: session.path.clone(),
+            session_dir: session.session_dir.clone(),
+            leaf_id: session.leaf_id().map(str::to_string),
+            content: serde_json::to_vec(&(&session.header, &session.entries))?,
+        })
+    }
+}
+
 /// Snapshot of the current agent session state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionState {
@@ -2290,47 +2313,71 @@ impl AgentSessionHandle {
         name: &str,
         note: Option<&str>,
     ) -> Result<crate::checkpoint::Checkpoint> {
-        let messages = self.session.agent.messages().to_vec();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let checkpoint = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            crate::checkpoint::mark_checkpoint(&mut guard, name, note, &messages)
-        };
-        self.session.persist_session().await?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let messages = candidate.to_messages_for_current_path();
+        let checkpoint =
+            crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
+        self.install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
+            .await?;
         Ok(checkpoint)
     }
 
     /// `/rewind [name]` (bd-cv653.3.7): collapse the active context since the
     /// named (default: latest) checkpoint into one summarized report. The
     /// session tree keeps every original entry; the rewind is recorded in it.
+    /// Summary failures leave the active context unchanged. A checkpoint
+    /// removed from the active context by compaction or an earlier rewind
+    /// cannot be used until its original branch is restored.
     pub async fn rewind_to_checkpoint(
         &mut self,
         name: Option<&str>,
     ) -> Result<crate::checkpoint::RewindOutcome> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let checkpoint = {
-            let guard = self
-                .session
-                .session
-                .lock(cx.cx())
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        // Match compaction's provider-permit contract. Do not hold Session or
+        // Session-action authority across provider callbacks: extensions may
+        // read or mutate that store while producing the summary.
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let store = self.session_store();
+        let (snapshot, mut candidate, checkpoint, span) = {
+            let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+            let guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            crate::checkpoint::find_checkpoint(&guard, name)
-        }
-        .ok_or_else(|| {
-            Error::session(name.map_or_else(
-                || String::from("No checkpoints yet — mark one with /checkpoint"),
-                |name| format!("No checkpoint named '{name}'"),
-            ))
-        })?;
+            let snapshot = SessionEditSnapshot::capture(&guard)?;
+            let mut candidate = guard.clone();
+            candidate.ensure_full_v2_hydration_before_save()?;
+            let checkpoint = crate::checkpoint::find_checkpoint(&candidate, name).ok_or_else(|| {
+                Error::session(name.map_or_else(
+                    || String::from("No checkpoints yet — mark one with /checkpoint"),
+                    |name| format!("No checkpoint named '{name}'"),
+                ))
+            })?;
+            let (messages, boundary) = checkpoint
+                .entry_id
+                .as_deref()
+                .and_then(|id| candidate.context_for_checkpoint(id))
+                .ok_or_else(|| {
+                    Error::session(format!(
+                        "Checkpoint '{}' is no longer in the active context after compaction or rewind; restore its branch or mark a new checkpoint",
+                        checkpoint.name
+                    ))
+                })?;
+            let span = messages[boundary..].to_vec();
+            (snapshot, candidate, checkpoint, span)
+        };
         let agent = &self.session.agent;
-        let span =
-            agent.messages()[checkpoint.message_count.min(agent.messages().len())..].to_vec();
         if span.is_empty() {
             return Err(Error::session(format!(
                 "Nothing to rewind — the active context is already at '{}'.",
@@ -2351,29 +2398,81 @@ impl AgentSessionHandle {
             &settings,
             &privacy,
         )
-        .await
-        .unwrap_or_else(|err| {
-            format!("(summarization failed: {err}; the span was collapsed without a report)")
-        });
-        let outcome = crate::checkpoint::apply_rewind_to_active(
-            &mut self.session.agent,
-            &checkpoint,
+        .await?;
+        let outcome = crate::checkpoint::RewindOutcome {
+            schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
+            checkpoint: checkpoint.name,
+            checkpoint_entry_id: checkpoint.entry_id,
+            collapsed_messages: span.len(),
+            summary_tokens_estimate: (summary.len() / 4) as u64,
             summary,
+            tree_preserved: true,
+        };
+        candidate.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::to_value(&outcome)?),
         );
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_custom_entry(
-                "rewind".to_string(),
-                Some(serde_json::to_value(&outcome).unwrap_or_default()),
-            );
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        admission.ensure_allowed()?;
+        if SessionEditSnapshot::capture(&guard)? != snapshot {
+            return Err(Error::session(
+                "Session changed while the rewind summary was running; the result was not applied",
+            ));
         }
-        self.session.persist_session().await?;
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            true,
+            &admission,
+            "checkpoint rewind",
+        )
+        .await?;
         Ok(outcome)
+    }
+
+    /// The caller owns provider and Session-action authority plus the live
+    /// Session lock. Persist a private candidate, then install its context
+    /// without another await. An interrupted or failed save keeps admission
+    /// quarantined even though the original live view remains intact.
+    async fn install_context_candidate(
+        &mut self,
+        live: &mut Session,
+        mut candidate: Session,
+        replace_context: bool,
+        admission: &crate::agent::ProviderAdmissionGate,
+        operation: &str,
+    ) -> Result<()> {
+        admission.ensure_allowed()?;
+        let save_enabled = self.session.save_enabled();
+        if save_enabled {
+            admission.block(format!(
+                "SDK {operation} persistence was interrupted before live installation completed"
+            ));
+            if let Err(first_error) = candidate.save().await
+                && let Err(retry_error) = candidate.save().await
+            {
+                let reason = format!(
+                    "SDK {operation} persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
+                );
+                admission.block(reason.clone());
+                return Err(Error::session_persistence(reason));
+            }
+        }
+        // Save reconciles IDs, navigation and the persisted header. Project
+        // from the accepted candidate, not the view prepared before that I/O.
+        let messages = replace_context.then(|| candidate.to_messages_for_current_path());
+        *live = candidate;
+        if let Some(messages) = messages {
+            self.session.invalidate_background_compaction();
+            self.session.agent.replace_messages(messages);
+        }
+        if save_enabled {
+            admission.clear();
+        }
+        Ok(())
     }
 
     /// OMP `/retry`: move the session leaf to the parent of the last
@@ -2406,7 +2505,6 @@ impl AgentSessionHandle {
     async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
         let admission = self.session.provider_admission_gate();
         admission.ensure_allowed()?;
-        let save_enabled = self.session.save_enabled();
         let cx = crate::agent_cx::AgentCx::for_request();
         // Provider callbacks may need Session actions and the store before
         // releasing their provider permit. Match recovery's lock order and
@@ -2431,28 +2529,14 @@ impl AgentSessionHandle {
         let mut candidate = guard.clone();
         crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
             .map_err(|error| Error::session(error.to_string()))?;
-        let messages = candidate.to_messages_for_current_path();
-        admission.ensure_allowed()?;
-        // The provider permit is already held. Mark uncertainty only at the
-        // persistence boundary; cancellation before this point changes nothing.
-        admission.block(
-            "SDK retry rewind persistence was interrupted before live installation completed"
-                .to_string(),
-        );
-        if save_enabled
-            && let Err(first_error) = candidate.save().await
-            && let Err(retry_error) = candidate.save().await
-        {
-            let reason = format!(
-                "SDK retry rewind persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
-            );
-            admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
-        self.session.invalidate_background_compaction();
-        *guard = candidate;
-        self.session.agent.replace_messages(messages);
-        admission.clear();
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            true,
+            &admission,
+            "retry rewind",
+        )
+        .await?;
         Ok(plan.content)
     }
 
@@ -2465,22 +2549,29 @@ impl AgentSessionHandle {
         &mut self,
         entry_id: &str,
     ) -> Result<crate::checkpoint::RewindPreparation> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let (prepared, messages) = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let prepared = crate::checkpoint::rewind_to_user_entry(&mut guard, entry_id)
-                .ok_or_else(|| {
-                    Error::session(format!("No user message {entry_id} on this branch"))
-                })?;
-            (prepared, guard.to_messages_for_current_path())
-        };
-        self.session.agent.replace_messages(messages);
-        self.session.persist_session().await?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
+            .ok_or_else(|| {
+                Error::session(format!("No user message {entry_id} on this branch"))
+            })?;
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            true,
+            &admission,
+            "branch rewind",
+        )
+        .await?;
         Ok(prepared)
     }
 
@@ -3585,6 +3676,73 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum RewindCallbackAction {
+        Append,
+        Header,
+        Pending,
+    }
+
+    struct RewindCallbackProvider {
+        delegate: RewindPrivacyProvider,
+        store: Arc<AsyncMutex<Session>>,
+        actions: crate::agent::SessionActionAdmissionGate,
+        action: RewindCallbackAction,
+        after_callback: Arc<Mutex<Option<SessionEditSnapshot>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RewindCallbackProvider {
+        fn name(&self) -> &str {
+            self.delegate.name()
+        }
+
+        fn api(&self) -> &str {
+            self.delegate.api()
+        }
+
+        fn model_id(&self) -> &str {
+            self.delegate.model_id()
+        }
+
+        async fn stream(
+            &self,
+            context: &ProviderContext<'_>,
+            options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let mut action = Box::pin(self.actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(_action_permit)) = futures::poll!(action.as_mut())
+                else {
+                    return Err(Error::session(
+                        "rewind held Session-action authority across its provider callback",
+                    ));
+                };
+                let mut session = self.store.try_lock().map_err(|_| {
+                    Error::session("rewind held the Session lock across its provider callback")
+                })?;
+                match self.action {
+                    RewindCallbackAction::Append => {
+                        session.append_custom_entry("callback-mutation".to_string(), None);
+                    }
+                    RewindCallbackAction::Header => {
+                        session.header.additional_roots = Some(vec!["/callback-root".to_string()]);
+                    }
+                    RewindCallbackAction::Pending => {}
+                }
+                *self.after_callback.lock().unwrap() =
+                    Some(SessionEditSnapshot::capture(&session)?);
+            }
+            if matches!(self.action, RewindCallbackAction::Pending) {
+                return futures::future::pending().await;
+            }
+            self.delegate.stream(context, options).await
+        }
+    }
+
     /// Fails its first `failures` calls with a retryable provider error, then
     /// answers normally. Counts calls so a test can prove how many were made.
     struct FlakyThenOkProvider {
@@ -3678,6 +3836,13 @@ mod tests {
     /// build an in-memory session with saving off, which cannot distinguish a
     /// turn that persisted from one that did not.
     fn saving_handle(dir: &Path) -> AgentSessionHandle {
+        saving_handle_with_store(dir, crate::session::SessionStoreKind::Jsonl)
+    }
+
+    fn saving_handle_with_store(
+        dir: &Path,
+        store_kind: crate::session::SessionStoreKind,
+    ) -> AgentSessionHandle {
         let provider = Arc::new(FlakyThenOkProvider {
             failures: 0,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3692,9 +3857,12 @@ mod tests {
         );
         let session = AgentSession::new(
             agent,
-            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
-                Some(dir.to_path_buf()),
-            ))),
+            Arc::new(AsyncMutex::new(
+                crate::session::Session::create_with_dir_and_store(
+                    Some(dir.to_path_buf()),
+                    store_kind,
+                ),
+            )),
             true,
             crate::compaction::ResolvedCompactionSettings::default(),
         );
@@ -4269,6 +4437,9 @@ mod tests {
         let wrong = run_async(handle.rewind_to_checkpoint(Some("nope"))).unwrap_err();
         assert!(wrong.to_string().contains("No checkpoint named 'nope'"));
 
+        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }));
         let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("rewind");
         assert_eq!(outcome.collapsed_messages, turn_len);
         assert!(
@@ -4289,6 +4460,573 @@ mod tests {
             entry,
             crate::session::SessionEntry::Custom(custom) if custom.custom_type == "rewind"
         )));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One failure matrix covers the public checkpoint transitions.
+    fn checkpoint_save_failures_preserve_live_state_and_fence_every_rewind() {
+        for operation in ["mark", "checkpoint", "branch"] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .prompt("keep this turn", |_| {})
+                    .await
+                    .expect("first turn");
+                handle
+                    .mark_checkpoint("kept", None)
+                    .await
+                    .expect("checkpoint");
+                handle
+                    .prompt("rewind this turn", |_| {})
+                    .await
+                    .expect("second turn");
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
+            let store = handle.session_store();
+            let (original_path, target_id) = {
+                let guard = store.try_lock().expect("session");
+                let target_id = guard
+                    .entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        crate::session::SessionEntry::Message(entry)
+                            if matches!(
+                                entry.message,
+                                crate::session::SessionMessage::User { .. }
+                            ) => entry.base.id.clone(),
+                        _ => None,
+                    })
+                    .expect("latest user entry");
+                (guard.path.clone().expect("saved path"), target_id)
+            };
+            let original_bytes = std::fs::read(&original_path).expect("session bytes");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let blocked_path = dir.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked_path).expect("block candidate save");
+            let before_session = {
+                let mut guard = store.try_lock().expect("session");
+                guard.path = Some(blocked_path);
+                SessionEditSnapshot::capture(&guard).expect("snapshot")
+            };
+            let result = run_async(async {
+                match operation {
+                    "mark" => handle
+                        .mark_checkpoint("must-not-appear", None)
+                        .await
+                        .map(|_| ()),
+                    "checkpoint" => handle
+                        .rewind_to_checkpoint(Some("kept"))
+                        .await
+                        .map(|_| ()),
+                    "branch" => handle.rewind_to_user_message(&target_id).await.map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                result.as_ref().is_err_and(Error::is_session_persistence),
+                "{operation}"
+            );
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            {
+                let mut guard = store.try_lock().expect("live session");
+                assert!(SessionEditSnapshot::capture(&guard).unwrap() == before_session);
+                guard.path = Some(original_path.clone());
+            }
+            let calls_before = requests.lock().unwrap().len();
+            run_async(async {
+                assert!(
+                    handle
+                        .mark_checkpoint("refused", None)
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .rewind_to_checkpoint(Some("kept"))
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .rewind_to_user_message(&target_id)
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .prompt("refused", |_| {})
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+            });
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                calls_before,
+                "quarantine must prevent summary requests too"
+            );
+            assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Root selection must survive both backends and all rewind forms.
+    fn first_turn_rewind_and_retry_keep_root_selected_after_save_and_reopen() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            for operation in ["branch", "retry", "native-retry"] {
+                let dir = tempdir().expect("tempdir");
+                let mut handle = saving_handle_with_store(dir.path(), store_kind);
+                let store = handle.session_store();
+                let (first_user, path) = run_async(async {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut session = store.lock(cx.cx()).await.expect("session");
+                    let content = if operation == "native-retry" {
+                        UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(
+                            "original first turn",
+                        ))])
+                    } else {
+                        UserContent::Text("original first turn".to_string())
+                    };
+                    let first_user =
+                        session.append_message(crate::session::SessionMessage::User {
+                            content,
+                            timestamp: Some(0),
+                        });
+                    session.append_message(crate::session::SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: vec![ContentBlock::Text(TextContent::new("original answer"))],
+                            stop_reason: StopReason::Stop,
+                            ..Default::default()
+                        },
+                    });
+                    session.save().await.expect("original session");
+                    handle
+                        .session
+                        .agent
+                        .replace_messages(session.to_messages_for_current_path());
+                    (first_user, session.path.clone().expect("saved path"))
+                });
+                assert_eq!(handle.session.agent.messages().len(), 2);
+                run_async(async {
+                    match operation {
+                        "branch" => {
+                            let prepared = handle
+                                .rewind_to_user_message(&first_user)
+                                .await
+                                .expect("first-user rewind");
+                            assert_eq!(prepared.text, "original first turn");
+                        }
+                        "retry" => {
+                            assert_eq!(
+                                handle.prepare_retry().await.expect("only-turn retry"),
+                                "original first turn"
+                            );
+                        }
+                        "native-retry" => {
+                            let prepared = handle
+                                .prepare_retry_content()
+                                .await
+                                .expect("native retry");
+                            assert!(matches!(prepared, UserContent::Blocks(_)));
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+                assert!(
+                    handle.session.agent.messages().is_empty(),
+                    "{operation}: live context"
+                );
+                {
+                    let session = store.try_lock().expect("selected root");
+                    assert!(session.leaf_id().is_none());
+                    assert_eq!(session.header.current_leaf.as_deref(), Some(""));
+                    assert!(session.to_messages_for_current_path().is_empty());
+                    assert_eq!(session.entries.len(), 2, "history remains in the tree");
+                }
+                let reopened =
+                    run_async(Session::open(&path.display().to_string())).expect("root reopen");
+                assert!(reopened.leaf_id().is_none(), "{operation}: reopened root");
+                assert!(reopened.to_messages_for_current_path().is_empty());
+                assert_eq!(reopened.entries.len(), 2);
+                run_async(handle.prompt("replacement first turn", |_| {})).expect("sibling turn");
+                let live_context = checkpoint_context_value(handle.session.agent.messages());
+                assert!(!live_context.to_string().contains("original first turn"));
+                let reopened =
+                    run_async(Session::open(&path.display().to_string())).expect("sibling reopen");
+                assert_eq!(
+                    checkpoint_context_value(&reopened.to_messages_for_current_path()),
+                    live_context
+                );
+                assert!(
+                    reopened.get_entry(&first_user).is_some(),
+                    "abandoned branch survives"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_summary_keeps_the_span_available_for_retry() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            handle
+                .mark_checkpoint("start", None)
+                .await
+                .expect("checkpoint");
+            handle
+                .prompt("valuable work must remain visible", |_| {})
+                .await
+                .expect("turn");
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        handle.session.agent.set_provider(Arc::new(FlakyThenOkProvider {
+            failures: usize::MAX,
+            calls: Arc::clone(&calls),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        }));
+        let store = handle.session_store();
+        let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let before_file = std::fs::read(&path).unwrap();
+        let error =
+            run_async(handle.rewind_to_checkpoint(Some("start"))).expect_err("failed summary");
+        assert!(error.to_string().contains("503"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before_agent
+        );
+        assert!(
+            SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_file);
+        assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+
+        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let outcome =
+            run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry summary");
+        assert_eq!(outcome.collapsed_messages, 2);
+        assert_eq!(handle.session.agent.messages().len(), 1);
+    }
+
+    /// Synthetic compaction summaries carry fresh timestamps on projection;
+    /// every other message field must still agree between live and reopened
+    /// context. Do not normalize content, tool calls, order or provider data.
+    fn checkpoint_context_value(messages: &[Message]) -> Value {
+        let mut value = serde_json::to_value(messages).expect("messages");
+        for message in value.as_array_mut().expect("message array") {
+            message
+                .as_object_mut()
+                .expect("message object")
+                .remove("timestamp");
+        }
+        value
+    }
+
+    #[test]
+    fn checkpoint_rewind_uses_compacted_boundary_and_reopens_identically() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            for index in 0..4 {
+                handle
+                    .prompt(format!("retained history {index}"), |_| {})
+                    .await
+                    .expect("history turn");
+            }
+            let checkpoint = handle
+                .mark_checkpoint("before-experiment", None)
+                .await
+                .expect("checkpoint");
+            assert_eq!(checkpoint.message_count, 8);
+            handle
+                .prompt("experiment to summarize", |_| {})
+                .await
+                .expect("experiment turn");
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut guard = store.lock(cx.cx()).await.expect("session");
+            let retained_user = guard
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::Message(entry)
+                        if matches!(
+                            entry.message,
+                            crate::session::SessionMessage::User { .. }
+                        ) => entry.base.id.clone(),
+                    _ => None,
+                })
+                .nth(3)
+                .expect("last history turn");
+            guard.append_compaction(
+                "earlier history summary".to_string(),
+                retained_user,
+                10_000,
+                None,
+                None,
+            );
+            guard.save().await.expect("persist compaction");
+            handle
+                .session
+                .agent
+                .replace_messages(guard.to_messages_for_current_path());
+        });
+        assert_eq!(
+            handle.session.agent.messages().len(),
+            5,
+            "compaction renumbers the checkpoint boundary"
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+            requests: Arc::clone(&requests),
+        }));
+        let store = handle.session_store();
+        let entries_before = store.try_lock().unwrap().entries.len();
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("before-experiment")))
+            .expect("rewind after compaction");
+        assert_eq!(outcome.collapsed_messages, 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("experiment to summarize"));
+        assert!(
+            !requests[0].contains("retained history 3"),
+            "kept context must not enter the collapsed span"
+        );
+        let live_context = checkpoint_context_value(handle.session.agent.messages());
+        let (path, entries_after) = {
+            let guard = store.try_lock().unwrap();
+            assert_eq!(
+                checkpoint_context_value(&guard.to_messages_for_current_path()),
+                live_context
+            );
+            (guard.path.clone().unwrap(), guard.entries.len())
+        };
+        assert_eq!(
+            entries_after,
+            entries_before + 1,
+            "append the report without removing history"
+        );
+        let reopened =
+            run_async(Session::open(&path.display().to_string())).expect("reopen rewind");
+        assert_eq!(
+            checkpoint_context_value(&reopened.to_messages_for_current_path()),
+            live_context
+        );
+        assert_eq!(reopened.entries.len(), entries_after);
+        assert_eq!(
+            live_context.as_array().unwrap().len(),
+            4,
+            "summary, retained turn and rewind report"
+        );
+    }
+
+    #[test]
+    fn checkpoint_hidden_by_compaction_or_rewind_is_refused_before_summary() {
+        for compacted in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .mark_checkpoint("outer", None)
+                    .await
+                    .expect("outer checkpoint");
+                handle.prompt("first span", |_| {}).await.expect("first turn");
+                handle
+                    .mark_checkpoint("inner", None)
+                    .await
+                    .expect("inner checkpoint");
+                handle
+                    .prompt("second span", |_| {})
+                    .await
+                    .expect("second turn");
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
+            let store = handle.session_store();
+            run_async(async {
+                if compacted {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut guard = store.lock(cx.cx()).await.expect("session");
+                    let retained_user = guard
+                        .entries
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            crate::session::SessionEntry::Message(entry)
+                                if matches!(
+                                    entry.message,
+                                    crate::session::SessionMessage::User { .. }
+                                ) => entry.base.id.clone(),
+                            _ => None,
+                        })
+                        .expect("last user entry");
+                    guard.append_compaction(
+                        "old context".to_string(),
+                        retained_user,
+                        10_000,
+                        None,
+                        None,
+                    );
+                    guard.save().await.expect("save compaction");
+                    handle
+                        .session
+                        .agent
+                        .replace_messages(guard.to_messages_for_current_path());
+                } else {
+                    handle
+                        .rewind_to_checkpoint(Some("outer"))
+                        .await
+                        .expect("outer rewind");
+                }
+            });
+            let before_agent = checkpoint_context_value(handle.session.agent.messages());
+            let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            let calls_before = requests.lock().unwrap().len();
+            let error = run_async(handle.rewind_to_checkpoint(Some("inner")))
+                .expect_err("hidden checkpoint");
+            assert!(
+                error.to_string().contains("no longer in the active context"),
+                "{error}"
+            );
+            assert_eq!(requests.lock().unwrap().len(), calls_before);
+            assert_eq!(
+                checkpoint_context_value(handle.session.agent.messages()),
+                before_agent
+            );
+            assert!(
+                SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+            );
+            assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        }
+    }
+
+    #[test]
+    fn checkpoint_rewind_does_not_overwrite_provider_callback_changes() {
+        for action in [RewindCallbackAction::Append, RewindCallbackAction::Header] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .mark_checkpoint("start", None)
+                    .await
+                    .expect("checkpoint");
+                handle.prompt("source context", |_| {}).await.expect("turn");
+            });
+            let store = handle.session_store();
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let before_file = std::fs::read(&path).unwrap();
+            let after_callback = Arc::new(Mutex::new(None));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let actions = handle.session.session_action_admission_gate();
+            handle.session.agent.set_provider(Arc::new(RewindCallbackProvider {
+                delegate: RewindPrivacyProvider {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                store: Arc::clone(&store),
+                actions,
+                action,
+                after_callback: Arc::clone(&after_callback),
+                calls: Arc::clone(&calls),
+            }));
+            let error =
+                run_async(handle.rewind_to_checkpoint(Some("start"))).expect_err("stale summary");
+            assert!(error.to_string().contains("Session changed while"), "{error}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            let live = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            assert!(
+                after_callback.lock().unwrap().as_ref() == Some(&live),
+                "callback changes must survive the refused rewind"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before_file);
+            assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        }
+    }
+
+    #[test]
+    fn dropping_checkpoint_summary_preserves_state_without_quarantining() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            handle
+                .mark_checkpoint("start", None)
+                .await
+                .expect("checkpoint");
+            handle
+                .prompt("context before cancelled summary", |_| {})
+                .await
+                .expect("turn");
+        });
+        let store = handle.session_store();
+        let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let before_file = std::fs::read(&path).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actions = handle.session.session_action_admission_gate();
+        handle.session.agent.set_provider(Arc::new(RewindCallbackProvider {
+            delegate: RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            store: Arc::clone(&store),
+            actions,
+            action: RewindCallbackAction::Pending,
+            after_callback: Arc::new(Mutex::new(None)),
+            calls: Arc::clone(&calls),
+        }));
+        run_async(async {
+            let mut rewind = Box::pin(handle.rewind_to_checkpoint(Some("start")));
+            assert!(futures::poll!(rewind.as_mut()).is_pending());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "drop during the provider request"
+            );
+            drop(rewind);
+        });
+        assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before_agent
+        );
+        assert!(
+            SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_file);
+        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let result =
+            run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry after drop");
+        assert_eq!(result.collapsed_messages, 2);
     }
 
     fn assert_rewind_privacy(mode: &str) {
@@ -4340,10 +5078,14 @@ mod tests {
                 let mut stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Populate original durable history.
                 stored.append_message(crate::session::SessionMessage::from(message));
             }
-            let outcome = handle // ubs:ignore[rust.ownership.unwrap-expect] -- Public rewind preserves its local fallback on a refused summary.
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let before_session = {
+                let stored = store.lock(cx.cx()).await.expect("session snapshot");
+                SessionEditSnapshot::capture(&stored).expect("snapshot")
+            };
+            let outcome = handle
                 .rewind_to_checkpoint(Some("start"))
-                .await
-                .expect("rewind");
+                .await;
             let stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original entries after context replacement.
             assert!(stored.entries.iter().any(
                 |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
@@ -4355,12 +5097,23 @@ mod tests {
                             } if text == &raw)
                 )
             ));
+            if mode == "block" {
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent,
+                    "privacy refusal must retain the active span"
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&stored).unwrap() == before_session,
+                    "privacy refusal must not append a replacement report"
+                );
+            }
             outcome
         });
         let requests = requests.lock().expect("recorded provider requests"); // ubs:ignore[rust.ownership.unwrap-expect] -- Observe what crossed the provider boundary.
         if mode == "block" {
             assert!(requests.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Configured blocking must prevent any provider dispatch.
-            assert!(outcome.summary.contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- Refusal is visible in the existing rewind fallback.
+            assert!(outcome.unwrap_err().to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- Refusal is returned without discarding the active span.
         } else {
             assert_eq!(requests.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- One real summarization request.
             let request = requests.first().expect("summarization request"); // ubs:ignore[rust.ownership.unwrap-expect] -- Count was asserted above.
@@ -4368,7 +5121,7 @@ mod tests {
             assert!(!request.contains("ACME-123456")); // ubs:ignore[rust.panic.assert-macros] -- User-defined pattern is applied.
             assert!(!request.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Bare reuse is protected by the live session vault.
             assert!(!request.contains("<pi-secret:000")); // ubs:ignore[rust.panic.assert-macros] -- Neither remembered nor newly allocated reversible IDs cross this fixture's provider boundary.
-            assert!(outcome.summary.contains("privacy-aware rewind report")); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
+            assert!(outcome.expect("rewind").summary.contains("privacy-aware rewind report")); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
         }
     }
 

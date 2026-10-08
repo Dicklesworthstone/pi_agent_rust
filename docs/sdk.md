@@ -187,6 +187,29 @@ contains secret material is refused when screening is enabled because replacing
 part of that identifier could change how the provider handles the attachment.
 Encoded payload bytes remain opaque to the text secret detector.
 
+### Checkpoints and branch rewinds
+
+`mark_checkpoint(name, note).await` records the current conversation boundary.
+`rewind_to_checkpoint(Some(name)).await` summarizes the active span after that
+marker and replaces the span with its report. The original entries remain in
+the session tree. The boundary is resolved from the current tree projection,
+so a retained checkpoint still works after compaction changes message counts.
+A checkpoint that compaction removed from the active context is refused;
+restore its original branch or mark a new checkpoint.
+
+`rewind_to_user_message(entry_id).await` moves to the parent of a selected user
+message and returns its editor preparation. Sending the next prompt creates a
+sibling branch. Both rewind methods save a private candidate before changing
+the live conversation. Checkpoint creation uses the same persistence ordering.
+An interrupted or failed save preserves the live view and blocks further
+provider requests until persistence is recovered. Ephemeral sessions apply
+the change in memory without writing a file.
+
+Checkpoint summarization respects provider admission and the configured secret
+policy. A summary error or privacy refusal leaves the span intact. If an
+extension changes the session during summarization, the stale report is
+rejected without overwriting that change.
+
 ## Recipe 2: Session-Level Subscribers and Typed Hooks
 
 ```rust

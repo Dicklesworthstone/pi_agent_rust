@@ -4863,9 +4863,13 @@ impl Session {
             .message_count
             .saturating_add(self.v2_message_count_offset);
         self.cached_name = finalized.name;
-        self.leaf_id = previous_leaf
+        let fallback_leaf = previous_leaf
             .filter(|id| self.entry_index.contains_key(id))
             .or_else(|| finalized.leaf_id.clone());
+        // Saving may select an explicit branch or the empty root. Interpret
+        // the accepted header exactly as reopening does; otherwise a root
+        // rewind resurrects the abandoned tip immediately after a good save.
+        self.leaf_id = resolve_loaded_leaf_id(&self.header, fallback_leaf, &self.entry_index);
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
@@ -5925,19 +5929,42 @@ impl Session {
     pub(crate) fn to_messages_for_current_path_with_timestamp_provenance(
         &self,
     ) -> Vec<(Message, bool)> {
+        self.rebuild_current_path().messages
+    }
+
+    /// Resolve a checkpoint against the context that is active now. Stored
+    /// message counts describe the context at mark time and become stale when
+    /// compaction or an earlier rewind changes the projected prefix.
+    pub(crate) fn context_for_checkpoint(
+        &self,
+        checkpoint_entry_id: &str,
+    ) -> Option<(Vec<Message>, usize)> {
+        let rebuild = self.rebuild_current_path();
+        let boundary = *rebuild.checkpoint_positions.get(checkpoint_entry_id)?;
+        Some((
+            rebuild
+                .messages
+                .into_iter()
+                .map(|(message, _)| message)
+                .collect(),
+            boundary,
+        ))
+    }
+
+    fn rebuild_current_path(&self) -> PathRebuildState {
         if self.leaf_id.is_none() {
-            return Vec::new();
+            return PathRebuildState::with_capacity(0);
         }
 
         if self.is_linear {
-            return Self::to_messages_from_path(self.entries.len(), |idx| &self.entries[idx]);
+            return Self::rebuild_from_path(self.entries.len(), |idx| &self.entries[idx]);
         }
 
         let path_entries = self.entries_for_current_path();
-        Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
+        Self::rebuild_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
-    fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<(Message, bool)>
+    fn rebuild_from_path<'a, F>(path_len: usize, entry_at: F) -> PathRebuildState
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
@@ -6006,14 +6033,14 @@ impl Session {
                 rebuild.append(entry);
             }
 
-            return rebuild.messages;
+            return rebuild;
         }
 
         let mut rebuild = PathRebuildState::with_capacity(path_len);
         for idx in 0..path_len {
             rebuild.append(entry_at(idx));
         }
-        rebuild.messages
+        rebuild
     }
 
     /// Find the nearest ancestor that is a fork point (has multiple children)
