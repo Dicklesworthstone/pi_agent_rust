@@ -456,6 +456,17 @@ least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
 every log instead; Pi then refuses new background jobs once the budget is
 full. Job snapshots report the applied policy, removed-file count, and
 reclaimed bytes in `artifactCleanup`.
+
+Hub service logs retain the first 16 MiB of raw output per run. Pi continues
+draining the service after that limit or an artifact write failure, so live
+tail logs, readiness checks, and PTY input continue working. `logs`, `ps`, and
+`describe` report `logCapture` byte counts, truncation, I/O errors, and output
+drain state separately from process status; incremental reads also report
+evicted lines. The cap applies to each artifact, not the total across runs.
+`detached: true` skips session-exit cleanup, but the PTY and its supervisor
+still belong to the current Pi process: cross-process reattachment and
+survival after that host process exits are not implemented.
+
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
 `essential`, `discoverable`, or `off`; an explicit `--tools` list always
 wins:

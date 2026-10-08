@@ -367,6 +367,184 @@ fn cancelling_a_log_wait_preserves_the_running_service() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
+fn noisy_service_caps_raw_artifact_without_losing_readiness_or_later_input() {
+    let _guard = hub_test_guard();
+    let case = "noisy_service_caps_raw_artifact_without_losing_readiness_or_later_input";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-artifact-cap";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import os, sys
+block = b'x' * 8191 + b'\n'
+for _ in range(2176):
+    remaining = memoryview(block)
+    while remaining:
+        remaining = remaining[os.write(1, remaining):]
+print('hub-ready-after-cap', flush=True)
+line = sys.stdin.readline().strip()
+print('hub-ack:' + line, flush=True)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "(?m)^hub-ready-after-cap$", "timeoutSecs": 30}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    assert!(first_text(&started).contains("Raw service log is incomplete"));
+    let start_details = started.details.as_ref().expect("start details");
+    let pid = u32::try_from(start_details["pid"].as_u64().expect("live child pid"))
+        .expect("pid fits u32");
+    let capture = &start_details["logCapture"];
+    assert_eq!(capture["byteLimit"], 16 * 1024 * 1024);
+    assert_eq!(capture["retainedBytes"], 16 * 1024 * 1024);
+    assert!(capture["observedBytes"].as_u64().expect("observed") > 16 * 1024 * 1024);
+    assert!(capture["droppedBytes"].as_u64().expect("dropped") > 0);
+    assert_eq!(capture["truncated"], true);
+    assert_eq!(capture["drainState"], "streaming");
+    assert!(capture.get("writeError").is_none());
+    assert!(capture.get("readError").is_none());
+    let log_path = start_details["logPath"].as_str().expect("raw log path");
+    let artifact = std::fs::read(log_path).expect("raw artifact");
+    assert_eq!(artifact.len(), 16 * 1024 * 1024);
+    assert!(artifact.starts_with(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    assert!(
+        !std::str::from_utf8(&artifact)
+            .expect("ASCII output")
+            .contains("hub-ready-after-cap"),
+        "readiness must observe bytes that are not retained in the raw artifact"
+    );
+    let logs = hub_exec(
+        &root,
+        json!({"op": "logs", "name": name, "cursor": 0, "grep": "hub-ready-after-cap"}),
+    );
+    assert!(!logs.is_error, "{}", first_text(&logs));
+    assert!(first_text(&logs).contains("hub-ready-after-cap"));
+    assert!(first_text(&logs).contains("requested log lines were evicted"));
+    assert!(first_text(&logs).contains("Raw service log is incomplete"));
+    let page = logs.details.as_ref().expect("log details");
+    assert_eq!(page["logPath"], log_path);
+    assert!(page["lostLines"].as_u64().expect("lost lines") > 0);
+    assert_eq!(page["lostLines"], page["oldestCursor"]);
+    let cursor = page["cursor"].as_u64().expect("cursor");
+
+    let described = hub_exec(&root, json!({"op": "describe", "name": name}));
+    assert!(!described.is_error, "{}", first_text(&described));
+    assert_eq!(
+        described.details.as_ref().expect("descriptor")["logCapture"],
+        *capture
+    );
+    let roster = hub_exec(&root, json!({"op": "ps"}));
+    assert!(!roster.is_error, "{}", first_text(&roster));
+    let service = roster.details.as_ref().expect("roster")["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .find(|service| service["name"] == name)
+        .expect("service in roster");
+    assert_eq!(service["logCapture"], *capture);
+
+    let sent = hub_exec(
+        &root,
+        json!({"op": "send", "name": name, "text": "input-after-cap"}),
+    );
+    assert!(!sent.is_error, "{}", first_text(&sent));
+    let acknowledged = hub_exec(
+        &root,
+        json!({
+            "op": "logs", "name": name, "cursor": cursor,
+            "grep": "hub-ack:input-after-cap", "waitMs": 5000
+        }),
+    );
+    assert!(!acknowledged.is_error, "{}", first_text(&acknowledged));
+    assert!(first_text(&acknowledged).contains("hub-ack:input-after-cap"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let finished = loop {
+        let snapshot = pi::hub::describe(name).expect("finished service");
+        if snapshot.status == "exited"
+            && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
+        {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service must drain and exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_reaped(pid);
+    assert_eq!(finished.log_capture.retained_bytes, 16 * 1024 * 1024);
+    assert_eq!(
+        finished.log_capture.dropped_bytes,
+        finished.log_capture.observed_bytes - finished.log_capture.retained_bytes
+    );
+    assert!(finished.log_capture.read_error.is_none());
+    assert!(finished.log_capture.write_error.is_none());
+    assert_eq!(
+        std::fs::metadata(log_path).expect("capped log").len(),
+        16 * 1024 * 1024
+    );
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn short_service_output_is_complete_and_unchanged() {
+    let _guard = hub_test_guard();
+    let case = "short_service_output_is_complete_and_unchanged";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-short-complete-log";
+    let _cleanup = ServiceCleanup(name);
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", "print('ordinary service output')"]
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = pi::hub::describe(name).expect("service");
+        if snapshot.status == "exited"
+            && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "short service must drain and exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let logs = hub_exec(&root, json!({"op": "logs", "name": name}));
+    assert!(!logs.is_error, "{}", first_text(&logs));
+    assert_eq!(first_text(&logs), "ordinary service output");
+    let page = logs.details.as_ref().expect("log details");
+    let capture = &page["logCapture"];
+    assert_eq!(capture["drainState"], "complete");
+    assert_eq!(capture["truncated"], false);
+    assert_eq!(capture["droppedBytes"], 0);
+    assert_eq!(page["lostLines"], 0);
+    assert!(capture.get("readError").is_none());
+    assert!(capture.get("writeError").is_none());
+    let artifact =
+        std::fs::read(page["logPath"].as_str().expect("log path")).expect("complete raw artifact");
+    assert_eq!(capture["observedBytes"], artifact.len() as u64);
+    assert_eq!(capture["retainedBytes"], artifact.len() as u64);
+    assert_eq!(
+        std::str::from_utf8(&artifact).expect("raw text").trim_end(),
+        "ordinary service output"
+    );
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
 fn cancelling_restart_finishes_the_old_process_without_launching_a_replacement() {
     let _guard = hub_test_guard();
     let case = "cancelling_restart_finishes_the_old_process_without_launching_a_replacement";

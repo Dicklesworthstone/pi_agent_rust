@@ -8899,7 +8899,9 @@ impl Tool for HubTool {
          gates: ready.log regex AND ready.port TCP accept, both must pass \
          within ready.timeoutSecs — start returns only after readiness is \
          observed), `ps` (list services), `logs` (tail/grep/incremental \
-         cursor reads with bounded wait), `send` (PTY stdin: text, named \
+         cursor reads with bounded wait; raw logs retain the first 16 MiB \
+         per run, live tails keep streaming, and logCapture reports loss \
+         and I/O errors), `send` (PTY stdin: text, named \
          keys, signals), `stop` (graceful tree termination), `restart` \
          (retained launch spec), `describe` (full descriptor), `jobs` \
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
@@ -8931,7 +8933,7 @@ impl Tool for HubTool {
                     },
                     "description": "Readiness gates; all supplied gates must pass"
                 },
-                "detached": { "type": "boolean", "description": "Survive session exit (default false)" },
+                "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
                 "cursor": { "type": "integer", "description": "logs: opaque cursor for incremental reads" },
                 "tail": { "type": "integer", "description": "logs: last N lines" },
                 "grep": { "type": "string", "description": "logs: substring filter" },
@@ -9004,6 +9006,26 @@ impl Tool for HubTool {
 }
 
 impl HubTool {
+    fn append_log_capture_notice(text: &mut String, capture: &crate::hub::LogCapture) {
+        if capture.truncated {
+            let _ = write!(
+                text,
+                "\n[Raw service log is incomplete: {} of {} bytes retained, {} omitted; \
+                 per-artifact limit {} bytes. Live tails are retained separately.]",
+                capture.retained_bytes,
+                capture.observed_bytes,
+                capture.dropped_bytes,
+                capture.byte_limit
+            );
+        }
+        if let Some(error) = &capture.write_error {
+            let _ = write!(text, "\n[Service log artifact error: {error}]");
+        }
+        if let Some(error) = &capture.read_error {
+            let _ = write!(text, "\n[Service output capture error: {error}]");
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
         let name_required = |op: &str| -> Result<String> {
@@ -9046,13 +9068,14 @@ impl HubTool {
                 })
                 .await?;
                 let details = serde_json::to_value(&snapshot)?;
-                let text = format!(
+                let mut text = format!(
                     "Service '{name}' is running (pid {}, log: {}).",
                     snapshot
                         .pid
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
                     snapshot.log_path
                 );
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
                 (text, details)
             }
             "ps" => {
@@ -9067,7 +9090,7 @@ impl HubTool {
                     let lines: Vec<String> = services
                         .iter()
                         .map(|svc| {
-                            format!(
+                            let mut text = format!(
                                 "{}: {} (pid {}, command `{}`, log {})",
                                 svc.name,
                                 svc.status,
@@ -9075,7 +9098,9 @@ impl HubTool {
                                     .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
                                 svc.command,
                                 svc.log_path
-                            )
+                            );
+                            Self::append_log_capture_notice(&mut text, &svc.log_capture);
+                            text
                         })
                         .collect();
                     format!("{} service(s):\n{}", services.len(), lines.join("\n"))
@@ -9104,6 +9129,14 @@ impl HubTool {
                 if text.is_empty() {
                     text = "(no new lines)".to_string();
                 }
+                if page.lost_lines != 0 {
+                    let _ = write!(
+                        text,
+                        "\n[{} requested log lines were evicted; oldest available cursor: {}.]",
+                        page.lost_lines, page.oldest_cursor
+                    );
+                }
+                Self::append_log_capture_notice(&mut text, &page.log_capture);
                 (text, details)
             }
             "stop" => {
@@ -9113,10 +9146,9 @@ impl HubTool {
                     crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name))
                         .await?;
                 let details = serde_json::to_value(&snapshot)?;
-                (
-                    format!("Service '{name}' stopped (status: {}).", snapshot.status),
-                    details,
-                )
+                let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
             }
             "restart" => {
                 let name = name_required("restart")?;
@@ -9126,10 +9158,9 @@ impl HubTool {
                 })
                 .await?;
                 let details = serde_json::to_value(&snapshot)?;
-                (
-                    format!("Service '{name}' restarted (status: {}).", snapshot.status),
-                    details,
-                )
+                let mut text = format!("Service '{name}' restarted (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
             }
             "describe" => {
                 let name = name_required("describe")?;

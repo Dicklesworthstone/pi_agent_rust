@@ -2,15 +2,15 @@
 //!
 //! Long-running services, watchers, REPLs, and debuggers live here instead
 //! of timeout-hacked `bash` calls. Every service spawns on a PTY (stdin
-//! stays writable for `send`), output streams to a raw artifact log plus
+//! stays writable for `send`), output streams to a bounded raw artifact plus
 //! a byte- and line-bounded text ring, and readiness is *observed* — a
 //! `ready.log` regex and/or a `ready.port` TCP accept must both pass within
 //! the timeout before `start` returns.
 //!
 //! Lifecycle: session-scoped by default (killed at the main shutdown
-//! chokepoint, same as background jobs); `detached: true` services survive
-//! session exit and are re-discovered from the state file under the hub
-//! artifact dir.
+//! chokepoint, same as background jobs); `detached: true` skips that cleanup.
+//! Detached PTYs still belong to this host process; the persisted roster does
+//! not provide cross-process reattachment or guarantee host-exit survival.
 //!
 //! The `hub` tool's `jobs` action group wraps the background-jobs registry
 //! (bd-cv653.3.10); the `messaging` action group lands with the agent-hub
@@ -30,14 +30,18 @@ use crate::error::{Error, Result};
 /// Tool-result schema tag for service descriptors (stable audit contract).
 pub const SERVICE_SCHEMA: &str = "pi.hub.service.v1";
 
+/// Maximum original output retained in one service's raw artifact. Output
+/// beyond this prefix still feeds readiness and the live text ring.
+pub const SERVICE_LOG_BYTE_CAP: u64 = 16 * 1024 * 1024;
+
 /// Default readiness budget when the caller passes none.
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 30;
 
 /// Bounded line ring kept per service for `logs` cursors.
 const RING_LINE_CAP: usize = 10_000;
 
-/// Bound retained text independently of newline frequency. Raw artifact bytes
-/// are unaffected; an oversized line retains its newest UTF-8-safe suffix.
+/// Bound retained text independently of newline frequency. An oversized line
+/// retains its newest UTF-8-safe suffix; raw artifacts have a separate cap.
 const RING_BYTE_CAP: usize = 1024 * 1024;
 const RING_LINE_BYTE_CAP: usize = 16 * 1024;
 const TRUNCATED_LINE_PREFIX: &str = "[...truncated...] ";
@@ -344,6 +348,50 @@ where
     }
 }
 
+/// Output-drain progress, independent of whether the child has already exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogDrainState {
+    Pending,
+    Streaming,
+    Complete,
+    Failed,
+}
+
+/// Raw artifact accounting. A complete drain means the reader reached EOF;
+/// `truncated` and `write_error` independently report an incomplete artifact.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCapture {
+    pub byte_limit: u64,
+    pub observed_bytes: u64,
+    /// Bytes accepted by successful writes, including partial writes before
+    /// failure. This is not an fsync or durable-storage acknowledgement.
+    pub retained_bytes: u64,
+    pub dropped_bytes: u64,
+    pub truncated: bool,
+    pub drain_state: LogDrainState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+}
+
+impl Default for LogCapture {
+    fn default() -> Self {
+        Self {
+            byte_limit: SERVICE_LOG_BYTE_CAP,
+            observed_bytes: 0,
+            retained_bytes: 0,
+            dropped_bytes: 0,
+            truncated: false,
+            drain_state: LogDrainState::Pending,
+            write_error: None,
+            read_error: None,
+        }
+    }
+}
+
 /// One ring entry: a completed output line with its cursor index.
 struct Ring {
     lines: VecDeque<String>,
@@ -358,6 +406,7 @@ struct Ring {
     cap: usize,
     ready_log: Option<regex::Regex>,
     ready_log_passed: bool,
+    capture: LogCapture,
 }
 
 impl Ring {
@@ -372,6 +421,7 @@ impl Ring {
             cap,
             ready_log: None,
             ready_log_passed: true,
+            capture: LogCapture::default(),
         }
     }
 
@@ -516,6 +566,7 @@ pub struct ServiceSnapshot {
     pub started_ms: i64,
     pub exit_code: Option<i32>,
     pub log_path: String,
+    pub log_capture: LogCapture,
     pub detached: bool,
     pub ready: bool,
 }
@@ -533,6 +584,12 @@ impl ServiceSnapshot {
             started_ms: entry.started_ms,
             exit_code: entry.exit_code,
             log_path: entry.log_path.display().to_string(),
+            log_capture: entry
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .capture
+                .clone(),
             detached: entry.spec.detached,
             ready: status == ServiceStatus::Running,
         }
@@ -548,7 +605,13 @@ pub struct LogPage {
     pub lines: Vec<String>,
     /// Opaque cursor for the next `logs` call (returns newer lines only).
     pub cursor: u64,
+    /// Earliest source-line cursor still retained in the live text ring.
+    pub oldest_cursor: u64,
+    /// Requested source lines evicted before an incremental cursor was read.
+    pub lost_lines: u64,
     pub status: String,
+    pub log_path: String,
+    pub log_capture: LogCapture,
 }
 
 #[derive(Default)]
@@ -670,6 +733,7 @@ struct PendingService {
     ring: Arc<Mutex<Ring>>,
     control: Arc<ServiceControl>,
     armed: bool,
+    output_started: bool,
 }
 
 impl PendingService {
@@ -691,6 +755,7 @@ impl PendingService {
             ring: Arc::clone(ring),
             control,
             armed: true,
+            output_started: false,
         })
     }
 }
@@ -698,6 +763,16 @@ impl PendingService {
 impl Drop for PendingService {
     fn drop(&mut self) {
         if self.armed {
+            if !self.output_started {
+                let mut ring = self
+                    .ring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ring.capture.drain_state = LogDrainState::Failed;
+                ring.capture.read_error = Some(
+                    "PI_HUB_LOG_NOT_STARTED: service output capture did not start".to_string(),
+                );
+            }
             let mut reg = registry()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -859,8 +934,8 @@ fn validated_service_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// Persist the detached-service roster (name, pid, log, spec) so a later
-/// session can rediscover survivors.
+/// Retain a diagnostic roster of detached services. A numeric PID is not an
+/// ownership token and is never imported for control by a later process.
 fn persist_detached_state(reg: &ServiceRegistry) {
     #[derive(Serialize)]
     struct DetachedRecord {
@@ -992,6 +1067,7 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
                 format!("Failed to start service output pump: {error}"),
             )
         })?;
+    pending.output_started = true;
 
     let monitor_name = name.clone();
     let monitor_ring = Arc::clone(&ring);
@@ -1173,29 +1249,89 @@ fn push_service_bytes(ring: &mut Ring, bytes: &[u8]) -> usize {
     offset
 }
 
+/// Stop writing after the byte cap or the first permanent write error, but
+/// continue accounting for every byte drained from the service. Never insert
+/// diagnostics into the raw byte stream or the readiness matcher.
+fn write_service_artifact<W: Write>(artifact: &mut W, capture: &mut LogCapture, data: &[u8]) {
+    capture.observed_bytes = capture.observed_bytes.saturating_add(data.len() as u64);
+    let remaining = capture.byte_limit.saturating_sub(capture.retained_bytes);
+    let count = data.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+    let mut offset = 0;
+    while offset < count && capture.write_error.is_none() {
+        match artifact.write(&data[offset..count]) {
+            Ok(0) => {
+                capture.write_error = Some(
+                    "PI_HUB_LOG_WRITE_FAILED: artifact writer made no progress".to_string(),
+                );
+            }
+            Ok(written) => {
+                offset += written;
+                capture.retained_bytes = capture.retained_bytes.saturating_add(written as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                capture.write_error = Some(format!("PI_HUB_LOG_WRITE_FAILED: {error}"));
+            }
+        }
+    }
+    capture.dropped_bytes = capture.observed_bytes.saturating_sub(capture.retained_bytes);
+    capture.truncated = capture.dropped_bytes != 0;
+}
+
 fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: &Mutex<Ring>) {
+    let mut capture = LogCapture {
+        drain_state: LogDrainState::Streaming,
+        ..LogCapture::default()
+    };
+    ring.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .capture
+        .clone_from(&capture);
     let mut chunk = [0u8; 8192];
     let mut pending = Vec::with_capacity(chunk.len() + 3);
     loop {
         match reader.read(&mut chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                capture.drain_state = LogDrainState::Complete;
+                break;
+            }
+            Err(error) => {
+                capture.drain_state = LogDrainState::Failed;
+                capture.read_error = Some(format!("PI_HUB_LOG_READ_FAILED: {error}"));
+                break;
+            }
             Ok(n) => {
                 let data = &chunk[..n]; // ubs:ignore n bounded by read into chunk
-                let _ = artifact.write_all(data);
+                write_service_artifact(&mut artifact, &mut capture, data);
                 pending.extend_from_slice(data);
-                let Ok(mut ring) = ring.lock() else {
-                    return;
-                };
+                let mut ring = ring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let consumed = push_service_bytes(&mut ring, &pending);
+                ring.capture.clone_from(&capture);
                 drop(pending.drain(..consumed));
             }
         }
     }
-    if let Ok(mut ring) = ring.lock() {
-        ring.push_chunk(&String::from_utf8_lossy(&pending));
-        ring.finish_partial();
+    loop {
+        match artifact.flush() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                capture
+                    .write_error
+                    .get_or_insert_with(|| format!("PI_HUB_LOG_FLUSH_FAILED: {error}"));
+                break;
+            }
+            Ok(()) => break,
+        }
     }
+    let mut ring = ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ring.push_chunk(&String::from_utf8_lossy(&pending));
+    ring.finish_partial();
+    ring.capture = capture;
 }
 
 fn ring_tail(ring: &Mutex<Ring>, count: usize) -> String {
@@ -1213,8 +1349,8 @@ fn ring_tail(ring: &Mutex<Ring>, count: usize) -> String {
     )
 }
 
-/// List every service this session, plus detached survivors from the state
-/// file that this process has not adopted.
+/// List every service supervised by this host process, including services
+/// excluded from session-exit cleanup. Persisted PIDs are never adopted.
 ///
 /// # Errors
 /// Registry lock failure.
@@ -1233,8 +1369,9 @@ pub fn ps() -> Result<Vec<ServiceSnapshot>> {
 /// lines; `grep` filters (substring, case-sensitive); `wait_ms` bounds how
 /// long `logs` blocks waiting for new lines when `since` is supplied.
 /// Retention is capped at 10,000 lines and 1 MiB of text. Oversized lines
-/// keep a UTF-8-safe tail with an explicit truncation marker; the raw artifact
-/// retains the original bytes. Eviction never rewinds the source-line cursor.
+/// keep a UTF-8-safe tail with an explicit truncation marker. The raw artifact
+/// retains the first 16 MiB of original bytes and reports any omissions or
+/// I/O failures. Eviction never rewinds the source-line cursor.
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names.
@@ -1283,6 +1420,8 @@ fn logs_inner(
             };
             let ring = entry.ring.lock().map_err(|_| registry_err())?;
             let (mut lines, cursor) = ring.since(since.unwrap_or(0));
+            let oldest_cursor = ring.next_index.saturating_sub(ring.lines.len() as u64);
+            let lost_lines = since.map_or(0, |since| oldest_cursor.saturating_sub(since));
             if since.is_none()
                 && let Some(count) = tail
             {
@@ -1295,13 +1434,24 @@ fn logs_inner(
             // an incremental cursor or a grep filter. A bare snapshot read
             // returns immediately.
             let seeking = since.is_some() || grep.is_some();
-            if !lines.is_empty() || !seeking || Instant::now() >= deadline {
+            if !lines.is_empty()
+                || !seeking
+                || matches!(
+                    ring.capture.drain_state,
+                    LogDrainState::Complete | LogDrainState::Failed
+                )
+                || Instant::now() >= deadline
+            {
                 return Ok(LogPage {
                     schema: "pi.hub.logs.v1".to_string(), // ubs:ignore loop returns immediately after
                     name: name.to_string(), // ubs:ignore loop returns immediately after
                     lines,
                     cursor,
+                    oldest_cursor,
+                    lost_lines,
                     status: entry.current_status().as_str().to_string(), // ubs:ignore loop returns after
+                    log_path: entry.log_path.display().to_string(),
+                    log_capture: ring.capture.clone(),
                 });
             }
         }
@@ -1744,6 +1894,20 @@ mod tests {
                 assert_eq!(ring.since(0).0, vec!["first", "prêt 界🙂 tail"]);
                 assert_eq!(ring.next_index, 2);
                 assert!(ring.partial.is_empty());
+                assert_eq!(ring.capture.observed_bytes, input.len() as u64);
+                assert_eq!(ring.capture.retained_bytes, input.len() as u64);
+                assert_eq!(ring.capture.dropped_bytes, 0);
+                assert!(!ring.capture.truncated);
+                assert!(ring.capture.write_error.is_none());
+                assert_eq!(
+                    ring.capture.drain_state,
+                    if terminal_error {
+                        LogDrainState::Failed
+                    } else {
+                        LogDrainState::Complete
+                    }
+                );
+                assert_eq!(ring.capture.read_error.is_some(), terminal_error);
             }
         }
     }
@@ -1784,6 +1948,202 @@ mod tests {
         assert!(lines[0].starts_with(TRUNCATED_LINE_PREFIX));
         assert!(lines[0].ends_with("final"));
         assert!(lines[0].len() <= RING_LINE_BYTE_CAP);
+    }
+
+    #[test]
+    fn capped_artifact_keeps_draining_and_observes_readiness_after_the_cap() {
+        let prefix_len = SERVICE_LOG_BYTE_CAP + 8192;
+        let tail = b"\nready-after-artifact-cap\nlast line";
+        let reader = std::io::repeat(b'x').take(prefix_len).chain(tail.as_slice());
+        let mut output = Ring::new(8);
+        output.watch_readiness(Some(
+            regex::Regex::new("(?m)^ready-after-artifact-cap$").expect("regex"),
+        ));
+        let ring = Mutex::new(output);
+        let mut artifact = Vec::new();
+        pump_service_stream(reader, &mut artifact, &ring);
+        assert_eq!(artifact.len() as u64, SERVICE_LOG_BYTE_CAP);
+        assert!(artifact.iter().all(|byte| *byte == b'x'));
+        let ring = ring.into_inner().expect("ring");
+        assert!(ring.ready_log_passed);
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(cursor, 3);
+        assert_eq!(&lines[1..], &["ready-after-artifact-cap", "last line"]);
+        assert_eq!(ring.capture.observed_bytes, prefix_len + tail.len() as u64);
+        assert_eq!(ring.capture.retained_bytes, SERVICE_LOG_BYTE_CAP);
+        assert_eq!(ring.capture.dropped_bytes, 8192 + tail.len() as u64);
+        assert!(ring.capture.truncated);
+        assert_eq!(ring.capture.drain_state, LogDrainState::Complete);
+        assert!(ring.capture.read_error.is_none());
+        assert!(ring.capture.write_error.is_none());
+    }
+
+    /// Exercise the real pump's short-write and failure paths without an
+    /// unreliable host-level disk exhaustion dependency.
+    struct FailingArtifact {
+        bytes: Vec<u8>,
+        remaining: usize,
+        interrupt_next: bool,
+        fail_with_zero: bool,
+        failed: bool,
+        writes_after_failure: usize,
+        flush_error: bool,
+    }
+
+    impl Write for FailingArtifact {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.failed {
+                self.writes_after_failure += 1;
+            }
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.remaining == 0 {
+                self.failed = true;
+                return if self.fail_with_zero {
+                    Ok(0)
+                } else {
+                    Err(std::io::Error::other("artifact storage unavailable"))
+                };
+            }
+            let written = bytes.len().min(self.remaining).min(3);
+            self.bytes.extend_from_slice(&bytes[..written]);
+            self.remaining -= written;
+            self.interrupt_next = true;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_error {
+                Err(std::io::Error::other("artifact flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_write_failures_report_actual_prefix_and_keep_draining() {
+        let input = b"first line\nready after write failure\nlast line";
+        for fail_with_zero in [false, true] {
+            let mut artifact = FailingArtifact {
+                bytes: Vec::new(),
+                remaining: 7,
+                interrupt_next: true,
+                fail_with_zero,
+                failed: false,
+                writes_after_failure: 0,
+                flush_error: false,
+            };
+            let reader = FragmentedReader {
+                bytes: input,
+                width: 5,
+                interrupt_next: true,
+                terminal_error: false,
+            };
+            let mut output = Ring::new(8);
+            output.watch_readiness(Some(
+                regex::Regex::new("(?m)^ready after write failure$").expect("regex"),
+            ));
+            let ring = Mutex::new(output);
+            pump_service_stream(reader, &mut artifact, &ring);
+            assert_eq!(artifact.bytes, &input[..7]);
+            assert_eq!(artifact.writes_after_failure, 0);
+            let ring = ring.into_inner().expect("ring");
+            assert!(ring.ready_log_passed);
+            assert_eq!(
+                ring.since(0).0,
+                ["first line", "ready after write failure", "last line"]
+            );
+            assert_eq!(ring.capture.observed_bytes, input.len() as u64);
+            assert_eq!(ring.capture.retained_bytes, 7);
+            assert_eq!(ring.capture.dropped_bytes, input.len() as u64 - 7);
+            assert!(ring.capture.truncated);
+            assert_eq!(ring.capture.drain_state, LogDrainState::Complete);
+            assert!(ring.capture.read_error.is_none());
+            assert!(
+                ring.capture
+                    .write_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("PI_HUB_LOG_WRITE_FAILED"))
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_flush_failure_does_not_claim_an_error_free_capture() {
+        let input = b"all bytes accepted\n";
+        let mut artifact = FailingArtifact {
+            bytes: Vec::new(),
+            remaining: input.len(),
+            interrupt_next: true,
+            fail_with_zero: false,
+            failed: false,
+            writes_after_failure: 0,
+            flush_error: true,
+        };
+        let ring = Mutex::new(Ring::new(8));
+        pump_service_stream(input.as_slice(), &mut artifact, &ring);
+        assert_eq!(artifact.bytes, input);
+        let capture = ring.into_inner().expect("ring").capture;
+        assert_eq!(capture.observed_bytes, input.len() as u64);
+        assert_eq!(capture.retained_bytes, input.len() as u64);
+        assert_eq!(capture.dropped_bytes, 0);
+        assert!(!capture.truncated);
+        assert_eq!(capture.drain_state, LogDrainState::Complete);
+        assert!(capture.read_error.is_none());
+        assert!(
+            capture
+                .write_error
+                .as_deref()
+                .is_some_and(|error| error.contains("PI_HUB_LOG_FLUSH_FAILED"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_settlement_does_not_seal_output_before_the_reader_finishes() {
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let ring = Arc::new(Mutex::new(Ring::new(8)));
+        let mut reg = ServiceRegistry::default();
+        let launch = spec("hub-output-settlement", "unused", &[], None);
+        reg.reserve(&launch, &ring, &PathBuf::from("settlement.log"))
+            .expect("reserve");
+        let pump_ring = Arc::clone(&ring);
+        let pump = std::thread::spawn(move || {
+            let mut artifact = Vec::new();
+            pump_service_stream(reader, &mut artifact, &pump_ring);
+            artifact
+        });
+        writer.write_all(b"before exit\n").expect("first bytes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if ring.lock().expect("ring").capture.observed_bytes != 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reader must consume the first bytes"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reg.settle(&launch.name, &ring, 0));
+        let snapshot =
+            ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
+        assert_eq!(snapshot.status, "exited");
+        assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Streaming);
+        writer.write_all(b"trailing output").expect("tail bytes");
+        drop(writer);
+        assert_eq!(pump.join().expect("pump"), b"before exit\ntrailing output");
+        let snapshot =
+            ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
+        assert_eq!(snapshot.status, "exited");
+        assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Complete);
+        assert_eq!(
+            ring.lock().expect("ring").since(1),
+            (vec!["trailing output".to_string()], 2)
+        );
     }
 
     #[test]
