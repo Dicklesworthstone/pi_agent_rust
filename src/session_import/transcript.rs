@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn_failed_envelope_is_not_merged_into_an_adjacent_successful_batch() {
+    fn failed_envelope_is_not_merged_into_an_adjacent_successful_batch() {
         let Message::Assistant(mut failed) = calls(&["a"]) else {
             unreachable!()
         };
