@@ -5062,17 +5062,25 @@ impl Agent {
 
         if let Some(signal) = abort.as_ref() {
             use futures::future::{Either, select};
-            let all_fut = stream::iter(futures)
-                .buffer_unordered(parallelism)
-                .collect::<Vec<_>>()
-                .fuse();
+            let pending = stream::iter(futures).buffer_unordered(parallelism);
             let abort_fut = signal.wait().fuse();
-            futures::pin_mut!(all_fut, abort_fut);
-
-            match select(all_fut, abort_fut).await {
-                Either::Left((batch_results, _)) => batch_results,
-                Either::Right(_) => Vec::new(), // Aborted
+            futures::pin_mut!(pending, abort_fut);
+            // Completed work belongs to the transcript even when a sibling
+            // remains blocked. Racing cancellation against collect() drops
+            // its already-collected outputs and later misreports those calls
+            // as aborted. Keep each observed completion outside the future
+            // that cancellation drops; only unfinished calls receive the
+            // synthetic cancellation results in execute_tool_calls.
+            let mut completed = Vec::new();
+            while !signal.is_aborted() {
+                let next = pending.next().fuse();
+                futures::pin_mut!(next);
+                match select(next, abort_fut.as_mut()).await {
+                    Either::Left((Some(result), _)) => completed.push(result),
+                    Either::Left((None, _)) | Either::Right(_) => break,
+                }
             }
+            completed
         } else {
             stream::iter(futures)
                 .buffer_unordered(parallelism)
@@ -11862,7 +11870,10 @@ mod abort_tests {
     }
 
     #[derive(Debug)]
-    struct ToolCallProvider;
+    struct ToolCallProvider {
+        tool_calls: Vec<ToolCall>,
+        calls: AtomicUsize,
+    }
 
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
@@ -11886,13 +11897,14 @@ mod abort_tests {
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let message = AssistantMessage {
-                content: vec![ContentBlock::ToolCall(ToolCall {
-                    id: "call-1".to_string(),
-                    name: "hanging_tool".to_string(),
-                    arguments: json!({}),
-                    thought_signature: None,
-                })],
+                content: self
+                    .tool_calls
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::ToolCall)
+                    .collect(),
                 api: "test-api".to_string(),
                 provider: "test-provider".to_string(),
                 model: "test-model".to_string(),
@@ -11946,6 +11958,105 @@ mod abort_tests {
         ) -> crate::error::Result<ToolOutput> {
             futures::future::pending::<()>().await;
             unreachable!("hanging tool should be aborted by the agent")
+        }
+    }
+
+    /// Exercise the real read tool while making its completion visible to the
+    /// blocked sibling without a scheduler- or wall-clock-dependent delay.
+    struct NotifyingReadTool {
+        inner: crate::tools::ReadTool,
+        completed: Arc<AtomicUsize>,
+        ready: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for NotifyingReadTool {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn label(&self) -> &str {
+            self.inner.label()
+        }
+
+        fn description(&self) -> &str {
+            self.inner.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            self.inner.parameters()
+        }
+
+        fn effects(&self) -> ToolEffects {
+            self.inner.effects()
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            input: serde_json::Value,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            let result = self.inner.execute(tool_call_id, input, on_update).await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            self.ready.notify_one();
+            result
+        }
+    }
+
+    struct BlockedToolDropGuard(Arc<AtomicBool>);
+
+    impl Drop for BlockedToolDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct AbortAfterReadsTool {
+        completed: Arc<AtomicUsize>,
+        ready: Arc<Notify>,
+        abort: AbortHandle,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for AbortAfterReadsTool {
+        fn name(&self) -> &'static str {
+            "blocked_network"
+        }
+
+        fn label(&self) -> &'static str {
+            "Blocked network operation"
+        }
+
+        fn description(&self) -> &'static str {
+            "Remains pending when the operator cancels after both reads complete"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::network()
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            let _drop_guard = BlockedToolDropGuard(Arc::clone(&self.dropped));
+            loop {
+                let ready = self.ready.notified();
+                if self.completed.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                ready.await;
+            }
+            self.abort.abort();
+            futures::future::pending().await
         }
     }
 
@@ -12435,7 +12546,15 @@ mod abort_tests {
         let handle = runtime.handle();
 
         runtime.block_on(async move {
-            let provider = Arc::new(ToolCallProvider);
+            let provider = Arc::new(ToolCallProvider {
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "hanging_tool".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }],
+                calls: AtomicUsize::new(0),
+            });
             let tools = ToolRegistry::from_tools(vec![Box::new(HangingTool)]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -12502,6 +12621,193 @@ mod abort_tests {
             assert_eq!(details["reason"], "abort_signal");
             assert_eq!(details["toolName"], "hanging_tool");
             assert_eq!(details["cleanup"], "tool_result_recorded_no_success");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn abort_preserves_completed_batch_results_in_persisted_history() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("completed.txt"),
+                "completed before cancellation\n",
+            )
+            .unwrap();
+            let completed = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(Notify::new());
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let tools = ToolRegistry::from_tools(vec![
+                Box::new(NotifyingReadTool {
+                    inner: crate::tools::ReadTool::new(temp.path()),
+                    completed: Arc::clone(&completed),
+                    ready: Arc::clone(&ready),
+                }),
+                Box::new(AbortAfterReadsTool {
+                    completed: Arc::clone(&completed),
+                    ready,
+                    abort: abort_handle,
+                    dropped: Arc::clone(&dropped),
+                }),
+                Box::new(crate::tools::WriteTool::new(temp.path())),
+            ]);
+            let provider = Arc::new(ToolCallProvider {
+                tool_calls: [
+                    ("read-complete", "read", json!({"path": "completed.txt"})),
+                    (
+                        "read-error",
+                        "read",
+                        json!({"path": "completed.txt", "limit": 0}),
+                    ),
+                    ("still-running", "blocked_network", json!({})),
+                    (
+                        "never-started",
+                        "write",
+                        json!({"path": "must-not-exist.txt", "content": "not admitted"}),
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, name, arguments)| ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                    thought_signature: None,
+                })
+                .collect(),
+                calls: AtomicUsize::new(0),
+            });
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                tools,
+                AgentConfig::default(),
+            );
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            ))));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let observed = Arc::clone(&events);
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(30),
+                agent_session.run_text_with_abort(
+                    "read the file twice, then write".to_string(),
+                    Some(abort_signal),
+                    move |event| observed.lock().unwrap().push(event),
+                ),
+            )
+            .await
+            .expect("cancelling a blocked sibling must finish the turn")
+            .expect("the cancelled turn must save completed work");
+            assert_eq!(result.stop_reason, StopReason::Aborted);
+            assert_eq!(completed.load(Ordering::SeqCst), 2);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert!(!temp.path().join("must-not-exist.txt").exists());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let path = session
+                .lock(cx.cx())
+                .await
+                .unwrap()
+                .path
+                .clone()
+                .expect("the cancelled turn must have a persisted session");
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen the cancelled session");
+            let persisted = reopened.to_messages_for_current_path();
+            let results = persisted
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|result| result.tool_call_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["read-complete", "read-error", "still-running", "never-started"],
+            );
+            assert!(!results[0].is_error);
+            assert!(results[0].content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("completed before cancellation")
+                )
+            }));
+            assert!(results[1].is_error);
+            assert!(results[1].content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("`limit` must be greater than 0")
+                )
+            }));
+            assert!(results[1].details.is_none());
+            for result in &results[2..] {
+                assert!(result.is_error);
+                let details = result.details.as_ref().expect("cancellation details");
+                assert_eq!(details["schema"], TOOL_CANCELLATION_SCHEMA_V1);
+                assert_eq!(details["reason"], "abort_signal");
+            }
+
+            let events = events.lock().unwrap();
+            for result in &results {
+                let ends = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::ToolExecutionEnd {
+                            tool_call_id,
+                            result: output,
+                            is_error,
+                            ..
+                        } if tool_call_id == &result.tool_call_id => Some((output, is_error)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ends.len(), 1, "one terminal event per tool call");
+                assert_eq!(*ends[0].1, result.is_error);
+                assert_eq!(
+                    serde_json::to_value(&ends[0].0.content).unwrap(),
+                    serde_json::to_value(&result.content).unwrap(),
+                );
+                assert_eq!(ends[0].0.details, result.details);
+                let message_end_count = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            AgentEvent::MessageEnd {
+                                message: Message::ToolResult(message),
+                            } if message.tool_call_id == result.tool_call_id
+                        )
+                    })
+                    .count();
+                assert_eq!(message_end_count, 1, "one transcript event per tool result");
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                    .count(),
+                1,
+            );
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::AgentEnd { error: Some(error), .. }) if error == "Aborted"
+            ));
         });
     }
 }
