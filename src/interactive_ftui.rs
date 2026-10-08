@@ -8112,9 +8112,6 @@ fn build_fork_session(
         .header
         .thinking_level
         .clone_from(&source.header.thinking_level);
-    if let Some(parent) = source.path.as_ref() {
-        forked.set_branched_from(Some(parent.display().to_string()));
-    }
     forked.init_from_fork_plan(plan);
     Ok((forked, selected_text))
 }
@@ -15335,6 +15332,77 @@ mod tests {
         assert_eq!(forked.header.model_id.as_deref(), Some("claude-test"));
         assert_eq!(forked.header.thinking_level.as_deref(), Some("high"));
         assert_eq!(forked.session_dir.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn ftui_fork_preserves_a_lazy_sources_workspace_and_resumed_sdk_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
+            let (mut fork, selected_text) = build_fork_session(
+                &fixture.source,
+                &fixture.target_id,
+                "anthropic".to_string(),
+                "test-model".to_string(),
+            )
+            .expect("build FTUI fork");
+            assert_eq!(selected_text, "revise this request");
+            fixture.assert_workspace(&fork);
+            fixture.assert_selected_context(&fork);
+            fork.save().await.expect("persist FTUI fork");
+            let mut workspace = crate::workspace::WorkspaceHandle::single(&fixture.bound_cwd);
+            workspace.add_root(&fixture.additional_root);
+            let options = crate::sdk::SessionOptions {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-4o".to_string()),
+                api_key: Some("fork-workspace-test-key".to_string()),
+                session_path: fork.path.clone(),
+                working_directory: Some(fixture.bound_cwd.clone()),
+                workspace: Some(workspace),
+                workspace_trusted: true,
+                enabled_tools: Some(vec!["write".to_string()]),
+                ..crate::sdk::SessionOptions::default()
+            };
+            let handle = crate::sdk::create_agent_session(options)
+                .await
+                .expect("resume FTUI fork in its attached workspace");
+            assert!(
+                handle
+                    .session()
+                    .agent
+                    .system_prompt()
+                    .unwrap()
+                    .contains(crate::session::fork_tests::WORKSPACE_CONTEXT)
+            );
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let output = tools
+                .get("write")
+                .expect("write tool")
+                .execute(
+                    "fork-workspace-write",
+                    serde_json::json!({"path": "fork-continuation.txt", "content": "continued fork"}),
+                    None,
+                )
+                .await
+                .expect("write from resumed fork");
+            assert!(!output.is_error);
+            assert_eq!(
+                std::fs::read_to_string(fixture.bound_cwd.join("fork-continuation.txt"))
+                    .expect("fork output in bound workspace"),
+                "continued fork"
+            );
+            assert!(!fixture.original_cwd.exists());
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            assert_eq!(
+                std::fs::read(&fixture.source_file).expect("unchanged source"),
+                fixture.source_bytes
+            );
+        }));
     }
 
     /// While a login waits for input, the next line is the secret: it goes to

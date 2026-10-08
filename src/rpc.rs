@@ -4552,7 +4552,6 @@ pub async fn run(
                     } else {
                         crate::session::Session::in_memory()
                     };
-                    new_session.header.parent_session = parent_path;
                     new_session
                         .header
                         .provider
@@ -4566,6 +4565,7 @@ pub async fn run(
                         .thinking_level
                         .clone_from(&header_snapshot.thinking_level);
                     new_session.init_from_fork_plan(fork_plan);
+                    crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)?;
                     let origin_session_id = header_snapshot.id;
 
                     // Phase 3: prepare and persist the complete target runtime,
@@ -12087,6 +12087,147 @@ mod retry_tests {
             }));
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    #[test]
+    fn rpc_fork_preserves_a_lazy_sources_attached_workspace_and_context() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], &fixture.bound_cwd, None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(fixture.source.clone()));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let mut options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
+            options.working_directory = Some(fixture.bound_cwd.clone());
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id})
+                        .to_string(),
+                )
+                .await
+                .expect("send fork");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            Box::pin(run(agent_session, options, in_rx, out_tx))
+                .await
+                .expect("RPC loop");
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event JSON"))
+                .find(|value| value["type"] == "response" && value["command"] == "fork")
+                .expect("fork response");
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["data"]["text"], "revise this request");
+            let fork_path = {
+                let cx = AgentCx::for_request();
+                let fork = inner_session.lock(&cx).await.expect("forked session");
+                fixture.assert_workspace(&fork);
+                fixture.assert_selected_context(&fork);
+                fork.path.clone().expect("persisted fork path")
+            };
+            let saved = Session::open(fork_path.to_str().unwrap())
+                .await
+                .expect("reopen RPC fork");
+            fixture.assert_workspace(&saved);
+            fixture.assert_selected_context(&saved);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                std::fs::read(&fixture.source_file).expect("unchanged source"),
+                fixture.source_bytes
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_fork_rejects_a_newer_attachment_outside_its_runtime_workspace() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
+            let runtime_cwd = temp
+                .path()
+                .join("previous-workspace")
+                .canonicalize()
+                .expect("runtime workspace");
+            assert_eq!(
+                crate::session_workdir::require_session_workdir(&fixture.source)
+                    .expect("lazy active branch still sees its earlier binding"),
+                runtime_cwd
+            );
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], &runtime_cwd, None),
+                AgentConfig::default(),
+            );
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(fixture.source.clone()));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let mut options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
+            options.working_directory = Some(runtime_cwd);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id})
+                        .to_string(),
+                )
+                .await
+                .expect("send fork");
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            Box::pin(run(agent_session, options, in_rx, out_tx))
+                .await
+                .expect("RPC loop");
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event JSON"))
+                .find(|value| value["type"] == "response" && value["command"] == "fork")
+                .expect("fork response");
+            assert_eq!(response["success"], false, "{response}");
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("PI_SESSION_WORKDIR_MISMATCH"))
+            );
+            let cx = AgentCx::for_request();
+            let source = inner_session
+                .lock(&cx)
+                .await
+                .expect("unchanged source session");
+            assert_eq!(source.header.id, fixture.source.header.id);
+            assert_eq!(source.leaf_id(), fixture.source.leaf_id());
+            assert_eq!(source.entries.len(), fixture.source.entries.len());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(!temp.path().join("sessions").exists());
+            assert_eq!(
+                std::fs::read(&fixture.source_file).expect("unchanged source"),
+                fixture.source_bytes
+            );
+        }));
     }
 
     #[test]

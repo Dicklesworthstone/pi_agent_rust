@@ -362,6 +362,7 @@ impl PiApp {
         let agent = Arc::clone(&self.agent);
         let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
+        let runtime_cwd = self.cwd.clone();
         let model_provider = self.model_entry.model.provider.clone();
         let model_id = self.model_entry.model.id.clone();
         let (thinking_level, session_id) = if let Ok(guard) = self.session.try_lock() {
@@ -401,7 +402,7 @@ impl PiApp {
                 }
             }
 
-            let (fork_plan, parent_path, session_dir) = {
+            let (fork_plan, session_dir) = {
                 let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
@@ -426,10 +427,9 @@ impl PiApp {
                         return;
                     }
                 };
-                let parent_path = guard.path.as_ref().map(|p| p.display().to_string());
                 let session_dir = guard.session_dir.clone();
                 drop(guard);
-                (fork_plan, parent_path, session_dir)
+                (fork_plan, session_dir)
             };
 
             let selected_text = fork_plan.selected_text.clone();
@@ -438,10 +438,17 @@ impl PiApp {
             new_session.header.provider = Some(model_provider);
             new_session.header.model_id = Some(model_id);
             new_session.header.thinking_level = thinking_level;
-            if let Some(parent_path) = parent_path {
-                new_session.set_branched_from(Some(parent_path));
-            }
             new_session.init_from_fork_plan(fork_plan);
+            if let Err(err) = crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)
+            {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(format!("Failed to fork session: {err}")),
+                )
+                .await;
+                return;
+            }
             let new_session_id = new_session.header.id.clone();
 
             if let Err(err) = new_session.save().await {

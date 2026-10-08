@@ -5043,6 +5043,103 @@ mod tests {
     }
 
     #[test]
+    fn classic_fork_preserves_a_lazy_sources_attached_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            temp.path(),
+            true,
+        ));
+        let source = Arc::new(Mutex::new(fixture.source.clone()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &fixture.bound_cwd);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork event before timeout")
+            .expect("fork event")
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(app.cwd, fixture.bound_cwd);
+        let fork_path = {
+            let fork = app.session.try_lock().expect("forked session");
+            fixture.assert_workspace(&fork);
+            fixture.assert_selected_context(&fork);
+            fork.path.clone().expect("persisted fork path")
+        };
+        let saved = runtime()
+            .block_on(Session::open(fork_path.to_str().expect("UTF-8 fork path")))
+            .expect("reopen classic fork");
+        fixture.assert_workspace(&saved);
+        fixture.assert_selected_context(&saved);
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
+    fn classic_fork_rejects_a_newer_attachment_outside_its_runtime_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            temp.path(),
+            true,
+        ));
+        let runtime_cwd = temp
+            .path()
+            .join("previous-workspace")
+            .canonicalize()
+            .expect("runtime workspace");
+        assert_eq!(
+            crate::session_workdir::require_session_workdir(&fixture.source)
+                .expect("lazy active branch still sees its earlier binding"),
+            runtime_cwd
+        );
+        let source = Arc::new(Mutex::new(fixture.source.clone()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &runtime_cwd);
+        let source_id = current_session_id(&app);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork error before timeout")
+            .expect("fork error")
+        });
+        assert!(
+            matches!(&terminal, PiMsg::AgentError(error) if error.contains("PI_SESSION_WORKDIR_MISMATCH")),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), source_id);
+        assert_eq!(app.cwd, runtime_cwd);
+        let source = app.session.try_lock().expect("unchanged source session");
+        assert_eq!(source.leaf_id(), fixture.source.leaf_id());
+        assert_eq!(source.entries.len(), fixture.source.entries.len());
+        assert!(!temp.path().join("sessions").exists());
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
     fn fork_rejects_staged_old_session_delivery() {
         let temp = TempDir::new().expect("tempdir");
         let mut raw_session = Session::in_memory();

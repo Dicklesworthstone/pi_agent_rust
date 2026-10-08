@@ -4,6 +4,8 @@
 //! branching and history navigation.
 
 pub(crate) mod attachments;
+#[cfg(test)]
+pub(crate) mod fork_tests;
 
 use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
@@ -2852,6 +2854,12 @@ pub struct ForkPlan {
     pub leaf_id: Option<String>,
     /// Text of the selected user message (for editor pre-fill).
     pub selected_text: String,
+    // Session-wide metadata must come from the source, independently of the
+    // selected conversation ancestry or the caller's process directory.
+    original_cwd: String,
+    additional_roots: Option<Vec<String>>,
+    parent_session: Option<String>,
+    inherited_workdir_binding: Option<Value>,
 }
 
 /// Lightweight snapshot of session data for non-blocking export.
@@ -5487,6 +5495,15 @@ impl Session {
     /// Returns the entries to copy into a new session (path to the parent of the selected
     /// user message), the new leaf id, and the selected user message text for editor pre-fill.
     pub fn plan_fork_from_user_message(&self, entry_id: &str) -> Result<ForkPlan> {
+        if self.v2_partial_hydration {
+            // A tail/active-path view can omit both the selected message's
+            // ancestry and the latest session-wide workspace attachment.
+            // Hydrate a clone so preparing a fork never navigates or mutates
+            // the live source session, including its pending local entries.
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration_before_save()?;
+            return complete.plan_fork_from_user_message(entry_id);
+        }
         let entry = self
             .get_entry(entry_id)
             .ok_or_else(|| Error::session(format!("Fork target not found: {entry_id}")))?;
@@ -5527,10 +5544,34 @@ impl Session {
             Vec::new()
         };
 
+        // Validate the latest reserved record before carrying it forward; an
+        // invalid/newer binding must never revive an older copied directory.
+        crate::session_workdir::inspect_session_workdir(self)?;
+        let inherited_workdir_binding = self.entries.iter().rev().find_map(|entry| {
+            let SessionEntry::Custom(custom) = entry else {
+                return None;
+            };
+            (custom.custom_type == crate::session_workdir::WORKDIR_BINDING_TYPE)
+                .then_some(custom)
+        });
+        let inherited_workdir_binding = inherited_workdir_binding
+            .filter(|binding| {
+                !binding.base.id.as_deref().is_some_and(|binding_id| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.base_id().map(String::as_str) == Some(binding_id))
+                })
+            })
+            .and_then(|binding| binding.data.clone());
+
         Ok(ForkPlan {
             entries,
             leaf_id,
             selected_text,
+            original_cwd: self.header.cwd.clone(),
+            additional_roots: self.header.additional_roots.clone(),
+            parent_session: self.path.as_ref().map(|path| path.display().to_string()),
+            inherited_workdir_binding,
         })
     }
 
@@ -5670,15 +5711,29 @@ impl Session {
         self.leaf_id.as_deref()
     }
 
-    /// Initialize the session entries and leaf from a `ForkPlan`.
+    /// Initialize a new session's history and source provenance from a `ForkPlan`.
     ///
-    /// This safely applies the new entries and leaf, and rebuilds
-    /// all internal caches (including the `is_linear` optimization flag).
+    /// A workspace binding outside the selected ancestry is inherited as a
+    /// separate metadata entry. It never becomes the selected conversation
+    /// leaf, and its parent cannot point into an omitted source branch.
     pub fn init_from_fork_plan(&mut self, plan: ForkPlan) {
         self.entries = plan.entries;
         self.leaf_id = plan.leaf_id;
+        self.header.cwd = plan.original_cwd;
+        self.header.additional_roots = plan.additional_roots;
+        self.header.parent_session = plan.parent_session;
+        if let Some(data) = plan.inherited_workdir_binding {
+            let id = generate_entry_id(&entry_id_set(&self.entries));
+            self.entries.push(SessionEntry::Custom(CustomEntry {
+                base: EntryBase::new(self.leaf_id.clone(), id),
+                custom_type: crate::session_workdir::WORKDIR_BINDING_TYPE.to_string(),
+                data: Some(data),
+            }));
+        }
         self.rebuild_all_caches();
         self.sync_navigation_state_to_header();
+        self.header_dirty = true;
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
     }
 
     /// Set the leaf ID directly (for tests only).

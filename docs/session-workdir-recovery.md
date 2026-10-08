@@ -5,7 +5,7 @@ project configuration or constructing tools and extensions. The
 `session_workdir` library module and developer example also provide read-only
 inspection and an explicit locate-and-attach flow for moved projects.
 This implements part of **bd-yutps**; the bead remains open pending executable
-validation and the remaining discovery and child-session integration.
+validation and the remaining discovery integration.
 
 ## Ordinary CLI and SDK use
 
@@ -50,8 +50,16 @@ and MCP credential helpers use the selected workspace. Bedrock's provider-owned
 request-time reload of legacy `auth.json` command credentials still needs the
 runtime workspace threaded through it.
 
-Recent-session indexing under a replacement workspace and automatic
-propagation into newly created child sessions still require integration.
+Forks created through classic, FTUI, and RPC inherit the original cwd,
+additional roots, direct parent-session provenance, and the latest workdir
+binding. A lazy source is hydrated on an independent copy, including fork
+targets outside the loaded branch. An off-branch binding remains metadata and
+does not change the fork's selected conversation or editor prefill. Classic
+and RPC refuse a fork before saving or installing it if a newly discovered
+attachment conflicts with the active runtime workspace.
+
+Recent-session indexing under a replacement workspace still requires
+integration; an explicit `--session` path remains available after attachment.
 
 ## Developer recovery example
 
@@ -107,7 +115,8 @@ than relying on a lazily loaded V2 tail. Native loading then validates the
 transcript, and startup checks that the source still matches the observation.
 An attachment request hydrates a lazy store before determining its previous
 binding. A malformed latest attachment is an error, not permission to revive
-an older binding. Fork/child creation must also preserve this metadata.
+an older binding. Fork creation preserves this metadata independently of the
+selected conversation ancestry.
 
 Read-only export/import should remain possible for a missing workspace and
 must not require the launch guard. Recovery of a source with parsing warnings
@@ -124,6 +133,9 @@ bindings, restored root access and revocation, native source-change rejection,
 project configuration, explicit CLI attachment, and ephemeral/read-only paths.
 Additional regressions cover RPC shell execution and session switching,
 classic resume and new sessions, prompt files, and credential command cwd.
+Fork regressions cover saved/reopened context, root forks with empty history,
+off-branch lazy targets and bindings, actual classic/FTUI/RPC entrypoints,
+source immutability, and refusal of a stale runtime workspace.
 They were **not executed in the authoring environment** because DSR was absent.
 No compilation, formatting, Clippy or test pass is claimed.
 
