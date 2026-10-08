@@ -6,7 +6,8 @@
 mod ownership;
 
 use super::{
-    AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, ContentBlock,
+    AbortHandle, AbortSignal, AgentEvent, AgentSession, AgentSessionHandle, AssistantMessage,
+    ContentBlock,
     Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
     RpcExtensionUiResponse, SessionPromptResult, SessionTransport, SessionTransportEvent,
     StopReason, TextContent, UserContent,

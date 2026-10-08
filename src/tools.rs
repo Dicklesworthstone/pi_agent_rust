@@ -190,12 +190,16 @@ pub trait Tool: Send + Sync {
     /// Tools making a second model request use `protect` on complete source
     /// fields before formatting or truncation. Ordinary tools retain their
     /// normal execution path and do not capture session state in the registry.
+    ///
+    /// `protect` names its lifetimes with `for<'a, 'b>` because `#[async_trait]`
+    /// replaces elided lifetimes inside `Fn(..)` with method lifetimes, which
+    /// would make the callback accept only one caller-chosen borrow.
     async fn execute_with_auxiliary_privacy(
         &self,
         tool_call_id: &str,
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        protect: &(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync),
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
         let _ = protect;
         self.execute(tool_call_id, input, on_update).await

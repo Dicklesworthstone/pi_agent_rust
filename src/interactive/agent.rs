@@ -3440,7 +3440,7 @@ mod stream_delta_batcher_tests {
     use crate::agent::{Agent, AgentConfig};
     use crate::config::Config;
     use crate::keybindings::KeyBindings;
-    use crate::model::{AssistantMessage, StreamEvent, Usage};
+    use crate::model::{AssistantMessage, ImageContent, StreamEvent, Usage};
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::Session;
@@ -4396,11 +4396,13 @@ mod stream_delta_batcher_tests {
             let events = drive_turn(&mut app, &mut receiver);
             assert!(matches!(
                 events.last(),
-                Some(PiMsg::AgentError(_))
-                    | Some(PiMsg::AgentDone {
-                        stop_reason: StopReason::Error,
-                        ..
-                    })
+                Some(
+                    PiMsg::AgentError(_)
+                        | PiMsg::AgentDone {
+                            stop_reason: StopReason::Error,
+                            ..
+                        }
+                )
             ));
             assert!(
                 !events
@@ -4806,7 +4808,21 @@ mod stream_delta_batcher_tests {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(temp.path().join("sessions")),
         )));
-        app.agent = Arc::new(asupersync::sync::Mutex::new(agent));
+        app.agent = Arc::new(asupersync::sync::Mutex::new(InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default()
+                    },
+                )
+                .with_runtime_handle(runtime_handle()),
+                crate::sdk::EventListeners::default(),
+            ),
+        }));
         app.session = Arc::clone(&session);
         app.cwd = temp.path().to_path_buf();
         app.model_entry = entry.clone();

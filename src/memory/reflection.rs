@@ -552,7 +552,7 @@ impl Tool for ReflectTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        protect: &(dyn Fn(&[&str]) -> Result<Vec<String>> + Send + Sync),
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
         self.execute_reflection(input, Some(protect)).await
     }

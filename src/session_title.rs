@@ -229,7 +229,7 @@ fn push_field<'a>(fields: &mut Vec<&'a str>, bytes: &mut usize, text: &'a str) -
         return Err(Error::validation(
             "PI_AUXILIARY_INPUT_LIMIT: session title input exceeds the privacy scan budget",
         ));
-    }
+    };
     *bytes = next_bytes;
     fields.push(text);
     Ok(())
