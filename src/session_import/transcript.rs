@@ -65,6 +65,8 @@ impl Batch {
 
     fn can_join(&self, message: &AssistantMessage) -> bool {
         self.results.is_empty()
+            && assistant_allows_tool_replay(&self.assistant)
+            && assistant_allows_tool_replay(message)
             && self.assistant.provider == message.provider
             && self.assistant.api == message.api
             && self.assistant.model == message.model
@@ -91,6 +93,14 @@ fn has_calls(message: &AssistantMessage) -> bool {
         .content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+}
+
+/// A matching output ID cannot turn an interrupted/failed model response into
+/// a completed call. Failed tool *executions* are different: their is_error
+/// results still complete a successfully authored call and remain replayable.
+fn assistant_allows_tool_replay(message: &AssistantMessage) -> bool {
+    matches!(message.stop_reason, StopReason::Stop | StopReason::ToolUse)
+        && message.error_message.is_none()
 }
 
 pub(super) fn normalize(records: Vec<SourceRecord>) -> Normalized {
@@ -213,12 +223,13 @@ fn flush_batch(
         return;
     };
     // Indexed membership keeps large parallel batches out of a quadratic
-    // call-by-output scan. Owned ids let the result vector be consumed below.
-    let observed: BTreeSet<String> = batch
+    // call-by-output scan. The resulting valid map owns its ids and names.
+    let observed: HashMap<&str, &str> = batch
         .results
         .iter()
-        .map(|result| result.tool_call_id.clone())
+        .map(|result| (result.tool_call_id.as_str(), result.tool_name.as_str()))
         .collect();
+    let replayable = assistant_allows_tool_replay(&batch.assistant);
     let valid: HashMap<String, String> = batch
         .assistant
         .content
@@ -228,7 +239,18 @@ fn flush_batch(
                 return None;
             };
             let count = counts.get(&call.id)?;
-            if count.calls == 1 && count.results == 1 && observed.contains(&call.id) {
+            let result_name = observed.get(call.id.as_str())?;
+            // Missing foreign result names can be filled from a unique call.
+            // An explicit conflicting name is evidence against pairing, not
+            // permission to silently relabel the recorded output.
+            if replayable
+                && !call.id.trim().is_empty()
+                && !call.name.trim().is_empty()
+                && call.arguments.is_object()
+                && count.calls == 1
+                && count.results == 1
+                && (result_name.is_empty() || *result_name == call.name.as_str())
+            {
                 Some((call.id.clone(), call.name.clone()))
             } else {
                 None
@@ -250,11 +272,13 @@ fn flush_batch(
             unresolved = true;
         }
     }
-    batch.assistant.stop_reason = if valid.is_empty() {
-        StopReason::Stop
-    } else {
-        StopReason::ToolUse
-    };
+    if !valid.is_empty() {
+        batch.assistant.stop_reason = StopReason::ToolUse;
+    } else if batch.assistant.stop_reason == StopReason::ToolUse {
+        // Remove the pending-tool marker without erasing an original error,
+        // abort, truncation, or paused-turn termination from the transcript.
+        batch.assistant.stop_reason = StopReason::Stop;
+    }
     out.messages.push(Message::assistant(batch.assistant));
 
     // Complete protocol results first; unpaired outputs are historical context
@@ -275,7 +299,7 @@ fn flush_batch(
         out.reconciliations.push(Reconciliation {
             source_lines: batch.lines.into_iter().collect(),
             reason: if unresolved {
-                "incomplete or ambiguous tool exchanges retained as non-executable history"
+                "incomplete, malformed or ambiguous tool exchanges retained as non-executable history"
             } else {
                 "combined adjacent foreign assistant tool-call envelopes into one native batch"
             }
@@ -382,6 +406,10 @@ mod tests {
                     if let Message::Assistant(assistant) = other {
                         for block in &assistant.content {
                             if let ContentBlock::ToolCall(call) = block {
+                                assert!(assistant.error_message.is_none());
+                                assert!(!call.id.trim().is_empty());
+                                assert!(!call.name.trim().is_empty());
+                                assert!(call.arguments.is_object());
                                 assert!(seen.insert(call.id.clone()), "duplicate native call id");
                                 pending.insert(call.id.clone(), call.name.clone());
                             }
@@ -667,5 +695,145 @@ mod tests {
             .expect("historical result");
         assert!(historical.content.contains("unknown tool"));
         assert!(!historical.content.contains("first_guess"));
+    }
+
+    #[test]
+    fn malformed_calls_are_preserved_but_never_admitted_as_native_pairs() {
+        for (id, name, arguments) in [
+            ("", "tool", json!({})),
+            (" \t", "tool", json!({})),
+            ("a", "", json!({})),
+            ("a", " \n", json!({})),
+            ("a", "tool", json!(null)),
+            ("a", "tool", json!([])),
+            ("a", "tool", json!("{partial")),
+            ("a", "tool", json!(42)),
+        ] {
+            let Message::Assistant(mut assistant) = calls(&[id]) else {
+                unreachable!()
+            };
+            let ContentBlock::ToolCall(call) = &mut Arc::make_mut(&mut assistant).content[0] else {
+                unreachable!()
+            };
+            call.name = name.to_string();
+            call.arguments = arguments;
+            let original = vec![Message::Assistant(assistant), result(id)];
+            let snapshot = serde_json::to_value(&original).expect("original messages");
+            let out = normalize(records(original));
+            assert_complete(&out.messages);
+            assert_eq!(native_call_count(&out.messages), 0);
+            assert_eq!(out.messages.len(), 2);
+            assert!(matches!(&out.messages[1], Message::Custom(_)));
+            assert_eq!(out.reconciliations.len(), 1);
+            assert!(out.reconciliations[0].unresolved);
+            assert_eq!(
+                serde_json::to_value(&out.reconciliations[0].original_messages)
+                    .expect("audit messages"),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_name_conflicts_do_not_poison_other_completed_pairs() {
+        let Message::ToolResult(mut conflicting) = result("a") else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut conflicting).tool_name = "different_tool".to_string();
+        let out = normalize(records(vec![
+            calls(&["a", "b"]),
+            Message::ToolResult(conflicting),
+            result("b"),
+        ]));
+        assert_complete(&out.messages);
+        assert_eq!(native_call_count(&out.messages), 1);
+        let Message::ToolResult(completed) = &out.messages[1] else {
+            panic!("valid tool output must precede historical context")
+        };
+        assert_eq!(completed.tool_call_id, "b");
+        assert!(completed.is_error, "failed execution is still a completed exchange");
+        let Message::Custom(historical) = &out.messages[2] else {
+            panic!("conflicting output must remain historical")
+        };
+        assert!(historical.content.contains("different_tool"));
+        assert_eq!(
+            historical.details.as_ref().expect("details")["toolResult"]["toolName"],
+            json!("different_tool")
+        );
+        assert!(out.reconciliations[0].unresolved);
+    }
+
+    #[test]
+    fn failed_or_interrupted_assistant_envelopes_cannot_become_completed_calls() {
+        for reason in [
+            StopReason::Error,
+            StopReason::Aborted,
+            StopReason::Length,
+            StopReason::PauseTurn,
+        ] {
+            let Message::Assistant(mut assistant) = calls(&["a"]) else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut assistant).stop_reason = reason;
+            let out = normalize(records(vec![Message::Assistant(assistant), result("a")]));
+            assert_complete(&out.messages);
+            assert_eq!(native_call_count(&out.messages), 0);
+            let Message::Assistant(historical) = &out.messages[0] else {
+                panic!("historical assistant")
+            };
+            assert_eq!(historical.stop_reason, reason);
+            assert!(out.reconciliations[0].unresolved);
+        }
+    }
+
+    #[test]
+    fn error_metadata_refuses_replay_even_with_a_successful_stop_reason() {
+        let Message::Assistant(mut assistant) = calls(&["a"]) else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut assistant).error_message = Some("source stream failed".to_string());
+        let original = vec![Message::Assistant(assistant), result("a")];
+        let snapshot = serde_json::to_value(&original).expect("original messages");
+        let out = normalize(records(original));
+        assert_complete(&out.messages);
+        assert_eq!(native_call_count(&out.messages), 0);
+        assert_eq!(
+            serde_json::to_value(&out.reconciliations[0].original_messages)
+                .expect("audit messages"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn_failed_envelope_is_not_merged_into_an_adjacent_successful_batch() {
+        let Message::Assistant(mut failed) = calls(&["a"]) else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut failed).stop_reason = StopReason::Error;
+        let out = normalize(records(vec![
+            Message::Assistant(failed),
+            calls(&["b"]),
+            result("b"),
+            result("a"),
+        ]));
+        assert_complete(&out.messages);
+        assert_eq!(native_call_count(&out.messages), 1);
+        let Message::Assistant(first) = &out.messages[0] else {
+            panic!("historical failed envelope")
+        };
+        assert_eq!(first.stop_reason, StopReason::Error);
+        assert!(out.reconciliations.iter().any(|notice| notice.unresolved));
+    }
+
+    #[test]
+    fn successful_stop_with_completed_tool_output_is_still_replayable() {
+        let Message::Assistant(mut assistant) = calls(&["a"]) else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut assistant).stop_reason = StopReason::Stop;
+        let out = normalize(records(vec![Message::Assistant(assistant), result("a")]));
+        assert_complete(&out.messages);
+        assert_eq!(native_call_count(&out.messages), 1);
+        assert!(out.reconciliations.is_empty());
     }
 }
