@@ -45,10 +45,14 @@ Classic and RPC live session switches require the target attachment to match
 the current runtime workspace. FTUI replacement sessions carry the same
 explicit workspace assertion. A refused switch preserves the active session;
 launch a new `pi --session ...` process to move to another project. RPC shell
-commands, new-session headers, prompt files, startup credential-command lookups,
-and MCP credential helpers use the selected workspace. Bedrock's provider-owned
-request-time reload of legacy `auth.json` command credentials still needs the
-runtime workspace threaded through it.
+commands, new-session headers, prompt files, stored credential commands, and
+MCP credential helpers use the selected workspace. Credential reloads after
+login/logout, model selection, resource reload, usage queries, and SDK fallback
+selection retain that runtime workspace. A caller-supplied fallback auth store
+keeps its credentials and storage path while inheriting the active runtime's
+command context. Bedrock's provider-owned request-time reload of legacy
+`auth.json` command credentials still needs the runtime workspace threaded
+through it.
 
 Forks created through classic, FTUI, and RPC inherit the original cwd,
 additional roots, direct parent-session provenance, and the latest workdir
@@ -133,6 +137,8 @@ bindings, restored root access and revocation, native source-change rejection,
 project configuration, explicit CLI attachment, and ephemeral/read-only paths.
 Additional regressions cover RPC shell execution and session switching,
 classic resume and new sessions, prompt files, and credential command cwd.
+The auth adoption regression executes real credential commands in distinct
+workspaces and checks active and fallback credentials through logout/relogin.
 Fork regressions cover saved/reopened context, root forks with empty history,
 off-branch lazy targets and bindings, actual classic/FTUI/RPC entrypoints,
 source immutability, and refusal of a stale runtime workspace.

@@ -534,7 +534,10 @@ impl AgentSessionHandle {
             .map_or_else(crate::failover::FailoverState::new_empty, |options| {
                 crate::failover::FailoverState::with_cooldown_secs(options.cooldown_secs)
             });
-        self.failover = options.map(Arc::new);
+        self.failover = options.map(|mut options| {
+            self.session.scope_auth_storage(&mut options.auth);
+            Arc::new(options)
+        });
         self
     }
 

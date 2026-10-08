@@ -7025,7 +7025,7 @@ fn adopt_stored_credentials(
     auth_path: &std::path::Path,
 ) {
     match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
-        Ok(auth) => handle.session_mut().adopt_auth_storage(auth),
+        Ok(auth) => handle.adopt_auth_storage(auth),
         Err(err) => tracing::warn!(
             event = "ftui.login.adopt_credentials_failed",
             error = %err,
@@ -8081,8 +8081,17 @@ fn run_undo_command(
 }
 
 /// Handle `/usage` in the driver (bd-cv653.7.4): read-only quota table.
-async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
-    let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+async fn run_usage_command(
+    cwd: &std::path::Path,
+    refresh: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path())
+        .and_then(|mut auth| {
+            auth.set_command_working_directory(cwd)?;
+            Ok(auth)
+        });
+    let message = match auth {
         Ok(auth) => {
             let rows = crate::usage::gather_usage(&auth, refresh).await;
             crate::usage::render_usage_text(&rows)
@@ -9036,7 +9045,7 @@ pub fn run(
                             run_undo_command(&handle, count, force, redo, &agent_tx);
                         }
                         Ok(UiCommand::Usage { refresh }) => {
-                            run_usage_command(refresh, &agent_tx).await;
+                            run_usage_command(&cwd, refresh, &agent_tx).await;
                         }
                         Ok(UiCommand::Mcp { subcommand, name }) => {
                             run_mcp_command(&mut handle, &subcommand, name.as_deref(), &agent_tx)

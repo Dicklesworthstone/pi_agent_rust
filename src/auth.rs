@@ -1500,6 +1500,14 @@ impl AuthStorage {
         Ok(())
     }
 
+    /// A credential reload inherits the active runtime's command context.
+    /// Credential entries and persistence identity remain owned by this store.
+    pub(crate) fn inherit_command_working_directory(&mut self, previous: &Self) {
+        if let Some(cwd) = &previous.command_working_directory {
+            self.command_working_directory = Some(cwd.clone());
+        }
+    }
+
     /// Persist auth.json (atomic write + permissions).
     pub fn save(&self) -> Result<()> {
         let data = serde_json::to_string_pretty(&AuthFileRef {

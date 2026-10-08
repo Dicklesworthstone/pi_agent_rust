@@ -22,7 +22,7 @@ impl PiApp {
     }
 
     fn available_models_with_credentials(&self) -> Vec<ModelEntry> {
-        let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path()).ok();
+        let auth = super::commands::load_runtime_auth(&self.cwd).ok();
         let mut provider_has_credential: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut filtered = Vec::new();
@@ -149,7 +149,7 @@ impl PiApp {
             return;
         }
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
         if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
                 "Missing credentials for provider {}. Run /login {}.",

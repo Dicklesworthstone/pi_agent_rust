@@ -425,7 +425,8 @@ impl PiApp {
                 return;
             }
         };
-        let resolved_key_opt = super::commands::resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt =
+            super::commands::resolve_model_key_from_default_auth(&next, &self.cwd);
         if crate::models::model_requires_configured_credential(&next) && resolved_key_opt.is_none()
         {
             self.status_message = Some(format!(

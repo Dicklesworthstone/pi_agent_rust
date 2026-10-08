@@ -14027,10 +14027,17 @@ impl AgentSession {
         self.auth_storage = Some(auth);
     }
 
+    pub(crate) fn scope_auth_storage(&self, auth: &mut AuthStorage) {
+        if let Some(previous) = &self.auth_storage {
+            auth.inherit_command_working_directory(previous);
+        }
+    }
+
     /// Adopt credentials changed outside this session (`/login`, `/logout`)
     /// and re-resolve the running model's key with the usual precedence:
     /// CLI override, then stored credential, then the catalog entry's key.
-    pub(crate) fn adopt_auth_storage(&mut self, auth: AuthStorage) {
+    pub(crate) fn adopt_auth_storage(&mut self, mut auth: AuthStorage) {
+        self.scope_auth_storage(&mut auth);
         self.auth_storage = Some(auth);
         let entry = self.current_model_entry();
         let key = entry.as_ref().map_or_else(

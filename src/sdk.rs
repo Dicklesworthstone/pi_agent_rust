@@ -2653,7 +2653,8 @@ impl AgentSessionHandle {
 
     /// Apply credentials changed by an interactive login/logout to both the
     /// live model and future fallback candidates, retaining the CLI key pin.
-    pub(crate) fn adopt_auth_storage(&mut self, auth: crate::auth::AuthStorage) {
+    pub(crate) fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
+        self.session.scope_auth_storage(&mut auth);
         self.session.adopt_auth_storage(auth.clone());
         if let Some(options) = &mut self.failover {
             Arc::make_mut(options).auth = auth;
@@ -3469,6 +3470,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             )
         }
     };
+    let failover = options.failover.map(|mut options| {
+        agent_session.scope_auth_storage(&mut options.auth);
+        Arc::new(options)
+    });
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
@@ -3477,7 +3482,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         mcp_manager,
         retry: options.retry,
         failover_state,
-        failover: options.failover.map(Arc::new),
+        failover,
         event_runtime,
     })
 }
@@ -3730,6 +3735,88 @@ mod tests {
     /// requirement, so the walk reaches provider construction.
     fn with_chain(handle: AgentSessionHandle, spec: &str) -> AgentSessionHandle {
         with_chain_cooldown(handle, spec, 300)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_reload_and_failover_keep_the_active_workspace() {
+        let root = tempdir().expect("fixture root");
+        let workspace = root.path().join("workspace");
+        let other = root.path().join("other");
+        std::fs::create_dir(&workspace).expect("runtime workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        std::fs::write(workspace.join("credential.txt"), "runtime-key\n")
+            .expect("runtime credential");
+        std::fs::write(other.join("credential.txt"), "other-key\n")
+            .expect("other credential");
+        let auth_path = root.path().join("auth.json");
+        let fresh_auth = || {
+            let mut auth = AuthStorage::empty_at(auth_path.clone());
+            auth.set(
+                "test-provider",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "$CMD:cat credential.txt".to_string(),
+                },
+            );
+            auth
+        };
+        let (mut handle, _) = flaky_handle(0);
+        let mut initial = AuthStorage::empty_at(auth_path.clone());
+        initial
+            .set_command_working_directory(&workspace)
+            .expect("scope active runtime");
+        handle.session_mut().set_auth_storage(initial);
+        let mut incoming = fresh_auth();
+        incoming
+            .set_command_working_directory(&other)
+            .expect("incoming context must not replace runtime workspace");
+        handle = handle.with_failover(Some(FailoverOptions {
+            chains: std::collections::HashMap::new(),
+            available_models: Vec::new(),
+            auth: incoming.clone(),
+            cli_api_key: None,
+            cooldown_secs: 0,
+        }));
+        assert_eq!(
+            handle
+                .failover
+                .as_ref()
+                .expect("installed failover")
+                .auth
+                .api_key("test-provider")
+                .as_deref(),
+            Some("runtime-key"),
+            "caller-supplied fallback credentials use the active runtime cwd"
+        );
+
+        handle.adopt_auth_storage(incoming);
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("runtime-key"),
+            "login adoption resolves the running model in its original workspace"
+        );
+        assert_eq!(
+            handle
+                .failover
+                .as_ref()
+                .expect("retained failover")
+                .auth
+                .api_key("test-provider")
+                .as_deref(),
+            Some("runtime-key"),
+            "future fallback candidates keep the same scoped credentials"
+        );
+
+        handle
+            .session_mut()
+            .adopt_auth_storage(AuthStorage::empty_at(auth_path.clone()));
+        assert!(handle.session().agent.stream_options().api_key.is_none());
+        handle.session_mut().adopt_auth_storage(fresh_auth());
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("runtime-key"),
+            "direct session adoption retains cwd through logout and another login"
+        );
     }
 
     /// A loopback HTTP endpoint that answers every request with a 401, the

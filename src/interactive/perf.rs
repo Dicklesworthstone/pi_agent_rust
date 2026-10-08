@@ -1126,10 +1126,11 @@ impl PiApp {
     pub(super) fn handle_slash_usage(&mut self, args: &str) -> Option<Cmd> {
         let refresh = args.trim().eq_ignore_ascii_case("refresh");
         let cx = asupersync::Cx::for_request();
+        let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         self.status_message = Some("Fetching provider usage...".to_string());
         self.runtime_handle.spawn(async move {
-            let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+            let message = match super::commands::load_runtime_auth(&cwd) {
                 Ok(auth) => {
                     let rows = crate::usage::gather_usage(&auth, refresh).await;
                     crate::usage::render_usage_text(&rows)

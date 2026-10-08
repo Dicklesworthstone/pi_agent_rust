@@ -1029,9 +1029,20 @@ pub(super) fn resolve_model_key_with_auth(
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
 }
 
-pub(super) fn resolve_model_key_from_default_auth(entry: &ModelEntry) -> Option<String> {
+pub(super) fn load_runtime_auth(
+    cwd: &std::path::Path,
+) -> crate::error::Result<crate::auth::AuthStorage> {
     let auth_path = crate::config::Config::auth_path();
-    crate::auth::AuthStorage::load(auth_path)
+    let mut auth = crate::auth::AuthStorage::load(auth_path)?;
+    auth.set_command_working_directory(cwd)?;
+    Ok(auth)
+}
+
+pub(super) fn resolve_model_key_from_default_auth(
+    entry: &ModelEntry,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    load_runtime_auth(cwd)
         .ok()
         .and_then(|auth| resolve_model_key_with_auth(&auth, entry))
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
@@ -1334,7 +1345,7 @@ impl PiApp {
 
     pub(super) fn sync_active_provider_credentials(&mut self, changed_provider: &str) {
         let changed_canonical = normalize_auth_provider_input(changed_provider);
-        let auth = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+        let auth = match load_runtime_auth(&self.cwd) {
             Ok(auth) => auth,
             Err(err) => {
                 tracing::warn!(
@@ -1655,7 +1666,7 @@ impl PiApp {
             let resolved_key_opt = target_entry
                 .api_key
                 .clone()
-                .or_else(|| resolve_model_key_from_default_auth(&target_entry));
+                .or_else(|| resolve_model_key_from_default_auth(&target_entry, &self.cwd));
             if model_requires_configured_credential(&target_entry) && resolved_key_opt.is_none() {
                 return Err(format!(
                     "Missing credentials for provider {}. Run /login {}.",
@@ -3109,7 +3120,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let next = matches.pop().expect("matches is exactly length 1 here");
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
         if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
                 "Missing credentials for provider {}. Run /login {}.",
@@ -3733,7 +3744,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .cloned()
             .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
         if let Some(entry) = entry {
-            let key = resolve_model_key_from_default_auth(&entry);
+            let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
             if let Ok(provider_impl) = providers::create_provider(&entry, self.extensions.as_ref())
             {
                 let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
@@ -4009,15 +4020,20 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         }
                     }
 
-                    let models_error =
-                        match crate::auth::AuthStorage::load_async(Config::auth_path()).await {
-                            Ok(auth) => {
-                                let models_path = default_models_path(&Config::global_dir());
-                                let registry = ModelRegistry::load(&auth, Some(models_path));
-                                registry.error().map(ToString::to_string)
-                            }
-                            Err(err) => Some(format!("Failed to load auth.json: {err}")),
-                        };
+                    let auth_result = crate::auth::AuthStorage::load_async(Config::auth_path())
+                        .await
+                        .and_then(|mut auth| {
+                            auth.set_command_working_directory(&cwd)?;
+                            Ok(auth)
+                        });
+                    let models_error = match auth_result {
+                        Ok(auth) => {
+                            let models_path = default_models_path(&Config::global_dir());
+                            let registry = ModelRegistry::load(&auth, Some(models_path));
+                            registry.error().map(ToString::to_string)
+                        }
+                        Err(err) => Some(format!("Failed to load auth.json: {err}")),
+                    };
 
                     let (diagnostics, diag_count) =
                         build_reload_diagnostics(models_error, &resources);
