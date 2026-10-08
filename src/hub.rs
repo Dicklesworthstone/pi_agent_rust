@@ -164,6 +164,186 @@ impl ServiceControl {
     }
 }
 
+/// One tool invocation owns a startup until its result reaches the caller.
+/// The control is retained directly: cancellation must never find a newer
+/// incarnation by looking up the service's reusable name.
+#[derive(Clone)]
+pub(crate) struct ServiceRequest {
+    owner: crate::agent_cx::AgentCx,
+    cancelled: Arc<AtomicBool>,
+    startup: Arc<Mutex<Option<OwnedStartup>>>,
+}
+
+#[derive(Clone)]
+struct OwnedStartup {
+    name: String,
+    control: Arc<ServiceControl>,
+    cleanup_deadline: Option<Instant>,
+}
+
+impl ServiceRequest {
+    fn new() -> Self {
+        Self {
+            owner: crate::agent_cx::AgentCx::for_current_or_request(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            startup: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) || self.owner.checkpoint().is_err() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_CANCELLED: service operation cancelled",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_spawn(&self) -> Result<()> {
+        self.check()?;
+        let capabilities = self.owner.capabilities();
+        if !capabilities.io || !capabilities.spawn || !capabilities.time {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_PERMISSION: service startup requires I/O, spawn and timer capabilities",
+            ));
+        }
+        Ok(())
+    }
+
+    fn own_startup(&self, name: &str, control: &Arc<ServiceControl>) -> Result<()> {
+        let mut startup = self
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check()?;
+        *startup = Some(OwnedStartup {
+            name: name.to_string(),
+            control: Arc::clone(control),
+            cleanup_deadline: None,
+        });
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(startup) = self
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            startup
+                .cleanup_deadline
+                .get_or_insert_with(|| Instant::now() + SETTLEMENT_BUDGET);
+            startup.control.request_stop(true);
+        }
+    }
+
+    fn cancel_and_wait(&self, error: Error) -> Error {
+        self.cancel();
+        let startup = self
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(startup) = startup
+            && let Err(cleanup) = startup.control.wait_until(
+                &startup.name,
+                startup
+                    .cleanup_deadline
+                    .expect("cancellation sets the startup cleanup deadline"),
+            )
+        {
+            return Error::tool(
+                "hub",
+                format!("{error}; startup cleanup remains pending: {cleanup}"),
+            );
+        }
+        error
+    }
+}
+
+struct ServiceRequestGuard {
+    request: ServiceRequest,
+    accepted: bool,
+}
+
+impl Drop for ServiceRequestGuard {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.request.cancel();
+        }
+    }
+}
+
+/// Keep foreign blocking I/O off the async executor even when a standalone
+/// request context has no runtime blocking pool. Failure to create a worker
+/// is an error, never an inline fallback that stalls unrelated tasks.
+async fn service_worker<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("hub-operation".to_string())
+        .spawn(move || {
+            let result = operation();
+            let _ = sender.send(result);
+        })
+        .map_err(|error| Error::tool("hub", format!("Failed to start service worker: {error}")))?;
+    receiver
+        .await
+        .map_err(|_| Error::tool("hub", "Service worker exited without a result"))
+}
+
+/// Offload one service operation while retaining cancellation and ownership
+/// through result delivery. An abandoned future only requests cleanup; the
+/// service monitor remains the process owner and publishes its actual reap.
+pub(crate) async fn run_service_request<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&ServiceRequest) -> Result<T> + Send + 'static,
+{
+    let request = ServiceRequest::new();
+    request.check()?;
+    let mut guard = ServiceRequestGuard {
+        request: request.clone(),
+        accepted: false,
+    };
+    let worker_request = request.clone();
+    let result = service_worker(move || {
+        let result = worker_request
+            .check()
+            .and_then(|()| operation(&worker_request));
+        let result = result.and_then(|value| worker_request.check().map(|()| value));
+        result.map_err(|error| worker_request.cancel_and_wait(error))
+    })
+    .await;
+    let result = match result {
+        Ok(Ok(value)) => Ok(value),
+        // The operation's worker already waited for any startup cleanup.
+        // Do not silently double the settlement budget after a timeout.
+        Ok(Err(error)) => return Err(error),
+        Err(error) => Err(error),
+    };
+    match result.and_then(|value| request.check().map(|()| value)) {
+        Ok(value) => {
+            guard.accepted = true;
+            Ok(value)
+        }
+        Err(error) => {
+            // Cancellation can win after the worker sent a successful start,
+            // but before the executor delivered it. Keep cleanup off-thread
+            // and await the exact startup control in that race too.
+            request.cancel();
+            Err(service_worker(move || request.cancel_and_wait(error)).await?)
+        }
+    }
+}
+
 /// One ring entry: a completed output line with its cursor index.
 struct Ring {
     lines: VecDeque<String>,
@@ -313,6 +493,16 @@ struct ServiceEntry {
     control: Arc<ServiceControl>,
 }
 
+impl ServiceEntry {
+    fn current_status(&self) -> ServiceStatus {
+        if self.status.live() && self.control.stop_requested.load(Ordering::Acquire) {
+            ServiceStatus::Stopping
+        } else {
+            self.status
+        }
+    }
+}
+
 /// Serializable service descriptor.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -332,18 +522,19 @@ pub struct ServiceSnapshot {
 
 impl ServiceSnapshot {
     fn from_entry(entry: &ServiceEntry) -> Self {
+        let status = entry.current_status();
         Self {
             schema: SERVICE_SCHEMA.to_string(),
             name: entry.spec.name.clone(),
             command: format!("{} {}", entry.spec.program, entry.spec.args.join(" ")),
             cwd: entry.spec.cwd.display().to_string(),
             pid: entry.pid,
-            status: entry.status.as_str().to_string(),
+            status: status.as_str().to_string(),
             started_ms: entry.started_ms,
             exit_code: entry.exit_code,
             log_path: entry.log_path.display().to_string(),
             detached: entry.spec.detached,
-            ready: entry.status == ServiceStatus::Running,
+            ready: status == ServiceStatus::Running,
         }
     }
 }
@@ -419,12 +610,12 @@ impl ServiceRegistry {
         let entry = self
             .current_mut(name, ring)
             .ok_or_else(|| stale_service(name))?;
-        if !entry.status.accepts_input() {
+        if !entry.current_status().accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!(
                     "PI_HUB_NOT_READY: service '{name}' is {} before readiness was observed",
-                    entry.status.as_str()
+                    entry.current_status().as_str()
                 ),
             ));
         }
@@ -436,7 +627,9 @@ impl ServiceRegistry {
         let Some(entry) = self.current_mut(name, ring) else {
             return false;
         };
-        if entry.status == ServiceStatus::Stopping {
+        if entry.status == ServiceStatus::Stopping
+            || entry.control.stop_requested.load(Ordering::Acquire)
+        {
             entry.status = ServiceStatus::Killed;
         } else if entry.status.live() {
             entry.status = if code == 0 {
@@ -709,9 +902,22 @@ fn persist_detached_state(reg: &ServiceRegistry) {
 /// `PI_HUB_NAME_TAKEN` for a duplicate live name; `PI_HUB_NOT_READY` when
 /// the gates do not pass in time (the process is killed — no half-started
 /// surprise daemons); tool errors for spawn failures.
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::significant_drop_tightening)]
 pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
+    start_inner(spec, None)
+}
+
+pub(crate) fn start_for_request(
+    spec: &LaunchSpec,
+    request: &ServiceRequest,
+) -> Result<ServiceSnapshot> {
+    start_inner(spec, Some(request))
+}
+
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<ServiceSnapshot> {
+    if let Some(request) = request {
+        request.check_spawn()?;
+    }
     let name = validated_service_name(&spec.name)?.to_string();
     let ready = spec.ready.clone().unwrap_or_default();
     let has_gates = ready.log.is_some() || ready.port.is_some();
@@ -741,6 +947,9 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     let log_dir = hub_artifact_dir();
     let log_path = log_dir.join(format!("{name}-{}.log", uuid::Uuid::new_v4()));
     let mut pending = PendingService::reserve(spec, &ring, &log_path)?;
+    if let Some(request) = request {
+        request.own_startup(&name, &pending.control)?;
+    }
     std::fs::create_dir_all(&log_dir)
         .map_err(|e| Error::tool("hub", format!("Failed to create hub artifact dir: {e}")))?;
     // All fallible artifact/PTY handle setup precedes child creation.
@@ -750,13 +959,13 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
         master,
         reader,
         writer,
-    } = spawn_pty(spec)?;
+    } = spawn_pty(spec, request)?;
     let initial_snapshot = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         let entry = reg
             .current_mut(&name, &ring)
             .ok_or_else(|| stale_service(&name))?;
-        if !entry.status.accepts_input() {
+        if !entry.current_status().accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!("PI_HUB_NOT_READY: service '{name}' was stopped during startup"),
@@ -816,11 +1025,14 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     }
 
     loop {
+        if let Some(request) = request {
+            request.check()?;
+        }
         let status = {
             let reg = registry().lock().map_err(|_| registry_err())?;
             reg.current(&name, &ring)
                 .ok_or_else(|| stale_service(&name))?
-                .status
+                .current_status()
         };
         if !status.accepts_input() {
             let tail = ring_tail(&ring, 20);
@@ -853,6 +1065,11 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
             return Ok(snapshot);
         }
         if Instant::now() >= deadline {
+            if let Some(request) = request {
+                // The caller's request shares this first cleanup deadline;
+                // reporting a timeout must not trigger a second full wait.
+                request.cancel();
+            }
             let control = {
                 let mut reg = registry().lock().map_err(|_| registry_err())?;
                 let control = reg.time_out(&name, &ring);
@@ -884,7 +1101,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     }
 }
 
-fn spawn_pty(spec: &LaunchSpec) -> Result<SpawnedService> {
+fn spawn_pty(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<SpawnedService> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     let pty_system = native_pty_system();
@@ -912,6 +1129,9 @@ fn spawn_pty(spec: &LaunchSpec) -> Result<SpawnedService> {
         .master
         .take_writer()
         .map_err(|e| Error::tool("hub", format!("Failed to open PTY writer: {e}")))?;
+    if let Some(request) = request {
+        request.check_spawn()?;
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1018,7 +1238,6 @@ pub fn ps() -> Result<Vec<ServiceSnapshot>> {
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names.
-#[allow(clippy::significant_drop_tightening)]
 pub fn logs(
     name: &str,
     since: Option<u64>,
@@ -1026,8 +1245,34 @@ pub fn logs(
     grep: Option<&str>,
     wait_ms: u64,
 ) -> Result<LogPage> {
+    logs_inner(name, since, tail, grep, wait_ms, None)
+}
+
+pub(crate) fn logs_for_request(
+    name: &str,
+    since: Option<u64>,
+    tail: Option<usize>,
+    grep: Option<&str>,
+    wait_ms: u64,
+    request: &ServiceRequest,
+) -> Result<LogPage> {
+    logs_inner(name, since, tail, grep, wait_ms, Some(request))
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn logs_inner(
+    name: &str,
+    since: Option<u64>,
+    tail: Option<usize>,
+    grep: Option<&str>,
+    wait_ms: u64,
+    request: Option<&ServiceRequest>,
+) -> Result<LogPage> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.min(60_000));
     loop {
+        if let Some(request) = request {
+            request.check()?;
+        }
         {
             let reg = registry().lock().map_err(|_| registry_err())?;
             let Some(entry) = reg.services.get(name) else {
@@ -1056,7 +1301,7 @@ pub fn logs(
                     name: name.to_string(), // ubs:ignore loop returns immediately after
                     lines,
                     cursor,
-                    status: entry.status.as_str().to_string(), // ubs:ignore loop returns after
+                    status: entry.current_status().as_str().to_string(), // ubs:ignore loop returns after
                 });
             }
         }
@@ -1130,12 +1375,12 @@ fn write_to_master(
                 format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
             ));
         };
-        if !entry.status.accepts_input() {
+        if !entry.current_status().accepts_input() {
             return Err(Error::tool(
                 "hub",
                 format!(
                     "PI_HUB_NOT_RUNNING: service '{name}' is {} — stdin is closed",
-                    entry.status.as_str()
+                    entry.current_status().as_str()
                 ),
             ));
         }
@@ -1256,8 +1501,19 @@ pub fn stop(name: &str) -> Result<ServiceSnapshot> {
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names; start errors otherwise.
-#[allow(clippy::significant_drop_tightening)]
 pub fn restart(name: &str) -> Result<ServiceSnapshot> {
+    restart_inner(name, None)
+}
+
+pub(crate) fn restart_for_request(name: &str, request: &ServiceRequest) -> Result<ServiceSnapshot> {
+    restart_inner(name, Some(request))
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn restart_inner(name: &str, request: Option<&ServiceRequest>) -> Result<ServiceSnapshot> {
+    if let Some(request) = request {
+        request.check_spawn()?;
+    }
     let (spec, control) = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         let Some(entry) = reg.services.get_mut(name) else {
@@ -1278,7 +1534,7 @@ pub fn restart(name: &str) -> Result<ServiceSnapshot> {
     if let Some(control) = control {
         control.wait_until(name, Instant::now() + SETTLEMENT_BUDGET)?;
     }
-    start(&spec)
+    start_inner(&spec, request)
 }
 
 /// Full descriptor for one service.

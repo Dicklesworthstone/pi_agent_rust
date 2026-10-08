@@ -108,6 +108,337 @@ impl Drop for ServiceCleanup {
 }
 
 #[cfg(unix)]
+async fn with_hub_owner<F: std::future::Future>(
+    owner: &pi::agent_cx::AgentCx,
+    future: F,
+) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|task_cx| {
+        let _guard = owner.cx().clone().set_current_restricted();
+        std::future::Future::poll(future.as_mut(), task_cx)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn wait_for_service_pid(name: &str) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(snapshot) = pi::hub::describe(name)
+            && let Some(pid) = snapshot.pid
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service must publish its actual process before cancellation"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_readiness_yields_the_executor_and_reaps_before_returning() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_readiness_yields_the_executor_and_reaps_before_returning";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-readiness";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let (output, pid) = block_on_local(async {
+        let mut call = Box::pin(with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-readiness",
+                json!({
+                    "op": "start", "name": name, "application": "python3",
+                    "args": ["-u", "-c", "import time; print('waiting-for-ready', flush=True); time.sleep(60)"],
+                    "ready": {"log": "never-ready", "timeoutSecs": 4}
+                }),
+                None,
+            ),
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(call.as_mut(), task_cx).is_pending(),
+                "readiness must yield before its timeout, including without a context blocking pool"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let cancel = async {
+            let pid = wait_for_service_pid(name).await;
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel readiness fixture"),
+            );
+            pid
+        };
+        futures::join!(call, cancel)
+    });
+    let output = output.expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    let settled = pi::hub::describe(name).expect("settled startup");
+    assert_eq!(settled.status, "killed");
+    assert!(settled.pid.is_none());
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_readiness_future_stops_its_unaccepted_service() {
+    let _guard = hub_test_guard();
+    let case = "dropping_a_readiness_future_stops_its_unaccepted_service";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-dropped-readiness";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let pid = block_on_local(async {
+        let mut call = Box::pin(tool.execute(
+            "drop-readiness",
+            json!({
+                "op": "start", "name": name, "application": "python3",
+                "args": ["-u", "-c", "import time; print('waiting-for-ready', flush=True); time.sleep(60)"],
+                "ready": {"log": "never-ready", "timeoutSecs": 60}
+            }),
+            None,
+        ));
+        let pid = match futures::future::select(call.as_mut(), Box::pin(wait_for_service_pid(name)))
+            .await
+        {
+            futures::future::Either::Left((result, _)) => {
+                panic!("startup returned before the caller could abandon it: {result:?}")
+            }
+            futures::future::Either::Right((pid, _)) => pid,
+        };
+        drop(call);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = pi::hub::describe(name).expect("abandoned service stays observable");
+            if snapshot.pid.is_none() && snapshot.status == "killed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping startup must request cleanup without waiting for readiness timeout"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        pid
+    });
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn abandoning_a_completed_start_never_stops_a_replacement_incarnation() {
+    let _guard = hub_test_guard();
+    let case = "abandoning_a_completed_start_never_stops_a_replacement_incarnation";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-unaccepted-result";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let script = r"import pathlib, time
+while not pathlib.Path('release-ready').exists():
+    time.sleep(0.01)
+print('old-fixture-ready', flush=True)
+time.sleep(60)
+";
+    block_on_local(async {
+        let mut first = Box::pin(tool.execute(
+            "unaccepted-start",
+            json!({
+                "op": "start", "name": name, "application": "python3",
+                "args": ["-u", "-c", script],
+                "ready": {"log": "old-fixture-ready", "timeoutSecs": 30}
+            }),
+            None,
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(first.as_mut(), task_cx).is_pending(),
+                "startup must yield while its output gate is held"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let old_pid = wait_for_service_pid(name).await;
+        std::fs::write(root.join("release-ready"), "ready").expect("release readiness");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pi::hub::describe(name).expect("first service").status != "running" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker must complete readiness before the name is reused"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        // The original tool future is deliberately not polled again. Its
+        // startup has completed, but that result has not reached its caller.
+        let stopped = tool
+            .execute("stop-old", json!({"op": "stop", "name": name}), None)
+            .await
+            .expect("stop old service");
+        assert!(!stopped.is_error, "{}", first_text(&stopped));
+        assert_reaped(old_pid);
+        let replacement = tool
+            .execute(
+                "replacement",
+                json!({
+                    "op": "start", "name": name, "application": "python3",
+                    "args": ["-u", "-c", "import time; print('replacement-ready', flush=True); time.sleep(60)"],
+                    "ready": {"log": "replacement-ready", "timeoutSecs": 10}
+                }),
+                None,
+            )
+            .await
+            .expect("start replacement");
+        assert!(!replacement.is_error, "{}", first_text(&replacement));
+        let before = pi::hub::describe(name).expect("replacement is running");
+        assert_eq!(before.status, "running");
+        assert!(before.pid.is_some());
+        drop(first);
+        let after = pi::hub::describe(name).expect("replacement survives old result abandonment");
+        assert_eq!(after.status, "running");
+        assert_eq!(after.pid, before.pid);
+    });
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_a_log_wait_preserves_the_running_service() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_a_log_wait_preserves_the_running_service";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-log-wait";
+    let _cleanup = ServiceCleanup(name);
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", "import time; print('log-fixture-ready', flush=True); time.sleep(60)"],
+            "ready": {"log": "log-fixture-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let before = pi::hub::describe(name).expect("running service");
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let output = block_on_local(async {
+        let mut call = Box::pin(with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-log-wait",
+                json!({"op": "logs", "name": name, "grep": "missing-line", "waitMs": 1000}),
+                None,
+            ),
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(call.as_mut(), task_cx).is_pending(),
+                "waiting for logs must yield the executor"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel log wait fixture"),
+        );
+        call.await
+    })
+    .expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    let after = pi::hub::describe(name).expect("service is not owned by the log request");
+    assert_eq!(after.status, "running");
+    assert_eq!(after.pid, before.pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_restart_finishes_the_old_process_without_launching_a_replacement() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_restart_finishes_the_old_process_without_launching_a_replacement";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-restart";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import pathlib, signal, sys, time
+counter = pathlib.Path('launch-count')
+counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
+def terminate(*_):
+    pathlib.Path('stop-begun').write_text('stopping')
+    while not pathlib.Path('release-stop').exists():
+        time.sleep(0.01)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, terminate)
+print('restart-fixture-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "restart-fixture-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let before = pi::hub::describe(name).expect("initial service");
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let output = block_on_local(async {
+        let call = with_hub_owner(
+            &owner,
+            tool.execute("cancel-restart", json!({"op": "restart", "name": name}), None),
+        );
+        let cancel = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !root.join("stop-begun").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restart must reach the old service's graceful shutdown"
+                );
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel during restart cleanup"),
+            );
+            std::fs::write(root.join("release-stop"), "finish").expect("release graceful stop");
+        };
+        let (output, ()) = futures::join!(call, cancel);
+        output
+    })
+    .expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    assert_eq!(std::fs::read_to_string(root.join("launch-count")).unwrap(), "1");
+    let settled = pi::hub::describe(name).expect("old service settles");
+    assert_eq!(settled.status, "killed");
+    assert_eq!(settled.exit_code, Some(0));
+    assert!(settled.pid.is_none());
+    assert_reaped(before.pid.expect("old process id"));
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
 #[test]
 fn graceful_stop_preserves_cleanup_and_returns_reaped_exit_metadata() {
     let _guard = hub_test_guard();

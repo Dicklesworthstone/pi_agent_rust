@@ -9041,7 +9041,10 @@ impl HubTool {
                     ready,
                     detached: input.detached.unwrap_or(false),
                 };
-                let snapshot = crate::hub::start(&spec)?;
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::start_for_request(&spec, request)
+                })
+                .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let text = format!(
                     "Service '{name}' is running (pid {}, log: {}).",
@@ -9053,7 +9056,7 @@ impl HubTool {
                 (text, details)
             }
             "ps" => {
-                let services = crate::hub::ps()?;
+                let services = crate::hub::run_service_request(|_| crate::hub::ps()).await?;
                 let details = serde_json::json!({
                     "schema": crate::hub::SERVICE_SCHEMA,
                     "services": services,
@@ -9081,13 +9084,21 @@ impl HubTool {
             }
             "logs" => {
                 let name = name_required("logs")?;
-                let page = crate::hub::logs(
-                    &name,
-                    input.cursor,
-                    input.tail,
-                    input.grep.as_deref(),
-                    input.wait_ms.unwrap_or(0),
-                )?;
+                let cursor = input.cursor;
+                let tail = input.tail;
+                let grep = input.grep.clone();
+                let wait_ms = input.wait_ms.unwrap_or(0);
+                let page = crate::hub::run_service_request(move |request| {
+                    crate::hub::logs_for_request(
+                        &name,
+                        cursor,
+                        tail,
+                        grep.as_deref(),
+                        wait_ms,
+                        request,
+                    )
+                })
+                .await?;
                 let details = serde_json::to_value(&page)?;
                 let mut text = page.lines.join("\n");
                 if text.is_empty() {
@@ -9097,7 +9108,10 @@ impl HubTool {
             }
             "stop" => {
                 let name = name_required("stop")?;
-                let snapshot = crate::hub::stop(&name)?;
+                let stop_name = name.clone();
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name))
+                        .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     format!("Service '{name}' stopped (status: {}).", snapshot.status),
@@ -9106,7 +9120,11 @@ impl HubTool {
             }
             "restart" => {
                 let name = name_required("restart")?;
-                let snapshot = crate::hub::restart(&name)?;
+                let restart_name = name.clone();
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::restart_for_request(&restart_name, request)
+                })
+                .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     format!("Service '{name}' restarted (status: {}).", snapshot.status),
@@ -9115,7 +9133,9 @@ impl HubTool {
             }
             "describe" => {
                 let name = name_required("describe")?;
-                let snapshot = crate::hub::describe(&name)?;
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::describe(&name))
+                        .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
@@ -9124,45 +9144,55 @@ impl HubTool {
             }
             "send" => {
                 let name = name_required("send")?;
-                let mut actions = Vec::new();
-                if let Some(text) = input.text.as_deref() {
-                    crate::hub::send_text(&name, text, input.enter.unwrap_or(true))?;
-                    actions.push(format!("sent {} byte(s) of text", text.len()));
-                }
-                if let Some(keys) = input.keys.as_ref()
-                    && !keys.is_empty()
-                {
-                    crate::hub::send_keys(&name, keys)?;
-                    actions.push(format!("sent keys: {}", keys.join(", ")));
-                }
-                if let Some(signal) = input.signal.as_deref() {
-                    let mapped = match signal.to_ascii_uppercase().as_str() {
-                        "SIGINT" => sysinfo::Signal::Interrupt,
-                        "SIGTERM" => sysinfo::Signal::Term,
-                        "SIGHUP" => sysinfo::Signal::Hangup,
-                        "SIGQUIT" => sysinfo::Signal::Quit,
-                        "SIGKILL" => sysinfo::Signal::Kill,
-                        other => {
-                            return Err(Error::validation(format!(
-                                "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
-                                 SIGQUIT, or SIGKILL"
-                            )));
-                        }
-                    };
-                    crate::hub::send_signal(&name, mapped)?;
-                    actions.push(format!("sent {}", signal.to_ascii_uppercase()));
-                }
-                if actions.is_empty() {
-                    return Err(Error::validation(
-                        "hub send requires text, keys, or signal".to_string(),
-                    ));
-                }
-                let details = serde_json::json!({
-                    "schema": "pi.hub.send.v1",
-                    "name": name,
-                    "actions": actions,
-                });
-                (format!("To '{name}': {}", actions.join("; ")), details)
+                let text = input.text.clone();
+                let enter = input.enter.unwrap_or(true);
+                let keys = input.keys.clone();
+                let signal = input.signal.clone();
+                crate::hub::run_service_request(move |request| {
+                    let mut actions = Vec::new();
+                    if let Some(text) = text.as_deref() {
+                        request.check()?;
+                        crate::hub::send_text(&name, text, enter)?;
+                        actions.push(format!("sent {} byte(s) of text", text.len()));
+                    }
+                    if let Some(keys) = keys.as_ref()
+                        && !keys.is_empty()
+                    {
+                        request.check()?;
+                        crate::hub::send_keys(&name, keys)?;
+                        actions.push(format!("sent keys: {}", keys.join(", ")));
+                    }
+                    if let Some(signal) = signal.as_deref() {
+                        let mapped = match signal.to_ascii_uppercase().as_str() {
+                            "SIGINT" => sysinfo::Signal::Interrupt,
+                            "SIGTERM" => sysinfo::Signal::Term,
+                            "SIGHUP" => sysinfo::Signal::Hangup,
+                            "SIGQUIT" => sysinfo::Signal::Quit,
+                            "SIGKILL" => sysinfo::Signal::Kill,
+                            other => {
+                                return Err(Error::validation(format!(
+                                    "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
+                                     SIGQUIT, or SIGKILL"
+                                )));
+                            }
+                        };
+                        request.check()?;
+                        crate::hub::send_signal(&name, mapped)?;
+                        actions.push(format!("sent {}", signal.to_ascii_uppercase()));
+                    }
+                    if actions.is_empty() {
+                        return Err(Error::validation(
+                            "hub send requires text, keys, or signal".to_string(),
+                        ));
+                    }
+                    let details = serde_json::json!({
+                        "schema": "pi.hub.send.v1",
+                        "name": name,
+                        "actions": actions,
+                    });
+                    Ok((format!("To '{name}': {}", actions.join("; ")), details))
+                })
+                .await?
             }
             "jobs" => {
                 let owner_session_id = self.job_session_scope.session_id().await?;
