@@ -1285,7 +1285,16 @@ mod tests {
     fn media_decoder_and_mime_validation_fail_closed() {
         assert_eq!(decode_media("AAEC/w==").unwrap(), [0, 1, 2, 255]);
         assert_eq!(decode_media("AAEC/w").unwrap(), [0, 1, 2, 255]);
-        for data in ["", "not-base64!", "A", "AB==", "AB", "_w==", "AAEC/w=", "Y Q=="] {
+        for data in [
+            "",
+            "not-base64!",
+            "A",
+            "AB==",
+            "AB",
+            "_w==",
+            "AAEC/w=",
+            "Y Q==",
+        ] {
             assert!(decode_media(data).is_err(), "{data}");
         }
         assert!(valid_mime("audio/x-wav"));

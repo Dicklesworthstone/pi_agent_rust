@@ -7,8 +7,7 @@ mod ownership;
 
 use super::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, AgentSessionHandle, AssistantMessage,
-    ContentBlock,
-    Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
+    ContentBlock, Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
     RpcExtensionUiResponse, SessionPromptResult, SessionTransport, SessionTransportEvent,
     StopReason, TextContent, UserContent,
 };
@@ -565,12 +564,13 @@ impl AgentSessionHandle {
             .await
             .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))?;
         let runtime = self.session.agent.provider();
-        let runtime_matches_session = session.effective_model_for_current_path().is_none_or(
-            |(provider, model)| {
-                crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
-                    && runtime.model_id().eq_ignore_ascii_case(&model)
-            },
-        );
+        let runtime_matches_session =
+            session
+                .effective_model_for_current_path()
+                .is_none_or(|(provider, model)| {
+                    crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
+                        && runtime.model_id().eq_ignore_ascii_case(&model)
+                });
         self.failover_state.reconcile_from_session(
             &session,
             configured_cooldown_secs,
@@ -1387,7 +1387,10 @@ mod stream_terminal_tests {
         let captured = Arc::clone(&generic_events);
         let output: EventCallback = Arc::new(move |event| {
             generic_order.lock().unwrap().push("generic");
-            captured.lock().unwrap().push(serde_json::to_value(event).unwrap());
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
         });
         let typed_order = Arc::clone(&order);
         let hook: super::super::OnStreamEvent = Arc::new(move |event| {

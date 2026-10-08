@@ -751,7 +751,10 @@ mod tests {
             panic!("valid tool output must precede historical context")
         };
         assert_eq!(completed.tool_call_id, "b");
-        assert!(completed.is_error, "failed execution is still a completed exchange");
+        assert!(
+            completed.is_error,
+            "failed execution is still a completed exchange"
+        );
         let Message::Custom(historical) = &out.messages[2] else {
             panic!("conflicting output must remain historical")
         };

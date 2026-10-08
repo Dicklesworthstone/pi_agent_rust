@@ -1668,9 +1668,7 @@ async fn invoke_turn_save_entrypoint(
                 )
                 .await
         }
-        TurnSaveEntrypoint::Continue => {
-            agent_session.run_continue_with_abort(None, on_event).await
-        }
+        TurnSaveEntrypoint::Continue => agent_session.run_continue_with_abort(None, on_event).await,
     }
 }
 
@@ -2000,7 +1998,9 @@ async fn assert_interrupted_turn_save_fences_reentry(
         .save_and_index()
         .await
         .expect("flush empty autosave queue");
-    fixture.assert_provider_reentry_blocked(expected_calls).await;
+    fixture
+        .assert_provider_reentry_blocked(expected_calls)
+        .await;
 }
 
 #[test]
@@ -2068,7 +2068,10 @@ fn completed_save_and_cancellation_before_persistence_leave_provider_admission_o
     });
 }
 
-async fn invoke_explicit_session_save(session: &mut AgentSession, save_and_index: bool) -> Result<()> {
+async fn invoke_explicit_session_save(
+    session: &mut AgentSession,
+    save_and_index: bool,
+) -> Result<()> {
     if save_and_index {
         session.save_and_index().await
     } else {

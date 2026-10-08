@@ -154,7 +154,9 @@ mod tests {
             // even though the provider receives the full literal spellings.
             assert!(
                 BpeCounter.count(&repeated_markers, table)
-                    > tokenizer.encode_with_special_tokens(&repeated_markers).len() as u64
+                    > tokenizer
+                        .encode_with_special_tokens(&repeated_markers)
+                        .len() as u64
             );
         }
     }

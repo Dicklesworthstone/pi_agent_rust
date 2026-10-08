@@ -366,7 +366,10 @@ fn capture_stream_events(handle: &mut AgentSessionHandle) -> Arc<Mutex<Vec<Strea
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&events);
     handle.listeners_mut().on_stream_event = Some(Arc::new(move |event| {
-        observed.lock().expect("stream event lock").push(event.clone());
+        observed
+            .lock()
+            .expect("stream event lock")
+            .push(event.clone());
     }));
     events
 }
@@ -614,12 +617,14 @@ fn sdk_mml_native_transport_retries_preserve_order_and_one_durable_prompt() {
     let content = ordered_native_content();
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&events);
-    let result = run_async(transport.prompt_with_content(content.clone(), move |event| {
-        let SessionTransportEvent::InProcess(event) = event else {
-            panic!("in-process event expected");
-        };
-        observed.lock().unwrap().push(*event);
-    }))
+    let result = run_async(
+        transport.prompt_with_content(content.clone(), move |event| {
+            let SessionTransportEvent::InProcess(event) = event else {
+                panic!("in-process event expected");
+            };
+            observed.lock().unwrap().push(*event);
+        }),
+    )
     .expect("native content prompt retries");
     let SessionPromptResult::InProcess(message) = result else {
         panic!("in-process result expected");
@@ -710,14 +715,21 @@ fn sdk_mml_explicit_retry_keeps_native_content_and_the_abandoned_branch() {
     );
     assert!(rewound.to_messages_for_current_path().is_empty());
     assert!(rewound.get_entry(&original_users[0]).is_some());
-    assert!(rewound.get_entry(original_leaf.as_deref().unwrap()).is_some());
+    assert!(
+        rewound
+            .get_entry(original_leaf.as_deref().unwrap())
+            .is_some()
+    );
 
     let UserContent::Blocks(blocks) = prepared else {
         panic!("native input must not flatten to text");
     };
     run_async(handle.prompt_with_content(blocks, |_| {})).expect("sibling retry turn");
     let requests = server.finish(2);
-    assert_eq!(user_wire_content(&requests[0]), user_wire_content(&requests[1]));
+    assert_eq!(
+        user_wire_content(&requests[0]),
+        user_wire_content(&requests[1])
+    );
     let retried = reopen(&handle);
     let users = retried
         .entries
@@ -732,7 +744,11 @@ fn sdk_mml_explicit_retry_keeps_native_content_and_the_abandoned_branch() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(users.len(), 2, "both original and retried input stay in the file");
+    assert_eq!(
+        users.len(),
+        2,
+        "both original and retried input stay in the file"
+    );
     assert_eq!(users[0].0, users[1].0, "the retry must be a sibling");
     for (_, stored_content) in users {
         assert_eq!(
@@ -862,7 +878,11 @@ fn assert_turn_save_failure_fences_every_entrypoint(with_images: bool, retry: bo
             1
         );
     }
-    let original = original.lock().unwrap().clone().expect("fault was injected");
+    let original = original
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("fault was injected");
     handle.session_store().try_lock().unwrap().path = Some(original.clone());
     let disk_before = std::fs::read(&original).expect("read original durable transcript");
     let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
@@ -1028,15 +1048,17 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[],"control":%s}
         let content = ordered_native_content();
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&events);
-        let result = run_async(transport.prompt_with_content(content.clone(), move |event| {
-            let SessionTransportEvent::Rpc(event) = event else {
-                panic!("RPC event expected");
-            };
-            if event["type"] == "fixture_input" {
-                assert_eq!(control.abort().expect("live abort"), "rpc-2");
-            }
-            observed.lock().unwrap().push(event);
-        }))
+        let result = run_async(
+            transport.prompt_with_content(content.clone(), move |event| {
+                let SessionTransportEvent::Rpc(event) = event else {
+                    panic!("RPC event expected");
+                };
+                if event["type"] == "fixture_input" {
+                    assert_eq!(control.abort().expect("live abort"), "rpc-2");
+                }
+                observed.lock().unwrap().push(event);
+            }),
+        )
         .expect("native RPC turn");
         let SessionPromptResult::RpcEvents(returned) = result else {
             panic!("RPC result expected");
@@ -1047,7 +1069,11 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[],"control":%s}
                 .iter()
                 .map(|event| event["type"].clone())
                 .collect::<Vec<_>>(),
-            [json!("agent_start"), json!("fixture_input"), json!("agent_end")]
+            [
+                json!("agent_start"),
+                json!("fixture_input"),
+                json!("agent_end")
+            ]
         );
         assert_eq!(
             returned[1]["frame"],
@@ -1078,13 +1104,11 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
             })];
             let mut delivered = Vec::new();
             let events = if streaming {
-                run_async(client.prompt_with_content_streaming(
-                    content,
-                    Some("steer"),
-                    |event| {
+                run_async(
+                    client.prompt_with_content_streaming(content, Some("steer"), |event| {
                         delivered.push(event);
-                    },
-                ))
+                    }),
+                )
             } else {
                 run_async(client.prompt_with_content(content))
             }
@@ -1133,9 +1157,11 @@ printf '{"type":"agent_end","messages":[%s]}\n' "$frame"
 "#,
         );
         let mut observed = Vec::new();
-        let events = run_async(client.prompt_with_content_streaming(content, None, |event| {
-            observed.push(event["type"].as_str().unwrap().to_string());
-        }))
+        let events = run_async(
+            client.prompt_with_content_streaming(content, None, |event| {
+                observed.push(event["type"].as_str().unwrap().to_string());
+            }),
+        )
         .expect("bounded native media echoes must be readable");
         assert_eq!(observed, ["message_start", "agent_end"]);
         for frame in [&events[0]["message"], &events[1]["messages"][0]] {
@@ -1209,9 +1235,12 @@ printf '{"type":"response","command":"prompt","id":"rpc-1","success":false,"erro
         let mut transport = SessionTransport::RpcSubprocess(client);
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
-        let result = run_async(transport.prompt_with_content(ordered_native_content(), move |_| {
-            observed.store(true, Ordering::SeqCst);
-        }));
+        let result = run_async(transport.prompt_with_content(
+            ordered_native_content(),
+            move |_| {
+                observed.store(true, Ordering::SeqCst);
+            },
+        ));
         assert!(result.is_err());
         assert!(!invoked.load(Ordering::SeqCst));
         transport.shutdown().expect("shutdown fixture");

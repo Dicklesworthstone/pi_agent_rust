@@ -592,7 +592,9 @@ fn starting_callback_cancellation_prevents_spawn() {
 
 fn source_entry(output: &ToolOutput) -> crate::agent_hub::ChildEntry {
     let value = result(output);
-    let pid = value["pid"].as_u64().expect("fixture child must have launched"); // ubs:ignore: required real-process fixture observation
+    let pid = value["pid"]
+        .as_u64()
+        .expect("fixture child must have launched"); // ubs:ignore: required real-process fixture observation
     let task = value["task"].as_str().expect("fixture assignment"); // ubs:ignore: required tool-result shape
     let preview = task.chars().take(500).collect::<String>();
     crate::agent_hub::registry()
@@ -668,9 +670,8 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     assert!(!revived.is_error, "{revived:?}");
     let replacement_id = revived_id(&revived);
     assert_ne!(replacement_id, source.id);
-    let arguments = std::fs::read_to_string(
-        tool.global_dir.join(format!("{replacement_id}.args")),
-    )?;
+    let arguments =
+        std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.args")))?;
     assert!(arguments.contains("--model\nfixture/original\n"));
     assert!(arguments.contains("--tools\nread\n"));
     assert!(arguments.contains("--thinking\nlow\n"));
@@ -683,16 +684,14 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     assert!(!arguments.contains("sk-ant-api03-AAAA"));
     assert!(arguments.len() < assignment.len() + 20 * 1024);
     assert_eq!(arguments.matches("Continuation of a prior run").count(), 1);
-    let original_depth = std::fs::read_to_string(
-        tool.global_dir.join(format!("{}.depth", source.id)),
-    )?;
+    let original_depth =
+        std::fs::read_to_string(tool.global_dir.join(format!("{}.depth", source.id)))?;
     assert_eq!(
         std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.depth")))?,
         original_depth
     );
     assert_eq!(
-        std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.cwd")))?
-            .trim(),
+        std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.cwd")))?.trim(),
         tool.cwd.to_string_lossy()
     );
     let replacement = {
@@ -712,8 +711,7 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     let repeated = revive_through_hub(unrelated.path(), replacement_id);
     assert!(!repeated.is_error, "{repeated:?}");
     let repeated_id = revived_id(&repeated);
-    let arguments =
-        std::fs::read_to_string(tool.global_dir.join(format!("{repeated_id}.args")))?;
+    let arguments = std::fs::read_to_string(tool.global_dir.join(format!("{repeated_id}.args")))?;
     assert!(arguments.contains(&assignment));
     assert!(arguments.contains("second-history-marker"));
     assert!(!arguments.contains("first-history-marker"));
@@ -730,15 +728,28 @@ fn hub_revival_refuses_synthetic_registration_without_spending_a_child_entry() {
     let name = format!("synthetic-{}", uuid::Uuid::new_v4());
     let source = {
         let mut registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: required registry fixture
-        let source = registry.register(&name, "not a native launch").expect("synthetic entry"); // ubs:ignore: synthetic-registration regression fixture
+        let source = registry
+            .register(&name, "not a native launch")
+            .expect("synthetic entry"); // ubs:ignore: synthetic-registration regression fixture
         registry.settle(&source.id, crate::agent_hub::ChildStatus::Done);
         source
     };
     let output = revive_through_hub(Path::new("."), &source.id);
     assert!(output.is_error);
-    assert!(serde_json::to_string(&output).expect("tool JSON").contains("PI_HUB_REVIVAL_UNAVAILABLE")); // ubs:ignore: named refusal oracle
+    assert!(
+        serde_json::to_string(&output)
+            .expect("tool JSON")
+            .contains("PI_HUB_REVIVAL_UNAVAILABLE")
+    ); // ubs:ignore: named refusal oracle
     let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: no-phantom-child regression oracle
-    assert_eq!(registry.roster().iter().filter(|entry| entry.name == name).count(), 1);
+    assert_eq!(
+        registry
+            .roster()
+            .iter()
+            .filter(|entry| entry.name == name)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -766,9 +777,12 @@ fn hub_revival_checks_current_authority_before_starting_a_replacement()
     assert!(output.is_error);
     assert!(serde_json::to_string(&output)?.contains("PI_SUBAGENT_PERMISSION"));
     let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: no-phantom-child regression oracle
-    assert!(!registry.roster().iter().any(|entry| {
-        entry.revived_from.as_deref() == Some(source.id.as_str())
-    }));
+    assert!(
+        !registry
+            .roster()
+            .iter()
+            .any(|entry| { entry.revived_from.as_deref() == Some(source.id.as_str()) })
+    );
     assert!(registry.native_revival_source(&source.id).is_ok());
     Ok(())
 }
@@ -792,7 +806,10 @@ fn failed_hub_revival_spawn_settles_its_single_registered_replacement()
         .collect::<Vec<_>>();
     assert_eq!(replacements.len(), 1);
     assert_eq!(replacements[0].id, replacement_id);
-    assert_eq!(replacements[0].status, crate::agent_hub::ChildStatus::Failed);
+    assert_eq!(
+        replacements[0].status,
+        crate::agent_hub::ChildStatus::Failed
+    );
     assert!(replacements[0].pid.is_none());
     assert!(registry.native_revival_source(replacement_id).is_ok());
     Ok(())
@@ -826,7 +843,8 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
                 if let Some(value) = update.details.as_ref()
                     && value["result"]["status"] == "running"
                     && let Some(pid) = value["result"]["pid"].as_u64()
-                    && let Some(sender) = sender.lock().expect("progress sender").take() // ubs:ignore: required running-child observation
+                    && let Some(sender) = sender.lock().expect("progress sender").take()
+                // ubs:ignore: required running-child observation
                 {
                     let _ = sender.send(pid);
                 }
@@ -890,7 +908,10 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
     assert!(!alive.success(), "dropped revival root was not reaped");
     let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: cleanup ownership oracle
     let recovered = registry.native_revival_source(&replacement_id)?;
-    assert_eq!(recovered.entry.status, crate::agent_hub::ChildStatus::Killed);
+    assert_eq!(
+        recovered.entry.status,
+        crate::agent_hub::ChildStatus::Killed
+    );
     assert_eq!(
         registry
             .roster()
@@ -907,9 +928,12 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
             .count(),
         1
     );
-    assert!(!registry.roster().iter().any(|entry| {
-        entry.revived_from.as_deref() == Some(replacement_id.as_str())
-    }));
+    assert!(
+        !registry
+            .roster()
+            .iter()
+            .any(|entry| { entry.revived_from.as_deref() == Some(replacement_id.as_str()) })
+    );
     Ok(())
 }
 
@@ -930,7 +954,10 @@ fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry(
     );
     let (_directory, tool) = fixture(&script);
     initialize_git(&tool.cwd);
-    let assignment = format!("retained-schema-{}: complete the authored change", uuid::Uuid::new_v4());
+    let assignment = format!(
+        "retained-schema-{}: complete the authored change",
+        uuid::Uuid::new_v4()
+    );
     let initial = run(
         &tool,
         json!({"tasks":[{
@@ -952,17 +979,31 @@ fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry(
     assert_eq!(result["data"]["accepted"], true);
     assert_eq!(result["iso"]["applied"], true);
     assert_eq!(result["task"], assignment);
-    assert_eq!(std::fs::read_to_string(tool.cwd.join("tracked.txt"))?, "accepted\n");
-    let preserved = result["preservedWorktrees"].as_array().expect("rejected attempt preserved"); // ubs:ignore: schema-rejection disposition oracle
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt"))?,
+        "accepted\n"
+    );
+    let preserved = result["preservedWorktrees"]
+        .as_array()
+        .expect("rejected attempt preserved"); // ubs:ignore: schema-rejection disposition oracle
     assert_eq!(preserved.len(), 1);
     assert_eq!(preserved[0]["applied"], false);
-    let rejected = preserved[0]["worktreePath"].as_str().expect("preserved worktree path"); // ubs:ignore: real isolation evidence
-    assert_eq!(std::fs::read_to_string(Path::new(rejected).join("tracked.txt"))?, "rejected\n");
+    let rejected = preserved[0]["worktreePath"]
+        .as_str()
+        .expect("preserved worktree path"); // ubs:ignore: real isolation evidence
+    assert_eq!(
+        std::fs::read_to_string(Path::new(rejected).join("tracked.txt"))?,
+        "rejected\n"
+    );
     let retry_id = revived_id(&output);
     let retry_source = {
         let registry = crate::agent_hub::registry().lock().expect("hub registry"); // ubs:ignore: native replay-policy oracle
         let retry = registry.native_revival_source(retry_id)?;
-        let first_id = retry.entry.revived_from.as_deref().expect("corrective lineage"); // ubs:ignore: one-attempt lineage oracle
+        let first_id = retry
+            .entry
+            .revived_from
+            .as_deref()
+            .expect("corrective lineage"); // ubs:ignore: one-attempt lineage oracle
         let first = registry.get(first_id).expect("first revival attempt"); // ubs:ignore: actual attempt registry evidence
         assert_eq!(first.revived_from.as_deref(), Some(source.id.as_str()));
         assert_eq!(first.status, crate::agent_hub::ChildStatus::Failed);

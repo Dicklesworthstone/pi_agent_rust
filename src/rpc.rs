@@ -1231,8 +1231,7 @@ impl RpcSharedState {
             configured_cooldown_secs,
             now,
         );
-        let (cooldown, primary, active, chain_position, lifecycle_id) =
-            reconstructed.into_parts();
+        let (cooldown, primary, active, chain_position, lifecycle_id) = reconstructed.into_parts();
         self.failover_primary = primary;
         self.active_failover_model = active;
         self.failover_chain_position = Some(chain_position);
@@ -1946,15 +1945,13 @@ pub async fn run(
             match parse_prompt_attachments(&parsed, &options.config) {
                 Ok(attachments) => {
                     if !attachments.is_empty()
-                        && parsed.get("message").and_then(Value::as_str).is_some_and(
-                            |message| {
-                                resolve_extension_command(
-                                    message,
-                                    rpc_extension_manager.as_ref(),
-                                )
-                                .is_some()
-                            },
-                        )
+                        && parsed
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|message| {
+                                resolve_extension_command(message, rpc_extension_manager.as_ref())
+                                    .is_some()
+                            })
                     {
                         let _ = out_tx.send(response_error(
                             id,
@@ -2122,8 +2119,7 @@ pub async fn run(
 
         match command_type {
             "prompt" => {
-                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
-                else {
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from) else {
                     let resp = response_error(id, "prompt", "Missing message".to_string());
                     let _ = out_tx.send(resp);
                     continue;
@@ -2147,8 +2143,7 @@ pub async fn run(
                     let _ = out_tx.send(response_error(
                         id,
                         "prompt",
-                        "Extension commands do not accept image or media attachments"
-                            .to_string(),
+                        "Extension commands do not accept image or media attachments".to_string(),
                     ));
                     continue;
                 }
@@ -2318,8 +2313,7 @@ pub async fn run(
             }
 
             "steer" => {
-                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
-                else {
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from) else {
                     let resp = response_error(id, "steer", "Missing message".to_string());
                     let _ = out_tx.send(resp);
                     continue;
@@ -2433,8 +2427,7 @@ pub async fn run(
             }
 
             "follow_up" => {
-                let Some(message) = rpc_prompt_message(&parsed).map(String::from)
-                else {
+                let Some(message) = rpc_prompt_message(&parsed).map(String::from) else {
                     let resp = response_error(id, "follow_up", "Missing message".to_string());
                     let _ = out_tx.send(resp);
                     continue;
@@ -6151,17 +6144,14 @@ async fn reconcile_rpc_failover_state(
         .await
         .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))?;
     let runtime = guard.agent.provider();
-    let runtime_matches_session = inner.effective_model_for_current_path().is_none_or(
-        |(provider, model)| {
-            provider_ids_match(runtime.name(), &provider)
-                && runtime.model_id().eq_ignore_ascii_case(&model)
-        },
-    );
-    state.reconstruct_failover_from_session(
-        &inner,
-        configured_cooldown_secs,
-        chrono::Utc::now(),
-    );
+    let runtime_matches_session =
+        inner
+            .effective_model_for_current_path()
+            .is_none_or(|(provider, model)| {
+                provider_ids_match(runtime.name(), &provider)
+                    && runtime.model_id().eq_ignore_ascii_case(&model)
+            });
+    state.reconstruct_failover_from_session(&inner, configured_cooldown_secs, chrono::Utc::now());
     Ok(runtime_matches_session)
 }
 
@@ -6412,7 +6402,8 @@ async fn try_failover_to_next_chain_entry(
     state.active_failover_model = Some((committed.to_provider.clone(), committed.to_model.clone()));
     // A resumed record may carry an older policy. This newly committed hop
     // persisted the current duration, so its live timer must use that too.
-    let mut cooldown = crate::failover::CooldownTracker::new(options.config.failover_cooldown_secs());
+    let mut cooldown =
+        crate::failover::CooldownTracker::new(options.config.failover_cooldown_secs());
     cooldown.record_primary_failure(std::time::Instant::now());
     state.failover_cooldown = Some(cooldown);
     state.provider_admission.clear();
@@ -9134,7 +9125,8 @@ mod retry_tests {
             runtime.block_on(Box::pin(async move {
                 let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated persistent sessions.
                 let extension_path = temp.path().join("recovery-provider.mjs");
-                std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Real extension provider used by both model destinations.
+                std::fs::write(
+                    // ubs:ignore[rust.ownership.unwrap-expect] -- Real extension provider used by both model destinations.
                     &extension_path,
                     r#"
                     export default function (pi) {
@@ -9197,11 +9189,14 @@ mod retry_tests {
                     .enable_extensions(&[], temp.path(), None, &[extension_path])
                     .await
                     .expect("enable recovery provider");
-                let manager = agent_session.extensions.as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- The real extension runtime was initialized.
+                let manager = agent_session
+                    .extensions
+                    .as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- The real extension runtime was initialized.
                     .expect("extensions")
                     .manager();
                 let initial = if is_fork { &fallback } else { &primary };
-                let provider = providers::create_provider(initial, Some(manager)).expect("provider"); // ubs:ignore[rust.ownership.unwrap-expect] -- Construct through the production extension provider factory.
+                let provider =
+                    providers::create_provider(initial, Some(manager)).expect("provider"); // ubs:ignore[rust.ownership.unwrap-expect] -- Construct through the production extension provider factory.
                 agent_session.agent.set_provider(provider);
                 let mut options =
                     build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
@@ -9231,7 +9226,8 @@ mod retry_tests {
                 } else {
                     json!({"id": "navigate", "type": command, "sessionPath": target_path})
                 };
-                in_tx.send(&send_cx, navigation.to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- Enter through the actual RPC navigation command.
+                in_tx
+                    .send(&send_cx, navigation.to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- Enter through the actual RPC navigation command.
                     .await
                     .expect("navigate");
                 in_tx // ubs:ignore[rust.ownership.unwrap-expect] -- The next prompt must enter the recovered destination.
@@ -9252,7 +9248,8 @@ mod retry_tests {
                     .map(|line| serde_json::from_str::<Value>(&line).expect("RPC JSON"))
                     .collect::<Vec<_>>();
                 for id in ["navigate", "next"] {
-                    let response = frames.iter() // ubs:ignore[rust.ownership.unwrap-expect] -- Every accepted command must answer.
+                    let response = frames
+                        .iter() // ubs:ignore[rust.ownership.unwrap-expect] -- Every accepted command must answer.
                         .find(|frame| frame["type"] == "response" && frame["id"] == id)
                         .expect("response");
                     assert_eq!(response["success"], true, "{response}"); // ubs:ignore[rust.panic.assert-macros] -- Both navigation and subsequent prompt must be accepted.
@@ -9292,7 +9289,8 @@ mod retry_tests {
                     .collect::<Vec<_>>();
                 assert_eq!(replies.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Exactly one real provider response is durable.
                 assert_eq!(replies[0].model, expected_model); // ubs:ignore[rust.panic.assert-macros] -- The provider request used the correct restored or held model.
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- streamSimple actually executed for the selected model.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- streamSimple actually executed for the selected model.
                     matches!(&replies[0].content[..], [ContentBlock::Text(text)]
                         if text.text == format!("served:{expected_model}"))
                 );
@@ -9301,12 +9299,19 @@ mod retry_tests {
                 let reopened = Session::open(&path.display().to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- Validate persisted navigation and restoration with a fresh read.
                     .await
                     .expect("reopen");
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Live and reopened model identity must agree.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Live and reopened model identity must agree.
                     reopened.effective_model_for_current_path(),
-                    Some(("rpc-recovery-fixture".to_string(), expected_model.to_string()))
+                    Some((
+                        "rpc-recovery-fixture".to_string(),
+                        expected_model.to_string()
+                    ))
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Only an active cooldown retains recovery provenance.
-                    reopened.active_failover_provenance_for_current_path().is_some(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Only an active cooldown retains recovery provenance.
+                    reopened
+                        .active_failover_provenance_for_current_path()
+                        .is_some(),
                     cooldown_secs != 0
                 );
             }));
@@ -9422,20 +9427,29 @@ mod retry_tests {
             let mut fixture = rpc_native_recovery_fixture(temp.path(), &runtime_handle, 0).await;
             // The resumed cycle used a different duration from today's
             // policy. A new hop must not retain the old zero-length timer.
-            fixture.options.config.retry.as_mut() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture has a configured chain.
+            fixture
+                .options
+                .config
+                .retry
+                .as_mut() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture has a configured chain.
                 .expect("retry policy")
                 .failover_cooldown_secs = Some(3600);
             let cx = AgentCx::for_request();
-            let store = fixture.session.lock(&cx).await // ubs:ignore[rust.ownership.unwrap-expect] -- Access the live Session owned by RPC.
+            let store = fixture
+                .session
+                .lock(&cx)
+                .await // ubs:ignore[rust.ownership.unwrap-expect] -- Access the live Session owned by RPC.
                 .expect("agent lock")
-                .session.clone();
+                .session
+                .clone();
             let extension = crate::session::SessionHandle(Arc::clone(&store));
             extension // ubs:ignore[rust.ownership.unwrap-expect] -- Execute the real extension Session mutation path.
                 .set_model("anthropic".to_string(), "fallback".to_string(), None)
                 .await
                 .expect("extension selection");
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
-            maybe_restore_primary( // ubs:ignore[rust.ownership.unwrap-expect] -- A stale cycle must not quarantine or undo an explicit model selection.
+            maybe_restore_primary(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- A stale cycle must not quarantine or undo an explicit model selection.
                 Arc::clone(&fixture.session),
                 Arc::clone(&fixture.state),
                 out_tx.clone(),
@@ -9445,10 +9459,18 @@ mod retry_tests {
             .await
             .expect("respect explicit selection");
             assert!(out_rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Explicitly selecting the fallback suppresses automatic restoration.
-            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The obsolete primary and cursor are retired before the next error.
-                fixture.state.lock(&cx).await.expect("state").failover_primary.is_none()
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The obsolete primary and cursor are retired before the next error.
+                fixture
+                    .state
+                    .lock(&cx)
+                    .await
+                    .expect("state")
+                    .failover_primary
+                    .is_none()
             );
-            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The selected fallback owns a new chain with a fresh cursor.
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The selected fallback owns a new chain with a fresh cursor.
                 try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
@@ -9468,14 +9490,17 @@ mod retry_tests {
             assert_eq!(primary.model_id, "fallback"); // ubs:ignore[rust.panic.assert-macros] -- The retired chain cannot reclaim its former primary.
             assert_eq!(state.failover_chain_position, Some(1)); // ubs:ignore[rust.panic.assert-macros] -- The new chain starts at its first candidate.
             let inner = store.lock(&cx).await.expect("Session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Compare durable provenance with the live transaction.
-            let provenance = inner.active_failover_provenance_for_current_path() // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted transition must be restart-safe.
+            let provenance = inner
+                .active_failover_provenance_for_current_path() // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted transition must be restart-safe.
                 .expect("provenance");
             assert_eq!(provenance.primary_model_id, "fallback"); // ubs:ignore[rust.panic.assert-macros] -- Reopening retains the new primary identity.
             assert_eq!(provenance.fallback_model_id, "after-manual"); // ubs:ignore[rust.panic.assert-macros] -- The selected model's own chain supplied the target.
             assert_eq!(provenance.cooldown_secs, Some(3600)); // ubs:ignore[rust.panic.assert-macros] -- The new durable cycle records the current policy rather than the resumed one.
             assert_eq!(provenance.lifecycle_id, state.failover_lifecycle_id); // ubs:ignore[rust.panic.assert-macros] -- One UUID must identify both durable and live lifecycle state.
             assert_ne!(provenance.lifecycle_id.as_deref(), Some("navigation-cycle")); // ubs:ignore[rust.panic.assert-macros] -- Explicit selection starts a distinct lifecycle.
-            let started = state.failover_cooldown.as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- Capture the clock established by the actual committed swap.
+            let started = state
+                .failover_cooldown
+                .as_ref() // ubs:ignore[rust.ownership.unwrap-expect] -- Capture the clock established by the actual committed swap.
                 .expect("live timer")
                 .failed_at();
             state.reconstruct_failover_from_session(
@@ -9483,12 +9508,21 @@ mod retry_tests {
                 3600,
                 chrono::Utc::now() + chrono::Duration::hours(2),
             );
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A wall-clock jump before the next prompt cannot replace the just-committed monotonic timer.
-                state.failover_cooldown.as_ref().expect("live timer").failed_at(),
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A wall-clock jump before the next prompt cannot replace the just-committed monotonic timer.
+                state
+                    .failover_cooldown
+                    .as_ref()
+                    .expect("live timer")
+                    .failed_at(),
                 started
             );
-            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The fresh live cooldown still holds after the wall clock advances.
-                !state.failover_cooldown.as_ref().expect("live timer")
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- The fresh live cooldown still holds after the wall clock advances.
+                !state
+                    .failover_cooldown
+                    .as_ref()
+                    .expect("live timer")
                     .should_use_primary(std::time::Instant::now())
             );
         });
@@ -9506,18 +9540,25 @@ mod retry_tests {
             let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated Session data.
             let fixture = rpc_native_recovery_fixture(temp.path(), &runtime_handle, 0).await;
             let cx = AgentCx::for_request();
-            let store = fixture.session.lock(&cx).await // ubs:ignore[rust.ownership.unwrap-expect] -- Reach the Session through the owned agent.
+            let store = fixture
+                .session
+                .lock(&cx)
+                .await // ubs:ignore[rust.ownership.unwrap-expect] -- Reach the Session through the owned agent.
                 .expect("agent")
-                .session.clone();
+                .session
+                .clone();
             crate::session::SessionHandle(Arc::clone(&store)) // ubs:ignore[rust.ownership.unwrap-expect] -- The new selection is deliberately awaiting normal runtime synchronization.
                 .set_model("anthropic".to_string(), "after-manual".to_string(), None)
                 .await
                 .expect("extension selection");
-            let before = serde_json::to_value( // ubs:ignore[rust.ownership.unwrap-expect] -- Capture exact branch bytes before recovery tries to mutate them.
+            let before = serde_json::to_value(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Capture exact branch bytes before recovery tries to mutate them.
                 &store.lock(&cx).await.expect("Session").entries,
-            ).expect("snapshot");
+            )
+            .expect("snapshot");
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
-            assert!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- An error from the old runtime cannot replace the newer Session choice.
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- An error from the old runtime cannot replace the newer Session choice.
                 !try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
@@ -9532,7 +9573,8 @@ mod retry_tests {
                 .await
                 .expect("refuse stale failure")
             );
-            maybe_restore_primary( // ubs:ignore[rust.ownership.unwrap-expect] -- Restoration must let normal synchronization install the choice.
+            maybe_restore_primary(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Restoration must let normal synchronization install the choice.
                 Arc::clone(&fixture.session),
                 Arc::clone(&fixture.state),
                 out_tx,
@@ -9542,7 +9584,8 @@ mod retry_tests {
             .await
             .expect("defer to new selection");
             assert!(out_rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Neither stale recovery path may emit a successful transition.
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Declining recovery leaves the selected branch untouched.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Declining recovery leaves the selected branch untouched.
                 serde_json::to_value(&store.lock(&cx).await.expect("Session").entries)
                     .expect("snapshot"),
                 before
@@ -9560,26 +9603,60 @@ mod retry_tests {
     fn rpc_reconciliation_preserves_unchanged_timers_and_uses_each_branch_record() {
         let primary = rpc_recovery_entry("primary");
         let fallback = rpc_recovery_entry("fallback");
-        let (mut session, _) = seed_rpc_recovery_session(Session::in_memory(), &primary, &fallback, 3600);
-        let mut legacy = session.active_failover_provenance_for_current_path().expect("provenance").clone(); // ubs:ignore[rust.ownership.unwrap-expect] -- Seed an older record whose cooldown has no wall deadline.
+        let (mut session, _) =
+            seed_rpc_recovery_session(Session::in_memory(), &primary, &fallback, 3600);
+        let mut legacy = session
+            .active_failover_provenance_for_current_path()
+            .expect("provenance")
+            .clone(); // ubs:ignore[rust.ownership.unwrap-expect] -- Seed an older record whose cooldown has no wall deadline.
         legacy.cooldown_deadline = None;
-        let shared_parent = session.append_model_change_with_role_and_failover(fallback.model.provider.clone(), fallback.model.id.clone(), Some("failover".to_string()), Some(legacy.clone()));
+        let shared_parent = session.append_model_change_with_role_and_failover(
+            fallback.model.provider.clone(),
+            fallback.model.id.clone(),
+            Some("failover".to_string()),
+            Some(legacy.clone()),
+        );
         let mut state = RpcSharedState::new(&Config::default());
         let wall = chrono::Utc::now();
         state.reconstruct_failover_from_session(&session, 3600, wall);
         let started = state.failover_cooldown.as_ref().expect("timer").failed_at(); // ubs:ignore[rust.ownership.unwrap-expect] -- Record the existing monotonic anchor.
         session.append_custom_entry("unrelated-observation".to_string(), None);
         state.reconstruct_failover_from_session(&session, 3600, wall + chrono::Duration::hours(2));
-        assert_eq!(state.failover_cooldown.as_ref().expect("timer").failed_at(), started); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Appends and wall-clock changes cannot restart the same recovery record.
+        assert_eq!(
+            state.failover_cooldown.as_ref().expect("timer").failed_at(),
+            started
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Appends and wall-clock changes cannot restart the same recovery record.
         legacy.cooldown_deadline = Some((wall - chrono::Duration::seconds(1)).to_rfc3339());
-        session.append_model_change_with_role_and_failover(fallback.model.provider.clone(), fallback.model.id.clone(), Some("failover".to_string()), Some(legacy.clone()));
+        session.append_model_change_with_role_and_failover(
+            fallback.model.provider.clone(),
+            fallback.model.id.clone(),
+            Some("failover".to_string()),
+            Some(legacy.clone()),
+        );
         state.reconstruct_failover_from_session(&session, 3600, wall);
-        assert!(state.failover_cooldown.as_ref().expect("timer").should_use_primary(std::time::Instant::now())); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A distinct expired branch record permits restoration.
+        assert!(
+            state
+                .failover_cooldown
+                .as_ref()
+                .expect("timer")
+                .should_use_primary(std::time::Instant::now())
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- A distinct expired branch record permits restoration.
         session._test_set_leaf_id(Some(shared_parent));
         legacy.cooldown_deadline = Some((wall + chrono::Duration::hours(1)).to_rfc3339());
-        session.append_model_change_with_role_and_failover(fallback.model.provider, fallback.model.id, Some("failover".to_string()), Some(legacy));
+        session.append_model_change_with_role_and_failover(
+            fallback.model.provider,
+            fallback.model.id,
+            Some("failover".to_string()),
+            Some(legacy),
+        );
         state.reconstruct_failover_from_session(&session, 3600, wall);
-        assert!(!state.failover_cooldown.as_ref().expect("timer").should_use_primary(std::time::Instant::now())); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Matching lifecycle and cursor do not justify reusing another record's expired timer.
+        assert!(
+            !state
+                .failover_cooldown
+                .as_ref()
+                .expect("timer")
+                .should_use_primary(std::time::Instant::now())
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Matching lifecycle and cursor do not justify reusing another record's expired timer.
     }
 
     #[test]
@@ -14099,7 +14176,9 @@ pub(crate) fn parse_native_prompt_content(
         .ok_or_else(|| invalid("content payload must be a string"))?;
         encoded_bytes = encoded_bytes.saturating_add(payload.len() as u64);
         if encoded_bytes > MAX_RPC_MEDIA_BYTES {
-            return Err(invalid("combined text and encoded attachments exceed 64 MiB"));
+            return Err(invalid(
+                "combined text and encoded attachments exceed 64 MiB",
+            ));
         }
         let block = match item.get("type").and_then(Value::as_str) {
             Some("text") => ContentBlock::Text(TextContent::new(payload)),
@@ -14164,7 +14243,9 @@ fn parse_native_prompt_image(item: &Value) -> Result<ImageContent> {
         .ok_or_else(|| Error::validation("native image data must be a nonempty base64 string"))?;
     let max_bytes = crate::media_tools::MAX_IMAGE_FILE_SIZE_BYTES;
     if data.len() as u64 > max_bytes.saturating_add(2) / 3 * 4 {
-        return Err(Error::validation("native image exceeds the 20 MiB decoded limit"));
+        return Err(Error::validation(
+            "native image exceeds the 20 MiB decoded limit",
+        ));
     }
     let raw_mime = item
         .get("mimeType")
@@ -14174,7 +14255,9 @@ fn parse_native_prompt_image(item: &Value) -> Result<ImageContent> {
     if !mime_type.split_once('/').is_some_and(|(kind, subtype)| {
         kind == "image" && !subtype.is_empty() && !subtype.contains('/')
     }) {
-        return Err(Error::validation("native image mimeType must be an image MIME type"));
+        return Err(Error::validation(
+            "native image mimeType must be an image MIME type",
+        ));
     }
     let engine = if data.ends_with('=') {
         &base64::engine::general_purpose::STANDARD
@@ -14185,7 +14268,9 @@ fn parse_native_prompt_image(item: &Value) -> Result<ImageContent> {
         .decode(data)
         .map_err(|_| Error::validation("native image data must be canonical standard base64"))?;
     if bytes.len() as u64 > max_bytes {
-        return Err(Error::validation("native image exceeds the 20 MiB decoded limit"));
+        return Err(Error::validation(
+            "native image exceeds the 20 MiB decoded limit",
+        ));
     }
     Ok(ImageContent {
         data: data.to_string(),
@@ -16623,7 +16708,9 @@ export default function init(pi) {
         ]});
         assert!(command_resumes_rpc_agent("prompt", &native, None));
         for command in ["prompt", "steer", "follow_up"] {
-            assert!(command_payload_can_advance_rpc_session(command, &native, None));
+            assert!(command_payload_can_advance_rpc_session(
+                command, &native, None
+            ));
         }
         for (command, payload) in [
             ("prompt", json!({})),
@@ -16746,10 +16833,15 @@ export default function init(pi) {
             let mut retry = Box::pin(take_last_rpc_user_turn_for_retry(&mut session));
             assert!(futures::poll!(retry.as_mut()).is_pending());
             let mut callback_action = Box::pin(actions.acquire(cx.cx()));
-            let std::task::Poll::Ready(Ok(action_permit)) = futures::poll!(callback_action.as_mut()) else {
+            let std::task::Poll::Ready(Ok(action_permit)) =
+                futures::poll!(callback_action.as_mut())
+            else {
                 panic!("waiting retry must not hold Session actions");
             };
-            assert!(store.try_lock().is_ok(), "provider callback must retain store access");
+            assert!(
+                store.try_lock().is_ok(),
+                "provider callback must retain store access"
+            );
             drop(action_permit);
             drop(retry);
             provider.ensure_allowed().unwrap();
@@ -18427,10 +18519,9 @@ export default function init(pi) {
                     .push_steering(steering.clone())
                     .expect("queue steering");
                 shared // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission.
-                    .push_follow_up(QueuedAgentMessage::from_authored_message(build_user_message(
-                        "retained follow-up",
-                        &[],
-                    )))
+                    .push_follow_up(QueuedAgentMessage::from_authored_message(
+                        build_user_message("retained follow-up", &[]),
+                    ))
                     .expect("queue follow-up");
                 let shared_state = Arc::new(asupersync::sync::Mutex::new(shared));
                 let fetch_state = Arc::clone(&shared_state);
@@ -18457,7 +18548,8 @@ export default function init(pi) {
                             .await
                             .expect("fetch state lock")
                             .lease_steering(0)
-                    }) as futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>>
+                    })
+                        as futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>>
                 };
                 let mut agent = Agent::new(
                     Arc::clone(&provider),
@@ -18538,7 +18630,8 @@ export default function init(pi) {
                     .await;
                     let events = out_rx
                         .try_iter()
-                        .map(|line| { // ubs:ignore[rust.ownership.unwrap-expect] -- Wire frames must remain valid JSON.
+                        .map(|line| {
+                            // ubs:ignore[rust.ownership.unwrap-expect] -- Wire frames must remain valid JSON.
                             serde_json::from_str::<Value>(&line).expect("RPC frame")
                         })
                         .collect::<Vec<_>>();
@@ -18575,7 +18668,8 @@ export default function init(pi) {
                     }
                     assert!(terminal.get("error").is_some_and(Value::is_null)); // ubs:ignore[rust.panic.assert-macros] -- Durable cap is successful bounded completion.
                     assert_eq!(cap_frames, 3); // ubs:ignore[rust.panic.assert-macros] -- One start, one end and one terminal containing the cap.
-                    assert!(events.iter().all(|event| { // ubs:ignore[rust.panic.assert-macros] -- Cap ends before automatic provider-backed compaction.
+                    assert!(events.iter().all(|event| {
+                        // ubs:ignore[rust.panic.assert-macros] -- Cap ends before automatic provider-backed compaction.
                         event.get("type").and_then(Value::as_str) != Some("auto_compaction_start")
                     }));
                     let recovery_plan = // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect next explicit provider admission.
@@ -18583,7 +18677,10 @@ export default function init(pi) {
                             .await
                             .expect("resume plan");
                     assert_eq!(recovery_plan, RpcTerminalRecoveryPlan::None); // ubs:ignore[rust.panic.assert-macros] -- Keep original executable queue semantics.
-                    let inner = inner_session.lock(&cx).await.expect("retry selection session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original retry ownership.
+                    let inner = inner_session
+                        .lock(&cx)
+                        .await
+                        .expect("retry selection session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original retry ownership.
                     let retry_target = select_rpc_user_turn_for_retry(&inner) // ubs:ignore[rust.ownership.unwrap-expect] -- Capped authored request remains retryable.
                         .expect("retry target selection")
                         .expect("authored retry target");
@@ -18593,7 +18690,8 @@ export default function init(pi) {
                         .into_iter()
                         .cloned()
                         .collect::<Vec<_>>();
-                    assert!( // ubs:ignore[rust.panic.assert-macros] -- The fixture is genuinely over the configured compaction threshold.
+                    assert!(
+                        // ubs:ignore[rust.panic.assert-macros] -- The fixture is genuinely over the configured compaction threshold.
                         prepare_compaction(
                             &entries,
                             ResolvedCompactionSettings {
@@ -18612,7 +18710,8 @@ export default function init(pi) {
                     let mut inner = inner_session.lock(&cx).await.expect("saved session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Capped turns already persisted.
                     inner.path.replace(blocked_path).expect("saved path") // ubs:ignore[rust.ownership.unwrap-expect] -- Restore this exact target after the fault.
                 };
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- Failed candidate flush must retain authority.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Failed candidate flush must retain authority.
                     preserve_terminal_rpc_input(&session, &shared_state, &cx)
                         .await
                         .is_err()
@@ -18649,7 +18748,8 @@ export default function init(pi) {
                     "retained steering",
                     "retained follow-up",
                 ] {
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Every input survives exactly once.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- Every input survives exactly once.
                         rpc_time_cap_user_count(&reopened.to_messages_for_current_path(), text),
                         1
                     );
@@ -18946,15 +19046,26 @@ export default function init(pi) {
             )
             .await;
             assert_eq!(response["success"], false);
-            assert!(response["error"].as_str().unwrap().contains("PI_INPUT_CONTENT"));
+            assert!(
+                response["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PI_INPUT_CONTENT")
+            );
             assert!(admission.reason().is_none());
             assert!(calls.lock().unwrap().is_empty());
             {
                 let cx = AgentCx::for_request();
                 let inner = inner_session.lock(&cx).await.expect("session lock");
                 assert_eq!(inner.leaf_id(), original_leaf.as_deref());
-                assert_eq!(serde_json::to_value(&inner.entries).unwrap(), original_entries);
-                assert_eq!(serde_json::to_value(&inner.header).unwrap(), original_header);
+                assert_eq!(
+                    serde_json::to_value(&inner.entries).unwrap(),
+                    original_entries
+                );
+                assert_eq!(
+                    serde_json::to_value(&inner.header).unwrap(),
+                    original_header
+                );
                 assert_eq!(
                     inner.active_failover_provenance_for_current_path(),
                     Some(&provenance)
@@ -19001,7 +19112,12 @@ export default function init(pi) {
                 )
                 .await;
                 assert_eq!(response["success"], false);
-                assert!(response["error"].as_str().unwrap().contains("media.maxBytes"));
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("media.maxBytes")
+                );
                 let extension = json!({
                     "id": command, "type": command, "message": "/report-queue-state",
                     "media": [{"type": "media", "data": "YQ==", "mimeType": "audio/wav"}]
@@ -19014,14 +19130,26 @@ export default function init(pi) {
                 )
                 .await;
                 assert_eq!(response["success"], false);
-                assert!(response["error"].as_str().unwrap().contains("do not accept"));
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("do not accept")
+                );
             }
             let cx = AgentCx::for_request();
             assert!(
-                inner_session.lock(&cx).await.expect("session lock").entries.is_empty()
+                inner_session
+                    .lock(&cx)
+                    .await
+                    .expect("session lock")
+                    .entries
+                    .is_empty()
             );
             drop(in_tx);
-            let error = server.await.expect_err("the preexisting quarantine must remain latched");
+            let error = server
+                .await
+                .expect_err("the preexisting quarantine must remain latched");
             assert!(error.is_session_persistence());
         });
     }
@@ -19055,9 +19183,9 @@ export default function init(pi) {
                 ToolRegistry::new(&[], temp.path(), None),
                 AgentConfig::default(),
             );
-            let inner_session = Arc::new(asupersync::sync::Mutex::new(
-                Session::create_with_dir(Some(temp.path().join("sessions"))),
-            ));
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+                Some(temp.path().join("sessions")),
+            )));
             let agent_session = AgentSession::new(
                 agent,
                 Arc::clone(&inner_session),
@@ -19095,10 +19223,7 @@ export default function init(pi) {
                     media[0].clone(), media[1].clone()
                 ])
             };
-            for (index, command) in ["prompt", "steer", "follow_up", "retry"]
-                .iter()
-                .enumerate()
-            {
+            for (index, command) in ["prompt", "steer", "follow_up", "retry"].iter().enumerate() {
                 let payload = if *command == "retry" {
                     json!({"id": index.to_string(), "type": command})
                 } else if ordered {
@@ -19195,10 +19320,8 @@ export default function init(pi) {
                     first_call_gate: Mutex::new(Some(gate)),
                     calls: Arc::clone(&calls),
                 });
-                let agent_session = build_test_agent_session_with_provider(
-                    Session::in_memory(),
-                    provider,
-                );
+                let agent_session =
+                    build_test_agent_session_with_provider(Session::in_memory(), provider);
                 let options =
                     build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
                 let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -21841,7 +21964,10 @@ export default function init(pi) {
             let empty = parse_prompt_attachments(&payload, &Config::default()).unwrap();
             assert!(matches!(
                 build_user_message("text only", &empty),
-                Message::User(UserMessage { content: UserContent::Text(_), .. })
+                Message::User(UserMessage {
+                    content: UserContent::Text(_),
+                    ..
+                })
             ));
         }
     }
@@ -21858,7 +21984,9 @@ export default function init(pi) {
         ]);
         let payload = json!({"content": content});
         let attachments = parse_prompt_attachments(&payload, &config).unwrap();
-        let Message::User(user) = build_user_message(rpc_prompt_message(&payload).unwrap(), &attachments) else {
+        let Message::User(user) =
+            build_user_message(rpc_prompt_message(&payload).unwrap(), &attachments)
+        else {
             panic!("expected native user message");
         };
         assert_eq!(serde_json::to_value(user.content).unwrap(), content);
@@ -21901,9 +22029,15 @@ export default function init(pi) {
         });
         let valid = json!({"type": "media", "data": "YQ==", "mimeType": "audio/wav"});
         assert!(parse_prompt_attachments(&json!({"content": [valid.clone()]}), &config).is_ok());
-        assert!(parse_prompt_attachments(&json!({"content": [
-            {"type": "media", "data": "YWE=", "mimeType": "audio/wav"}
-        ]}), &config).is_err());
+        assert!(
+            parse_prompt_attachments(
+                &json!({"content": [
+                    {"type": "media", "data": "YWE=", "mimeType": "audio/wav"}
+                ]}),
+                &config
+            )
+            .is_err()
+        );
         let media_overflow = json!({"content": vec![valid; MAX_RPC_MEDIA_ATTACHMENTS + 1]});
         assert!(parse_prompt_attachments(&media_overflow, &config).is_err());
         let block_overflow = json!({"content": vec![
@@ -21932,7 +22066,8 @@ export default function init(pi) {
             assert!(parse_prompt_images(Some(&json!([image]))).is_err());
         }
         let too_many = json!(vec![
-            json!({"data": "YQ==", "mimeType": "image/png"}); MAX_RPC_CONTENT_BLOCKS + 1
+            json!({"data": "YQ==", "mimeType": "image/png"});
+            MAX_RPC_CONTENT_BLOCKS + 1
         ]);
         assert!(parse_prompt_images(Some(&too_many)).is_err());
     }

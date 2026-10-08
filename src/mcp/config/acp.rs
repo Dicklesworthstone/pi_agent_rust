@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    ConfiguredServer, MAX_MCP_CONFIG_BYTES, Provenance, normalize_env,
-    normalize_http_headers, validate_server_name, validate_transport_shape,
+    ConfiguredServer, MAX_MCP_CONFIG_BYTES, Provenance, normalize_env, normalize_http_headers,
+    validate_server_name, validate_transport_shape,
 };
 
 const MAX_ACP_MCP_SERVERS: usize = 32;
@@ -53,9 +53,10 @@ struct SizeLimit(usize);
 
 impl Write for SizeLimit {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-            std::io::Error::other("ACP MCP configuration size overflow")
-        })?;
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("ACP MCP configuration size overflow"))?;
         if self.0 > MAX_MCP_CONFIG_BYTES {
             return Err(std::io::Error::other("ACP MCP configuration size limit"));
         }
@@ -81,7 +82,9 @@ pub(crate) fn parse_acp_servers(
         .as_array()
         .ok_or_else(|| "mcpServers must be an array".to_string())?;
     if servers.len() > MAX_ACP_MCP_SERVERS {
-        return Err(format!("mcpServers supports at most {MAX_ACP_MCP_SERVERS} servers"));
+        return Err(format!(
+            "mcpServers supports at most {MAX_ACP_MCP_SERVERS} servers"
+        ));
     }
     serde_json::to_writer(&mut SizeLimit(0), raw).map_err(|_| {
         format!("mcpServers exceeds the {MAX_MCP_CONFIG_BYTES}-byte configuration limit")
@@ -109,7 +112,9 @@ pub(crate) fn parse_acp_servers(
         match kind {
             "stdio" => {
                 if wire.url.is_some() || wire.headers.is_some() {
-                    return Err(format!("Stdio server at mcpServers[{index}] cannot define url or headers"));
+                    return Err(format!(
+                        "Stdio server at mcpServers[{index}] cannot define url or headers"
+                    ));
                 }
                 let command = wire.command.as_deref().ok_or_else(|| {
                     format!("Stdio server at mcpServers[{index}] requires command")
@@ -129,11 +134,14 @@ pub(crate) fn parse_acp_servers(
             }
             "http" => {
                 if wire.command.is_some() || wire.args.is_some() || wire.env.is_some() {
-                    return Err(format!("HTTP server at mcpServers[{index}] cannot define command, args, or env"));
+                    return Err(format!(
+                        "HTTP server at mcpServers[{index}] cannot define command, args, or env"
+                    ));
                 }
-                let raw_url = wire.url.as_deref().ok_or_else(|| {
-                    format!("HTTP server at mcpServers[{index}] requires url")
-                })?;
+                let raw_url = wire
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| format!("HTTP server at mcpServers[{index}] requires url"))?;
                 let parsed = url::Url::parse(raw_url)
                     .map_err(|_| format!("Invalid HTTP URL at mcpServers[{index}]"))?;
                 if !matches!(parsed.scheme(), "http" | "https")
@@ -144,16 +152,23 @@ pub(crate) fn parse_acp_servers(
                     || raw_url.chars().any(char::is_control)
                     || raw_url.trim() != raw_url
                 {
-                    return Err(format!("Invalid HTTP URL at mcpServers[{index}]; use HTTP(S) with credentials in headers"));
+                    return Err(format!(
+                        "Invalid HTTP URL at mcpServers[{index}]; use HTTP(S) with credentials in headers"
+                    ));
                 }
             }
-            "sse" => return Err("ACP MCP SSE transport is not supported; use stdio or HTTP".to_string()),
+            "sse" => {
+                return Err("ACP MCP SSE transport is not supported; use stdio or HTTP".to_string());
+            }
             _ => return Err(format!("Unsupported MCP transport at mcpServers[{index}]")),
         }
 
         let pairs = |entries: Option<Vec<NameValue>>| {
-            entries.unwrap_or_default().into_iter()
-                .map(|entry| (entry.name, entry.value)).collect()
+            entries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| (entry.name, entry.value))
+                .collect()
         };
         let server = ConfiguredServer {
             name: wire.name,
@@ -194,7 +209,11 @@ mod tests {
 
     #[test]
     fn preserves_omission_and_explicit_empty_list() {
-        assert!(parse_acp_servers(&json!({}), Path::new("/workspace")).unwrap().is_none());
+        assert!(
+            parse_acp_servers(&json!({}), Path::new("/workspace"))
+                .unwrap()
+                .is_none()
+        );
         assert!(parse(json!([])).unwrap().is_empty());
         for invalid in [Value::Null, json!({}), json!(false)] {
             assert!(parse(invalid).is_err());
@@ -208,12 +227,17 @@ mod tests {
              "env":[{"name":"TOKEN","value":"$CMD:must-not-run"}]},
             {"type":"http","name":"remote","url":"https://example.invalid/mcp",
              "headers":[{"name":"Authorization","value":"$ENV:NOT_A_LOOKUP"}]}
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert_eq!(servers[0].name, "remote");
         assert_eq!(servers[0].headers[0].1, "$ENV:NOT_A_LOOKUP");
         assert_eq!(servers[1].args, ["--flag", "a b"]);
         assert_eq!(servers[1].env[0].1, "$CMD:must-not-run");
-        assert!(servers.iter().all(|server| server.provenance == Provenance::Acp));
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.provenance == Provenance::Acp)
+        );
         assert!(!Provenance::Acp.is_native());
     }
 
@@ -243,15 +267,25 @@ mod tests {
             json!([{"name":"Mcp-Session-Id","value":"forged"}]),
             json!([{"name":"Authorization","value":"a\r\nb"}]),
         ] {
-            assert!(parse(json!([{"type":"http","name":"remote",
-                "url":"https://example.invalid/mcp","headers":headers}])).is_err());
+            assert!(
+                parse(json!([{"type":"http","name":"remote",
+                "url":"https://example.invalid/mcp","headers":headers}]))
+                .is_err()
+            );
         }
-        for url in ["file:///secret", "https://user:secret@example.invalid", "https://example.invalid/#x"] {
+        for url in [
+            "file:///secret",
+            "https://user:secret@example.invalid",
+            "https://example.invalid/#x",
+        ] {
             let error = parse(json!([{"type":"http","name":"remote","url":url}])).unwrap_err();
             assert!(!error.contains("secret"));
         }
-        assert!(parse(json!([{"name":"one","command":command(),"env":[
-            {"name":"PATH","value":"a"},{"name":"Path","value":"b"}]}])).is_err());
+        assert!(
+            parse(json!([{"name":"one","command":command(),"env":[
+            {"name":"PATH","value":"a"},{"name":"Path","value":"b"}]}]))
+            .is_err()
+        );
         assert!(parse(json!([{"name":"bad\nname","command":"x"}])).is_err());
     }
 
@@ -259,14 +293,20 @@ mod tests {
     fn bounds_count_and_total_input_before_cloning() {
         let repeated = vec![json!({"name":"one","command":"x"}); MAX_ACP_MCP_SERVERS + 1];
         assert!(parse(json!(repeated)).unwrap_err().contains("at most"));
-        assert!(parse(json!([{"name":"one","command":"x",
-            "args":["x".repeat(MAX_MCP_CONFIG_BYTES)]}])).unwrap_err().contains("byte"));
+        assert!(
+            parse(json!([{"name":"one","command":"x",
+            "args":["x".repeat(MAX_MCP_CONFIG_BYTES)]}]))
+            .unwrap_err()
+            .contains("byte")
+        );
     }
 
     #[test]
     fn trust_identity_is_workspace_definition_and_provenance_bound() {
         let raw = json!({"mcpServers":[{"name":"one","command":command()}]});
-        let mut servers = parse_acp_servers(&raw, Path::new("/workspace")).unwrap().unwrap();
+        let mut servers = parse_acp_servers(&raw, Path::new("/workspace"))
+            .unwrap()
+            .unwrap();
         let server = &mut servers[0];
         let first = server.fingerprint(Path::new("/workspace"));
         assert_ne!(first, server.fingerprint(Path::new("/other-workspace")));

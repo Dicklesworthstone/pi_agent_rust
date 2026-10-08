@@ -1906,8 +1906,11 @@ async fn run(
             available_models,
             model_registry: model_registry.clone(),
             auth: auth.clone(),
-            oauth_refresh_failures: startup_oauth_refresh.failed_provider_ids()
-                .into_iter().map(str::to_string).collect(),
+            oauth_refresh_failures: startup_oauth_refresh
+                .failed_provider_ids()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
             // The ACP prompt builder advertises skills only when this launch
@@ -2463,7 +2466,11 @@ async fn run(
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
         .as_ref()
-        .map(|options| options.runtime().with_secrets_settings(config.secrets.as_ref()));
+        .map(|options| {
+            options
+                .runtime()
+                .with_secrets_settings(config.secrets.as_ref())
+        });
     // Host authorization must not depend on granting the model the ask tool.
     // The registry picker is always handed to interactive/RPC hosts; only this
     // conditional extend adds ask to the provider-visible schema.
@@ -2873,8 +2880,8 @@ async fn run(
                 )
             })
             .collect::<Vec<_>>();
-        let title_client = pi::app::titling_model_entry(&cli, &config, &model_registry)
-            .and_then(|entry| {
+        let title_client =
+            pi::app::titling_model_entry(&cli, &config, &model_registry).and_then(|entry| {
                 pi::session_title::TitleClient::for_model_entry(
                     &entry,
                     &selection.model_entry,
@@ -11233,7 +11240,8 @@ mod tests {
         cli.model = None;
         cli.api_key = None;
         let mut config = Config::default();
-        let bootstrap = build_extension_bootstrap_selection( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture bootstrap must resolve.
+        let bootstrap = build_extension_bootstrap_selection(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture bootstrap must resolve.
             &config,
             &registry,
             &temp.path().join("models.json"),
@@ -11246,7 +11254,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(
                 &cli,
                 &refresh,
@@ -11257,7 +11266,8 @@ mod tests {
             .is_ok(),
             "a preliminary native identity must not block extension registration"
         );
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(
                 &cli,
                 &refresh,
@@ -11280,7 +11290,8 @@ mod tests {
         registry.merge_entries(vec![registered]);
         let session = pi::session::Session::in_memory();
         let patterns = vec!["startup-oauth-extension/scoped".to_string()];
-        let scoped = pi::app::resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture scope must resolve.
+        let scoped = pi::app::resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture scope must resolve.
             &cli,
             &session,
             &patterns,
@@ -11289,7 +11300,8 @@ mod tests {
             temp.path(),
         )
         .expect("allowed registered scope");
-        let selection = pi::app::select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must resolve.
+        let selection = pi::app::select_model_and_thinking(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must resolve.
             &cli,
             &config,
             &session,
@@ -11298,11 +11310,13 @@ mod tests {
             temp.path(),
         )
         .expect("registered extension destination");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             selection.model_entry.model.provider,
             "startup-oauth-extension"
         );
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(
                 &cli,
                 &refresh,
@@ -11329,18 +11343,25 @@ mod tests {
         };
         for key in [None, Some(" \t ")] {
             cli.api_key = key.map(str::to_string);
-            let error = validate_startup_oauth_refresh( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
-                &cli, &refresh, "openrouter", &[], false,
+            let error = validate_startup_oauth_refresh(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+                &cli,
+                &refresh,
+                "openrouter",
+                &[],
+                false,
             )
             .expect_err("provider aliases and blank keys cannot evade the final OAuth failure");
-            assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 error
                     .to_string()
                     .contains("OAuth token refresh failed for: OPEN-ROUTER")
             );
         }
         cli.api_key = Some(" explicit-run-key ".to_string());
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(&cli, &refresh, "openrouter", &[], false).is_ok()
         );
         cli.api_key = None;
@@ -11349,9 +11370,14 @@ mod tests {
             provider: "Open-Router".to_string(),
             oauth_config: None,
         };
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(
-                &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+                &cli,
+                &refresh,
+                "openrouter",
+                std::slice::from_ref(&binding),
+                false,
             )
             .is_err(),
             "registering a provider without replacement OAuth leaves its native failure relevant"
@@ -11363,9 +11389,14 @@ mod tests {
             scopes: vec!["models:use".to_string()],
             redirect_uri: None,
         });
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             validate_startup_oauth_refresh(
-                &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+                &cli,
+                &refresh,
+                "openrouter",
+                std::slice::from_ref(&binding),
+                false,
             )
             .is_ok(),
             "the selected provider's extension OAuth supersedes its native refresh result"
@@ -11373,9 +11404,14 @@ mod tests {
         binding.provider = "unrelated-extension".to_string();
         for oauth in [binding.oauth_config.clone(), None] {
             binding.oauth_config = oauth;
-            assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 validate_startup_oauth_refresh(
-                    &cli, &refresh, "openrouter", std::slice::from_ref(&binding), false,
+                    &cli,
+                    &refresh,
+                    "openrouter",
+                    std::slice::from_ref(&binding),
+                    false,
                 )
                 .is_err(),
                 "an unrelated extension cannot suppress the selected provider's native failure"

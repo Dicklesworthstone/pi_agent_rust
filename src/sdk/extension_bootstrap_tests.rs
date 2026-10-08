@@ -506,7 +506,8 @@ fn final_scoped_selection_filters_registered_and_native_providers_with_an_explic
             };
             let mut inputs = selection_inputs(&request, &config, temp.path(), &refresh);
             inputs.scoped_patterns = &patterns;
-            super::finish_selection_inner( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            super::finish_selection_inner(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
                 &mut handle.session,
                 &mut registry,
                 &mut auth,
@@ -514,21 +515,25 @@ fn final_scoped_selection_filters_registered_and_native_providers_with_an_explic
             )
             .await
             .expect("an allowed scoped provider remains");
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 handle.model(),
                 (expected.0.to_string(), expected.1.to_string())
             );
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 handle.thinking_level(),
                 Some(thinking)
             );
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 handle.session().agent.stream_options().api_key.as_deref(),
                 Some("scoped-selection-key")
             );
             handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture state must be readable.
                 .with_session(|stored| {
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                         (
                             stored.header.provider.as_deref(),
                             stored.header.model_id.as_deref(),
@@ -546,11 +551,13 @@ fn final_scoped_selection_filters_registered_and_native_providers_with_an_explic
             .prompt("use the permitted scoped extension", |_| {})
             .await
             .expect("extension prompt");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             text(&message),
             "loads:1 starts:1 model:second"
         );
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             handle.shutdown_owned_resources().await.completed_cleanly()
         );
     });
@@ -568,7 +575,11 @@ fn fully_disabled_registered_scope_does_not_publish_a_fallback_or_new_credential
         // while recreating that unnamed store with the same session id and cwd.
         {
             let owner = crate::agent_cx::AgentCx::for_request();
-            let mut stored = handle.session.session.lock(owner.cx()).await // ubs:ignore[rust.ownership.unwrap-expect] -- Prepare the real unnamed startup store before final selection.
+            let mut stored = handle
+                .session
+                .session
+                .lock(owner.cx())
+                .await // ubs:ignore[rust.ownership.unwrap-expect] -- Prepare the real unnamed startup store before final selection.
                 .expect("lock startup store");
             let session_id = stored.header.id.clone();
             let session_cwd = stored.header.cwd.clone();
@@ -602,7 +613,8 @@ fn fully_disabled_registered_scope_does_not_publish_a_fallback_or_new_credential
         let mut inputs = selection_inputs(&request, &config, temp.path(), &refresh);
         inputs.scoped_patterns = &patterns;
         inputs.cwd = &live_cwd;
-        let error = super::finish_selection_inner( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+        let error = super::finish_selection_inner(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
             &mut handle.session,
             &mut registry,
             &mut auth,
@@ -610,24 +622,29 @@ fn fully_disabled_registered_scope_does_not_publish_a_fallback_or_new_credential
         )
         .await
         .expect_err("global and workspace policy remove every registered candidate");
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             error.to_string().contains("[MODEL_SCOPE_DISABLED]")
         );
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             registry_identity(&registry),
             before
         );
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             handle.model(),
             ("sdk-extension-fixture".to_string(), "fixture".to_string())
         );
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             handle.session().agent.stream_options().api_key.as_deref(),
             Some("sdk-explicit-test-key")
         );
         handle // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture state must be readable.
             .with_session(|stored| {
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     (
                         stored.header.provider.as_deref(),
                         stored.header.model_id.as_deref(),
@@ -641,11 +658,13 @@ fn fully_disabled_registered_scope_does_not_publish_a_fallback_or_new_credential
             .prompt("the original session remains usable", |_| {})
             .await
             .expect("prompt after rejected selection");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             text(&message),
             "loads:1 starts:1 model:fixture"
         );
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             handle.shutdown_owned_resources().await.completed_cleanly()
         );
     });

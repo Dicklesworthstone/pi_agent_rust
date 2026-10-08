@@ -1876,8 +1876,14 @@ mod tests {
             "anthropic/first:low".to_string(),
         ];
         let cwd = Path::new("/scope-policy/project/src");
-        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
-            &cli, &Session::in_memory(), &patterns, &registry, &config, cwd,
+        let scoped = resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli,
+            &Session::in_memory(),
+            &patterns,
+            &registry,
+            &config,
+            cwd,
         )
         .expect("allowed workspace candidates");
 
@@ -1893,14 +1899,16 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             identities,
             vec![
                 ("anthropic", "second", Some(model::ThinkingLevel::High)),
                 ("anthropic", "first", Some(model::ThinkingLevel::Low)),
             ]
         );
-        let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+        let selection = select_model_and_thinking(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
             &cli,
             &config,
             &Session::in_memory(),
@@ -1909,7 +1917,8 @@ mod tests {
             cwd,
         )
         .expect("automatic selection respects the filtered scope");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             (
                 selection.model_entry.model.provider.as_str(),
                 selection.model_entry.model.id.as_str(),
@@ -1936,22 +1945,36 @@ mod tests {
         };
         let patterns = vec!["openai/scoped".to_string()];
         let cwd = Path::new("/scope-policy");
-        let error = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
-            &cli, &Session::in_memory(), &patterns, &registry, &config, cwd,
+        let error = resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+            &cli,
+            &Session::in_memory(),
+            &patterns,
+            &registry,
+            &config,
+            cwd,
         )
         .expect_err("a disabled requested scope must not select an unrelated default");
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             error.to_string().contains("[MODEL_SCOPE_DISABLED]")
         );
 
         // An absent or explicitly cleared scope is different: ordinary
         // configured-default selection must remain available.
-        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
-            &cli, &Session::in_memory(), &[], &registry, &config, cwd,
+        let scoped = resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            &cli,
+            &Session::in_memory(),
+            &[],
+            &registry,
+            &config,
+            cwd,
         )
         .expect("an empty requested scope remains unrestricted");
         assert!(scoped.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-        let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+        let selection = select_model_and_thinking(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
             &cli,
             &config,
             &Session::in_memory(),
@@ -1960,7 +1983,8 @@ mod tests {
             cwd,
         )
         .expect("configured default without a scope");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             selection.model_entry.model.id,
             "outside-scope"
         );
@@ -1996,16 +2020,19 @@ mod tests {
                 cli.model = None;
             }
             cli.api_key = Some("scope-override".to_string());
-            let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            let scoped = resolve_startup_model_scope(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
                 &cli, &session, &patterns, &registry, &config, cwd,
             )
             .expect("explicit and resumed identities retain their selection precedence");
             assert!(scoped.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-            let selection = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+            let selection = select_model_and_thinking(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
                 &cli, &config, &session, &registry, &scoped, cwd,
             )
             .expect("the selected or saved identity remains usable");
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                 (
                     selection.model_entry.model.provider.as_str(),
                     selection.model_entry.model.id.as_str(),
@@ -2036,10 +2063,7 @@ mod tests {
         let mut stale_header = Session::in_memory();
         stale_header.header.provider = Some("openai".to_string());
         stale_header.header.model_id = Some("scoped".to_string());
-        stale_header.append_model_change(
-            "removed-custom-provider".to_string(),
-            "gone".to_string(),
-        );
+        stale_header.append_model_change("removed-custom-provider".to_string(), "gone".to_string());
 
         for args in [
             vec!["pi", "--continue"],
@@ -2051,11 +2075,13 @@ mod tests {
             cli.model = None;
             cli.api_key = Some("scope-override".to_string());
             for session in [&empty, &missing, &stale_header] {
-                let error = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+                let error = resolve_startup_model_scope(
+                    // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
                     &cli, session, &patterns, &registry, &config, cwd,
                 )
                 .expect_err("resume intent must not authorize an unrelated default");
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     error.to_string().contains("[MODEL_SCOPE_DISABLED]")
                 );
             }
@@ -2070,15 +2096,18 @@ mod tests {
         restored.header.provider = Some("removed-custom-provider".to_string());
         restored.header.model_id = Some("gone".to_string());
         restored.append_model_change("openai".to_string(), "saved-ad-hoc".to_string());
-        let scoped = resolve_startup_model_scope( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+        let scoped = resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
             &cli, &restored, &patterns, &registry, &config, cwd,
         )
         .expect("a restorable branch keeps its exact destination");
-        let selected = select_model_and_thinking( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
+        let selected = select_model_and_thinking(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must succeed.
             &cli, &config, &restored, &registry, &scoped, cwd,
         )
         .expect("restore the native ad-hoc branch identity");
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             (
                 selected.model_entry.model.provider.as_str(),
                 selected.model_entry.model.id.as_str(),

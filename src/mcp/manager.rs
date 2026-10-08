@@ -1755,19 +1755,28 @@ mod acp_literal_tests {
     #[test]
     fn acp_transport_construction_never_resolves_references_or_trims_literals() {
         let entries = vec![
-            ("A".to_string(), "$ENV:PI_ACP_SHOULD_NOT_RESOLVE".to_string()),
+            (
+                "A".to_string(),
+                "$ENV:PI_ACP_SHOULD_NOT_RESOLVE".to_string(),
+            ),
             ("B".to_string(), "$CMD:exit 97".to_string()),
             ("C".to_string(), "  literal spaces  ".to_string()),
         ];
         let resolved = resolve_server_secrets(
-            &entries, Provenance::Acp, super::super::config::validate_env_value,
-        ).expect("literal ACP values");
-        assert_eq!(resolved, entries);
-        assert!(resolve_server_secrets(
-            &[("TOKEN".into(), "bad\r\nvalue".into())],
+            &entries,
             Provenance::Acp,
-            super::super::config::validate_http_header_value,
-        ).is_err());
+            super::super::config::validate_env_value,
+        )
+        .expect("literal ACP values");
+        assert_eq!(resolved, entries);
+        assert!(
+            resolve_server_secrets(
+                &[("TOKEN".into(), "bad\r\nvalue".into())],
+                Provenance::Acp,
+                super::super::config::validate_http_header_value,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -2181,7 +2190,9 @@ mod tests {
             .expect("acknowledge fixture execution");
     }
 
-    pub(super) fn trusted_fixture_manager(temp: &tempfile::TempDir) -> (McpManager, Arc<ServerEntry>) {
+    pub(super) fn trusted_fixture_manager(
+        temp: &tempfile::TempDir,
+    ) -> (McpManager, Arc<ServerEntry>) {
         let cwd = temp.path().join("project");
         let global = temp.path().join("global");
         std::fs::create_dir_all(&cwd).expect("project directory");

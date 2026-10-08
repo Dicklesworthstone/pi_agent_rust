@@ -282,9 +282,11 @@ fn collect_digest(messages: &[Message]) -> (TurnDigest, Vec<String>) {
             Message::ToolResult(result)
                 if result.is_error && digest.tool_errors.len() < MAX_DIGEST_ERRORS =>
             {
-                digest
-                    .tool_errors
-                    .push(retain_error_text(result, &mut remaining, &mut source_error_blocks));
+                digest.tool_errors.push(retain_error_text(
+                    result,
+                    &mut remaining,
+                    &mut source_error_blocks,
+                ));
             }
             _ => {}
         }
@@ -605,22 +607,21 @@ impl AdvisorRuntime {
             return AdvisorOutcome::Failed;
         };
         let call = self.call_advisor(&digest);
-        let reply = match crate::text_completion::with_timeout_and_abort(self.timeout, abort, call)
-            .await
-        {
-            Ok(Ok(reply)) => reply,
-            Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
-            Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
-                self.consecutive_failures += 1;
-                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    self.disabled_notice = Some(format!(
-                        "advisor ({}) disabled after {} consecutive failures",
-                        self.label, self.consecutive_failures
-                    ));
+        let reply =
+            match crate::text_completion::with_timeout_and_abort(self.timeout, abort, call).await {
+                Ok(Ok(reply)) => reply,
+                Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
+                Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
+                    self.consecutive_failures += 1;
+                    if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        self.disabled_notice = Some(format!(
+                            "advisor ({}) disabled after {} consecutive failures",
+                            self.label, self.consecutive_failures
+                        ));
+                    }
+                    return AdvisorOutcome::Failed;
                 }
-                return AdvisorOutcome::Failed;
-            }
-        };
+            };
         self.consecutive_failures = 0;
         let verdict = parse_verdict(&reply);
         if verdict.level == VerdictLevel::Note && verdict.rationale.len() < 12 {
@@ -1153,12 +1154,11 @@ mod tests {
                 let (runtime, provider) = scripted_runtime(vec![completed_reply(
                     "CONCERN\nCheck the selected error handling before continuing.",
                 )]);
-                let mut runtime = runtime.with_secrets_settings(Some(
-                    &crate::secrets::SecretsSettings {
+                let mut runtime =
+                    runtime.with_secrets_settings(Some(&crate::secrets::SecretsSettings {
                         mode: Some(mode.to_string()),
                         extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
-                    },
-                ));
+                    }));
                 let digest = TurnDigest {
                     files_touched: vec!["ACME-123456.rs".to_string()],
                     commands_run: vec![format!("{}ACME-123456", "x".repeat(197))],
@@ -1187,12 +1187,11 @@ mod tests {
             let (runtime, provider) = scripted_runtime(vec![completed_reply(
                 "CONCERN\nThe clean digest should still receive a review.",
             )]);
-            let mut runtime = runtime.with_secrets_settings(Some(
-                &crate::secrets::SecretsSettings {
+            let mut runtime =
+                runtime.with_secrets_settings(Some(&crate::secrets::SecretsSettings {
                     mode: Some("block".to_string()),
                     extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
-                },
-            ));
+                }));
             runtime.consecutive_failures = 2;
             for turn in 0..u64::from(MAX_CONSECUTIVE_FAILURES) + 2 {
                 let secret = if turn.is_multiple_of(2) {
@@ -1248,15 +1247,18 @@ mod tests {
         let messages = vec![tool_error(vec![text("ACME-123456"), text("details")])];
         for mode in ["obfuscate", "block"] {
             let (runtime, provider) = scripted_runtime(Vec::new());
-            let runtime = runtime.with_secrets_settings(Some(
-                &crate::secrets::SecretsSettings {
-                    mode: Some(mode.to_string()),
-                    extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
-                },
-            ));
+            let runtime = runtime.with_secrets_settings(Some(&crate::secrets::SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+            }));
             let projection = runtime.build_digest(&messages);
             if mode == "block" {
-                assert!(projection.unwrap_err().to_string().contains("PI_SECRET_BLOCK"));
+                assert!(
+                    projection
+                        .unwrap_err()
+                        .to_string()
+                        .contains("PI_SECRET_BLOCK")
+                );
             } else {
                 assert_eq!(
                     projection.unwrap().tool_errors,
@@ -1390,7 +1392,8 @@ mod tests {
             let (handle, signal) = crate::agent::AbortHandle::new();
             handle.abort();
             for turn in 0..4 {
-                assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- User cancellation is quiet and must not spend the provider failure budget.
+                assert!(matches!(
+                    // ubs:ignore[rust.panic.assert-macros] -- User cancellation is quiet and must not spend the provider failure budget.
                     runtime
                         .review_turn_with_abort(&review_digest(), turn, Some(&signal))
                         .await,
@@ -1401,7 +1404,8 @@ mod tests {
             assert!(!runtime.is_disabled()); // ubs:ignore[rust.panic.assert-macros] -- Repeated user aborts cannot disable a healthy advisor.
             assert_eq!(runtime.guard.notes_in_window, 0); // ubs:ignore[rust.panic.assert-macros] -- Cancelled work does not consume emission allowance.
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- No cancelled review may enter the provider.
-            assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- A new uncancelled turn is a positive admission control.
+            assert!(matches!(
+                // ubs:ignore[rust.panic.assert-macros] -- A new uncancelled turn is a positive admission control.
                 runtime.review_turn(&review_digest(), 4).await,
                 AdvisorOutcome::Inject(_)
             ));

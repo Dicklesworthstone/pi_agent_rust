@@ -149,7 +149,10 @@ pub(crate) async fn revive_child(
 ) -> Result<ToolOutput> {
     let owner = crate::agent_cx::AgentCx::for_current_or_request();
     if owner.checkpoint().is_err() {
-        return Err(Error::tool("hub", "PI_HUB_REVIVAL_CANCELLED: caller is cancelled"));
+        return Err(Error::tool(
+            "hub",
+            "PI_HUB_REVIVAL_CANCELLED: caller is cancelled",
+        ));
     }
     let capabilities = owner.capabilities();
     if !capabilities.io || !capabilities.spawn || !capabilities.time {

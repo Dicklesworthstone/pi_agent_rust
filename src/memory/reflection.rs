@@ -698,12 +698,8 @@ mod tests {
             extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
         }));
         let protect = |parts: &[&str]| redact_inputs(parts, &privacy);
-        let (question, projected) = screen_sources(
-            "ACME-123456",
-            vec![source.clone()],
-            &protect,
-        )
-        .expect("project complete source set");
+        let (question, projected) = screen_sources("ACME-123456", vec![source.clone()], &protect)
+            .expect("project complete source set");
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!question.contains("ACME-123456"));
         assert!(!serialized.contains("ACME-123456"));

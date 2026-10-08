@@ -93,7 +93,9 @@ struct SourceStamp {
 impl SourceStamp {
     fn from_metadata(identity: FileIdentity, metadata: &Metadata) -> Result<Self> {
         if !metadata.is_file() {
-            return Err(Error::session("Workdir discovery requires a regular session file"));
+            return Err(Error::session(
+                "Workdir discovery requires a regular session file",
+            ));
         }
         Ok(Self {
             identity,
@@ -165,7 +167,9 @@ fn read_projection(
             return Err(Error::Aborted);
         }
         line.clear();
-        let limit = u64::try_from(max_line_bytes).unwrap_or(u64::MAX - 2).saturating_add(2);
+        let limit = u64::try_from(max_line_bytes)
+            .unwrap_or(u64::MAX - 2)
+            .saturating_add(2);
         let read = (&mut *reader).take(limit).read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
@@ -173,21 +177,28 @@ fn read_projection(
         line_number += 1;
         let content = line.strip_suffix(b"\n").unwrap_or(&line);
         if content.len() > max_line_bytes {
-            return Err(invalid_row(line_number, "JSONL line exceeds the metadata reader limit"));
+            return Err(invalid_row(
+                line_number,
+                "JSONL line exceeds the metadata reader limit",
+            ));
         }
         let text = std::str::from_utf8(content).map_err(|error| invalid_row(line_number, error))?;
-        let text = if line_number == 1 { text.trim_start_matches('\u{feff}') } else { text };
+        let text = if line_number == 1 {
+            text.trim_start_matches('\u{feff}')
+        } else {
+            text
+        };
         if text.trim().is_empty() {
             continue;
         }
-        let row: MetadataRow<'_> = serde_json::from_str(text)
-            .map_err(|error| invalid_row(line_number, error))?;
+        let row: MetadataRow<'_> =
+            serde_json::from_str(text).map_err(|error| invalid_row(line_number, error))?;
         if !saw_header {
             if row.kind != "session" {
                 return Err(invalid_row(line_number, "missing session header"));
             }
-            let header: SessionHeader = serde_json::from_str(text)
-                .map_err(|error| invalid_row(line_number, error))?;
+            let header: SessionHeader =
+                serde_json::from_str(text).map_err(|error| invalid_row(line_number, error))?;
             if header.id.trim().is_empty() {
                 return Err(invalid_row(line_number, "empty session ID"));
             }
@@ -198,15 +209,28 @@ fn read_projection(
         if row.kind == "session" {
             return Err(invalid_row(line_number, "duplicate session header"));
         }
-        if row.custom_type.as_deref().is_some_and(|kind| kind.starts_with(WORKDIR_BINDING_PREFIX)) {
+        if row
+            .custom_type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with(WORKDIR_BINDING_PREFIX))
+        {
             if row.kind != "custom" {
-                return Err(invalid_row(line_number, "workdir metadata is not a custom entry"));
+                return Err(invalid_row(
+                    line_number,
+                    "workdir metadata is not a custom entry",
+                ));
             }
-            if row.data.is_some_and(|data| data.get().len() > MAX_BINDING_BYTES) {
-                return Err(invalid_row(line_number, "workdir attachment exceeds 64 KiB"));
+            if row
+                .data
+                .is_some_and(|data| data.get().len() > MAX_BINDING_BYTES)
+            {
+                return Err(invalid_row(
+                    line_number,
+                    "workdir attachment exceeds 64 KiB",
+                ));
             }
-            let entry: SessionEntry = serde_json::from_str(text)
-                .map_err(|error| invalid_row(line_number, error))?;
+            let entry: SessionEntry =
+                serde_json::from_str(text).map_err(|error| invalid_row(line_number, error))?;
             projection.entries.clear();
             projection.entries.push(entry);
         }
@@ -259,10 +283,16 @@ impl Drop for CancelRead {
 pub async fn inspect_saved_session_workdir(path: &Path) -> Result<SavedSessionWorkdir> {
     ensure_session_file_readable(path)?;
     let path = std::fs::canonicalize(path)?;
-    if path.extension().is_some_and(|extension| extension == "sqlite") {
-        let text = path.to_str().ok_or_else(|| Error::session("Session path is not UTF-8"))?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "sqlite")
+    {
+        let text = path
+            .to_str()
+            .ok_or_else(|| Error::session("Session path is not UTF-8"))?;
         let (session, diagnostics) = Session::open_with_diagnostics(text).await?;
-        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
+        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
+        {
             return Err(invalid_row(0, "session has recovery diagnostics"));
         }
         let workdir = inspect_session_workdir(&session)?;
@@ -284,7 +314,9 @@ pub async fn inspect_saved_session_workdir(path: &Path) -> Result<SavedSessionWo
             let _ = tx.send(cx.cx(), result);
         })?;
     let cx = AgentCx::for_current_or_request();
-    rx.recv(cx.cx()).await.map_err(|_| Error::session("Workdir metadata discovery was interrupted"))?
+    rx.recv(cx.cx())
+        .await
+        .map_err(|_| Error::session("Workdir metadata discovery was interrupted"))?
 }
 
 #[cfg(test)]
@@ -320,14 +352,23 @@ mod tests {
         let before = write_fixture(&session);
         let saved = read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false)).unwrap();
         assert_eq!(saved.workdir.bound_cwd, target);
-        assert!(matches!(saved.workdir.health, WorkdirHealth::Available { .. }));
+        assert!(matches!(
+            saved.workdir.health,
+            WorkdirHealth::Available { .. }
+        ));
         // A tail or active-path view can exclude every binding. Never infer
         // session-wide state from that intentionally incomplete entry subset.
         session.entries.clear();
         saved.check_loaded_session(&session).unwrap();
         saved.check_runtime_cwd(&target).unwrap();
-        assert_eq!(std::fs::read(session.path.as_ref().unwrap()).unwrap(), before);
-        assert_eq!(session.header.cwd, target.join("old-project").to_str().unwrap());
+        assert_eq!(
+            std::fs::read(session.path.as_ref().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            session.header.cwd,
+            target.join("old-project").to_str().unwrap()
+        );
     }
 
     #[test]
@@ -348,12 +389,20 @@ mod tests {
         assert!(saved.check_runtime_cwd(&first).is_err());
         session.append_custom_entry(WORKDIR_BINDING_TYPE.into(), Some(json!({"cwd": second})));
         write_fixture(&session);
-        assert!(read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false))
-            .unwrap_err().to_string().contains("BINDING_INVALID"));
+        assert!(
+            read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false))
+                .unwrap_err()
+                .to_string()
+                .contains("BINDING_INVALID")
+        );
         session.append_custom_entry("pi.session.workdir.v2".into(), None);
         write_fixture(&session);
-        assert!(read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false))
-            .unwrap_err().to_string().contains("BINDING_UNSUPPORTED"));
+        assert!(
+            read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false))
+                .unwrap_err()
+                .to_string()
+                .contains("BINDING_UNSUPPORTED")
+        );
     }
 
     #[test]
@@ -370,7 +419,10 @@ mod tests {
         std::fs::write(session.path.as_ref().unwrap(), &bytes).unwrap();
         let saved = read_jsonl(session.path.as_ref().unwrap(), &AtomicBool::new(false)).unwrap();
         assert_eq!(saved.session_id, session.header.id);
-        assert_eq!(std::fs::read(session.path.as_ref().unwrap()).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(session.path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
     }
 
     #[test]
@@ -383,10 +435,20 @@ mod tests {
         session.header.id = "different-session".into();
         assert!(saved.check_loaded_session(&session).is_err());
         session.header.id = id;
-        let old = session.path.as_ref().unwrap().with_extension("retained-original");
+        let old = session
+            .path
+            .as_ref()
+            .unwrap()
+            .with_extension("retained-original");
         std::fs::rename(session.path.as_ref().unwrap(), &old).unwrap();
         write_fixture(&session);
-        assert!(saved.check_loaded_session(&session).unwrap_err().to_string().contains("SOURCE_CHANGED"));
+        assert!(
+            saved
+                .check_loaded_session(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("SOURCE_CHANGED")
+        );
         assert!(old.is_file());
     }
 
@@ -401,15 +463,32 @@ mod tests {
             "{}\n".to_string(),
             String::new(),
         ] {
-            assert!(read_projection(&mut std::io::Cursor::new(bytes), &AtomicBool::new(false), MAX_LINE_BYTES).is_err());
+            assert!(
+                read_projection(
+                    &mut std::io::Cursor::new(bytes),
+                    &AtomicBool::new(false),
+                    MAX_LINE_BYTES
+                )
+                .is_err()
+            );
         }
-        assert!(read_projection(&mut std::io::Cursor::new(header), &AtomicBool::new(false), 16).is_err());
+        assert!(
+            read_projection(
+                &mut std::io::Cursor::new(header),
+                &AtomicBool::new(false),
+                16
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn cancelled_metadata_work_stops_before_reading() {
         let mut reader = std::io::Cursor::new(b"not JSON");
-        assert!(matches!(read_projection(&mut reader, &AtomicBool::new(true), MAX_LINE_BYTES), Err(Error::Aborted)));
+        assert!(matches!(
+            read_projection(&mut reader, &AtomicBool::new(true), MAX_LINE_BYTES),
+            Err(Error::Aborted)
+        ));
         assert_eq!(reader.position(), 0);
         let signal = Arc::new(AtomicBool::new(false));
         drop(CancelRead(Arc::clone(&signal)));
@@ -418,15 +497,21 @@ mod tests {
 
     #[test]
     fn public_discovery_and_native_open_agree_without_writing_the_source() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().canonicalize().unwrap();
             let mut original = fixture(&cwd.join("saved.jsonl"), &cwd.join("moved-away"));
             attach_session_workdir(&mut original, &cwd).unwrap();
             let before = write_fixture(&original);
-            let saved = inspect_saved_session_workdir(original.path.as_ref().unwrap()).await.unwrap();
-            let loaded = Session::open(saved.source_path.to_str().unwrap()).await.unwrap();
+            let saved = inspect_saved_session_workdir(original.path.as_ref().unwrap())
+                .await
+                .unwrap();
+            let loaded = Session::open(saved.source_path.to_str().unwrap())
+                .await
+                .unwrap();
             saved.check_loaded_session(&loaded).unwrap();
             saved.check_runtime_cwd(&cwd).unwrap();
             assert_eq!(loaded.header.cwd, original.header.cwd);
@@ -437,18 +522,25 @@ mod tests {
     #[cfg(feature = "sqlite-sessions")]
     #[test]
     fn sqlite_discovery_uses_the_native_saved_binding() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().canonicalize().unwrap();
             let mut session = Session::create_with_dir_and_store(
-                Some(cwd.clone()), crate::session::SessionStoreKind::Sqlite,
+                Some(cwd.clone()),
+                crate::session::SessionStoreKind::Sqlite,
             );
             session.header.cwd = cwd.join("moved-away").to_str().unwrap().into();
             attach_session_workdir(&mut session, &cwd).unwrap();
             session.save().await.unwrap();
-            let saved = inspect_saved_session_workdir(session.path.as_ref().unwrap()).await.unwrap();
-            let loaded = Session::open(saved.source_path.to_str().unwrap()).await.unwrap();
+            let saved = inspect_saved_session_workdir(session.path.as_ref().unwrap())
+                .await
+                .unwrap();
+            let loaded = Session::open(saved.source_path.to_str().unwrap())
+                .await
+                .unwrap();
             saved.check_loaded_session(&loaded).unwrap();
             saved.check_runtime_cwd(&cwd).unwrap();
             assert_eq!(loaded.header.cwd, session.header.cwd);

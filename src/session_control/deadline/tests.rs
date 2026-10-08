@@ -320,7 +320,10 @@ fn completion_and_drop_retire_the_deadline_owner_waker() {
             // Verify retirement even while the completed wrapper stays alive.
             assert!(limited.cancellation.is_none());
             let before = wakes.0.load(Ordering::SeqCst);
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("after completion"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("after completion"),
+            );
             assert_eq!(wakes.0.load(Ordering::SeqCst), before);
         }
         drop(limited);
@@ -348,7 +351,10 @@ fn explicit_abort_retires_owner_wait_without_reclassifying_cleanup() {
     assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
     assert!(limited.cancellation.is_none());
     let before = wakes.0.load(Ordering::SeqCst);
-    owner.cancel_with(asupersync::types::CancelKind::User, Some("after explicit abort"));
+    owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("after explicit abort"),
+    );
     assert_eq!(wakes.0.load(Ordering::SeqCst), before);
     release.store(true, Ordering::SeqCst);
     assert!(matches!(

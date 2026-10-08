@@ -1474,7 +1474,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(store.lookup("ext", "exec"), Some(false));
         assert_eq!(
-            PermissionStore::open(&backup).unwrap().lookup("ext", "exec"),
+            PermissionStore::open(&backup)
+                .unwrap()
+                .lookup("ext", "exec"),
             Some(false)
         );
     }

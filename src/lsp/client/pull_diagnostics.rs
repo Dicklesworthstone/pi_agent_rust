@@ -449,15 +449,18 @@ mod delivery_failure_tests {
                     ]
                 }));
                 peer.runtime
-                    .block_on(peer.client.refresh_document_diagnostics(
-                        &uri,
-                        Duration::from_secs(5),
-                    ))
+                    .block_on(
+                        peer.client
+                            .refresh_document_diagnostics(&uri, Duration::from_secs(5)),
+                    )
                     .unwrap();
                 peer.client.quiescent.store(true, Ordering::SeqCst);
                 let error = peer
                     .runtime
-                    .block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5)))
+                    .block_on(
+                        peer.client
+                            .document_diagnostics(&uri, Duration::from_secs(5)),
+                    )
                     .unwrap_err();
                 assert!(error.to_string().contains("fixture"), "{error}");
                 assert_eq!(
@@ -488,7 +491,10 @@ mod delivery_failure_tests {
                 }));
                 assert!(
                     peer.runtime
-                        .block_on(peer.client.document_diagnostics(&uri, Duration::from_secs(5)))
+                        .block_on(
+                            peer.client
+                                .document_diagnostics(&uri, Duration::from_secs(5))
+                        )
                         .unwrap()
                         .is_empty()
                 );

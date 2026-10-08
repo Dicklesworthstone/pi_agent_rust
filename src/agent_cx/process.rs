@@ -460,7 +460,9 @@ mod tests {
         let _caller = restricted.set_current_restricted();
         let error = owner
             .process()
-            .spawn_checked(&mut Command::new(directory.path().join("missing-child.exe")))
+            .spawn_checked(&mut Command::new(
+                directory.path().join("missing-child.exe"),
+            ))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         let caller = Cx::current().unwrap();

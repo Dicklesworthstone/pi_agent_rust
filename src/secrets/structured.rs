@@ -506,13 +506,9 @@ mod structured_outbound_tests {
         let patterns = [regex::Regex::new(r"^(?:true|false|null)$").unwrap()];
         let mut vault = SecretVault::default();
 
-        let (output, _) = transform_assistant_replay_json(
-            &input,
-            &mut vault,
-            SecretsMode::Obfuscate,
-            &patterns,
-        )
-        .expect("model-authored primitive replay");
+        let (output, _) =
+            transform_assistant_replay_json(&input, &mut vault, SecretsMode::Obfuscate, &patterns)
+                .expect("model-authored primitive replay");
 
         assert_eq!(output["token"].as_u64(), Some(numeric));
         assert_eq!(output["flags"], input["flags"]);

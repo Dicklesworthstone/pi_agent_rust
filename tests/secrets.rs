@@ -1017,9 +1017,8 @@ fn unsigned_numeric_tool_arguments_survive_same_origin_continuations() {
 fn numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode() {
     use pi::model::{Message, StopReason};
 
-    let harness = TestHarness::new(
-        "numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode",
-    );
+    let harness =
+        TestHarness::new("numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode");
     let root = harness.temp_path(".");
     for mismatch in ["same", "api", "provider", "model", "unknown"] {
         for mode in ["obfuscate", "block"] {
@@ -1403,15 +1402,20 @@ fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() 
 
             let capture = capture.lock().expect("capture");
             assert_eq!(capture.payloads.len(), 1);
-            assert!(!capture.payloads[0].contains(OPAQUE), "{mismatch} {reason:?}");
+            assert!(
+                !capture.payloads[0].contains(OPAQUE),
+                "{mismatch} {reason:?}"
+            );
             let Message::Assistant(screened) = &capture.messages[0][0] else {
                 panic!("expected screened assistant history")
             };
             assert_eq!(screened.stop_reason, reason);
             assert!(matches!(&screened.content[0], ContentBlock::Text(text)
                 if text.text == "<pi-secret:000001>" && text.text_signature.is_none()));
-            assert!(matches!(&screened.content[1], ContentBlock::Thinking(thinking)
-                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none()));
+            assert!(
+                matches!(&screened.content[1], ContentBlock::Thinking(thinking)
+                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none())
+            );
             assert!(matches!(&screened.content[2], ContentBlock::ToolCall(call)
                 if call.id == "call_source" && call.name == "fixture"
                     && call.arguments == json!({"echo": "<pi-secret:000001>"})
@@ -1450,8 +1454,7 @@ fn attachment_message(
 fn media_names_are_discovered_before_earlier_fields_are_screened() {
     use pi::model::{ContentBlock, MediaContent, Message, TextContent, UserContent};
 
-    let harness =
-        TestHarness::new("media_names_are_discovered_before_earlier_fields_are_screened");
+    let harness = TestHarness::new("media_names_are_discovered_before_earlier_fields_are_screened");
     let root = harness.temp_path(".");
     for as_tool_result in [false, true] {
         for mode in ["obfuscate", "block"] {
@@ -1464,9 +1467,7 @@ fn media_names_are_discovered_before_earlier_fields_are_screened() {
             );
             let message = attachment_message(
                 vec![
-                    ContentBlock::Text(TextContent::new(format!(
-                        "earlier echo: {OPAQUE_SECRET}"
-                    ))),
+                    ContentBlock::Text(TextContent::new(format!("earlier echo: {OPAQUE_SECRET}"))),
                     ContentBlock::Media(MediaContent {
                         data: "cGF5bG9hZA==".to_string(),
                         mime_type: "audio/wav".to_string(),
@@ -1481,8 +1482,7 @@ fn media_names_are_discovered_before_earlier_fields_are_screened() {
                 as_tool_result,
             );
             let original = serde_json::to_value(&message).expect("original attachment message");
-            let outcome =
-                block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
+            let outcome = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
             let capture = capture.lock().expect("capture");
             if mode == "block" {
                 let error = outcome
@@ -1511,7 +1511,10 @@ fn media_names_are_discovered_before_earlier_fields_are_screened() {
                         panic!("media must be retained")
                     };
                     assert_eq!(media.data, "cGF5bG9hZA==");
-                    assert!(matches!(media.mime_type.as_str(), "audio/wav" | "video/mp4"));
+                    assert!(matches!(
+                        media.mime_type.as_str(),
+                        "audio/wav" | "video/mp4"
+                    ));
                     assert!(media.name.as_deref().unwrap().contains("<pi-secret:"));
                     assert!(!media.placeholder().contains(SECRET));
                     assert!(!media.placeholder().contains(OPAQUE_SECRET));
@@ -1530,9 +1533,8 @@ fn media_names_are_discovered_before_earlier_fields_are_screened() {
 fn remembered_and_configured_media_names_are_protected_at_provider_entry() {
     use pi::model::{ContentBlock, MediaContent};
 
-    let harness = TestHarness::new(
-        "remembered_and_configured_media_names_are_protected_at_provider_entry",
-    );
+    let harness =
+        TestHarness::new("remembered_and_configured_media_names_are_protected_at_provider_entry");
     let root = harness.temp_path(".");
     for as_tool_result in [false, true] {
         let (mut agent, capture) = build_agent(&root, None);
@@ -1703,8 +1705,14 @@ fn encoded_image_and_media_payloads_remain_opaque_to_secret_screening() {
             .expect("encoded payloads are not text metadata");
         let capture = capture.lock().expect("capture");
         assert_eq!(capture.payloads.len(), 1);
-        assert_eq!(serde_json::to_value(&capture.messages[0]).unwrap(), original);
-        assert_eq!(serde_json::to_value(&agent.messages()[..2]).unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(&capture.messages[0]).unwrap(),
+            original
+        );
+        assert_eq!(
+            serde_json::to_value(&agent.messages()[..2]).unwrap(),
+            original
+        );
     }
 }
 
@@ -1749,8 +1757,14 @@ fn block_mode_paused_replay_keeps_payloads_opaque_but_screens_content_and_names(
         .expect("opaque paused payloads and signatures must not be screened as text");
     let capture = capture.lock().expect("capture");
     assert_eq!(capture.payloads.len(), 1);
-    assert_eq!(serde_json::to_value(&capture.messages[0][0]).unwrap(), original);
-    assert_eq!(serde_json::to_value(&agent.messages()[0]).unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(&capture.messages[0][0]).unwrap(),
+        original
+    );
+    assert_eq!(
+        serde_json::to_value(&agent.messages()[0]).unwrap(),
+        original
+    );
     drop(capture);
 
     let protected_blocks = [

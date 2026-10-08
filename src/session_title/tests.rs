@@ -97,7 +97,8 @@ impl Provider for RecordingProvider {
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(context.tools.is_empty(), "naming cannot execute tools"); // ubs:ignore[rust.panic.assert-macros] -- Tool-free request regression oracle.
-        self.requests.lock().unwrap().push(CapturedRequest { // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- A poisoned test recorder must fail the fixture.
+        self.requests.lock().unwrap().push(CapturedRequest {
+            // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- A poisoned test recorder must fail the fixture.
             messages: context.messages.to_vec(),
             system_prompt: context.system_prompt.as_deref().map(str::to_string),
             options: options.clone(),
@@ -155,7 +156,9 @@ fn assistant(text: impl Into<String>) -> AssistantMessage {
 fn exchange() -> Vec<Message> {
     vec![
         user("Fix the editor session startup"),
-        Message::assistant(assistant("The model selection now reaches the editor session.")),
+        Message::assistant(assistant(
+            "The model selection now reaches the editor session.",
+        )),
     ]
 }
 
@@ -268,18 +271,31 @@ fn preparation_screens_individual_complete_fields_before_excerpting() {
                 assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
                 assert_eq!(provider.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Blocked input must never call the provider.
             } else {
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Sanitized eligible input must produce a title.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Sanitized eligible input must produce a title.
                     client.generate(prepared.unwrap().unwrap()).await.as_deref(), // ubs:ignore[rust.ownership.unwrap-expect] -- Nonblocking fixture input must remain eligible.
                     Some("Fix editor startup"),
                 );
                 let requests = provider.requests.lock().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail this test.
                 let prompt = requests[0].prompt(); // ubs:ignore[rust.panic.direct-indexing] -- A successful fixture request must have been recorded.
                 assert!(prompt.contains("echo <pi-secret:redacted>")); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
-                assert!(!prompt.contains(secret), "later assignment screens earlier echo"); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
-                assert!(!prompt.contains("ACME-"), "anchored patterns see each original field"); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
-                assert!(!prompt.contains("PRIVATE-"), "attachments and reasoning are excluded"); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
+                assert!(
+                    !prompt.contains(secret),
+                    "later assignment screens earlier echo"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
+                assert!(
+                    !prompt.contains("ACME-"),
+                    "anchored patterns see each original field"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
+                assert!(
+                    !prompt.contains("PRIVATE-"),
+                    "attachments and reasoning are excluded"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
                 assert!(!prompt.contains("<pi-secret:000001>")); // ubs:ignore[rust.panic.assert-macros] -- Privacy regression oracle.
-                assert_eq!(requests[0].options.api_key.as_deref(), Some("title-fixture-key")); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded transport credentials are part of this regression oracle.
+                assert_eq!(
+                    requests[0].options.api_key.as_deref(),
+                    Some("title-fixture-key")
+                ); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded transport credentials are part of this regression oracle.
             }
             assert_eq!(serde_json::to_value(agent.messages()).unwrap(), before); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Serializable fixture history must remain unchanged.
         }
@@ -294,13 +310,18 @@ fn preparation_retains_live_vault_discoveries_without_exporting_reversible_ids()
         let client = client(provider.clone(), None);
         let mut agent = agent(provider.clone());
         let secret = "rememberedCredentialValue123456";
-        agent.secrets_transform_outbound_text(&format!("API_KEY={secret}")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must populate the live secret vault.
+        agent
+            .secrets_transform_outbound_text(&format!("API_KEY={secret}"))
+            .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must populate the live secret vault.
         agent.replace_messages(vec![
             user(format!("Check echo {secret}")),
             Message::assistant(assistant("The configuration was repaired.")),
         ]);
         let request = client.prepare_with_agent(&agent).unwrap().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The complete fixture exchange must be eligible.
-        assert_eq!(client.generate(request).await.as_deref(), Some("Repair account setup")); // ubs:ignore[rust.panic.assert-macros] -- Title generation regression oracle.
+        assert_eq!(
+            client.generate(request).await.as_deref(),
+            Some("Repair account setup")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Title generation regression oracle.
         let requests = provider.requests.lock().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail this test.
         assert!(requests[0].prompt().contains("echo <pi-secret:redacted>")); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded request privacy regression oracle.
         assert!(!requests[0].prompt().contains(secret)); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded request privacy regression oracle.
@@ -315,7 +336,10 @@ fn unscannable_text_is_refused_without_sending_an_unscreened_prefix() {
     let client = client(provider.clone(), None);
     for content in [
         UserContent::Text(format!("PRIVATE-PREFIX{}", "x".repeat(MAX_INPUT_BYTES))),
-        UserContent::Blocks(vec![ContentBlock::Text(TextContent::new("small field")); 257]),
+        UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("small field"));
+            257
+        ]),
     ] {
         let mut agent = agent(provider.clone());
         agent.replace_messages(vec![
@@ -343,8 +367,12 @@ fn title_uses_the_clean_terminal_message_and_sanitizes_display_controls() {
             done("\"Fix\u{202e} editor\u{1b} startup.\"\nextra commentary"),
         ])]);
         let client = client(provider.clone(), None);
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Only the clean terminal response may become a title.
-            client.generate(prepare(&client, exchange())).await.as_deref(),
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Only the clean terminal response may become a title.
+            client
+                .generate(prepare(&client, exchange()))
+                .await
+                .as_deref(),
             Some("Fix editor startup"),
         );
         let requests = provider.requests.lock().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail this test.
@@ -381,7 +409,12 @@ fn partial_failed_and_oversized_provider_responses_never_become_titles() {
         for events in cases {
             let provider = RecordingProvider::new(vec![Reply::Events(events)]);
             let client = client(provider.clone(), None);
-            assert!(client.generate(prepare(&client, exchange())).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Invalid terminal responses must not become titles.
+            assert!(
+                client
+                    .generate(prepare(&client, exchange()))
+                    .await
+                    .is_none()
+            ); // ubs:ignore[rust.panic.assert-macros] -- Invalid terminal responses must not become titles.
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Invalid responses must not trigger a retry.
         }
     });
@@ -422,8 +455,14 @@ fn title_deadline_retires_the_actual_pending_provider_stream() {
             .await;
         assert!(title.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A deadline cannot publish a title.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- A deadline cannot start a retry.
-        assert!(state.polled.load(Ordering::SeqCst), "provider stream reached Pending"); // ubs:ignore[rust.panic.assert-macros] -- The deadline must exercise an actual pending stream.
-        assert!(state.dropped.load(Ordering::SeqCst), "deadline must retire provider ownership"); // ubs:ignore[rust.panic.assert-macros] -- Pending provider ownership must be retired.
+        assert!(
+            state.polled.load(Ordering::SeqCst),
+            "provider stream reached Pending"
+        ); // ubs:ignore[rust.panic.assert-macros] -- The deadline must exercise an actual pending stream.
+        assert!(
+            state.dropped.load(Ordering::SeqCst),
+            "deadline must retire provider ownership"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Pending provider ownership must be retired.
     });
 }
 
@@ -467,7 +506,11 @@ fn resolved_credentials_and_headers_reach_the_role_without_cross_destination_ove
             },
         );
         let primary = entry("title-primary", "https://primary.invalid/v1", None);
-        let mut same = entry("title-primary", "https://primary.invalid/v1", Some("catalog-key"));
+        let mut same = entry(
+            "title-primary",
+            "https://primary.invalid/v1",
+            Some("catalog-key"),
+        );
         same.model.max_tokens = 32;
         let other_provider = entry(
             "title-secondary",
@@ -487,7 +530,8 @@ fn resolved_credentials_and_headers_reach_the_role_without_cross_destination_ove
             (&other_endpoint, &primary, "endpoint-key"),
             (&alias_role, &alias_primary, "foreground-cli-key"),
         ] {
-            let mut client = TitleClient::for_model_entry( // ubs:ignore[rust.ownership.unwrap-expect] -- Every authorized fixture role must resolve.
+            let mut client = TitleClient::for_model_entry(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Every authorized fixture role must resolve.
                 role,
                 original,
                 Some(" foreground-cli-key "),
@@ -500,11 +544,20 @@ fn resolved_credentials_and_headers_reach_the_role_without_cross_destination_ove
             Arc::get_mut(&mut client) // ubs:ignore[rust.ownership.unwrap-expect] -- The newly constructed fixture client has one owner.
                 .expect("unique newly constructed client")
                 .provider = provider.clone();
-            assert!(client.generate(prepare(&client, exchange())).await.is_some()); // ubs:ignore[rust.panic.assert-macros] -- An authorized role must generate a title.
+            assert!(
+                client
+                    .generate(prepare(&client, exchange()))
+                    .await
+                    .is_some()
+            ); // ubs:ignore[rust.panic.assert-macros] -- An authorized role must generate a title.
             let requests = provider.requests.lock().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail this test.
             assert_eq!(requests[0].options.api_key.as_deref(), Some(expected)); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded credential isolation regression oracle.
-            assert_eq!(requests[0].options.max_tokens, Some(role.model.max_tokens.min(96))); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded model limit regression oracle.
-            assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Configured headers must reach the title provider.
+            assert_eq!(
+                requests[0].options.max_tokens,
+                Some(role.model.max_tokens.min(96))
+            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded model limit regression oracle.
+            assert_eq!(
+                // ubs:ignore[rust.panic.assert-macros] -- Configured headers must reach the title provider.
                 requests[0] // ubs:ignore[rust.panic.direct-indexing] -- A successful fixture request must have been recorded.
                     .options
                     .headers
@@ -515,8 +568,13 @@ fn resolved_credentials_and_headers_reach_the_role_without_cross_destination_ove
             assert_eq!(requests[0].options.thinking_level, Some(ThinkingLevel::Off)); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Recorded reasoning setting regression oracle.
             assert!(!requests[0].prompt().contains(expected)); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- Credentials must stay out of the prompt.
         }
-        let missing = entry("title-uncredentialed", "https://uncredentialed.invalid/v1", None);
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Unrelated roles cannot borrow the foreground override.
+        let missing = entry(
+            "title-uncredentialed",
+            "https://uncredentialed.invalid/v1",
+            None,
+        );
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Unrelated roles cannot borrow the foreground override.
             TitleClient::for_model_entry(
                 &missing,
                 &primary,
@@ -554,20 +612,31 @@ async fn persist_exchange(agent_session: &mut AgentSession, messages: Vec<Messag
     for message in &messages {
         session.append_model_message(message.clone());
     }
-    session.save().await.expect("persist completed foreground exchange"); // ubs:ignore[rust.ownership.unwrap-expect] -- A setup save failure must fail the durability test.
+    session
+        .save()
+        .await
+        .expect("persist completed foreground exchange"); // ubs:ignore[rust.ownership.unwrap-expect] -- A setup save failure must fail the durability test.
     drop(session);
     agent_session.agent.replace_messages(messages);
 }
 
 async fn current_name(agent_session: &AgentSession) -> Option<String> {
     let cx = crate::agent_cx::AgentCx::for_request();
-    agent_session.session.lock(cx.cx()).await.unwrap().get_name() // ubs:ignore[rust.ownership.unwrap-expect] -- This observation must not hide a failed test-session lock.
+    agent_session
+        .session
+        .lock(cx.cx())
+        .await
+        .unwrap()
+        .get_name() // ubs:ignore[rust.ownership.unwrap-expect] -- This observation must not hide a failed test-session lock.
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !predicate() {
-        assert!(Instant::now() < deadline, "background title operation did not settle"); // ubs:ignore[rust.panic.assert-macros] -- Bounded asynchronous test wait.
+        assert!(
+            Instant::now() < deadline,
+            "background title operation did not settle"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Bounded asynchronous test wait.
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
     }
 }
@@ -583,7 +652,10 @@ async fn wait_for_title(
         if let Some(title) = controller.tick(agent_session, Some(client), runtime).await {
             return title;
         }
-        assert!(Instant::now() < deadline, "automatic title was never published"); // ubs:ignore[rust.panic.assert-macros] -- Bounded publication regression oracle.
+        assert!(
+            Instant::now() < deadline,
+            "automatic title was never published"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Bounded publication regression oracle.
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
     }
 }
@@ -608,7 +680,8 @@ fn controller_publishes_one_durable_title_and_never_charges_for_later_turns() {
         assert_eq!(current_name(&owner).await.as_deref(), Some(title.as_str())); // ubs:ignore[rust.panic.assert-macros] -- Published runtime metadata must match.
         let reopened = Session::open(path.to_str().unwrap()).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Reopening the UTF-8 fixture path verifies durable publication.
         assert_eq!(reopened.get_name().as_deref(), Some(title.as_str())); // ubs:ignore[rust.panic.assert-macros] -- Published disk metadata must match.
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Exactly one durable name transition is required.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Exactly one durable name transition is required.
             reopened
                 .entries
                 .iter()
@@ -621,9 +694,16 @@ fn controller_publishes_one_durable_title_and_never_charges_for_later_turns() {
 
         let mut later = exchange();
         later.push(user("Now improve terminal rendering"));
-        later.push(Message::assistant(assistant("The terminal redraw was improved.")));
+        later.push(Message::assistant(assistant(
+            "The terminal redraw was improved.",
+        )));
         owner.agent.replace_messages(later);
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Later turns must not request another title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Later turns must not request another title.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Automatic titling has one provider attempt.
     }));
 }
@@ -645,13 +725,23 @@ fn resumed_and_ephemeral_sessions_do_not_start_automatic_title_requests() {
         let mut controller = AutoTitleController::for_session(&resumed);
         let mut owner = agent_session(provider.clone(), resumed, true);
         owner.agent.replace_messages(exchange());
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Resumed sessions are ineligible for automatic titling.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Resumed sessions are ineligible for automatic titling.
 
         let ephemeral = Session::in_memory();
         let mut controller = AutoTitleController::for_session(&ephemeral);
         let mut owner = agent_session(provider.clone(), ephemeral, false);
         owner.agent.replace_messages(exchange());
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Ephemeral sessions are ineligible for automatic titling.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Ephemeral sessions are ineligible for automatic titling.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Ineligible sessions must never call the provider.
     }));
 }
@@ -676,17 +766,26 @@ fn failed_foreground_turn_is_not_named_and_first_success_remains_eligible() {
             vec![user("Fix editor startup"), Message::assistant(failed)],
         )
         .await;
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A failed foreground turn must not be named.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- A failed foreground turn must not be named.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- A failed foreground turn must not spend a title request.
 
         let recovered = exchange();
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = owner.session.lock(cx.cx()).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Recovery fixture setup requires the session lock.
         session.append_model_message(recovered.last().unwrap().clone()); // ubs:ignore[rust.ownership.unwrap-expect] -- The complete fixture exchange contains a terminal response.
-        session.save().await.expect("persist recovered foreground response"); // ubs:ignore[rust.ownership.unwrap-expect] -- The recovered foreground response must be durable.
+        session
+            .save()
+            .await
+            .expect("persist recovered foreground response"); // ubs:ignore[rust.ownership.unwrap-expect] -- The recovered foreground response must be durable.
         drop(session);
         owner.agent.replace_messages(recovered);
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The first successful exchange remains eligible.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- The first successful exchange remains eligible.
             wait_for_title(&mut controller, &owner, &client, &handle).await,
             "Recover editor startup",
         );
@@ -706,12 +805,22 @@ fn a_failed_title_request_is_not_retried_on_subsequent_driver_ticks() {
         let client = client(provider.clone(), None);
         let mut owner = agent_session(provider.clone(), session, true);
         persist_exchange(&mut owner, exchange()).await;
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Starting a pending request cannot publish a title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Starting a pending request cannot publish a title.
         wait_until(|| state.polled.load(Ordering::SeqCst)).await;
         sender.send(delta("unfinished title")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The active fixture stream must accept its scripted response.
         wait_until(|| state.dropped.load(Ordering::SeqCst)).await;
         for _ in 0..3 {
-            assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Driver ticks cannot retry a failed optional request.
+            assert!(
+                controller
+                    .tick(&owner, Some(&client), &handle)
+                    .await
+                    .is_none()
+            ); // ubs:ignore[rust.panic.assert-macros] -- Driver ticks cannot retry a failed optional request.
             asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
         }
         assert!(current_name(&owner).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A partial response cannot name the session.
@@ -733,9 +842,16 @@ fn a_manual_name_wins_over_an_already_completed_background_suggestion() {
         let client = client(provider.clone(), None);
         let mut owner = agent_session(provider.clone(), session, true);
         persist_exchange(&mut owner, exchange()).await;
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
         wait_until(|| state.polled.load(Ordering::SeqCst)).await;
-        sender.send(done("Automatic suggestion")).expect("deliver title response"); // ubs:ignore[rust.ownership.unwrap-expect] -- The active fixture stream must accept its response.
+        sender
+            .send(done("Automatic suggestion"))
+            .expect("deliver title response"); // ubs:ignore[rust.ownership.unwrap-expect] -- The active fixture stream must accept its response.
         wait_until(|| state.dropped.load(Ordering::SeqCst)).await;
 
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -743,10 +859,23 @@ fn a_manual_name_wins_over_an_already_completed_background_suggestion() {
         session.set_name("My explicit session name");
         session.save().await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The manual name must be saved before publication races it.
         drop(session);
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- An existing manual name must win the race.
-        assert_eq!(current_name(&owner).await.as_deref(), Some("My explicit session name")); // ubs:ignore[rust.panic.assert-macros] -- Runtime metadata must preserve the manual name.
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Disk metadata must preserve the manual name.
-            Session::open(path.to_str().unwrap()).await.unwrap().get_name().as_deref(), // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the saved UTF-8 fixture path to verify durability.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- An existing manual name must win the race.
+        assert_eq!(
+            current_name(&owner).await.as_deref(),
+            Some("My explicit session name")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Runtime metadata must preserve the manual name.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Disk metadata must preserve the manual name.
+            Session::open(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .get_name()
+                .as_deref(), // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the saved UTF-8 fixture path to verify durability.
             Some("My explicit session name"),
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- The manual-name race must not trigger another request.
@@ -766,19 +895,38 @@ fn replacing_the_session_retires_the_old_provider_stream_without_naming_either_s
         let client = client(provider.clone(), None);
         let mut owner = agent_session(provider.clone(), session, true);
         persist_exchange(&mut owner, exchange()).await;
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
         wait_until(|| state.polled.load(Ordering::SeqCst)).await;
 
         let replacement = saved_session(dir.path(), "new.jsonl").await;
         let new_path = replacement.path.clone().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The replacement fixture must have a saved path.
         owner.session = Arc::new(asupersync::sync::Mutex::new(replacement));
         owner.agent.clear_messages();
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A replacement cannot receive the old title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- A replacement cannot receive the old title.
         wait_until(|| state.dropped.load(Ordering::SeqCst)).await;
-        assert!(sender.send(done("Stale old title")).is_err(), "old receiver was retired"); // ubs:ignore[rust.panic.assert-macros] -- Replacing the session must cancel provider ownership.
+        assert!(
+            sender.send(done("Stale old title")).is_err(),
+            "old receiver was retired"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Replacing the session must cancel provider ownership.
         assert!(current_name(&owner).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- The replacement runtime metadata must remain unnamed.
         for path in [old_path, new_path] {
-            assert!(Session::open(path.to_str().unwrap()).await.unwrap().get_name().is_none()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening both fixture paths must show no stale title.
+            assert!(
+                Session::open(path.to_str().unwrap())
+                    .await
+                    .unwrap()
+                    .get_name()
+                    .is_none()
+            ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening both fixture paths must show no stale title.
         }
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Session replacement cannot retry the stale request.
     }));
@@ -797,7 +945,12 @@ fn another_persistence_quarantine_discards_a_ready_title_before_publication() {
         let client = client(provider.clone(), None);
         let mut owner = agent_session(provider.clone(), session, true);
         persist_exchange(&mut owner, exchange()).await;
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
         wait_until(|| state.polled.load(Ordering::SeqCst)).await;
         sender.send(done("Must remain unpublished")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The active fixture stream must accept its response.
         wait_until(|| state.dropped.load(Ordering::SeqCst)).await;
@@ -805,10 +958,22 @@ fn another_persistence_quarantine_discards_a_ready_title_before_publication() {
         owner
             .provider_admission_gate()
             .block("another transition has an indeterminate save".to_string());
-        assert!(controller.tick(&owner, Some(&client), &handle).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A quarantine must prevent title publication.
+        assert!(
+            controller
+                .tick(&owner, Some(&client), &handle)
+                .await
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros] -- A quarantine must prevent title publication.
         assert!(current_name(&owner).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Quarantined runtime metadata must remain unchanged.
-        assert!(Session::open(path.to_str().unwrap()).await.unwrap().get_name().is_none()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the fixture must show no quarantined publication.
-        assert!( // ubs:ignore[rust.panic.assert-macros] -- Optional titling cannot clear another persistence quarantine.
+        assert!(
+            Session::open(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .get_name()
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the fixture must show no quarantined publication.
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Optional titling cannot clear another persistence quarantine.
             owner.ensure_provider_reentry_allowed().is_err(),
             "title cannot clear another quarantine"
         );
@@ -840,14 +1005,29 @@ fn failed_title_persistence_keeps_live_metadata_unchanged_and_quarantines_reentr
             .expect_err("both writes to a directory must fail");
         assert!(error.is_session_persistence()); // ubs:ignore[rust.panic.assert-macros] -- A failed save must report a persistence error.
         let session = owner.session.lock(cx.cx()).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure observations require the session lock.
-        assert_eq!(serde_json::to_value(&session.header).unwrap(), header_before); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable live metadata.
-        assert_eq!(serde_json::to_value(&session.entries).unwrap(), entries_before); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable live history.
+        assert_eq!(
+            serde_json::to_value(&session.header).unwrap(),
+            header_before
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable live metadata.
+        assert_eq!(
+            serde_json::to_value(&session.entries).unwrap(),
+            entries_before
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable live history.
         assert!(session.get_name().is_none()); // ubs:ignore[rust.panic.assert-macros] -- Undurable titles cannot become live metadata.
         drop(session);
-        assert_eq!(serde_json::to_value(owner.agent.messages()).unwrap(), messages_before); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable runtime history.
+        assert_eq!(
+            serde_json::to_value(owner.agent.messages()).unwrap(),
+            messages_before
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Failed saves must preserve serializable runtime history.
         assert!(owner.ensure_provider_reentry_allowed().is_err()); // ubs:ignore[rust.panic.assert-macros] -- An unresolved persistence failure must quarantine provider reentry.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Metadata failure cannot invoke a provider.
-        assert!(Session::open(path.to_str().unwrap()).await.unwrap().get_name().is_none()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the original fixture must show unchanged durable metadata.
+        assert!(
+            Session::open(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .get_name()
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the original fixture must show unchanged durable metadata.
     });
 }
 
@@ -871,12 +1051,21 @@ fn cancelling_while_waiting_for_admission_prevents_title_persistence() {
             "Cancelled suggestion",
             Some(&cancellation),
         ));
-        assert!(futures::poll!(publish.as_mut()).is_pending(), "provider admission is held"); // ubs:ignore[rust.panic.assert-macros] -- The publication future must actually wait for admission.
+        assert!(
+            futures::poll!(publish.as_mut()).is_pending(),
+            "provider admission is held"
+        ); // ubs:ignore[rust.panic.assert-macros] -- The publication future must actually wait for admission.
         cancellation.abort();
         drop(permit);
         assert!(!publish.await.unwrap()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Cancellation must finish cleanly without publishing.
         assert!(current_name(&owner).await.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Cancelled publication must leave runtime metadata unnamed.
-        assert!(Session::open(path.to_str().unwrap()).await.unwrap().get_name().is_none()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the fixture must show no cancelled publication.
+        assert!(
+            Session::open(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .get_name()
+                .is_none()
+        ); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Reopening the fixture must show no cancelled publication.
         assert!(owner.ensure_provider_reentry_allowed().is_ok()); // ubs:ignore[rust.panic.assert-macros] -- Clean cancellation must leave foreground admission available.
     });
 }

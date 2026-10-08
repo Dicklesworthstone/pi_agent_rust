@@ -150,7 +150,10 @@ fn windows_stdio_adapter_accepts_input_after_spawn_returns() {
         if transport.stderr_tail().contains("pi-dap-stdio-ack") {
             break;
         }
-        assert!(transport.is_alive(), "adapter died before acknowledging stdin");
+        assert!(
+            transport.is_alive(),
+            "adapter died before acknowledging stdin"
+        );
         assert!(
             std::time::Instant::now() < deadline,
             "adapter did not acknowledge its piped stdin"

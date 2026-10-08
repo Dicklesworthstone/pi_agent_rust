@@ -128,9 +128,7 @@ fn accept(listener: &TcpListener) -> TcpStream {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nodelay(true).expect("fixture TCP_NODELAY");
-                stream
-                    .set_write_timeout(Some(WAIT))
-                    .expect("write timeout");
+                stream.set_write_timeout(Some(WAIT)).expect("write timeout");
                 return stream;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -144,12 +142,15 @@ fn accept(listener: &TcpListener) -> TcpStream {
 
 fn begin_response(stream: &mut TcpStream) {
     stream
-        .write_all(concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Type: text/event-stream\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "Connection: close\r\n\r\n",
-        ).as_bytes())
+        .write_all(
+            concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n\r\n",
+            )
+            .as_bytes(),
+        )
         .expect("SSE headers");
 }
 
@@ -249,10 +250,7 @@ fn peer(listener: &TcpListener, ack: &mpsc::Receiver<usize>, abort: bool) {
         );
     }
     begin_response(&mut next);
-    finish(
-        &mut next,
-        if abort { "RECOVERED_OK" } else { "RESUMED_OK" },
-    );
+    finish(&mut next, if abort { "RECOVERED_OK" } else { "RESUMED_OK" });
 }
 
 struct Screen {
@@ -331,7 +329,10 @@ impl Input {
         );
         if script.probes > 0
             && flushes != script.last_flush
-            && matches!(script.step, Step::Tail(_) | Step::Typed(_) | Step::Erased(_))
+            && matches!(
+                script.step,
+                Step::Tail(_) | Step::Typed(_) | Step::Erased(_)
+            )
         {
             assert!(
                 rows[0].contains("pi · working"),
@@ -379,16 +380,11 @@ impl Input {
                     && rows[0].contains("ready") =>
             {
                 script.cold_resume = true;
-                self.pending.extend(
-                    "next prompt"
-                        .chars()
-                        .map(|ch| key(KeyCode::Char(ch))),
-                );
+                self.pending
+                    .extend("next prompt".chars().map(|ch| key(KeyCode::Char(ch))));
                 Some(Step::Draft("next prompt"))
             }
-            Step::Aborting
-                if body.contains("ABORT_SETTLED") && rows[0].contains("ready") =>
-            {
+            Step::Aborting if body.contains("ABORT_SETTLED") && rows[0].contains("ready") => {
                 phase("Escape settled without quitting; typing a real recovery prompt");
                 self.pending
                     .extend("recover".chars().map(|ch| key(KeyCode::Char(ch))));
@@ -684,13 +680,8 @@ pub(super) fn run(abort: bool) {
     let directory = tempfile::tempdir().expect("real session directory");
     let path = directory.path().join("reasoning.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").expect("local SSE peer");
-    listener
-        .set_nonblocking(true)
-        .expect("bounded accept");
-    let url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("peer address")
-    );
+    listener.set_nonblocking(true).expect("bounded accept");
+    let url = format!("http://{}/v1", listener.local_addr().expect("peer address"));
     let (ack_tx, ack_rx) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || peer(&listener, &ack_rx, abort));
     run_ui(
@@ -735,8 +726,5 @@ pub(super) fn run(abort: bool) {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        answer,
-        if abort { "RECOVERED_OK" } else { "RESUMED_OK" }
-    );
+    assert_eq!(answer, if abort { "RECOVERED_OK" } else { "RESUMED_OK" });
 }

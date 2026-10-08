@@ -89,7 +89,8 @@ fn proc_state(pid: u32) -> Option<char> {
 fn assert_reaped(pid: u32) {
     let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
         .expect("positive child pid");
-    assert!( // ubs:ignore[rust.panic.assert-macros] -- The fixture requires actual process absence after successful stop.
+    assert!(
+        // ubs:ignore[rust.panic.assert-macros] -- The fixture requires actual process absence after successful stop.
         rustix::process::test_kill_process(pid).is_err(),
         "service must be reaped before successful settlement, including on platforms without /proc"
     );
@@ -146,7 +147,8 @@ while True:
     assert_eq!(details["status"], "killed"); // ubs:ignore[rust.panic.assert-macros] -- Requested termination must have settled.
     assert_eq!(details["exitCode"], 0); // ubs:ignore[rust.panic.assert-macros] -- Graceful handler exited successfully.
     assert!(details["pid"].is_null()); // ubs:ignore[rust.panic.assert-macros] -- Reaped children no longer publish a PID.
-    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The grace window must preserve the child's cleanup work.
+    assert_eq!(
+        // ubs:ignore[rust.panic.assert-macros] -- The grace window must preserve the child's cleanup work.
         std::fs::read_to_string(root.join("grace-completed")).expect("graceful cleanup ran"),
         "clean shutdown"
     );

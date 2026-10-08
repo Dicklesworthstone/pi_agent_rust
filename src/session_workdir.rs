@@ -248,7 +248,10 @@ mod tests {
         assert!(attach_session_workdir(&mut session, replacement.path()).expect("attach"));
         check_session_workdir(&session, replacement.path()).expect("attached workspace");
         assert!(check_session_workdir(&session, original.path()).is_err());
-        assert_eq!(serde_json::to_value(&session.header).expect("header"), header);
+        assert_eq!(
+            serde_json::to_value(&session.header).expect("header"),
+            header
+        );
         assert!(!attach_session_workdir(&mut session, replacement.path()).expect("no-op"));
         assert_eq!(session.entries.len(), 1);
     }
@@ -280,7 +283,10 @@ mod tests {
         let header = serde_json::to_value(&session.header).expect("header");
         assert!(attach_session_workdir(&mut session, &root.path().join("missing")).is_err());
         assert!(session.entries.is_empty());
-        assert_eq!(serde_json::to_value(&session.header).expect("header"), header);
+        assert_eq!(
+            serde_json::to_value(&session.header).expect("header"),
+            header
+        );
     }
 
     #[test]
@@ -312,7 +318,11 @@ mod tests {
             Some(serde_json::json!({"cwd": "/"})),
         );
         let error = require_session_workdir(&session).expect_err("invalid metadata");
-        assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_INVALID"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_WORKDIR_BINDING_INVALID")
+        );
     }
 
     #[test]
@@ -323,7 +333,11 @@ mod tests {
         attach_session_workdir(&mut session, second.path()).expect("known attachment");
         session.append_custom_entry("pi.session.workdir.v2".to_owned(), None);
         let error = require_session_workdir(&session).expect_err("unsupported version");
-        assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_UNSUPPORTED"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_WORKDIR_BINDING_UNSUPPORTED")
+        );
         let count = session.entries.len();
         assert!(attach_session_workdir(&mut session, first.path()).is_err());
         assert_eq!(session.entries.len(), count);

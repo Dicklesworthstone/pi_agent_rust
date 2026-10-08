@@ -999,8 +999,7 @@ fn process_file_arguments_mixed_text_and_image() {
 
 #[test]
 fn prepare_initial_message_preserves_mixed_media_and_image_order() {
-    let harness =
-        TestHarness::new("prepare_initial_message_preserves_mixed_media_and_image_order");
+    let harness = TestHarness::new("prepare_initial_message_preserves_mixed_media_and_image_order");
     let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
     let png = base64::engine::general_purpose::STANDARD
         .decode(png_base64)
@@ -1118,9 +1117,8 @@ fn process_file_arguments_recognizes_all_media_extensions_case_insensitively() {
 
 #[test]
 fn process_file_arguments_skips_empty_media_and_reports_oversized_media() {
-    let harness = TestHarness::new(
-        "process_file_arguments_skips_empty_media_and_reports_oversized_media",
-    );
+    let harness =
+        TestHarness::new("process_file_arguments_skips_empty_media_and_reports_oversized_media");
     let empty = harness.create_file("empty.WAV", "");
     let oversized = harness.temp_path("too-large.mp4");
     std::fs::File::create(&oversized)

@@ -581,9 +581,7 @@ mod tests {
         owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancelled"));
         let error = peer
             .runtime
-            .block_on(owner.with_current(
-                peer.client.workspace_diagnostics(Duration::from_secs(5)),
-            ))
+            .block_on(owner.with_current(peer.client.workspace_diagnostics(Duration::from_secs(5))))
             .unwrap_err();
         assert!(error.to_string().contains("LSP_CANCELLED"), "{error}");
         assert!(
@@ -609,14 +607,13 @@ mod tests {
             // real peer acknowledgement using an independent transport slot
             // before dropping the owner of the written workspace request.
             let (id, response) = peer.client.rpc.request("test/frames", Value::Null).unwrap();
-            let observed = crate::lsp::jsonrpc::await_completion(
-                response,
-                Duration::from_secs(5),
-                || peer.client.rpc.cancel_request(id),
-            )
-            .await
-            .expect("peer observation arrived")
-            .expect("peer observation succeeded");
+            let observed =
+                crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+                    peer.client.rpc.cancel_request(id)
+                })
+                .await
+                .expect("peer observation arrived")
+                .expect("peer observation succeeded");
             assert!(
                 observed
                     .as_array()

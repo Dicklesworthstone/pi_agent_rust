@@ -676,7 +676,8 @@ impl FailoverState {
         {
             return;
         }
-        *self = Self::reconstruct_from_provenance(&source.provenance, configured_cooldown_secs, now);
+        *self =
+            Self::reconstruct_from_provenance(&source.provenance, configured_cooldown_secs, now);
         self.source = Some(source);
     }
 

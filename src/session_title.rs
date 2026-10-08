@@ -58,11 +58,8 @@ impl TitleClient {
             &entry.model.provider,
             &primary_entry.model.provider,
         ) && entry.model.base_url == primary_entry.model.base_url;
-        let api_key = crate::models::resolve_model_key(
-            cli_api_key.filter(|_| same_destination),
-            auth,
-            entry,
-        );
+        let api_key =
+            crate::models::resolve_model_key(cli_api_key.filter(|_| same_destination), auth, entry);
         if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
             return None;
         }
@@ -311,9 +308,7 @@ pub(crate) async fn save_if_unnamed(
     // Mark uncertainty immediately before persistence. If the owner is
     // dropped during the save, the shared gate remains closed. The identical
     // candidate reconciles an append that reached disk before a failed ack.
-    gate.block(
-        "session title persistence was interrupted before live installation".to_string(),
-    );
+    gate.block("session title persistence was interrupted before live installation".to_string());
     if let Err(first_error) = candidate.save().await
         && let Err(retry_error) = candidate.save().await
     {

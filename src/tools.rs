@@ -5135,11 +5135,11 @@ pub fn process_file_arguments(
         allowed_roots.push(Config::global_dir());
         let bytes = read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, max_bytes)
             .map_err(|e| {
-                Error::tool(
-                    "read",
-                    format!("Could not read file {}: {e}", absolute_path.display()),
-                )
-            })?;
+            Error::tool(
+                "read",
+                format!("Could not read file {}: {e}", absolute_path.display()),
+            )
+        })?;
         if bytes.is_empty() {
             continue;
         }

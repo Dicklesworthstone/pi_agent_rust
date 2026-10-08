@@ -1855,11 +1855,8 @@ mod tests {
 
     #[test]
     fn child_guard_retries_wait_failure_before_releasing_ownership() {
-        let (child, events) = recording_child(&[
-            WaitStep::Failed,
-            WaitStep::Interrupted,
-            WaitStep::Exit(137),
-        ]);
+        let (child, events) =
+            recording_child(&[WaitStep::Failed, WaitStep::Interrupted, WaitStep::Exit(137)]);
         drop(child);
         assert_eq!(
             *events.lock().expect("events"),

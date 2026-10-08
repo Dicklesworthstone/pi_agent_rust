@@ -11,9 +11,8 @@
 use super::deadline::Deadline;
 use super::{
     AgentDefinition, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
-    UpdateCallback,
-    append_bounded_line, child_args, child_depth, compile_output_schema, corrective_retry_task,
-    emit_progress, protocol, validate_child_output,
+    UpdateCallback, append_bounded_line, child_args, child_depth, compile_output_schema,
+    corrective_retry_task, emit_progress, protocol, validate_child_output,
 };
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::ChildKind;
@@ -279,16 +278,13 @@ impl ChildRunner {
         }
         // Tracking is a launch prerequisite, not optional telemetry. A failed
         // registration must never leave an unsteerable/uncontrollable child.
-        let hub_entry = match attempt
-            .hub
-            .register(
-                &agent.name,
-                &launch.task.task,
-                self.hub_kind,
-                launch.clone(),
-                revived_from,
-            )
-        {
+        let hub_entry = match attempt.hub.register(
+            &agent.name,
+            &launch.task.task,
+            self.hub_kind,
+            launch.clone(),
+            revived_from,
+        ) {
             Ok(entry) => entry,
             Err(error) => {
                 attempt.result.fail(error.to_string());
@@ -328,7 +324,10 @@ impl ChildRunner {
             .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
-            .env("PI_SUBAGENT_DEPTH", launch.depth.max(child_depth()).to_string())
+            .env(
+                "PI_SUBAGENT_DEPTH",
+                launch.depth.max(child_depth()).to_string(),
+            )
             .env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &hub_entry.id);
         #[cfg(unix)]
@@ -844,11 +843,18 @@ mod windows_process_tests {
         assert_eq!(role, "root");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !directory.join("start").exists() {
-            assert!(Instant::now() < deadline, "parent did not start the fixture");
+            assert!(
+                Instant::now() < deadline,
+                "parent did not start the fixture"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut descendant = fixture_command("descendant", &directory).spawn().unwrap();
-        std::fs::write(directory.join("descendant.pid"), descendant.id().to_string()).unwrap();
+        std::fs::write(
+            directory.join("descendant.pid"),
+            descendant.id().to_string(),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if directory.join("exit-root").exists() {
@@ -876,11 +882,9 @@ mod windows_process_tests {
             // This is the exact dispatch and ownership transfer used by
             // ChildRunner. Do not attach a Job after this call: doing so
             // would hide the regression in spawn_checked.
-            let child = ChildProcessGuard::spawn(
-                &owner,
-                &mut fixture_command("root", directory.path()),
-            )
-            .unwrap();
+            let child =
+                ChildProcessGuard::spawn(&owner, &mut fixture_command("root", directory.path()))
+                    .unwrap();
             let mut limits = ExtendedLimitInfo::new();
             limits.limit_kill_on_job_close();
             let observer = Job::create_with_limit_info(&limits).unwrap();
@@ -898,9 +902,8 @@ mod windows_process_tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             let descendant = loop {
                 if fixture.directory.path().join("descendant.ready").exists()
-                    && let Ok(text) = std::fs::read_to_string(
-                        fixture.directory.path().join("descendant.pid"),
-                    )
+                    && let Ok(text) =
+                        std::fs::read_to_string(fixture.directory.path().join("descendant.pid"))
                     && let Ok(pid) = text.parse::<usize>()
                 {
                     break pid;

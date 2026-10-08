@@ -339,7 +339,10 @@ fn native_content_retries_preserve_order_and_persist_one_user_message() {
         }
     }
     assert_prompt_hook_ran_once(&handle);
-    assert_eq!(handle.session.agent.system_prompt(), Some("ordinary-system"));
+    assert_eq!(
+        handle.session.agent.system_prompt(),
+        Some("ordinary-system")
+    );
     assert_native_user_persisted_once(&handle, &content);
 }
 
@@ -484,9 +487,11 @@ fn invalid_native_content_refuses_before_provider_calls_or_session_persistence()
     ];
     let mut invalid = vec![Vec::new()];
     invalid.extend(assistant_blocks.iter().cloned().map(|block| vec![block]));
-    invalid.extend(assistant_blocks.into_iter().map(|block| {
-        vec![ContentBlock::Text(TextContent::new("valid prefix")), block]
-    }));
+    invalid.extend(
+        assistant_blocks
+            .into_iter()
+            .map(|block| vec![ContentBlock::Text(TextContent::new("valid prefix")), block]),
+    );
     for content in invalid {
         let dir = tempdir().unwrap();
         let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
@@ -1115,17 +1120,20 @@ fn explicitly_selecting_the_fallback_cancels_restoration_durably() {
     );
 
     let (events, callback) = event_log();
-    let message = run_async(handle.prompt("continue on my selected model", move |event| {
-        callback(event);
-    }))
+    let message = run_async(
+        handle.prompt("continue on my selected model", move |event| {
+            callback(event);
+        }),
+    )
     .expect("selected fixture model answers");
     assert_eq!(message.stop_reason, StopReason::Stop);
     assert_eq!(handle.model(), (provider, model));
-    assert!(
-        !events.lock().unwrap().iter().any(|event| {
-            matches!(event["type"].as_str(), Some("failover_start" | "failover_end"))
-        })
-    );
+    assert!(!events.lock().unwrap().iter().any(|event| {
+        matches!(
+            event["type"].as_str(),
+            Some("failover_start" | "failover_end")
+        )
+    }));
 }
 
 #[test]
@@ -1144,7 +1152,10 @@ fn rejected_model_selection_keeps_the_previous_fallback_cycle() {
     run_async(handle.set_model("missing-provider", "missing-model"))
         .expect_err("invalid selection is refused");
     assert_eq!(handle.model(), original_model);
-    assert_eq!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        Some("selection-fixture")
+    );
     assert_eq!(handle.failover_state.chain_position(), 2);
     assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
 
@@ -1154,7 +1165,10 @@ fn rejected_model_selection_keeps_the_previous_fallback_cycle() {
     let result = run_async(handle.set_model(&original_model.0, &original_model.1));
     assert!(result.as_ref().is_err_and(Error::is_session_persistence));
     assert_eq!(handle.model(), original_model);
-    assert_eq!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        Some("selection-fixture")
+    );
     assert_eq!(handle.failover_state.chain_position(), 2);
     assert!(
         handle
@@ -1354,18 +1368,17 @@ fn invalid_native_content_does_not_restore_an_expired_fallback_or_mutate_its_ses
     let (events, callback) = event_log();
     let (abort, signal) = AbortHandle::new();
 
-    let error = run_async(handle.prompt_with_content_with_abort(
-        Vec::new(),
-        signal,
-        move |event| {
-            // A regressed preflight could emit primary restoration before
-            // validating input. Stop there so that failure cannot contact the
-            // real reconstructed primary while still recording the defect.
-            abort.abort();
-            callback(event);
-        },
-    ))
-    .expect_err("invalid original blocks must refuse before restoration");
+    let error =
+        run_async(
+            handle.prompt_with_content_with_abort(Vec::new(), signal, move |event| {
+                // A regressed preflight could emit primary restoration before
+                // validating input. Stop there so that failure cannot contact the
+                // real reconstructed primary while still recording the defect.
+                abort.abort();
+                callback(event);
+            }),
+        )
+        .expect_err("invalid original blocks must refuse before restoration");
 
     assert!(error.to_string().contains("PI_INPUT_CONTENT"), "{error}");
     assert!(events.lock().unwrap().is_empty());
@@ -1814,9 +1827,7 @@ fn every_failover_hop_keeps_the_extension_prompt_then_next_turn_restores_base() 
             .as_array()
             .unwrap()
             .iter()
-            .find(|message| {
-                matches!(message["role"].as_str(), Some("system" | "developer"))
-            })
+            .find(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
             .and_then(|message| message["content"].as_str());
         assert_eq!(system_prompt, Some(expected));
     }
@@ -2186,14 +2197,19 @@ fn extension_selection_starts_the_next_failover_from_its_own_primary_and_cursor(
         (&selected.0, &selected.1)
     );
     assert_eq!(handle.failover_state.chain_position(), 1);
-    assert_ne!(handle.failover_state.lifecycle_id(), Some("selection-fixture"));
+    assert_ne!(
+        handle.failover_state.lifecycle_id(),
+        Some("selection-fixture")
+    );
     assert_eq!(
         handle.model(),
         ("openai".to_string(), "gpt-4o-mini".to_string())
     );
     let store = handle.session_store();
     let session = store.try_lock().unwrap();
-    let provenance = session.active_failover_provenance_for_current_path().unwrap();
+    let provenance = session
+        .active_failover_provenance_for_current_path()
+        .unwrap();
     assert_eq!(
         (&provenance.primary_provider, &provenance.primary_model_id),
         (&selected.0, &selected.1)
@@ -2281,7 +2297,10 @@ fn unchanged_failover_provenance_keeps_its_running_monotonic_cooldown() {
     let (events, callback) = event_log();
     for _ in 0..2 {
         run_async(handle.maybe_restore_primary(&callback)).unwrap();
-        assert_eq!(handle.failover_state.cooldown().unwrap().failed_at(), started);
+        assert_eq!(
+            handle.failover_state.cooldown().unwrap().failed_at(),
+            started
+        );
         assert!(
             !handle
                 .failover_state

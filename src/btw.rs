@@ -103,10 +103,12 @@ impl BtwClient {
     /// Owner cancellation and missing timer authority are reported separately
     /// from timeout, and neither admits a new provider request.
     pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
-        let [system_prompt, context_summary, question]: [String; 3] =
-            redact_inputs(&[BTW_SYSTEM_PROMPT, context_summary, question], &self.privacy)?
-                .try_into()
-                .map_err(|_| Error::validation("side-question privacy projection changed shape"))?;
+        let [system_prompt, context_summary, question]: [String; 3] = redact_inputs(
+            &[BTW_SYSTEM_PROMPT, context_summary, question],
+            &self.privacy,
+        )?
+        .try_into()
+        .map_err(|_| Error::validation("side-question privacy projection changed shape"))?;
         self.ask_prepared(PreparedBtwRequest {
             system_prompt,
             context_summary,
@@ -170,12 +172,14 @@ impl BtwClient {
             .collect();
         let protected = screen(&inputs)?;
         if protected.len() != inputs.len() {
-            return Err(Error::validation("side-question privacy projection changed shape"));
+            return Err(Error::validation(
+                "side-question privacy projection changed shape",
+            ));
         }
         let mut protected = protected.into_iter();
-        let system_prompt = protected
-            .next()
-            .ok_or_else(|| Error::validation("side-question privacy projection lost system text"))?;
+        let system_prompt = protected.next().ok_or_else(|| {
+            Error::validation("side-question privacy projection lost system text")
+        })?;
         let question = protected
             .next_back()
             .ok_or_else(|| Error::validation("side-question privacy projection lost question"))?;
@@ -797,13 +801,22 @@ mod tests {
                 let original = serde_json::to_value(&messages).unwrap();
                 let question = format!("Does API_KEY={echo} match ACME-123456?");
                 assert_eq!(
-                    client.ask_with_messages(&messages, &question).await.unwrap(),
+                    client
+                        .ask_with_messages(&messages, &question)
+                        .await
+                        .unwrap(),
                     "safe answer",
                 );
                 assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 let prompts = provider.prompts.lock().unwrap();
-                assert!(!prompts[0].contains("ACME-"), "no clipped credential prefix");
-                assert!(!prompts[0].contains(echo), "discovery spans question and history");
+                assert!(
+                    !prompts[0].contains("ACME-"),
+                    "no clipped credential prefix"
+                );
+                assert!(
+                    !prompts[0].contains(echo),
+                    "discovery spans question and history"
+                );
                 assert!(prompts[0].contains("echo <pi-secret:redacted>"));
                 assert!(prompts[0].contains("match <pi-secret:redacted>?"));
                 drop(prompts);
@@ -836,7 +849,10 @@ mod tests {
             }
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert!(provider.prompts.lock().unwrap().is_empty());
-            assert_eq!(client.ask("clean context", "why?").await.unwrap(), "safe answer");
+            assert_eq!(
+                client.ask("clean context", "why?").await.unwrap(),
+                "safe answer"
+            );
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }
@@ -895,7 +911,12 @@ mod tests {
                 .err()
                 .expect("known bare credential must block before clipping");
             assert!(error.to_string().contains("PI_SECRET_BLOCK"));
-            assert_eq!(block_provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                block_provider
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
             assert_eq!(agent.mask_secrets_text(known), "<pi-secret:000001>");
         });
     }

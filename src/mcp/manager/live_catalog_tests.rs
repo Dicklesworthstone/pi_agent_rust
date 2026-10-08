@@ -1,6 +1,8 @@
 use super::*;
 use crate::agent::{Agent, AgentConfig};
-use crate::model::{AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall};
+use crate::model::{
+    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall,
+};
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::tools::{SharedToolRegistry, Tool, ToolOrigin, ToolOutput, ToolRegistry, ToolUpdate};
 use async_trait::async_trait;
@@ -176,7 +178,10 @@ fn live_agent_reconciles_refreshed_schemas_and_removed_tools_before_provider_dis
     runtime().block_on(async {
         manager.test("fixture").await.expect("initial catalog");
         crate::mcp::reconcile_tools(&manager, &registry);
-        agent.run("first request", |_| {}).await.expect("first turn");
+        agent
+            .run("first request", |_| {})
+            .await
+            .expect("first turn");
         let old = registry.snapshot();
         let version = registry.version();
         *McpManager::lock(&state.catalog) =
@@ -201,8 +206,16 @@ fn live_agent_reconciles_refreshed_schemas_and_removed_tools_before_provider_dis
             json!(["old_argument"])
         );
         for context in &contexts[1..] {
-            assert!(!context.iter().any(|tool| tool.name == "mcp__fixture__removed"));
-            assert!(context.iter().any(|tool| tool.name == "mcp__fixture__added"));
+            assert!(
+                !context
+                    .iter()
+                    .any(|tool| tool.name == "mcp__fixture__removed")
+            );
+            assert!(
+                context
+                    .iter()
+                    .any(|tool| tool.name == "mcp__fixture__added")
+            );
             assert_eq!(
                 context
                     .iter()
@@ -225,7 +238,10 @@ fn live_agent_reconciles_refreshed_schemas_and_removed_tools_before_provider_dis
         );
         assert!(old.get("mcp__fixture__removed").is_some());
         let stable = registry.version();
-        agent.run("unchanged", |_| {}).await.expect("unchanged turn");
+        agent
+            .run("unchanged", |_| {})
+            .await
+            .expect("unchanged turn");
         assert_eq!(
             registry.version(),
             stable,
@@ -254,7 +270,10 @@ fn live_agent_refreshes_empty_expired_and_reconnected_catalogs() {
             .checked_sub(TOOL_CACHE_TTL)
             .and_then(|at| at.checked_sub(Duration::from_secs(1)))
             .expect("test clock can represent an expired catalog");
-        McpManager::lock(&entry.tools_cache).as_mut().expect("cache").0 = expired_at;
+        McpManager::lock(&entry.tools_cache)
+            .as_mut()
+            .expect("cache")
+            .0 = expired_at;
         agent
             .run("discover newly available tool", |_| {})
             .await
@@ -299,7 +318,10 @@ fn live_agent_withdraws_failed_catalogs_and_denied_servers_without_restarting_th
         *McpManager::lock(&state.catalog) = json!({"tools":[meta("recovered","value")]});
         manager.test("fixture").await.expect("operator recovery");
         manager.deny("fixture").await.expect("deny");
-        agent.run("denied catalog", |_| {}).await.expect("denied turn");
+        agent
+            .run("denied catalog", |_| {})
+            .await
+            .expect("denied turn");
         assert!(registry.snapshot().tools().is_empty());
         let starts = state.starts.load(Ordering::SeqCst);
         let lists = state.lists.load(Ordering::SeqCst);
@@ -334,7 +356,10 @@ fn aborting_catalog_refresh_never_dispatches_the_provider() {
             .checked_sub(TOOL_CACHE_TTL)
             .and_then(|at| at.checked_sub(Duration::from_secs(1)))
             .expect("test clock can represent an expired catalog");
-        McpManager::lock(&entry.tools_cache).as_mut().expect("cache").0 = expired_at;
+        McpManager::lock(&entry.tools_cache)
+            .as_mut()
+            .expect("cache")
+            .0 = expired_at;
         state.hold_list.store(true, Ordering::SeqCst);
         let (started, receive) = futures::channel::oneshot::channel();
         *McpManager::lock(&state.list_started) = Some(started);
@@ -347,7 +372,10 @@ fn aborting_catalog_refresh_never_dispatches_the_provider() {
             agent.run_with_abort("cancel during discovery", Some(signal), |_| {}),
             cancel,
         );
-        assert_eq!(result.expect("aborted turn").stop_reason, StopReason::Aborted);
+        assert_eq!(
+            result.expect("aborted turn").stop_reason,
+            StopReason::Aborted
+        );
         assert!(McpManager::lock(&provider.contexts).is_empty());
         assert!(McpManager::lock(&entry.tools_cache).is_none());
     });
@@ -430,8 +458,8 @@ fn reconciliation_preserves_other_owners_and_shelved_extension_collisions() {
                 warnings: Vec::new(),
             },
         ));
-        let foreign = super::parse_tool_list(&json!({"tools":[meta("foreign","value")]}))
-            .expect("metadata");
+        let foreign =
+            super::parse_tool_list(&json!({"tools":[meta("foreign","value")]})).expect("metadata");
         registry.update(|tools| {
             tools.push(Box::new(crate::mcp::McpTool::new(
                 "fixture",

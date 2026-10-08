@@ -22,7 +22,10 @@ const MAX_DIAGNOSTICS: usize = 16_384;
 const MAX_ID_BYTES: usize = 4096;
 
 fn report_error(message: &str) -> Error {
-    Error::tool("lsp", format!("[LSP_WORKSPACE_DIAGNOSTIC_REPORT] {message}"))
+    Error::tool(
+        "lsp",
+        format!("[LSP_WORKSPACE_DIAGNOSTIC_REPORT] {message}"),
+    )
 }
 
 struct ByteBudget(usize);
@@ -45,8 +48,8 @@ fn normalize_report_uri(raw: &str) -> Result<String> {
     if raw.is_empty() || raw.len() > MAX_ID_BYTES || raw.chars().any(char::is_control) {
         return Err(report_error("report URI must be a bounded absolute URI"));
     }
-    let parsed = url::Url::parse(raw)
-        .map_err(|_| report_error("report URI must be an absolute URI"))?;
+    let parsed =
+        url::Url::parse(raw).map_err(|_| report_error("report URI must be an absolute URI"))?;
     if parsed.scheme() == "file" {
         return file_uri::normalize_uri(raw)
             .ok_or_else(|| report_error("invalid local file URI in diagnostic report"));
@@ -82,7 +85,9 @@ fn validate_reports(raw: Value, open_docs: &HashMap<String, OpenDoc>) -> Result<
             .ok_or_else(|| report_error("document report is missing its URI"))?;
         let uri = normalize_report_uri(uri)?;
         if !seen.insert(uri.clone()) {
-            return Err(report_error("workspace report contains duplicate document URIs"));
+            return Err(report_error(
+                "workspace report contains duplicate document URIs",
+            ));
         }
         let version = match report.get("version") {
             Some(Value::Null) => None,
@@ -124,7 +129,9 @@ fn validate_reports(raw: Value, open_docs: &HashMap<String, OpenDoc>) -> Result<
             if range.end < range.start
                 || diagnostic.get("message").and_then(Value::as_str).is_none()
             {
-                return Err(report_error("diagnostic needs an ordered range and string message"));
+                return Err(report_error(
+                    "diagnostic needs an ordered range and string message",
+                ));
             }
         }
         report["uri"] = Value::String(uri);
@@ -169,13 +176,18 @@ impl LspClient {
                 let identifier = identifier
                     .as_str()
                     .filter(|identifier| identifier.len() <= MAX_ID_BYTES)
-                    .ok_or_else(|| report_error("diagnostic identifier must be a bounded string"))?;
+                    .ok_or_else(|| {
+                        report_error("diagnostic identifier must be a bounded string")
+                    })?;
                 params["identifier"] = json!(identifier);
             }
         }
         let (before, epoch) = {
             let docs = Self::lock(&self.open_docs);
-            (docs.clone(), self.next_document_version.load(Ordering::SeqCst))
+            (
+                docs.clone(),
+                self.next_document_version.load(Ordering::SeqCst),
+            )
         };
         let raw = self
             .call_with_budget("workspace/diagnostic", params, &budget)
@@ -256,9 +268,12 @@ mod tests {
             .filter(|frame| frame["method"] == "workspace/diagnostic")
             .collect();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["params"], json!({
-            "identifier": "workspace-fixture", "previousResultIds": []
-        }));
+        assert_eq!(
+            calls[0]["params"],
+            json!({
+                "identifier": "workspace-fixture", "previousResultIds": []
+            })
+        );
         assert!(!frames.iter().any(|frame| matches!(
             frame["method"].as_str(),
             Some("textDocument/didOpen" | "textDocument/didChange" | "textDocument/diagnostic")
@@ -282,7 +297,11 @@ mod tests {
         ] {
             assert!(validate_reports(raw, &HashMap::new()).is_err());
         }
-        assert!(validate_reports(json!({"items": []}), &HashMap::new()).unwrap().is_empty());
+        assert!(
+            validate_reports(json!({"items": []}), &HashMap::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -291,7 +310,8 @@ mod tests {
         let error = validate_reports(
             json!({"items":vec![empty; MAX_DOCUMENTS + 1]}),
             &HashMap::new(),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("too many documents"));
         let mut crowded = report("untitled:source", "x");
         crowded["items"] = json!(vec![crowded["items"][0].clone(); MAX_DIAGNOSTICS + 1]);
@@ -318,7 +338,12 @@ mod tests {
             .block_on(peer.client.workspace_diagnostics(Duration::ZERO))
             .unwrap_err();
         assert!(error.to_string().contains("LSP_TIMEOUT"));
-        assert!(!peer.frames().iter().any(|frame| frame["method"] == "workspace/diagnostic"));
+        assert!(
+            !peer
+                .frames()
+                .iter()
+                .any(|frame| frame["method"] == "workspace/diagnostic")
+        );
     }
 
     #[test]
@@ -342,7 +367,8 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("version"));
             peer.runtime.block_on(async {
-                let mut pending = Box::pin(peer.client.workspace_diagnostics(Duration::from_secs(5)));
+                let mut pending =
+                    Box::pin(peer.client.workspace_diagnostics(Duration::from_secs(5)));
                 assert!(futures::poll!(pending.as_mut()).is_pending());
                 if close {
                     peer.client.invalidate(&uri);
@@ -353,7 +379,13 @@ mod tests {
                 peer.client
                     .call_no_wait_notify("test/release", json!({"result":{"items":[]}}))
                     .unwrap();
-                assert!(pending.await.unwrap_err().to_string().contains("changed or closed"));
+                assert!(
+                    pending
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("changed or closed")
+                );
             });
         }
     }
@@ -375,7 +407,12 @@ mod tests {
             if retrigger {
                 assert!(result.unwrap().is_empty());
             } else {
-                assert!(result.unwrap_err().to_string().contains("fixture cancellation"));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fixture cancellation")
+                );
             }
             assert_eq!(
                 peer.frames()

@@ -2350,7 +2350,11 @@ impl ExtensionSession for SessionHandle {
             }
             _ => (normalized_provider, model_id.clone(), true),
         };
-        if changed || session.active_failover_provenance_for_current_path().is_some() {
+        if changed
+            || session
+                .active_failover_provenance_for_current_path()
+                .is_some()
+        {
             // Selecting the current fallback explicitly retires automatic
             // restoration just like selecting a different model. Keep one
             // ordinary model-change record to distinguish that intent from
@@ -4897,7 +4901,9 @@ impl Session {
 
     /// Include the entry identity when reconciling an in-memory cooldown: two
     /// branch records may otherwise carry identical older failover metadata.
-    pub(crate) fn active_failover_model_change_for_current_path(&self) -> Option<&ModelChangeEntry> {
+    pub(crate) fn active_failover_model_change_for_current_path(
+        &self,
+    ) -> Option<&ModelChangeEntry> {
         for entry in self.entries_for_current_path().into_iter().rev() {
             if let SessionEntry::ModelChange(change) = entry {
                 return (change.role.as_deref() == Some("failover")).then_some(change);
@@ -8161,8 +8167,7 @@ fn read_jsonl_entries_for_v2<R: std::io::BufRead>(
         if line.trim().is_empty() {
             continue;
         }
-        let (entry, plan) =
-            attachments::decode_entry_with_references(Some(jsonl_source), &line)?;
+        let (entry, plan) = attachments::decode_entry_with_references(Some(jsonl_source), &line)?;
         entries.push(entry);
         references.push(plan);
     }

@@ -463,7 +463,10 @@ fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()
         }
         remove_sqlite_sidecars_best_effort(path, trash_cmd)?;
         remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd)?;
-        remove_sidecar_dir_best_effort(&crate::session::attachments::sidecar_path(path), trash_cmd)?;
+        remove_sidecar_dir_best_effort(
+            &crate::session::attachments::sidecar_path(path),
+            trash_cmd,
+        )?;
         return ensure_session_artifacts_removed(path);
     }
 
@@ -1719,7 +1722,10 @@ mod tests {
         assert!(!session_path.exists());
         assert!(!blob_root.exists());
         assert!(kept_path.is_file());
-        assert_eq!(fs::read(kept_blobs.join("media")).unwrap(), b"attachment bytes");
+        assert_eq!(
+            fs::read(kept_blobs.join("media")).unwrap(),
+            b"attachment bytes"
+        );
     }
 
     #[cfg(all(unix, feature = "sqlite-sessions"))]

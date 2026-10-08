@@ -246,10 +246,7 @@ impl UiStreamDeltaBatcher {
     }
 }
 
-fn build_agent_done_pi_msg(
-    messages: &[ModelMessage],
-    retry_attempts: Option<(u32, u32)>,
-) -> PiMsg {
+fn build_agent_done_pi_msg(messages: &[ModelMessage], retry_attempts: Option<(u32, u32)>) -> PiMsg {
     let last = last_assistant_message(messages);
     let mut usage = Usage::default();
     for message in messages {
@@ -820,8 +817,10 @@ impl PiApp {
             }
             PiMsg::AssistantMessageStart => {
                 if self.discard_incomplete_on_next_assistant {
-                    self.current_response.truncate(self.current_assistant_start.0);
-                    self.current_thinking.truncate(self.current_assistant_start.1);
+                    self.current_response
+                        .truncate(self.current_assistant_start.0);
+                    self.current_thinking
+                        .truncate(self.current_assistant_start.1);
                     self.discard_incomplete_on_next_assistant = false;
                 }
                 self.current_assistant_start =
@@ -846,11 +845,8 @@ impl PiApp {
                     self.model = spec;
                 }
                 self.status_message = Some(message.clone());
-                self.messages.push(ConversationMessage::new(
-                    MessageRole::System,
-                    message,
-                    None,
-                ));
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
                 self.scroll_to_bottom();
             }
             PiMsg::RunPending => {
@@ -3706,8 +3702,7 @@ mod stream_delta_batcher_tests {
             .as_ref()
             .and_then(|options| {
                 options.available_models.iter().find(|entry| {
-                    entry.model.provider == provider.name()
-                        && entry.model.id == provider.model_id()
+                    entry.model.provider == provider.name() && entry.model.id == provider.model_id()
                 })
             })
             .cloned()
@@ -3929,9 +3924,7 @@ mod stream_delta_batcher_tests {
                 Ok(event) => {
                     let done = matches!(
                         event,
-                        PiMsg::AgentDone { .. }
-                            | PiMsg::AgentTimeCap { .. }
-                            | PiMsg::AgentError(_)
+                        PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. } | PiMsg::AgentError(_)
                     );
                     let _ = app.handle_pi_message(event.clone());
                     events.push(event);
@@ -4144,20 +4137,31 @@ mod stream_delta_batcher_tests {
         );
         app.session.try_lock().expect("session").session_dir = // ubs:ignore[rust.ownership.unwrap-expect] -- Configure the real session persistence destination before the turn.
             Some(temp.path().join("sessions"));
-        app.pending_inputs.push_back(PendingInput::Text("queued startup input".to_string()));
+        app.pending_inputs
+            .push_back(PendingInput::Text("queued startup input".to_string()));
         let _ = app.submit_message("capped foreground input");
         let events = drive_turn(&mut app, &mut receiver);
         let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
         assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- A zero budget must not call the provider.
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Exactly one successful terminal cap must reach the UI.
-            events.iter().filter(|event| matches!(event, PiMsg::AgentTimeCap { .. })).count(),
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Exactly one successful terminal cap must reach the UI.
+            events
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentTimeCap { .. }))
+                .count(),
             1
         );
-        assert!(!events.iter().any(|event| matches!( // ubs:ignore[rust.panic.assert-macros] -- A cap is one terminal outcome, never a duplicate ordinary completion or error.
-            event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
+        assert!(!events.iter().any(|event| matches!(
+            // ubs:ignore[rust.panic.assert-macros] -- A cap is one terminal outcome, never a duplicate ordinary completion or error.
+            event,
+            PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
         )));
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The durable marker appears exactly once in the transcript.
-            app.messages.iter().filter(|message| message.content == marker).count(),
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- The durable marker appears exactly once in the transcript.
+            app.messages
+                .iter()
+                .filter(|message| message.content == marker)
+                .count(),
             1
         );
         assert_eq!(app.status_message.as_deref(), Some(marker)); // ubs:ignore[rust.panic.assert-macros] -- The stop reason remains visible at the input boundary.
@@ -4167,9 +4171,13 @@ mod stream_delta_batcher_tests {
         assert_eq!(app.pending_inputs.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- A suppressed wakeup cannot consume queued work.
         let (session_id, path) = {
             let stored = app.session.try_lock().expect("saved session"); // ubs:ignore[rust.ownership.unwrap-expect] -- The settled session must be available.
-            (stored.header.id.clone(), stored.path.clone().expect("saved path")) // ubs:ignore[rust.ownership.unwrap-expect] -- The successful cap must reach a real file.
+            (
+                stored.header.id.clone(),
+                stored.path.clone().expect("saved path"),
+            ) // ubs:ignore[rust.ownership.unwrap-expect] -- The successful cap must reach a real file.
         };
-        let saved = runtime().block_on(Session::open(path.to_str().expect("path"))) // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the actual durable session to verify the marker.
+        let saved = runtime()
+            .block_on(Session::open(path.to_str().expect("path"))) // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the actual durable session to verify the marker.
             .expect("reopen capped session");
         assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Persistence and UI must agree on one synthetic cap.
             saved.to_messages_for_current_path().iter().filter(|message| {
@@ -4177,10 +4185,14 @@ mod stream_delta_batcher_tests {
             }).count(),
             1
         );
-        assert!(app.handle_pi_message(PiMsg::EnqueuePendingInput { // ubs:ignore[rust.panic.assert-macros] -- A late admitted input is retained without automatic restart.
-            session_id: session_id.clone(),
-            input: PendingInput::Continue,
-        }).is_none());
+        assert!(
+            app.handle_pi_message(PiMsg::EnqueuePendingInput {
+                // ubs:ignore[rust.panic.assert-macros] -- A late admitted input is retained without automatic restart.
+                session_id: session_id.clone(),
+                input: PendingInput::Continue,
+            })
+            .is_none()
+        );
         assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Both earlier and later queued work remain available.
         assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- Late queue admission cannot restart the capped turn.
         assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Neither queue wakeup may call the provider.
@@ -4205,7 +4217,10 @@ mod stream_delta_batcher_tests {
         assert!(!app.pending_inputs_paused_by_time_cap); // ubs:ignore[rust.panic.assert-macros] -- An explicitly committed retry may renew the budget.
         let events = drive_turn(&mut app, &mut receiver);
         assert!(matches!(events.last(), Some(PiMsg::AgentTimeCap { .. }))); // ubs:ignore[rust.panic.assert-macros] -- The actual retry must finish before inspecting its durable input.
-        let latest_user = app.session.try_lock().expect("retried session") // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the actual settled retry journal.
+        let latest_user = app
+            .session
+            .try_lock()
+            .expect("retried session") // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the actual settled retry journal.
             .to_messages_for_current_path()
             .iter()
             .rev()
@@ -4219,8 +4234,13 @@ mod stream_delta_batcher_tests {
             .expect("retry user input");
         assert_eq!(latest_user, "explicit retry target"); // ubs:ignore[rust.panic.assert-macros] -- An older paused entry must not take the explicitly retried target's budget.
         assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Retrying must not discard the older paused work.
-        assert!(matches!(app.pending_inputs.front(), Some(PendingInput::Text(text)) if text == "queued startup input")); // ubs:ignore[rust.panic.assert-macros] -- Older queued input retains its relative order.
-        assert!(matches!(app.pending_inputs.back(), Some(PendingInput::Continue))); // ubs:ignore[rust.panic.assert-macros] -- The later queued continuation stays after the earlier input.
+        assert!(
+            matches!(app.pending_inputs.front(), Some(PendingInput::Text(text)) if text == "queued startup input")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Older queued input retains its relative order.
+        assert!(matches!(
+            app.pending_inputs.back(),
+            Some(PendingInput::Continue)
+        )); // ubs:ignore[rust.panic.assert-macros] -- The later queued continuation stays after the earlier input.
     }
 
     #[test]
@@ -4240,25 +4260,44 @@ mod stream_delta_batcher_tests {
         for error in [None, Some("final session save failed".to_string())] {
             let (sender, mut receiver) = asupersync::channel::mpsc::channel(16);
             let mut batcher = UiStreamDeltaBatcher::new(sender);
-            dispatch_agent_event_to_ui(&AgentEvent::MessageStart { message: message.clone() }, &mut batcher);
-            dispatch_agent_event_to_ui(&AgentEvent::MessageEnd { message: message.clone() }, &mut batcher);
+            dispatch_agent_event_to_ui(
+                &AgentEvent::MessageStart {
+                    message: message.clone(),
+                },
+                &mut batcher,
+            );
+            dispatch_agent_event_to_ui(
+                &AgentEvent::MessageEnd {
+                    message: message.clone(),
+                },
+                &mut batcher,
+            );
             while let Ok(event) = receiver.try_recv() {
                 assert!(matches!(event, PiMsg::AssistantMessageStart)); // ubs:ignore[rust.panic.assert-macros] -- Pre-save lifecycle events cannot publish a marker or terminal success.
             }
-            dispatch_agent_event_to_ui(&AgentEvent::AgentEnd {
-                session_id: Arc::from("time-cap-fixture"),
-                messages: vec![message.clone()],
-                error: error.clone(),
-            }, &mut batcher);
+            dispatch_agent_event_to_ui(
+                &AgentEvent::AgentEnd {
+                    session_id: Arc::from("time-cap-fixture"),
+                    messages: vec![message.clone()],
+                    error: error.clone(),
+                },
+                &mut batcher,
+            );
             let terminal = receiver.try_recv().expect("terminal UI outcome"); // ubs:ignore[rust.ownership.unwrap-expect] -- A terminal event must be delivered.
             if error.is_some() {
-                assert!(matches!(terminal, PiMsg::AgentDone { // ubs:ignore[rust.panic.assert-macros] -- Failed persistence must remain an error and suppress the cap success.
-                    stop_reason: StopReason::Error,
-                    error_message: Some(_),
-                    ..
-                }));
+                assert!(matches!(
+                    terminal,
+                    PiMsg::AgentDone {
+                        // ubs:ignore[rust.panic.assert-macros] -- Failed persistence must remain an error and suppress the cap success.
+                        stop_reason: StopReason::Error,
+                        error_message: Some(_),
+                        ..
+                    }
+                ));
             } else {
-                assert!(matches!(terminal, PiMsg::AgentTimeCap { message, .. } if message == marker)); // ubs:ignore[rust.panic.assert-macros] -- Only successful terminal persistence publishes the cap.
+                assert!(
+                    matches!(terminal, PiMsg::AgentTimeCap { message, .. } if message == marker)
+                ); // ubs:ignore[rust.panic.assert-macros] -- Only successful terminal persistence publishes the cap.
             }
             assert!(receiver.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- A capped completion must have exactly one terminal outcome.
         }
@@ -4273,13 +4312,19 @@ mod stream_delta_batcher_tests {
             owner_session_id: owner_session_id.clone(),
             text: "unclaimed queued input".to_string(),
         });
-        assert_eq!(app.input.value(), "unclaimed queued input\n\nnewly typed draft"); // ubs:ignore[rust.panic.assert-macros] -- Restoring old work must preserve newer typing.
+        assert_eq!(
+            app.input.value(),
+            "unclaimed queued input\n\nnewly typed draft"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Restoring old work must preserve newer typing.
         assert_eq!(app.input_mode, InputMode::MultiLine); // ubs:ignore[rust.panic.assert-macros] -- Both parts of the restored draft must remain editable.
         let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
             owner_session_id: "replaced-session".to_string(),
             text: "stale work".to_string(),
         });
-        assert_eq!(app.input.value(), "unclaimed queued input\n\nnewly typed draft"); // ubs:ignore[rust.panic.assert-macros] -- A replaced session cannot alter the current draft.
+        assert_eq!(
+            app.input.value(),
+            "unclaimed queued input\n\nnewly typed draft"
+        ); // ubs:ignore[rust.panic.assert-macros] -- A replaced session cannot alter the current draft.
         app.input.set_value("  \n ");
         let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
             owner_session_id,
@@ -4504,7 +4549,10 @@ mod stream_delta_batcher_tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
         listener.set_nonblocking(true).expect("nonblocking accept");
-        let url = format!("http://{}/v1", listener.local_addr().expect("fixture address"));
+        let url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("fixture address")
+        );
         let (requests_tx, requests_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
@@ -4681,10 +4729,8 @@ mod stream_delta_batcher_tests {
                     .count(),
                 if index == 2 { 2 } else { 1 }
             );
-            assert!(
-                messages.iter().any(|message| message["role"] == "system"
-                    && message["content"] == "Preserved classic system prompt")
-            );
+            assert!(messages.iter().any(|message| message["role"] == "system"
+                && message["content"] == "Preserved classic system prompt"));
         }
         let path = app
             .session
@@ -4700,7 +4746,11 @@ mod stream_delta_batcher_tests {
             saved.effective_model_for_current_path(),
             Some(("openai".to_string(), "classic-primary".to_string()))
         );
-        assert!(saved.active_failover_provenance_for_current_path().is_none());
+        assert!(
+            saved
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
         assert_eq!(
             saved
                 .to_messages_for_current_path()
@@ -5641,7 +5691,10 @@ mod stream_delta_batcher_tests {
             .expect("lock agent")
             .handle
             .session_mut()
-            .extensions = app.extensions.clone().map(crate::extensions::ExtensionRegion::new);
+            .extensions = app
+            .extensions
+            .clone()
+            .map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);
@@ -5683,7 +5736,10 @@ mod stream_delta_batcher_tests {
             .expect("lock agent")
             .handle
             .session_mut()
-            .extensions = app.extensions.clone().map(crate::extensions::ExtensionRegion::new);
+            .extensions = app
+            .extensions
+            .clone()
+            .map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);

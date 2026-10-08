@@ -310,9 +310,11 @@ impl AgentHubRegistry {
                 "PI_HUB_REVIVAL_UNAVAILABLE: original native launch policy is unavailable",
             )
         })?;
-        if self.active_executions.iter().any(|active| {
-            self.native_lineages.get(active) == Some(lineage_root)
-        }) {
+        if self
+            .active_executions
+            .iter()
+            .any(|active| self.native_lineages.get(active) == Some(lineage_root))
+        {
             return Err(Error::validation(format!(
                 "hub: cannot revive '{id}' — a replacement is already active"
             )));

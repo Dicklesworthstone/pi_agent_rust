@@ -537,11 +537,7 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
             return;
         };
         // Forward through the runtime's bounded, stop-aware sender directly.
-        drain_agent_events(
-            &rx,
-            |message| sender.send(message),
-            || stop.is_stopped(),
-        );
+        drain_agent_events(&rx, |message| sender.send(message), || stop.is_stopped());
     }
 }
 
@@ -11700,10 +11696,14 @@ mod tests {
                 let draft = format!("/{name} Keep this draft");
                 type_str(&mut sim, &draft);
                 sim.inject_event(key(KeyCode::Enter, modifiers));
-                assert!(submit_rx.try_recv().is_err(), "busy /{name} must not dispatch");
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "busy /{name} must not dispatch"
+                );
                 assert_eq!(sim.model().input.text(), draft);
                 assert!(sim.model().transcript.iter().any(|entry| {
-                    entry.role == EntryRole::Error && entry.text.starts_with("Extension commands wait")
+                    entry.role == EntryRole::Error
+                        && entry.text.starts_with("Extension commands wait")
                 }));
                 assert!(sim.model().input_history.is_empty());
             }
@@ -14586,7 +14586,9 @@ mod tests {
         type_str(&mut sim, "/btw quick check");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
-            submit_rx.try_recv().expect("question queued for the driver"),
+            submit_rx
+                .try_recv()
+                .expect("question queued for the driver"),
             UiCommand::Btw {
                 question: String::from("quick check"),
                 owner_session_id: String::from("busy-session"),
@@ -14595,10 +14597,9 @@ mod tests {
         assert!(sim.model().pending_task.is_none());
         assert!(sim.model().input.text().is_empty());
         assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|entry| entry.text.contains("queued until the current turn finishes")),
+            sim.model().transcript.iter().any(|entry| entry
+                .text
+                .contains("queued until the current turn finishes")),
             "the note explains when the question will be answered"
         );
     }
@@ -14784,7 +14785,15 @@ mod tests {
             assert!(!prompts[0].contains(known));
             assert!(prompts[0].contains("<pi-secret:redacted>"));
             assert!(handle.session().agent.messages().is_empty());
-            assert!(handle.session().session.try_lock().unwrap().entries.is_empty());
+            assert!(
+                handle
+                    .session()
+                    .session
+                    .try_lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
         });
     }
 
@@ -14928,7 +14937,8 @@ mod tests {
             owner_session_id: String::from("previous"),
             text: String::from("stale controls"),
         }));
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             sim.model().input.text(),
             "existing draft"
         );
@@ -14940,7 +14950,8 @@ mod tests {
             owner_session_id: String::from("current"),
             text: String::new(),
         }));
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             sim.model().input.text(),
             "first control\n\nsecond control\n\nexisting draft"
         );
@@ -14948,7 +14959,8 @@ mod tests {
             owner_session_id: String::from("current"),
             text: String::from("explicit replacement"),
         }));
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             sim.model().input.text(),
             "explicit replacement"
         );
@@ -16251,7 +16263,8 @@ mod tests {
                             ContentBlock::Text(text)
                                 if text.text.starts_with("[time cap reached] ")
                         )
-                    }) => {
+                    }) =>
+                    {
                         generated_for_callback.fetch_add(1, Ordering::SeqCst);
                         if fail_save {
                             // The user input has already been saved. Fail only
@@ -16263,7 +16276,8 @@ mod tests {
                     _ => {}
                 });
 
-                asupersync::time::timeout( // ubs:ignore[rust.ownership.unwrap-expect] -- A broken continuation loop must fail within the watchdog.
+                asupersync::time::timeout(
+                    // ubs:ignore[rust.ownership.unwrap-expect] -- A broken continuation loop must fail within the watchdog.
                     asupersync::time::wall_now(),
                     Duration::from_secs(10),
                     Box::pin(run_prompt_turn(
@@ -16277,29 +16291,43 @@ mod tests {
                 .await
                 .expect("capped driver watchdog");
                 assert!(queued.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     generated.load(Ordering::SeqCst),
                     1,
                     "pending work must not start another run with a fresh cap"
                 );
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     provider.calls.lock().expect("provider capture").is_empty() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
                 );
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     control.lock().expect("control lock").is_none() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
                 );
 
                 let events = rx.try_iter().collect::<Vec<_>>();
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events.iter().filter(|event| matches!(event, PiMsg::AgentStart)).count(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, PiMsg::AgentStart))
+                        .count(),
                     1
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events.iter().filter(|event| matches!(event, PiMsg::AgentDone { .. })).count(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, PiMsg::AgentDone { .. }))
+                        .count(),
                     1
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events.iter().any(|event| matches!(event, PiMsg::AgentError(_))),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .any(|event| matches!(event, PiMsg::AgentError(_))),
                     fail_save
                 );
                 let restored = events
@@ -16308,14 +16336,13 @@ mod tests {
                         PiMsg::RestorePendingInput {
                             owner_session_id,
                             text,
-                        } => {
-                            Some((owner_session_id.as_str(), text.as_str()))
-                        }
+                        } => Some((owner_session_id.as_str(), text.as_str())),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
                 let pending_text = "first unclaimed follow-up\n\nsecond unclaimed follow-up";
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     restored,
                     vec![(owner_session_id.as_str(), pending_text)]
                 );
@@ -16324,11 +16351,16 @@ mod tests {
                     .await
                     .expect("reopen original session");
                 let messages = saved.to_messages_for_current_path();
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
                     1
                 );
-                assert!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     messages.iter().any(|message| matches!(
                         message,
                         Message::User(user)
@@ -16337,12 +16369,16 @@ mod tests {
                     ))
                 );
                 let expected_markers = if fail_save { 0 } else { 1 };
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    messages.iter().filter(|message| matches!(
-                        message,
-                        Message::Assistant(assistant)
-                            if crate::agent::time_cap_marker(assistant).is_some()
-                    )).count(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages
+                        .iter()
+                        .filter(|message| matches!(
+                            message,
+                            Message::Assistant(assistant)
+                                if crate::agent::time_cap_marker(assistant).is_some()
+                        ))
+                        .count(),
                     expected_markers
                 );
 
@@ -16357,18 +16393,23 @@ mod tests {
                     }
                     sim.send(PiFtuiMsg::Agent(event));
                 }
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     sim.model().input.text(),
                     format!("{pending_text}\n\nnew unsent draft")
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     sim.model().state,
                     AgentUiState::Ready
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    sim.model().transcript.iter().filter(|entry| {
-                        entry.text.starts_with("[time cap reached] ")
-                    }).count(),
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model()
+                        .transcript
+                        .iter()
+                        .filter(|entry| { entry.text.starts_with("[time cap reached] ") })
+                        .count(),
                     expected_markers,
                     "only a durably saved cap appears, exactly once"
                 );
@@ -16501,7 +16542,10 @@ mod tests {
         assert_eq!(user.role, EntryRole::User);
         assert!(user.text.contains("visible generated file body"));
         assert!(!user.text.contains('\x1b'));
-        assert_eq!(sim.model().input_history, vec!["authored prompt".to_string()]);
+        assert_eq!(
+            sim.model().input_history,
+            vec!["authored prompt".to_string()]
+        );
         assert!(
             submit_rx.try_recv().is_err(),
             "display must not enqueue another turn"
@@ -16562,14 +16606,17 @@ mod tests {
             assert!(!system.contains("invoked `workflowz`"));
             assert_eq!(calls[1].thinking, Some(ThinkingLevel::High));
             assert!(matches!(&calls[1].content, UserContent::Text(text) if text == "ultrathink"));
-            assert!(!rx.try_iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+            assert!(
+                !rx.try_iter()
+                    .any(|event| matches!(event, PiMsg::AgentError(_)))
+            );
         });
     }
 
     #[test]
     fn initial_native_prompt_keeps_prepared_bytes_order_and_authored_authority_once() {
-        use base64::Engine as _;
         use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
+        use base64::Engine as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let audio = b"RIFF\x00\xffWAVEfrozen-audio";
@@ -16675,7 +16722,11 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(!events.iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, PiMsg::AgentError(_)))
+            );
             let (_tx, model) = new_model();
             let mut sim = ProgramSimulator::new(model);
             sim.init();
@@ -16757,7 +16808,11 @@ mod tests {
                     assert!(call.system_prompt.as_deref().is_none_or(str::is_empty));
                 }
                 let events = rx.try_iter().collect::<Vec<_>>();
-                assert!(!events.iter().any(|event| matches!(event, PiMsg::AgentError(_))));
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, PiMsg::AgentError(_)))
+                );
                 let text = events
                     .iter()
                     .find_map(|event| match event {
@@ -16768,7 +16823,9 @@ mod tests {
                 match &content {
                     UserContent::Blocks(_) => {
                         assert!(text.find("voice.wav").unwrap() < text.find("first text").unwrap());
-                        assert!(text.find("image/png").unwrap() < text.find("second text").unwrap());
+                        assert!(
+                            text.find("image/png").unwrap() < text.find("second text").unwrap()
+                        );
                         assert!(text.ends_with("[Media: clip.mp4, video/mp4, 4 B]"));
                         for payload in ["AP+A/w==", "aW1hZ2U=", "AAECAw=="] {
                             assert!(!text.contains(payload));

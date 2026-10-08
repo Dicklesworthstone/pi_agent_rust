@@ -266,7 +266,8 @@ impl AcpLaunchOptions {
         }
         cli.no_tools = self.no_tools;
         cli.system_prompt.clone_from(&self.system_prompt);
-        cli.append_system_prompt.clone_from(&self.append_system_prompt);
+        cli.append_system_prompt
+            .clone_from(&self.append_system_prompt);
         cli.no_context_files = self.no_context_files;
         cli.hide_cwd_in_prompt = self.hide_cwd_in_prompt;
         cli.max_tool_iterations = self.max_tool_iterations;
@@ -1111,9 +1112,13 @@ async fn run(
 
     let cleanup = AgentCx::for_request();
     if let Ok(guard) = active_prompts.lock(&cleanup).await {
-        for abort in guard.values() { abort.abort(); }
+        for abort in guard.values() {
+            abort.abort();
+        }
     }
-    if let Ok(mut pending) = pending_permissions.lock() { pending.clear(); }
+    if let Ok(mut pending) = pending_permissions.lock() {
+        pending.clear();
+    }
     mcp::shutdown(&sessions).await;
     result
 }
@@ -1397,16 +1402,15 @@ fn resolve_acp_selection(
         cli.provider = Some(provider);
         cli.model = Some(model);
         // A launch option configures new conversations, never the loaded branch.
-        cli.thinking = Some(
-            match session.effective_thinking_level_for_current_path() {
+        cli.thinking =
+            Some(match session.effective_thinking_level_for_current_path() {
                 Some(level) => entry
                     .clamp_thinking_level(level.parse().map_err(|_| {
                         Error::session("Saved session has an invalid thinking level")
                     })?)
                     .to_string(),
                 None => resolve_acp_thinking_level(&options.config, &entry).to_string(),
-            },
-        );
+            });
         registry.merge_entries(vec![entry]);
     } else if cli.provider.is_none() && cli.model.is_none() {
         let scope_override = options
@@ -1440,9 +1444,11 @@ fn resolve_acp_selection(
                     .is_some_and(|provider| {
                         provider_ids_match(provider, &scoped.model.model.provider)
                     })
-                    && options.config.default_model.as_deref().is_some_and(|model| {
-                        model.eq_ignore_ascii_case(&scoped.model.model.id)
-                    })
+                    && options
+                        .config
+                        .default_model
+                        .as_deref()
+                        .is_some_and(|model| model.eq_ignore_ascii_case(&scoped.model.model.id))
             })
             .or_else(|| scoped_models.first());
         let entry = if let Some(scoped) = scoped {
@@ -1550,13 +1556,20 @@ fn handle_session_new(
 ) -> Result<(String, AcpSessionState)> {
     let cwd = history::requested_cwd(params).map_err(|error| Error::session(error.message))?;
     let servers = crate::mcp::config::parse_acp_servers(params, &cwd)
-        .map_err(Error::session)?.unwrap_or_default();
+        .map_err(Error::session)?
+        .unwrap_or_default();
 
     // Create the backing session. Persists to disk when --session-dir is set
     // (save_enabled), otherwise in-memory (existing default behavior).
     let (session, save_enabled) =
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
-    let (id, mut state) = build_acp_session(session, save_enabled, cwd.clone(), options, permission_client)?;
+    let (id, mut state) = build_acp_session(
+        session,
+        save_enabled,
+        cwd.clone(),
+        options,
+        permission_client,
+    )?;
     let mcp_state = mcp::prepare(&cwd, &Config::global_dir(), servers);
     if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
         mcp::mount(agent.session_mut(), mcp_state);
@@ -1779,10 +1792,16 @@ fn session_config_options(
 /// holds the agent session.
 fn config_options_for(state: &AcpSessionState) -> Option<Value> {
     let agent_session = state.agent_session.as_ref()?;
-    Some(config_options_for_handle(agent_session, &state.available_models))
+    Some(config_options_for_handle(
+        agent_session,
+        &state.available_models,
+    ))
 }
 
-fn config_options_for_handle(handle: &AgentSessionHandle, available_models: &[ModelEntry]) -> Value {
+fn config_options_for_handle(
+    handle: &AgentSessionHandle,
+    available_models: &[ModelEntry],
+) -> Value {
     let (provider, model) = handle.model();
     session_config_options(
         (&provider, &model),
@@ -2142,9 +2161,15 @@ async fn run_prompt(
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
     let prepared = mcp::before_prompt(
-        mcp_state.as_ref(), agent_session.session_mut(), mcp_command,
-        &abort_signal, &cx, &out_tx, &session_id,
-    ).await;
+        mcp_state.as_ref(),
+        agent_session.session_mut(),
+        mcp_command,
+        &abort_signal,
+        &cx,
+        &out_tx,
+        &session_id,
+    )
+    .await;
     let stop_reason = if let Some(reason) = prepared {
         reason
     } else {
@@ -2493,7 +2518,8 @@ mod tests {
             &self,
             _context: &crate::provider::Context<'_>,
             _options: &StreamOptions,
-        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some((stored, path)) = &self.save_fault {
                 stored.try_lock().expect("prompt already persisted").path = Some(path.clone());
@@ -2548,10 +2574,8 @@ mod tests {
         Arc<PromptTestProvider>,
         Arc<Mutex<Session>>,
     ) {
-        let mut stored = Session::create_with_dir_and_store(
-            Some(root.to_path_buf()),
-            SessionStoreKind::Jsonl,
-        );
+        let mut stored =
+            Session::create_with_dir_and_store(Some(root.to_path_buf()), SessionStoreKind::Jsonl);
         stored.set_model_header(
             Some("acp-test-provider".to_string()),
             Some("acp-test-model".to_string()),
@@ -2654,12 +2678,9 @@ mod tests {
         runtime.block_on(async {
             for after_provider in [false, true] {
                 let root = tempfile::tempdir().unwrap();
-                let (state, provider, stored) = prompt_test_state(
-                    root.path(),
-                    PromptTestOutcome::Complete,
-                    after_provider,
-                )
-                .await;
+                let (state, provider, stored) =
+                    prompt_test_state(root.path(), PromptTestOutcome::Complete, after_provider)
+                        .await;
                 let original = stored.try_lock().unwrap().path.clone();
                 if !after_provider {
                     stored.try_lock().unwrap().path = Some(root.path().to_path_buf());
@@ -2970,10 +2991,7 @@ mod tests {
             true
         );
         // mcpCapabilities advertised explicitly so the client knows transports.
-        assert_eq!(
-            result["agentCapabilities"]["mcpCapabilities"]["http"],
-            true
-        );
+        assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["http"], true);
         assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], false);
         // Tool approval is exposed as implementation metadata; the standard
         // permission request itself is an Agent -> Client JSON-RPC call.
@@ -3583,7 +3601,11 @@ mod tests {
             let guard = state.lock(&cx).await.expect("lock state");
             let agent_session = guard.agent_session.as_ref().expect("session present");
             assert_eq!(
-                agent_session.session().agent.stream_options().thinking_level,
+                agent_session
+                    .session()
+                    .agent
+                    .stream_options()
+                    .thinking_level,
                 Some(crate::model::ThinkingLevel::Off)
             );
         });

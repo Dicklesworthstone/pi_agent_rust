@@ -66,7 +66,9 @@ fn supervise(case: &str) {
         ])
         .env(CHILD_CASE, case)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output.try_clone().expect("clone output handle")))
+        .stdout(Stdio::from(
+            output.try_clone().expect("clone output handle"),
+        ))
         .stderr(Stdio::from(output))
         .spawn()
         .expect("spawn supervised FTUI test");
@@ -243,9 +245,7 @@ fn stream_resume_abort() {
         thinking.push_str(&delta);
         send(&mut model, PiMsg::ThinkingDelta(delta));
         if index == 0 || index % 64 == 63 {
-            phase(&format!(
-                "delta={index} update returned; before Full frame"
-            ));
+            phase(&format!("delta={index} update returned; before Full frame"));
             assert_tail(&capture(&model), &marker);
             // Interleave real terminal-key dispatch without scrolling: the
             // default follow-stream-tail state must continue to follow.
@@ -285,7 +285,10 @@ fn stream_resume_abort() {
             _ => None,
         })
         .expect("persisted thinking block");
-    assert_eq!(restored_thinking, thinking, "never truncate stored reasoning");
+    assert_eq!(
+        restored_thinking, thinking,
+        "never truncate stored reasoning"
+    );
 
     let (_tx, rx) = mpsc::channel();
     let (submit_tx, submit_rx) = mpsc::channel();
@@ -340,5 +343,8 @@ fn stream_resume_abort() {
     // is a UI policy, not the workload deadline.
     let second = resumed.update(key(KeyCode::Char('c'), Modifiers::CTRL));
     assert!(matches!(second, Cmd::Quit));
-    assert!(signal.is_aborted(), "quit must deliver the real abort handle");
+    assert!(
+        signal.is_aborted(),
+        "quit must deliver the real abort handle"
+    );
 }

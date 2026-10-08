@@ -4,12 +4,14 @@
 
 use super::*;
 use crate::acp::{
-    AcpOptions, AcpPermissionClient, AcpSessionState, AbortHandle, PendingPermissionMap,
+    AbortHandle, AcpOptions, AcpPermissionClient, AcpSessionState, PendingPermissionMap,
 };
 use crate::agent::{Agent, AgentConfig};
 use crate::auth::{AuthCredential, AuthStorage};
 use crate::compaction::ResolvedCompactionSettings;
-use crate::model::{AssistantMessage, ContentBlock, Message, StopReason, TextContent, UserContent, UserMessage};
+use crate::model::{
+    AssistantMessage, ContentBlock, Message, StopReason, TextContent, UserContent, UserMessage,
+};
 use crate::models::ModelRegistry;
 use crate::provider::StreamOptions;
 use crate::session::{Session, SessionStoreKind};
@@ -35,32 +37,52 @@ struct HttpFixture {
 }
 
 fn read_request(stream: &mut TcpStream) -> (String, Value) {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut byte = [0_u8; 1];
         stream.read_exact(&mut byte).unwrap();
         bytes.push(byte[0]);
         assert!(bytes.len() <= 32 * 1024, "bounded request headers");
-        if bytes.ends_with(b"\r\n\r\n") { break bytes.len() }
+        if bytes.ends_with(b"\r\n\r\n") {
+            break bytes.len();
+        }
     };
     let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-    let length = headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap_or(0);
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
     assert!(length <= 1024 * 1024);
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body).unwrap();
-    (headers, if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() })
+    (
+        headers,
+        if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        },
+    )
 }
 
 fn reply(stream: &mut TcpStream, body: Option<Value>) {
     if let Some(body) = body {
         let bytes = body.to_string();
-        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bytes}", bytes.len());
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bytes}",
+            bytes.len()
+        );
     } else {
-        let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     }
 }
 
@@ -82,13 +104,17 @@ impl HttpFixture {
                 let (mut stream, _) = match listener.accept() {
                     Ok(value) => value,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2)); continue;
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
                 let (headers, request) = read_request(&mut stream);
-                assert!(headers.lines().any(|line| line.split_once(':').is_some_and(|(name, value)|
-                    name.eq_ignore_ascii_case("x-acp-literal") && value.trim() == LITERAL_HEADER)));
+                assert!(headers.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-acp-literal") && value.trim() == LITERAL_HEADER
+                    })
+                }));
                 if headers.starts_with("GET /mcp ") {
                     // Native activation probes the optional receive channel.
                     // Decline it explicitly without inventing a JSON-RPC call.
@@ -99,7 +125,8 @@ impl HttpFixture {
                 let method = request["method"].as_str().unwrap_or("");
                 if method == "initialize" {
                     worker_entered.store(true, Ordering::Release);
-                    while hang_initialize && !worker_release.load(Ordering::Acquire)
+                    while hang_initialize
+                        && !worker_release.load(Ordering::Acquire)
                         && worker_running.load(Ordering::Acquire)
                     {
                         std::thread::sleep(Duration::from_millis(2));
@@ -121,10 +148,21 @@ impl HttpFixture {
                     "notifications/initialized" => None,
                     _ => panic!("unexpected fixture method {method:?}"),
                 };
-                reply(&mut stream, result.map(|result| json!({"jsonrpc":"2.0","id":request["id"],"result":result})));
+                reply(
+                    &mut stream,
+                    result
+                        .map(|result| json!({"jsonrpc":"2.0","id":request["id"],"result":result})),
+                );
             }
         });
-        Self { url, running, entered, release, records, worker: Some(worker) }
+        Self {
+            url,
+            running,
+            entered,
+            release,
+            records,
+            worker: Some(worker),
+        }
     }
 
     fn config(&self) -> Value {
@@ -133,7 +171,12 @@ impl HttpFixture {
     }
 
     fn count(&self, method: &str) -> usize {
-        self.records.lock().unwrap().iter().filter(|request| request["method"] == method).count()
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == method)
+            .count()
     }
 }
 
@@ -143,22 +186,35 @@ impl Drop for HttpFixture {
         self.running.store(false, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let result = worker.join();
-            if !std::thread::panicking() { result.expect("fixture worker"); }
+            if !std::thread::panicking() {
+                result.expect("fixture worker");
+            }
         }
     }
 }
 
 fn runtime() -> asupersync::runtime::Runtime {
     asupersync::runtime::RuntimeBuilder::new()
-        .worker_threads(1).blocking_threads(1, 2).build().unwrap()
+        .worker_threads(1)
+        .blocking_threads(1, 2)
+        .build()
+        .unwrap()
 }
 
 async fn bounded<F: Future>(work: F) -> F::Output {
     let cx = AgentCx::for_current_or_request();
     let time = cx.time();
-    match futures::future::select(Box::pin(work), Box::pin(time.sleep(Duration::from_secs(15)))).await {
+    match futures::future::select(
+        Box::pin(work),
+        Box::pin(time.sleep(Duration::from_secs(15))),
+    )
+    .await
+    {
         futures::future::Either::Left((result, _)) => result,
-        futures::future::Either::Right(((), pending)) => { drop(pending); panic!("ACP MCP watchdog expired"); }
+        futures::future::Either::Right(((), pending)) => {
+            drop(pending);
+            panic!("ACP MCP watchdog expired");
+        }
     }
 }
 
@@ -168,9 +224,11 @@ fn text(value: &str) -> Vec<ContentBlock> {
 
 fn permission_client(out: &SyncSender<String>, cx: &AgentCx) -> AcpPermissionClient {
     AcpPermissionClient {
-        out_tx: out.clone(), pending: Arc::new(StdMutex::new(HashMap::new())),
+        out_tx: out.clone(),
+        pending: Arc::new(StdMutex::new(HashMap::new())),
         request_counter: Arc::new(AtomicU64::new(0)),
-        timeout: Duration::from_secs(2), cx: cx.clone(),
+        timeout: Duration::from_secs(2),
+        cx: cx.clone(),
     }
 }
 
@@ -195,33 +253,56 @@ impl ProviderFixture {
         let worker = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(12);
             while observed.load(Ordering::Acquire) < 2 && !worker_stop.load(Ordering::Acquire) {
-                assert!(std::time::Instant::now() < deadline, "provider fixture timed out");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "provider fixture timed out"
+                );
                 let (mut stream, _) = match listener.accept() {
                     Ok(value) => value,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2)); continue;
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
                     }
                     Err(error) => panic!("provider fixture accept: {error}"),
                 };
                 let (_, request) = read_request(&mut stream);
                 let index = observed.fetch_add(1, Ordering::AcqRel);
-                assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == TOOL));
+                assert!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == TOOL)
+                );
                 let delta = if index == 0 {
                     json!({"role":"assistant","tool_calls":[{"index":0,"id":"acp-call-1",
                         "type":"function","function":{"name":TOOL,"arguments":"{\"text\":\"hello\"}"}}]})
                 } else {
-                    assert!(request["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool"));
+                    assert!(
+                        request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|message| message["role"] == "tool")
+                    );
                     json!({"role":"assistant","content":"finished"})
                 };
-                let body = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                let body = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                     json!({"id":"fixture","object":"chat.completion.chunk","model":"gpt-4o",
                         "choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
                     json!({"id":"fixture","object":"chat.completion.chunk","model":"gpt-4o",
-                        "choices":[{"index":0,"delta":{},"finish_reason":if index == 0 {"tool_calls"} else {"stop"}}]}));
+                        "choices":[{"index":0,"delta":{},"finish_reason":if index == 0 {"tool_calls"} else {"stop"}}]})
+                );
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        Self { url, turns, stop, worker: Some(worker) }
+        Self {
+            url,
+            turns,
+            stop,
+            worker: Some(worker),
+        }
     }
 }
 
@@ -230,14 +311,20 @@ impl Drop for ProviderFixture {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let result = worker.join();
-            if !std::thread::panicking() { result.expect("provider worker"); }
+            if !std::thread::panicking() {
+                result.expect("provider worker");
+            }
         }
     }
 }
 
 fn live_state(
-    cwd: &Path, root: &Path, server: &HttpFixture, provider_url: &str,
-    client: &AcpPermissionClient, handle: asupersync::runtime::RuntimeHandle,
+    cwd: &Path,
+    root: &Path,
+    server: &HttpFixture,
+    provider_url: &str,
+    client: &AcpPermissionClient,
+    handle: asupersync::runtime::RuntimeHandle,
 ) -> (String, Arc<Mutex<AcpSessionState>>, Arc<SessionMcp>) {
     let mut session = Session::in_memory();
     session.header.cwd = cwd.display().to_string();
@@ -246,30 +333,52 @@ fn live_state(
     model.model.api = "openai-completions".into();
     model.model.base_url = provider_url.into();
     let provider = crate::providers::create_provider(&model, None).unwrap();
-    let agent = Agent::new(provider, ToolRegistry::new(&[], cwd, None), AgentConfig {
-        stream_options: StreamOptions { api_key: Some("local-fixture-key".into()), ..StreamOptions::default() },
-        tool_approval: Some(client.handler_for_session(id.clone())),
-        ..AgentConfig::default()
-    });
-    let mut agent_session = AgentSession::new(agent, Arc::new(Mutex::new(session)), false,
-        ResolvedCompactionSettings { enabled: false, ..ResolvedCompactionSettings::default() })
-        .with_runtime_handle(handle);
-    let servers = crate::mcp::config::parse_acp_servers(&json!({"mcpServers":server.config()}), cwd).unwrap().unwrap();
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], cwd, None),
+        AgentConfig {
+            stream_options: StreamOptions {
+                api_key: Some("local-fixture-key".into()),
+                ..StreamOptions::default()
+            },
+            tool_approval: Some(client.handler_for_session(id.clone())),
+            ..AgentConfig::default()
+        },
+    );
+    let mut agent_session = AgentSession::new(
+        agent,
+        Arc::new(Mutex::new(session)),
+        false,
+        ResolvedCompactionSettings {
+            enabled: false,
+            ..ResolvedCompactionSettings::default()
+        },
+    )
+    .with_runtime_handle(handle);
+    let servers =
+        crate::mcp::config::parse_acp_servers(&json!({"mcpServers":server.config()}), cwd)
+            .unwrap()
+            .unwrap();
     let mcp = prepare(cwd, root, servers).unwrap();
     mount(&mut agent_session, &mcp);
     let state = Arc::new(Mutex::new(AcpSessionState {
         agent_session: Some(crate::sdk::AgentSessionHandle::from_session_with_listeners(
-            agent_session, crate::sdk::EventListeners::default(),
+            agent_session,
+            crate::sdk::EventListeners::default(),
         )),
-        cwd: cwd.into(), mcp: Some(Arc::clone(&mcp)),
+        cwd: cwd.into(),
+        mcp: Some(Arc::clone(&mcp)),
         available_models: Vec::new(),
     }));
     (id, state, mcp)
 }
 
 async fn read_permission(
-    rx: &std::sync::mpsc::Receiver<String>, out: &mut Vec<Value>,
-    pending: &PendingPermissionMap, cx: &AgentCx, approve: bool,
+    rx: &std::sync::mpsc::Receiver<String>,
+    out: &mut Vec<Value>,
+    pending: &PendingPermissionMap,
+    cx: &AgentCx,
+    approve: bool,
 ) {
     loop {
         while let Ok(line) = rx.try_recv() {
@@ -278,11 +387,15 @@ async fn read_permission(
             out.push(value.clone());
             if is_request {
                 assert_eq!(value["params"]["toolCall"]["title"], TOOL);
-                assert!(crate::acp::route_permission_response(&json!({
-                    "jsonrpc":"2.0","id":value["id"],"result":{"outcome":{
-                        "outcome":"selected","optionId":if approve {"allow-once"} else {"reject-once"},
-                    }},
-                }), pending, cx));
+                assert!(crate::acp::route_permission_response(
+                    &json!({
+                        "jsonrpc":"2.0","id":value["id"],"result":{"outcome":{
+                            "outcome":"selected","optionId":if approve {"allow-once"} else {"reject-once"},
+                        }},
+                    }),
+                    pending,
+                    cx
+                ));
                 return;
             }
         }
@@ -302,32 +415,97 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             let cx = AgentCx::for_current_or_request();
             let (tx, rx) = std::sync::mpsc::sync_channel(128);
             let client = permission_client(&tx, &cx);
-            let (id, state, mcp) = live_state(temp.path(), &temp.path().join("global"), &server, &provider.url, &client, handle);
+            let (id, state, mcp) = live_state(
+                temp.path(),
+                &temp.path().join("global"),
+                &server,
+                &provider.url,
+                &client,
+                handle,
+            );
             let (_, signal) = AbortHandle::new();
-            let reason = crate::acp::run_prompt(Arc::clone(&state), text("/mcp trust remote"),
-                Some(Command::Trust("remote".into())), signal, tx.clone(), id.clone(), cx.clone()).await;
+            let reason = crate::acp::run_prompt(
+                Arc::clone(&state),
+                text("/mcp trust remote"),
+                Some(Command::Trust("remote".into())),
+                signal,
+                tx.clone(),
+                id.clone(),
+                cx.clone(),
+            )
+            .await;
             assert_eq!(reason, "end_turn");
-            assert_eq!(provider.turns.load(Ordering::Acquire), 0, "host commands do not start provider turns");
+            assert_eq!(
+                provider.turns.load(Ordering::Acquire),
+                0,
+                "host commands do not start provider turns"
+            );
             assert_eq!(server.count("tools/call"), 0);
-            assert!(state.lock(&cx).await.unwrap().agent_session.as_ref().unwrap().has_tool(TOOL));
-            let mut seen = rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
+            assert!(
+                state
+                    .lock(&cx)
+                    .await
+                    .unwrap()
+                    .agent_session
+                    .as_ref()
+                    .unwrap()
+                    .has_tool(TOOL)
+            );
+            let mut seen = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
             let (_, signal) = AbortHandle::new();
-            let prompt = crate::acp::run_prompt(Arc::clone(&state), text("Call echo"), None,
-                signal, tx.clone(), id.clone(), cx.clone());
-            let (reason, ()) = futures::join!(prompt, read_permission(&rx, &mut seen, &client.pending, &cx, approve));
+            let prompt = crate::acp::run_prompt(
+                Arc::clone(&state),
+                text("Call echo"),
+                None,
+                signal,
+                tx.clone(),
+                id.clone(),
+                cx.clone(),
+            );
+            let (reason, ()) = futures::join!(
+                prompt,
+                read_permission(&rx, &mut seen, &client.pending, &cx, approve)
+            );
             assert_eq!(reason, "end_turn");
-            seen.extend(rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()));
+            seen.extend(
+                rx.try_iter()
+                    .map(|line| serde_json::from_str::<Value>(&line).unwrap()),
+            );
             assert_eq!(server.count("tools/call"), usize::from(approve));
-            assert!(seen.iter().any(|value| value["params"]["update"]["toolCallId"] == "acp-call-1"
-                && value["params"]["update"]["status"] == if approve {"completed"} else {"failed"}));
-            assert!(!serde_json::to_string(&seen).unwrap().contains(LITERAL_HEADER));
+            assert!(
+                seen.iter().any(
+                    |value| value["params"]["update"]["toolCallId"] == "acp-call-1"
+                        && value["params"]["update"]["status"]
+                            == if approve { "completed" } else { "failed" }
+                )
+            );
+            assert!(
+                !serde_json::to_string(&seen)
+                    .unwrap()
+                    .contains(LITERAL_HEADER)
+            );
             assert!(client.pending.lock().unwrap().is_empty());
 
             let (_, signal) = AbortHandle::new();
-            crate::acp::run_prompt(Arc::clone(&state), text("/mcp deny remote"),
-                Some(Command::Deny("remote".into())), signal, tx, id, cx.clone()).await;
+            crate::acp::run_prompt(
+                Arc::clone(&state),
+                text("/mcp deny remote"),
+                Some(Command::Deny("remote".into())),
+                signal,
+                tx,
+                id,
+                cx.clone(),
+            )
+            .await;
             let before = server.count("tools/call");
-            let error = mcp.manager.call_tool("remote", "echo", json!({"text":"blocked"})).await.unwrap_err();
+            let error = mcp
+                .manager
+                .call_tool("remote", "echo", json!({"text":"blocked"}))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("MCP_TRUST_DENIED"));
             assert_eq!(server.count("tools/call"), before);
             mcp.manager.shutdown_all().await;
@@ -346,11 +524,24 @@ fn cancelling_mcp_setup_restores_the_agent_and_busy_session_shutdown_reaches_the
         let cx = AgentCx::for_current_or_request();
         let (tx, _rx) = std::sync::mpsc::sync_channel(32);
         let client = permission_client(&tx, &cx);
-        let (id, state, mcp) = live_state(temp.path(), &temp.path().join("global"), &server,
-            "http://127.0.0.1:1/v1", &client, handle);
+        let (id, state, mcp) = live_state(
+            temp.path(),
+            &temp.path().join("global"),
+            &server,
+            "http://127.0.0.1:1/v1",
+            &client,
+            handle,
+        );
         let (abort, signal) = AbortHandle::new();
-        let prompt = crate::acp::run_prompt(Arc::clone(&state), text("/mcp trust remote"),
-            Some(Command::Trust("remote".into())), signal, tx, id.clone(), cx.clone());
+        let prompt = crate::acp::run_prompt(
+            Arc::clone(&state),
+            text("/mcp trust remote"),
+            Some(Command::Trust("remote".into())),
+            signal,
+            tx,
+            id.clone(),
+            cx.clone(),
+        );
         let cancel = async {
             while !server.entered.load(Ordering::Acquire) {
                 cx.time().sleep(Duration::from_millis(2)).await;
@@ -367,7 +558,11 @@ fn cancelling_mcp_setup_restores_the_agent_and_busy_session_shutdown_reaches_the
         let agent = state.lock(&cx).await.unwrap().agent_session.take().unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::from([(id, state)])));
         shutdown(&sessions).await;
-        let error = mcp.manager.call_tool("remote", "echo", json!({})).await.unwrap_err();
+        let error = mcp
+            .manager
+            .call_tool("remote", "echo", json!({}))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("MCP_MANAGER_SHUTDOWN"));
         drop(agent);
         server.release.store(true, Ordering::Release);
@@ -376,15 +571,26 @@ fn cancelling_mcp_setup_restores_the_agent_and_busy_session_shutdown_reaches_the
 
 fn options(root: &Path, handle: asupersync::runtime::RuntimeHandle) -> AcpOptions {
     let mut auth = AuthStorage::load(root.join("auth.json")).unwrap();
-    auth.set("anthropic", AuthCredential::ApiKey { key: "not-live".into() });
+    auth.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "not-live".into(),
+        },
+    );
     let model_registry = ModelRegistry::load(&auth, None);
-    let model = model_registry.find("anthropic", "claude-sonnet-4-5").unwrap();
+    let model = model_registry
+        .find("anthropic", "claude-sonnet-4-5")
+        .unwrap();
     AcpOptions {
         launch: crate::acp::AcpLaunchOptions::default(),
-        config: crate::config::Config::default(), available_models: vec![model],
-        model_registry, auth, runtime_handle: handle,
+        config: crate::config::Config::default(),
+        available_models: vec![model],
+        model_registry,
+        auth,
+        runtime_handle: handle,
         oauth_refresh_failures: Vec::new(),
-        session_dir: Some(root.into()), skills_prompt: None,
+        session_dir: Some(root.into()),
+        skills_prompt: None,
     }
 }
 
@@ -406,34 +612,76 @@ fn new_and_restored_sessions_accept_mcp_definitions_without_connecting_or_replay
         assert!(new.mcp.is_some());
         assert_eq!(server.count("initialize"), 0);
 
-        let mut saved = Session::create_with_dir_and_store(Some(root.path().into()), SessionStoreKind::Jsonl);
+        let mut saved =
+            Session::create_with_dir_and_store(Some(root.path().into()), SessionStoreKind::Jsonl);
         saved.header.cwd = cwd.display().to_string();
-        saved.set_model_header(Some("anthropic".into()), Some("claude-sonnet-4-5".into()), Some("off".into()));
+        saved.set_model_header(
+            Some("anthropic".into()),
+            Some("claude-sonnet-4-5".into()),
+            Some("off".into()),
+        );
         saved.append_model_message(Message::User(UserMessage {
-            content: UserContent::Text("/mcp trust remote".into()), timestamp: 1,
+            content: UserContent::Text("/mcp trust remote".into()),
+            timestamp: 1,
         }));
         saved.append_model_message(Message::assistant(AssistantMessage {
-            content: text("historical response"), stop_reason: StopReason::Stop,
+            content: text("historical response"),
+            stop_reason: StopReason::Stop,
             ..AssistantMessage::default()
         }));
         saved.save().await.unwrap();
         let before = std::fs::read(saved.path.as_ref().unwrap()).unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let request = json!({"sessionId":saved.header.id,"cwd":cwd,"mcpServers":server.config()});
-        let result = history::load(&request, &options, &client, &sessions, &cx, &tx, true).await.unwrap();
+        let result = history::load(&request, &options, &client, &sessions, &cx, &tx, true)
+            .await
+            .unwrap();
         assert_eq!(result["sessionId"], saved.header.id);
-        let notifications = rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
-        assert!(notifications.iter().any(|value| value["params"]["update"]["content"]["text"] == "/mcp trust remote"));
-        assert!(notifications.iter().any(|value| value["params"]["update"]["sessionUpdate"] == "available_commands_update"));
-        assert_eq!(server.count("initialize"), 0, "replay must never execute historic operator commands");
-        let state = sessions.lock(&cx).await.unwrap().get(&saved.header.id).unwrap().clone();
+        let notifications = rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            notifications
+                .iter()
+                .any(|value| value["params"]["update"]["content"]["text"] == "/mcp trust remote")
+        );
+        assert!(
+            notifications
+                .iter()
+                .any(|value| value["params"]["update"]["sessionUpdate"]
+                    == "available_commands_update")
+        );
+        assert_eq!(
+            server.count("initialize"),
+            0,
+            "replay must never execute historic operator commands"
+        );
+        let state = sessions
+            .lock(&cx)
+            .await
+            .unwrap()
+            .get(&saved.header.id)
+            .unwrap()
+            .clone();
         let mcp = state.lock(&cx).await.unwrap().mcp.clone().unwrap();
         assert_eq!(mcp.manager.list()[0].trust, "pending");
-        history::load(&request, &options, &client, &sessions, &cx, &tx, false).await.unwrap();
-        assert!(rx.try_iter().all(|line| !line.contains("historical response")));
+        history::load(&request, &options, &client, &sessions, &cx, &tx, false)
+            .await
+            .unwrap();
+        assert!(
+            rx.try_iter()
+                .all(|line| !line.contains("historical response"))
+        );
         let mut changed = request;
         changed["mcpServers"][0]["headers"][0]["value"] = json!("changed-credential");
-        assert_eq!(history::load(&changed, &options, &client, &sessions, &cx, &tx, false).await.unwrap_err().code, crate::acp::INVALID_PARAMS);
+        assert_eq!(
+            history::load(&changed, &options, &client, &sessions, &cx, &tx, false)
+                .await
+                .unwrap_err()
+                .code,
+            crate::acp::INVALID_PARAMS
+        );
         assert_eq!(std::fs::read(saved.path.as_ref().unwrap()).unwrap(), before);
         shutdown(&sessions).await;
     }));

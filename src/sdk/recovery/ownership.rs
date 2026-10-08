@@ -132,16 +132,22 @@ mod tests {
                 let _guard = PendingGuard(Arc::clone(&self.0));
                 futures::future::pending::<()>().await;
             }
-            Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Done {
-                reason: StopReason::Stop,
-                message: completed_message(),
-            })])))
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: completed_message(),
+                },
+            )])))
         }
     }
 
     fn handle(probe: Arc<Probe>) -> AgentSessionHandle {
         let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
-        let agent = Agent::new(Arc::new(PendingProvider(probe)), tools, AgentConfig::default());
+        let agent = Agent::new(
+            Arc::new(PendingProvider(probe)),
+            tools,
+            AgentConfig::default(),
+        );
         let session = AgentSession::new(
             agent,
             Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
@@ -308,14 +314,21 @@ mod tests {
             for result in results {
                 let error = result.expect_err("abandoned turn requires deliberate recovery");
                 assert!(error.is_session_persistence(), "{error}");
-                assert!(error.to_string().contains("SDK_TURN_INTERRUPTED"), "{error}");
+                assert!(
+                    error.to_string().contains("SDK_TURN_INTERRUPTED"),
+                    "{error}"
+                );
             }
             assert_eq!(
                 serde_json::to_value(handle.messages().await.unwrap()).unwrap(),
                 before
             );
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
-            assert_ne!(before, json!([]), "the original input really entered the session");
+            assert_ne!(
+                before,
+                json!([]),
+                "the original input really entered the session"
+            );
         }));
     }
 
@@ -353,11 +366,13 @@ mod tests {
             let mut message = completed_message();
             if call == 0 {
                 message.stop_reason = StopReason::ToolUse;
-                message.content = vec![serde_json::from_value(json!({
-                    "type": "toolCall", "id": "write-once", "name": "write",
-                    "arguments": {"path": "marker.txt", "content": "real tool effect"}
-                }))
-                .unwrap()];
+                message.content = vec![
+                    serde_json::from_value(json!({
+                        "type": "toolCall", "id": "write-once", "name": "write",
+                        "arguments": {"path": "marker.txt", "content": "real tool effect"}
+                    }))
+                    .unwrap(),
+                ];
             } else {
                 assert_eq!(tool_results(&context.messages), 1);
                 if call == 1 {
@@ -365,10 +380,12 @@ mod tests {
                     futures::future::pending::<()>().await;
                 }
             }
-            Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Done {
-                reason: message.stop_reason,
-                message,
-            })])))
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::Done {
+                    reason: message.stop_reason,
+                    message,
+                },
+            )])))
         }
     }
 
@@ -390,9 +407,9 @@ mod tests {
         );
         let session = AgentSession::new(
             agent,
-            Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(Some(
-                root.to_path_buf(),
-            )))),
+            Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+                Some(root.to_path_buf()),
+            ))),
             true,
             crate::compaction::ResolvedCompactionSettings {
                 enabled: false,
@@ -432,9 +449,16 @@ mod tests {
             assert!(probe.dropped.load(Ordering::SeqCst));
             assert_eq!(tool_results(handle.session.agent.messages()), 1);
             let durable = reopen(&handle).await.to_messages_for_current_path();
-            assert_eq!(tool_results(&durable), 0, "the abandoned tail was not saved");
             assert_eq!(
-                durable.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                tool_results(&durable),
+                0,
+                "the abandoned tail was not saved"
+            );
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|message| matches!(message, Message::User(_)))
+                    .count(),
                 1
             );
             let before = serde_json::to_value(handle.session.agent.messages()).unwrap();
@@ -445,7 +469,10 @@ mod tests {
                     .unwrap_err()
                     .is_session_persistence()
             );
-            assert_eq!(serde_json::to_value(handle.session.agent.messages()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before
+            );
             assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
         }));
     }
@@ -490,17 +517,28 @@ mod tests {
                 assert!(probe.dropped.load(Ordering::SeqCst));
                 handle.session.ensure_provider_reentry_allowed().unwrap();
                 let durable = reopen(&handle).await.to_messages_for_current_path();
-                assert_eq!(tool_results(&durable), 1, "cleanup must persist the successful write");
+                assert_eq!(
+                    tool_results(&durable),
+                    1,
+                    "cleanup must persist the successful write"
+                );
                 assert_eq!(
                     std::fs::read_to_string(root.path().join("marker.txt")).unwrap(),
                     "real tool effect"
                 );
                 assert_eq!(
-                    handle.prompt("continue with a new turn", |_| {}).await.unwrap().stop_reason,
+                    handle
+                        .prompt("continue with a new turn", |_| {})
+                        .await
+                        .unwrap()
+                        .stop_reason,
                     StopReason::Stop
                 );
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
-                assert_eq!(tool_results(&reopen(&handle).await.to_messages_for_current_path()), 1);
+                assert_eq!(
+                    tool_results(&reopen(&handle).await.to_messages_for_current_path()),
+                    1
+                );
             }));
         }
     }
@@ -536,14 +574,24 @@ mod tests {
         let probe = Arc::new(Probe::default());
         let mut handle = handle(Arc::clone(&probe));
         runtime.block_on(bounded(async {
-            let error = handle.prompt_with_content(Vec::new(), |_| {}).await.unwrap_err();
+            let error = handle
+                .prompt_with_content(Vec::new(), |_| {})
+                .await
+                .unwrap_err();
             assert!(!error.is_session_persistence());
             let (abort, signal) = AbortHandle::new();
             abort.abort();
-            assert_native_abort(&handle.prompt_with_abort("not admitted", signal, |_| {}).await);
+            assert_native_abort(
+                &handle
+                    .prompt_with_abort("not admitted", signal, |_| {})
+                    .await,
+            );
             handle.session.ensure_provider_reentry_allowed().unwrap();
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(serde_json::to_value(handle.messages().await.unwrap()).unwrap(), Value::Array(vec![]));
+            assert_eq!(
+                serde_json::to_value(handle.messages().await.unwrap()).unwrap(),
+                Value::Array(vec![])
+            );
         }));
     }
 }

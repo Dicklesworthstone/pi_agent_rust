@@ -377,8 +377,7 @@ fn reflect_screens_question_and_memories_before_http_without_changing_stored_fac
             Some("STOP"),
         ),
     );
-    let tool =
-        reflection_tool(Arc::clone(&store), &server).with_secrets_settings(Some(&settings));
+    let tool = reflection_tool(Arc::clone(&store), &server).with_secrets_settings(Some(&settings));
     let output = block_on_local(tool.execute(
         "reflection-privacy",
         json!({"question": format!("parser api_key={OPAQUE}")}),
@@ -419,12 +418,9 @@ fn reflect_block_mode_rejects_secret_source_metadata_before_http() {
             extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
         },
     ));
-    let error = block_on_local(tool.execute(
-        "reflection-block",
-        json!({"question": "parser?"}),
-        None,
-    ))
-    .expect_err("configured block mode must refuse source secrets");
+    let error =
+        block_on_local(tool.execute("reflection-block", json!({"question": "parser?"}), None))
+            .expect_err("configured block mode must refuse source secrets");
     assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
     assert!(!error.to_string().contains("ACME-123456"));
     server.assert_no_request();

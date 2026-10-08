@@ -3001,7 +3001,8 @@ impl Agent {
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<()> {
-        if Self::secrets_transform_text(mime_type, vault, mode, extra, total, labels)? != mime_type {
+        if Self::secrets_transform_text(mime_type, vault, mode, extra, total, labels)? != mime_type
+        {
             return Err(Error::validation(
                 "PI_SECRET_MEDIA_MIME: media MIME type contains secret material and cannot be rewritten without changing transport; provide a nonsecret MIME type",
             ));
@@ -5483,10 +5484,7 @@ impl Agent {
     /// Capture the policy and remembered values for one compaction request.
     #[must_use]
     pub fn compaction_privacy(&self) -> compaction::CompactionPrivacy {
-        compaction::CompactionPrivacy::with_vault(
-            self.config.secrets.as_ref(),
-            &self.secrets_vault,
-        )
+        compaction::CompactionPrivacy::with_vault(self.config.secrets.as_ref(), &self.secrets_vault)
     }
 
     fn refresh_compaction_privacy(&self) {
@@ -9139,7 +9137,8 @@ mod extensions_integration_tests {
             &self,
             _context: &Context<'_>,
             _options: &StreamOptions,
-        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
             Err(Error::api(
                 "native privacy fixture only supports native compaction",
             ))
@@ -9256,7 +9255,8 @@ mod extensions_integration_tests {
                 assert!(rendered.contains("<pi-secret:redacted>"));
                 assert_eq!(captured["input"][1]["call_id"], "call-kept");
                 assert_eq!(captured["input"][1]["id"], "item-kept");
-                let arguments: Value = serde_json::from_str( // ubs:ignore[rust.parsing.serde-unwrap] -- Parsing provider-observed fixture arguments verifies preserved native wire syntax.
+                let arguments: Value = serde_json::from_str(
+                    // ubs:ignore[rust.parsing.serde-unwrap] -- Parsing provider-observed fixture arguments verifies preserved native wire syntax.
                     captured["input"][1]["arguments"]
                         .as_str()
                         .expect("JSON arguments stay encoded"),
@@ -9402,19 +9402,23 @@ mod extensions_integration_tests {
                     for secret in [known, discovered, "ACME-123456"] {
                         assert!(!visible.contains(secret)); // ubs:ignore[rust.panic.assert-macros] -- Both human summary and replayable native text must be screened.
                     }
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Cut-point IDs remain exact even when their spelling matches a pattern.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- Cut-point IDs remain exact even when their spelling matches a pattern.
                         result.get("firstKeptEntryId"),
                         Some(&json!("ACME-654321"))
                     );
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Native replay identifiers are immutable protocol metadata.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- Native replay identifiers are immutable protocol metadata.
                         result.pointer("/details/compactedWindow/0/id"),
                         Some(&json!("window-kept"))
                     );
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- The opaque replay payload must not be rewritten.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- The opaque replay payload must not be rewritten.
                         result.pointer("/details/compactedWindow/0/encrypted_content"),
                         Some(&json!("opaque-kept"))
                     );
-                    assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Request discoveries remain private to this compaction transaction.
+                    assert_eq!(
+                        // ubs:ignore[rust.panic.assert-macros] -- Request discoveries remain private to this compaction transaction.
                         session.agent.mask_secrets_text(discovered),
                         discovered
                     );
@@ -12086,9 +12090,8 @@ mod abort_tests {
                 .lock()
                 .unwrap()
                 .push_back(PendingIdleAction::CustomMessage(message));
-            let mut turn = Box::pin(
-                agent_session.run_pending_idle_actions_with_abort(None, Arc::new(|_| {})),
-            );
+            let mut turn =
+                Box::pin(agent_session.run_pending_idle_actions_with_abort(None, Arc::new(|_| {})));
             let reached_provider = futures::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
                 if provider.calls.load(Ordering::SeqCst) == 1 {
@@ -12110,7 +12113,10 @@ mod abort_tests {
             assert!(!active.load(Ordering::SeqCst));
             assert!(!streaming.load(Ordering::SeqCst));
             assert_eq!(agent_session.agent.system_prompt(), Some("base-system"));
-            assert_eq!(agent_session.input_source.as_str(), previous_source.as_str());
+            assert_eq!(
+                agent_session.input_source.as_str(),
+                previous_source.as_str()
+            );
 
             agent_session.extensions = None;
             let result = agent_session
@@ -14465,8 +14471,12 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
         authority: &ProviderTransitionAuthority,
     ) -> Result<Option<RestoredPrimary>> {
-        self.restore_primary_swap_admitted(cx, request, Some(ProviderSwapAdmission::Held(authority)))
-            .await
+        self.restore_primary_swap_admitted(
+            cx,
+            request,
+            Some(ProviderSwapAdmission::Held(authority)),
+        )
+        .await
     }
 
     async fn restore_primary_swap_admitted(
@@ -14788,7 +14798,8 @@ impl AgentSession {
                 cooldown_secs: attempt.cooldown_secs,
                 lifecycle_id: attempt.lifecycle_id,
             };
-            let (_, source) = self.commit_failover_swap_admitted(cx, &request, admission)
+            let (_, source) = self
+                .commit_failover_swap_admitted(cx, &request, admission)
                 .await?;
             return Ok(FailoverSwapOutcome {
                 next_position,
@@ -14918,7 +14929,10 @@ impl AgentSession {
         cx: &crate::agent_cx::AgentCx,
         request: &FailoverSwapRequest<'_>,
         admission: Option<ProviderSwapAdmission<'_>>,
-    ) -> Result<(crate::model::ThinkingLevel, Option<crate::failover::FailoverSource>)> {
+    ) -> Result<(
+        crate::model::ThinkingLevel,
+        Option<crate::failover::FailoverSource>,
+    )> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
@@ -16809,13 +16823,13 @@ impl AgentSession {
         let prepared = self.prepare_semantic_context_prompt()?;
         let existing = history.iter().rposition(|message| {
             matches!(message, Message::Custom(custom)
-                if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
-                    && custom.details.as_ref().is_some_and(|details| {
-                        details.get("schema").and_then(Value::as_str)
-                            == Some(SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1)
-                            && details.get("bundleRevision").and_then(Value::as_str)
-                                == Some(prepared.revision.as_str())
-                    }))
+            if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
+                && custom.details.as_ref().is_some_and(|details| {
+                    details.get("schema").and_then(Value::as_str)
+                        == Some(SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1)
+                        && details.get("bundleRevision").and_then(Value::as_str)
+                            == Some(prepared.revision.as_str())
+                }))
         });
         let timestamp = existing
             .and_then(|index| match &history[index] {
@@ -17026,8 +17040,7 @@ impl AgentSession {
         } = self
             .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
             .await;
-        let prompt_scope =
-            SessionTurnPromptGuard::new(self, system_prompt.or(base_system_prompt));
+        let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt.or(base_system_prompt));
         prompt_scope
             .session
             .run_agent_with_prompt_message(message, abort, on_event, custom_messages)
@@ -20200,7 +20213,8 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn semantic_context_continuation_preserves_bundle_across_provider_shapes_without_duplicate_entries() {
+    fn semantic_context_continuation_preserves_bundle_across_provider_shapes_without_duplicate_entries()
+     {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -20225,17 +20239,22 @@ mod tests {
                 agent_session.set_semantic_context_bundle(Some(
                     SemanticContextBundleInjection::enabled(bundle).with_prompt_budget(4, 2048),
                 ));
-                agent_session.run_text("first turn".to_string(), |_| {}).await.unwrap();
+                agent_session
+                    .run_text("first turn".to_string(), |_| {})
+                    .await
+                    .unwrap();
 
                 let semantic_entries = |stored: &Session| {
                     stored
                         .to_messages_for_current_path()
                         .into_iter()
-                        .filter(|message| matches!(
-                            message,
-                            Message::Custom(custom)
-                                if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
-                        ))
+                        .filter(|message| {
+                            matches!(
+                                message,
+                                Message::Custom(custom)
+                                    if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
+                            )
+                        })
                         .map(|message| serde_json::to_value(message).unwrap())
                         .collect::<Vec<_>>()
                 };
@@ -23828,15 +23847,18 @@ mod tests {
             };
             let reopened = Session::open(path.to_string_lossy().as_ref()).await?;
             self.observed_durable_completion.store(
-                reopened.to_messages_for_current_path().iter().any(|message| {
-                    matches!(
-                        message,
-                        Message::Assistant(assistant)
-                            if assistant.stop_reason == StopReason::Stop
-                                && assistant_text_content(&assistant.content)
-                                    == "durable doer completion"
-                    )
-                }),
+                reopened
+                    .to_messages_for_current_path()
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            Message::Assistant(assistant)
+                                if assistant.stop_reason == StopReason::Stop
+                                    && assistant_text_content(&assistant.content)
+                                        == "durable doer completion"
+                        )
+                    }),
                 Ordering::SeqCst,
             );
             if let Some(handle) = &self.abort_on_call {
@@ -23848,7 +23870,9 @@ mod tests {
 
     fn advisor_lifecycle_reply(stop_reason: StopReason) -> AssistantMessage {
         AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent::new("durable doer completion"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "durable doer completion",
+            ))],
             api: "test-api".to_string(),
             provider: "doer".to_string(),
             model: "doer-model".to_string(),
@@ -23880,8 +23904,7 @@ mod tests {
         Arc<AdvisorLifecycleDoer>,
         Arc<AdvisorLifecycleReview>,
     ) {
-        std::fs::write(root.join("fixture.txt"), "fixture content")
-            .expect("write read fixture"); // ubs:ignore[rust.panic.expect] -- Real read-tool execution establishes a substantial turn.
+        std::fs::write(root.join("fixture.txt"), "fixture content").expect("write read fixture"); // ubs:ignore[rust.panic.expect] -- Real read-tool execution establishes a substantial turn.
         let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
             root.join("sessions"),
         ))));
@@ -23951,7 +23974,9 @@ mod tests {
                 };
                 let result = match entrypoint {
                     "text" => {
-                        session.run_text("check the fixture".to_string(), on_event).await
+                        session
+                            .run_text("check the fixture".to_string(), on_event)
+                            .await
                     }
                     "content" => {
                         session
@@ -23982,10 +24007,20 @@ mod tests {
                 assert_eq!(result.stop_reason, StopReason::Stop, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- The primary result remains unchanged by optional review.
                 assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advice is queued for a later explicit turn.
                 assert_eq!(advisor.calls.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Nested wrappers must neither omit nor duplicate review.
-                assert!(advisor.observed_durable_completion.load(Ordering::SeqCst), "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Independent disk reopen at provider admission sees the completed doer reply.
+                assert!(
+                    advisor.observed_durable_completion.load(Ordering::SeqCst),
+                    "{entrypoint}"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Independent disk reopen at provider admission sees the completed doer reply.
                 assert_eq!(ends.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advisory work adds no extra agent terminal.
-                assert_eq!(session.agent.message_queue.steering.len(), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Exactly one generated concern awaits the next turn.
-                assert!(!session.extensions_turn_active.load(Ordering::SeqCst), "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Completion releases turn ownership on every path.
+                assert_eq!(
+                    session.agent.message_queue.steering.len(),
+                    1,
+                    "{entrypoint}"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Exactly one generated concern awaits the next turn.
+                assert!(
+                    !session.extensions_turn_active.load(Ordering::SeqCst),
+                    "{entrypoint}"
+                ); // ubs:ignore[rust.panic.assert-macros] -- Completion releases turn ownership on every path.
             }
         });
     }
@@ -24018,7 +24053,12 @@ mod tests {
                 .expect("provider terminal is returned"); // ubs:ignore[rust.panic.expect] -- The scripted failure is a completed Error terminal.
             assert_eq!(failed.stop_reason, StopReason::Error); // ubs:ignore[rust.panic.assert-macros] -- Review must be withheld for the failed first attempt.
             assert_eq!(advisor.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Substantial but failed work never starts review.
-            assert!(session.revert_incomplete_response().await.expect("revert failed tail")); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect] -- Retry restores the real incomplete assistant tail.
+            assert!(
+                session
+                    .revert_incomplete_response()
+                    .await
+                    .expect("revert failed tail")
+            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect] -- Retry restores the real incomplete assistant tail.
             let observed_tools = Arc::clone(&tool_starts);
             let recovered = session
                 .run_continue_with_abort(None, move |event| {
@@ -24051,11 +24091,7 @@ mod tests {
             );
             {
                 let cx = crate::agent_cx::AgentCx::for_request();
-                let mut inner = session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("seed tool work"); // ubs:ignore[rust.panic.expect] -- A completed tool cycle makes this digest nontrivial even at a zero cap.
+                let mut inner = session.session.lock(cx.cx()).await.expect("seed tool work"); // ubs:ignore[rust.panic.expect] -- A completed tool cycle makes this digest nontrivial even at a zero cap.
                 inner.append_model_message(user_message("check the fixture"));
                 inner.append_model_message(Message::assistant(advisor_lifecycle_tool_call()));
                 inner.append_model_message(Message::tool_result(ToolResultMessage {
@@ -24091,9 +24127,11 @@ mod tests {
             let reopened = Session::open(path.to_string_lossy().as_ref())
                 .await
                 .expect("reopen capped session"); // ubs:ignore[rust.panic.expect] -- Assert durable output rather than only the in-memory result.
-            assert!(reopened.to_messages_for_current_path().iter().any(|message| matches!( // ubs:ignore[rust.panic.assert-macros] -- The exact bounded terminal must survive reopen.
-                message, Message::Assistant(assistant) if time_cap_marker(assistant).is_some()
-            )));
+            assert!(reopened.to_messages_for_current_path().iter().any(
+                |message| matches!( // ubs:ignore[rust.panic.assert-macros] -- The exact bounded terminal must survive reopen.
+                    message, Message::Assistant(assistant) if time_cap_marker(assistant).is_some()
+                )
+            ));
             session.agent.config.max_time = None;
             session
                 .run_continue_with_abort(None, |_| {})
@@ -24239,7 +24277,9 @@ mod tests {
 
     #[test]
     fn advisor_hook_blocks_configured_and_remembered_secrets_before_provider_admission() {
-        let runtime = RuntimeBuilder::current_thread().build().expect("runtime build");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
         runtime.block_on(async {
             let advisor = Arc::new(ScriptedDoerProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -24271,8 +24311,9 @@ mod tests {
                 "API_KEY=r4nd0mCredentialValue123456".to_string(),
                 format!("echo {known}"),
             ] {
-                session.agent.replace_messages(vec![Message::Assistant(Arc::new(
-                    AssistantMessage {
+                session
+                    .agent
+                    .replace_messages(vec![Message::Assistant(Arc::new(AssistantMessage {
                         content: vec![ContentBlock::ToolCall(ToolCall {
                             id: "privacy-call".to_string(),
                             name: "bash".to_string(),
@@ -24280,22 +24321,24 @@ mod tests {
                             thought_signature: None,
                         })],
                         ..Default::default()
-                    },
-                ))]);
+                    }))]);
                 let original = serde_json::to_value(session.agent.messages()).unwrap();
                 session.maybe_advise_turn(None).await;
                 assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-                assert_eq!(serde_json::to_value(session.agent.messages()).unwrap(), original);
+                assert_eq!(
+                    serde_json::to_value(session.agent.messages()).unwrap(),
+                    original
+                );
                 assert!(!session.advisor.as_ref().unwrap().is_disabled());
             }
             // The zero-call assertions must not pass just because the hook is
             // disabled or globally paused: a clean substantial turn is admitted.
-            session.agent.replace_messages(vec![Message::Assistant(Arc::new(
-                AssistantMessage {
+            session
+                .agent
+                .replace_messages(vec![Message::Assistant(Arc::new(AssistantMessage {
                     content: vec![ContentBlock::Text(TextContent::new("x".repeat(500)))],
                     ..Default::default()
-                },
-            ))]);
+                }))]);
             session.maybe_advise_turn(None).await;
             assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });

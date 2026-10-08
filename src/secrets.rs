@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Result};
 
 mod structured;
-pub(crate) use structured::{discover_outbound_json, transform_assistant_replay_json};
 pub use structured::transform_outbound_json;
+pub(crate) use structured::{discover_outbound_json, transform_assistant_replay_json};
 
 /// Tool-result schema tag for secrets operations.
 pub const SECRETS_SCHEMA: &str = "pi.secrets.v1";

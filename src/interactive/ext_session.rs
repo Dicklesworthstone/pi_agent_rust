@@ -500,7 +500,11 @@ impl ExtensionSession for InteractiveExtensionSession {
             }
             _ => (normalized_provider, model_id.clone(), true),
         };
-        if changed || guard.active_failover_provenance_for_current_path().is_some() {
+        if changed
+            || guard
+                .active_failover_provenance_for_current_path()
+                .is_some()
+        {
             guard.append_model_change(stored_provider.clone(), stored_model_id.clone());
         }
         guard.set_model_header(Some(stored_provider), Some(stored_model_id), None);
@@ -1512,7 +1516,11 @@ mod tests {
                 .expect("explicit fallback selection");
             let path = {
                 let guard = session.try_lock().expect("session");
-                assert!(guard.active_failover_provenance_for_current_path().is_none());
+                assert!(
+                    guard
+                        .active_failover_provenance_for_current_path()
+                        .is_none()
+                );
                 assert_eq!(
                     guard
                         .entries_for_current_path()
@@ -1528,7 +1536,11 @@ mod tests {
             let saved = Session::open(path.to_str().expect("path"))
                 .await
                 .expect("reopen explicit selection");
-            assert!(saved.active_failover_provenance_for_current_path().is_none());
+            assert!(
+                saved
+                    .active_failover_provenance_for_current_path()
+                    .is_none()
+            );
             assert_eq!(
                 saved.effective_model_for_current_path(),
                 Some(("openai".to_string(), "fallback".to_string()))

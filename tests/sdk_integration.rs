@@ -360,7 +360,11 @@ fn sdk_run_limit_reaches_the_live_agent_and_persists_its_terminal_turn() {
                 "exactly one terminal event for {label}"
             );
             // ubs:ignore rust.panic.assert-macros -- Regression assertion: a terminal time cap must not enter provider retry.
-            assert!(events.iter().all(|event| event["type"] != "auto_retry_start"));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["type"] != "auto_retry_start")
+            );
             let path = handle
                 .with_session(|session| session.path.clone())
                 .await
@@ -385,7 +389,11 @@ fn sdk_run_limit_reaches_the_live_agent_and_persists_its_terminal_turn() {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(assistants.len(), 1, "one durable assistant result for {label}");
+            assert_eq!(
+                assistants.len(),
+                1,
+                "one durable assistant result for {label}"
+            );
             let text = assistants
                 .first()
                 .expect("one durable assistant result")

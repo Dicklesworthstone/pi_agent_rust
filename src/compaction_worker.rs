@@ -673,10 +673,11 @@ mod tests {
                 timestamp: Some(1),
             }];
             preparation.is_split_turn = true;
-            let privacy = CompactionPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
-                mode: Some("block".to_string()),
-                extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
-            }));
+            let privacy =
+                CompactionPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+                    mode: Some("block".to_string()),
+                    extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+                }));
             let gate = crate::agent::ProviderAdmissionGate::default();
             let cx = crate::agent_cx::AgentCx::for_request();
             let permit = gate.acquire(cx.cx()).await.expect("provider authority");

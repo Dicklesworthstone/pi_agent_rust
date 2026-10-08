@@ -360,11 +360,7 @@ struct ProjectedPathMessage {
 }
 
 impl ProjectedPathMessage {
-    const fn candidate(
-        content: UserContent,
-        entry_id: String,
-        parent_id: Option<String>,
-    ) -> Self {
+    const fn candidate(content: UserContent, entry_id: String, parent_id: Option<String>) -> Self {
         Self {
             disposition: RetryDisposition::Candidate,
             content: Some(content),

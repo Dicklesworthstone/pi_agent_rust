@@ -1996,7 +1996,11 @@ impl AgentSessionHandle {
         let Some(manager) = self.mcp_manager.clone() else {
             return 0;
         };
-        if !manager.list().iter().any(|server| server.name == server_name) {
+        if !manager
+            .list()
+            .iter()
+            .any(|server| server.name == server_name)
+        {
             return 0;
         }
         crate::mcp::reconcile_tools(&manager, &self.session.agent.shared_tools())
@@ -2026,7 +2030,11 @@ impl AgentSessionHandle {
     /// Returns the number of newly registered definitions. Called at the start
     /// of every prompt; cheap when nothing changed.
     pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
-        let Some(manager) = self.mcp_manager.clone().or_else(|| self.session.mcp_manager()) else {
+        let Some(manager) = self
+            .mcp_manager
+            .clone()
+            .or_else(|| self.session.mcp_manager())
+        else {
             return 0;
         };
         let Some(extensions) = self.extension_manager().cloned() else {
@@ -2942,7 +2950,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     cli.no_session = options.no_session;
     cli.provider = options.provider.clone();
     cli.model = options.model.clone();
-    cli.models = options.model_scope.as_ref().map(|patterns| patterns.join(","));
+    cli.models = options
+        .model_scope
+        .as_ref()
+        .map(|patterns| patterns.join(","));
     cli.api_key = options.api_key.clone();
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
@@ -3197,10 +3208,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
-    agent_session.advisor = options
-        .advisor
-        .as_ref()
-        .map(|options| options.runtime().with_secrets_settings(config.secrets.as_ref()));
+    agent_session.advisor = options.advisor.as_ref().map(|options| {
+        options
+            .runtime()
+            .with_secrets_settings(config.secrets.as_ref())
+    });
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent
@@ -4138,9 +4150,10 @@ mod tests {
         );
         let learned = "historicalValue482610";
         if mode == "obfuscate" {
-            let masked = agent // ubs:ignore[rust.ownership.unwrap-expect] -- Seed a secret through the real live-vault API.
-                .secrets_transform_outbound_text(&format!("API_KEY={learned}"))
-                .expect("learn earlier credential");
+            let masked =
+                agent // ubs:ignore[rust.ownership.unwrap-expect] -- Seed a secret through the real live-vault API.
+                    .secrets_transform_outbound_text(&format!("API_KEY={learned}"))
+                    .expect("learn earlier credential");
             assert!(!masked.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Fixture must learn the credential before its bare reuse.
         }
         let session = AgentSession::new(
@@ -4173,14 +4186,16 @@ mod tests {
                 .await
                 .expect("rewind");
             let stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original entries after context replacement.
-            assert!(stored.entries.iter().any(|entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
-                entry,
-                crate::session::SessionEntry::Message(entry)
-                    if matches!(&entry.message,
-                        crate::session::SessionMessage::User {
-                            content: crate::model::UserContent::Text(text), ..
-                        } if text == &raw)
-            )));
+            assert!(stored.entries.iter().any(
+                |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
+                    entry,
+                    crate::session::SessionEntry::Message(entry)
+                        if matches!(&entry.message,
+                            crate::session::SessionMessage::User {
+                                content: crate::model::UserContent::Text(text), ..
+                            } if text == &raw)
+                )
+            ));
             outcome
         });
         let requests = requests.lock().expect("recorded provider requests"); // ubs:ignore[rust.ownership.unwrap-expect] -- Observe what crossed the provider boundary.
@@ -4309,7 +4324,10 @@ mod tests {
             {
                 let mut guard = store.try_lock().expect("unchanged live session");
                 assert_eq!(guard.leaf_id(), original_leaf.as_deref());
-                assert_eq!(serde_json::to_value(&guard.entries).unwrap(), original_entries);
+                assert_eq!(
+                    serde_json::to_value(&guard.entries).unwrap(),
+                    original_entries
+                );
                 guard.path = Some(original_path.clone());
             }
             let blocked_prompt = run_async(handle.prompt_with_content(content, |_| {
@@ -4357,7 +4375,13 @@ mod tests {
             serde_json::to_value(handle.session.agent.messages()).unwrap(),
             before
         );
-        assert!(handle.session.provider_admission_gate().ensure_allowed().is_ok());
+        assert!(
+            handle
+                .session
+                .provider_admission_gate()
+                .ensure_allowed()
+                .is_ok()
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -4365,13 +4389,14 @@ mod tests {
     fn prepare_retry_waits_for_provider_before_session_locks_and_cancels_cleanly() {
         let (mut handle, calls) = flaky_handle(0);
         let store = handle.session_store();
-        let original = store
-            .try_lock()
-            .unwrap()
-            .append_message(crate::session::SessionMessage::User {
-                content: UserContent::Text("original input".to_string()),
-                timestamp: Some(0),
-            });
+        let original =
+            store
+                .try_lock()
+                .unwrap()
+                .append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("original input".to_string()),
+                    timestamp: Some(0),
+                });
         let provider_gate = handle.session.provider_admission_gate();
         let action_gate = handle.session.session_action_admission_gate();
         run_async(async {
@@ -6125,25 +6150,28 @@ export default function init(pi) {
     #[test]
     fn empty_default_tool_registry_disables_configured_builtins() {
         let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
-        let config: Config = serde_json::from_value(serde_json::json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture settings must deserialize.
-            "askPolicy": "recommended",
-            "memory": {"backend": "local"},
-            "media": {
-                "enableInspectImage": true,
-                "enableReadMedia": true,
-                "enableGenerateImage": true,
-                "enableTts": true
-            },
-            "computer": {"enableComputer": true},
-            "browser": {"enableBrowser": true}
-        }))
+        let config: Config = serde_json::from_value(
+            serde_json::json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture settings must deserialize.
+                "askPolicy": "recommended",
+                "memory": {"backend": "local"},
+                "media": {
+                    "enableInspectImage": true,
+                    "enableReadMedia": true,
+                    "enableGenerateImage": true,
+                    "enableTts": true
+                },
+                "computer": {"enableComputer": true},
+                "browser": {"enableBrowser": true}
+            }),
+        )
         .expect("configured builtins");
         let registry = default_tool_registry(&[], tmp.path(), &config);
         assert!(registry.tools().is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
 
         // The host still owns its configured picker, even with no model tools.
         let picker = registry.host_ask_tool();
-        let output = run_async(crate::tools::Tool::execute( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture host picker must execute.
+        let output = run_async(crate::tools::Tool::execute(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture host picker must execute.
             &picker,
             "host-picker",
             serde_json::json!({
@@ -6157,7 +6185,8 @@ export default function init(pi) {
         ))
         .expect("configured host picker remains usable");
         assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
             output
                 .details
                 .as_ref()
@@ -6171,7 +6200,8 @@ export default function init(pi) {
     fn sdk_no_builtins_keeps_explicit_extension_tools_executable() {
         let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
         let extension_path = tmp.path().join("kept_custom.js");
-        std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be written.
+        std::fs::write(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be written.
             &extension_path,
             r#"
 export default function init(pi) {
@@ -6275,7 +6305,8 @@ export default function init(pi) {
             drop(enabled);
 
             let extension_path = tmp.path().join("disabled-plan-probe.mjs");
-            std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- Install an explicit extension fixture to exercise live registry publication.
+            std::fs::write(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Install an explicit extension fixture to exercise live registry publication.
                 &extension_path,
                 r#"export default function (pi) {
   pi.registerTool({
@@ -6319,11 +6350,13 @@ export default function init(pi) {
                 .with_session(|session| session.entries.clone())
                 .await
                 .expect("read restored journal");
-            assert!(entries_before.iter().any(|entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- The reopened conversation must retain its real saved checkpoint.
-                entry,
-                crate::session::SessionEntry::Custom(custom)
-                    if custom.custom_type == "plan_checkpoint"
-            )));
+            assert!(entries_before.iter().any(
+                |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- The reopened conversation must retain its real saved checkpoint.
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "plan_checkpoint"
+                )
+            ));
             let journal_before = serde_json::to_value(&entries_before) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture history must serialize for exact comparison.
                 .expect("serialize journal before rejection");
             let disk_before = std::fs::read(&path).expect("read saved checkpoint"); // ubs:ignore[rust.ownership.unwrap-expect] -- The durable fixture must remain readable.
@@ -6339,7 +6372,8 @@ export default function init(pi) {
                 assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- A rejected control cannot activate planning.
                 assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- A rejected restore cannot install the saved proposal.
                 assert!(!disabled.has_tool("submit_plan")); // ubs:ignore[rust.panic.assert-macros] -- Rejected controls cannot mount a built-in.
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection must preserve every currently mounted extension.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection must preserve every currently mounted extension.
                     shared
                         .snapshot()
                         .tools()
@@ -6348,7 +6382,8 @@ export default function init(pi) {
                         .collect::<Vec<_>>(),
                     names_before,
                 );
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection cannot install or remove prompt context.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection cannot install or remove prompt context.
                     disabled.session().agent.system_prompt(),
                     prompt_before.as_deref(),
                 );
@@ -6358,7 +6393,8 @@ export default function init(pi) {
                     .expect("read journal after rejection")
                     .expect("serialize journal after rejection");
                 assert_eq!(journal_after, journal_before); // ubs:ignore[rust.panic.assert-macros] -- Rejection must not append a plan transition or checkpoint.
-                assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Rejection must leave durable checkpoint bytes unchanged.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection must leave durable checkpoint bytes unchanged.
                     std::fs::read(&path).expect("reread saved checkpoint"), // ubs:ignore[rust.ownership.unwrap-expect] -- Read the same durable fixture after the rejected operation.
                     disk_before,
                 );

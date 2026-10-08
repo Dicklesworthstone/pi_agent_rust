@@ -13,8 +13,8 @@ use pi::compaction::{
     semantic_compaction_quality_report_to_jsonl, semantic_compaction_quality_report_to_value,
 };
 use pi::model::{
-    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, ThinkingContent,
-    ToolCall, Usage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent,
+    ThinkingContent, ToolCall, Usage, UserContent, UserMessage,
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::{
@@ -1221,14 +1221,8 @@ fn compaction_screens_secrets_assembled_from_adjacent_text_blocks_before_dispatc
                     // Only the second request contains the assembled secret.
                     prep.turn_prefix_messages = vec![message];
                     let original = pi::compaction::compaction_preparation_to_value(&prep);
-                    let result = compact(
-                        prep.clone(),
-                        provider.clone(),
-                        "auth-kept",
-                        None,
-                        &privacy,
-                    )
-                    .await;
+                    let result =
+                        compact(prep.clone(), provider.clone(), "auth-kept", None, &privacy).await;
                     if mode == "block" {
                         let error = result.expect_err("assembled secret must block both requests");
                         assert!(error.to_string().contains("PI_SECRET_BLOCK"));

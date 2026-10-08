@@ -49,8 +49,8 @@ impl PyKernel {
         // Own process group so shutdown kills kernel-spawned children too
         // (session-end tree discipline, bd-cv653.1.4 acceptance #5).
         crate::tools::isolate_command_process_group(&mut command);
-        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
-            .map_err(|err| {
+        let child =
+            crate::tools::spawn_command_with_job_discipline(&mut command).map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     Error::tool(
                         "eval",
@@ -681,9 +681,7 @@ mod tests {
                 let mut system = sysinfo::System::new();
                 system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
                 if system.process(pid).is_none_or(|process| {
-                    index != 0
-                        && cfg!(unix)
-                        && process.status() == sysinfo::ProcessStatus::Zombie
+                    index != 0 && cfg!(unix) && process.status() == sysinfo::ProcessStatus::Zombie
                 }) {
                     break;
                 }

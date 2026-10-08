@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{LspInput, LspTool, MAX_PAYLOAD_BYTES, Result, ToolOutput, resolve_tool_path, text_output, tool_err};
+use super::{
+    LspInput, LspTool, MAX_PAYLOAD_BYTES, Result, ToolOutput, resolve_tool_path, text_output,
+    tool_err,
+};
 use crate::agent_cx::AgentCx;
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
@@ -16,7 +19,10 @@ fn checkpoint(owner: &AgentCx) -> Result<()> {
         .checkpoint()
         .map_err(|_| tool_err("LSP_CANCELLED", "project diagnostics cancelled"))?;
     if !owner.capabilities().io {
-        return Err(tool_err("LSP_IO_PERMISSION", "project diagnostics requires filesystem I/O"));
+        return Err(tool_err(
+            "LSP_IO_PERMISSION",
+            "project diagnostics requires filesystem I/O",
+        ));
     }
     Ok(())
 }
@@ -42,19 +48,37 @@ fn validate_input(input: &LspInput) -> Result<&str> {
         || input.completion_id.is_some()
         || input.snippet_values.is_some()
     {
-        return Err(tool_err("LSP_USAGE", "project_diagnostics accepts only file, timeout and limit"));
+        return Err(tool_err(
+            "LSP_USAGE",
+            "project_diagnostics accepts only file, timeout and limit",
+        ));
     }
     if input.limit == Some(0) {
-        return Err(tool_err("LSP_USAGE", "project diagnostic display limit must be positive"));
+        return Err(tool_err(
+            "LSP_USAGE",
+            "project diagnostic display limit must be positive",
+        ));
     }
     input
         .file
         .as_deref()
-        .filter(|file| !file.is_empty() && file.len() <= 4096 && !file.chars().any(char::is_control))
-        .ok_or_else(|| tool_err("LSP_USAGE", "project_diagnostics requires a bounded anchor file path"))
+        .filter(|file| {
+            !file.is_empty() && file.len() <= 4096 && !file.chars().any(char::is_control)
+        })
+        .ok_or_else(|| {
+            tool_err(
+                "LSP_USAGE",
+                "project_diagnostics requires a bounded anchor file path",
+            )
+        })
 }
 
-fn render_report(server: &str, root: &Path, reports: Vec<Value>, limit: usize) -> Result<ToolOutput> {
+fn render_report(
+    server: &str,
+    root: &Path,
+    reports: Vec<Value>,
+    limit: usize,
+) -> Result<ToolOutput> {
     let total_documents = reports.len();
     let mut total_diagnostics = 0_usize;
     let mut errors = 0_usize;
@@ -84,7 +108,12 @@ fn render_report(server: &str, root: &Path, reports: Vec<Value>, limit: usize) -
     // or a diagnostic halfway through, nor silently change a count to zero.
     let mut remaining = MAX_PAYLOAD_BYTES
         .checked_sub(payload.to_string().len().saturating_add(128))
-        .ok_or_else(|| tool_err("LSP_OUTPUT_LIMIT", "project diagnostic metadata exceeds the output budget"))?;
+        .ok_or_else(|| {
+            tool_err(
+                "LSP_OUTPUT_LIMIT",
+                "project diagnostic metadata exceeds the output budget",
+            )
+        })?;
     let mut retained = Vec::new();
     for report in reports.into_iter().take(limit) {
         let bytes = report.to_string().len().saturating_add(1);
@@ -101,7 +130,10 @@ fn render_report(server: &str, root: &Path, reports: Vec<Value>, limit: usize) -
     payload["reports"] = Value::Array(retained);
     let text = payload.to_string();
     if text.len() > MAX_PAYLOAD_BYTES {
-        return Err(tool_err("LSP_OUTPUT_LIMIT", "project diagnostic result exceeds the output budget"));
+        return Err(tool_err(
+            "LSP_OUTPUT_LIMIT",
+            "project diagnostic result exceeds the output budget",
+        ));
     }
     Ok(text_output(text, payload))
 }
@@ -123,7 +155,10 @@ impl LspTool {
             // The anchor selects the server; it is not opened as a document.
             // In particular, a glob or nonexistent anchor must not spawn one.
             if !std::fs::metadata(&path)?.is_file() {
-                return Err(tool_err("LSP_FILE_UNREADABLE", "project diagnostic anchor must be a regular file"));
+                return Err(tool_err(
+                    "LSP_FILE_UNREADABLE",
+                    "project diagnostic anchor must be a regular file",
+                ));
             }
             checkpoint(&owner)?;
             if started.elapsed() >= timeout {
@@ -218,7 +253,8 @@ while True:
                 "command":python,"args":["-u","-c",SERVER,mode,root.display().to_string()],
                 "languages":["plaintext"],"extensions":[".piproject"],"rootMarkers":[]
             }}
-        }})).unwrap();
+        }}))
+        .unwrap();
         Some(LspTool::new(root, Some(&config)))
     }
 
@@ -228,10 +264,18 @@ while True:
         let Some(tool) = tool(temp.path(), "full") else {
             return;
         };
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let output = runtime.block_on(tool.execute("project-test", json!({
-            "action":"project_diagnostics","file":"anchor.piproject","timeout":5
-        }), None)).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "project-test",
+                json!({
+                    "action":"project_diagnostics","file":"anchor.piproject","timeout":5
+                }),
+                None,
+            ))
+            .unwrap();
         assert!(!output.is_error);
         let details = output.details.unwrap();
         assert_eq!(details["totalDocuments"], 2);
@@ -242,14 +286,35 @@ while True:
         assert_eq!(details["complete"], true);
         assert_eq!(details["truncated"], false);
         assert_eq!(details["cachedOnly"], false);
-        assert!(details["reports"][0]["uri"].as_str().unwrap().contains("never-opened"));
+        assert!(
+            details["reports"][0]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("never-opened")
+        );
         assert!(!temp.path().join("never-opened.piproject").exists());
-        let entry = runtime.block_on(tool.client_for(&temp.path().join("anchor.piproject"))).unwrap();
-        let frames = runtime.block_on(entry.client.call("test/frames", json!({}), Duration::from_secs(5))).unwrap();
+        let entry = runtime
+            .block_on(tool.client_for(&temp.path().join("anchor.piproject")))
+            .unwrap();
+        let frames = runtime
+            .block_on(
+                entry
+                    .client
+                    .call("test/frames", json!({}), Duration::from_secs(5)),
+            )
+            .unwrap();
         let frames = frames.as_array().unwrap();
-        assert_eq!(frames.iter().filter(|frame| frame["method"] == "workspace/diagnostic").count(), 1);
-        assert!(!frames.iter().any(|frame| matches!(frame["method"].as_str(),
-            Some("textDocument/didOpen" | "textDocument/didChange" | "textDocument/diagnostic"))));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "workspace/diagnostic")
+                .count(),
+            1
+        );
+        assert!(!frames.iter().any(|frame| matches!(
+            frame["method"].as_str(),
+            Some("textDocument/didOpen" | "textDocument/didChange" | "textDocument/diagnostic")
+        )));
         assert_eq!(entry.client.open_document_count(), 0);
     }
 
@@ -259,10 +324,18 @@ while True:
         let Some(tool) = tool(temp.path(), "full") else {
             return;
         };
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let output = runtime.block_on(tool.execute("project-test", json!({
-            "action":"project_diagnostics","file":"anchor.piproject","timeout":5,"limit":1
-        }), None)).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "project-test",
+                json!({
+                    "action":"project_diagnostics","file":"anchor.piproject","timeout":5,"limit":1
+                }),
+                None,
+            ))
+            .unwrap();
         let details = output.details.unwrap();
         assert_eq!(details["responseComplete"], true);
         assert_eq!(details["complete"], false);
@@ -284,10 +357,18 @@ while True:
             let Some(tool) = tool(temp.path(), mode) else {
                 return;
             };
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-            let error = runtime.block_on(tool.execute("project-test", json!({
-                "action":"project_diagnostics","file":"anchor.piproject","timeout":5
-            }), None)).unwrap_err();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(tool.execute(
+                    "project-test",
+                    json!({
+                        "action":"project_diagnostics","file":"anchor.piproject","timeout":5
+                    }),
+                    None,
+                ))
+                .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
     }
@@ -298,10 +379,18 @@ while True:
         let Some(tool) = tool(temp.path(), "empty") else {
             return;
         };
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let output = runtime.block_on(tool.execute("project-test", json!({
-            "action":"project_diagnostics","file":"anchor.piproject","timeout":5
-        }), None)).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "project-test",
+                json!({
+                    "action":"project_diagnostics","file":"anchor.piproject","timeout":5
+                }),
+                None,
+            ))
+            .unwrap();
         let details = output.details.unwrap();
         assert_eq!(details["complete"], true);
         assert_eq!(details["responseComplete"], true);
@@ -330,12 +419,27 @@ while True:
         let Some(tool) = tool(temp.path(), "full") else {
             return;
         };
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        for extra in [json!({"limit":0}), json!({"query":"other"}), json!({"symbol":"other"}),
-            json!({"apply":false}), json!({"after":"a.rs"}), json!({"payload":{}})] {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for extra in [
+            json!({"limit":0}),
+            json!({"query":"other"}),
+            json!({"symbol":"other"}),
+            json!({"apply":false}),
+            json!({"after":"a.rs"}),
+            json!({"payload":{}}),
+        ] {
             let mut input = json!({"action":"project_diagnostics","file":"anchor.piproject"});
-            input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            assert!(runtime.block_on(tool.execute("project-test", input, None)).is_err());
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                runtime
+                    .block_on(tool.execute("project-test", input, None))
+                    .is_err()
+            );
             assert!(tool.registry.status().is_empty());
         }
     }

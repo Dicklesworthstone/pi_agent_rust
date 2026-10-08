@@ -3446,7 +3446,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        if question.len().saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
+        if question
+            .len()
+            .saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
             > pi::text_completion::MAX_INPUT_BYTES
         {
             self.status_message = Some(

@@ -379,9 +379,7 @@ struct SummaryFields<'a> {
 }
 
 fn compaction_privacy_limit() -> Error {
-    Error::validation(
-        "PI_COMPACTION_INPUT_LIMIT: input exceeds the compaction privacy scan budget",
-    )
+    Error::validation("PI_COMPACTION_INPUT_LIMIT: input exceeds the compaction privacy scan budget")
 }
 
 fn compaction_text_budget(text: &str, bytes: &mut usize, count: &mut usize) -> Result<()> {
@@ -454,13 +452,12 @@ impl<'a> SummaryFields<'a> {
                         .then(|| part.get("text").and_then(Value::as_str))
                         .flatten()
                     });
-                    let separator = if object.get("role").and_then(Value::as_str)
-                        == Some("assistant")
-                    {
-                        "\n"
-                    } else {
-                        ""
-                    };
+                    let separator =
+                        if object.get("role").and_then(Value::as_str) == Some("assistant") {
+                            "\n"
+                        } else {
+                            ""
+                        };
                     let mut bytes = 0usize;
                     let mut count = 0usize;
                     for text in texts.clone() {
@@ -2287,10 +2284,7 @@ fn summary_prompt_text(
     prompt_text
 }
 
-fn turn_prefix_prompt_text(
-    messages: &[SessionMessage],
-    prompts: &SummaryPrompts,
-) -> String {
+fn turn_prefix_prompt_text(messages: &[SessionMessage], prompts: &SummaryPrompts) -> String {
     let llm_messages = messages
         .iter()
         .filter_map(session_message_to_model)
@@ -2633,7 +2627,8 @@ pub async fn summarize_entries(
         &prompts,
         &mut privacy,
     )?;
-    let mut summary = generate_llm_summary(&preparation.settings, provider, api_key, requests).await?;
+    let mut summary =
+        generate_llm_summary(&preparation.settings, provider, api_key, requests).await?;
     let mut fields = SummaryFields::default();
     fields.text(&mut summary)?;
     fields.screen(&mut privacy)?;
@@ -2806,7 +2801,9 @@ pub async fn compact(
         &mut privacy,
     )?;
     let snap_transcript = requests.snap_transcript.take();
-    let summary = match generate_llm_summary(&preparation.settings, provider, api_key, requests).await {
+    let summary = match generate_llm_summary(&preparation.settings, provider, api_key, requests)
+        .await
+    {
         Ok(summary) => summary,
         Err(error) => {
             // An oversized session makes the summarization prompt itself

@@ -56,8 +56,12 @@ impl ProviderFixture {
                     }
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let (headers, request) = read_request(&mut stream, deadline);
                 let model = request["model"].as_str().unwrap().to_string();
                 captured.lock().unwrap().push((headers, request));
@@ -91,7 +95,10 @@ impl ProviderFixture {
                         "id": "acp-completion",
                         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                     });
-                    ("text/event-stream", format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n"))
+                    (
+                        "text/event-stream",
+                        format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+                    )
                 } else {
                     ("application/json", json!({"error": {
                         "message": "PRIVATE-PROMPT PRIVATE-CREDENTIAL",
@@ -105,12 +112,21 @@ impl ProviderFixture {
                 stream.flush().unwrap();
             }
         });
-        Self { url, requests, stopped, worker: Some(worker) }
+        Self {
+            url,
+            requests,
+            stopped,
+            worker: Some(worker),
+        }
     }
 
     fn finish(&mut self, expected: usize) -> Vec<(String, Value)> {
         self.stopped.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().expect("provider fixture completed");
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("provider fixture completed");
         let requests = self.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), expected, "exact provider admission count");
         requests
@@ -135,21 +151,40 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> (String, Value) {
         match stream.read(&mut buffer) {
             Ok(0) => panic!("provider request ended early"),
             Ok(read) => bytes.extend_from_slice(&buffer[..read]),
-            Err(error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(error) => panic!("provider request read: {error}"),
         }
         assert!(bytes.len() <= LIMIT, "bounded provider request");
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let headers = std::str::from_utf8(&bytes[..end]).unwrap();
-            let length = headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            }).expect("content-length");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("content-length");
             assert!(end + 4 + length <= LIMIT);
             if bytes.len() >= end + 4 + length {
-                assert!(headers.lines().next().unwrap().contains("/chat/completions"));
-                return (headers.to_string(), serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap());
+                assert!(
+                    headers
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains("/chat/completions")
+                );
+                return (
+                    headers.to_string(),
+                    serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
+                );
             }
         }
     }
@@ -158,7 +193,8 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> (String, Value) {
 fn runtime() -> asupersync::runtime::Runtime {
     RuntimeBuilder::current_thread()
         .with_reactor(create_reactor().expect("reactor"))
-        .build().expect("runtime")
+        .build()
+        .expect("runtime")
 }
 
 fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpOptions {
@@ -167,12 +203,17 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
         entry.model.provider = provider.to_string();
         entry.model.api = "openai-completions".to_string();
         entry.model.base_url = url.to_string();
-        entry.model.input = vec![crate::provider::InputType::Text, crate::provider::InputType::Image];
+        entry.model.input = vec![
+            crate::provider::InputType::Text,
+            crate::provider::InputType::Image,
+        ];
         entry.model.reasoning = reasoning;
         entry.model.context_window = if reasoning { 128_000 } else { 32_000 };
         entry.model.max_tokens = max_tokens;
         entry.api_key = Some(format!("{model}-fixture-key"));
-        entry.headers.insert("x-acp-model".to_string(), model.to_string());
+        entry
+            .headers
+            .insert("x-acp-model".to_string(), model.to_string());
         entry
     };
     let models = vec![
@@ -186,15 +227,20 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
             default_model: Some(PRIMARY_MODEL.to_string()),
             default_thinking_level: Some("high".to_string()),
             compaction: Some(crate::config::CompactionSettings {
-                enabled: Some(false), ..crate::config::CompactionSettings::default()
+                enabled: Some(false),
+                ..crate::config::CompactionSettings::default()
             }),
             retry: Some(crate::config::RetrySettings {
-                enabled: Some(true), max_retries: Some(retries),
-                base_delay_ms: Some(0), max_delay_ms: Some(0),
+                enabled: Some(true),
+                max_retries: Some(retries),
+                base_delay_ms: Some(0),
+                max_delay_ms: Some(0),
                 fallback_chains: Some(HashMap::from([(
-                    "default".to_string(), vec![format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}")]
+                    "default".to_string(),
+                    vec![format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}")],
                 )])),
-                failover_cooldown_secs: Some(0), max_failovers_per_turn: Some(2),
+                failover_cooldown_secs: Some(0),
+                max_failovers_per_turn: Some(2),
             }),
             ..Config::default()
         },
@@ -209,7 +255,8 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
 }
 
 fn new_state(root: &Path, options: &AcpOptions) -> (String, Arc<Mutex<AcpSessionState>>) {
-    let (id, state) = handle_session_new(&json!({"cwd": root, "mcpServers": []}), options, None).unwrap();
+    let (id, state) =
+        handle_session_new(&json!({"cwd": root, "mcpServers": []}), options, None).unwrap();
     (id, Arc::new(Mutex::new(state)))
 }
 
@@ -221,40 +268,79 @@ fn native_content() -> Vec<ContentBlock> {
     vec![
         ContentBlock::Text(TextContent::new("  compare\n")),
         ContentBlock::Media(MediaContent {
-            data: "YQ==".to_string(), mime_type: "audio/wav".to_string(), name: Some("voice.wav".to_string()),
+            data: "YQ==".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("voice.wav".to_string()),
         }),
-        ContentBlock::Image(ImageContent { data: PNG.to_string(), mime_type: "image/png".to_string() }),
+        ContentBlock::Image(ImageContent {
+            data: PNG.to_string(),
+            mime_type: "image/png".to_string(),
+        }),
         ContentBlock::Text(TextContent::new("this frame")),
     ]
 }
 
 async fn prompt(
-    state: &Arc<Mutex<AcpSessionState>>, id: &str, content: Vec<ContentBlock>, signal: AbortSignal,
+    state: &Arc<Mutex<AcpSessionState>>,
+    id: &str,
+    content: Vec<ContentBlock>,
+    signal: AbortSignal,
 ) -> (&'static str, Vec<Value>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(128);
-    let reason = run_prompt(Arc::clone(state), content, None, signal, tx.clone(), id.to_string(),
-        AgentCx::for_current_or_request()).await;
+    let reason = run_prompt(
+        Arc::clone(state),
+        content,
+        None,
+        signal,
+        tx.clone(),
+        id.to_string(),
+        AgentCx::for_current_or_request(),
+    )
+    .await;
     // Mirror the dispatcher: the response must follow recovery notices,
     // committed selection updates and the session's final persistence step.
-    tx.send(json_rpc_ok(json!(7), json!({"stopReason": reason}))).unwrap();
-    (reason, rx.try_iter().map(|line| serde_json::from_str(&line).unwrap()).collect())
+    tx.send(json_rpc_ok(json!(7), json!({"stopReason": reason})))
+        .unwrap();
+    (
+        reason,
+        rx.try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect(),
+    )
 }
 
 fn events(state: &Arc<Mutex<AcpSessionState>>) -> Arc<StdMutex<Vec<AgentEvent>>> {
     let recorded = Arc::new(StdMutex::new(Vec::new()));
     let captured = Arc::clone(&recorded);
-    state.try_lock().unwrap().agent_session.as_ref().unwrap().subscribe(move |event| {
-        captured.lock().unwrap().push(event);
-    });
+    state
+        .try_lock()
+        .unwrap()
+        .agent_session
+        .as_ref()
+        .unwrap()
+        .subscribe(move |event| {
+            captured.lock().unwrap().push(event);
+        });
     recorded
 }
 
 fn session_store(state: &Arc<Mutex<AcpSessionState>>) -> Arc<Mutex<Session>> {
-    state.try_lock().unwrap().agent_session.as_ref().unwrap().session_store()
+    state
+        .try_lock()
+        .unwrap()
+        .agent_session
+        .as_ref()
+        .unwrap()
+        .session_store()
 }
 
 async fn reopen(state: &Arc<Mutex<AcpSessionState>>) -> Session {
-    let path = session_store(state).try_lock().unwrap().path.clone().expect("durable session path");
+    let path = session_store(state)
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .expect("durable session path");
     Session::open(path.to_str().unwrap()).await.unwrap()
 }
 
@@ -266,13 +352,21 @@ fn assert_no_private_diagnostics(updates: &[Value]) {
 }
 
 fn configuration_updates(updates: &[Value]) -> Vec<&Value> {
-    updates.iter().filter(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
-        .map(|update| &update["params"]["update"]["configOptions"]).collect()
+    updates
+        .iter()
+        .filter(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
+        .map(|update| &update["params"]["update"]["configOptions"])
+        .collect()
 }
 
 fn user_content(request: &Value) -> &Value {
-    &request["messages"].as_array().unwrap().iter().rev()
-        .find(|message| message["role"] == "user").unwrap()["content"]
+    &request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
 }
 
 async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
@@ -286,7 +380,11 @@ fn launch_prompt_and_no_tools_controls_reach_the_actual_provider_request() {
     use clap::Parser as _;
 
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("CLAUDE.md"), "EXCLUDED-ACP-PROJECT-CONTEXT").unwrap();
+    std::fs::write(
+        root.path().join("CLAUDE.md"),
+        "EXCLUDED-ACP-PROJECT-CONTEXT",
+    )
+    .unwrap();
     std::fs::write(
         root.path().join(".cursorrules"),
         "EXCLUDED-ACP-FOREIGN-CONTEXT",
@@ -420,7 +518,10 @@ fn launch_selected_tools_reach_the_live_registry_without_terminal_host_tools() {
                 .contains("INCLUDED-ACP-SKILLS")
         );
         for excluded in ["bash", "write", "edit", "ask", "todo", "submit_plan"] {
-            assert!(!names.contains(&excluded), "unexpected ACP tool: {excluded}");
+            assert!(
+                !names.contains(&excluded),
+                "unexpected ACP tool: {excluded}"
+            );
         }
     }));
 }
@@ -749,7 +850,12 @@ fn launch_scope_uses_the_requested_workspace_and_preserves_scoped_effort() {
     let project = tempfile::tempdir().unwrap();
     let runtime = runtime();
     runtime.block_on(async {
-        let mut options = options(root.path(), "https://acp-scope.invalid/v1", runtime.handle(), 0);
+        let mut options = options(
+            root.path(),
+            "https://acp-scope.invalid/v1",
+            runtime.handle(),
+            0,
+        );
         options.config.enabled_models = Some(vec![format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}")]);
         options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
             path: project.path().display().to_string(),
@@ -761,7 +867,10 @@ fn launch_scope_uses_the_requested_workspace_and_preserves_scoped_effort() {
         let guard = state.try_lock().unwrap();
         let agent = &guard.agent_session.as_ref().unwrap().session().agent;
         assert_eq!(agent.provider().model_id(), PRIMARY_MODEL);
-        assert_eq!(agent.stream_options().thinking_level, Some(crate::model::ThinkingLevel::Low));
+        assert_eq!(
+            agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Low)
+        );
     });
 }
 
@@ -770,11 +879,18 @@ fn invalid_launch_selection_and_missing_credentials_fail_before_a_session_is_ins
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime();
     runtime.block_on(async {
-        let mut options = options(root.path(), "https://acp-errors.invalid/v1", runtime.handle(), 0);
+        let mut options = options(
+            root.path(),
+            "https://acp-errors.invalid/v1",
+            runtime.handle(),
+            0,
+        );
         options.launch.provider = Some("unknown-acp-provider".to_string());
         options.launch.model = Some("missing-model".to_string());
         let params = json!({"cwd": root.path(), "mcpServers": []});
-        let error = handle_session_new(&params, &options, None).err().expect("reject unknown explicit model");
+        let error = handle_session_new(&params, &options, None)
+            .err()
+            .expect("reject unknown explicit model");
         assert!(error.to_string().contains("not found"));
         options.launch.provider = Some(PRIMARY_PROVIDER.to_string());
         options.launch.model = Some(PRIMARY_MODEL.to_string());
@@ -790,10 +906,15 @@ fn invalid_launch_selection_and_missing_credentials_fail_before_a_session_is_ins
         options.auth = AuthStorage::empty_at(root.path().join("unreadable-auth"));
         std::fs::create_dir(root.path().join("unreadable-auth")).unwrap();
         options.launch.api_key = Some(" \t ".to_string());
-        let error = handle_session_new(&params, &options, None).err().expect("blank override supplies no credential");
+        let error = handle_session_new(&params, &options, None)
+            .err()
+            .expect("blank override supplies no credential");
         assert!(error.to_string().contains("No API key found"));
         options.launch.api_key = Some("explicit-fixture-key".to_string());
-        assert!(handle_session_new(&params, &options, None).is_ok(), "explicit key does not read the unavailable store");
+        assert!(
+            handle_session_new(&params, &options, None).is_ok(),
+            "explicit key does not read the unavailable store"
+        );
     });
 }
 
@@ -802,14 +923,22 @@ fn reopening_preserves_the_selected_branch_over_conflicting_launch_options() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime();
     runtime.block_on(async {
-        let mut options = options(root.path(), "https://acp-restore.invalid/v1", runtime.handle(), 0);
+        let mut options = options(
+            root.path(),
+            "https://acp-restore.invalid/v1",
+            runtime.handle(),
+            0,
+        );
         options.launch = AcpLaunchOptions {
-            provider: Some(FALLBACK_PROVIDER.to_string()), model: Some(FALLBACK_MODEL.to_string()),
-            thinking: Some("high".to_string()), api_key: Some("restart-fixture-key".to_string()),
+            provider: Some(FALLBACK_PROVIDER.to_string()),
+            model: Some(FALLBACK_MODEL.to_string()),
+            thinking: Some("high".to_string()),
+            api_key: Some("restart-fixture-key".to_string()),
             models: None,
             ..AcpLaunchOptions::default()
         };
-        let (mut saved, _) = new_acp_session(options.session_dir.as_ref(), &options.config, root.path());
+        let (mut saved, _) =
+            new_acp_session(options.session_dir.as_ref(), &options.config, root.path());
         saved.append_model_change(PRIMARY_PROVIDER.to_string(), PRIMARY_MODEL.to_string());
         saved.append_thinking_level_change("low".to_string());
         let selected = saved.leaf_id.clone().unwrap();
@@ -821,14 +950,33 @@ fn reopening_preserves_the_selected_branch_over_conflicting_launch_options() {
         let before = std::fs::read(&path).unwrap();
         let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
         let expected_id = reopened.header.id.clone();
-        let (id, state) = build_acp_session(reopened, true, root.path().to_path_buf(), &options, None).unwrap();
+        let (id, state) =
+            build_acp_session(reopened, true, root.path().to_path_buf(), &options, None).unwrap();
         assert_eq!(id, expected_id);
         let handle = state.agent_session.as_ref().unwrap();
         assert_eq!(handle.session().agent.provider().model_id(), PRIMARY_MODEL);
-        assert_eq!(handle.session().agent.stream_options().thinking_level, Some(crate::model::ThinkingLevel::Low));
-        assert_eq!(handle.session().agent.stream_options().api_key.as_deref(), Some("restart-fixture-key"));
-        assert_eq!(handle.session_store().try_lock().unwrap().leaf_id.as_deref(), Some(selected.as_str()));
-        assert_eq!(std::fs::read(&path).unwrap(), before, "opening a branch sends no provider request or disk write");
+        assert_eq!(
+            handle.session().agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Low)
+        );
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("restart-fixture-key")
+        );
+        assert_eq!(
+            handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .leaf_id
+                .as_deref(),
+            Some(selected.as_str())
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "opening a branch sends no provider request or disk write"
+        );
     });
 }
 
@@ -837,28 +985,67 @@ fn selected_ad_hoc_model_remains_registered_for_runtime_switching() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime();
     runtime.block_on(async {
-        let mut options = options(root.path(), "https://acp-ad-hoc.invalid/v1", runtime.handle(), 0);
+        let mut options = options(
+            root.path(),
+            "https://acp-ad-hoc.invalid/v1",
+            runtime.handle(),
+            0,
+        );
         options.launch.provider = Some("openai".to_string());
         options.launch.model = Some("editor-ad-hoc-model".to_string());
         options.launch.api_key = Some("ad-hoc-fixture-key".to_string());
         let (_, state) = new_state(root.path(), &options);
-        assert!(state.try_lock().unwrap().agent_session.as_ref().unwrap().session()
-            .model_registry().unwrap().find("openai", "editor-ad-hoc-model").is_some());
+        assert!(
+            state
+                .try_lock()
+                .unwrap()
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .session()
+                .model_registry()
+                .unwrap()
+                .find("openai", "editor-ad-hoc-model")
+                .is_some()
+        );
         let cx = AgentCx::for_current_or_request();
         // Both wire shapes resolve through the same path as their dispatchers,
         // including the registry lookup before the durable model transition.
-        apply_set_model_request(&state, &json!({ "provider": FALLBACK_PROVIDER, "model": FALLBACK_MODEL }), &cx).await.unwrap();
+        apply_set_model_request(
+            &state,
+            &json!({ "provider": FALLBACK_PROVIDER, "model": FALLBACK_MODEL }),
+            &cx,
+        )
+        .await
+        .unwrap();
         {
             let guard = state.try_lock().unwrap();
             let config = config_options_for(&guard).unwrap();
-            assert!(config[0]["options"].as_array().unwrap().iter().any(|entry| {
-                entry["value"] == "openai/editor-ad-hoc-model"
-            }));
+            assert!(
+                config[0]["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry["value"] == "openai/editor-ad-hoc-model" })
+            );
         }
-        apply_set_model_request(&state, &json!({ "model": "openai/editor-ad-hoc-model" }), &cx).await.unwrap();
+        apply_set_model_request(
+            &state,
+            &json!({ "model": "openai/editor-ad-hoc-model" }),
+            &cx,
+        )
+        .await
+        .unwrap();
         let saved = reopen(&state).await;
-        assert_eq!(saved.effective_model_for_current_path(), Some(("openai".to_string(), "editor-ad-hoc-model".to_string())));
-        assert!(!std::fs::read_to_string(saved.path.unwrap()).unwrap().contains("ad-hoc-fixture-key"));
+        assert_eq!(
+            saved.effective_model_for_current_path(),
+            Some(("openai".to_string(), "editor-ad-hoc-model".to_string()))
+        );
+        assert!(
+            !std::fs::read_to_string(saved.path.unwrap())
+                .unwrap()
+                .contains("ad-hoc-fixture-key")
+        );
     });
 }
 
@@ -867,12 +1054,19 @@ fn startup_refresh_failures_only_block_the_selected_provider_without_an_override
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime();
     runtime.block_on(async {
-        let mut options = options(root.path(), "https://acp-refresh.invalid/v1", runtime.handle(), 0);
+        let mut options = options(
+            root.path(),
+            "https://acp-refresh.invalid/v1",
+            runtime.handle(),
+            0,
+        );
         let params = json!({"cwd": root.path(), "mcpServers": []});
         options.oauth_refresh_failures = vec![FALLBACK_PROVIDER.to_string()];
         assert!(handle_session_new(&params, &options, None).is_ok());
         options.oauth_refresh_failures = vec![PRIMARY_PROVIDER.to_uppercase()];
-        let error = handle_session_new(&params, &options, None).err().expect("selected refresh failed");
+        let error = handle_session_new(&params, &options, None)
+            .err()
+            .expect("selected refresh failed");
         assert!(error.to_string().contains("OAuth token refresh failed"));
         options.launch.provider = Some(PRIMARY_PROVIDER.to_string());
         options.launch.model = Some(PRIMARY_MODEL.to_string());
@@ -891,19 +1085,44 @@ fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
         options.config.default_provider = Some(FALLBACK_PROVIDER.to_string());
         options.config.default_model = Some(FALLBACK_MODEL.to_string());
         options.launch = AcpLaunchOptions {
-            provider: Some(PRIMARY_PROVIDER.to_string()), model: Some(PRIMARY_MODEL.to_string()),
-            thinking: Some("high".to_string()), api_key: Some("  pinned-launch-key  ".to_string()),
+            provider: Some(PRIMARY_PROVIDER.to_string()),
+            model: Some(PRIMARY_MODEL.to_string()),
+            thinking: Some("high".to_string()),
+            api_key: Some("  pinned-launch-key  ".to_string()),
             models: None,
             ..AcpLaunchOptions::default()
         };
-        options.auth.set(PRIMARY_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-primary-key".to_string() });
-        options.auth.set(FALLBACK_PROVIDER, crate::auth::AuthCredential::ApiKey { key: "stored-fallback-key".to_string() });
+        options.auth.set(
+            PRIMARY_PROVIDER,
+            crate::auth::AuthCredential::ApiKey {
+                key: "stored-primary-key".to_string(),
+            },
+        );
+        options.auth.set(
+            FALLBACK_PROVIDER,
+            crate::auth::AuthCredential::ApiKey {
+                key: "stored-fallback-key".to_string(),
+            },
+        );
         let (id, state) = new_state(root.path(), &options);
         let (_, signal) = AbortHandle::new();
-        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
-        apply_set_model(&state, PRIMARY_PROVIDER, PRIMARY_MODEL, &AgentCx::for_current_or_request()).await.unwrap();
+        assert_eq!(
+            prompt(&state, &id, text(), signal).await.0,
+            ACP_STOP_REASON_END_TURN
+        );
+        apply_set_model(
+            &state,
+            PRIMARY_PROVIDER,
+            PRIMARY_MODEL,
+            &AgentCx::for_current_or_request(),
+        )
+        .await
+        .unwrap();
         let (_, signal) = AbortHandle::new();
-        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
+        assert_eq!(
+            prompt(&state, &id, text(), signal).await.0,
+            ACP_STOP_REASON_END_TURN
+        );
         let saved = reopen(&state).await;
         let durable = std::fs::read_to_string(saved.path.unwrap()).unwrap();
         assert!(!durable.contains("pinned-launch-key"));
@@ -911,12 +1130,18 @@ fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
         assert!(!durable.contains("stored-fallback-key"));
     });
     let requests = server.finish(4);
-    assert_eq!(requests.iter().map(|(_, body)| body["model"].as_str().unwrap()).collect::<Vec<_>>(),
-        [PRIMARY_MODEL, PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|(_, body)| body["model"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [PRIMARY_MODEL, PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]
+    );
     for (headers, body) in requests {
         assert!(headers.lines().any(|line| {
             line.split_once(':').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer pinned-launch-key"
+                name.eq_ignore_ascii_case("authorization")
+                    && value.trim() == "Bearer pinned-launch-key"
             })
         }));
         let model = body["model"].as_str().unwrap();
@@ -940,27 +1165,73 @@ fn configured_acp_retry_preserves_ordered_native_input_and_one_durable_turn() {
         let (reason, updates) = prompt(&state, &id, input.clone(), signal).await;
         assert_eq!(reason, ACP_STOP_REASON_END_TURN);
         assert_eq!(updates.last().unwrap()["result"]["stopReason"], "end_turn");
-        assert!(updates.iter().any(|update| update["params"]["update"]["content"]["text"]
-            .as_str().is_some_and(|text| text.contains("attempt 1/1"))));
-        assert!(configuration_updates(&updates).is_empty(), "same-model retry does not alter selectors");
+        assert!(updates.iter().any(|update| {
+            update["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("attempt 1/1"))
+        }));
+        assert!(
+            configuration_updates(&updates).is_empty(),
+            "same-model retry does not alter selectors"
+        );
         assert_no_private_diagnostics(&updates);
         let saved = reopen(&state).await;
         let messages = saved.to_messages_for_current_path();
-        let users = messages.iter().filter_map(|message| match message { Message::User(user) => Some(user), _ => None }).collect::<Vec<_>>();
+        let users = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(users.len(), 1, "retry must not append the input twice");
-        assert_eq!(serde_json::to_value(&users[0].content).unwrap(), serde_json::to_value(UserContent::Blocks(input)).unwrap());
+        assert_eq!(
+            serde_json::to_value(&users[0].content).unwrap(),
+            serde_json::to_value(UserContent::Blocks(input)).unwrap()
+        );
         let observed = observed.lock().unwrap();
-        assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::AgentStart { .. })).count(), 1);
-        assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::AgentEnd { error: None, .. })).count(), 1);
-        assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::AutoRetryStart { .. })).count(), 1);
-        assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::AutoRetryEnd { success: true, .. })).count(), 1);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AgentStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AgentEnd { error: None, .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AutoRetryStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AutoRetryEnd { success: true, .. }))
+                .count(),
+            1
+        );
     });
     let requests = server.finish(2);
     assert_eq!(requests[0].1["model"], PRIMARY_MODEL);
     assert_eq!(requests[1].1["model"], PRIMARY_MODEL);
     assert_eq!(user_content(&requests[0].1), user_content(&requests[1].1));
-    assert!(serde_json::to_string(user_content(&requests[0].1)).unwrap().contains(PNG));
-    assert!(requests.iter().all(|(headers, _)| headers.contains("editor-primary-fixture-key") && headers.contains("x-acp-model: editor-primary")));
+    assert!(
+        serde_json::to_string(user_content(&requests[0].1))
+            .unwrap()
+            .contains(PNG)
+    );
+    assert!(requests.iter().all(
+        |(headers, _)| headers.contains("editor-primary-fixture-key")
+            && headers.contains("x-acp-model: editor-primary")
+    ));
 }
 
 #[test]
@@ -976,20 +1247,54 @@ fn configured_acp_failover_and_reopen_restore_the_primary_and_editor_selectors()
         let (reason, updates) = prompt(&state, &id, native_content(), signal).await;
         assert_eq!(reason, ACP_STOP_REASON_END_TURN);
         let selected = configuration_updates(&updates);
-        assert_eq!(selected.len(), 1, "a committed fallback publishes one complete selection");
-        assert_eq!(selected[0][0]["currentValue"], format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}"));
+        assert_eq!(
+            selected.len(),
+            1,
+            "a committed fallback publishes one complete selection"
+        );
+        assert_eq!(
+            selected[0][0]["currentValue"],
+            format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}")
+        );
         assert_eq!(selected[0][1]["currentValue"], "off");
         assert_eq!(selected[0][0]["options"].as_array().unwrap().len(), 2);
         assert_no_private_diagnostics(&updates);
         {
             let observed = observed.lock().unwrap();
-            assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::FailoverStart { .. })).count(), 1);
-            assert_eq!(observed.iter().filter(|event| matches!(event, AgentEvent::FailoverEnd { restored_primary: false, success: true, .. })).count(), 1);
-            assert!(matches!(observed.last(), Some(AgentEvent::AgentEnd { error: None, .. })));
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::FailoverStart { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentEvent::FailoverEnd {
+                            restored_primary: false,
+                            success: true,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                observed.last(),
+                Some(AgentEvent::AgentEnd { error: None, .. })
+            ));
         }
         let saved = reopen(&state).await;
-        assert!(saved.active_failover_provenance_for_current_path().is_some());
-        let (restored_id, restored) = build_acp_session(saved, true, root.path().to_path_buf(), &options, None).unwrap();
+        assert!(
+            saved
+                .active_failover_provenance_for_current_path()
+                .is_some()
+        );
+        let (restored_id, restored) =
+            build_acp_session(saved, true, root.path().to_path_buf(), &options, None).unwrap();
         assert_eq!(restored_id, id);
         let restored = Arc::new(Mutex::new(restored));
         let (_, signal) = AbortHandle::new();
@@ -997,17 +1302,39 @@ fn configured_acp_failover_and_reopen_restore_the_primary_and_editor_selectors()
         assert_eq!(reason, ACP_STOP_REASON_END_TURN);
         let selected = configuration_updates(&updates);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0][0]["currentValue"], format!("{PRIMARY_PROVIDER}/{PRIMARY_MODEL}"));
+        assert_eq!(
+            selected[0][0]["currentValue"],
+            format!("{PRIMARY_PROVIDER}/{PRIMARY_MODEL}")
+        );
         assert_eq!(selected[0][1]["currentValue"], "high");
-        assert!(updates.iter().any(|update| update["params"]["update"]["content"]["text"]
-            .as_str().is_some_and(|text| text.contains("Restored primary provider"))));
+        assert!(updates.iter().any(|update| {
+            update["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Restored primary provider"))
+        }));
         let saved = reopen(&restored).await;
-        assert!(saved.active_failover_provenance_for_current_path().is_none());
-        assert_eq!(saved.to_messages_for_current_path().iter().filter(|message| matches!(message, Message::User(_))).count(), 2);
+        assert!(
+            saved
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
+        assert_eq!(
+            saved
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| matches!(message, Message::User(_)))
+                .count(),
+            2
+        );
     });
     let requests = server.finish(3);
-    assert_eq!(requests.iter().map(|(_, body)| body["model"].as_str().unwrap()).collect::<Vec<_>>(),
-        [PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|(_, body)| body["model"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]
+    );
     assert_eq!(user_content(&requests[0].1), user_content(&requests[1].1));
     for (index, expected) in [(0, 2_048_u64), (1, 512), (2, 2_048)] {
         let body = &requests[index].1;
@@ -1031,14 +1358,33 @@ fn configured_acp_explicitly_choosing_the_fallback_ends_automatic_restoration() 
         let options = options(root.path(), &server.url, runtime.handle(), 0);
         let (id, state) = new_state(root.path(), &options);
         let (_, signal) = AbortHandle::new();
-        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
-        apply_set_model(&state, FALLBACK_PROVIDER, FALLBACK_MODEL, &AgentCx::for_current_or_request()).await.unwrap();
-        assert!(reopen(&state).await.active_failover_provenance_for_current_path().is_none());
+        assert_eq!(
+            prompt(&state, &id, text(), signal).await.0,
+            ACP_STOP_REASON_END_TURN
+        );
+        apply_set_model(
+            &state,
+            FALLBACK_PROVIDER,
+            FALLBACK_MODEL,
+            &AgentCx::for_current_or_request(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopen(&state)
+                .await
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
         let (_, signal) = AbortHandle::new();
         let (reason, updates) = prompt(&state, &id, text(), signal).await;
         assert_eq!(reason, ACP_STOP_REASON_END_TURN);
         assert!(configuration_updates(&updates).is_empty());
-        assert!(!serde_json::to_string(&updates).unwrap().contains("Restored primary"));
+        assert!(
+            !serde_json::to_string(&updates)
+                .unwrap()
+                .contains("Restored primary")
+        );
     });
     let requests = server.finish(3);
     assert_eq!(requests[2].1["model"], FALLBACK_MODEL);
@@ -1081,20 +1427,23 @@ fn configured_acp_abort_during_retry_keeps_the_handle_reusable_without_reentry()
         let (abort, signal) = AbortHandle::new();
         let retry_started = Arc::new(AtomicBool::new(false));
         let observed_retry = Arc::clone(&retry_started);
-        state.try_lock().unwrap().agent_session.as_ref().unwrap().subscribe(move |event| {
-            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
-                observed_retry.store(true, Ordering::SeqCst);
-            }
-        });
+        state
+            .try_lock()
+            .unwrap()
+            .agent_session
+            .as_ref()
+            .unwrap()
+            .subscribe(move |event| {
+                if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                    observed_retry.store(true, Ordering::SeqCst);
+                }
+            });
         let mut abort_after_pending = false;
         let pending = prompt(&state, &id, text(), signal);
         let mut pending = std::pin::pin!(pending);
         let (reason, updates) = std::future::poll_fn(|cx| {
             let result = pending.as_mut().poll(cx);
-            if result.is_pending()
-                && retry_started.load(Ordering::SeqCst)
-                && !abort_after_pending
-            {
+            if result.is_pending() && retry_started.load(Ordering::SeqCst) && !abort_after_pending {
                 // AutoRetryStart is synchronous. Only cancel after the turn
                 // has yielded in its delay, so this covers pending backoff
                 // cancellation without relying on a wall-clock sleep race.
@@ -1105,13 +1454,19 @@ fn configured_acp_abort_during_retry_keeps_the_handle_reusable_without_reentry()
             result
         })
         .await;
-        assert!(abort_after_pending, "the retry delay yielded before cancellation");
+        assert!(
+            abort_after_pending,
+            "the retry delay yielded before cancellation"
+        );
         assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
         assert_eq!(server.requests.lock().unwrap().len(), 1);
         assert!(!serde_json::to_string(&updates).unwrap().contains("Error:"));
         assert!(state.try_lock().unwrap().agent_session.is_some());
         let (_, signal) = AbortHandle::new();
-        assert_eq!(prompt(&state, &id, text(), signal).await.0, ACP_STOP_REASON_END_TURN);
+        assert_eq!(
+            prompt(&state, &id, text(), signal).await.0,
+            ACP_STOP_REASON_END_TURN
+        );
     });
     server.finish(2);
 }
@@ -1140,12 +1495,26 @@ fn configured_acp_retry_save_failure_blocks_all_later_provider_work() {
         });
         let (reason, updates) = prompt(&state, &id, native_content(), AbortHandle::new().1).await;
         assert_eq!(reason, ACP_STOP_REASON_ERROR);
-        assert!(serde_json::to_string(&updates).unwrap().contains("Session persistence failed"));
+        assert!(
+            serde_json::to_string(&updates)
+                .unwrap()
+                .contains("Session persistence failed")
+        );
         stored.try_lock().unwrap().path = original.lock().unwrap().clone();
-        let before = serde_json::to_value(stored.try_lock().unwrap().to_messages_for_current_path()).unwrap();
+        let before =
+            serde_json::to_value(stored.try_lock().unwrap().to_messages_for_current_path())
+                .unwrap();
         let (_, updates) = prompt(&state, &id, text(), AbortHandle::new().1).await;
-        assert!(serde_json::to_string(&updates).unwrap().contains("Session persistence failed"));
-        assert_eq!(before, serde_json::to_value(stored.try_lock().unwrap().to_messages_for_current_path()).unwrap());
+        assert!(
+            serde_json::to_string(&updates)
+                .unwrap()
+                .contains("Session persistence failed")
+        );
+        assert_eq!(
+            before,
+            serde_json::to_value(stored.try_lock().unwrap().to_messages_for_current_path())
+                .unwrap()
+        );
         assert_no_private_diagnostics(&updates);
     });
     server.finish(2);

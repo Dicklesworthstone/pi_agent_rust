@@ -396,11 +396,14 @@ fn borrowed_handle_native_prompt_preserves_order_through_provider_and_session() 
         .iter()
         .find(|message| message["role"] == "user")
         .expect("native user request");
-    assert_eq!(user["content"], json!([
-        {"type": "text", "text": "  inspect\n"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
-        {"type": "text", "text": "\ntrailing context  "}
-    ]));
+    assert_eq!(
+        user["content"],
+        json!([
+            {"type": "text", "text": "  inspect\n"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+            {"type": "text", "text": "\ntrailing context  "}
+        ])
+    );
 }
 
 #[test]

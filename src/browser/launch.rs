@@ -621,7 +621,10 @@ mod tests {
         while !std::fs::read_to_string(profile.join("ack"))
             .is_ok_and(|text| text.trim() == "browser-running")
         {
-            assert!(browser.running().unwrap(), "the browser lost its owning Job");
+            assert!(
+                browser.running().unwrap(),
+                "the browser lost its owning Job"
+            );
             assert!(
                 Instant::now() < deadline,
                 "browser did not acknowledge the probe"

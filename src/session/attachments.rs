@@ -175,8 +175,7 @@ struct BlobDirectory {
 impl BlobDirectory {
     fn open(session_path: &Path, create: bool) -> Result<Self> {
         let path = sidecar_path(session_path);
-        let handle =
-            session_store_v2::open_private_directory(&path, create).map_err(blob_error)?;
+        let handle = session_store_v2::open_private_directory(&path, create).map_err(blob_error)?;
         let identity = FileIdentity::of_open_file(&handle).map_err(blob_error)?;
         let directory = Self {
             path,
@@ -249,8 +248,7 @@ impl BlobDirectory {
         // Atomic no-replace publication never overwrites an existing digest.
         // A failed save can retain a staging file, but never publishes a ref to
         // it, and never truncates the authoritative session or an older blob.
-        session_store_v2::rename_regular_file_no_replace(&staging, &path)
-            .map_err(blob_error)?;
+        session_store_v2::rename_regular_file_no_replace(&staging, &path).map_err(blob_error)?;
         super::sync_parent_dir(&path).map_err(blob_error)?;
         if self.read(reference)? != bytes {
             return Err(blob_error("published attachment has different content"));
@@ -656,8 +654,14 @@ mod tests {
         assert_eq!(fs::read(&blobs(&path)[0]).expect("blob bytes"), bytes);
 
         let wire = wire_entries(&path);
-        assert_eq!(wire[0]["message"]["content"][0]["data"]["encoding"], "base64");
-        assert_eq!(wire[0]["message"]["content"][1]["data"]["encoding"], "base64NoPad");
+        assert_eq!(
+            wire[0]["message"]["content"][0]["data"]["encoding"],
+            "base64"
+        );
+        assert_eq!(
+            wire[0]["message"]["content"][1]["data"]["encoding"],
+            "base64NoPad"
+        );
         assert!(fs::metadata(&path).expect("metadata").len() < 4096);
         assert!(!fs::read_to_string(&path).expect("JSONL").contains(&padded));
 
@@ -672,7 +676,9 @@ mod tests {
         let reloaded = open(&path).expect("reopen rewritten JSONL");
         assert_eq!(serde_json::to_value(&reloaded.entries).unwrap(), original);
         assert!(reloaded.to_messages().iter().any(|message| {
-            serde_json::to_string(message).expect("provider message").contains(&unpadded)
+            serde_json::to_string(message)
+                .expect("provider message")
+                .contains(&unpadded)
         }));
     }
 
@@ -700,8 +706,11 @@ mod tests {
         let mut forked = session_at(&forked_path);
         forked.init_from_fork_plan(parent.plan_fork_from_user_message(&fork_target).unwrap());
         save(&mut forked);
-        fs::rename(sidecar_path(&path), directory.path().join("parent-blobs-offline"))
-            .expect("make parent attachments unavailable");
+        fs::rename(
+            sidecar_path(&path),
+            directory.path().join("parent-blobs-offline"),
+        )
+        .expect("make parent attachments unavailable");
 
         assert_attachment_error(open(&path).expect_err("parent must fail"), ERROR_PREFIX);
         let copy = open(&copied_path).expect("copy owns attachments");
@@ -740,9 +749,12 @@ mod tests {
                 thought_signature: None,
             }),
         ]));
-        session.append_custom_entry("opaque".to_string(), Some(json!({
-            "type":"media", "data":{"$piBlob":"../../private"}
-        })));
+        session.append_custom_entry(
+            "opaque".to_string(),
+            Some(json!({
+                "type":"media", "data":{"$piBlob":"../../private"}
+            })),
+        );
         save(&mut session);
         assert!(!sidecar_path(&path).exists());
         let loaded = open(&path).expect("legacy and opaque data remain valid");
@@ -824,9 +836,8 @@ mod tests {
                 "duplicate",
             );
         }
-        let duplicate_content = format!(
-            r#"{entry_prefix}{{"role":"user","content":{content},"content":"hidden"}}}}"#
-        );
+        let duplicate_content =
+            format!(r#"{entry_prefix}{{"role":"user","content":{content},"content":"hidden"}}}}"#);
         let duplicate_message = format!(
             r#"{entry_prefix}{original_message},"message":{{"role":"user","content":"hidden"}}}}"#
         );
@@ -1015,7 +1026,12 @@ mod tests {
                 ERROR_PREFIX,
             );
             assert_eq!(fs::read(&path).unwrap(), source);
-            assert!(fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+            assert!(
+                fs::symlink_metadata(&target)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
     }
 
@@ -1027,7 +1043,9 @@ mod tests {
         for index in 0..=crate::session::PARALLEL_THRESHOLD {
             session.append_message(text_message(&format!("text {index}")));
         }
-        session.append_message(message(vec![image(STANDARD.encode(vec![0x72; INLINE_BYTES + 2]))]));
+        session.append_message(message(vec![image(
+            STANDARD.encode(vec![0x72; INLINE_BYTES + 2]),
+        )]));
         save(&mut session);
         let blob = blobs(&path).pop().unwrap();
         fs::rename(&blob, directory.path().join("missing-blob")).unwrap();
@@ -1064,13 +1082,28 @@ mod tests {
                 crate::session::open_jsonl_blocking(&link).expect("resolve target sidecar");
             assert!(diagnostics.skipped_entries.is_empty());
             assert_eq!(opened.entries.len(), text_count + 1);
-            assert_eq!(opened.path.as_ref(), Some(&fs::canonicalize(&target).unwrap()));
-            assert!(serde_json::to_string(&opened.entries).unwrap().contains(&data));
+            assert_eq!(
+                opened.path.as_ref(),
+                Some(&fs::canonicalize(&target).unwrap())
+            );
+            assert!(
+                serde_json::to_string(&opened.entries)
+                    .unwrap()
+                    .contains(&data)
+            );
             opened.header.provider = Some("updated-through-target".to_string());
             opened.header_dirty = true;
             save(&mut opened);
-            assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
-            assert_eq!(fs::read(&shadow_file).unwrap(), b"untrusted alias attachment");
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read(&shadow_file).unwrap(),
+                b"untrusted alias attachment"
+            );
             assert_eq!(open(&link).unwrap().entries.len(), text_count + 1);
         }
     }
@@ -1080,9 +1113,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("branches.jsonl");
         let mut session = session_at(&path);
-        let root = session.append_message(message(vec![image(
-            STANDARD.encode(vec![0x31; INLINE_BYTES + 2]),
-        )]));
+        let root =
+            session.append_message(message(vec![image(
+                STANDARD.encode(vec![0x31; INLINE_BYTES + 2]),
+            )]));
         let active = session.append_message(text_message("active branch"));
         assert!(session.navigate_to(&root));
         let hidden = session.append_message(message(vec![media(
@@ -1142,14 +1176,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("warm.jsonl");
         let mut session = session_at(&path);
-        session.append_message(message(vec![image(STANDARD.encode(vec![0x51; INLINE_BYTES + 2]))]));
+        session.append_message(message(vec![image(
+            STANDARD.encode(vec![0x51; INLINE_BYTES + 2]),
+        )]));
         save(&mut session);
         let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
         assert!(
             open(&path).unwrap().v2_sidecar_root.is_some(),
             "exercise healthy V2 resume first"
         );
-        let before = store.read_all_entries().unwrap()[0].payload.get().to_string();
+        let before = store.read_all_entries().unwrap()[0]
+            .payload
+            .get()
+            .to_string();
         let blob = blobs(&path).pop().unwrap();
         let parked = directory.path().join("offline");
         fs::rename(&blob, &parked).unwrap();
@@ -1166,7 +1205,11 @@ mod tests {
         let opened = open(&path).expect("changed source invalidates old cache");
         assert_eq!(opened.header.id, replacement.header.id);
         assert!(opened.v2_sidecar_root.is_none());
-        assert!(!serde_json::to_string(&opened.entries).unwrap().contains("$piBlob"));
+        assert!(
+            !serde_json::to_string(&opened.entries)
+                .unwrap()
+                .contains("$piBlob")
+        );
     }
 
     #[test]
@@ -1174,11 +1217,18 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("listing.jsonl");
         let mut session = session_at(&path);
-        session.append_message(message(vec![image(STANDARD.encode(vec![0x65; INLINE_BYTES + 2]))]));
+        session.append_message(message(vec![image(
+            STANDARD.encode(vec![0x65; INLINE_BYTES + 2]),
+        )]));
         save(&mut session);
         let blob = blobs(&path).pop().unwrap();
         fs::rename(&blob, directory.path().join("unavailable")).unwrap();
-        assert_eq!(crate::session::load_session_meta_jsonl(&path).unwrap().message_count, 1);
+        assert_eq!(
+            crate::session::load_session_meta_jsonl(&path)
+                .unwrap()
+                .message_count,
+            1
+        );
         assert_attachment_error(
             open(&path).expect_err("listing is not attachment validation"),
             "missing",

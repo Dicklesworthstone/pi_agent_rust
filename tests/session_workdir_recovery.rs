@@ -5,8 +5,8 @@ use std::path::Path;
 
 use pi::session::Session;
 use pi::session_workdir::{
-    WORKDIR_BINDING_TYPE, attach_session_workdir, check_session_workdir,
-    inspect_session_workdir, require_session_workdir,
+    WORKDIR_BINDING_TYPE, attach_session_workdir, check_session_workdir, inspect_session_workdir,
+    require_session_workdir,
 };
 
 fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -37,15 +37,23 @@ async fn round_trip(root: &Path, extension: &str) {
     session.save().await.expect("save attachment");
     drop(session);
 
-    let mut reopened = Session::open(path.to_str().expect("UTF-8 path")).await.expect("reopen");
+    let mut reopened = Session::open(path.to_str().expect("UTF-8 path"))
+        .await
+        .expect("reopen");
     check_session_workdir(&reopened, &replacement).expect("binding survives persistence");
     assert_eq!(reopened.header.id, original_id);
     assert_eq!(reopened.header.parent_session, original_parent);
-    assert_eq!(reopened.header.cwd, original.to_str().expect("UTF-8 original"));
+    assert_eq!(
+        reopened.header.cwd,
+        original.to_str().expect("UTF-8 original")
+    );
     assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
     let state = inspect_session_workdir(&reopened).expect("inspect");
     assert_eq!(state.original_cwd, original);
-    assert_eq!(state.bound_cwd, replacement.canonicalize().expect("canonical replacement"));
+    assert_eq!(
+        state.bound_cwd,
+        replacement.canonicalize().expect("canonical replacement")
+    );
     assert!(!attach_session_workdir(&mut reopened, &replacement).expect("idempotent attach"));
     assert_eq!(reopened.entries.iter().filter(|entry| matches!(
         entry,

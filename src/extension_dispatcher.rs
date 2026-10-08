@@ -5222,8 +5222,7 @@ mod tests {
             let directory = tempfile::tempdir().expect("fixture directory");
             let holder_dir = directory.path().join("holder");
             std::fs::create_dir(&holder_dir).expect("descendant directory");
-            std::fs::write(directory.path().join("exec-fixture.role"), b"root")
-                .expect("root role");
+            std::fs::write(directory.path().join("exec-fixture.role"), b"root").expect("root role");
             std::fs::write(holder_dir.join("exec-fixture.role"), b"holder")
                 .expect("descendant role");
             let resource = std::fs::OpenOptions::new()

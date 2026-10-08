@@ -140,7 +140,11 @@ pub(super) fn close_pending(pending: &PendingMap, alive: &AtomicBool, error: &Tr
 }
 
 impl QueuedWriter {
-    fn channel(alive: Arc<AtomicBool>, capacity: usize, byte_limit: usize) -> (Self, FrameReceiver) {
+    fn channel(
+        alive: Arc<AtomicBool>,
+        capacity: usize,
+        byte_limit: usize,
+    ) -> (Self, FrameReceiver) {
         let queue = Arc::new(Queue {
             state: Mutex::new(QueueState {
                 frames: VecDeque::new(),
@@ -389,7 +393,8 @@ mod tests {
             } else {
                 4096
             };
-            let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, byte_limit);
+            let (queued, receiver) =
+                QueuedWriter::channel(Arc::clone(&client.alive), 1, byte_limit);
             // Hold the real pump's sender so replacing admission for this
             // deterministic stall does not close the original transport.
             let _original = std::mem::replace(&mut *lock(&client.writer), queued);
@@ -498,7 +503,9 @@ mod tests {
         let _original = std::mem::replace(&mut *lock(&client.writer), queued);
         let mut requests = Vec::new();
         for _ in 0..super::super::MAX_PENDING_REQUESTS {
-            let (id, response) = client.request("test/pending", Value::Null).expect("request");
+            let (id, response) = client
+                .request("test/pending", Value::Null)
+                .expect("request");
             let frame = receiver.try_recv().expect("writer claims request");
             assert_eq!(frame.request_id, Some(id));
             drop(frame);
@@ -928,9 +935,8 @@ mod tests {
                 serde_json::json!({"textDocument":{"uri":"file:///closed.rs"}}),
             )
             .expect("queued lifecycle notification");
-        let (successor, successor_response) = client
-            .request("test/next", Value::Null)
-            .expect("successor");
+        let (successor, successor_response) =
+            client.request("test/next", Value::Null).expect("successor");
         let started = std::time::Instant::now();
         drop(super::super::await_completion(
             response,

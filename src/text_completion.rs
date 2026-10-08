@@ -327,7 +327,11 @@ mod tests {
         let clean = "  α\r\n  code: C:\\work\\file\t\"quoted\"  ";
         let protected = redact_inputs(&[clean, key], &AuxiliaryPrivacy::default()).unwrap();
         assert_eq!(protected, [clean, "<pi-secret:redacted>"]);
-        assert!(redact_inputs(&[], &AuxiliaryPrivacy::default()).unwrap().is_empty());
+        assert!(
+            redact_inputs(&[], &AuxiliaryPrivacy::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -337,8 +341,8 @@ mod tests {
             redact_inputs(&[&input], &AuxiliaryPrivacy::default()).unwrap(),
             std::slice::from_ref(&input)
         );
-        let error = redact_inputs(&[&input, "SECRET-CANARY"], &AuxiliaryPrivacy::default())
-            .unwrap_err();
+        let error =
+            redact_inputs(&[&input, "SECRET-CANARY"], &AuxiliaryPrivacy::default()).unwrap_err();
         assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
         assert!(!error.to_string().contains("SECRET-CANARY"));
         assert!(
@@ -360,7 +364,11 @@ mod tests {
                 .expect("obfuscated auxiliary fields");
             assert_eq!(
                 protected,
-                ["<pi-secret:redacted>", "<pi-secret:redacted>", "clean context"],
+                [
+                    "<pi-secret:redacted>",
+                    "<pi-secret:redacted>",
+                    "clean context"
+                ],
             );
         }
         let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
@@ -399,7 +407,11 @@ mod tests {
                 "API_KEY=<pi-secret:redacted>",
             ],
         );
-        assert_eq!(vault.mask(later), later, "new discoveries remain disposable");
+        assert_eq!(
+            vault.mask(later),
+            later,
+            "new discoveries remain disposable"
+        );
         assert_eq!(vault.mask(known), "<pi-secret:000001>");
         let block = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
             mode: Some("block".to_string()),

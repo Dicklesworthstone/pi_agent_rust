@@ -74,8 +74,7 @@ impl<'a> EncodedMedia<'a> {
         let decoded_len = base64::engine::general_purpose::STANDARD
             .decode_slice(encoded, &mut decoded)
             .or_else(|_| {
-                base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode_slice(encoded, &mut decoded)
+                base64::engine::general_purpose::STANDARD_NO_PAD.decode_slice(encoded, &mut decoded)
             })
             .ok()?;
         let mut result = [0_u8; N];
@@ -347,9 +346,13 @@ fn mp3_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
         (false, true) => 9,
     };
     let bitrates = if version == 3 {
-        [32_u64, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+        [
+            32_u64, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+        ]
     } else {
-        [8_u64, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+        [
+            8_u64, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
+        ]
     };
     let bitrate = bitrates[bitrate_index - 1];
     let frame_bytes = samples_per_frame * 125 * bitrate / rate + u64::from((header >> 9) & 1);
@@ -562,8 +565,8 @@ fn ogg_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
                     return None;
                 }
             } else if codec.opus && first_audio {
-                initial_samples = initial_samples
-                    .checked_add(opus_packet_samples(&prefix[..prefix_len])?)?;
+                initial_samples =
+                    initial_samples.checked_add(opus_packet_samples(&prefix[..prefix_len])?)?;
             }
             packet_len = 0;
             prefix_len = 0;
@@ -626,7 +629,9 @@ struct EbmlElement {
 
 fn ebml_vint(reader: &mut EncodedMedia<'_>, offset: usize, id: bool) -> Option<(u64, usize)> {
     let first = reader.read::<1>(offset)?[0];
-    let len = usize::try_from(first.leading_zeros()).ok()?.checked_add(1)?;
+    let len = usize::try_from(first.leading_zeros())
+        .ok()?
+        .checked_add(1)?;
     if len > 8 || (id && len > 4) {
         return None;
     }
@@ -762,7 +767,10 @@ mod tests {
     }
 
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut bytes = u32::try_from(body.len() + 8).unwrap().to_be_bytes().to_vec();
+        let mut bytes = u32::try_from(body.len() + 8)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
         bytes.extend_from_slice(kind);
         bytes.extend_from_slice(body);
         bytes
@@ -795,7 +803,10 @@ mod tests {
                     assert_eq!(reader.read::<1>(offset), Some([bytes[offset]]));
                     if offset + 64 <= len {
                         assert_eq!(
-                            reader.read::<64>(offset).as_ref().map(|value| value.as_slice()),
+                            reader
+                                .read::<64>(offset)
+                                .as_ref()
+                                .map(|value| value.as_slice()),
                             Some(&bytes[offset..offset + 64])
                         );
                     }
@@ -812,9 +823,15 @@ mod tests {
             let mut bytes = boxed(b"mdat", &vec![0; 2 * 1024 * 1024]);
             bytes.extend(movie(90_000, 2_745_000, version));
             let data = encode(&bytes);
-            assert_eq!(inspect(&data, "video/mp4"), Some(Duration::from_millis(30_500)));
+            assert_eq!(
+                inspect(&data, "video/mp4"),
+                Some(Duration::from_millis(30_500))
+            );
             let mut reader = EncodedMedia::new(&data).unwrap();
-            assert_eq!(iso_duration(&mut reader), Some(Duration::from_millis(30_500)));
+            assert_eq!(
+                iso_duration(&mut reader),
+                Some(Duration::from_millis(30_500))
+            );
             assert!(MAX_HEADER_BYTES - reader.remaining < 256);
         }
         assert_eq!(
@@ -869,7 +886,10 @@ mod tests {
     fn wave_duration_counts_samples_instead_of_bitrate_or_channels() {
         for (rate, channels, bits) in [(8_000, 1, 8), (48_000, 2, 24)] {
             let bytes = wave(rate, channels, bits, rate * 3);
-            assert_eq!(inspect(&encode(&bytes), "audio/wav"), Some(Duration::from_secs(3)));
+            assert_eq!(
+                inspect(&encode(&bytes), "audio/wav"),
+                Some(Duration::from_secs(3))
+            );
         }
         let mut invalid = wave(8_000, 1, 16, 8_000);
         invalid[28..32].copy_from_slice(&1_u32.to_le_bytes());
@@ -887,7 +907,10 @@ mod tests {
         bytes.resize(42, 0);
         let packed = (48_000_u64 << 44) | (15_u64 << 36) | 2_880_000;
         bytes[18..26].copy_from_slice(&packed.to_be_bytes());
-        assert_eq!(inspect(&encode(&bytes), "audio/flac"), Some(Duration::from_secs(60)));
+        assert_eq!(
+            inspect(&encode(&bytes), "audio/flac"),
+            Some(Duration::from_secs(60))
+        );
         bytes[18..26].copy_from_slice(&(48_000_u64 << 44).to_be_bytes());
         assert!(inspect(&encode(&bytes), "audio/flac").is_none());
     }
@@ -1006,7 +1029,10 @@ mod tests {
             let mut bytes = opus_headers();
             bytes.extend(opus_audio_pages(2, origin));
             for mime in ["audio/ogg", "Audio/Opus; codecs=opus", "application/ogg"] {
-                assert_eq!(inspect(&encode(&bytes), mime), Some(Duration::from_secs(30)));
+                assert_eq!(
+                    inspect(&encode(&bytes), mime),
+                    Some(Duration::from_secs(30))
+                );
             }
         }
         for rate in [24_000, 48_000] {
@@ -1075,7 +1101,7 @@ mod tests {
             (first_audio + 5, 2),   // Unexpected second BOS.
             (first_audio + 5, 8),   // Reserved header flags.
             (first_audio + 14, 43), // Another logical stream.
-            (first_audio + 18, 3), // Missing page sequence.
+            (first_audio + 18, 3),  // Missing page sequence.
         ] {
             let mut malformed = valid.clone();
             malformed[offset] = replacement;
@@ -1166,7 +1192,10 @@ mod tests {
                 Some(Duration::from_millis(30_500))
             );
             assert_eq!(
-                inspect(&encode(&webm(61.0, Some(500_000_000), unknown)), "audio/webm"),
+                inspect(
+                    &encode(&webm(61.0, Some(500_000_000), unknown)),
+                    "audio/webm"
+                ),
                 Some(Duration::from_millis(30_500))
             );
         }
@@ -1219,6 +1248,9 @@ mod tests {
         let mut many_boxes = boxed(b"free", &[]).repeat(MAX_HEADER_BYTES / 4);
         many_boxes.extend(movie(1, 30, 0));
         assert!(inspect(&encode(&many_boxes), "video/mp4").is_none());
-        assert_eq!(duration_from_units(1, 3), Some(Duration::from_nanos(333_333_334)));
+        assert_eq!(
+            duration_from_units(1, 3),
+            Some(Duration::from_nanos(333_333_334))
+        );
     }
 }

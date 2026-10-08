@@ -63,7 +63,11 @@ fn extract_with_limit(blocks: &[Value], limit: usize) -> Result<Vec<ContentBlock
                 )));
             }
             Some("image") => {
-                content.push(ContentBlock::Image(parse_image(block, "data", &mut budget)?));
+                content.push(ContentBlock::Image(parse_image(
+                    block,
+                    "data",
+                    &mut budget,
+                )?));
             }
             Some("resource") => append_resource(block, &mut budget, &mut content)?,
             Some(_) => return Err("ACP prompt block type is not supported by this agent".into()),
@@ -506,10 +510,16 @@ mod tests {
 
         let mut different = media.clone();
         different.data = "b3RoZXI=".to_string();
-        assert_ne!(embedded_video(&different)["resource"]["uri"], resource["uri"]);
+        assert_ne!(
+            embedded_video(&different)["resource"]["uri"],
+            resource["uri"]
+        );
         different = media;
         different.mime_type = "video/webm".to_string();
-        assert_ne!(embedded_video(&different)["resource"]["uri"], resource["uri"]);
+        assert_ne!(
+            embedded_video(&different)["resource"]["uri"],
+            resource["uri"]
+        );
     }
 
     #[test]
@@ -616,9 +626,10 @@ mod tests {
         let handler = super::super::build_acp_event_handler(tx, "editor-session".to_string());
         let mut result = screenshot_output();
         result.is_error = true;
-        result
-            .content
-            .insert(0, ContentBlock::Text(TextContent::new("Visual check failed")));
+        result.content.insert(
+            0,
+            ContentBlock::Text(TextContent::new("Visual check failed")),
+        );
         handler(crate::agent::AgentEvent::ToolExecutionEnd {
             tool_call_id: "failed-check".to_string(),
             tool_name: "browser".to_string(),
@@ -629,7 +640,10 @@ mod tests {
         let message: Value = serde_json::from_str(&line).unwrap();
         let update = &message["params"]["update"];
         assert_eq!(update["status"], "failed");
-        assert_eq!(update["content"][0]["content"]["text"], "Visual check failed");
+        assert_eq!(
+            update["content"][0]["content"]["text"],
+            "Visual check failed"
+        );
         assert_eq!(update["content"][1]["content"]["data"], PNG);
     }
 }

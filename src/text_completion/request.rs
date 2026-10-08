@@ -61,9 +61,8 @@ where
     F: Future,
 {
     let owner = AgentCx::for_current_or_request();
-    let cancelled = || {
-        abort.is_some_and(crate::agent::AbortSignal::is_aborted) || owner.checkpoint().is_err()
-    };
+    let cancelled =
+        || abort.is_some_and(crate::agent::AbortSignal::is_aborted) || owner.checkpoint().is_err();
     if cancelled() {
         return Err(RequestStop::Cancelled);
     }
@@ -144,7 +143,8 @@ mod tests {
         ));
         let _owner_guard = owner.clone().set_current_restricted();
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        assert!(matches!( // ubs:ignore[rust.panic.assert-macros] -- The aborted request must finish without provider admission.
+        assert!(matches!(
+            // ubs:ignore[rust.panic.assert-macros] -- The aborted request must finish without provider admission.
             request.as_mut().poll(&mut cx),
             Poll::Ready(Err(RequestStop::Cancelled))
         ));
