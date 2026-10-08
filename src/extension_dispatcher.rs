@@ -3134,12 +3134,15 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         .current_dir(&cwd);
                     crate::tools::isolate_command_process_group(&mut command);
 
-                    let mut child = command.spawn().map_err(|err| err.to_string())?;
-                    crate::tools::attach_child_job_discipline(&child);
-                    let pid = child.id();
+                    let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                        .map_err(|err| err.to_string())?;
+                    let mut child = crate::tools::ProcessGuard::new(
+                        child,
+                        crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                    );
 
-                    let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
-                    let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
+                    let stdout = child.take_stdout().ok_or("Missing stdout pipe")?;
+                    let stderr = child.take_stderr().ok_or("Missing stderr pipe")?;
 
                     let stdout_tx = tx.clone();
                     let stderr_tx = tx.clone();
@@ -3153,15 +3156,15 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     let start = Instant::now();
                     let mut killed = false;
                     let status = loop {
-                        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                        if let Some(status) =
+                            child.try_wait_child().map_err(|err| err.to_string())?
+                        {
                             break status;
                         }
 
                         if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
                             killed = true;
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                            break child.wait().map_err(|err| err.to_string())?;
+                            break child.terminate_and_wait().map_err(|err| err.to_string())?;
                         }
 
                         if let Some(timeout_ms) = timeout_ms
@@ -3169,9 +3172,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             && start.elapsed() >= Duration::from_millis(timeout_ms)
                         {
                             killed = true;
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                            break child.wait().map_err(|err| err.to_string())?;
+                            break child.terminate_and_wait().map_err(|err| err.to_string())?;
                         }
 
                         thread::sleep(Duration::from_millis(10));
@@ -3301,12 +3302,15 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .current_dir(&cwd);
                 crate::tools::isolate_command_process_group(&mut command);
 
-                let mut child = command.spawn().map_err(|err| err.to_string())?;
-                crate::tools::attach_child_job_discipline(&child);
-                let pid = child.id();
+                let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                    .map_err(|err| err.to_string())?;
+                let mut child = crate::tools::ProcessGuard::new(
+                    child,
+                    crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                );
 
-                let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
-                let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
+                let stdout = child.take_stdout().ok_or("Missing stdout pipe")?;
+                let stderr = child.take_stderr().ok_or("Missing stderr pipe")?;
 
                 let (tx, rx) = std::sync::mpsc::sync_channel::<ExecCaptureFrame>(1024);
                 let tx_stdout = tx.clone();
@@ -3341,24 +3345,18 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             &mut stderr_bytes_len,
                             max_bytes,
                         ) {
-                            if !killed {
-                                crate::tools::kill_process_group_tree(Some(pid));
-                                let _ = child.kill();
-                            }
-                            let _ = child.wait();
+                            let _ = child.terminate_and_wait();
                             return Err(message);
                         }
                     }
 
-                    if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                    if let Some(status) = child.try_wait_child().map_err(|err| err.to_string())? {
                         break status;
                     }
 
                     if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
                         killed = true;
-                        crate::tools::kill_process_group_tree(Some(pid));
-                        let _ = child.kill();
-                        break child.wait().map_err(|err| err.to_string())?;
+                        break child.terminate_and_wait().map_err(|err| err.to_string())?;
                     }
 
                     if let Some(timeout_ms) = timeout_ms
@@ -3366,9 +3364,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         && start.elapsed() >= Duration::from_millis(timeout_ms)
                     {
                         killed = true;
-                        crate::tools::kill_process_group_tree(Some(pid));
-                        let _ = child.kill();
-                        break child.wait().map_err(|err| err.to_string())?;
+                        break child.terminate_and_wait().map_err(|err| err.to_string())?;
                     }
 
                     if let Ok(frame) = rx.recv_timeout(Duration::from_millis(10))
@@ -3383,11 +3379,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             max_bytes,
                         )
                     {
-                        if !killed {
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                        }
-                        let _ = child.wait();
+                        let _ = child.terminate_and_wait();
                         return Err(message);
                     }
                 };
@@ -5157,6 +5149,177 @@ mod tests {
                 .await
                 .expect("verify error");
         });
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_EXEC_FIXTURE: &str =
+        "extension_dispatcher::tests::windows_exec_descendant_fixture";
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exec_descendant_fixture() {
+        let cwd = std::env::current_dir().expect("fixture cwd");
+        let Ok(role) = std::fs::read_to_string(cwd.join("exec-fixture.role")) else {
+            return;
+        };
+        if role == "holder" {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(cwd.join("held.lock"))
+                .expect("open descendant lock");
+            fs4::FileExt::lock(&file).expect("hold descendant resource");
+            std::fs::write(cwd.join("ready"), b"locked").expect("publish descendant readiness");
+            // The inherited stdout/stderr and this lock must be closed by
+            // the parent's Job, not by waiting for the fixture to finish.
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        assert_eq!(role, "root");
+        std::fs::write(cwd.join("root.pid"), std::process::id().to_string())
+            .expect("publish root identity");
+        let holder_dir = cwd.join("holder");
+        // Intentionally use a bare child here: the real extension exec must
+        // establish containment before its target creates this descendant.
+        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", WINDOWS_EXEC_FIXTURE, "--nocapture"])
+            .current_dir(&holder_dir)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn inherited-pipe descendant");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !holder_dir.join("ready").exists() {
+            if descendant.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                let _ = descendant.kill();
+                let _ = descendant.wait();
+                panic!("descendant did not acquire its resource before root exit");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        println!("extension-root-complete");
+        // Deliberately leave the descendant alive after this root returns.
+    }
+
+    #[cfg(windows)]
+    struct WindowsExecFixtureCleanup(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for WindowsExecFixtureCleanup {
+        fn drop(&mut self) {
+            if let Ok(text) = std::fs::read_to_string(self.0.join("root.pid"))
+                && let Ok(pid) = text.parse()
+            {
+                // Close only the retained Job, never walk a reaped root PID.
+                crate::tools::terminate_reaped_child_discipline(pid);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dispatcher_exec_releases_descendant_resources_before_its_final_result() {
+        for stream in [false, true] {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let holder_dir = directory.path().join("holder");
+            std::fs::create_dir(&holder_dir).expect("descendant directory");
+            std::fs::write(directory.path().join("exec-fixture.role"), b"root")
+                .expect("root role");
+            std::fs::write(holder_dir.join("exec-fixture.role"), b"holder")
+                .expect("descendant role");
+            let resource = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(holder_dir.join("held.lock"))
+                .expect("resource witness");
+            let _cleanup = WindowsExecFixtureCleanup(directory.path().to_path_buf());
+            let executable = serde_json::to_string(&std::env::current_exe().unwrap()).unwrap();
+            let cwd = serde_json::to_string(directory.path()).unwrap();
+            futures::executor::block_on(async {
+                let runtime = Rc::new(
+                    PiJsRuntime::with_clock(DeterministicClock::new(0))
+                        .await
+                        .expect("runtime"),
+                );
+                runtime
+                    .eval(&format!(
+                        r#"
+                        globalThis.result = null;
+                        globalThis.execError = null;
+                        globalThis.output = "";
+                        const args = ["--exact", "{WINDOWS_EXEC_FIXTURE}", "--nocapture"];
+                        pi.exec({executable}, args, {{
+                            cwd: {cwd}, stream: {stream}, timeoutMs: 15000,
+                            onChunk: (chunk) => {{
+                                if (chunk && chunk.stdout) globalThis.output += chunk.stdout;
+                            }},
+                        }}).then((result) => {{ globalThis.result = result; }})
+                          .catch((error) => {{ globalThis.execError = String(error); }});
+                        "#
+                    ))
+                    .await
+                    .expect("dispatch fixture exec");
+                let requests = runtime.drain_hostcall_requests();
+                assert_eq!(requests.len(), 1);
+                let dispatcher = build_dispatcher(Rc::clone(&runtime));
+                for request in requests {
+                    dispatcher.dispatch_and_complete(request).await;
+                }
+                let mut settled = false;
+                for _ in 0..256 {
+                    runtime.tick().await.expect("advance exec stream");
+                    runtime.drain_microtasks().await.expect("finish callbacks");
+                    settled = runtime
+                        .with_ctx(|ctx| {
+                            let globals = ctx.globals();
+                            let result: rquickjs::Value<'_> = globals.get("result")?;
+                            let error: rquickjs::Value<'_> = globals.get("execError")?;
+                            Ok(!result.is_null() || !error.is_null())
+                        })
+                        .await
+                        .expect("inspect exec completion");
+                    if settled {
+                        break;
+                    }
+                }
+                assert!(settled, "exec stream did not publish its final result");
+                runtime
+                    .eval(
+                        r#"
+                        if (globalThis.execError !== null) throw new Error(globalThis.execError);
+                        const result = globalThis.result;
+                        if (!result || result.code !== 0 || result.killed) {
+                            throw new Error("root result was lost: " + JSON.stringify(result));
+                        }
+                        const output = globalThis.output + (globalThis.result.stdout || "");
+                        if (!output.includes("extension-root-complete")) {
+                            throw new Error("final root output was lost: " + output);
+                        }
+                        "#,
+                    )
+                    .await
+                    .expect("verify real exec result");
+            });
+            assert!(
+                holder_dir.join("ready").exists(),
+                "the descendant really held the lock"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match fs4::FileExt::try_lock(&resource) {
+                    Ok(()) => {
+                        fs4::FileExt::unlock(&resource).unwrap();
+                        break;
+                    }
+                    Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!(
+                        "stream={stream}: final result left a descendant resource live: {error}"
+                    ),
+                }
+            }
+        }
     }
 
     #[derive(Default)]

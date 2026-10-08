@@ -681,20 +681,13 @@ impl McpStdioClient {
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
         crate::tools::isolate_command_process_group(&mut command_builder);
-        let mut child = command_builder.spawn().map_err(|error| {
-            tool_err(
-                "MCP_SERVER_MISSING",
-                format!("failed to spawn MCP server {command:?}: {error}"),
-            )
-        })?;
-        if !crate::tools::attach_child_job_discipline(&child) {
-            let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
-            let _ = guard.kill();
-            return Err(tool_err(
-                "MCP_PROCESS_ISOLATION",
-                "failed to attach MCP server to process-tree cleanup discipline",
-            ));
-        }
+        let mut child = crate::tools::spawn_command_with_job_discipline(&mut command_builder)
+            .map_err(|error| {
+                tool_err(
+                    "MCP_SERVER_MISSING",
+                    format!("failed to spawn MCP server {command:?}: {error}"),
+                )
+            })?;
         let pid = child.id();
         let Some(stdin) = child.stdin.take() else {
             let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);

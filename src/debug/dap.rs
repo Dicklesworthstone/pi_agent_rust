@@ -230,24 +230,24 @@ impl DapTransport {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
         }
-        let mut child = owner.process().spawn_checked(&mut cmd).map_err(|err| {
+        let child = owner.process().spawn_checked(&mut cmd).map_err(|err| {
             tool_err(
                 "DAP_ADAPTER_MISSING",
                 format!("failed to spawn debug adapter {command:?}: {err}"),
             )
         })?;
-        crate::tools::attach_child_job_discipline(&child);
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(tool_err("DAP_TRANSPORT", "adapter pipes unavailable"));
-        };
-        let child = crate::tools::ProcessGuard::new(
+        // spawn_checked already owns an atomic Windows Job registration.
+        // Reattaching would replace and close the Job containing the adapter.
+        let mut child = crate::tools::ProcessGuard::new(
             child,
             crate::tools::ProcessCleanupMode::ProcessGroupTree,
         );
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr())
+        else {
+            let _ = child.kill();
+            return Err(tool_err("DAP_TRANSPORT", "adapter pipes unavailable"));
+        };
         owner
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "cancelled during adapter spawn"))?;

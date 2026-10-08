@@ -13871,6 +13871,18 @@ impl ProcessGuard {
         }
     }
 
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut().and_then(|child| child.stdin.take())
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|child| child.stdout.take())
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut().and_then(|child| child.stderr.take())
+    }
+
     pub(crate) fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let status = self
             .child
@@ -13890,16 +13902,59 @@ impl ProcessGuard {
 
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
-            cleanup_child(Some(child.id()), self.cleanup_mode);
-            let _ = child.kill();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        // A previous poll may already have released the Job.
+                        // Never fall back to walking an exited root's PID.
+                        terminate_reaped_child_discipline(child.id());
+                    }
+                    return Some(status);
+                }
+                Ok(None) => {
+                    cleanup_child(Some(child.id()), self.cleanup_mode);
+                    let _ = child.kill();
+                }
+                Err(_) => {
+                    // An ambiguous wait error does not establish ownership
+                    // of a live PID. Release only our retained Windows Job;
+                    // the reaper below still owns the actual child handle.
+                    #[cfg(windows)]
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        let _ = win_job::terminate(child.id());
+                    }
+                }
+            }
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
-            // We cannot return the exit status synchronously without blocking,
-            // so we return None to indicate the process was forcefully killed.
+            // A live or unconfirmed child is reaped without blocking callers.
             return None;
         }
         None
+    }
+
+    /// Stop an owned process tree and reap its root before returning. Blocking
+    /// subprocess workers use this path when their terminal result requires an
+    /// exit status; async callers can retain the nonblocking `kill` path.
+    pub(crate) fn terminate_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let reaped = self.try_wait_child()?.is_some();
+        if let Some(child) = self.child.as_mut() {
+            if reaped {
+                if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                    // Retire only the owned group/Job. The root PID may have
+                    // been reused since try_wait, so never walk its children.
+                    terminate_reaped_child_discipline(child.id());
+                }
+            } else {
+                cleanup_child(Some(child.id()), self.cleanup_mode);
+                // The tree kill can already have ended the root. Still wait
+                // for its actual status if the direct kill races that exit.
+                let _ = child.kill();
+            }
+        }
+        // A wait error leaves this guard armed for a later cleanup attempt.
+        self.wait()
     }
 
     pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -13947,9 +14002,10 @@ impl Drop for ProcessGuard {
 /// Spawn with Windows Job membership established before any child code runs.
 ///
 /// Unix callers configure their process group on `command` before calling.
-/// A returned child owns exactly one registered Job on Windows; do not also
-/// call `attach_child_job_discipline`. The caller must immediately retain its
-/// existing cleanup guard and release the discipline when the root is reaped.
+/// A returned child owns exactly one registered Job on Windows. The caller
+/// must immediately retain its cleanup guard and release the discipline when
+/// the root is reaped. There is deliberately no post-spawn attachment API:
+/// replacing an owned kill-on-close Job can terminate a live child.
 pub(crate) fn spawn_command_with_job_discipline(
     command: &mut Command,
 ) -> std::io::Result<std::process::Child> {
@@ -13957,30 +14013,6 @@ pub(crate) fn spawn_command_with_job_discipline(
     return win_job::spawn(command);
     #[cfg(not(windows))]
     command.spawn()
-}
-
-/// Attach an already-spawned child to platform tree-discipline bookkeeping.
-///
-/// Windows assigns the child to a kill-on-close Job object so later
-/// `kill_process_group_tree` / `terminate_process_group_tree` calls reap the
-/// whole descendant tree, including processes spawned between the kill-time
-/// snapshot and the kill (bd-9jgrt item 1). Unix needs nothing here: the
-/// child already leads its own process group. Hub PTY services are out of
-/// scope (portable-pty children keep the walk-based discipline).
-/// This cannot contain descendants created before attachment. New owned
-/// launch paths should use `spawn_command_with_job_discipline` instead.
-// Const only on unix where the body degenerates to `let _`; the windows
-// branch calls non-const job registration, so the lint cannot hold for both
-// targets at once.
-#[allow(clippy::missing_const_for_fn)]
-pub(crate) fn attach_child_job_discipline(child: &std::process::Child) -> bool {
-    #[cfg(windows)]
-    return win_job::attach(child);
-    #[cfg(not(windows))]
-    {
-        let _ = child;
-        true
-    }
 }
 
 /// Terminate descendants still covered by an already-reaped root's platform
@@ -14011,7 +14043,6 @@ mod win_job {
     //! job's handle terminates every current member in one shot.
 
     use std::collections::HashMap;
-    use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::{CommandExt as _, ProcThreadAttributeList};
     use std::process::{Child, Command};
     use std::sync::{LazyLock, Mutex};
@@ -14062,32 +14093,6 @@ mod win_job {
         Ok(child)
     }
 
-    /// Assign `child` to a fresh kill-on-close job and remember it by pid.
-    ///
-    /// Returns whether the child is now covered by a registered Job. Most
-    /// callers can retain the walk-based fallback on failure; subprocess
-    /// surfaces that cannot safely tolerate inherited handles can fail closed.
-    // `win_job` is a private module, so `pub` here is already crate-limited.
-    pub fn attach(child: &Child) -> bool {
-        let Ok(mut map) = REGISTRY.lock() else {
-            return false;
-        };
-        prune_dead_entries(&mut map);
-        let mut info = ExtendedLimitInfo::new();
-        info.limit_kill_on_job_close();
-        let Ok(job) = Job::create_with_limit_info(&info) else {
-            return false;
-        };
-        // RawHandle is *mut c_void; win32job takes the isize numeric handle.
-        if job.assign_process(child.as_raw_handle() as isize).is_err() {
-            // Never assigned, so closing harms nothing.
-            drop(job);
-            return false;
-        }
-        map.insert(child.id(), job);
-        true
-    }
-
     /// Kill the tree rooted at `pid` via its job, returning whether one
     /// existed. Dropping the stored `Job` closes the handle, and
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
@@ -14129,6 +14134,7 @@ mod win_job {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::windows::io::AsRawHandle;
         use std::path::Path;
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -14325,7 +14331,14 @@ mod win_job {
 
         #[test]
         fn process_guard_releases_the_job_when_its_root_exits() {
-            for completion in ["try_wait", "wait", "drop"] {
+            for completion in [
+                "try_wait",
+                "wait",
+                "terminate_and_wait",
+                "kill",
+                "try_wait_then_kill",
+                "drop",
+            ] {
                 let directory = tempfile::tempdir().unwrap();
                 let pid_file = directory.path().join("descendant.pid");
                 let mut child = spawn(&mut fixture_command("root-exit", &pid_file)).unwrap();
@@ -14346,6 +14359,13 @@ mod win_job {
                 match completion {
                     "try_wait" => assert!(guard.try_wait_child().unwrap().is_some()),
                     "wait" => assert!(guard.wait().unwrap().success()),
+                    "terminate_and_wait" => assert!(guard.terminate_and_wait().unwrap().success()),
+                    "kill" => assert!(guard.kill().unwrap().success()),
+                    "try_wait_then_kill" => {
+                        assert!(guard.try_wait_child().unwrap().is_some());
+                        assert!(guard.kill().unwrap().success());
+                        assert!(guard.kill().is_none());
+                    }
                     _ => drop(guard),
                 }
                 assert!(!REGISTRY.lock().unwrap().contains_key(&pid));
@@ -14377,7 +14397,7 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
     };
 
     // Windows fast path: children spawned through
-    // `attach_child_job_discipline` carry a Job object containing their whole
+    // `spawn_command_with_job_discipline` carry a Job object containing their whole
     // descendant tree, so dropping the job kills everyone in one shot —
     // including grandchildren that appeared after this function would
     // otherwise have taken its snapshot (bd-9jgrt item 1). Pids without a
@@ -14516,14 +14536,13 @@ impl JobGatedChildLaunch {
     }
 }
 
-/// Prepare a command whose Windows target cannot spawn before Job attachment.
+/// Prepare a command whose Windows target waits for its owner's launch gate.
 ///
 /// Unix already creates a new process-group leader before the target image
-/// runs. Windows has no equivalent `Command` API for atomic Job assignment, so
-/// a copy of Pi waits on a private file gate using only in-process operations.
-/// Once the parent attaches that wrapper to the Job and opens the gate, the
-/// real target is spawned as a Job member and all of its descendants inherit
-/// the same kill-on-close discipline.
+/// runs. On Windows, a copy of Pi waits on a private file gate using only
+/// in-process operations. Spawn that wrapper with atomic Job membership,
+/// retain its owner and check cancellation before opening the gate. The real
+/// target then inherits the same kill-on-close discipline as the wrapper.
 pub(crate) fn command_with_job_gate_in_dir(
     program: impl AsRef<OsStr>,
     args: &[OsString],
@@ -14568,10 +14587,10 @@ pub(crate) fn command_with_job_gate_in_dir(
     }
 }
 
-/// Run the Windows half of the private pre-Job launch gate, if requested.
+/// Run the Windows half of the private target launch gate, if requested.
 ///
 /// This is called before normal CLI initialization. The wait itself never
-/// spawns a process, which is the property that closes the spawn-to-Job race.
+/// spawns a process, so cancellation can still prevent the target launch.
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn run_windows_share_job_child_if_requested() -> Option<i32> {

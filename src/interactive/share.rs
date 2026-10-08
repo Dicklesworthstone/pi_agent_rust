@@ -128,7 +128,6 @@ impl ShareProcess {
         // root, so only the process group/job can still contain live processes.
         if let Some(child) = self.child.as_ref() {
             crate::tools::terminate_reaped_child_discipline(child.id());
-            crate::tools::kill_process_group_tree(Some(child.id()));
         }
         let _ = self.child.take();
         self.stop_readers();
@@ -251,15 +250,7 @@ async fn run_command_output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::tools::isolate_command_process_group(&mut child);
-    let mut child = child.spawn()?;
-    if !crate::tools::attach_child_job_discipline(&child) {
-        crate::tools::kill_process_group_tree(Some(child.id()));
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(std::io::Error::other(
-            "share command could not establish required process-tree isolation",
-        ));
-    }
+    let child = crate::tools::spawn_command_with_job_discipline(&mut child)?;
     let mut process = ShareProcess::new(child, launch_guard);
     if abort_signal.is_aborted() {
         process.terminate_and_reap();

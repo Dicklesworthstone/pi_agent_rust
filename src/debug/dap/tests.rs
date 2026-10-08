@@ -115,6 +115,53 @@ fn dispatch_declines_reverse_requests() {
     assert_eq!(frame["success"], false);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_stdio_adapter_accepts_input_after_spawn_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let transport = DapTransport::spawn(
+        "cmd.exe",
+        &[
+            "/D".into(),
+            "/Q".into(),
+            "/C".into(),
+            "set /P first=&echo pi-dap-stdio-ack 1>&2&set /P second=".into(),
+        ],
+        &[],
+        temp.path(),
+    )
+    .expect("spawn contained stdio adapter");
+
+    // The adapter cannot acknowledge before this post-spawn input arrives.
+    // Replacing the Job inside spawn_inner kills it before the handshake,
+    // even if it was scheduled before its parent returned from CreateProcess.
+    assert!(
+        transport
+            .writer
+            .try_send(Frame {
+                bytes: b"probe\r\n".to_vec(),
+                phase: Arc::new(AtomicU8::new(QUEUED)),
+            })
+            .is_ok(),
+        "adapter writer must accept the startup probe"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if transport.stderr_tail().contains("pi-dap-stdio-ack") {
+            break;
+        }
+        assert!(transport.is_alive(), "adapter died before acknowledging stdin");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "adapter did not acknowledge its piped stdin"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(transport.is_alive());
+    transport.kill();
+    assert!(!transport.is_alive());
+}
+
 fn lldb() -> Option<String> {
     super::super::adapters::default_adapters()
         .into_iter()

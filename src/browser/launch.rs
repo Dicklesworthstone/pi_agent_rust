@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Trusted host configuration. These fields are deliberately not tool arguments.
@@ -127,14 +127,17 @@ impl ManagedBrowser {
         Ok(Self { process, address })
     }
 
-    pub(super) fn id(&self) -> u32 {
-        self.process.child.id()
+    pub(super) const fn id(&self) -> u32 {
+        self.process.pid
     }
 
     pub(super) fn running(&mut self) -> Result<bool> {
+        if self.process.stopped {
+            return Ok(false);
+        }
         self.process
             .child
-            .try_wait()
+            .try_wait_child()
             .map(|status| status.is_none())
             .map_err(|failure| error(format!("could not inspect the owned browser: {failure}")))
     }
@@ -149,7 +152,9 @@ impl ManagedBrowser {
 struct Process {
     // The session owns the established browser, not a completed tool call's Cx.
     // Each new operation checks its own owner; startup still checks cancellation.
-    child: Child,
+    child: crate::tools::ProcessGuard,
+    // Stable display identity only; cleanup always uses the owned guard.
+    pid: u32,
     stopped: bool,
     profile: tempfile::TempDir,
 }
@@ -188,12 +193,19 @@ impl Process {
                     "could not launch the configured browser: {failure}"
                 ))
             })?;
+        let pid = child.id();
         let process = Self {
-            child,
+            child: crate::tools::ProcessGuard::new(
+                child,
+                crate::tools::ProcessCleanupMode::ProcessGroupTree,
+            ),
+            pid,
             stopped: false,
             profile,
         };
-        crate::tools::attach_child_job_discipline(&process.child);
+        // spawn_checked establishes Windows Job membership before the browser
+        // runs. Keep that same Job for the lifetime of this guard; replacing
+        // it would close the original kill-on-close Job and stop the browser.
         // The guard already exists if cancellation races with spawn.
         owner
             .checkpoint()
@@ -208,7 +220,7 @@ impl Process {
             owner
                 .checkpoint()
                 .map_err(|_| error("browser launch cancelled"))?;
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = self.child.try_wait_child()? {
                 return Err(error(format!(
                     "Chromium exited before remote debugging became ready ({status}); check the executable, display and OS sandbox support. Pi does not disable the browser sandbox"
                 )));
@@ -229,16 +241,7 @@ impl Process {
         if self.stopped {
             return Ok(());
         }
-        #[cfg(unix)]
-        if let Ok(pid) = i32::try_from(self.child.id())
-            && let Some(group) = rustix::process::Pid::from_raw(pid)
-        {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
-        #[cfg(not(unix))]
-        crate::tools::kill_process_tree(Some(self.child.id()));
-        let _ = self.child.kill();
-        self.child.wait()?;
+        self.child.terminate_and_wait()?;
         self.stopped = true;
         Ok(())
     }
@@ -577,5 +580,66 @@ mod tests {
             Some("cancel before launch"),
         );
         assert!(Process::spawn(&owner, dir.path(), &options).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_managed_browser_keeps_its_job_after_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fixture-browser.cmd");
+        std::fs::write(
+            &executable,
+            concat!(
+                "@echo off\r\n",
+                "set \"profile_arg=%~1\"\r\n",
+                "set \"profile=%profile_arg:~16%\"\r\n",
+                ">\"%profile%\\DevToolsActivePort\" echo 43123\r\n",
+                ">>\"%profile%\\DevToolsActivePort\" echo /devtools/browser/windows-fixture\r\n",
+                ":wait\r\n",
+                "if exist \"%profile%\\probe\" >\"%profile%\\ack\" echo browser-running\r\n",
+                "ping -n 2 127.0.0.1 >nul\r\n",
+                "goto wait\r\n",
+            ),
+        )
+        .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let options = BrowserLaunchOptions {
+            executable_path: Some(executable),
+            ..Default::default()
+        };
+        let mut browser = runtime
+            .block_on(ManagedBrowser::launch(&owner, directory.path(), &options))
+            .expect("launch the contained browser fixture");
+        let profile = browser.process.profile.path().to_path_buf();
+        // Readiness might be written before a duplicate attachment kills the
+        // child. A new request after launch returns proves it remains alive.
+        std::fs::write(profile.join("probe"), "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(profile.join("ack"))
+            .is_ok_and(|text| text.trim() == "browser-running")
+        {
+            assert!(browser.running().unwrap(), "the browser lost its owning Job");
+            assert!(
+                Instant::now() < deadline,
+                "browser did not acknowledge the probe"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            browser.address.debugger_path,
+            "/devtools/browser/windows-fixture"
+        );
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("launch request finished"),
+        );
+        assert!(browser.running().unwrap());
+        browser.stop().unwrap();
+        assert!(!browser.running().unwrap());
+        drop(browser);
+        assert!(!profile.exists());
     }
 }

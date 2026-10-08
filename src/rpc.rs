@@ -13843,20 +13843,17 @@ async fn run_bash_rpc(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::tools::isolate_command_process_group(&mut child);
-    let mut child = child
-        .spawn()
+    let child = crate::tools::spawn_command_with_job_discipline(&mut child)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
-    crate::tools::attach_child_job_discipline(&child);
-
-    let Some(stdout) = child.stdout.take() else {
-        return Err(Error::tool("bash", "Missing stdout".to_string()));
-    };
-    let Some(stderr) = child.stderr.take() else {
-        return Err(Error::tool("bash", "Missing stderr".to_string()));
-    };
-
     let mut guard =
         crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
+
+    let Some(stdout) = guard.take_stdout() else {
+        return Err(Error::tool("bash", "Missing stdout".to_string()));
+    };
+    let Some(stderr) = guard.take_stderr() else {
+        return Err(Error::tool("bash", "Missing stderr".to_string()));
+    };
 
     // We use a bounded channel to provide backpressure. If the child process
     // produces output faster than the async loop can drain it (and spill to disk),

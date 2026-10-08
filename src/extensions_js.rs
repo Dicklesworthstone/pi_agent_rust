@@ -20002,14 +20002,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     .stderr(Stdio::piped());
                                 crate::tools::isolate_command_process_group(&mut command);
 
-                                let mut child = command.spawn().map_err(|e| e.to_string())?;
-                                crate::tools::attach_child_job_discipline(&child);
+                                let child =
+                                    crate::tools::spawn_command_with_job_discipline(&mut command)
+                                        .map_err(|e| e.to_string())?;
                                 let pid = child.id();
+                                let mut child = crate::tools::ProcessGuard::new(
+                                    child,
+                                    crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                                );
 
                                 let stdout_pipe =
-                                    child.stdout.take().ok_or("Missing stdout pipe")?;
+                                    child.take_stdout().ok_or("Missing stdout pipe")?;
                                 let stderr_pipe =
-                                    child.stderr.take().ok_or("Missing stderr pipe")?;
+                                    child.take_stderr().ok_or("Missing stderr pipe")?;
 
                                 let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
                                 let tx_stdout = tx.clone();
@@ -20058,23 +20063,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
                                     }
 
-                                    if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                                    if let Some(st) =
+                                        child.try_wait_child().map_err(|e| e.to_string())?
+                                    {
                                         break st;
                                     }
                                     if !killed && limit_exceeded {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
                                     if let Some(t) = timeout
                                         && !killed
                                         && start.elapsed() >= t
                                     {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(5)) {
                                         ingest_chunk!(chunk.kind, chunk.bytes);

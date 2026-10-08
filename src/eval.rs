@@ -10,11 +10,11 @@
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
 
 struct PyKernel {
-    child: Child,
+    child: ProcessGuard,
     stdin: ChildStdin,
     /// Lines from the kernel's stdout, streamed by a dedicated reader thread
     /// (a cell may emit several bridge-request lines before its final
@@ -35,9 +35,6 @@ struct PyKernel {
     lines: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
     next_id: u64,
     cells_run: u64,
-    /// Set by the first kill(): the pid is reaped and may be recycled, so a
-    /// second group-kill must never run.
-    killed: bool,
 }
 
 impl PyKernel {
@@ -52,29 +49,35 @@ impl PyKernel {
         // Own process group so shutdown kills kernel-spawned children too
         // (session-end tree discipline, bd-cv653.1.4 acceptance #5).
         crate::tools::isolate_command_process_group(&mut command);
-        let mut child = command.spawn().map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                Error::tool(
-                    "eval",
-                    format!(
-                        "EVAL_PY_MISSING: `{python_path}` not found. Install Python 3 \
-                         or set PI_EVAL_PYTHON."
-                    ),
-                )
-            } else {
-                Error::tool("eval", format!("EVAL_SPAWN: {err}"))
-            }
-        })?;
-        crate::tools::attach_child_job_discipline(&child);
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::tool("eval", "EVAL_SPAWN: no stdin pipe"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::tool("eval", "EVAL_SPAWN: no stdout pipe"))?;
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    Error::tool(
+                        "eval",
+                        format!(
+                            "EVAL_PY_MISSING: `{python_path}` not found. Install Python 3 \
+                             or set PI_EVAL_PYTHON."
+                        ),
+                    )
+                } else {
+                    Error::tool("eval", format!("EVAL_SPAWN: {err}"))
+                }
+            })?;
+        let mut child = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
+        let (Some(stdin), Some(stdout)) = (child.take_stdin(), child.take_stdout()) else {
+            let _ = child.terminate_and_wait();
+            return Err(Error::tool("eval", "EVAL_SPAWN: kernel pipes unavailable"));
+        };
         let (tx, rx) = std::sync::mpsc::channel();
+        // Own the child before starting the reader. A thread-creation failure
+        // must close the Job/process group and reap the kernel as well.
+        let kernel = Self {
+            child,
+            stdin,
+            lines: std::sync::Mutex::new(rx),
+            next_id: 1,
+            cells_run: 0,
+        };
         std::thread::Builder::new()
             .name("eval-py-read".into())
             .spawn(move || {
@@ -95,14 +98,7 @@ impl PyKernel {
                 }
             })
             .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?;
-        Ok(Self {
-            child,
-            stdin,
-            lines: std::sync::Mutex::new(rx),
-            next_id: 1,
-            cells_run: 0,
-            killed: false,
-        })
+        Ok(kernel)
     }
 
     /// Await the next stdout line under a budget. Ok(None) = EOF.
@@ -135,17 +131,9 @@ impl PyKernel {
     }
 
     fn kill(&mut self) {
-        // Guard against double-kill: after the first wait() the pid is
-        // freed and the OS may recycle it — a second group-kill could hit
-        // an innocent process group.
-        if self.killed {
-            return;
-        }
-        self.killed = true;
-        // Process-tree discipline: the kernel's own children die with it.
-        crate::tools::kill_process_group_tree(Some(self.child.id()));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The guard releases its child after reaping, so repeated cleanup
+        // cannot signal a recycled PID or replace the kernel's Windows Job.
+        let _ = self.child.terminate_and_wait();
     }
 }
 
@@ -672,43 +660,40 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        // A unique sleep duration marks OUR child: `pgrep -f "sleep 60"`
-        // substring-matches any concurrent process mentioning "sleep 60x"
-        // (other agents' polling shells), which made this test fail on
-        // shared machines through no fault of the kill discipline.
-        let marker_secs = 50_000 + std::process::id() % 10_000;
-        let kernel_pid = {
+        let pids: [u32; 2] = {
             let tool = EvalTool::new(dir.path());
             let out = run_cell_sync(
                 &tool,
-                &format!(
-                    "import os\nimport subprocess\npid = os.getpid()\nsubprocess.Popen(['sleep', '{marker_secs}'])"
-                ),
+                "import os, sys, subprocess\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
             )
             .expect("spawn cell");
             assert!(!out.is_error, "cell: {}", output_text(&out));
-            let out = run_cell_sync(&tool, "pid").expect("pid cell");
-            let text = output_text(&out);
-            text.trim()
-                .trim_matches('"')
-                .parse::<u32>()
-                .unwrap_or_else(|_| panic!("pid from cell output: {text}"))
+            let out = run_cell_sync(&tool, "[os.getpid(), child.pid]").expect("pid cell");
+            serde_json::from_str(output_text(&out).trim()).expect("kernel and descendant PIDs")
             // tool (and its kernel) drop here
         };
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let state = std::fs::read_to_string(format!("/proc/{kernel_pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit(')').next()?.trim().chars().next());
-        assert!(
-            state.is_none() || state == Some('Z'),
-            "kernel pid {kernel_pid} survived session end (state {state:?})"
-        );
-        // The kernel's own `sleep` child died with it (tree discipline).
-        let survivor = std::process::Command::new("pgrep")
-            .args(["-f", &format!("sleep {marker_secs}")])
-            .output()
-            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
-        assert!(!survivor, "kernel-spawned sleep survived session end");
+        // Probe the exact processes through the same portable API on Windows
+        // and Unix. No external sleep/pgrep or Linux-only /proc oracle.
+        for (index, pid) in pids.into_iter().enumerate() {
+            let pid = sysinfo::Pid::from_u32(pid);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut system = sysinfo::System::new();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                if system.process(pid).is_none_or(|process| {
+                    index != 0
+                        && cfg!(unix)
+                        && process.status() == sysinfo::ProcessStatus::Zombie
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "kernel-owned process {pid} survived session end"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]
