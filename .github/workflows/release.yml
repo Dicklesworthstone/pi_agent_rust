@@ -654,6 +654,33 @@ jobs:
           workspaces: pi_agent_rust -> target
           key: release-${{ needs.plan.outputs.commit }}-${{ matrix.target }}
 
+      # Windows sandbox (fork srt-win): the helper must be embedded at
+      # build time (build.rs reads SRT_WIN_EXE) or the shipped binary
+      # silently degrades to the dev sentinel fallback, which the sandbox
+      # account cannot execute. Source binding: the exact fork rev resolved
+      # in Cargo.lock — the embedded helper always matches the linked
+      # sandbox-runtime sources.
+      - name: Build embedded srt-win helper [windows]
+        if: runner.os == 'Windows'
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(sed -n '/name = "sandbox-runtime"/{n;p}' pi_agent_rust/Cargo.lock             | grep -oE 'rev=[0-9a-f]{40}' | head -1 | cut -d= -f2)"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sandbox-runtime rev not found in Cargo.lock"
+            exit 1
+          fi
+          echo "Building srt-win helper from defims/sandbox-runtime-rs@${rev}"
+          git init -q srt-win-src
+          git -C srt-win-src remote add origin https://github.com/defims/sandbox-runtime-rs
+          git -C srt-win-src fetch --depth 1 --quiet origin "$rev"
+          git -C srt-win-src checkout -q FETCH_HEAD
+          cargo build --release --locked --manifest-path srt-win-src/Cargo.toml -p srt-win
+          helper="srt-win-src/target/release/srt-win.exe"
+          echo "helper sha256: $(sha256sum "$helper" | cut -d' ' -f1)"
+          echo "SRT_WIN_EXE=${{ github.workspace }}/$helper" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --locked --bin pi --target "${{ matrix.target }}"
 
