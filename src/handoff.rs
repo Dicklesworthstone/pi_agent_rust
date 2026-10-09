@@ -353,7 +353,7 @@ impl HandoffGenerator {
         base: &EntryBase,
         turn_index: usize,
         goal: &mut String,
-        last_assistant_text: &mut String,
+        latest_state_text: &mut String,
         decisions: &mut Vec<Decision>,
         blockers: &mut Vec<String>,
         open_threads: &mut Vec<String>,
@@ -386,7 +386,7 @@ impl HandoffGenerator {
                         next_steps,
                         lessons,
                     );
-                    *last_assistant_text = screened;
+                    *latest_state_text = screened;
                 }
             }
             SessionMessage::ToolResult {
@@ -468,7 +468,6 @@ impl HandoffGenerator {
         entries: impl IntoIterator<Item = &'a SessionEntry>,
     ) -> HandoffDocument {
         let mut goal = String::new();
-        let mut current_state = String::new();
         let mut decisions = Vec::new();
         let mut failed_approaches = Vec::new();
         let mut files_touched_map: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
@@ -479,7 +478,7 @@ impl HandoffGenerator {
         let mut compaction_count = 0;
 
         let mut turn_index = 0usize;
-        let mut last_assistant_text = String::new();
+        let mut latest_state_text = String::new();
 
         for entry in entries {
             match entry {
@@ -500,7 +499,7 @@ impl HandoffGenerator {
                         base,
                         turn_index,
                         &mut goal,
-                        &mut last_assistant_text,
+                        &mut latest_state_text,
                         &mut decisions,
                         &mut blockers,
                         &mut open_threads,
@@ -512,8 +511,9 @@ impl HandoffGenerator {
                 }
                 SessionEntry::BranchSummary(bs) => {
                     let screened = screen_secrets(&bs.summary);
-                    current_state.push_str(&screened);
-                    current_state.push('\n');
+                    if !screened.trim().is_empty() {
+                        latest_state_text = screened;
+                    }
                 }
                 _ => {}
             }
@@ -523,18 +523,13 @@ impl HandoffGenerator {
             goal = "No explicit initial goal detected in session history.".to_string();
         }
 
-        if current_state.is_empty() {
-            if last_assistant_text.is_empty() {
-                current_state = "Session active, awaiting next instructions.".to_string();
-            } else {
-                // Take the last few lines or first paragraph of last assistant message
-                current_state = last_assistant_text
-                    .lines()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-        }
+        // A branch summary is state at its position, not an override for all
+        // later assistant replies. Empty replies leave the last useful state.
+        let current_state = if latest_state_text.is_empty() {
+            "Session active, awaiting next instructions.".to_string()
+        } else {
+            latest_state_text.lines().take(6).collect::<Vec<_>>().join("\n")
+        };
 
         let files_touched = files_touched_map
             .into_iter()
@@ -624,6 +619,56 @@ impl HandoffGenerator {
         }
     }
 
+    /// Recognize a Markdown task marker without stripping markers from the
+    /// task's own text. Completion retires an earlier pending item; a later
+    /// unchecked occurrence explicitly reopens it.
+    fn task_status(trimmed: &str) -> Option<(bool, &str)> {
+        let mut chars = trimmed.chars();
+        if !matches!(chars.next()?, '-' | '*' | '+') {
+            return None;
+        }
+        let rest = chars.as_str();
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let (complete, item) = if let Some(item) = rest.strip_prefix("[ ]") {
+            (false, item)
+        } else if let Some(item) = rest.strip_prefix("[x]").or_else(|| rest.strip_prefix("[X]")) {
+            (true, item)
+        } else {
+            return None;
+        };
+        if !item.is_empty() && !item.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some((complete, item.trim()))
+    }
+
+    /// Examples inside fenced code are not handoff directives. Match both the
+    /// delimiter and its width so an inner triple fence cannot close a longer
+    /// enclosing fence, and keep unterminated code excluded through EOF.
+    fn unfenced_lines(text: &str) -> impl Iterator<Item = &str> {
+        let mut fence: Option<(char, usize)> = None;
+        text.lines().filter(move |line| {
+            let trimmed = line.trim();
+            if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+                let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+                if let Some((opening, minimum)) = fence {
+                    if marker == opening && width >= minimum && trimmed[width..].trim().is_empty() {
+                        fence = None;
+                    }
+                    return false;
+                }
+                if width >= 3 {
+                    fence = Some((marker, width));
+                    return false;
+                }
+            }
+            fence.is_none()
+        })
+    }
+
     fn parse_structured_line(
         trimmed: &str,
         ref_str: &str,
@@ -633,12 +678,10 @@ impl HandoffGenerator {
         next_steps: &mut Vec<String>,
         lessons: &mut Vec<String>,
     ) {
-        if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") {
-            let item = trimmed
-                .trim_start_matches("- [ ]")
-                .trim_start_matches("- [x]")
-                .trim();
-            if !item.is_empty() && !next_steps.iter().any(|s| s == item) {
+        if let Some((complete, item)) = Self::task_status(trimmed) {
+            if complete {
+                next_steps.retain(|pending| pending != item);
+            } else if !item.is_empty() && !next_steps.iter().any(|s| s == item) {
                 next_steps.push(item.to_string());
             }
         } else if let Some(rest) = trimmed.strip_prefix("Decision:") {
@@ -677,7 +720,7 @@ impl HandoffGenerator {
         next_steps: &mut Vec<String>,
         lessons: &mut Vec<String>,
     ) {
-        for line in text.lines() {
+        for line in Self::unfenced_lines(text) {
             Self::parse_structured_line(
                 line.trim(),
                 ref_str,
@@ -731,7 +774,7 @@ impl HandoffGenerator {
         files_touched: &mut BTreeMap<String, (String, BTreeSet<String>)>,
         lessons: &mut Vec<String>,
     ) {
-        for line in summary.lines() {
+        for line in Self::unfenced_lines(summary) {
             Self::parse_compaction_line(
                 line.trim(),
                 decisions,
@@ -866,6 +909,112 @@ mod tests {
     use super::*;
     use crate::model::{AssistantMessage, ContentBlock, TextContent, ToolCall, UserContent};
     use crate::session::{CompactionEntry, EntryBase, MessageEntry, SessionEntry, SessionMessage};
+
+    fn handoff_note_entry(id: &str, text: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(None, id.to_string()),
+            message: SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    ..AssistantMessage::default()
+                },
+            },
+        })
+    }
+
+    fn handoff_notes(notes: &[&str]) -> HandoffDocument {
+        let entries = notes
+            .iter()
+            .enumerate()
+            .map(|(index, text)| handoff_note_entry(&format!("note-{index}"), text))
+            .collect::<Vec<_>>();
+        HandoffGenerator::generate_from_entries("task-state", &entries)
+    }
+
+    #[test]
+    fn completed_work_is_not_reissued_as_a_next_step() {
+        let document = handoff_notes(&[
+            "- [ ] Apply migration\n- [ ] Validate service\n- [ ] Apply migration",
+            "- [x] Apply migration\n* [X] Validate service\n+ [x] Already completed",
+        ]);
+        assert!(document.next_steps.is_empty());
+        assert!(!document.to_markdown().contains("- [ ] Apply migration"));
+    }
+
+    #[test]
+    fn reopened_tasks_preserve_order_and_do_not_close_similarly_named_work() {
+        let document = handoff_notes(&[
+            "- [ ] Test\n- [ ] Test deployment\n- [x] Test",
+            "+ [ ] Test\n* [ ] Test deployment\n- [ ] - [x] literal task text",
+        ]);
+        assert_eq!(document.next_steps, ["Test deployment", "Test", "- [x] literal task text"]);
+    }
+
+    #[test]
+    fn task_markers_require_a_markdown_boundary_and_keep_unicode_text() {
+        let document = handoff_notes(&[
+            "-[ ] Not a list\n- [ ]not a task\n- [x]not a task\n- [ ]\n- [ ] 验证 🦀\n*\t[ ]\tDeploy safely",
+            "- [X] 验证 🦀",
+        ]);
+        assert_eq!(document.next_steps, ["Deploy safely"]);
+    }
+
+    #[test]
+    fn fenced_examples_cannot_add_or_complete_handoff_work() {
+        let document = handoff_notes(&[
+            "- [ ] Keep real work\n````markdown\n- [x] Keep real work\n```\n- [ ] Still code\n~~~~\nDecision: still code\n````\n~~~text\nBlocker: sample blocker\nQuestion: sample question\nLesson: sample lesson\n~~~\nDecision: Real decision\n- [ ] Real next step\n```unclosed\n- [ ] Incomplete example",
+        ]);
+        assert_eq!(document.next_steps, ["Keep real work", "Real next step"]);
+        assert_eq!(document.decisions.len(), 1);
+        assert_eq!(document.decisions[0].decision, "Real decision");
+        assert!(document.blockers.is_empty());
+        assert!(document.open_threads.is_empty());
+        assert!(document.lessons.is_empty());
+    }
+
+    #[test]
+    fn latest_nonempty_branch_or_assistant_state_wins_in_chronological_order() {
+        let summary = |id: &str, text: &str| {
+            SessionEntry::BranchSummary(crate::session::BranchSummaryEntry {
+                base: EntryBase::new(None, id.to_string()),
+                from_id: "other-branch".to_string(),
+                summary: text.to_string(),
+                details: None,
+                from_hook: None,
+            })
+        };
+        let mut entries = vec![
+            summary("branch", "Old branch context"),
+            handoff_note_entry("latest", "Implementation finished\nReady for verification"),
+            handoff_note_entry("empty", "  \n"),
+        ];
+        let document = HandoffGenerator::generate_from_entries("state", &entries);
+        assert_eq!(document.current_state, "Implementation finished\nReady for verification");
+        entries.push(summary("new-branch", "New branch context"));
+        assert_eq!(
+            HandoffGenerator::generate_from_entries("state", &entries).current_state,
+            "New branch context"
+        );
+    }
+
+    #[test]
+    fn compaction_code_examples_do_not_become_historical_decisions_or_files() {
+        let entries = [SessionEntry::Compaction(CompactionEntry {
+            base: EntryBase::new(None, "summary".to_string()),
+            summary: "```text\nDecision: sample decision\nFile touched: sample.rs\nFailed approach: sample failure\nLesson: sample lesson\n```\nDecision: actual decision\nFile touched: actual.rs".to_string(),
+            first_kept_entry_id: "retained".to_string(),
+            tokens_before: 100,
+            details: None,
+            from_hook: None,
+        })];
+        let document = HandoffGenerator::generate_from_entries("summary", &entries);
+        assert_eq!(document.decisions.len(), 1);
+        assert_eq!(document.decisions[0].decision, "actual decision");
+        assert_eq!(document.files_touched.len(), 1);
+        assert_eq!(document.files_touched[0].path, "actual.rs");
+        assert!(document.failed_approaches.is_empty());
+        assert!(document.lessons.is_empty());
+    }
 
     fn append_handoff_branch(session: &mut Session, marker: &str) -> String {
         let user = session.append_message(SessionMessage::User {
