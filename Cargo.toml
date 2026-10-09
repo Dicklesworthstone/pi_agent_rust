@@ -218,10 +218,10 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # Rev bumps only through an alignment pass per the fork's UPSTREAM_BASE.md;
 # the local [patch] workflow at the bottom of this file redirects to a local
 # checkout for development.
-# NOTE(rev): the Windows backend requires a fork rev >= feat/windows-sandbox;
-# until that lands on the fork's mainline, Windows builds need the [patch]
-# redirect. Unix builds are unchanged by this rev.
-sandbox-runtime = { git = "https://github.com/defims/sandbox-runtime-rs", rev = "f662a4c5be5c23a9c720ce7a2b53101ca799073b" }
+# Rev 7653002 = fork feat/windows-sandbox head, windows-gate CI green
+# (MSVC check/tests/clippy + unix regression + real-runner smoke:
+# install/readiness/exec-kill probes/uninstall).
+sandbox-runtime = { git = "https://github.com/defims/sandbox-runtime-rs", rev = "7653002b8ec7ddfa133c244d73dbb2b709d6f6eb" }
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
