@@ -962,7 +962,21 @@ pub fn create_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
-    let provider = create_transport_provider(entry, extensions)?;
+    create_provider_with_auth(entry, extensions, None)
+}
+
+/// Create a provider bound to the runtime's credential file and command workspace.
+///
+/// Bedrock retains an immutable source binding, not the store's credential
+/// entries. This keeps reused provider instances (including compaction and
+/// other auxiliary requests) in the same workspace while allowing on-disk
+/// credentials to change between requests. Other providers are unchanged.
+pub fn create_provider_with_auth(
+    entry: &ModelEntry,
+    extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
+) -> Result<Arc<dyn Provider>> {
+    let provider = create_transport_provider(entry, extensions, auth)?;
     if entry.model.cost.is_priced() {
         Ok(Arc::new(PricedProvider {
             inner: provider,
@@ -977,6 +991,7 @@ pub fn create_provider(
 fn create_transport_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
 ) -> Result<Arc<dyn Provider>> {
     if let Some(manager) = extensions
         && let Some(provider_id) =
@@ -1093,13 +1108,17 @@ fn create_transport_provider(
                     .with_client(client),
             ))
         }
-        ProviderRouteKind::NativeBedrock => Ok(Arc::new(
-            bedrock::BedrockProvider::new(&entry.model.id)
+        ProviderRouteKind::NativeBedrock => {
+            let provider = bedrock::BedrockProvider::new(&entry.model.id)
                 .with_provider_name(&entry.model.provider)
                 .with_base_url(&entry.model.base_url)
                 .with_compat(entry.compat.clone())
-                .with_client(client),
-        )),
+                .with_client(client);
+            Ok(Arc::new(match auth {
+                Some(auth) => provider.with_auth_storage(auth)?,
+                None => provider,
+            }))
+        }
         ProviderRouteKind::NativeAzure => {
             let runtime = resolve_azure_provider_runtime(entry)?;
             Ok(Arc::new(

@@ -173,7 +173,11 @@ async fn finish_selection_inner(
     let api_key = app::resolve_api_key(auth, inputs.cli, &selection.model_entry)
         .map_err(|error| Error::validation(error.to_string()))?;
     ensure_startup_active(&cx)?;
-    let provider = crate::providers::create_provider(&selection.model_entry, Some(&manager))?;
+    let provider = crate::providers::create_provider_with_auth(
+        &selection.model_entry,
+        Some(&manager),
+        Some(auth),
+    )?;
 
     // Complete every fallible operation before publishing the final identity.
     // Keep the extension-installed request hook and other stream options; only

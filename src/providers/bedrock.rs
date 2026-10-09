@@ -160,6 +160,7 @@ pub struct BedrockProvider {
     base_url_override: Option<String>,
     compat: Option<CompatConfig>,
     auth_path_override: Option<PathBuf>,
+    auth_command_working_directory: Option<PathBuf>,
 }
 
 impl BedrockProvider {
@@ -176,6 +177,7 @@ impl BedrockProvider {
             base_url_override: None,
             compat: None,
             auth_path_override: None,
+            auth_command_working_directory: None,
         }
     }
 
@@ -210,6 +212,26 @@ impl BedrockProvider {
         self
     }
 
+    /// Bind request-time credential reloads to this runtime's auth source.
+    ///
+    /// Only the file path and command workspace are retained. Each request
+    /// reloads the file so login, logout, and credential rotation stay visible
+    /// even when the provider is shared with auxiliary completion clients.
+    /// Relative auth paths are anchored when this binding is created.
+    ///
+    /// # Errors
+    /// Returns an error if a relative auth path cannot be anchored.
+    pub fn with_auth_storage(mut self, auth: &AuthStorage) -> Result<Self> {
+        self.auth_path_override = Some(if auth.path().is_absolute() {
+            auth.path().to_path_buf()
+        } else {
+            std::env::current_dir()?.join(auth.path())
+        });
+        self.auth_command_working_directory =
+            auth.command_working_directory().map(Path::to_path_buf);
+        Ok(self)
+    }
+
     #[cfg(test)]
     #[must_use]
     fn with_auth_path(mut self, path: impl AsRef<Path>) -> Self {
@@ -224,10 +246,15 @@ impl BedrockProvider {
     }
 
     fn load_auth_storage(&self) -> std::result::Result<AuthStorage, AuthStorageLoadFailure> {
-        AuthStorage::load_with_lock_timeout_classified(
+        let mut auth = AuthStorage::load_with_lock_timeout_classified(
             self.auth_path(),
             AUTH_RESOLUTION_LOCK_TIMEOUT,
-        )
+        )?;
+        if let Some(cwd) = &self.auth_command_working_directory {
+            auth.set_command_working_directory(cwd)
+                .map_err(AuthStorageLoadFailure::Other)?;
+        }
+        Ok(auth)
     }
 
     async fn resolve_auth_context(&self, options: &StreamOptions) -> Result<BedrockAuthContext> {

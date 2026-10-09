@@ -14193,9 +14193,10 @@ impl AgentSession {
             None
         } else {
             Some(
-                crate::providers::create_provider(
+                crate::providers::create_provider_with_auth(
                     &entry,
                     self.extensions.as_ref().map(ExtensionRegion::manager),
+                    self.auth_storage.as_ref(),
                 )
                 .map_err(|e| {
                     Error::validation(format!(
@@ -14848,9 +14849,10 @@ impl AgentSession {
         let Some((entry, key)) = Self::resolve_restore_target(request)? else {
             return Ok(None);
         };
-        let provider_impl = match crate::providers::create_provider(
+        let provider_impl = match crate::providers::create_provider_with_auth(
             &entry,
             self.extensions.as_ref().map(ExtensionRegion::manager),
+            Some(request.auth),
         ) {
             Ok(provider_impl) => provider_impl,
             Err(err) if request.strict_invariants => return Err(err),
@@ -15088,9 +15090,10 @@ impl AgentSession {
             if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
                 continue;
             }
-            let Ok(provider) = crate::providers::create_provider(
+            let Ok(provider) = crate::providers::create_provider_with_auth(
                 &entry,
                 self.extensions.as_ref().map(ExtensionRegion::manager),
+                Some(attempt.auth),
             ) else {
                 continue;
             };

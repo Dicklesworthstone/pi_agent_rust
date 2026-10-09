@@ -86,7 +86,7 @@ impl BtwClient {
         if !credentialed {
             return None;
         }
-        crate::providers::create_provider(entry, None)
+        crate::providers::create_provider_with_auth(entry, None, Some(auth))
             .ok()
             .map(|provider| {
                 std::sync::Arc::new(Self::new(provider, key).with_secrets_settings(secrets))

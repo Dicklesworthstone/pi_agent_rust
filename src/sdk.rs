@@ -3271,7 +3271,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
-    let provider = providers::create_provider(&selection.model_entry, None)
+    let provider = providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
     let api_key = if has_extensions {

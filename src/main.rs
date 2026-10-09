@@ -1419,7 +1419,7 @@ fn advisor_options(
         );
         return None;
     }
-    match pi::providers::create_provider(&entry, None) {
+    match pi::providers::create_provider_with_auth(&entry, None, Some(auth)) {
         Ok(provider) => Some(pi::advisor::AdvisorOptions {
             provider,
             label: format!("{}/{}", entry.model.provider, entry.model.id),
@@ -2519,7 +2519,8 @@ async fn run(
         &config,
     )?;
     let provider =
-        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
+        providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
+            .map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
 
@@ -2896,12 +2897,13 @@ async fn run(
         selection = updated_selection;
         resolved_key = updated_key;
 
-        let provider = providers::create_provider(
+        let provider = providers::create_provider_with_auth(
             &selection.model_entry,
             agent_session
                 .extensions
                 .as_ref()
                 .map(ExtensionRegion::manager),
+            Some(&auth),
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);

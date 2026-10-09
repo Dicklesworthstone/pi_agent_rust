@@ -1038,6 +1038,19 @@ pub(super) fn load_runtime_auth(
     Ok(auth)
 }
 
+pub(super) fn create_runtime_provider(
+    entry: &ModelEntry,
+    extensions: Option<&crate::extensions::ExtensionManager>,
+    cwd: &std::path::Path,
+) -> crate::error::Result<std::sync::Arc<dyn crate::provider::Provider>> {
+    // Match load_runtime_auth's file identity without requiring a successful
+    // read now. A provider-owned reload must retain the workspace even if the
+    // file was unavailable during model selection and becomes readable later.
+    let mut auth = crate::auth::AuthStorage::empty_at(crate::config::Config::auth_path());
+    auth.set_command_working_directory(cwd)?;
+    providers::create_provider_with_auth(entry, extensions, Some(&auth))
+}
+
 pub(super) fn resolve_model_key_from_default_auth(
     entry: &ModelEntry,
     cwd: &std::path::Path,
@@ -1461,8 +1474,11 @@ impl PiApp {
         }
 
         let resolved_key_opt = resolved_key_for(&next);
-        let provider_impl = match crate::providers::create_provider(&next, self.extensions.as_ref())
-        {
+        let provider_impl = match crate::providers::create_provider_with_auth(
+            &next,
+            self.extensions.as_ref(),
+            Some(auth),
+        ) {
             Ok(p) => p,
             Err(err) => {
                 self.status_message = Some(format!("Auto-switch failed: {err}"));
@@ -1674,8 +1690,9 @@ impl PiApp {
                 ));
             }
 
-            let provider_impl = providers::create_provider(&target_entry, self.extensions.as_ref())
-                .map_err(|err| err.to_string())?;
+            let provider_impl =
+                create_runtime_provider(&target_entry, self.extensions.as_ref(), &self.cwd)
+                    .map_err(|err| err.to_string())?;
             agent_guard
                 .handle
                 .session_mut()
@@ -3137,13 +3154,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
-            Ok(provider_impl) => provider_impl,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return None;
-            }
-        };
+        let provider_impl =
+            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
+                Ok(provider_impl) => provider_impl,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return None;
+                }
+            };
 
         if let Err(message) =
             self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref(), "command")
@@ -3745,7 +3763,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
         if let Some(entry) = entry {
             let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
-            if let Ok(provider_impl) = providers::create_provider(&entry, self.extensions.as_ref())
+            if let Ok(provider_impl) =
+                create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
             {
                 let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
             }

@@ -418,7 +418,11 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
+        let provider_impl = match super::commands::create_runtime_provider(
+            &next,
+            self.extensions.as_ref(),
+            &self.cwd,
+        ) {
             Ok(provider_impl) => provider_impl,
             Err(err) => {
                 self.status_message = Some(err.to_string());

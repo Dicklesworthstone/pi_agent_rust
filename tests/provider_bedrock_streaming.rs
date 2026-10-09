@@ -686,3 +686,206 @@ fn request_rewrite_receives_the_streaming_route_and_reaches_the_wire() {
         1024
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn saved_workspace_auth_reload_survives_auxiliary_requests() {
+    const CHILD_ROOT: &str = "PI_BEDROCK_WORKSPACE_RELOAD_CHILD";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        check_saved_workspace_auth_reload(&std::path::PathBuf::from(root));
+        eprintln!("BEDROCK_WORKSPACE_AUTH_RELOAD_COMPLETE");
+        return;
+    }
+
+    // Scope ambient AWS credentials and cwd changes to a single-test child;
+    // no other integration test can observe its temporary process context.
+    let root = tempfile::tempdir().expect("fixture root");
+    let root_path = root.path().canonicalize().expect("canonical fixture root");
+    let invocation = root_path.join("invocation");
+    std::fs::create_dir(&invocation).expect("invocation workspace");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "saved_workspace_auth_reload_survives_auxiliary_requests",
+            "--nocapture",
+        ])
+        .current_dir(&invocation)
+        .env(CHILD_ROOT, &root_path)
+        .env("PI_CODING_AGENT_DIR", root_path.join("global"))
+        .env("AWS_REGION", "us-east-1");
+    for name in [
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_DEFAULT_REGION",
+        pi::vcr::VCR_ENV_MODE,
+    ] {
+        child.env_remove(name);
+    }
+    let log_path = root_path.join("child.log");
+    let log = std::fs::File::create(&log_path).expect("child diagnostic log");
+    let mut child = child
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("clone child diagnostic log"))
+        .stderr(log)
+        .spawn()
+        .expect("run isolated Bedrock auth regression");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(format!("polling child failed: {error}")),
+            Ok(None) if Instant::now() >= deadline => {
+                break Err("child exceeded its 60-second deadline".to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let trace = std::fs::read_to_string(&log_path).expect("read child diagnostics");
+    let status = result.unwrap_or_else(|reason| {
+        panic!("Bedrock auth regression failed: {reason}\n{trace}")
+    });
+    assert!(
+        status.success() && trace.contains("BEDROCK_WORKSPACE_AUTH_RELOAD_COMPLETE"),
+        "Bedrock auth regression failed: {status}\n{trace}",
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn check_saved_workspace_auth_reload(root: &std::path::Path) {
+    use pi::auth::{AuthCredential, AuthStorage};
+
+    let invocation = root.join("invocation");
+    let saved_workspace = root.join("saved-project");
+    let later_workspace = root.join("later-project");
+    let global_dir = root.join("global");
+    for directory in [&saved_workspace, &later_workspace, &global_dir] {
+        std::fs::create_dir(directory).expect("fixture directory");
+    }
+    for (directory, token) in [
+        (&invocation, "invocation-token"),
+        (&saved_workspace, "saved-workspace-rotated-token"),
+        (&later_workspace, "later-workspace-token"),
+    ] {
+        std::fs::write(directory.join("credential-first.txt"), "initial-token\n")
+            .expect("initial command credential");
+        std::fs::write(directory.join("credential-rotated.txt"), format!("{token}\n"))
+            .expect("rotated command credential");
+    }
+
+    let session_path = root.join("saved-session.jsonl");
+    let mut header = pi::session::SessionHeader::new();
+    header.cwd = saved_workspace.display().to_string();
+    std::fs::write(
+        &session_path,
+        format!("{}\n", serde_json::to_string(&header).expect("session header")),
+    )
+    .expect("saved session");
+    let saved = run(pi::session_workdir::inspect_saved_session_workdir(&session_path))
+        .expect("inspect saved workspace");
+    let runtime_cwd = saved.resolve_runtime_cwd(None).expect("saved runtime cwd");
+    assert_eq!(runtime_cwd, saved_workspace);
+    assert_eq!(std::env::current_dir().unwrap(), invocation);
+
+    let mut default_auth = AuthStorage::empty_at(pi::config::Config::auth_path());
+    default_auth.set(
+        "amazon-bedrock",
+        AuthCredential::BearerToken {
+            token: "wrong-default-auth-file".to_string(),
+        },
+    );
+    default_auth.save().expect("conflicting default auth file");
+
+    let relative_auth_path = std::path::PathBuf::from("selected-auth.json");
+    let mut auth = AuthStorage::empty_at(relative_auth_path.clone());
+    auth.set_command_working_directory(&runtime_cwd)
+        .expect("scope selected auth");
+    auth.set(
+        "amazon-bedrock",
+        AuthCredential::ApiKey {
+            key: "$CMD:cat credential-first.txt".to_string(),
+        },
+    );
+    auth.save().expect("initial selected auth");
+    let server = Server::new(200, EVENT_STREAM, complete_text());
+    let mut entry = pi::models::ad_hoc_model_entry("amazon-bedrock", "model-a")
+        .expect("Bedrock model entry");
+    entry.model.base_url.clone_from(&server.base);
+    entry.model.cost.input = 1.0;
+    let provider = pi::providers::create_provider_with_auth(&entry, None, Some(&auth))
+        .expect("bind runtime provider");
+    assert!(
+        provider.model_cost().is_some(),
+        "retain catalog pricing wrapper"
+    );
+
+    // The provider must reload credential entries while retaining its original
+    // source and workspace. Changing the command also avoids its intended
+    // short-lived command-result cache masking the credential rotation.
+    auth.set(
+        "amazon-bedrock",
+        AuthCredential::ApiKey {
+            key: "$CMD:cat credential-rotated.txt".to_string(),
+        },
+    );
+    auth.save().expect("rotate selected auth on disk");
+    auth.set_command_working_directory(&later_workspace)
+        .expect("change original store scope after provider binding");
+
+    let mut conflicting_auth = AuthStorage::empty_at(later_workspace.join(&relative_auth_path));
+    conflicting_auth.set(
+        "amazon-bedrock",
+        AuthCredential::BearerToken {
+            token: "wrong-relative-auth-file".to_string(),
+        },
+    );
+    conflicting_auth.save().expect("conflicting relative auth file");
+    std::env::set_current_dir(&later_workspace).expect("change isolated child cwd");
+
+    // Rewind/compaction creates fresh StreamOptions and clones the provider.
+    // No API key or workspace is passed through the summary options.
+    let span = context().messages.into_owned();
+    let summary = run(pi::checkpoint::summarize_span(
+        &span,
+        Arc::clone(&provider),
+        "",
+        &pi::compaction::ResolvedCompactionSettings::default(),
+        &pi::compaction::CompactionPrivacy::default(),
+    ))
+    .expect("summary with reloaded command credential");
+    assert_eq!(summary, "ok");
+    let request = server.finish();
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer saved-workspace-rotated-token"),
+        "auxiliary reload must use the bound auth file and saved project",
+    );
+    assert_eq!(std::env::current_dir().unwrap(), later_workspace);
+
+    let mut missing_workspace_auth =
+        AuthStorage::load(invocation.join(relative_auth_path)).expect("load selected auth");
+    missing_workspace_auth
+        .set_command_working_directory(&root.join("missing-project"))
+        .expect("bind unavailable workspace");
+    let missing_provider =
+        pi::providers::create_provider_with_auth(&entry, None, Some(&missing_workspace_auth))
+            .expect("provider construction does not run credential commands");
+    let error = run(async {
+        missing_provider
+            .stream(&context(), &StreamOptions::default())
+            .await
+            .err()
+            .expect("unavailable bound workspace must reject auth before HTTP")
+    });
+    assert!(matches!(&error, pi::error::Error::Auth(_)), "{error}");
+    assert_eq!(std::env::current_dir().unwrap(), later_workspace);
+}

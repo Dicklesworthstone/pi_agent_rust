@@ -1,4 +1,6 @@
-use super::commands::{model_entry_matches, resolve_model_key_from_default_auth};
+use super::commands::{
+    create_runtime_provider, model_entry_matches, resolve_model_key_from_default_auth,
+};
 use super::*;
 use crate::models::model_requires_configured_credential;
 
@@ -158,13 +160,14 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
-            Ok(p) => p,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return;
-            }
-        };
+        let provider_impl =
+            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
+                Ok(p) => p,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return;
+                }
+            };
 
         if let Err(message) = self.switch_active_model(
             &next,

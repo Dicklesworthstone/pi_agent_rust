@@ -64,7 +64,7 @@ impl TitleClient {
             return None;
         }
         Some(Arc::new(Self {
-            provider: crate::providers::create_provider(entry, None).ok()?,
+            provider: crate::providers::create_provider_with_auth(entry, None, Some(auth)).ok()?,
             options: StreamOptions {
                 api_key,
                 headers: entry.headers.clone(),

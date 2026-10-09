@@ -1500,6 +1500,14 @@ impl AuthStorage {
         Ok(())
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn command_working_directory(&self) -> Option<&Path> {
+        self.command_working_directory.as_deref()
+    }
+
     /// A credential reload inherits the active runtime's command context.
     /// Credential entries and persistence identity remain owned by this store.
     pub(crate) fn inherit_command_working_directory(&mut self, previous: &Self) {

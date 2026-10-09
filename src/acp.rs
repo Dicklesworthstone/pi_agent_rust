@@ -1589,6 +1589,8 @@ fn build_acp_session(
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
     let session_id = session.header.id.clone();
+    let mut auth = options.auth.clone();
+    auth.set_command_working_directory(&cwd)?;
 
     let mut cli = options.launch.selection_cli()?;
     let enabled_tools = acp_enabled_tools(&cli);
@@ -1612,7 +1614,7 @@ fn build_acp_session(
             model_entry.model.provider, model_entry.model.provider,
         )));
     }
-    let api_key = crate::app::resolve_api_key(&options.auth, &cli, model_entry)
+    let api_key = crate::app::resolve_api_key(&auth, &cli, model_entry)
         .map_err(|error| Error::provider("acp", error.to_string()))?;
     let stream_options =
         crate::app::build_stream_options(&options.config, api_key, &selection, &session);
@@ -1627,7 +1629,7 @@ fn build_acp_session(
         available_models.push(model_entry.clone());
     }
 
-    let provider = providers::create_provider(model_entry, None)
+    let provider = providers::create_provider_with_auth(model_entry, None, Some(&auth))
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     let system_prompt = build_acp_system_prompt(
@@ -1683,7 +1685,7 @@ fn build_acp_session(
     let agent_session = AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
         .with_runtime_handle(options.runtime_handle.clone())
         .with_model_registry(registry.clone())
-        .with_auth_storage(options.auth.clone())
+        .with_auth_storage(auth.clone())
         .with_api_key_override(cli.api_key.clone());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
@@ -1694,7 +1696,7 @@ fn build_acp_session(
             .with_failover(FailoverOptions::from_config(
                 &options.config,
                 registry.models().to_vec(),
-                options.auth.clone(),
+                auth,
                 cli.api_key,
             ));
 
@@ -3390,6 +3392,92 @@ mod tests {
             ));
             assert!(pending_permissions_empty(&pending));
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_acp_sessions_resolve_command_credentials_in_each_workspace() {
+        let root = tempfile::tempdir().expect("credential fixture");
+        let host = root.path().join("host");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for (cwd, key) in [
+            (&host, "host-credential"),
+            (&first, "first-workspace-credential"),
+            (&second, "second-workspace-credential"),
+        ] {
+            std::fs::create_dir(cwd).expect("credential workspace");
+            std::fs::write(cwd.join("credential.txt"), format!("{key}\n"))
+                .expect("workspace credential");
+        }
+        // A unique custom provider avoids ambient credentials without changing
+        // process-global environment or cwd. Construction never streams.
+        let provider_id = format!("acp-workspace-command-{}", uuid::Uuid::new_v4());
+        let mut auth = AuthStorage::empty_at(root.path().join("auth.json"));
+        auth.set(
+            &provider_id,
+            crate::auth::AuthCredential::ApiKey {
+                key: "$CMD:cat credential.txt".to_string(),
+            },
+        );
+        auth.set_command_working_directory(&host)
+            .expect("scope host auth");
+        assert_eq!(auth.api_key(&provider_id).as_deref(), Some("host-credential"));
+        let mut entry = test_model_entry(&provider_id, "acp-credential-fixture");
+        entry.model.api = "openai-completions".to_string();
+        entry.model.base_url = "https://acp-credential.invalid/v1".to_string();
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let options = AcpOptions {
+            config: Config::default(),
+            launch: AcpLaunchOptions {
+                provider: Some(provider_id.clone()),
+                model: Some(entry.model.id.clone()),
+                no_tools: true,
+                no_context_files: true,
+                system_prompt: Some("ACP credential isolation fixture".to_string()),
+                ..AcpLaunchOptions::default()
+            },
+            available_models: vec![entry.clone()],
+            model_registry: ModelRegistry::from_entries_for_tests(vec![entry]),
+            auth,
+            oauth_refresh_failures: Vec::new(),
+            runtime_handle: runtime.handle(),
+            session_dir: None,
+            skills_prompt: None,
+        };
+        let build = |cwd: &std::path::Path| {
+            let (session, save_enabled) = new_acp_session(None, &options.config, cwd);
+            build_acp_session(session, save_enabled, cwd.to_path_buf(), &options, None)
+                .expect("construct ACP session")
+        };
+        let (first_id, first_state) = build(&first);
+        let (second_id, second_state) = build(&second);
+        assert_ne!(first_id, second_id);
+        for (state, cwd, expected) in [
+            (&first_state, &first, "first-workspace-credential"),
+            (&second_state, &second, "second-workspace-credential"),
+        ] {
+            let handle = state.agent_session.as_ref().expect("configured agent");
+            assert_eq!(state.cwd, *cwd);
+            assert_eq!(
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some(expected)
+            );
+            // Reloads must inherit the same context retained by this session,
+            // rather than the host store or the most recently created session.
+            let mut reloaded = options.auth.clone();
+            handle.session().scope_auth_storage(&mut reloaded);
+            assert_eq!(reloaded.command_working_directory(), Some(cwd.as_path()));
+            assert_eq!(reloaded.api_key(&provider_id).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            options.auth.command_working_directory(),
+            Some(host.as_path())
+        );
+        assert_eq!(
+            options.auth.api_key(&provider_id).as_deref(),
+            Some("host-credential")
+        );
     }
 
     // ── session/set_model + session/set_config_option (#105) ──────────────

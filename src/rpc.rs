@@ -2795,12 +2795,13 @@ pub async fn run(
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     state.bind_provider_admission(guard.provider_admission_gate());
                     state.ensure_session_advancement_allowed()?;
-                    let provider_impl = providers::create_provider(
+                    let provider_impl = providers::create_provider_with_auth(
                         &entry,
                         guard
                             .extensions
                             .as_ref()
                             .map(crate::extensions::ExtensionRegion::manager),
+                        Some(&options.auth),
                     )?;
                     let current_thinking = guard
                         .agent
@@ -4360,12 +4361,13 @@ pub async fn run(
                                     requested_model.0, requested_model.1
                                 )));
                             }
-                            let provider_impl = providers::create_provider(
+                            let provider_impl = providers::create_provider_with_auth(
                                 &entry,
                                 guard
                                     .extensions
                                     .as_ref()
                                     .map(crate::extensions::ExtensionRegion::manager),
+                                Some(&options.auth),
                             )?;
                             let (thinking, normalization_changed) =
                                 normalize_resumed_session_model(&mut new_session, &entry);
@@ -4630,12 +4632,13 @@ pub async fn run(
                                 requested_model.0, requested_model.1
                             )));
                         }
-                        let provider_impl = providers::create_provider(
+                        let provider_impl = providers::create_provider_with_auth(
                             &entry,
                             guard
                                 .extensions
                                 .as_ref()
                                 .map(crate::extensions::ExtensionRegion::manager),
+                            Some(&options.auth),
                         )?;
                         let (thinking, _) =
                             normalize_resumed_session_model(&mut new_session, &entry);
@@ -14928,12 +14931,13 @@ async fn cycle_model_for_rpc(
         )));
     }
 
-    let provider_impl = crate::providers::create_provider(
+    let provider_impl = crate::providers::create_provider_with_auth(
         &next_entry,
         guard
             .extensions
             .as_ref()
             .map(crate::extensions::ExtensionRegion::manager),
+        Some(&options.auth),
     )?;
     let desired_thinking = if is_scoped {
         options.scoped_models[next_index]

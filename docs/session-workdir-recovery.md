@@ -50,9 +50,22 @@ MCP credential helpers use the selected workspace. Credential reloads after
 login/logout, model selection, resource reload, usage queries, and SDK fallback
 selection retain that runtime workspace. A caller-supplied fallback auth store
 keeps its credentials and storage path while inheriting the active runtime's
-command context. Bedrock's provider-owned request-time reload of legacy
-`auth.json` command credentials still needs the runtime workspace threaded
-through it.
+command context.
+
+Bedrock providers bind their request-time credential reloads to the runtime's
+auth-file path and command workspace. Each request reloads credential entries
+from that file, so rotation, login, and logout remain visible to ordinary turns,
+compaction, checkpoint summaries, and auxiliary clients. Native startup, model
+switches, fallback and restore paths pass their selected auth source into
+provider construction. ACP scopes credentials to each editor session's cwd;
+memory reflection uses the project's root.
+
+The binding belongs to the constructed provider. Programmatically replacing
+an `AgentSession` auth store with a different file affects subsequent provider
+construction; an existing Bedrock provider continues to reload its original
+source. Standalone callers can use `providers::create_provider_with_auth` or
+`BedrockProvider::with_auth_storage` with a scoped `AuthStorage`. The original
+`create_provider` API retains its standalone behavior.
 
 Forks created through classic, FTUI, and RPC inherit the original cwd,
 additional roots, direct parent-session provenance, and the latest workdir
@@ -155,6 +168,11 @@ Additional regressions cover RPC shell execution and session switching,
 classic resume and new sessions, prompt files, and credential command cwd.
 The auth adoption regression executes real credential commands in distinct
 workspaces and checks active and fallback credentials through logout/relogin.
+The Bedrock wire regression binds a saved workspace and a relative custom auth
+file, rotates its command credential, changes the isolated caller's cwd, and
+checks an auxiliary summary's actual HTTP authorization. It also checks refusal
+of a missing credential workspace. ACP construction regressions check distinct
+command credentials for two editor sessions while preserving the host context.
 Fork regressions cover saved/reopened context, root forks with empty history,
 off-branch lazy targets and bindings, actual classic/FTUI/RPC entrypoints,
 source immutability, and refusal of a stale runtime workspace.
@@ -172,6 +190,7 @@ dsr wrap cargo test --test session_workdir_recovery
 dsr wrap cargo test --features sqlite-sessions --test session_workdir_recovery
 dsr wrap cargo test --test session_index_tests
 dsr wrap cargo test --features sqlite-sessions --test session_index_tests
+dsr wrap cargo test --test provider_bedrock_streaming
 dsr wrap cargo test --example session_workdir
 dsr wrap cargo fmt --check
 ```

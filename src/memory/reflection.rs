@@ -123,11 +123,12 @@ impl ReflectTool {
             root,
             trust.trusted,
         )?;
-        let auth = AuthStorage::load(Config::auth_path())?;
+        let mut auth = AuthStorage::load(Config::auth_path())?;
+        auth.set_command_working_directory(root)?;
         let registry = ModelRegistry::load(&auth, None);
         let entry = select_model(&config, &registry)?;
         let options = options_for_entry(&auth, &entry)?;
-        let provider = crate::providers::create_provider(&entry, None)
+        let provider = crate::providers::create_provider_with_auth(&entry, None, Some(&auth))
             .map_err(|error| safe_error(&error.to_string(), &options))?;
         let privacy = self
             .privacy
