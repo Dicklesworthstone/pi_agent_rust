@@ -131,12 +131,33 @@ fn read_entries_with_limits(
     conn: &SqliteConnection,
     limits: ReadLimits,
 ) -> Result<Vec<SessionEntry>> {
+    let mut entries = Vec::new();
+    visit_entry_json_with_limits(conn, limits, |json| {
+        entries.push(attachments::decode_entry(conn, json)?);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// Inspect stored metadata with the same bounded row admission and sequence
+/// checks as native loading, without decoding conversation attachments.
+pub(super) fn visit_entry_json(
+    conn: &SqliteConnection,
+    visit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    visit_entry_json_with_limits(conn, ReadLimits::default(), visit)
+}
+
+fn visit_entry_json_with_limits(
+    conn: &SqliteConnection,
+    limits: ReadLimits,
+    mut visit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let row_limit = i64::try_from(limits.rows)
         .ok()
         .filter(|limit| *limit > 0)
         .ok_or_else(|| Error::session("SQLite read page limit must be positive"))?;
     let mut after = None;
-    let mut entries = Vec::new();
     loop {
         let metadata = match after {
             None => map_sqlite_result(conn.query_sync(
@@ -151,7 +172,7 @@ fn read_entries_with_limits(
             ))?,
         };
         if metadata.is_empty() {
-            return Ok(entries);
+            return Ok(());
         }
         let first = after
             .map_or(Some(1), |seq: i64| seq.checked_add(1))
@@ -184,9 +205,9 @@ fn read_entries_with_limits(
             if json.len() != expected {
                 return Err(Error::session("SQLite entry length changed during read"));
             }
-            // Borrow the row's string: hydration must not first clone a large
-            // inline payload just to pass it to the native decoder.
-            entries.push(attachments::decode_entry(conn, json.as_str())?);
+            // Borrow the row's string; neither native loading nor metadata
+            // discovery needs a second copy of a large inline payload.
+            visit(json.as_str())?;
         }
         after = Some(last);
     }

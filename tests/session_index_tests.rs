@@ -9,6 +9,7 @@ use common::TestHarness;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
 use pi::session::{Session, SessionHeader, SessionMessage};
 use pi::session_index::SessionIndex;
+use pi::session_workdir::{WORKDIR_BINDING_TYPE, attach_session_workdir};
 use std::fs::{self, File};
 use std::io::Write;
 use std::time::Duration;
@@ -41,6 +42,273 @@ fn make_assistant_message(text: &str) -> SessionMessage {
             timestamp: 0,
         },
     }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn saved_attachment_discovery_round_trip(extension: &str) {
+    let harness = TestHarness::new("saved_attachment_discovery_round_trip");
+    let sessions_root = harness.temp_path("sessions");
+    let original = harness.temp_path("original");
+    let replacement = harness.temp_path("replacement");
+    let next = harness.temp_path("next");
+    fs::create_dir_all(&original).expect("original workspace");
+    fs::create_dir_all(&next).expect("next workspace");
+    let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+    session.header.cwd = original.display().to_string();
+    session.header.parent_session = Some("parent-provenance.jsonl".to_string());
+    let path = sessions_root
+        .join(pi::session::encode_cwd(&original))
+        .join(format!("recovered.{extension}"));
+    session.path = Some(path.clone());
+    session.append_message(make_user_message("before the move"));
+    session.save().await.expect("save original session");
+    let id = session.header.id.clone();
+    let index = SessionIndex::for_sessions_root(&sessions_root);
+    assert_eq!(
+        index
+            .list_sessions(Some(&session.header.cwd))
+            .expect("original listing")
+            .len(),
+        1
+    );
+
+    fs::rename(&original, &replacement).expect("move the project");
+    assert!(attach_session_workdir(&mut session, &replacement).expect("attach replacement"));
+    session.save().await.expect("persist attachment");
+    let replacement_key = replacement
+        .canonicalize()
+        .expect("canonical replacement")
+        .display()
+        .to_string();
+    assert_eq!(
+        index
+            .list_sessions(Some(&replacement_key))
+            .expect("replacement listing")
+            .len(),
+        1
+    );
+    assert!(
+        index
+            .list_sessions(Some(&session.header.cwd))
+            .expect("old listing")
+            .is_empty()
+    );
+    assert!(
+        !sessions_root
+            .join(pi::session::encode_cwd(&replacement))
+            .exists()
+    );
+
+    drop(session);
+    let mut reopened = Session::open(path.to_str().expect("UTF-8 source"))
+        .await
+        .expect("reopen original file");
+    reopened.session_dir = Some(sessions_root.clone());
+    assert_eq!(reopened.header.id, id);
+    assert_eq!(reopened.header.cwd, original.display().to_string());
+    assert_eq!(
+        reopened.header.parent_session.as_deref(),
+        Some("parent-provenance.jsonl")
+    );
+    assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
+    reopened.append_message(make_user_message("after reopening"));
+    reopened
+        .save()
+        .await
+        .expect("incremental save retains attachment");
+    reopened.set_additional_roots(std::slice::from_ref(&next));
+    reopened
+        .save()
+        .await
+        .expect("header rewrite retains attachment");
+    let listed = index
+        .list_sessions(Some(&replacement_key))
+        .expect("listing after both save paths");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].message_count, 2);
+
+    #[cfg(feature = "tui")]
+    {
+        let listed =
+            pi::session_picker::list_sessions_for_project(&replacement, Some(&sessions_root));
+        assert_eq!(
+            listed.len(),
+            1,
+            "picker discovers a file stored under its original workspace"
+        );
+        assert_eq!(listed[0].path, path.display().to_string());
+        assert!(
+            pi::session_picker::list_sessions_for_project(&original, Some(&sessions_root))
+                .is_empty()
+        );
+    }
+
+    assert!(attach_session_workdir(&mut reopened, &next).expect("reattach again"));
+    reopened.save().await.expect("persist second attachment");
+    let next_key = next
+        .canonicalize()
+        .expect("canonical next")
+        .display()
+        .to_string();
+    assert!(
+        index
+            .list_sessions(Some(&replacement_key))
+            .expect("prior binding listing")
+            .is_empty()
+    );
+    assert_eq!(
+        index
+            .list_sessions(Some(&next_key))
+            .expect("latest listing")
+            .len(),
+        1
+    );
+    index.reindex_all().expect("rebuild from saved stores");
+    let rebuilt = index.list_sessions(None).expect("rebuilt metadata");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].cwd, next_key);
+    assert_eq!(rebuilt[0].id, id);
+    assert_eq!(rebuilt[0].path, path.display().to_string());
+
+    fs::rename(&next, harness.temp_path("temporarily-unavailable")).expect("move bound workspace");
+    index
+        .reindex_all()
+        .expect("read-only discovery does not require workspace health");
+    assert_eq!(
+        index
+            .list_sessions(Some(&next_key))
+            .expect("unavailable workspace metadata")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn jsonl_saved_reattachment_moves_discovery_without_moving_the_session() {
+    run_async_test(saved_attachment_discovery_round_trip("jsonl"));
+}
+
+#[test]
+fn indexing_a_partial_v2_view_keeps_the_binding_outside_its_loaded_branch() {
+    run_async_test(async {
+        let harness = TestHarness::new("indexing_partial_v2_workdir");
+        let sessions_root = harness.temp_path("sessions");
+        let replacement = harness.temp_path("replacement");
+        fs::create_dir_all(&replacement).expect("replacement workspace");
+        let path = sessions_root.join("lazy.jsonl");
+        let mut source = Session::create_with_dir(Some(sessions_root.clone()));
+        source.header.cwd = harness.temp_path("original").display().to_string();
+        source.path = Some(path.clone());
+        source.append_message(make_user_message("branch with the attachment"));
+        attach_session_workdir(&mut source, &replacement).expect("attach off-branch workspace");
+        source.reset_leaf();
+        source.append_message(make_user_message("selected independent branch"));
+        source.save().await.expect("save complete source");
+        let original_bytes = fs::read(&path).expect("source bytes");
+        let store = pi::session::create_v2_sidecar_from_jsonl(&path).expect("create V2 sidecar");
+        let (mut partial, diagnostics) = Session::open_from_v2(
+            &store,
+            source.header.clone(),
+            pi::session::V2OpenMode::ActivePath,
+        )
+        .expect("open just the selected branch");
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert_eq!(partial.entries.len(), 1);
+        assert!(!partial.entries.iter().any(|entry| matches!(
+            entry,
+            pi::session::SessionEntry::Custom(custom) if custom.custom_type == WORKDIR_BINDING_TYPE
+        )));
+        partial.path = Some(path.clone());
+        partial.session_dir = Some(sessions_root.clone());
+        let selected_leaf = partial.leaf_id().map(str::to_owned);
+
+        let index = SessionIndex::for_sessions_root(&sessions_root);
+        index.index_session(&partial).expect("repair index from lazy view");
+        let listed = index.list_sessions(None).expect("all indexed metadata");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].cwd,
+            replacement.canonicalize().expect("canonical").display().to_string()
+        );
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].id, source.header.id);
+        assert_eq!(partial.entries.len(), 1, "indexing must not hydrate live state");
+        assert_eq!(partial.leaf_id(), selected_leaf.as_deref());
+        assert_eq!(fs::read(&path).expect("source after indexing"), original_bytes);
+    });
+}
+
+#[cfg(feature = "sqlite-sessions")]
+#[test]
+fn sqlite_saved_reattachment_moves_discovery_without_moving_the_session() {
+    run_async_test(saved_attachment_discovery_round_trip("sqlite"));
+}
+
+async fn malformed_saved_binding_is_not_discoverable(extension: &str) {
+    let harness = TestHarness::new("malformed_saved_binding_is_not_discoverable");
+    let sessions_root = harness.temp_path("sessions");
+    let replacement = harness.temp_path("replacement");
+    fs::create_dir_all(&replacement).expect("replacement");
+    let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+    session.header.cwd = harness.temp_path("missing-original").display().to_string();
+    session.path = Some(sessions_root.join(format!("malformed.{extension}")));
+    session.append_message(make_user_message("preserve this transcript"));
+    attach_session_workdir(&mut session, &replacement).expect("valid initial binding");
+    session.save().await.expect("save valid binding");
+    let index = SessionIndex::for_sessions_root(&sessions_root);
+    assert_eq!(
+        index.list_sessions(None).expect("valid binding indexed").len(),
+        1
+    );
+
+    session.append_custom_entry(
+        WORKDIR_BINDING_TYPE.to_string(),
+        Some(serde_json::json!({
+            "originalCwd": session.header.cwd,
+            "previousCwd": replacement,
+            "cwd": "relative-and-invalid"
+        })),
+    );
+    session
+        .save()
+        .await
+        .expect("preserve transcript containing invalid metadata");
+    assert!(
+        index
+            .list_sessions(None)
+            .expect("old derived row evicted")
+            .is_empty()
+    );
+    index.reindex_all().expect("rebuild skips malformed binding");
+    assert!(
+        index
+            .list_sessions(None)
+            .expect("no revived old binding")
+            .is_empty()
+    );
+    let reopened = Session::open(
+        session
+            .path
+            .as_ref()
+            .expect("source path")
+            .to_str()
+            .expect("UTF-8 source"),
+    )
+    .await
+    .expect("transcript remains available for inspection");
+    assert_eq!(reopened.header.id, session.header.id);
+    assert!(pi::session_workdir::inspect_session_workdir(&reopened).is_err());
+}
+
+#[test]
+fn jsonl_invalid_latest_binding_evicts_the_previous_workspace() {
+    run_async_test(malformed_saved_binding_is_not_discoverable("jsonl"));
+}
+
+#[cfg(feature = "sqlite-sessions")]
+#[test]
+fn sqlite_invalid_latest_binding_evicts_the_previous_workspace() {
+    run_async_test(malformed_saved_binding_is_not_discoverable("sqlite"));
 }
 
 /// Create a minimal valid session JSONL file

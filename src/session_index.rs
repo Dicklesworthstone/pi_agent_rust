@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
+use crate::session_workdir::{WORKDIR_BINDING_PREFIX, binding_path_from_entries};
 use fsqlite::SqliteValue as Value;
 use serde::Deserialize;
 use std::borrow::Borrow;
@@ -19,11 +20,14 @@ const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
 // recovery when a process is killed while updating the session index.
 const SESSION_INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_INDEX_GENERATION_FILENAME: &str = "session-index.generation";
+const SESSION_INDEX_METADATA_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub path: String,
     pub id: String,
+    /// Effective discovery directory, including the latest saved attachment.
+    /// The session header retains its original cwd as provenance.
     pub cwd: String,
     pub timestamp: String,
     pub message_count: u64,
@@ -71,20 +75,29 @@ impl SessionIndex {
         // paths use `index_session_snapshot_at_generation` with a ticket taken
         // before persistence and may advance a contiguous generation instead.
         note_session_namespace_change(self.sessions_root())?;
-        let meta = build_meta(path, &session.header, &session.entries)?;
+        let meta = if session.has_partial_v2_hydration() {
+            // A V2 tail can omit an off-branch attachment. Read its original
+            // metadata without hydrating the conversation or mutating caches.
+            build_meta_from_file(path)?
+        } else {
+            build_meta(path, &session.header, &session.entries)?
+        };
         self.upsert_meta(meta, None)
     }
 
     /// Update index metadata for an already-persisted session snapshot.
     ///
     /// This avoids requiring a full `Session` clone when callers already have
-    /// header + aggregate entry stats. Because the snapshot is already on disk,
+    /// header, persisted entries, and aggregate entry stats. The entries must
+    /// include off-branch metadata so the latest workspace binding is retained.
+    /// Because the snapshot is already on disk,
     /// this conservative repair invalidates global freshness instead of
     /// pretending to have witnessed the preceding write.
     pub fn index_session_snapshot(
         &self,
         path: &Path,
         header: &SessionHeader,
+        entries: &[SessionEntry],
         message_count: u64,
         name: Option<String>,
     ) -> Result<()> {
@@ -93,7 +106,9 @@ impl SessionIndex {
         let meta = SessionMeta {
             path: path.display().to_string(),
             id: header.id.clone(),
-            cwd: header.cwd.clone(),
+            cwd: binding_path_from_entries(header, entries)?
+                .display()
+                .to_string(),
             timestamp: header.timestamp.clone(),
             message_count,
             last_modified_ms,
@@ -107,6 +122,7 @@ impl SessionIndex {
         &self,
         path: &Path,
         header: &SessionHeader,
+        entries: &[SessionEntry],
         message_count: u64,
         name: Option<String>,
         generation: u64,
@@ -115,7 +131,9 @@ impl SessionIndex {
         let meta = SessionMeta {
             path: path.display().to_string(),
             id: header.id.clone(),
-            cwd: header.cwd.clone(),
+            cwd: binding_path_from_entries(header, entries)?
+                .display()
+                .to_string(),
             timestamp: header.timestamp.clone(),
             message_count,
             last_modified_ms,
@@ -192,6 +210,45 @@ impl SessionIndex {
             }
             Ok(result)
         })
+    }
+
+    /// Discover a workspace through the derived index, falling back to the
+    /// managed session namespace if that cache cannot be read or repaired.
+    /// A recovered session need not live in this workspace's storage folder.
+    pub(crate) fn discover_sessions(&self, cwd: &str) -> Vec<SessionMeta> {
+        let indexed = (|| -> Result<Vec<SessionMeta>> {
+            self.reindex_if_stale(Duration::from_secs(60))?;
+            let mut sessions = self.list_sessions(Some(cwd))?;
+            if sessions.is_empty() {
+                self.reindex_all()?;
+                sessions = self.list_sessions(Some(cwd))?;
+            }
+            Ok(sessions)
+        })();
+        match indexed {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(error = %error, "Session index unavailable; reading saved metadata");
+                walk_sessions(self.sessions_root())
+                    .into_iter()
+                    .filter_map(|path| {
+                        let path = path.ok()?;
+                        match build_meta_from_file(&path) {
+                            Ok(meta) if meta.cwd == cwd => Some(meta),
+                            Ok(_) => None,
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %error,
+                                    "Skipping invalid session metadata"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 
     pub fn delete_session_path(&self, path: &Path) -> Result<()> {
@@ -610,6 +667,7 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     sessions_root: &Path,
     path: &Path,
     header: &SessionHeader,
+    entries: &[SessionEntry],
     message_count: u64,
     name: Option<String>,
     generation: Option<u64>,
@@ -620,21 +678,33 @@ pub(crate) fn enqueue_session_index_snapshot_update(
 
     let index = SessionIndex::for_sessions_root(&sessions_root);
     let result = if let Some(generation) = generation {
-        index.index_session_snapshot_at_generation(&path, &header, message_count, name, generation)
-    } else {
-        let meta = session_file_stats(&path).map(|(last_modified_ms, size_bytes)| SessionMeta {
-            path: path.display().to_string(),
-            id: header.id.clone(),
-            cwd: header.cwd.clone(),
-            timestamp: header.timestamp.clone(),
+        index.index_session_snapshot_at_generation(
+            &path,
+            &header,
+            entries,
             message_count,
-            last_modified_ms,
-            size_bytes,
             name,
+            generation,
+        )
+    } else {
+        let meta = binding_path_from_entries(&header, entries).and_then(|cwd| {
+            session_file_stats(&path).map(|(last_modified_ms, size_bytes)| SessionMeta {
+                path: path.display().to_string(),
+                id: header.id.clone(),
+                cwd: cwd.display().to_string(),
+                timestamp: header.timestamp.clone(),
+                message_count,
+                last_modified_ms,
+                size_bytes,
+                name,
+            })
         });
         meta.and_then(|meta| index.upsert_meta(meta, None))
     };
     if let Err(err) = result {
+        // An invalid new binding must not leave the older workspace selectable.
+        // Persistence succeeded; index repair remains best-effort.
+        let _ = index.delete_session_path(&path);
         tracing::warn!(
             sessions_root = %sessions_root.display(),
             path = %path.display(),
@@ -670,6 +740,40 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
         )",
     )
     .map_err(|e| Error::session(format!("Create meta table: {e}")))?;
+
+    let version = conn
+        .query_sync("SELECT value FROM meta WHERE key='metadata_version'", &[])
+        .map_err(|e| Error::session(format!("Read index metadata version: {e}")))?;
+    if !matches!(
+        version.first().and_then(|row| row.get(0)),
+        Some(Value::Text(version)) if version.as_str() == SESSION_INDEX_METADATA_VERSION
+    ) {
+        // Old rows describe header.cwd, even when mtime and size still match.
+        // Invalidate the complete derived snapshot atomically before it can
+        // be reused under the new attachment-aware grouping semantics.
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .map_err(|e| Error::session(format!("BEGIN metadata migration: {e}")))?;
+        let result = (|| -> Result<()> {
+            conn.execute_raw("DELETE FROM sessions")
+                .map_err(|e| Error::session(format!("Clear old session metadata: {e}")))?;
+            record_scan_completeness(conn, false, 0)?;
+            conn.execute_sync(
+                "INSERT OR REPLACE INTO meta (key,value) VALUES ('metadata_version', ?1)",
+                &[Value::from(SESSION_INDEX_METADATA_VERSION)],
+            )
+            .map_err(|e| Error::session(format!("Store index metadata version: {e}")))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn
+                .execute_raw("COMMIT")
+                .map_err(|e| Error::session(format!("COMMIT metadata migration: {e}")))?,
+            Err(err) => {
+                let _ = conn.execute_raw("ROLLBACK");
+                return Err(err);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -881,7 +985,9 @@ fn build_meta(
     Ok(SessionMeta {
         path: path.display().to_string(),
         id: header.id.clone(),
-        cwd: header.cwd.clone(),
+        cwd: binding_path_from_entries(header, entries)?
+            .display()
+            .to_string(),
         timestamp: header.timestamp.clone(),
         message_count,
         last_modified_ms,
@@ -940,14 +1046,20 @@ pub(crate) fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
 }
 
 #[derive(Deserialize)]
-struct PartialEntry {
-    #[serde(default)]
-    r#type: String,
-    #[serde(default)]
-    name: Option<String>,
+struct PartialEntry<'a> {
+    #[serde(borrow)]
+    r#type: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    name: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow, rename = "customType")]
+    custom_type: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    data: Option<&'a serde_json::value::RawValue>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
+    crate::session::ensure_session_file_readable(path)?;
     let file = File::open(path)
         .map_err(|err| Error::session(format!("Read session file {}: {err}", path.display())))?;
     let mut reader = BufReader::new(file);
@@ -971,19 +1083,76 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
 
     let mut message_count = 0u64;
     let mut name = None;
+    let mut binding = Vec::new();
     while let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
         Error::session(format!("Read session entry line {}: {err}", path.display()))
     })? {
-        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
-            match entry.r#type.as_str() {
-                "message" => message_count += 1,
-                "session_info" if entry.name.is_some() => {
-                    name = entry.name;
-                }
-                _ => {}
+        if line_buf.trim().is_empty() {
+            continue;
+        }
+        // A malformed row may be a newer attachment. Never silently revive
+        // an older workspace; audit/export still own damaged-source recovery.
+        let invalid = |err| {
+            Error::session(format!(
+                "PI_SESSION_WORKDIR_SOURCE_INVALID: invalid session metadata {}: {err}",
+                path.display()
+            ))
+        };
+        let entry: PartialEntry<'_> = serde_json::from_str(&line_buf).map_err(invalid)?;
+        let kind: Option<String> = entry
+            .r#type
+            .map(|value| serde_json::from_str(value.get()))
+            .transpose()
+            .map_err(invalid)?;
+        let kind = kind.ok_or_else(|| {
+            Error::session("PI_SESSION_WORKDIR_SOURCE_INVALID: missing session entry type")
+        })?;
+        let custom_type: Option<String> = entry
+            .custom_type
+            .map(|value| serde_json::from_str(value.get()))
+            .transpose()
+            .map_err(invalid)?;
+        if kind == "custom" && custom_type.is_none() {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_SOURCE_INVALID: custom entry is missing its type",
+            ));
+        }
+        if custom_type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with(WORKDIR_BINDING_PREFIX))
+        {
+            if kind != "custom" || entry.data.is_some_and(|data| data.get().len() > 64 * 1024) {
+                return Err(Error::session(
+                    "PI_SESSION_WORKDIR_BINDING_INVALID: invalid workdir metadata",
+                ));
             }
+            let custom: SessionEntry = serde_json::from_str(&line_buf).map_err(|err| {
+                Error::session(format!("PI_SESSION_WORKDIR_BINDING_INVALID: {err}"))
+            })?;
+            binding.clear();
+            binding.push(custom);
+        }
+        match kind.as_str() {
+            "message" => message_count += 1,
+            "session_info" if entry.name.is_some() => {
+                name = entry
+                    .name
+                    .map(|value| serde_json::from_str(value.get()))
+                    .transpose()
+                    .map_err(invalid)?;
+            }
+            "session" => {
+                return Err(Error::session(
+                    "PI_SESSION_WORKDIR_SOURCE_INVALID: duplicate session header",
+                ));
+            }
+            _ => {}
         }
     }
+
+    let cwd = binding_path_from_entries(&header, &binding)?
+        .display()
+        .to_string();
 
     let meta = fs::metadata(path)?;
     let size_bytes = meta.len();
@@ -997,7 +1166,7 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
     Ok(SessionMeta {
         path: path.display().to_string(),
         id: header.id,
-        cwd: header.cwd,
+        cwd,
         timestamp: header.timestamp,
         message_count,
         last_modified_ms,
@@ -1021,7 +1190,7 @@ fn build_meta_from_sqlite(path: &Path) -> Result<SessionMeta> {
     Ok(SessionMeta {
         path: path.display().to_string(),
         id: header.id,
-        cwd: header.cwd,
+        cwd: meta.cwd,
         timestamp: header.timestamp,
         message_count: meta.message_count,
         last_modified_ms,
@@ -1688,7 +1857,7 @@ mod tests {
         let generation_before =
             load_session_namespace_generation(&root).expect("read generation before update");
         let update_handle = std::thread::spawn(move || {
-            let result = updater.index_session_snapshot(&second_path, &second_header, 1, None);
+            let result = updater.index_session_snapshot(&second_path, &second_header, &[], 1, None);
             update_done_tx.send(()).expect("signal update completion");
             result
         });
@@ -2076,7 +2245,7 @@ mod tests {
         let index = SessionIndex::for_sessions_root(&root);
         let header = make_header("sqlite-id", "sqlite-cwd");
         index
-            .index_session_snapshot(&path, &header, 3, Some("sqlite session".to_string()))
+            .index_session_snapshot(&path, &header, &[], 3, Some("sqlite session".to_string()))
             .expect("index sqlite snapshot");
 
         let listed = index
@@ -2106,6 +2275,7 @@ mod tests {
             &root,
             &path,
             &header,
+            &[],
             3,
             Some("Queued Session".to_string()),
             None,
@@ -2610,7 +2780,7 @@ mod tests {
             &[make_user_entry(None, "m2", "later")],
         );
         index
-            .index_session_snapshot(&later_path, &later_header, 1, None)
+            .index_session_snapshot(&later_path, &later_header, &[], 1, None)
             .expect("upsert one later session");
         assert!(
             index.should_reindex(Duration::from_secs(3600)),
@@ -2641,7 +2811,7 @@ mod tests {
         assert!(!index.should_reindex(Duration::from_secs(3600)));
 
         index
-            .index_session_snapshot(&path, &header, 1, None)
+            .index_session_snapshot(&path, &header, &[], 1, None)
             .expect("repair one persisted snapshot");
         assert!(
             index.should_reindex(Duration::from_secs(3600)),
@@ -2679,6 +2849,7 @@ mod tests {
             .index_session_snapshot_at_generation(
                 &later_path,
                 &later_header,
+                &[],
                 1,
                 None,
                 later_generation,
@@ -3301,8 +3472,151 @@ mod tests {
     // ── build_meta_from_jsonl with entries having parse errors ───────
 
     #[test]
-    fn build_meta_from_jsonl_skips_bad_entry_lines() {
-        let harness = TestHarness::new("build_meta_from_jsonl_skips_bad_entry_lines");
+    fn workspace_metadata_version_rebuilds_rows_despite_matching_file_stats() {
+        let harness = TestHarness::new("workspace_metadata_version_rebuilds_rows");
+        let root = harness.temp_path("sessions");
+        let original = harness.temp_path("original");
+        let replacement = harness.temp_path("replacement");
+        fs::create_dir_all(&root).expect("sessions root");
+        fs::create_dir_all(&replacement).expect("replacement workspace");
+        let path = root.join("attached.jsonl");
+        let mut session = Session::in_memory();
+        session.header.cwd = original.display().to_string();
+        crate::session_workdir::attach_session_workdir(&mut session, &replacement)
+            .expect("attach");
+        write_session_jsonl(&path, &session.header, &session.entries);
+        let index = SessionIndex::for_sessions_root(&root);
+        index.reindex_all().expect("seed complete scan");
+        let before = index.list_sessions(None).expect("initial row").remove(0);
+        index
+            .with_lock(|conn| {
+                conn.execute_sync(
+                    "UPDATE sessions SET cwd=?1 WHERE path=?2",
+                    &[
+                        Value::from(session.header.cwd.clone()),
+                        Value::from(before.path.clone()),
+                    ],
+                )
+                .map_err(|err| Error::session(err.to_string()))?;
+                conn.execute_raw("DELETE FROM meta WHERE key='metadata_version'")
+                    .map_err(|err| Error::session(err.to_string()))?;
+                conn.execute_sync(
+                    "UPDATE meta SET value=?1 WHERE key='last_sync_epoch_ms'",
+                    &[Value::from(before.last_modified_ms.saturating_add(1).to_string())],
+                )
+                .map_err(|err| Error::session(err.to_string()))?;
+                Ok(())
+            })
+            .expect("emulate old header-cwd metadata semantics");
+
+        let refreshed = index
+            .refresh_incremental()
+            .expect("semantic migration refresh");
+        assert_eq!(
+            refreshed.reused_files,
+            0,
+            "old semantics cannot reuse matching stats"
+        );
+        assert_eq!(refreshed.refreshed_files, 1);
+        let after = index.list_sessions(None).expect("migrated row").remove(0);
+        assert_eq!(
+            after.cwd,
+            replacement.canonicalize().expect("canonical").display().to_string()
+        );
+        assert_eq!(after.size_bytes, before.size_bytes);
+        assert_eq!(after.last_modified_ms, before.last_modified_ms);
+        assert_eq!(after.path, before.path);
+        assert!(
+            index
+                .list_sessions(Some(&session.header.cwd))
+                .expect("old cwd")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn latest_binding_is_not_hidden_by_malformed_row_or_optional_display_fields() {
+        let harness = TestHarness::new("latest_binding_is_not_hidden");
+        let replacement = harness.temp_path("replacement");
+        fs::create_dir_all(&replacement).expect("replacement");
+        let mut session = Session::in_memory();
+        session.header.cwd = harness.temp_path("original").display().to_string();
+        crate::session_workdir::attach_session_workdir(&mut session, &replacement).expect("attach");
+        let valid =
+            serde_json::to_value(session.entries.last().expect("binding")).expect("binding JSON");
+        for (index, mutation) in [
+            "wrong-type",
+            "missing-type",
+            "null-type",
+            "missing-custom-type",
+            "null-custom-type",
+            "unsupported",
+            "malformed-data",
+            "torn",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = harness.temp_path(format!("invalid-{index}.jsonl"));
+            write_session_jsonl(&path, &session.header, &session.entries);
+            let mut latest = valid.clone();
+            latest["id"] = serde_json::json!(format!("latest-{index}"));
+            match *mutation {
+                "wrong-type" => latest["type"] = serde_json::json!(42),
+                "missing-type" => {
+                    latest.as_object_mut().expect("object").remove("type");
+                }
+                "null-type" => latest["type"] = serde_json::Value::Null,
+                "missing-custom-type" => {
+                    latest.as_object_mut().expect("object").remove("customType");
+                }
+                "null-custom-type" => latest["customType"] = serde_json::Value::Null,
+                "unsupported" => {
+                    latest["customType"] = serde_json::json!("pi.session.workdir.v999");
+                }
+                "malformed-data" => latest["data"] = serde_json::json!({"cwd": "relative"}),
+                _ => {}
+            }
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append later row");
+            if *mutation == "torn" {
+                writeln!(
+                    file,
+                    "{{\"type\":\"custom\",\"customType\":\"pi.session.workdir.v1\","
+                )
+                .expect("torn row");
+            } else {
+                writeln!(file, "{latest}").expect("latest row");
+            }
+            assert!(
+                build_meta_from_file(&path).is_err(),
+                "must not revive old binding after {mutation}"
+            );
+        }
+
+        let path = harness.temp_path("valid-extra-fields.jsonl");
+        let mut valid = valid;
+        valid["name"] = serde_json::json!(42);
+        let mut file = File::create(&path).expect("create valid fixture");
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&session.header).expect("header")
+        )
+        .expect("write header");
+        writeln!(file, "{valid}").expect("unrelated custom name is ignored");
+        let meta = build_meta_from_file(&path).expect("valid attachment with unrelated fields");
+        assert_eq!(
+            meta.cwd,
+            replacement.canonicalize().expect("canonical").display().to_string()
+        );
+    }
+
+    #[test]
+    fn build_meta_from_jsonl_rejects_bad_entry_lines() {
+        let harness = TestHarness::new("build_meta_from_jsonl_rejects_bad_entry_lines");
         let path = harness.temp_path("mixed.jsonl");
 
         let header = make_header("id-mixed", "cwd-mixed");
@@ -3320,9 +3634,9 @@ mod tests {
 
         fs::write(&path, content).expect("write");
 
-        let meta = build_meta_from_jsonl(&path).expect("build_meta");
-        // Bad line is skipped, so we get 2 messages
-        assert_eq!(meta.message_count, 2);
+        let error = build_meta_from_jsonl(&path)
+            .expect_err("malformed later row is not resumable metadata");
+        assert!(error.to_string().contains("PI_SESSION_WORKDIR_SOURCE_INVALID"));
     }
 
     #[test]
@@ -3396,7 +3710,7 @@ mod tests {
 
         let header = make_header("id-overflow", "cwd-overflow");
         let err = index
-            .index_session_snapshot(&path, &header, (i64::MAX as u64) + 1, None)
+            .index_session_snapshot(&path, &header, &[], (i64::MAX as u64) + 1, None)
             .expect_err("out-of-range message_count should error");
         assert!(
             matches!(err, Error::Session(ref msg) if msg.contains("message_count exceeds SQLite INTEGER range")),
@@ -3522,7 +3836,8 @@ mod tests {
 
             let mut header = make_header(&id, &cwd);
             header.timestamp = timestamp.clone();
-            let index_result = index.index_session_snapshot(&path, &header, message_count, name.clone());
+            let index_result =
+                index.index_session_snapshot(&path, &header, &[], message_count, name.clone());
             if message_count > i64::MAX as u64 {
                 prop_assert!(
                     index_result.is_err(),

@@ -253,12 +253,7 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     let project_session_dir = base_dir.join(encode_cwd(cwd));
     let cwd_key = cwd.display().to_string();
     let index = SessionIndex::for_sessions_root(&base_dir);
-    let mut sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
-    let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
-
-    if !project_session_dir_missing && sessions.is_empty() && index.reindex_all().is_ok() {
-        sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
-    }
+    let mut sessions = index.discover_sessions(&cwd_key);
 
     let mut missing_paths = Vec::new();
     let mut by_path = HashMap::new();
@@ -273,10 +268,6 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
 
     for path in &missing_paths {
         let _ = index.delete_session_path(path);
-    }
-
-    if project_session_dir_missing {
-        return Vec::new();
     }
 
     let scanned = scan_sessions_on_disk(&project_session_dir, &by_path);
@@ -300,6 +291,12 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     let mut by_id: HashMap<String, SessionMeta> = HashMap::new();
     let mut anonymous = Vec::new();
     for meta in by_path.into_values() {
+        // The storage folder is historical provenance. Reattachment moves
+        // discovery to the latest binding even when this file was found by
+        // scanning its original project's folder.
+        if Path::new(&meta.cwd) != cwd {
+            continue;
+        }
         if meta.id.is_empty() {
             anonymous.push(meta);
             continue;
@@ -392,26 +389,28 @@ fn scan_sessions_on_disk(
 ) -> ScanSessionsResult {
     let mut out = Vec::new();
     let mut failed_paths = Vec::new();
-    if let Err(err) = crate::session::ensure_session_directory_readable(project_session_dir) {
-        tracing::warn!(
-            path = %project_session_dir.display(),
-            error = %err,
-            "Failed to read project session directory; retaining indexed rows"
-        );
-        return ScanSessionsResult {
-            metas: out,
-            failed_paths,
-        };
+    let mut paths = cached_by_path
+        .keys()
+        .map(PathBuf::from)
+        .collect::<std::collections::HashSet<_>>();
+    if !indexed_session_path_is_missing(project_session_dir) {
+        if let Err(err) = crate::session::ensure_session_directory_readable(project_session_dir) {
+            tracing::warn!(
+                path = %project_session_dir.display(),
+                error = %err,
+                "Failed to read project session directory; retaining indexed rows"
+            );
+            return ScanSessionsResult {
+                metas: out,
+                failed_paths,
+            };
+        }
+        if let Ok(entries) = fs::read_dir(project_session_dir) {
+            paths.extend(entries.flatten().map(|entry| entry.path()));
+        }
     }
-    let Ok(entries) = fs::read_dir(project_session_dir) else {
-        return ScanSessionsResult {
-            metas: out,
-            failed_paths,
-        };
-    };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         if is_session_file_path(&path) {
             let path_key = path.display().to_string();
             if cached_by_path

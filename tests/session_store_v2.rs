@@ -2348,6 +2348,7 @@ fn index_concurrent_session_snapshots(root: &Path) -> PiResult<usize> {
                 index.index_session_snapshot(
                     &path,
                     &header,
+                    &[],
                     1,
                     Some(format!("worker {worker} session {item}")),
                 )?;

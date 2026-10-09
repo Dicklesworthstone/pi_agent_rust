@@ -131,6 +131,8 @@ const MAX_SQLITE_JSON_BYTES: usize = 100 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct SqliteSessionMeta {
     pub header: SessionHeader,
+    /// Effective saved binding used for discovery; `header.cwd` is provenance.
+    pub cwd: String,
     pub message_count: u64,
     pub name: Option<String>,
 }
@@ -380,7 +382,8 @@ fn is_missing_meta_table_error(err: &SqliteError) -> bool {
 
 fn query_session_meta_rows(conn: &SqliteConnection) -> Result<Vec<SqliteRow>> {
     match conn.query_sync(
-        "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name','name_json')",
+        "SELECT key,value FROM pi_session_meta \
+         WHERE key IN ('message_count','name','name_json','workdir_binding_json')",
         &[],
     ) {
         Ok(rows) => Ok(rows),
@@ -406,6 +409,38 @@ fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<Stri
     }
 
     (message_count, name)
+}
+
+fn read_latest_workdir_binding(conn: &SqliteConnection) -> Result<Option<SessionEntry>> {
+    #[derive(serde::Deserialize)]
+    struct EntryKind {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default, rename = "customType")]
+        custom_type: Option<String>,
+    }
+
+    let mut binding = None;
+    entry_io::visit_entry_json(conn, |json| {
+        let kind: EntryKind = parse_sqlite_json("session entry metadata", json)?;
+        if kind.kind == "custom" && kind.custom_type.is_none() {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_SOURCE_INVALID: custom entry is missing its type",
+            ));
+        }
+        if kind.custom_type.as_deref().is_some_and(|kind| {
+            kind.starts_with(crate::session_workdir::WORKDIR_BINDING_PREFIX)
+        }) {
+            if kind.kind != "custom" {
+                return Err(Error::session(
+                    "PI_SESSION_WORKDIR_BINDING_INVALID: workdir metadata is not a custom entry",
+                ));
+            }
+            binding = Some(parse_sqlite_json("session workdir metadata", json)?);
+        }
+        Ok(())
+    })?;
+    Ok(binding)
 }
 
 struct ReconciledEntries {
@@ -537,6 +572,19 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
         "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
         &[SqliteValue::from("name_json"), SqliteValue::from(name_json)],
     ))?;
+    // Persist the latest session-wide record, including explicit absence, in
+    // the same transaction as the entries. Preserve unsupported or malformed
+    // binding data so discovery rejects it instead of reviving an older cwd.
+    let binding_json =
+        serde_json::to_string(&crate::session_workdir::latest_workdir_binding(entries))?;
+    validate_sqlite_json_for_write("session workdir metadata", &binding_json)?;
+    map_sqlite_result(conn.execute_sync(
+        "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+        &[
+            SqliteValue::from("workdir_binding_json"),
+            SqliteValue::from(binding_json),
+        ],
+    ))?;
     Ok(())
 }
 
@@ -595,6 +643,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         let mut name: Option<String> = None;
         let mut name_cached = false;
         let mut legacy_name: Option<String> = None;
+        let mut binding: Option<Option<SessionEntry>> = None;
         for row in meta_rows {
             let key = row_get_string(&row, 0, "key")?;
             let value = row_get_string(&row, 1, "value")?;
@@ -606,6 +655,9 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
                 }
                 "name" if !value.is_empty() => {
                     legacy_name = Some(value);
+                }
+                "workdir_binding_json" => {
+                    binding = Some(parse_sqlite_json("session workdir metadata", &value)?);
                 }
                 _ => {}
             }
@@ -627,11 +679,30 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
             if !name_cached {
                 name = fallback_name;
             }
+            if binding.is_none() {
+                binding = Some(crate::session_workdir::latest_workdir_binding(&entries).cloned());
+            }
         }
+        if binding.is_none() {
+            binding = Some(read_latest_workdir_binding(&conn)?);
+        }
+
+        let binding = binding.flatten().into_iter().collect::<Vec<_>>();
+        if !binding.is_empty()
+            && crate::session_workdir::latest_workdir_binding(&binding).is_none()
+        {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_BINDING_INVALID: invalid cached workdir record",
+            ));
+        }
+        let cwd = crate::session_workdir::binding_path_from_entries(&header, &binding)?
+            .display()
+            .to_string();
 
         snapshot.finish()?;
         Ok(SqliteSessionMeta {
             header,
+            cwd,
             message_count: message_count.unwrap_or(0),
             name,
         })
@@ -1001,6 +1072,7 @@ mod tests {
                 id: "test-session".to_string(),
                 ..SessionHeader::default()
             },
+            cwd: "/workspace".to_string(),
             message_count: 42,
             name: Some("My Session".to_string()),
         };
@@ -1013,6 +1085,7 @@ mod tests {
     fn sqlite_session_meta_no_name() {
         let meta = SqliteSessionMeta {
             header: SessionHeader::default(),
+            cwd: "/workspace".to_string(),
             message_count: 0,
             name: None,
         };
@@ -1228,7 +1301,12 @@ mod tests {
                 timestamp: None,
             },
         });
-        futures::executor::block_on(save_session(&path, &header, &[entry], true))
+        let mut source = crate::session::Session::in_memory();
+        source.header = header.clone();
+        source.entries.push(entry);
+        crate::session_workdir::attach_session_workdir(&mut source, dir.path())
+            .expect("attach metadata fixture");
+        futures::executor::block_on(save_session(&path, &header, &source.entries, true))
             .expect("save large attachment");
         with_write_connection(&path, |conn| {
             // Keep the same byte count so only payload verification, not a
@@ -1243,6 +1321,20 @@ mod tests {
             .expect("listing must not hydrate attachments");
         assert_eq!(meta.message_count, 1);
         assert!(meta.name.is_none());
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_raw(
+                "DELETE FROM pi_session_meta WHERE key='workdir_binding_json'",
+            ))
+        })
+        .expect("emulate metadata written before workspace bindings were cached");
+        let legacy_meta = futures::executor::block_on(load_session_meta(&path))
+            .expect("legacy workspace scan must not hydrate attachment blobs");
+        assert_eq!(
+            legacy_meta.cwd,
+            dir.path().canonicalize().expect("canonical").display().to_string()
+        );
+        assert_eq!(legacy_meta.header.cwd, header.cwd);
+        assert_eq!(legacy_meta.message_count, 1);
         let error = futures::executor::block_on(load_session(&path))
             .expect_err("opening the session verifies the attachment");
         assert!(error.to_string().contains("PI_SESSION_ATTACHMENT_INVALID"));

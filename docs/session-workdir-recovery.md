@@ -4,8 +4,8 @@ The ordinary CLI and SDK resolve a saved session's workspace before loading
 project configuration or constructing tools and extensions. The
 `session_workdir` library module and developer example also provide read-only
 inspection and an explicit locate-and-attach flow for moved projects.
-This implements part of **bd-yutps**; the bead remains open pending executable
-validation and the remaining discovery integration.
+The recovery path covers startup, explicit attachment, forks, and session
+discovery. Executable validation remains pending.
 
 ## Ordinary CLI and SDK use
 
@@ -62,8 +62,24 @@ does not change the fork's selected conversation or editor prefill. Classic
 and RPC refuse a fork before saving or installing it if a newly discovered
 attachment conflicts with the active runtime workspace.
 
-Recent-session indexing under a replacement workspace still requires
-integration; an explicit `--session` path remains available after attachment.
+## Discovery after attachment
+
+`--continue`, `--resume`, and project session pickers group sessions by their
+latest saved workspace attachment. A reattached session remains in its original
+storage folder and can be found from the replacement workspace even when that
+workspace has no encoded session folder. It no longer appears in the original
+workspace's project list.
+
+Managed saves update this effective workspace in the index using the accepted
+persisted entries, including bindings outside the active branch. JSONL and
+SQLite metadata reads use the same binding rules. Older index rows are rebuilt
+under the new grouping semantics; when the index is unavailable, discovery
+scans the managed session namespace without requiring that cache.
+
+Listing does not require the bound workspace to remain available. Launch still
+checks its health. Malformed JSON and invalid or unsupported attachment
+metadata are refused during discovery instead of selecting an older binding.
+Use explicit-path audit tooling to inspect damaged sources.
 
 ## Developer recovery example
 
@@ -142,6 +158,9 @@ workspaces and checks active and fallback credentials through logout/relogin.
 Fork regressions cover saved/reopened context, root forks with empty history,
 off-branch lazy targets and bindings, actual classic/FTUI/RPC entrypoints,
 source immutability, and refusal of a stale runtime workspace.
+Discovery regressions cover effective-workspace indexing, continuation and
+picker lookup without a replacement storage folder, stale index migration,
+unavailable index fallback, lazy off-branch bindings, and malformed metadata.
 They were **not executed in the authoring environment** because DSR was absent.
 No compilation, formatting, Clippy or test pass is claimed.
 
@@ -151,6 +170,8 @@ Suggested focused DSR lanes:
 dsr wrap cargo test --lib session_workdir::tests
 dsr wrap cargo test --test session_workdir_recovery
 dsr wrap cargo test --features sqlite-sessions --test session_workdir_recovery
+dsr wrap cargo test --test session_index_tests
+dsr wrap cargo test --features sqlite-sessions --test session_index_tests
 dsr wrap cargo test --example session_workdir
 dsr wrap cargo fmt --check
 ```

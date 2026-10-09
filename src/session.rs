@@ -1469,6 +1469,7 @@ fn save_jsonl_full_rewrite_blocking(
         sessions_root,
         path,
         &header_to_write,
+        &entries_to_write,
         message_count,
         session_name,
         Some(index_generation),
@@ -1639,6 +1640,7 @@ fn append_jsonl_entries_blocking(
         sessions_root,
         path,
         &disk_session.header,
+        &persisted_entries,
         message_count,
         session_name,
         index_generation,
@@ -3380,16 +3382,14 @@ impl Session {
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         let base_dir_clone = base_dir.clone();
         let cwd_display = cwd.display().to_string();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
-            let indexed_meta = SessionIndex::for_sessions_root(&base_dir_clone)
-                .list_sessions(Some(&cwd_display))
-                .unwrap_or_default();
+            let index = SessionIndex::for_sessions_root(&base_dir_clone);
+            let indexed_meta = index.discover_sessions(&cwd_display);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_meta));
         });
@@ -3407,10 +3407,6 @@ impl Session {
                 path,
                 "Failed to prune missing session from index during picker refresh",
             );
-        }
-
-        if project_session_dir_missing {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, entries.clone()).await?;
@@ -3432,7 +3428,10 @@ impl Session {
             "Failed to refresh session metadata in index during picker refresh",
         );
         merge_scanned_session_entries(&mut by_path, scanned.entries);
-        let mut entries = by_path.into_values().collect::<Vec<_>>();
+        let mut entries = by_path
+            .into_values()
+            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .collect::<Vec<_>>();
 
         if entries.is_empty() {
             return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
@@ -4238,8 +4237,8 @@ impl Session {
 
     /// The most recent openable session in this directory, with its path.
     ///
-    /// `None` means there is nothing to continue: the project directory is
-    /// absent, or no candidate could be opened. Unreadable candidates are
+    /// `None` means there is nothing to continue: no candidate attached to
+    /// this workspace could be opened. Unreadable candidates are
     /// pruned from the index on the way past, which is why this both selects
     /// and opens rather than merely ranking paths.
     async fn resolve_recent_session_in_dir(
@@ -4250,7 +4249,6 @@ impl Session {
         let cwd_display = cwd.display().to_string();
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         // Prefer the session index for fast lookup.
         let base_dir_clone = base_dir.clone();
@@ -4259,15 +4257,7 @@ impl Session {
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let mut indexed_sessions = index
-                .list_sessions(Some(&cwd_display_clone))
-                .unwrap_or_default();
-
-            if indexed_sessions.is_empty() && index.reindex_all().is_ok() {
-                indexed_sessions = index
-                    .list_sessions(Some(&cwd_display_clone))
-                    .unwrap_or_default();
-            }
+            let indexed_sessions = index.discover_sessions(&cwd_display_clone);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_sessions));
         });
@@ -4286,10 +4276,6 @@ impl Session {
                 path,
                 "Failed to prune missing session from index during recent-session refresh",
             );
-        }
-
-        if project_session_dir_missing {
-            return Ok(None);
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
@@ -4313,7 +4299,10 @@ impl Session {
         );
         merge_scanned_session_entries(&mut by_path, scanned.entries);
 
-        let mut candidates = by_path.into_values().collect::<Vec<_>>();
+        let mut candidates = by_path
+            .into_values()
+            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .collect::<Vec<_>>();
         candidates.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
 
         for entry in &candidates {
@@ -4493,6 +4482,10 @@ impl Session {
             }
             Err(error) => self.recover_full_v2_rehydration(v2_root, &error),
         }
+    }
+
+    pub(crate) const fn has_partial_v2_hydration(&self) -> bool {
+        self.v2_partial_hydration
     }
 
     /// Ensure a lazily hydrated V2 session is fully hydrated before persisting.
@@ -4843,6 +4836,7 @@ impl Session {
                     &sessions_root,
                     &path_clone,
                     &self.header,
+                    &self.entries,
                     message_count,
                     session_name,
                     index_generation,
@@ -6371,18 +6365,25 @@ async fn scan_sessions_on_disk(
                 let mut entries = Vec::new();
                 let mut refreshed_entries = Vec::new();
                 let mut failed_paths = Vec::new();
-                ensure_session_directory_readable(&path_buf)
-                    .map_err(|err| Error::Io(Box::new(err)))?;
-                let dir_entries = std::fs::read_dir(&path_buf)
-                    .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
-
                 let known_map: HashMap<PathBuf, SessionPickEntry> =
                     known.into_iter().map(|e| (e.path.clone(), e)).collect();
+                // A recovered session stays in its original storage folder.
+                // Revalidate those indexed paths as well as files physically
+                // stored under this workspace's encoded directory.
+                let mut paths = known_map.keys().cloned().collect::<HashSet<_>>();
+                if !indexed_session_path_is_missing(&path_buf) {
+                    ensure_session_directory_readable(&path_buf)
+                        .map_err(|err| Error::Io(Box::new(err)))?;
+                    let dir_entries = std::fs::read_dir(&path_buf)
+                        .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
+                    for entry in dir_entries {
+                        let entry =
+                            entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
+                        paths.insert(entry.path());
+                    }
+                }
 
-                for entry in dir_entries {
-                    let entry =
-                        entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
-                    let path = entry.path();
+                for path in paths {
                     if is_session_file_path(&path) {
                         // Optimization: if we already have this file indexed and both mtime and
                         // size match, reuse indexed metadata to avoid a full parse.
@@ -6431,60 +6432,11 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     }
 }
 
-#[derive(Deserialize)]
-struct PartialEntry {
-    #[serde(default)]
-    r#type: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let resolved_path = resolve_session_persistence_path(path)?;
-    let file = open_existing_session_file_for_read(&resolved_path)
-        .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
-    let mut reader = BufReader::new(file);
-
-    let Some(header_line) = read_capped_utf8_line(&mut reader)
-        .map_err(|e| Error::session(format!("Failed to read header: {e}")))?
-    else {
-        return Err(Error::session("Empty session file"));
-    };
-
-    let header: SessionHeader =
-        serde_json::from_str(&header_line).map_err(|e| Error::session(format!("{e}")))?;
-    header
-        .validate()
-        .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
-
-    let mut message_count = 0u64;
-    let mut name = None;
-    while let Some(line_content) = read_capped_utf8_line(&mut reader)
-        .map_err(|e| Error::session(format!("Failed to read session entry: {e}")))?
-    {
-        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_content) {
-            match entry.r#type.as_str() {
-                "message" => message_count += 1,
-                "session_info" if entry.name.is_some() => {
-                    name = entry.name;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let (last_modified_ms, size_bytes) = session_file_stats(path)?;
-
-    Ok(SessionPickEntry {
-        path: path.to_path_buf(),
-        id: header.id,
-        cwd: header.cwd,
-        timestamp: header.timestamp,
-        message_count,
-        name,
-        last_modified_ms,
-        size_bytes,
-    })
+    let mut meta = crate::session_index::build_meta_from_file(&resolved_path)?;
+    meta.path = path.display().to_string();
+    Ok(SessionPickEntry::from_meta(meta))
 }
 
 #[cfg(feature = "sqlite-sessions")]
@@ -6502,7 +6454,7 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
     Ok(SessionPickEntry {
         path: path.to_path_buf(),
         id: header.id,
-        cwd: header.cwd,
+        cwd: meta.cwd,
         timestamp: header.timestamp,
         message_count: meta.message_count,
         name: meta.name,
@@ -14061,6 +14013,83 @@ mod tests {
         );
     }
 
+    fn attached_session_discovery_reopens_original_store(extension: &str, index_unavailable: bool) {
+        let _lock = current_dir_lock();
+        let root = tempfile::tempdir().expect("fixture root");
+        let original = root.path().join("original");
+        let replacement = root.path().join("replacement");
+        let sessions_root = root.path().join("sessions");
+        std::fs::create_dir_all(&replacement).expect("replacement workspace");
+        if index_unavailable {
+            // A directory at the cache filename refuses SQLite opens without
+            // changing the authoritative session store or needing permissions
+            // that a privileged test runner might bypass.
+            std::fs::create_dir_all(sessions_root.join("session-index.sqlite"))
+                .expect("block derived cache");
+        }
+        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        session.header.cwd = original.display().to_string();
+        session.header.parent_session = Some("parent-history.jsonl".to_string());
+        let path = sessions_root
+            .join(encode_cwd(&original))
+            .join(format!("recovered.{extension}"));
+        session.path = Some(path.clone());
+        session.append_message(make_test_message("before recovery"));
+        crate::session_workdir::attach_session_workdir(&mut session, &replacement).expect("attach");
+        run_async(async { session.save().await }).expect("persist attachment");
+        let id = session.header.id.clone();
+        drop(session);
+        assert!(!sessions_root.join(encode_cwd(&replacement)).exists());
+        let _guard = CurrentDirGuard::new(&replacement);
+
+        let recent = run_async(Session::recent_session_path_in_dir(Some(&sessions_root)))
+            .expect("resolve recovered session");
+        assert_eq!(recent.as_deref(), Some(path.as_path()));
+        let continued = run_async(Session::continue_recent_in_dir(
+            Some(&sessions_root),
+            &Config::default(),
+        ))
+        .expect("continue recovered session");
+        assert_eq!(continued.header.id, id);
+        assert_eq!(continued.header.cwd, original.display().to_string());
+        assert_eq!(continued.path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            continued.header.parent_session.as_deref(),
+            Some("parent-history.jsonl")
+        );
+        assert_eq!(continued.to_messages().len(), 1);
+        let picked = run_async(Session::resume_with_picker(
+            Some(&sessions_root),
+            &Config::default(),
+            Some("1".to_string()),
+        ))
+        .expect("pick recovered session");
+        assert_eq!(picked.header.id, id);
+        assert_eq!(picked.path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn continue_and_resume_find_jsonl_attached_to_workspace_without_a_storage_folder() {
+        attached_session_discovery_reopens_original_store("jsonl", false);
+    }
+
+    #[test]
+    fn continue_and_resume_find_attached_jsonl_when_index_cannot_open() {
+        attached_session_discovery_reopens_original_store("jsonl", true);
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn continue_and_resume_find_sqlite_attached_to_workspace_without_a_storage_folder() {
+        attached_session_discovery_reopens_original_store("sqlite", false);
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn continue_and_resume_find_attached_sqlite_when_index_cannot_open() {
+        attached_session_discovery_reopens_original_store("sqlite", true);
+    }
+
     /// Nothing to continue is not an error: the classic stack starts a new
     /// session there, and a path-driven surface must be told `None` rather than
     /// a path that does not exist.
@@ -14203,7 +14232,9 @@ mod tests {
         let expected_path = path.display().to_string();
         let cwd = std::path::Path::new(&cwd_display);
         let project_session_dir = temp.path().join(encode_cwd(cwd));
-        let moved_project_dir = temp.path().join("moved-project-dir");
+        // Move outside the managed namespace. A directory renamed *within*
+        // it remains discoverable by the binding-aware namespace refresh.
+        let moved_project_dir = process_cwd.path().join("moved-project-dir");
 
         std::fs::rename(&project_session_dir, &moved_project_dir)
             .expect("move project session dir away");
@@ -14637,7 +14668,7 @@ mod tests {
 
         let err = load_session_meta_jsonl(&session_path).expect_err("invalid utf8 should error");
         assert!(
-            err.to_string().contains("Failed to read session entry"),
+            err.to_string().contains("Read session entry line"),
             "{err}"
         );
     }

@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::session::{Session, SessionEntry, ensure_session_directory_readable};
+use crate::session::{Session, SessionEntry, SessionHeader, ensure_session_directory_readable};
 
 /// Reserved custom-entry type for an explicit workdir attachment.
 pub const WORKDIR_BINDING_TYPE: &str = "pi.session.workdir.v1";
-const WORKDIR_BINDING_PREFIX: &str = "pi.session.workdir.";
+pub(crate) const WORKDIR_BINDING_PREFIX: &str = "pi.session.workdir.";
 
 /// Filesystem health is separate from the user's decision to attach a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -97,14 +97,21 @@ pub struct SessionWorkdir {
     pub health: WorkdirHealth,
 }
 
-fn binding_path(session: &Session) -> Result<PathBuf> {
-    for entry in session.entries.iter().rev() {
-        let SessionEntry::Custom(custom) = entry else {
-            continue;
-        };
-        if !custom.custom_type.starts_with(WORKDIR_BINDING_PREFIX) {
-            continue;
-        }
+pub(crate) fn latest_workdir_binding(entries: &[SessionEntry]) -> Option<&SessionEntry> {
+    entries.iter().rev().find(|entry| {
+        matches!(entry, SessionEntry::Custom(custom)
+            if custom.custom_type.starts_with(WORKDIR_BINDING_PREFIX))
+    })
+}
+
+/// Resolve metadata without requiring the directory to remain available. The
+/// index groups sessions by their current binding while the original header
+/// and persistence location remain provenance.
+pub(crate) fn binding_path_from_entries(
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+) -> Result<PathBuf> {
+    if let Some(SessionEntry::Custom(custom)) = latest_workdir_binding(entries) {
         if custom.custom_type != WORKDIR_BINDING_TYPE {
             return Err(Error::session(
                 "PI_SESSION_WORKDIR_BINDING_UNSUPPORTED: unknown workdir attachment version; \
@@ -120,18 +127,18 @@ fn binding_path(session: &Session) -> Result<PathBuf> {
         let binding: WorkdirBinding =
             serde_json::from_value(custom.data.clone().ok_or_else(invalid)?)
                 .map_err(|_| invalid())?;
-        if binding.original_cwd != session.header.cwd || !Path::new(&binding.cwd).is_absolute() {
+        if binding.original_cwd != header.cwd || !Path::new(&binding.cwd).is_absolute() {
             return Err(invalid());
         }
         return Ok(PathBuf::from(binding.cwd));
     }
-    Ok(PathBuf::from(&session.header.cwd))
+    Ok(PathBuf::from(&header.cwd))
 }
 
 /// Inspect the latest session-wide attachment, falling back only when no
 /// attachment exists. An invalid latest record never revives an older binding.
 pub fn inspect_session_workdir(session: &Session) -> Result<SessionWorkdir> {
-    let bound_cwd = binding_path(session)?;
+    let bound_cwd = binding_path_from_entries(&session.header, &session.entries)?;
     let health = WorkdirHealth::inspect(&bound_cwd);
     Ok(SessionWorkdir {
         original_cwd: PathBuf::from(&session.header.cwd),
@@ -179,7 +186,7 @@ pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bo
         })?
         .to_owned();
     session.ensure_full_v2_hydration_before_save()?;
-    let previous = binding_path(session)?;
+    let previous = binding_path_from_entries(&session.header, &session.entries)?;
     if let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&previous)
         && canonical_path == canonical
     {
