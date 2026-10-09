@@ -290,12 +290,15 @@ pub struct HandoffDeliveryReport {
 pub struct HandoffGenerator;
 
 impl HandoffGenerator {
-    /// Generate a structured handoff document from a loaded `Session`.
+    /// Generate a handoff for the selected branch, not the physical append log.
+    ///
+    /// Abandoned retry attempts and sibling branches stay available in the
+    /// session tree, but must not become the successor's decisions, failures,
+    /// or next steps. Borrow the selected entries so large tool payloads are
+    /// not cloned just to choose the branch.
     #[must_use]
     pub fn generate_from_session(session: &Session) -> HandoffDocument {
-        let session_id = session.header.id.clone();
-        let entries = session.entries.as_slice();
-        Self::generate_from_entries(&session_id, entries)
+        Self::generate_from_entry_refs(&session.header.id, session.entries_for_current_path())
     }
 
     fn extract_user_text(content: &UserContent) -> String {
@@ -451,10 +454,19 @@ impl HandoffGenerator {
         }
     }
 
-    /// Generate a structured handoff document from a list of `SessionEntry` records.
+    /// Generate a handoff from an explicitly selected chronological record list.
+    /// Use [`Self::generate_from_session`] when the session's active leaf should
+    /// select the branch; this lower-level entrypoint analyzes every supplied row.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn generate_from_entries(session_id: &str, entries: &[SessionEntry]) -> HandoffDocument {
+        Self::generate_from_entry_refs(session_id, entries)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn generate_from_entry_refs<'a>(
+        session_id: &str,
+        entries: impl IntoIterator<Item = &'a SessionEntry>,
+    ) -> HandoffDocument {
         let mut goal = String::new();
         let mut current_state = String::new();
         let mut decisions = Vec::new();
@@ -854,6 +866,133 @@ mod tests {
     use super::*;
     use crate::model::{AssistantMessage, ContentBlock, TextContent, ToolCall, UserContent};
     use crate::session::{CompactionEntry, EntryBase, MessageEntry, SessionEntry, SessionMessage};
+
+    fn append_handoff_branch(session: &mut Session, marker: &str) -> String {
+        let user = session.append_message(SessionMessage::User {
+            content: UserContent::Text(format!("Continue {marker}")),
+            timestamp: Some(0),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new(format!(
+                        "Decision: {marker} design\nBlocker: {marker} blocker\nQuestion: {marker} question\nLesson: {marker} lesson\n- [ ] {marker} next step"
+                    ))),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: format!("call-{marker}"),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": format!("{marker}.rs")}),
+                        thought_signature: None,
+                    }),
+                ],
+                ..AssistantMessage::default()
+            },
+        });
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: format!("call-{marker}"),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Error: {marker} read failed"
+            )))],
+            details: None,
+            is_error: true,
+            timestamp: Some(0),
+        });
+        session.append_compaction(
+            format!("Decision: {marker} checkpoint"),
+            user,
+            100,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn session_handoff_excludes_sibling_notes_files_failures_and_checkpoints() {
+        let mut session = Session::in_memory();
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("Shared objective".to_string()),
+            timestamp: Some(0),
+        });
+        let left = append_handoff_branch(&mut session, "left-branch");
+        assert!(session.navigate_to(&root));
+        let right = append_handoff_branch(&mut session, "right-branch");
+        let original = serde_json::to_value(&session.entries).expect("original entries");
+
+        for (leaf, included, excluded) in [
+            (&left, "left-branch", "right-branch"),
+            (&right, "right-branch", "left-branch"),
+        ] {
+            assert!(session.navigate_to(leaf));
+            let document = HandoffGenerator::generate_from_session(&session);
+            assert_eq!(document.goal, "Shared objective");
+            assert_eq!(document.compaction_summaries_count, 1);
+            assert_eq!(document.decisions.len(), 2);
+            assert_eq!(document.failed_approaches.len(), 1);
+            assert_eq!(document.files_touched.len(), 1);
+            assert_eq!(document.files_touched[0].path, format!("{included}.rs"));
+            assert!(document.current_state.contains(included));
+            for rendered in [document.to_markdown(), document.to_json().expect("JSON")] {
+                assert!(rendered.contains(included));
+                assert!(!rendered.contains(excluded), "sibling history leaked: {rendered}");
+            }
+            assert_eq!(serde_json::to_value(&session.entries).unwrap(), original);
+        }
+
+        // Explicit record-list callers retain their deliberately selected input.
+        let all = HandoffGenerator::generate_from_entries(&session.header.id, &session.entries);
+        assert_eq!(all.compaction_summaries_count, 2);
+    }
+
+    #[test]
+    fn root_selection_does_not_handoff_abandoned_history() {
+        let mut session = Session::in_memory();
+        let abandoned = append_handoff_branch(&mut session, "abandoned-branch");
+        session.reset_leaf();
+        let document = HandoffGenerator::generate_from_session(&session);
+        assert_eq!(document.compaction_summaries_count, 0);
+        assert!(document.decisions.is_empty());
+        assert!(document.failed_approaches.is_empty());
+        assert!(document.files_touched.is_empty());
+        assert!(document.next_steps.is_empty());
+        assert!(!document.to_json().unwrap().contains("abandoned-branch"));
+        assert!(session.get_entry(&abandoned).is_some(), "tree history is preserved");
+    }
+
+    #[test]
+    fn persisted_non_tip_selection_remains_the_handoff_branch_after_reopen() {
+        let directory = tempfile::tempdir().expect("session directory");
+        let path = directory.path().join("handoff.jsonl");
+        let mut session = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        session.path = Some(path.clone());
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("Persisted objective".to_string()),
+            timestamp: Some(0),
+        });
+        let selected = append_handoff_branch(&mut session, "selected-branch");
+        assert!(session.navigate_to(&root));
+        let abandoned = append_handoff_branch(&mut session, "newer-abandoned-branch");
+        assert!(session.navigate_to(&selected));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let reopened = runtime.block_on(async {
+            session.save().await.expect("save selected branch");
+            Session::open(path.to_str().expect("UTF-8 fixture path"))
+                .await
+                .expect("reopen selected branch")
+        });
+        assert_eq!(reopened.leaf_id(), Some(selected.as_str()));
+        assert!(reopened.get_entry(&abandoned).is_some());
+        let before = fs::read(&path).expect("saved session bytes");
+        let document = HandoffGenerator::generate_from_session(&reopened);
+        assert_eq!(document.goal, "Persisted objective");
+        let rendered = document.to_json().expect("handoff JSON");
+        assert!(rendered.contains("selected-branch"));
+        assert!(!rendered.contains("newer-abandoned-branch"));
+        assert_eq!(fs::read(&path).unwrap(), before, "handoff must be read-only");
+    }
 
     #[test]
     fn test_handoff_target_parsing() {
