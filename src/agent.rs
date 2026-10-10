@@ -725,11 +725,15 @@ pub struct AgentConfig {
     pub stream_options: StreamOptions,
 
     /// Whether the active model accepts image inputs (bd-cv653.7.6).
-    /// When false, snapcompact compaction frames are stripped from the
-    /// outbound context with a logged degradation reason.
+    /// When false, outbound context drops images. Snapcompact frames are
+    /// stripped first so the summary text and degradation diagnostic stay,
+    /// then every remaining image uses the same placeholder as `block_images`.
+    /// Stored history is not mutated.
     pub model_accepts_images: bool,
 
-    /// Strip image blocks before sending context to providers.
+    /// Strip image blocks from the outbound provider context.
+    /// Either this flag or a text-only model (`model_accepts_images == false`)
+    /// removes images. Only an image-capable, non-blocked context keeps them.
     pub block_images: bool,
 
     /// Fail closed when extension tool hooks error or time out.
@@ -2483,36 +2487,41 @@ impl Agent {
             .messages
             .iter()
             .any(|m| matches!(m, Message::Custom(c) if context_excluded_custom_message(c)));
-        let messages: Cow<'_, [Message]> = if self.config.block_images || has_excluded {
+        // Owned outbound copy when images are blocked, the model is text-only,
+        // or provenance records must be dropped. Text-only models strip
+        // snapcompact frames first (summary text and degradation diagnostic
+        // stay); stored history is not mutated. Capable, non-blocked
+        // requests keep the borrowed fast path.
+        let filter_images = self.config.block_images || !self.config.model_accepts_images;
+        let messages: Cow<'_, [Message]> = if filter_images || has_excluded {
             let mut msgs = self.messages.clone();
             msgs.retain(|m| match m {
                 Message::Custom(c) => !context_excluded_custom_message(c),
                 _ => true,
             });
-            if self.config.block_images {
+            if !self.config.model_accepts_images {
+                let _stats = crate::compaction_snap::strip_snapcompact_images(&mut msgs, false);
+            }
+            if filter_images {
                 let stats = filter_images_for_provider(&mut msgs);
                 if stats.removed_images > 0 {
+                    let reason = outbound_image_filter_reason(
+                        self.config.block_images,
+                        self.config.model_accepts_images,
+                    );
                     tracing::debug!(
                         filtered_images = stats.removed_images,
                         affected_messages = stats.affected_messages,
-                        "Filtered image content from outbound provider context (images.block_images=true)"
+                        block_images = self.config.block_images,
+                        model_accepts_images = self.config.model_accepts_images,
+                        reason,
+                        "Filtered image content from outbound provider context ({reason})"
                     );
                 }
             }
             Cow::Owned(msgs)
         } else {
             Cow::Borrowed(self.messages.as_slice())
-        };
-
-        // Snapcompact vision gating (bd-cv653.7.6): text-only models never see
-        // rasterized compaction frames; the helper logs the degradation with a
-        // stable reason code and never touches user-pasted images.
-        let messages = if self.config.model_accepts_images {
-            messages
-        } else {
-            let mut owned = messages.into_owned();
-            let _stats = crate::compaction_snap::strip_snapcompact_images(&mut owned, false);
-            std::borrow::Cow::Owned(owned)
         };
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
@@ -18255,6 +18264,19 @@ fn log_repair_diagnostics(events: &[crate::extensions_js::ExtensionRepairEvent])
 
 const BLOCK_IMAGES_PLACEHOLDER: &str = "Image reading is disabled.";
 
+/// Why outbound images were removed. Only called when filtering is on.
+const fn outbound_image_filter_reason(
+    block_images: bool,
+    model_accepts_images: bool,
+) -> &'static str {
+    match (block_images, model_accepts_images) {
+        (true, false) => "images.block_images=true; model does not accept images",
+        (true, true) => "images.block_images=true",
+        (false, false) => "model does not accept images",
+        (false, true) => "model accepts images",
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct ImageFilterStats {
     removed_images: usize,
@@ -21074,6 +21096,469 @@ mod tests {
         let context = agent.build_context();
         assert_eq!(context.messages.len(), 1);
         assert_eq!(image_count_in_message(&context.messages[0]), 1);
+    }
+
+    fn agent_with_image_policy(block_images: bool, model_accepts_images: bool) -> Agent {
+        Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                block_images,
+                model_accepts_images,
+                ..AgentConfig::default()
+            },
+        )
+    }
+
+    fn png_block(data: &str) -> ContentBlock {
+        ContentBlock::Image(ImageContent {
+            data: data.to_string(),
+            mime_type: "image/png".to_string(),
+        })
+    }
+
+    fn tool_result_with(id: &str, content: Vec<ContentBlock>, is_error: bool) -> Message {
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error,
+            timestamp: 0,
+        })
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> Message {
+        Message::assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            api: "openai-completions".to_string(),
+            provider: "openai".to_string(),
+            model: "text-only".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
+    fn image_data_present(messages: &[Message], data: &str) -> bool {
+        messages.iter().any(|message| {
+            let blocks: &[ContentBlock] = match message {
+                Message::User(UserMessage {
+                    content: UserContent::Blocks(blocks),
+                    ..
+                }) => blocks,
+                Message::Assistant(assistant) => assistant.content.as_slice(),
+                Message::ToolResult(result) => result.content.as_slice(),
+                Message::User(_) | Message::Custom(_) => return false,
+            };
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(image) if image.data == data))
+        })
+    }
+
+    fn message_has_placeholder(message: &Message) -> bool {
+        let Message::User(UserMessage {
+            content: UserContent::Blocks(blocks),
+            ..
+        }) = message
+        else {
+            return false;
+        };
+        blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text(text) if text.text == BLOCK_IMAGES_PLACEHOLDER)
+        })
+    }
+
+    fn logged_on_target(target: &str, emit: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=info")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(
+            captured
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("utf-8")
+    }
+
+    /// Loopback capture for one OpenAI chat-completions request.
+    ///
+    /// A short read timeout only polls. The deadline is the patience budget,
+    /// so a slow client is not reported as a malformed request.
+    fn read_http_request_body(socket: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set read timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for the request"
+                    );
+                }
+                Err(err) => panic!("read error: {err}"),
+            }
+        }
+        let header_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request header boundary");
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = header_text
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let mut request_body = bytes[header_end + 4..].to_vec();
+        while request_body.len() < content_length {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for the request body"
+                    );
+                }
+                Err(err) => panic!("read error: {err}"),
+            }
+        }
+        String::from_utf8_lossy(&request_body).into_owned()
+    }
+
+    fn write_sse_ok(socket: &mut std::net::TcpStream) {
+        use std::io::Write;
+        let body = [
+            r#"data: {"choices":[{"delta":{}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        response.push_str("Connection: close\r\n\r\n");
+        response.push_str(&body);
+        socket
+            .write_all(response.as_bytes())
+            .expect("write response");
+        socket.flush().expect("flush response");
+    }
+
+    fn capture_openai_request_body(context: &Context<'_>) -> String {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let body = read_http_request_body(&mut socket);
+            tx.send(body).expect("send captured request");
+            write_sse_ok(&mut socket);
+        });
+        let provider = crate::providers::openai::OpenAIProvider::new("text-only-test")
+            .with_base_url(format!("http://{addr}/chat/completions"));
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+        let body = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        handle.join().expect("fixture thread");
+        body
+    }
+
+    #[test]
+    fn build_context_keeps_images_only_when_capable_and_unblocked() {
+        for (block_images, accepts_images, keep) in [
+            (false, true, true),
+            (true, true, false),
+            (false, false, false),
+            (true, false, false),
+        ] {
+            let mut agent = agent_with_image_policy(block_images, accepts_images);
+            agent.add_message(Message::User(UserMessage {
+                content: UserContent::Blocks(vec![sample_image_block()]),
+                timestamp: 0,
+            }));
+            let context = agent.build_context();
+            assert_eq!(
+                image_count_in_message(&context.messages[0]) == 1,
+                keep,
+                "block_images={block_images} accepts_images={accepts_images}"
+            );
+            assert_eq!(message_has_placeholder(&context.messages[0]), !keep);
+            assert_eq!(image_count_in_message(&agent.messages()[0]), 1);
+        }
+    }
+
+    #[test]
+    fn text_only_build_context_strips_images_and_restores_them_when_capable() {
+        let summary = format!(
+            "{}compact body{}",
+            crate::compaction_snap::COMPACTION_SUMMARY_PREFIX,
+            crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX
+        );
+        let mut agent = agent_with_image_policy(false, false);
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new(summary.clone())),
+                png_block("FRAME_PNG"),
+            ]),
+            timestamp: 0,
+        }));
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("hello")),
+                png_block("USER_PNG"),
+            ]),
+            timestamp: 0,
+        }));
+        agent.add_message(tool_result_with(
+            "call_read",
+            vec![
+                ContentBlock::Text(TextContent::new("tool text")),
+                png_block("TOOL_PNG"),
+                ContentBlock::Media(crate::model::MediaContent {
+                    data: "MEDIA_PNG".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            false,
+        ));
+
+        let logged = logged_on_target("snapcompact", || {
+            let context = agent.build_context();
+            assert_eq!(context.messages.len(), 3);
+            assert!(!image_data_present(context.messages.as_ref(), "FRAME_PNG"));
+            assert!(!image_data_present(context.messages.as_ref(), "USER_PNG"));
+            assert!(!image_data_present(context.messages.as_ref(), "TOOL_PNG"));
+            let Message::User(UserMessage {
+                content: UserContent::Blocks(blocks),
+                ..
+            }) = &context.messages[0]
+            else {
+                panic!("summary message");
+            };
+            assert_eq!(blocks.len(), 1, "snapcompact frame removed, text kept");
+            assert!(matches!(&blocks[0], ContentBlock::Text(text) if text.text == summary));
+            assert!(message_has_placeholder(&context.messages[1]));
+            let Message::ToolResult(result) = &context.messages[2] else {
+                panic!("tool result");
+            };
+            assert!(result.content.iter().any(
+                |block| matches!(block, ContentBlock::Text(text) if text.text == "tool text")
+            ));
+            assert!(result.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text(text) if text.text == BLOCK_IMAGES_PLACEHOLDER)
+            }));
+            assert!(result.content.iter().any(
+                |block| matches!(block, ContentBlock::Media(media) if media.data == "MEDIA_PNG")
+            ));
+            assert_eq!(image_count_in_message(&context.messages[2]), 0);
+        });
+        assert!(
+            logged.contains("snapcompact_degraded_non_vision"),
+            "{logged}"
+        );
+        assert!(image_data_present(agent.messages(), "FRAME_PNG"));
+        assert!(image_data_present(agent.messages(), "USER_PNG"));
+        assert!(image_data_present(agent.messages(), "TOOL_PNG"));
+
+        agent.set_model_accepts_images(true);
+        let restored = agent.build_context();
+        assert!(image_data_present(restored.messages.as_ref(), "FRAME_PNG"));
+        assert!(image_data_present(restored.messages.as_ref(), "USER_PNG"));
+        assert!(image_data_present(restored.messages.as_ref(), "TOOL_PNG"));
+    }
+
+    #[test]
+    fn text_only_agent_streams_contiguous_tool_replies_without_images() {
+        let mut agent = agent_with_image_policy(false, false);
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("look")),
+                png_block("USER_SENTINEL"),
+            ]),
+            timestamp: 0,
+        }));
+        agent.add_message(assistant_with_calls(&["call_a", "call_b", "call_c"]));
+        agent.add_message(tool_result_with(
+            "call_a",
+            vec![
+                ContentBlock::Text(TextContent::new("scan complete")),
+                png_block("TOOL_A_SENTINEL"),
+            ],
+            false,
+        ));
+        agent.add_message(tool_result_with(
+            "call_b",
+            vec![
+                ContentBlock::Text(TextContent::new("read failed")),
+                ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            true,
+        ));
+        agent.add_message(tool_result_with(
+            "call_c",
+            vec![png_block("TOOL_C_SENTINEL")],
+            false,
+        ));
+        agent.add_message(user_message("thanks"));
+
+        let context = agent.build_context();
+        assert_eq!(
+            context
+                .messages
+                .iter()
+                .map(image_count_in_message)
+                .sum::<usize>(),
+            0
+        );
+        let body = capture_openai_request_body(&context);
+        assert!(!body.contains("image_url"), "{body}");
+        assert!(!body.contains("USER_SENTINEL"), "{body}");
+        assert!(!body.contains("TOOL_A_SENTINEL"), "{body}");
+        assert!(!body.contains("TOOL_C_SENTINEL"), "{body}");
+        assert!(!body.contains("AAAA"), "{body}");
+        assert!(
+            !body.contains("Attached image(s) from tool result:"),
+            "{body}"
+        );
+        assert!(!body.contains("(see attached image)"), "{body}");
+        let request: Value = serde_json::from_str(&body).expect("request json");
+        let wire = request["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().expect("role"))
+            .collect();
+        assert_eq!(
+            roles.as_slice(),
+            ["user", "assistant", "tool", "tool", "tool", "user"].as_slice()
+        );
+        assert_eq!(wire[2]["tool_call_id"], "call_a");
+        assert_eq!(
+            wire[2]["content"],
+            "scan complete\nImage reading is disabled."
+        );
+        assert_eq!(wire[3]["tool_call_id"], "call_b");
+        assert_eq!(
+            wire[3]["content"],
+            "read failed\n[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+        assert_eq!(wire[4]["tool_call_id"], "call_c");
+        assert_eq!(wire[4]["content"], "Image reading is disabled.");
+        assert_eq!(wire[5]["content"], "thanks");
+        assert!(wire[0].to_string().contains("look"));
+        assert!(wire[0].to_string().contains("Image reading is disabled."));
+        let calls = wire[1]["tool_calls"].as_array().expect("tool calls");
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[1]["id"], "call_b");
+        assert_eq!(calls[2]["id"], "call_c");
+        assert!(
+            agent
+                .messages()
+                .iter()
+                .map(image_count_in_message)
+                .sum::<usize>()
+                >= 3
+        );
     }
 
     #[test]
