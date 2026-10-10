@@ -123,6 +123,102 @@ Gemini-family providers receive native audio/video input through their media
 transport. Other providers receive the documented `[media omitted: ...]`
 placeholder. Session and RPC message events retain the native content blocks.
 
+### Compact output and attachment retrieval
+
+RPC output defaults to `full`, preserving the existing inline payload format.
+Clients that understand attachment references can opt into `compact` output
+while the connection is idle:
+
+```json
+{"id":"mode-1","type":"set_output_mode","mode":"compact"}
+```
+
+The successful response contains `data: {"mode":"compact"}`; `get_state`
+also reports `outputMode`. Switching to either mode is rejected during a
+streaming turn or context compaction, so a turn has one output format.
+Use `{"type":"set_output_mode","mode":"full"}` to restore full output.
+
+In compact mode, native image and media blocks in message history and
+message-bearing events keep their type, MIME type, optional name, and position.
+An admitted block replaces only its base64 `data` string with this object:
+
+```json
+{
+  "type":"image",
+  "mimeType":"image/png",
+  "data":{
+    "attachmentId":"rpc:...",
+    "$piBlob":"sha256:...",
+    "sizeBytes":3,
+    "encoding":"base64"
+  }
+}
+```
+
+The IDs and digest above are placeholders: use the exact `attachmentId`
+issued by this connection. `$piBlob` identifies the SHA-256 digest of the
+decoded bytes; `encoding` is `base64` or `base64NoPad` and records the
+original spelling. Identical decoded bytes share an attachment ID even when
+their original padding differs. Text, signed thinking, tool arguments,
+custom details, and other opaque JSON remain unchanged.
+
+Compact `message_update` events use the delta-only assistant event shape:
+incremental updates omit the cumulative `message` and `partial` snapshots.
+Message start/end, turn end, agent end, and tool output events retain their
+lifecycle fields and terminal results, with native attachment data projected
+as above. Terminal assistant events retain their final assistant payload.
+`get_messages` uses borrowed compact projections without first cloning the
+complete encoded attachment strings. `get_fork_messages` keeps its existing
+`{entryId, text}` user-message previews; constructing those previews also
+avoids cloning attachment contents.
+
+Retrieve an issued attachment in bounded chunks:
+
+```json
+{"id":"bytes-1","type":"get_attachment","attachmentId":"rpc:...","offset":0,"maxBytes":2}
+```
+
+For an illustrative three-byte payload, the response data can be:
+
+```json
+{
+  "attachmentId":"rpc:...",
+  "$piBlob":"sha256:...",
+  "offset":0,
+  "nextOffset":2,
+  "bytesReturned":2,
+  "sizeBytes":3,
+  "data":"YWI=",
+  "eof":false
+}
+```
+
+Offsets and lengths count **decoded bytes**. The default `offset` is 0;
+`maxBytes` defaults to 65,536 and must be between 1 and 1,048,576.
+Each returned `data` chunk is independently encoded with standard padded
+base64. Decode each chunk before concatenating its bytes, then request the
+returned `nextOffset` until `eof` is true. Reading exactly at `sizeBytes`
+returns an empty chunk with `eof: true`; reading beyond it is an error.
+
+The connection retains at most 128 MiB of decoded attachments, with a
+64 MiB per-attachment limit and at most 4,096 distinct attachments. It does
+not evict issued references. When data is malformed, noncanonical, oversized,
+or cannot fit in the catalog, the original inline string is preserved.
+Clients must therefore accept either form of `data` in compact mode.
+These bounds apply to retained attachment bytes, not every RPC frame or
+total process memory, and do not increase the existing media input limits.
+
+Issued IDs remain readable across output mode changes. They expire after
+a successful `new_session`, `switch_session`, or `fork`, and when the RPC
+connection closes. Failed or cancelled session transitions keep existing IDs
+valid. Retrieval accepts issued IDs, not filesystem paths or bare digests.
+Attachment reference objects are an output format; they are not accepted in
+`prompt`, `steer`, or `follow_up` inputs.
+
+Compact output changes RPC serialization and retrieval. Native session loading,
+provider requests, and extension payloads continue to use their complete
+in-memory content; session resume still hydrates saved sidecar payloads.
+
 ### Session
 - **new_session**: Start fresh.
   - Params: `parentSession` (optional path).
@@ -138,8 +234,13 @@ placeholder. Session and RPC message events retain the native content blocks.
   - Params: `entryId`.
 
 ### State & Config
-- **get_state**: Get current model, settings, token usage.
-- **get_messages**: Get conversation history.
+- **get_state**: Get current model, settings, token usage, and `outputMode`.
+- **get_messages**: Get conversation history in the negotiated output mode.
+- **get_fork_messages**: Get `{entryId, text}` previews of branchable user messages.
+- **set_output_mode**: Negotiate `full` (default) or `compact` output while idle.
+  - Params: `mode`.
+- **get_attachment**: Read a bounded byte range from an issued attachment ID.
+  - Params: `attachmentId`, `offset` (optional), `maxBytes` (optional).
 - **get_available_models**: List models.
 - **set_model**: Change model.
   - Params: `provider`, `modelId`.

@@ -54,6 +54,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+mod attachments;
+
+use attachments::{
+    AssistantMessageProjection, AttachmentCatalog, ContentBlocks, ModelMessageProjection,
+    SessionMessageProjection,
+};
+
 #[derive(Clone)]
 pub struct RpcOptions {
     pub config: Config,
@@ -200,6 +207,8 @@ fn normalize_command_type(command_type: &str) -> &str {
     match command_type {
         "follow-up" | "followUp" | "queue-follow-up" | "queueFollowUp" => "follow_up",
         "get-state" | "getState" => "get_state",
+        "set-output-mode" | "setOutputMode" => "set_output_mode",
+        "get-attachment" | "getAttachment" => "get_attachment",
         "set-model" | "setModel" => "set_model",
         "set-steering-mode" | "setSteeringMode" => "set_steering_mode",
         "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
@@ -562,17 +571,261 @@ fn resolve_extension_command(
         .then_some((command_name, args))
 }
 
+/// Transport-only output policy. Native messages and extension callbacks keep
+/// their complete payloads; only this connection's JSON projection changes.
+#[derive(Clone, Default)]
+struct RpcOutput {
+    compact: Arc<AtomicBool>,
+    attachments: AttachmentCatalog,
+    generation: Arc<std::sync::Mutex<uuid::Uuid>>,
+    bound_generation: Option<uuid::Uuid>,
+}
+
+impl std::fmt::Debug for RpcOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RpcOutput")
+            .field("mode", &self.mode())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RpcOutput {
+    fn mode(&self) -> &'static str {
+        if self.compact.load(Ordering::SeqCst) {
+            "compact"
+        } else {
+            "full"
+        }
+    }
+
+    fn set_compact(&self, compact: bool) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.compact.swap(compact, Ordering::SeqCst) != compact {
+            // A completed turn's retained callback cannot cross a negotiated
+            // format change. Already issued attachments remain readable.
+            *generation = uuid::Uuid::new_v4();
+        }
+    }
+
+    fn for_turn(&self) -> Self {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            bound_generation: Some(*generation),
+            ..self.clone()
+        }
+    }
+
+    fn lock_current_generation(&self) -> Option<std::sync::MutexGuard<'_, uuid::Uuid>> {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.bound_generation
+            .is_none_or(|expected| expected == *generation)
+            .then_some(generation)
+    }
+
+    fn clear_session(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.attachments.clear();
+        *generation = uuid::Uuid::new_v4();
+    }
+
+    fn message_value(&self, message: &Message) -> Value {
+        let result = if self.compact.load(Ordering::SeqCst) {
+            serde_json::to_value(ModelMessageProjection::new(message, &self.attachments))
+        } else {
+            serde_json::to_value(message)
+        };
+        result.unwrap_or_else(rpc_event_serialization_error)
+    }
+
+    fn session_message_value(&self, message: &SessionMessage) -> Value {
+        if !self.compact.load(Ordering::SeqCst) {
+            return rpc_session_message_value(message);
+        }
+        serde_json::to_value(SessionMessageProjection::new(message, &self.attachments))
+            .unwrap_or_else(rpc_event_serialization_error)
+    }
+
+    fn terminal_value(&self, messages: &[Message], error: Value) -> Value {
+        let messages = messages
+            .iter()
+            .map(|message| self.message_value(message))
+            .collect::<Vec<_>>();
+        json!({
+            "type": "agent_end",
+            "messages": messages,
+            "error": error,
+        })
+    }
+
+    fn event_line(&self, event: &AgentEvent) -> String {
+        if let AgentEvent::AgentEnd {
+            messages, error, ..
+        } = event
+        {
+            return self.terminal_value(messages, json!(error)).to_string();
+        }
+        if !self.compact.load(Ordering::SeqCst) {
+            return serde_json::to_string(event)
+                .unwrap_or_else(|error| rpc_event_serialization_error(error).to_string());
+        }
+        self.compact_event_value(event)
+            .unwrap_or_else(rpc_event_serialization_error)
+            .to_string()
+    }
+
+    fn compact_event_value(&self, event: &AgentEvent) -> serde_json::Result<Value> {
+        match event {
+            AgentEvent::MessageStart { message } => Ok(json!({
+                "type": "message_start",
+                "message": self.message_value(message),
+            })),
+            AgentEvent::MessageEnd { message } => Ok(json!({
+                "type": "message_end",
+                "message": self.message_value(message),
+            })),
+            AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => {
+                // Done/Error retain a final assistant message even in the
+                // shared delta-only view. Project those terminal payloads too.
+                let assistant_message_event = match assistant_message_event {
+                    crate::model::AssistantMessageEvent::Done { reason, message } => json!({
+                        "type": "done",
+                        "reason": reason,
+                        "message": AssistantMessageProjection::new(message, &self.attachments),
+                    }),
+                    crate::model::AssistantMessageEvent::Error { reason, error } => json!({
+                        "type": "error",
+                        "reason": reason,
+                        "error": AssistantMessageProjection::new(error, &self.attachments),
+                    }),
+                    other => serde_json::to_value(other.delta_only())?,
+                };
+                Ok(json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": assistant_message_event,
+                }))
+            }
+            AgentEvent::TurnEnd {
+                session_id,
+                turn_index,
+                message,
+                tool_results,
+                latency_breakdown,
+            } => {
+                let tool_results = tool_results
+                    .iter()
+                    .map(|message| self.message_value(message))
+                    .collect::<Vec<_>>();
+                let mut value = json!({
+                    "type": "turn_end",
+                    "sessionId": session_id,
+                    "turnIndex": turn_index,
+                    "message": self.message_value(message),
+                    "toolResults": tool_results,
+                });
+                if let Some(latency) = latency_breakdown {
+                    value["latencyBreakdown"] = serde_json::to_value(latency)?;
+                }
+                Ok(value)
+            }
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => Ok(json!({
+                "type": "tool_execution_update",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "args": args,
+                "partialResult": self.tool_output_value(partial_result),
+            })),
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => Ok(json!({
+                "type": "tool_execution_end",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "result": self.tool_output_value(result),
+                "isError": is_error,
+            })),
+            // All remaining variants carry no native message/content payload.
+            // Their existing field names and omission rules remain authoritative.
+            other => serde_json::to_value(other),
+        }
+    }
+
+    fn tool_output_value(&self, output: &crate::tools::ToolOutput) -> Value {
+        let mut value = json!({
+            "content": ContentBlocks::new(&output.content, &self.attachments),
+            "details": output.details,
+        });
+        if output.is_error {
+            value["isError"] = Value::Bool(true);
+        }
+        value
+    }
+}
+
+fn rpc_event_serialization_error(error: serde_json::Error) -> Value {
+    json!({
+        "type": "event_serialize_error",
+        "error": error.to_string(),
+    })
+}
+
+fn rpc_attachment_count(
+    parsed: &Value,
+    field: &str,
+    default: usize,
+) -> std::result::Result<usize, String> {
+    let Some(value) = parsed.get(field) else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| format!("{field} must be a non-negative integer within platform limits"))
+}
+
 fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
     deferred_agent_end: Option<Arc<std::sync::Mutex<Option<AgentEvent>>>>,
     defer_time_cap: bool,
+    output: RpcOutput,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
+        let Some(generation_guard) = output.lock_current_generation() else {
+            // Extensions still receive the original native event. Only this
+            // obsolete connection projection is discarded.
+            if let Some(coalescer) = &coalescer {
+                coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
+            }
+            return;
+        };
         if defer_time_cap
             && matches!(
                 &event,
@@ -583,6 +836,7 @@ fn rpc_agent_event_handler(
             // The synthetic stop is an outcome of the whole RPC request.
             // Publish it only after the completed turn is durable. Ordinary
             // provider output keeps streaming normally.
+            drop(generation_guard);
             if let Some(coalescer) = &coalescer {
                 coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
             }
@@ -595,6 +849,7 @@ fn rpc_agent_event_handler(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .flush_pending(&out_tx);
+            drop(generation_guard);
             if let Some(coalescer) = &coalescer {
                 coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
             }
@@ -603,29 +858,12 @@ fn rpc_agent_event_handler(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
             return;
         }
-        let serialized = if let AgentEvent::AgentEnd {
-            messages, error, ..
-        } = &event
-        {
-            json!({
-                "type": "agent_end",
-                "messages": messages,
-                "error": error,
-            })
-            .to_string()
-        } else {
-            serde_json::to_string(&event).unwrap_or_else(|err| {
-                json!({
-                    "type": "event_serialize_error",
-                    "error": err.to_string(),
-                })
-                .to_string()
-            })
-        };
+        let serialized = output.event_line(&event);
         output_pressure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .send_agent_event(&out_tx, &event, serialized);
+        drop(generation_guard);
         if let Some(coalescer) = &coalescer {
             coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
         }
@@ -845,6 +1083,7 @@ type RpcFailoverPrimary = crate::failover::FailoverPrimary;
 
 #[derive(Debug)]
 struct RpcSharedState {
+    output: RpcOutput,
     steering: VecDeque<QueuedAgentMessage>,
     follow_up: VecDeque<QueuedAgentMessage>,
     steering_in_flight: VecDeque<RpcInFlightMessage>,
@@ -1017,6 +1256,7 @@ impl RpcSharedState {
         provider_admission: ProviderAdmissionGate,
     ) -> Self {
         Self {
+            output: RpcOutput::default(),
             steering: VecDeque::new(),
             follow_up: VecDeque::new(),
             steering_in_flight: VecDeque::new(),
@@ -1703,10 +1943,10 @@ pub async fn run(
     let session_handle = Arc::clone(&session.session);
     let provider_admission = session.provider_admission_gate();
     let session = Arc::new(Mutex::new(session));
-    let shared_state = Arc::new(Mutex::new(RpcSharedState::new_with_provider_admission(
-        &options.config,
-        provider_admission,
-    )));
+    let initial_state =
+        RpcSharedState::new_with_provider_admission(&options.config, provider_admission);
+    let output = initial_state.output.clone();
+    let shared_state = Arc::new(Mutex::new(initial_state));
     let is_streaming = Arc::new(AtomicBool::new(false));
     let is_compacting = Arc::new(AtomicBool::new(false));
     let turn_phase_linearizer = Arc::new(std::sync::Mutex::new(()));
@@ -2276,6 +2516,7 @@ pub async fn run(
                 if let Some((command_name, args)) = extension_command {
                     let command_runtime = runtime_handle.clone();
                     let command_cx = cx.clone();
+                    let command_output = output.for_turn();
                     runtime_handle.spawn(future_with_current_cx(
                         command_cx.cx().clone(),
                         async move {
@@ -2288,6 +2529,7 @@ pub async fn run(
                                 command_name,
                                 args,
                                 command_cx,
+                                command_output,
                             )
                             .await;
                         },
@@ -2657,6 +2899,68 @@ pub async fn run(
                 }
             }
 
+            "set_output_mode" => {
+                let compact = match parsed.get("mode").and_then(Value::as_str) {
+                    Some("full") => false,
+                    Some("compact") => true,
+                    _ => {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "set_output_mode",
+                            "mode must be either full or compact",
+                        ));
+                        continue;
+                    }
+                };
+                let changed = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle {
+                        output.set_compact(compact);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "set_output_mode",
+                        Some(json!({ "mode": output.mode() })),
+                    ));
+                } else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "set_output_mode",
+                        "Output mode can only change while the agent is idle",
+                    ));
+                }
+            }
+
+            "get_attachment" => {
+                let result = (|| -> std::result::Result<Value, String> {
+                    let attachment_id = parsed
+                        .get("attachmentId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| "Missing attachmentId".to_string())?;
+                    let offset = rpc_attachment_count(&parsed, "offset", 0)?;
+                    let max_bytes = rpc_attachment_count(&parsed, "maxBytes", 64 * 1024)?;
+                    let chunk = output
+                        .attachments
+                        .read(attachment_id, offset, max_bytes)
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_value(chunk).map_err(|error| error.to_string())
+                })();
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "get_attachment", Some(data)));
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(response_error(id, "get_attachment", error));
+                    }
+                }
+            }
+
             "get_state" => {
                 let snapshot = {
                     let state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
@@ -2664,7 +2968,7 @@ pub async fn run(
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     RpcStateSnapshot::from(&*state)
                 };
-                let data = {
+                let mut data = {
                     let inner_session = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
                         .await
                         .map_err(|err| {
@@ -2678,6 +2982,7 @@ pub async fn run(
                         is_compacting.load(Ordering::SeqCst),
                     )
                 };
+                data["outputMode"] = Value::String(output.mode().to_string());
                 let _ = out_tx.send(response_ok(id, "get_state", Some(data)));
             }
 
@@ -2703,24 +3008,22 @@ pub async fn run(
                         })?;
                     inner_session
                         .entries_for_current_path()
-                        .iter()
+                        .into_iter()
                         .filter_map(|entry| match entry {
-                            crate::session::SessionEntry::Message(msg) => match msg.message {
+                            crate::session::SessionEntry::Message(msg) => match &msg.message {
                                 SessionMessage::User { .. }
                                 | SessionMessage::Assistant { .. }
                                 | SessionMessage::ToolResult { .. }
                                 | SessionMessage::BashExecution { .. }
-                                | SessionMessage::Custom { .. } => Some(msg.message.clone()),
+                                | SessionMessage::Custom { .. } => {
+                                    Some(output.session_message_value(&msg.message))
+                                }
                                 _ => None,
                             },
                             _ => None,
                         })
                         .collect::<Vec<_>>()
                 };
-                let messages = messages
-                    .into_iter()
-                    .map(rpc_session_message_value)
-                    .collect::<Vec<_>>();
                 let _ = out_tx.send(response_ok(
                     id,
                     "get_messages",
@@ -4152,6 +4455,7 @@ pub async fn run(
                             })?;
                         *inner_session = new_session;
                         session_transition_permit.commit_session_change();
+                        state.output.clear_session();
                     }
                     guard.agent.clear_messages();
                     crate::app::rebind_stream_options_session(
@@ -4406,6 +4710,7 @@ pub async fn run(
                             );
                             *inner_session = new_session;
                             session_transition_permit.commit_session_change();
+                            state.output.clear_session();
                             drop(inner_session);
                             guard.agent.replace_messages(messages);
                             crate::app::rebind_stream_options_session(
@@ -4678,6 +4983,7 @@ pub async fn run(
                         );
                         *inner = new_session;
                         session_transition_permit.commit_session_change();
+                        state.output.clear_session();
                         drop(inner);
                         guard.agent.replace_messages(messages);
                         crate::app::rebind_stream_options_session(
@@ -4761,21 +5067,14 @@ pub async fn run(
             }
 
             "get_fork_messages" => {
-                // Snapshot entries under brief lock, compute messages outside.
-                let path_entries = {
-                    let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                let messages = {
+                    let inner_session = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
                         .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    inner_session
-                        .entries_for_current_path()
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
+                        .map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                    fork_messages_from_entries(&inner_session.entries_for_current_path())
                 };
-                let messages = fork_messages_from_entries(&path_entries);
                 let _ = out_tx.send(response_ok(
                     id,
                     "get_fork_messages",
@@ -5507,9 +5806,9 @@ async fn run_prompt_with_retry(
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
     let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
 
-    let provider_reentry_blocked = match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await
-    {
-        Ok(state) => state.provider_admission.reason(),
+    let initial_state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await;
+    let (provider_reentry_blocked, output) = match initial_state {
+        Ok(state) => (state.provider_admission.reason(), state.output.for_turn()),
         Err(err) => {
             let error = Error::session(format!("retry state lock failed: {err}"));
             let mut payload = json!({
@@ -5605,6 +5904,7 @@ async fn run_prompt_with_retry(
                 extensions,
                 Some(Arc::clone(&deferred_agent_end)),
                 true,
+                output.clone(),
             );
 
             if first_attempt_done {
@@ -6081,11 +6381,10 @@ async fn run_prompt_with_retry(
             })
             .unwrap_or_default();
         terminal_messages.retain(|message| !is_rpc_time_cap_message(message));
-        let mut payload = json!({
-            "type": "agent_end",
-            "messages": terminal_messages,
-            "error": final_error.unwrap_or_else(|| "Request failed".to_string())
-        });
+        let mut payload = output.terminal_value(
+            &terminal_messages,
+            json!(final_error.unwrap_or_else(|| "Request failed".to_string())),
+        );
         if let Some(hints) = final_error_hints {
             payload["errorHints"] = hints;
         }
@@ -6109,19 +6408,15 @@ async fn run_prompt_with_retry(
             .iter()
             .find(|message| is_rpc_time_cap_message(message))
     {
-        let _ = out_tx.send(agent_event(AgentEvent::MessageStart {
+        let _ = out_tx.send(output.event_line(&AgentEvent::MessageStart {
             message: message.clone(),
         }));
-        let _ = out_tx.send(agent_event(AgentEvent::MessageEnd {
+        let _ = out_tx.send(output.event_line(&AgentEvent::MessageEnd {
             message: message.clone(),
         }));
     }
     terminal_guard.disarm();
-    let _ = out_tx.send(event(&json!({
-        "type": "agent_end",
-        "messages": terminal_messages,
-        "error": Value::Null,
-    })));
+    let _ = out_tx.send(event(&output.terminal_value(&terminal_messages, Value::Null)));
 
     if stopped_at_time_cap {
         // Compaction may make another provider call; a capped request ends at
@@ -6479,6 +6774,7 @@ async fn run_extension_command(
     command_name: String,
     args: String,
     cx: AgentCx,
+    output: RpcOutput,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
@@ -6519,6 +6815,7 @@ async fn run_extension_command(
             extensions,
             Some(Arc::clone(&deferred_agent_end)),
             false,
+            output.clone(),
         );
         guard
             .execute_extension_command_with_abort(
@@ -6546,11 +6843,7 @@ async fn run_extension_command(
             _ => None,
         })
         .unwrap_or_default();
-    let mut payload = json!({
-        "type": "agent_end",
-        "messages": terminal_messages,
-        "error": Value::Null,
-    });
+    let mut payload = output.terminal_value(&terminal_messages, Value::Null);
     if let Err(err) = result {
         payload["error"] = Value::String(err.to_string());
         payload["errorHints"] = error_hints_value(&err);
@@ -7869,7 +8162,7 @@ fn error_hints_value(error: &Error) -> Value {
     })
 }
 
-fn rpc_session_message_value(message: SessionMessage) -> Value {
+fn rpc_session_message_value(message: &SessionMessage) -> Value {
     let mut value = match serde_json::to_value(message) {
         Ok(v) => v,
         Err(err) => {
@@ -15013,11 +15306,9 @@ async fn apply_model_change(
     Ok(provider_transition)
 }
 
-/// Extract user messages from a pre-captured list of session entries.
-///
-/// Used by the non-blocking `get_fork_messages` path where entries are
-/// captured under a brief lock and messages are computed outside the lock.
-fn fork_messages_from_entries(entries: &[crate::session::SessionEntry]) -> Vec<Value> {
+/// Extract fork-picker text from borrowed session entries. Image and media
+/// payloads never need to be copied for this text-only response.
+fn fork_messages_from_entries(entries: &[&crate::session::SessionEntry]) -> Vec<Value> {
     let mut result = Vec::new();
 
     for entry in entries {
@@ -19670,6 +19961,881 @@ export default function init(pi) {
         });
     }
 
+    fn rpc_restore_compact_attachments(value: &mut Value, catalog: &AttachmentCatalog) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+
+        if let Some(reference) = value.get("data").filter(|data| data.is_object())
+            && let Some(id) = reference.get("attachmentId").and_then(Value::as_str)
+        {
+            let chunk = catalog
+                .read(id, 0, attachments::MAX_CHUNK_BYTES)
+                .expect("issued attachment must remain readable");
+            assert!(chunk.eof, "fixture must fit in one retrieval chunk");
+            assert_eq!(reference["$piBlob"], chunk.digest);
+            assert_eq!(reference["sizeBytes"], chunk.size_bytes);
+            let bytes = STANDARD.decode(&chunk.data).expect("decode attachment chunk");
+            let encoded = if reference["encoding"] == "base64NoPad" {
+                STANDARD_NO_PAD.encode(bytes)
+            } else {
+                assert_eq!(reference["encoding"], "base64");
+                STANDARD.encode(bytes)
+            };
+            value["data"] = Value::String(encoded);
+        }
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    rpc_restore_compact_attachments(value, catalog);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values_mut() {
+                    rpc_restore_compact_attachments(value, catalog);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rpc_compact_fixture_content() -> Vec<ContentBlock> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+
+        let bytes = (0..65_539)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        vec![
+            ContentBlock::Text(TextContent::new("keep the surrounding text")),
+            ContentBlock::Image(ImageContent {
+                data: STANDARD.encode(&bytes),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Media(MediaContent {
+                data: STANDARD_NO_PAD.encode(&bytes),
+                mime_type: "audio/wav".to_string(),
+                name: Some("recording.wav".to_string()),
+            }),
+        ]
+    }
+
+    #[test]
+    fn rpc_compact_native_events_round_trip_every_media_bearing_envelope() {
+        let content = rpc_compact_fixture_content();
+        let user = Message::User(UserMessage {
+            content: UserContent::Blocks(content.clone()),
+            timestamp: 11,
+        });
+        let assistant = Message::assistant(AssistantMessage {
+            content: content.clone(),
+            api: "native-api".to_string(),
+            provider: "native-provider".to_string(),
+            model: "vendor/native-model".to_string(),
+            stop_reason: StopReason::Refusal,
+            stop_details: Some(crate::model::StopDetails {
+                kind: "refusal".to_string(),
+                category: None,
+                explanation: Some("preserve structured stop metadata".to_string()),
+            }),
+            error_message: Some("preserve the original explanation".to_string()),
+            timestamp: 12,
+            ..AssistantMessage::default()
+        });
+        let tool = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "media_fixture".to_string(),
+            content: content.clone(),
+            details: Some(json!({ "toolMetadata": ["keep", 17] })),
+            is_error: true,
+            timestamp: 13,
+        });
+        let partial_result = crate::tools::ToolOutput {
+            content: content.clone(),
+            details: None,
+            is_error: false,
+        };
+        let result = crate::tools::ToolOutput {
+            content,
+            details: Some(json!({ "complete": true })),
+            is_error: true,
+        };
+        let events = [
+            AgentEvent::MessageStart {
+                message: user.clone(),
+            },
+            AgentEvent::MessageEnd {
+                message: assistant.clone(),
+            },
+            AgentEvent::MessageEnd {
+                message: tool.clone(),
+            },
+            AgentEvent::TurnEnd {
+                session_id: Arc::from("event-session"),
+                turn_index: 4,
+                message: assistant.clone(),
+                tool_results: vec![tool.clone()],
+                latency_breakdown: None,
+            },
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "media_fixture".to_string(),
+                args: json!({ "path": "keep-the-arguments" }),
+                partial_result,
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "media_fixture".to_string(),
+                result,
+                is_error: true,
+            },
+            AgentEvent::AgentEnd {
+                session_id: Arc::from("event-session"),
+                messages: vec![user, assistant, tool],
+                error: Some("preserve terminal failure".to_string()),
+            },
+        ];
+        let full = RpcOutput::default();
+        let compact = RpcOutput::default();
+        compact.set_compact(true);
+
+        for event in events {
+            let untouched = serde_json::to_value(&event).expect("native event");
+            let mut expected = untouched.clone();
+            if let AgentEvent::AgentEnd { error, .. } = &event {
+                expected.as_object_mut().unwrap().remove("sessionId");
+                expected["error"] = json!(error);
+            }
+            assert_eq!(parse_response(&full.event_line(&event)), expected);
+            let line = compact.event_line(&event);
+            assert!(
+                line.len() < 8192,
+                "media payload must not be repeated in compact {}",
+                expected["type"]
+            );
+            let mut projected = parse_response(&line);
+            assert!(
+                line.contains("attachmentId"),
+                "every fixture event must actually externalize its payload"
+            );
+            rpc_restore_compact_attachments(&mut projected, &compact.attachments);
+            assert_eq!(projected, expected, "only media data may change on the wire");
+            assert_eq!(
+                serde_json::to_value(&event).expect("untouched native event"),
+                untouched,
+                "transport projection must not mutate provider/extension messages"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_compact_updates_drop_snapshots_and_project_done_and_error_media() {
+        let mut partial = AssistantMessage {
+            content: rpc_compact_fixture_content(),
+            api: "fixture-api".to_string(),
+            provider: "fixture-provider".to_string(),
+            model: "fixture-model".to_string(),
+            ..AssistantMessage::default()
+        };
+        partial
+            .content
+            .push(ContentBlock::Text(TextContent::new("long snapshot ".repeat(8192))));
+        let partial = Arc::new(partial);
+        let output = RpcOutput::default();
+        output.set_compact(true);
+        let deltas = [
+            AssistantMessageEvent::Start {
+                partial: Arc::clone(&partial),
+            },
+            AssistantMessageEvent::TextDelta {
+                content_index: 3,
+                delta: "text tail".to_string(),
+                partial: Arc::clone(&partial),
+            },
+            AssistantMessageEvent::ThinkingDelta {
+                content_index: 3,
+                delta: "thinking tail".to_string(),
+                partial: Arc::clone(&partial),
+            },
+            AssistantMessageEvent::ToolCallDelta {
+                content_index: 3,
+                delta: "{\"path\":".to_string(),
+                partial: Arc::clone(&partial),
+            },
+        ];
+        for update in deltas {
+            let expected = serde_json::to_value(update.delta_only()).expect("expected delta");
+            let event = AgentEvent::MessageUpdate {
+                message: Message::Assistant(Arc::clone(&partial)),
+                assistant_message_event: update,
+            };
+            let line = output.event_line(&event);
+            assert!(line.len() < 1024, "delta frame copied its cumulative snapshot");
+            let value = parse_response(&line);
+            assert!(value.get("message").is_none());
+            assert!(value["assistantMessageEvent"].get("partial").is_none());
+            assert_eq!(value["assistantMessageEvent"], expected);
+        }
+
+        for (field, update) in [
+            (
+                "message",
+                AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: Arc::clone(&partial),
+                },
+            ),
+            (
+                "error",
+                AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: Arc::clone(&partial),
+                },
+            ),
+        ] {
+            let event = AgentEvent::MessageUpdate {
+                message: Message::Assistant(Arc::clone(&partial)),
+                assistant_message_event: update,
+            };
+            let mut value = parse_response(&output.event_line(&event));
+            assert!(value.get("message").is_none());
+            assert!(value["assistantMessageEvent"][field]["content"][1]["data"].is_object());
+            rpc_restore_compact_attachments(&mut value, &output.attachments);
+            assert_eq!(
+                value["assistantMessageEvent"][field],
+                serde_json::to_value(&partial).expect("complete terminal assistant")
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_output_epoch_fences_retained_callbacks_without_discarding_live_ids() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let output = RpcOutput::default();
+        output.set_compact(true);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+        let event = AgentEvent::MessageEnd {
+            message: Message::User(UserMessage {
+                content: UserContent::Blocks(rpc_compact_fixture_content()),
+                timestamp: 0,
+            }),
+        };
+        let old_callback = rpc_agent_event_handler(
+            out_tx.clone(),
+            runtime.handle(),
+            None,
+            None,
+            false,
+            output.for_turn(),
+        );
+        old_callback(event.clone());
+        let first = parse_response(&out_rx.try_recv().expect("first compact frame"));
+        let id = first["message"]["content"][1]["data"]["attachmentId"]
+            .as_str()
+            .expect("attachment id")
+            .to_string();
+
+        output.set_compact(false);
+        old_callback(event.clone());
+        assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(output.attachments.read(&id, 0, 1).is_ok());
+        let full_callback = rpc_agent_event_handler(
+            out_tx.clone(),
+            runtime.handle(),
+            None,
+            None,
+            false,
+            output.for_turn(),
+        );
+        full_callback(event.clone());
+        let full = parse_response(&out_rx.try_recv().expect("new full frame"));
+        assert!(full["message"]["content"][1]["data"].is_string());
+
+        output.set_compact(true);
+        full_callback(event.clone());
+        assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(output.attachments.read(&id, 0, 1).is_ok());
+        let compact_callback = rpc_agent_event_handler(
+            out_tx.clone(),
+            runtime.handle(),
+            None,
+            None,
+            false,
+            output.for_turn(),
+        );
+        compact_callback(event.clone());
+        let compact = parse_response(&out_rx.try_recv().expect("renewed compact frame"));
+        assert_eq!(compact["message"]["content"][1]["data"]["attachmentId"], id);
+
+        output.clear_session();
+        old_callback(event.clone());
+        compact_callback(event.clone());
+        assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(output.attachments.read(&id, 0, 1).is_err());
+        let current_callback = rpc_agent_event_handler(
+            out_tx,
+            runtime.handle(),
+            None,
+            None,
+            false,
+            output.for_turn(),
+        );
+        current_callback(event);
+        let current = parse_response(&out_rx.try_recv().expect("new session frame"));
+        let new_id = current["message"]["content"][1]["data"]["attachmentId"]
+            .as_str()
+            .expect("new attachment id");
+        assert_ne!(new_id, id);
+        assert!(output.attachments.read(new_id, 0, 1).is_ok());
+        assert!(output.attachments.read(&id, 0, 1).is_err());
+    }
+
+    #[test]
+    fn rpc_compact_history_attachment_lifetimes_follow_committed_transitions() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for command in ["new_session", "switch_session", "fork"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let content = rpc_compact_fixture_content();
+                let mut source = Session::in_memory();
+                source.header.provider = Some("anthropic".to_string());
+                source.header.model_id = Some("test-model".to_string());
+                source.header.thinking_level = Some("off".to_string());
+                source.append_message(SessionMessage::User {
+                    content: UserContent::Blocks(content.clone()),
+                    timestamp: Some(0),
+                });
+                let source_id = source.header.id.clone();
+                let entry_id = source
+                    .entries_for_current_path()
+                    .last()
+                    .and_then(|entry| entry.base_id())
+                    .cloned()
+                    .expect("fork source entry");
+
+                let mut target =
+                    Session::create_with_dir(Some(temp.path().join("sessions")));
+                target.header.provider = Some("anthropic".to_string());
+                target.header.model_id = Some("test-model".to_string());
+                target.header.thinking_level = Some("off".to_string());
+                target.append_message(SessionMessage::User {
+                    content: UserContent::Blocks(content.clone()),
+                    timestamp: Some(0),
+                });
+                target.save().await.expect("save attachment-bearing target");
+                let target_path = target.path.clone().expect("saved target path");
+
+                let extension_path = temp.path().join("veto-first-transition.mjs");
+                std::fs::write(
+                    &extension_path,
+                    r#"
+                    export default function init(pi) {
+                      let veto = true;
+                      const before = () => {
+                        if (veto) {
+                          veto = false;
+                          return { cancel: true };
+                        }
+                      };
+                      pi.on("session_before_switch", before);
+                      pi.on("session_before_fork", before);
+                    }
+                    "#,
+                )
+                .expect("write transition veto");
+                let mut agent_session = build_test_agent_session(source);
+                let inner_session = Arc::clone(&agent_session.session);
+                agent_session
+                    .enable_extensions(&[], temp.path(), None, &[extension_path])
+                    .await
+                    .expect("enable transition veto");
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.api_key = Some("test-key".to_string());
+                options.available_models.push(model);
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = runtime_handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_state"}"#,
+                    "initial output mode",
+                )
+                .await;
+                assert_eq!(state["data"]["outputMode"], "full");
+                let full = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_messages"}"#,
+                    "default inline history",
+                )
+                .await;
+                assert_ok(&full, "get_messages");
+                assert_eq!(
+                    full["data"]["messages"][0]["content"],
+                    serde_json::to_value(&content).expect("native content")
+                );
+                let invalid_mode = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_output_mode","mode":"unknown"}"#,
+                    "reject unknown mode",
+                )
+                .await;
+                assert_err(&invalid_mode, "set_output_mode");
+                let negotiated = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_output_mode","mode":"compact"}"#,
+                    "negotiate compact mode",
+                )
+                .await;
+                assert_ok(&negotiated, "set_output_mode");
+                assert_eq!(negotiated["data"]["mode"], "compact");
+                let history = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_messages"}"#,
+                    "compact native history",
+                )
+                .await;
+                assert!(history.to_string().len() < 4096);
+                let blocks = &history["data"]["messages"][0]["content"];
+                assert_eq!(blocks[0], full["data"]["messages"][0]["content"][0]);
+                assert_eq!(blocks[1]["mimeType"], "image/png");
+                assert_eq!(blocks[2]["name"], "recording.wav");
+                let id = blocks[1]["data"]["attachmentId"]
+                    .as_str()
+                    .expect("issued image id")
+                    .to_string();
+                assert_eq!(blocks[2]["data"]["attachmentId"], id);
+                assert_eq!(blocks[1]["data"]["encoding"], "base64");
+                assert_eq!(blocks[2]["data"]["encoding"], "base64NoPad");
+                assert_eq!(blocks[1]["data"]["sizeBytes"], 65_539);
+                let fork_messages = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_fork_messages"}"#,
+                    "borrowed fork previews",
+                )
+                .await;
+                assert_eq!(
+                    fork_messages["data"]["messages"],
+                    json!([{"entryId": entry_id, "text": "keep the surrounding text"}])
+                );
+
+                let read = json!({"type": "get_attachment", "attachmentId": id});
+                let first = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &read.to_string(),
+                    "default attachment chunk",
+                )
+                .await;
+                assert_ok(&first, "get_attachment");
+                assert_eq!(first["data"]["offset"], 0);
+                assert_eq!(first["data"]["nextOffset"], 65_536);
+                assert_eq!(first["data"]["bytesReturned"], 65_536);
+                assert_eq!(first["data"]["sizeBytes"], 65_539);
+                assert_eq!(first["data"]["$piBlob"], blocks[1]["data"]["$piBlob"]);
+                assert_eq!(first["data"]["eof"], false);
+                let bytes = STANDARD
+                    .decode(first["data"]["data"].as_str().expect("chunk base64"))
+                    .expect("decode chunk");
+                assert_eq!(bytes.len(), 65_536);
+                assert_eq!(&bytes[..3], &[0, 1, 2]);
+
+                for offset in [65_536, 65_539] {
+                    let mut request = read.clone();
+                    request["offset"] = json!(offset);
+                    request["maxBytes"] = json!(3);
+                    let tail = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &request.to_string(),
+                        "raw offset and exact EOF",
+                    )
+                    .await;
+                    assert_ok(&tail, "get_attachment");
+                    let decoded = STANDARD
+                        .decode(tail["data"]["data"].as_str().expect("tail base64"))
+                        .expect("decode tail");
+                    let expected = (offset..65_539)
+                        .map(|index| (index % 251) as u8)
+                        .collect::<Vec<_>>();
+                    assert_eq!(decoded, expected);
+                    assert_eq!(tail["data"]["nextOffset"], 65_539);
+                    assert_eq!(tail["data"]["bytesReturned"], expected.len());
+                    assert_eq!(tail["data"]["eof"], true);
+                }
+                for (field, value) in [
+                    ("offset", json!(-1)),
+                    ("offset", json!(0.5)),
+                    ("offset", Value::Null),
+                    ("offset", json!(65_540)),
+                    ("maxBytes", json!(0)),
+                    ("maxBytes", json!(1_048_577)),
+                    ("maxBytes", json!("3")),
+                    ("attachmentId", json!("/etc/passwd")),
+                    ("attachmentId", json!("sha256:unissued")),
+                ] {
+                    let mut request = read.clone();
+                    request[field] = value;
+                    let rejected = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &request.to_string(),
+                        "invalid attachment range or identity",
+                    )
+                    .await;
+                    assert_err(&rejected, "get_attachment");
+                }
+
+                for mode in ["full", "compact"] {
+                    let request = json!({"type": "set_output_mode", "mode": mode});
+                    let response = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &request.to_string(),
+                        "mode change preserves issued references",
+                    )
+                    .await;
+                    assert_ok(&response, "set_output_mode");
+                    let readable = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &read.to_string(),
+                        "read after mode change",
+                    )
+                    .await;
+                    assert_ok(&readable, "get_attachment");
+                }
+
+                let transition = json!({
+                    "type": command,
+                    "sessionPath": target_path,
+                    "entryId": entry_id,
+                });
+                let cancelled = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &transition.to_string(),
+                    "veto transition",
+                )
+                .await;
+                assert_ok(&cancelled, command);
+                assert_eq!(cancelled["data"]["cancelled"], true);
+                let readable = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &read.to_string(),
+                    "read after veto",
+                )
+                .await;
+                assert_ok(&readable, "get_attachment");
+                {
+                    let cx = AgentCx::for_request();
+                    let stored = inner_session.lock(&cx).await.expect("source lock");
+                    assert_eq!(stored.header.id, source_id);
+                }
+
+                let missing_target = json!({
+                    "type": "switch_session",
+                    "sessionPath": temp.path().join("does-not-exist.jsonl"),
+                });
+                let failed = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &missing_target.to_string(),
+                    "failed session preparation",
+                )
+                .await;
+                assert_err(&failed, "switch_session");
+                let readable = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &read.to_string(),
+                    "read after failed preparation",
+                )
+                .await;
+                assert_ok(&readable, "get_attachment");
+
+                let committed = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &transition.to_string(),
+                    "commit active session transition",
+                )
+                .await;
+                assert_ok(&committed, command);
+                assert_eq!(committed["data"]["cancelled"], false);
+                let stale = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &read.to_string(),
+                    "old attachment expires at commit",
+                )
+                .await;
+                assert_err(&stale, "get_attachment");
+                {
+                    let cx = AgentCx::for_request();
+                    let mut stored = inner_session.lock(&cx).await.expect("new session lock");
+                    assert_ne!(stored.header.id, source_id);
+                    stored.append_message(SessionMessage::User {
+                        content: UserContent::Blocks(content),
+                        timestamp: Some(1),
+                    });
+                }
+                let renewed = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_messages"}"#,
+                    "register identical bytes in new session",
+                )
+                .await;
+                let new_user = renewed["data"]["messages"]
+                    .as_array()
+                    .expect("message array")
+                    .iter()
+                    .find(|message| message["role"] == "user")
+                    .expect("new user message");
+                let new_id = &new_user["content"][1]["data"]["attachmentId"];
+                assert!(new_id.is_string());
+                assert_ne!(new_id, &json!(id));
+                let new_read = json!({"type": "get_attachment", "attachmentId": new_id});
+                let readable = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &new_read.to_string(),
+                    "new reference is readable",
+                )
+                .await;
+                assert_ok(&readable, "get_attachment");
+                let still_stale = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &read.to_string(),
+                    "identical bytes cannot revive old reference",
+                )
+                .await;
+                assert_err(&still_stale, "get_attachment");
+                drop(in_tx);
+                assert!(server.await.is_ok());
+            }
+        }));
+    }
+
+    #[test]
+    fn rpc_compact_stream_preserves_native_input_and_rejects_mid_turn_mode_changes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (entered, mut wait_for_entry) = asupersync::channel::oneshot::channel();
+            let (release, gate) = asupersync::channel::oneshot::channel();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(Some(entered)),
+                first_call_gate: Mutex::new(Some(gate)),
+                calls: Arc::clone(&calls),
+            });
+            let agent_session =
+                build_test_agent_session_with_provider(Session::in_memory(), provider);
+            let inner_session = Arc::clone(&agent_session.session);
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+            let negotiated = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"set_output_mode","mode":"compact"}"#,
+                "negotiate before native turn",
+            )
+            .await;
+            assert_ok(&negotiated, "set_output_mode");
+            let content = rpc_compact_fixture_content();
+            let native_content = serde_json::to_value(&content).expect("native input");
+            let request = json!({"type": "prompt", "content": native_content});
+            in_tx
+                .send(&asupersync::Cx::for_testing(), request.to_string())
+                .await
+                .expect("send compact native turn");
+
+            let mut accepted = false;
+            let mut attachment_id = None;
+            while !accepted || attachment_id.is_none() {
+                let line = recv_line(&out_rx, "native prompt acceptance and compact start")
+                    .await
+                    .expect("prompt event");
+                assert!(
+                    line.len() < 16_384,
+                    "compact start must not echo media: {line}"
+                );
+                let value = parse_response(&line);
+                if value["type"] == "response" {
+                    assert_ok(&value, "prompt");
+                    accepted = true;
+                } else if value["type"] == "message_start" && value["message"]["role"] == "user" {
+                    attachment_id = Some(
+                        value["message"]["content"][1]["data"]["attachmentId"]
+                            .as_str()
+                            .expect("live user image reference")
+                            .to_string(),
+                    );
+                }
+            }
+            wait_for_entry
+                .recv(AgentCx::for_request().cx())
+                .await
+                .expect("provider is running with native input");
+            let attachment_id = attachment_id.expect("stream issued an attachment");
+            let read = json!({
+                "type": "get_attachment",
+                "attachmentId": attachment_id,
+                "maxBytes": 3,
+            });
+            let chunk = send_recv(
+                &in_tx,
+                &out_rx,
+                &read.to_string(),
+                "retrieve while the provider is held open",
+            )
+            .await;
+            assert_ok(&chunk, "get_attachment");
+            assert_eq!(chunk["data"]["data"], "AAEC");
+            assert_eq!(chunk["data"]["eof"], false);
+            let rejected = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"set_output_mode","mode":"full"}"#,
+                "reject mode change during native turn",
+            )
+            .await;
+            assert_err(&rejected, "set_output_mode");
+            let state = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_state"}"#,
+                "mode remains fixed during native turn",
+            )
+            .await;
+            assert_eq!(state["data"]["outputMode"], "compact");
+            assert_eq!(state["data"]["isStreaming"], true);
+            {
+                let captured = calls.lock().expect("captured provider context");
+                assert_eq!(captured.len(), 1);
+                let user = captured[0]
+                    .messages
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::User(user) => Some(user),
+                        _ => None,
+                    })
+                    .expect("provider user input");
+                assert_eq!(
+                    serde_json::to_value(&user.content).expect("provider native content"),
+                    native_content,
+                    "compact transport must preserve complete provider input"
+                );
+            }
+
+            release
+                .send(AgentCx::for_request().cx(), ())
+                .expect("release native provider");
+            loop {
+                let line = recv_line(&out_rx, "compact native completion")
+                    .await
+                    .expect("terminal event");
+                assert!(line.len() < 16_384, "compact completion must not echo media");
+                let value = parse_response(&line);
+                if value["type"] == "message_update" {
+                    assert!(value.get("message").is_none());
+                    assert!(value["assistantMessageEvent"].get("partial").is_none());
+                }
+                if value["type"] == "agent_end" {
+                    assert!(value["error"].is_null(), "{value}");
+                    assert!(value["messages"].is_array());
+                    break;
+                }
+            }
+            let history = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_messages"}"#,
+                "compact history after native terminal",
+            )
+            .await;
+            assert_ok(&history, "get_messages");
+            assert_eq!(
+                history["data"]["messages"][0]["content"][1]["data"]["attachmentId"],
+                attachment_id
+            );
+            {
+                let cx = AgentCx::for_request();
+                let stored = inner_session.lock(&cx).await.expect("stored native messages");
+                let stored_user = stored
+                    .entries_for_current_path()
+                    .into_iter()
+                    .find_map(|entry| match entry {
+                        SessionEntry::Message(message) => match &message.message {
+                            SessionMessage::User { content, .. } => Some(content),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .expect("persisted user input");
+                assert_eq!(
+                    serde_json::to_value(stored_user).expect("stored native content"),
+                    native_content
+                );
+            }
+            let restored = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"set_output_mode","mode":"full"}"#,
+                "restore full output after completion",
+            )
+            .await;
+            assert_ok(&restored, "set_output_mode");
+            let full = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_messages"}"#,
+                "unchanged full history",
+            )
+            .await;
+            assert_eq!(full["data"]["messages"][0]["content"], native_content);
+            let readable = send_recv(
+                &in_tx,
+                &out_rx,
+                &read.to_string(),
+                "stream reference survives full output restoration",
+            )
+            .await;
+            assert_ok(&readable, "get_attachment");
+            drop(in_tx);
+            assert!(server.await.is_ok());
+        }));
+    }
+
     #[test]
     fn rpc_native_media_idle_commands_retry_and_durable_sidecar_round_trip() {
         assert_rpc_native_media_idle_commands_round_trip(false);
@@ -22041,6 +23207,21 @@ export default function init(pi) {
                 .recv(entered_cx.cx())
                 .await
                 .expect("auto-compaction provider entered");
+
+            let output_mode = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"mode","type":"set_output_mode","mode":"compact"}"#,
+                "output negotiation during compaction",
+            )
+            .await;
+            assert_err(&output_mode, "set_output_mode");
+            assert!(
+                output_mode["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("idle")),
+                "negotiation must wait until compaction releases the phase"
+            );
 
             for (id, command, expected_command) in [
                 (
