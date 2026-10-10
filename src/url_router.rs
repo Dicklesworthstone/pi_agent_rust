@@ -17,7 +17,9 @@
 //! `PI_SSH_ALLOWED_HOSTS`; auth is BatchMode-only (never interactive);
 //! host keys use accept-new-then-strict with hard failure + remediation on
 //! change; writes stage atomically (mktemp + rename, permissions preserved
-//! via `cp -p`); transfers resume from existing target prefixes and verify
+//! via `cp -p`); edits verify the original bytes after upload under a remote
+//! Pi write lock before replacing the file; transfers resume from existing
+//! target prefixes and verify
 //! final sizes. Heavy remote trees are better served by an explicit SSHFS
 //! mount (`sshfs host:path mnt`) — documented degradation: pi then sees a
 //! local FS with network latency and no atomic-replace guarantees across
@@ -29,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -971,12 +974,52 @@ fn ssh_capped_read_script(remote_path: &str) -> String {
 /// removes the staging file if anything aborts before the rename.
 #[must_use]
 pub fn remote_atomic_write_script(remote_path: &str) -> String {
+    remote_write_script(remote_path, None)
+}
+
+/// Serialize Pi writers and optionally check the original file immediately
+/// before publishing. The digest never puts original file contents in argv.
+/// Other applications need not honor this lock, so this is an optimistic
+/// content check, not a filesystem compare-and-swap against arbitrary writers.
+fn remote_write_script(remote_path: &str, original: Option<&[u8]>) -> String {
     let quoted = sh_quote(remote_path);
+    // The lock already lives in the destination directory. Hashing only its
+    // entry name makes /dir/file, /dir/./file and directory symlink aliases
+    // acquire the same lock in that physical directory.
+    let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let lock_id = crate::package_manager::hex_encode(&Sha256::digest(name.as_bytes()));
+    let regular_file_guard = if original.is_some() {
+        format!(
+            "if [ ! -f {quoted} ] || [ -L {quoted} ]; then \
+             printf '%s\\n' 'PI_SSH_EDIT_CONFLICT: remote file changed after it was read; re-read before retrying.' >&2; exit 73; fi; "
+        )
+    } else {
+        String::new()
+    };
+    let guard = original.map_or_else(String::new, |original| {
+        let expected = crate::package_manager::hex_encode(&Sha256::digest(original));
+        format!(
+            "{regular_file_guard}\
+             pi_hash() {{ \
+             if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < {quoted}) || return 1; \
+             elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < {quoted}) || return 1; \
+             elif command -v sha256 >/dev/null 2>&1; then h=$(sha256 -q < {quoted}) || return 1; \
+             else return 1; fi; printf '%s\\n' \"${{h%% *}}\"; }}; \
+             if ! actual=$(pi_hash); then \
+             printf '%s\\n' 'PI_SSH_HASH_FAILED: cannot verify remote content; install sha256sum, shasum, or sha256 and retry.' >&2; exit 74; fi; \
+             if [ \"$actual\" != '{expected}' ]; then \
+             printf '%s\\n' 'PI_SSH_EDIT_CONFLICT: remote file changed after it was read; re-read before retrying.' >&2; exit 73; fi; "
+        )
+    });
     format!(
-        "set -eu; d=$(dirname -- {quoted}); t=$(mktemp \"$d/.pi-ssh-write.XXXXXX\"); \
-         trap 'rm -f \"$t\"' EXIT; \
-         if [ -e {quoted} ]; then cp -p -- {quoted} \"$t\"; fi; cat > \"$t\"; \
-         mv -f -- \"$t\" {quoted}"
+        "set -eu; d=$(dirname -- {quoted}); l=\"$d/.pi-ssh-lock-{lock_id}\"; \
+         if ! mkdir -- \"$l\" 2>/dev/null; then \
+         printf '%s\\n' \"PI_SSH_WRITE_BUSY: cannot acquire remote write lock $l; another write may be active.\" >&2; exit 75; fi; \
+         t=; trap 'if [ -n \"$t\" ]; then rm -f -- \"$t\"; fi; rmdir -- \"$l\"' EXIT; \
+         trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         t=$(mktemp \"$d/.pi-ssh-write.XXXXXX\"); \
+         {regular_file_guard}if [ -e {quoted} ]; then cp -p -- {quoted} \"$t\"; fi; cat > \"$t\"; \
+         {guard}mv -f -- \"$t\" {quoted}"
     )
 }
 
@@ -989,8 +1032,38 @@ pub fn remote_atomic_write_script(remote_path: &str) -> String {
 /// # Errors
 /// `PI_SSH_HOST_NOT_ALLOWED` (confinement), `PI_SSH_HOSTKEY_CHANGED`
 /// (with [`SSH_HOSTKEY_REMEDIATION`]), `PI_SSH_AUTH_FAILED`,
-/// `PI_SSH_TIMEOUT`, `PI_SSH_WRITE_FAILED`.
+/// `PI_SSH_TIMEOUT`, `PI_SSH_WRITE_FAILED`, `PI_SSH_WRITE_BUSY`.
 pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value> {
+    ssh_write_document_inner(url, content, None)
+}
+
+/// Replace a remote text document only while its original bytes still match.
+///
+/// Both the replacement and the content check run under the same remote Pi
+/// write lock. The check happens after payload transfer, immediately before
+/// rename, and includes the complete original bytes (including BOM and line
+/// endings). A conflicting edit preserves the newer remote file. A missing,
+/// non-regular, or symbolic-link destination is also refused.
+///
+/// This does not lock out applications that ignore Pi's lock. Such an
+/// application can still race the final check and rename.
+///
+/// # Errors
+/// The write-side SSH errors, plus `PI_SSH_EDIT_CONFLICT`,
+/// `PI_SSH_WRITE_BUSY`, and `PI_SSH_HASH_FAILED`. No unguarded retry is made.
+pub fn ssh_replace_document(
+    url: &str,
+    original: &[u8],
+    content: &str,
+) -> Result<serde_json::Value> {
+    ssh_write_document_inner(url, content, Some(original))
+}
+
+fn ssh_write_document_inner(
+    url: &str,
+    content: &str,
+    original: Option<&[u8]>,
+) -> Result<serde_json::Value> {
     let target = parse_ssh_target(url)?;
     if !ssh_host_allowed(&target.host) {
         return Err(Error::tool(
@@ -1002,7 +1075,7 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
             ),
         ));
     }
-    let script = remote_atomic_write_script(&target.path);
+    let script = remote_write_script(&target.path, original);
     let mut child = std::process::Command::new("ssh")
         .args(ssh_command_flags())
         .arg(&target.host)
@@ -1012,21 +1085,40 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::tool("write", "PI_SSH_BACKEND: missing ssh stdin"))?;
-        stdin
-            .write_all(content.as_bytes())
-            .and_then(|()| stdin.flush())
-            .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}")))?;
-    }
+    // A remote refusal can close stdin before a large payload finishes. Reap
+    // the process and read its named diagnostic even when that write breaks.
+    let streamed = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::tool("write", "PI_SSH_BACKEND: missing ssh stdin"))
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(content.as_bytes())
+                .and_then(|()| stdin.flush())
+                .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}")))
+        });
     let output = child
         .wait_with_output()
         .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: waiting on ssh: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        for (code, marker) in [
+            (73, "PI_SSH_EDIT_CONFLICT"),
+            (74, "PI_SSH_HASH_FAILED"),
+            (75, "PI_SSH_WRITE_BUSY"),
+        ] {
+            if output.status.code() == Some(code) && stderr.contains(marker) {
+                return Err(Error::tool(
+                    "write",
+                    format!(
+                        "{marker}: ssh {} write '{}': {}",
+                        target.host,
+                        target.path,
+                        stderr.trim()
+                    ),
+                ));
+            }
+        }
         return Err(match classify_ssh_failure(&stderr) {
             SshFailureKind::HostKeyChanged => Error::tool(
                 "write",
@@ -1062,6 +1154,7 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
             ),
         });
     }
+    streamed?;
     Ok(serde_json::json!({
         "schema": URL_ROUTER_SCHEMA,
         "scheme": "ssh",
@@ -1069,14 +1162,16 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
         "path": target.path,
         "bytes": content.len(),
         "atomic": true,
+        "contentGuarded": original.is_some(),
     }))
 }
 
 /// Fetch the FULL remote file content for edit flows (bd-cv653.6.5).
 ///
-/// Unlike [`resolve_ssh`], there is no `head -c` truncation: an editor
-/// operating on a truncated view would overwrite real data on write-back.
-/// `max_bytes` is enforced after transfer with a named error instead.
+/// Request at most `max_bytes + 1` bytes so a huge remote file cannot force a
+/// complete transfer. The extra byte distinguishes an exact-limit file from
+/// an oversized one. Oversized files return a named error, never a truncated
+/// document that an editor could mistake for complete source.
 ///
 /// # Errors
 /// `PI_SSH_TARGET`/`PI_SSH_TRAVERSAL` (parse), `PI_SSH_HOSTKEY_CHANGED`,
@@ -1084,10 +1179,11 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
 /// `PI_SSH_TOO_LARGE`.
 pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     let target = parse_ssh_target(url)?;
+    let script = remote_edit_read_script(&target.path, max_bytes)?;
     let output = std::process::Command::new("ssh")
         .args(ssh_command_flags())
         .arg(&target.host)
-        .arg(format!("cat -- {}", sh_quote(&target.path)))
+        .arg(script)
         .output()
         .map_err(|e| Error::tool("edit", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
     if !output.status.success() {
@@ -1134,6 +1230,16 @@ pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         ));
     }
     Ok(output.stdout)
+}
+
+fn remote_edit_read_script(remote_path: &str, max_bytes: u64) -> Result<String> {
+    let transfer_limit = max_bytes.checked_add(1).ok_or_else(|| {
+        Error::validation("PI_SSH_READ_LIMIT: edit byte limit must leave room for an overflow byte")
+    })?;
+    Ok(format!(
+        "head -c {transfer_limit} -- {}",
+        sh_quote(remote_path)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,10 +1768,200 @@ mod tests {
         assert!(script.contains("mktemp \"$d/.pi-ssh-write.XXXXXX\""));
         assert!(script.contains("mv -f -- \"$t\" '/var/www/app.conf'"));
         assert!(script.contains("cp -p -- '/var/www/app.conf'"));
-        assert!(script.contains("trap 'rm -f \"$t\"' EXIT"));
+        assert!(script.contains("rmdir -- \"$l\"' EXIT"));
         // Quote escaping survives embedded single quotes.
         let tricky = remote_atomic_write_script("/tmp/it's");
         assert!(tricky.contains("'\\''"), "{tricky}");
+    }
+
+    #[cfg(unix)]
+    fn run_remote_script(script: &str, payload: &[u8]) -> std::process::Output {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("remote shell fixture");
+        let streamed = child
+            .stdin
+            .take()
+            .expect("fixture stdin")
+            .write_all(payload);
+        let output = child.wait_with_output().expect("remote shell output");
+        if output.status.success() {
+            streamed.expect("complete fixture payload");
+        }
+        output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_preserves_bytes_permissions_and_literal_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("it's; $(unused)\nfile.txt");
+        let original = b"\xef\xbb\xbfalpha\r\nbeta\r\n";
+        std::fs::write(&target, original).expect("original");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("original permissions");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let replacement = b"\xef\xbb\xbfALPHA\r\nbeta\r\n";
+        let output = run_remote_script(&script, replacement);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_rejects_changes_outside_the_edited_region() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"alpha\r\nbeta\r\n";
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        for changed in [b"alpha\r\nBETA\r\n".as_slice(), b"alpha\nbeta\n"] {
+            std::fs::write(&target, changed).expect("concurrent remote edit");
+            let output = run_remote_script(&script, b"ALPHA\r\nbeta\r\n");
+            assert_eq!(output.status.code(), Some(73), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("PI_SSH_EDIT_CONFLICT"));
+            assert_eq!(std::fs::read(&target).unwrap(), changed);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_checks_after_payload_transfer() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"original\n";
+        std::fs::write(&target, original).expect("original");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("remote shell");
+        let mut input = child.stdin.take().expect("payload pipe");
+        // More than the pipe capacity forces the remote staging reader to run.
+        // Keeping stdin open holds it before the publication check, with no
+        // timing assumptions or sleeps.
+        input.write_all(&vec![b'x'; 2 * 1024 * 1024]).expect("payload");
+        std::fs::write(&target, b"external edit during upload\n").expect("remote change");
+        drop(input);
+        let output = child.wait_with_output().expect("remote output");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"external edit during upload\n");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_write_lock_serializes_competing_edits_and_survives_refusal() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"original\n";
+        std::fs::write(&target, original).expect("original");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let mut first = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("first remote writer");
+        let mut input = first.stdin.take().expect("first stdin");
+        let replacement = vec![b'x'; 2 * 1024 * 1024];
+        input.write_all(&replacement).expect("first upload");
+
+        let competing = run_remote_script(&script, b"other edit\n");
+        assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        // A rejected contender must not remove the first writer's lock.
+        let unconditional = remote_atomic_write_script(target.to_str().unwrap());
+        let competing = run_remote_script(&unconditional, b"other write\n");
+        assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).expect("directory alias");
+        for path in [
+            format!("{}/./document.txt", root.path().display()),
+            alias.join("document.txt").to_str().unwrap().to_string(),
+        ] {
+            let aliased = remote_write_script(&path, Some(original));
+            let competing = run_remote_script(&aliased, b"aliased edit\n");
+            assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        }
+
+        drop(input);
+        let output = first.wait_with_output().expect("first output");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        let stale_retry = run_remote_script(&script, b"stale edit\n");
+        assert_eq!(stale_retry.status.code(), Some(73), "{stale_retry:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_does_not_recreate_missing_files_or_replace_symlinks() {
+        let root = tempfile::tempdir().expect("fixture");
+        let missing = root.path().join("missing.txt");
+        let script = remote_write_script(missing.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(!missing.exists());
+
+        let target = root.path().join("target.txt");
+        let link = root.path().join("link.txt");
+        std::fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let script = remote_write_script(link.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_refuses_a_fifo_before_copying_it() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("replaced-with-fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("FIFO fixture");
+        assert!(status.success());
+        let script = remote_write_script(target.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_edit_reads_include_one_overflow_byte_without_transferring_whole_file() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("large file's data");
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        std::fs::write(&target, &bytes).unwrap();
+        for limit in [0, 128, bytes.len() as u64] {
+            let script = remote_edit_read_script(target.to_str().unwrap(), limit).unwrap();
+            let output = run_remote_script(&script, &[]);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout.len(), bytes.len().min(limit as usize + 1));
+        }
+        assert!(remote_edit_read_script(target.to_str().unwrap(), u64::MAX).is_err());
     }
 
     #[test]

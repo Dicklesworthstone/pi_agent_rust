@@ -10504,7 +10504,7 @@ impl EditTool {
     /// `edit` over `ssh://host/path` (bd-cv653.6.5): fetch the FULL remote
     /// content (never truncated — an editor on a truncated view would
     /// overwrite real data), run the same replacement core as local edits,
-    /// then stage + rename atomically on the remote host.
+    /// then stage and check the original bytes before remote replacement.
     async fn execute_ssh_edit(&self, input: &EditInput) -> Result<ToolOutput> {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
@@ -10523,7 +10523,7 @@ impl EditTool {
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
-            crate::url_router::ssh_write_document(&write_url, &payload)
+            crate::url_router::ssh_replace_document(&write_url, &raw, &payload)
                 .map_err(std::io::Error::other)
         })
         .await
@@ -10559,7 +10559,7 @@ impl EditTool {
 impl HashlineEditTool {
     /// `hashline_edit` over `ssh://host/path` (bd-cv653.6.5): full remote
     /// fetch, the same anchor-validation/splice core as local hashline
-    /// edits (stale anchors rejected), atomic remote staging.
+    /// edits (stale anchors rejected), and a remote original-content guard.
     async fn execute_ssh_hashline_edit(&self, input: &HashlineEditInput) -> Result<ToolOutput> {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
@@ -10586,7 +10586,7 @@ impl HashlineEditTool {
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
-            crate::url_router::ssh_write_document(&write_url, &payload)
+            crate::url_router::ssh_replace_document(&write_url, raw_content.as_bytes(), &payload)
                 .map_err(std::io::Error::other)
         })
         .await
