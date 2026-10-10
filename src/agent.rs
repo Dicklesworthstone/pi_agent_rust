@@ -1962,7 +1962,11 @@ impl Agent {
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
-        let job_session_scope = tools.snapshot().job_session_scope();
+        let registry = tools.snapshot();
+        let job_session_scope = registry.job_session_scope();
+        registry
+            .model_scope()
+            .set(provider.name(), provider.model_id());
         let compaction_privacy_state = Arc::new(StdMutex::new(
             compaction::CompactionPrivacy::from_settings(config.secrets.as_ref()),
         ));
@@ -2228,6 +2232,10 @@ impl Agent {
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+        self.tools
+            .snapshot()
+            .model_scope()
+            .set(self.provider.name(), self.provider.model_id());
         // A bare provider object does not carry registry capability metadata.
         // Reset fail-closed so a new or external call site cannot accidentally
         // carry a high thinking cap from the previous model. Registry-aware
@@ -21569,6 +21577,8 @@ mod tests {
             let auth_path = dir.path().join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("load auth");
             let mut agent_session = build_switch_test_session(&auth);
+            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
+            let original_model = model_scope.current();
 
             {
                 let cx = crate::agent_cx::AgentCx::for_request();
@@ -21590,6 +21600,7 @@ mod tests {
                     .contains("Missing credentials for openai/gpt-4o"),
                 "unexpected error: {err}"
             );
+            assert_eq!(model_scope.current(), original_model);
             assert_eq!(agent_session.agent.provider().name(), "anthropic");
             assert_eq!(
                 agent_session.agent.provider().model_id(),
@@ -21634,6 +21645,8 @@ mod tests {
                 },
             );
             let mut agent_session = build_switch_test_session(&auth);
+            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
+            let original_model = model_scope.current();
             let blocked_path = dir.path().join("blocked.jsonl");
             std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
             {
@@ -21655,6 +21668,11 @@ mod tests {
                 .await
                 .expect_err("unwritable model-selection candidate must fail closed");
             assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert_eq!(
+                model_scope.current(),
+                original_model,
+                "a failed model commit must not retarget delegated work"
+            );
             assert!(
                 agent_session.has_pending_background_compaction(),
                 "a switch that never became durable must not retire the live model's compaction"
@@ -21924,6 +21942,138 @@ mod tests {
     }
 
     #[test]
+    fn tool_model_scope_tracks_provider_swaps_without_changing_captured_selections() {
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let standalone_scope = tools.model_scope();
+        assert!(standalone_scope.current().is_none());
+        let shared = crate::tools::SharedToolRegistry::new(tools);
+        let old_snapshot = shared.snapshot();
+        let mut agent = Agent::with_shared_tools(
+            Arc::new(SilentProvider),
+            shared.clone(),
+            AgentConfig {
+                stream_options: StreamOptions {
+                    api_key: Some("private-parent-credential".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let captured = standalone_scope.current().expect("initial model affinity");
+        assert_eq!(captured.provider, "silent-provider");
+        assert_eq!(captured.model, "test-model");
+
+        let other = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::from_tools(Vec::new()),
+            AgentConfig::default(),
+        );
+        let fallback = crate::models::ad_hoc_model_entry("openrouter", "vendor/fallback-model")
+            .expect("fallback entry");
+        agent.set_provider(
+            crate::providers::create_provider(&fallback, None).expect("fallback provider"),
+        );
+        let expected = crate::tools::ToolModelSelection {
+            provider: "openrouter".to_string(),
+            model: "vendor/fallback-model".to_string(),
+        };
+        assert_eq!(standalone_scope.current(), Some(expected.clone()));
+        assert_eq!(old_snapshot.model_scope().current(), Some(expected.clone()));
+        assert_eq!(shared.snapshot().model_scope().current(), Some(expected));
+        assert_eq!(captured.provider, "silent-provider");
+        assert_eq!(captured.model, "test-model");
+        assert_eq!(
+            other.shared_tools().snapshot().model_scope().current(),
+            Some(captured.clone()),
+            "another registry must retain its own parent model"
+        );
+
+        agent.set_provider(Arc::new(SilentProvider));
+        assert_eq!(standalone_scope.current(), Some(captured));
+    }
+
+    struct ModelScopeProbeTool {
+        name: &'static str,
+        bindings: StdArc<StdTestMutex<Vec<crate::tools::ToolModelScope>>>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for ModelScopeProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            self.name
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn bind_model_scope(&mut self, scope: crate::tools::ToolModelScope) {
+            self.bindings.lock().unwrap().push(scope);
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
+        ) -> Result<crate::tools::ToolOutput> {
+            panic!("model affinity binding must not execute a tool");
+        }
+    }
+
+    #[test]
+    fn newly_mounted_and_replaced_tools_share_the_live_model_scope() {
+        let bindings = StdArc::new(StdTestMutex::new(Vec::new()));
+        let probe = |name| -> Box<dyn crate::tools::Tool> {
+            Box::new(ModelScopeProbeTool {
+                name,
+                bindings: StdArc::clone(&bindings),
+            })
+        };
+        let tools = ToolRegistry::from_tools(vec![probe("initial")]);
+        let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+        let shared = agent.shared_tools();
+        let old_snapshot = shared.snapshot();
+        shared.update(|registry| {
+            registry.push(probe("pushed"));
+            registry.extend(vec![probe("extended")]);
+        });
+
+        let target = crate::models::ad_hoc_model_entry("openai", "next-model").unwrap();
+        agent.set_provider(crate::providers::create_provider(&target, None).unwrap());
+        shared.update(|registry| {
+            registry.push(probe("pushed"));
+            registry.extend(vec![probe("extended"), probe("late")]);
+        });
+
+        assert_eq!(old_snapshot.tools().len(), 1);
+        assert_eq!(shared.snapshot().tools().len(), 4);
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.len(), 6, "initial, mounted, and replacement tools");
+        for scope in bindings.iter() {
+            assert_eq!(
+                scope.current(),
+                Some(crate::tools::ToolModelSelection {
+                    provider: "openai".to_string(),
+                    model: "next-model".to_string(),
+                })
+            );
+        }
+        agent.set_provider(Arc::new(SilentProvider));
+        for scope in bindings.iter() {
+            assert_eq!(scope.current().unwrap().provider, "silent-provider");
+        }
+    }
+
+    #[test]
     fn set_provider_model_records_model_change_once() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -21947,6 +22097,7 @@ mod tests {
             );
 
             let mut agent_session = build_switch_test_session(&auth);
+            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
             agent_session
                 .set_provider_model("openai", "gpt-4o")
                 .await
@@ -21955,6 +22106,13 @@ mod tests {
                 .set_provider_model("openai", "gpt-4o")
                 .await
                 .expect("repeat same model");
+            assert_eq!(
+                model_scope.current(),
+                Some(crate::tools::ToolModelSelection {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                })
+            );
 
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = agent_session

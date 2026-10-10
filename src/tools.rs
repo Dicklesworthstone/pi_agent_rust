@@ -159,6 +159,50 @@ impl ToolEffects {
     }
 }
 
+/// Non-secret identity of the model currently serving the owning agent.
+///
+/// Keep provider and model separate: model identifiers can contain slashes,
+/// and child processes must not reinterpret them as a provider-qualified spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Live model affinity shared by one registry and its delegating tools.
+///
+/// The host publishes changes only when it installs a provider. A delegation
+/// captures [`Self::current`] once so queued children and retries retain the
+/// model selected for that request. Credentials are never stored here.
+#[derive(Clone, Default)]
+pub struct ToolModelScope {
+    current: Arc<Mutex<Option<ToolModelSelection>>>,
+}
+
+impl ToolModelScope {
+    /// Capture the active model, or `None` for an unattached tool registry.
+    #[must_use]
+    pub fn current(&self) -> Option<ToolModelSelection> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set(&self, provider: &str, model: &str) {
+        let selection = (!provider.trim().is_empty() && !model.trim().is_empty()).then(|| {
+            ToolModelSelection {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            }
+        });
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+    }
+}
+
 /// A tool that can be executed by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -226,6 +270,10 @@ pub trait Tool: Send + Sync {
     /// Attach the owning registry's live background-job session scope.
     /// Non-job tools intentionally ignore it.
     fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
+
+    /// Attach the owning registry's live provider/model identity.
+    /// Tools that do not delegate model work intentionally ignore it.
+    fn bind_model_scope(&mut self, _scope: ToolModelScope) {}
 
     /// Where the tool comes from. Extension-registered tools answer
     /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
@@ -5445,6 +5493,8 @@ pub struct ToolRegistry {
     /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
     /// to the live session handle.
     job_session_scope: crate::jobs::JobSessionScope,
+    /// Shared by delegating tools and updated on every host provider switch.
+    model_scope: ToolModelScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
@@ -5634,6 +5684,7 @@ impl ToolRegistry {
         ));
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
@@ -5919,12 +5970,14 @@ impl ToolRegistry {
 
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
         }
 
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
+            model_scope,
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
@@ -5946,14 +5999,17 @@ impl ToolRegistry {
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
         }
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
+            model_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
             host_ask,
@@ -5962,7 +6018,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Shallow copy: the same tool handles, job scope, discoverability set,
+    /// Shallow copy: the same tool handles, job/model scopes, discoverability set,
     /// and undo recorder. [`SharedToolRegistry::update`] publishes a new
     /// snapshot from it without disturbing readers of the previous one.
     #[must_use]
@@ -5971,6 +6027,7 @@ impl ToolRegistry {
             tools: self.tools.clone(),
             inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
+            model_scope: self.model_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
@@ -6052,6 +6109,7 @@ impl ToolRegistry {
     /// Append a tool.
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
+        tool.bind_model_scope(self.model_scope.clone());
         let name = tool.name();
         if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
             self.tools[pos] = Arc::from(tool);
@@ -6067,6 +6125,7 @@ impl ToolRegistry {
     {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
+            tool.bind_model_scope(self.model_scope.clone());
             let name = tool.name();
             if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
                 self.tools[pos] = Arc::from(tool);
@@ -6103,6 +6162,7 @@ impl ToolRegistry {
             let mut next = replacements.remove(index);
             if next.description() != tool.description() || next.parameters() != tool.parameters() {
                 next.bind_job_session_scope(self.job_session_scope.clone());
+                next.bind_model_scope(self.model_scope.clone());
                 *tool = Arc::from(next);
                 changed += 1;
             }
@@ -6118,6 +6178,7 @@ impl ToolRegistry {
                 continue;
             }
             next.bind_job_session_scope(self.job_session_scope.clone());
+            next.bind_model_scope(self.model_scope.clone());
             self.tools.push(Arc::from(next));
             changed += 1;
         }
@@ -6133,6 +6194,12 @@ impl ToolRegistry {
     /// Rebind every job-aware tool and fetcher to a live session resolver.
     pub fn bind_job_session_resolver(&self, resolver: crate::jobs::JobSessionIdResolver) {
         self.job_session_scope.bind(resolver);
+    }
+
+    /// The live host model shared by every snapshot and delegating tool.
+    #[must_use]
+    pub fn model_scope(&self) -> ToolModelScope {
+        self.model_scope.clone()
     }
 
     /// Get all tools.

@@ -161,8 +161,9 @@ impl HubLease {
         true
     }
 
-    /// Keep process-control retirement separate from result acceptance. This
-    /// guard outlives the OS reaper, but not a pending ordered writeback.
+    /// Keep process-control retirement separate from result acceptance. The
+    /// OS reaper owns this guard, including on early return or future drop;
+    /// a pending ordered writeback retains only its result-acceptance lease.
     pub(super) fn process_lifetime(&self) -> ProcessLease {
         ProcessLease {
             id: self.id.clone(),
@@ -209,7 +210,7 @@ impl ProcessLease {
         let mut hub = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        child.terminate();
+        child.terminate_untracked();
         if let Some(id) = &self.id {
             hub.mark_process_reaped(id);
         }
@@ -356,12 +357,14 @@ mod tests {
 
     #[cfg(unix)]
     mod processes {
-        use super::super::super::{ChildRunner, Deadline, UpdateCallback};
+        use super::super::super::{ChildProcessGuard, ChildRunner, Deadline, UpdateCallback};
         use super::*;
+        use crate::agent_cx::AgentCx;
         use crate::subagents::SubagentTask;
         use serde_json::json;
         use std::collections::BTreeMap;
         use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::CommandExt as _;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -437,6 +440,108 @@ mod tests {
                     .unwrap();
                 assert!(!status.success(), "child was not reaped");
             }
+        }
+
+        #[test]
+        fn dropping_a_process_guard_serializes_reaping_with_pid_retirement() {
+            for operator_killed in [false, true] {
+                let mut command = std::process::Command::new("sh");
+                command
+                    .args(["-c", "exec sleep 30"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0);
+                let child = ChildProcessGuard::spawn(&AgentCx::for_request(), &mut command)
+                    .expect("spawn owned child");
+                let pid = child.id();
+                let os_pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+                let mut hub = registry().lock().unwrap();
+                let entry = hub
+                    .register_kind("drop-lease", "serialized process drop", ChildKind::Subagent)
+                    .unwrap();
+                hub.mark_running(&entry.id, pid);
+                let child = child.with_process_lifetime(ProcessLease {
+                    id: Some(entry.id.clone()),
+                });
+                let (starting, started) = std::sync::mpsc::channel();
+                let (finishing, finished) = std::sync::mpsc::channel();
+                let reaper = std::thread::spawn(move || {
+                    starting.send(()).unwrap();
+                    drop(child);
+                    finishing.send(()).unwrap();
+                });
+                let drop_started = started.recv_timeout(Duration::from_secs(5)).is_ok();
+                let completed_while_locked =
+                    finished.recv_timeout(Duration::from_millis(100)).is_ok();
+                // Waiting for the hub lock must happen before the actual reap,
+                // not in a separate lease destructor after the PID is freed.
+                let alive_while_locked = rustix::process::test_kill_process(os_pid).is_ok();
+                let authority_while_locked = hub.control_pid(&entry.id);
+                if operator_killed {
+                    hub.mark_killed(&entry.id);
+                }
+                drop(hub);
+                reaper.join().unwrap();
+
+                let (authority_after_drop, history) = {
+                    let mut hub = registry().lock().unwrap();
+                    let authority = hub.control_pid(&entry.id);
+                    let history = hub.get(&entry.id).unwrap().clone();
+                    hub.settle(&entry.id, ChildStatus::Cancelled);
+                    (authority, history)
+                };
+                assert!(drop_started, "the reaper thread must reach Drop");
+                assert!(!completed_while_locked);
+                assert!(alive_while_locked, "PID was freed before serialized retirement");
+                assert_eq!(authority_while_locked, Some(pid));
+                assert_eq!(authority_after_drop, None);
+                assert_eq!(history.pid, Some(pid), "keep diagnostic process history");
+                assert_eq!(
+                    history.status,
+                    if operator_killed {
+                        ChildStatus::Killed
+                    } else {
+                        ChildStatus::Running
+                    },
+                    "process retirement must not settle or resurrect the result"
+                );
+                assert!(rustix::process::test_kill_process(os_pid).is_err());
+            }
+        }
+
+        #[test]
+        fn dropping_a_pending_runner_reaps_and_retires_its_bound_process_lease() {
+            let (_dir, runner) = fixture("exec sleep 30");
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let request = task(false);
+            let assignment = request.task.clone();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut run = Box::pin(runner.run_one(&agents, request, None, None));
+                assert!(futures::poll!(&mut run).is_pending());
+                let entry = registry()
+                    .lock()
+                    .unwrap()
+                    .roster()
+                    .into_iter()
+                    .find(|entry| entry.task == assignment)
+                    .expect("pending runner has a registered process");
+                let pid = entry.pid.expect("test reaches process activation");
+                drop(run);
+                let (authority, settled) = {
+                    let hub = registry().lock().unwrap();
+                    (hub.control_pid(&entry.id), hub.get(&entry.id).unwrap().clone())
+                };
+                assert_eq!(authority, None);
+                assert_eq!(settled.pid, Some(pid));
+                assert_eq!(settled.status, ChildStatus::Cancelled);
+                let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+                assert!(rustix::process::test_kill_process(pid).is_err());
+            });
         }
 
         #[test]

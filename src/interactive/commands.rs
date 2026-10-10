@@ -3599,7 +3599,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// parent agent's next idle turn boundary.
     pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
         enum TanGate {
-            Enabled,
+            Enabled(Option<pi::tools::ToolModelSelection>),
             Disabled,
             Busy,
         }
@@ -3613,12 +3613,12 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
-                TanGate::Enabled
+                TanGate::Enabled(agent.shared_tools().snapshot().model_scope().current())
             } else {
                 TanGate::Disabled
             }
         });
-        match gate {
+        let parent_model = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -3632,8 +3632,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled => {}
-        }
+            TanGate::Enabled(model) => model,
+        };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
         let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
@@ -3647,7 +3647,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
-            .with_role_model_spec(pi::app::subagent_role_spec(&self.config));
+            .with_role_model_spec(pi::app::subagent_role_spec(&self.config))
+            .with_parent_model(parent_model);
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);

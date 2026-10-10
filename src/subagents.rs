@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{Tool, ToolEffects, ToolModelScope, ToolModelSelection, ToolOutput, ToolUpdate};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,6 +119,10 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// Live host identity for tools mounted in an agent's registry.
+    model_scope: Option<ToolModelScope>,
+    /// An explicit launch-time snapshot for background host commands.
+    parent_model: Option<ToolModelSelection>,
     /// Host ceiling for the entire request, not a fresh allowance per child.
     timeout: Option<Duration>,
 }
@@ -135,6 +139,7 @@ pub(crate) struct RevivalSpec {
     global_dir: PathBuf,
     child_binary: PathBuf,
     role_model_spec: Option<String>,
+    parent_model: Option<ToolModelSelection>,
     timeout: Duration,
     depth: usize,
 }
@@ -184,6 +189,7 @@ pub(crate) async fn revive_child(
         source.entry.kind,
         deadline,
     )
+    .with_parent_model(launch.parent_model.clone())
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
         .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
@@ -218,6 +224,8 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            model_scope: None,
+            parent_model: None,
             timeout: None,
         }
     }
@@ -228,6 +236,30 @@ impl SubagentTool {
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
         self
+    }
+
+    /// Bind the owning agent's live provider/model. Each delegation captures
+    /// it once; definition pins and task/smol roles retain precedence.
+    #[must_use]
+    pub fn with_model_scope(mut self, scope: ToolModelScope) -> Self {
+        self.bind_model_scope(scope);
+        self
+    }
+
+    /// Freeze the parent's identity before dispatching background work such
+    /// as `/tan`. This carries no credentials; children use their ordinary
+    /// inherited authentication environment and configured credential stores.
+    #[must_use]
+    pub fn with_parent_model(mut self, model: Option<ToolModelSelection>) -> Self {
+        self.model_scope = None;
+        self.parent_model = model;
+        self
+    }
+
+    fn capture_parent_model(&self) -> Option<ToolModelSelection> {
+        self.model_scope
+            .as_ref()
+            .map_or_else(|| self.parent_model.clone(), ToolModelScope::current)
     }
 
     /// Set the host's request-wide execution ceiling (1 ms through 24 hours).
@@ -291,6 +323,7 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Tan,
             deadline,
         )
+        .with_parent_model(self.capture_parent_model())
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -310,6 +343,8 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            model_scope: None,
+            parent_model: None,
             timeout: None,
         }
     }
@@ -323,6 +358,7 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
+        let parent_model = self.capture_parent_model();
         // Capture once, before discovery and queueing. Every parallel task,
         // sequential step and schema-correction retry consumes this budget.
         let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
@@ -334,7 +370,8 @@ impl SubagentTool {
 
         match request.mode()? {
             RequestMode::Single(task) => Ok(vec![
-                self.run_one(&agents, task, None, on_update, deadline).await,
+                self.run_one(&agents, task, None, on_update, deadline, parent_model)
+                    .await,
             ]),
             RequestMode::Parallel(tasks) => {
                 Ok(ChildRunner::new(
@@ -345,6 +382,7 @@ impl SubagentTool {
                     crate::agent_hub::ChildKind::Subagent,
                     deadline,
                 )
+                .with_parent_model(parent_model)
                 .run_parallel(&agents, tasks, concurrency, on_update)
                 .await)
             }
@@ -354,7 +392,14 @@ impl SubagentTool {
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
                     let result = self
-                        .run_one(&agents, task, Some(step + 1), on_update.clone(), deadline)
+                        .run_one(
+                            &agents,
+                            task,
+                            Some(step + 1),
+                            on_update.clone(),
+                            deadline,
+                            parent_model.clone(),
+                        )
                         .await;
                     let failed = result.is_error;
                     previous = Some(result.clone());
@@ -375,6 +420,7 @@ impl SubagentTool {
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
         deadline: Deadline,
+        parent_model: Option<ToolModelSelection>,
     ) -> SubagentResult {
         ChildRunner::new(
             self.cwd.clone(),
@@ -384,6 +430,7 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Subagent,
             deadline,
         )
+        .with_parent_model(parent_model)
         .run_one(agents, task, step, on_update)
         .await
     }
@@ -486,6 +533,11 @@ impl Tool for SubagentTool {
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::process()
+    }
+
+    fn bind_model_scope(&mut self, scope: ToolModelScope) {
+        self.model_scope = Some(scope);
+        self.parent_model = None;
     }
 }
 
@@ -911,6 +963,7 @@ fn child_args(
     agent: &AgentDefinition,
     task: &str,
     role_model_spec: Option<&str>,
+    parent_model: Option<&ToolModelSelection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
     let mut args = vec![
@@ -926,11 +979,20 @@ fn child_args(
             .into(),
     ];
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
-    // spec from settings > nothing (child inherits the parent's ambient model).
+    // spec from settings > captured active parent > ambient configuration.
     if let Some(model) = &agent.model {
         args.extend(["--model".into(), model.clone().into()]);
     } else if let Some(spec) = role_model_spec {
         args.extend(["--model".into(), spec.into()]);
+    } else if let Some(parent) = parent_model {
+        // A parent's model ID is already resolved. Separate arguments preserve
+        // slashes and suffixes instead of parsing it as a fresh model spec.
+        args.extend([
+            "--provider".into(),
+            parent.provider.clone().into(),
+            "--model".into(),
+            parent.model.clone().into(),
+        ]);
     }
     if let Some(reasoning) = &agent.reasoning {
         args.extend(["--thinking".into(), reasoning.clone().into()]);
@@ -1394,8 +1456,8 @@ mod tests {
     }
 
     /// bd-cv653.3.1: agent-def `model:` pin beats the role spec; the role
-    /// spec is used only when the definition has no pin; no spec at all keeps
-    /// the ambient-inheritance behavior (no --model passed).
+    /// spec is used only when the definition has no pin. The resolved parent
+    /// supplies the default; standalone unbound tools retain ambient selection.
     #[test]
     fn child_args_role_model_precedence() {
         let base = AgentDefinition {
@@ -1410,12 +1472,13 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args_of = |agent: &AgentDefinition, spec: Option<&str>| {
-            child_args(agent, "inspect provider", spec, None)
-                .iter()
-                .map(|arg| arg.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-        };
+        let args_of =
+            |agent: &AgentDefinition, spec: Option<&str>, parent: Option<&ToolModelSelection>| {
+                child_args(agent, "inspect provider", spec, parent, None)
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            };
         let model_value = |args: &[String]| {
             args.windows(2)
                 .find(|pair| pair[0] == "--model")
@@ -1424,27 +1487,37 @@ mod tests {
 
         // No pin + role spec → role spec is used (task/smol resolution
         // happens at the registry; here we only prove the wire shape).
-        let args = args_of(&base, Some("openai/gpt-5-mini:low"));
+        let parent = ToolModelSelection {
+            provider: "router".to_string(),
+            model: "vendor/resolved-model:literal".to_string(),
+        };
+        let args = args_of(&base, Some("openai/gpt-5-mini:low"), Some(&parent));
         assert_eq!(
             model_value(&args).as_deref(),
             Some("openai/gpt-5-mini:low"),
             "role spec must be passed as --model when the agent def has no pin"
         );
+        assert!(!args.iter().any(|arg| arg == "--provider"));
 
         // Pin present → pin wins over the role spec.
         let pinned = AgentDefinition {
             model: Some("ai-router/gpt-5.6-sol".to_string()),
             ..base.clone()
         };
-        let args = args_of(&pinned, Some("openai/gpt-5-mini:low"));
+        let args = args_of(&pinned, Some("openai/gpt-5-mini:low"), Some(&parent));
         assert_eq!(
             model_value(&args).as_deref(),
             Some("ai-router/gpt-5.6-sol"),
             "agent-def model pin must beat the role spec"
         );
+        assert!(!args.iter().any(|arg| arg == "--provider"));
 
-        // No pin and no spec → no --model flag at all (ambient inheritance).
-        let args = args_of(&base, None);
+        let args = args_of(&base, None, Some(&parent));
+        assert_eq!(model_value(&args).as_deref(), Some(parent.model.as_str()));
+        assert!(args.windows(2).any(|pair| pair == ["--provider", "router"]));
+
+        // Unbound standalone tools still resolve ordinary child configuration.
+        let args = args_of(&base, None, None);
         assert!(
             model_value(&args).is_none(),
             "no role spec and no pin must not inject --model"
@@ -1465,7 +1538,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None)
+        let args = child_args(&agent, "inspect provider", None, None, None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1495,6 +1568,7 @@ mod tests {
             &tan_agent_definition(),
             "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
+            None,
             None,
         )
         .iter()

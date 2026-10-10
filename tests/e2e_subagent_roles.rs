@@ -217,3 +217,152 @@ fn e2e_subagent_child_uses_task_role_model() {
     harness.record_artifact("e2e_subagent_child_uses_task_role_model.jsonl", &path);
     harness.log().info("done", "case assertions passed");
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Exercise CLI selection through the real child/provider boundary.
+fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
+    let harness = TestHarness::new(
+        "e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults",
+    );
+    let server = harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/selected/v1/chat/completions",
+        vec![
+            sse_response(tool_call_sse_body()),
+            sse_response(text_sse_body("child used selected model")),
+            sse_response(text_sse_body("parent done")),
+        ],
+    );
+    server.add_route(
+        "POST",
+        "/configured/v1/chat/completions",
+        sse_response(text_sse_body("unexpected configured default")),
+    );
+    let root = harness.temp_path("pi-env");
+    let agent_dir = root.join("agent");
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    for directory in [agent_dir.join("agents"), home.clone(), workspace.clone()] {
+        std::fs::create_dir_all(directory).expect("create isolated environment");
+    }
+    std::fs::write(
+        agent_dir.join("agents/scout.md"),
+        "---\nname: scout\ndescription: unpinned scout\ntools: read\n---\nYou are the child scout.\n",
+    )
+    .expect("write unpinned agent");
+    let model_id = "vendor/selected-model:literal";
+    let models = serde_json::json!({"providers":{
+        "e2eselected":{
+            "api":"openai-completions",
+            "baseUrl":format!("{}/selected/v1", server.base_url()),
+            "apiKey":"test-key",
+            "models":[{"id":model_id,"contextWindow":128000}]
+        },
+        "e2econfigured":{
+            "api":"openai-completions",
+            "baseUrl":format!("{}/configured/v1", server.base_url()),
+            "apiKey":"test-key",
+            "models":[{"id":"configured-model","contextWindow":128000}]
+        }
+    }});
+    std::fs::write(agent_dir.join("models.json"), models.to_string())
+        .expect("write model registry");
+    std::fs::write(
+        root.join("settings.json"),
+        serde_json::json!({
+            "defaultProvider":"e2econfigured","defaultModel":"configured-model",
+            "checkForUpdates":false,"approval":{"mode":"yolo"}
+        })
+        .to_string(),
+    )
+    .expect("write settings without task or smol roles");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .args([
+            "--mode",
+            "json",
+            "--print",
+            "--no-session",
+            "--provider",
+            "e2eselected",
+            "--model",
+            model_id,
+            "--tools",
+            "subagent",
+        ])
+        .arg("run the scout")
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("PI_CONFIG_PATH", root.join("settings.json"))
+        .env("PI_SESSIONS_DIR", root.join("sessions"))
+        .env("PI_PACKAGE_DIR", root.join("packages"))
+        .env("PI_NO_AUTO_UPDATE_CHECK", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "XAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "PI_SUBAGENT_PI_BINARY",
+        "PI_SUBAGENT_DEPTH",
+        "PI_SUBAGENT_PARENT_PID",
+        "PI_SUBAGENT_RUN_ID",
+        "PI_SUBAGENT_DEADLINE_UNIX_MS",
+        "PI_SUBAGENT_TIMEOUT_SECS",
+    ] {
+        command.env_remove(key);
+    }
+    let mut child = command.spawn().expect("spawn native parent");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let finished = loop {
+        if child.try_wait().expect("poll native parent").is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = child
+        .wait_with_output()
+        .expect("collect native parent output");
+    assert!(
+        finished && output.status.success(),
+        "native delegation failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.requests();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path == "/configured/v1/chat/completions"),
+        "an unpinned child reverted to the configured default provider"
+    );
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|request| request.path == "/selected/v1/chat/completions")
+        .map(|request| serde_json::from_slice(&request.body).expect("provider request JSON"))
+        .collect();
+    assert_eq!(bodies.len(), 3, "parent, child, and parent follow-up requests");
+    assert!(bodies.iter().all(|body| body["model"] == model_id));
+    assert!(
+        bodies.iter().any(|body| {
+            body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "user"
+                        && message["content"].to_string().contains("Task: reply briefly")
+                })
+            })
+        }),
+        "the selected provider must actually receive the child's assignment"
+    );
+}

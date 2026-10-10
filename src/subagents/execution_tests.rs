@@ -60,6 +60,144 @@ fn result(output: &ToolOutput) -> &Value {
     &output.details.as_ref().unwrap()["results"][0]
 }
 
+fn record_model_script(body: &str) -> String {
+    format!(
+        "provider=\nmodel=\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --provider) shift; provider=\"$1\" ;;\n\
+             --model) shift; model=\"$1\" ;;\n\
+           esac\n\
+           shift\n\
+         done\n\
+         printf '%s|%s\\n' \"$provider\" \"$model\" >> \"$PI_CODING_AGENT_DIR/models-used\"\n\
+         {body}"
+    )
+}
+
+fn recorded_models(tool: &SubagentTool) -> Vec<String> {
+    std::fs::read_to_string(tool.global_dir.join("models-used"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn subagent_launch_model_precedence_keeps_resolved_parent_ids_exact() {
+    let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+    let scope = ToolModelScope::default();
+    scope.set("host-router", "vendor/resolved-model:literal");
+    let tool = tool.with_model_scope(scope);
+    assert!(!run(&tool, request()).is_error);
+
+    let tool = tool.with_role_model_spec(Some("role-provider/task-model:low".to_string()));
+    assert!(!run(&tool, request()).is_error);
+    std::fs::write(
+        tool.global_dir.join("agents/worker.md"),
+        "---\nname: worker\ndescription: pinned\nmodel: pinned-provider/pinned-model\n---\nFinish.\n",
+    )
+    .unwrap();
+    assert!(!run(&tool, request()).is_error);
+    assert_eq!(
+        recorded_models(&tool),
+        [
+            "host-router|vendor/resolved-model:literal",
+            "|role-provider/task-model:low",
+            "|pinned-provider/pinned-model",
+        ]
+    );
+}
+
+#[test]
+fn request_model_snapshot_survives_queue_chain_retry_and_revival() {
+    for mode in ["tasks", "chain"] {
+        let body = format!(
+            "if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+             else\n\
+               : > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+             fi\n",
+            emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+            emit(&[ended("not JSON", "stop")]),
+        );
+        let (_dir, tool) = fixture(&record_model_script(&body));
+        let scope = ToolModelScope::default();
+        scope.set("initial", "vendor/parent:literal");
+        let selected = scope.current().unwrap();
+        let tool = tool.with_model_scope(scope.clone());
+        let mut input = json!({"concurrency":1});
+        input[mode] = json!([
+            {"agent":"worker","task":format!("captured-{}", uuid::Uuid::new_v4()),
+             "outputSchema":{"type":"object","required":["accepted"]},"schemaMode":"strict"},
+            {"agent":"worker","task":"follow up on {previous}"}
+        ]);
+        let changed = scope.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "capture-model-once",
+                input,
+                Some(Box::new(move |update| {
+                    if update.details.as_ref().unwrap()["result"]["status"] == "starting" {
+                        changed.set("changed", "vendor/next-model");
+                    }
+                })),
+            ))
+            .unwrap();
+        assert!(!output.is_error, "{mode}: {output:?}");
+        assert_eq!(result(&output)["schemaRetries"], 1);
+        assert_eq!(result(&output)["schemaValid"], true);
+        assert_eq!(
+            recorded_models(&tool),
+            vec!["initial|vendor/parent:literal".to_string(); 3],
+            "queued work, chain steps and corrective retries must share the initial selection"
+        );
+        let source = source_entry(&output);
+        assert!(!run(&tool, request()).is_error);
+        assert_eq!(recorded_models(&tool)[3], "changed|vendor/next-model");
+
+        scope.set("third", "another/model");
+        let revived = revive_through_hub(&tool.cwd, &source.id);
+        assert!(!revived.is_error, "{revived:?}");
+        assert_eq!(recorded_models(&tool)[4], "initial|vendor/parent:literal");
+        let hub = crate::agent_hub::registry().lock().unwrap();
+        let replacement = hub.native_revival_source(revived_id(&revived)).unwrap();
+        assert_eq!(replacement.launch.parent_model, Some(selected));
+    }
+}
+
+#[test]
+fn background_tan_keeps_parent_snapshot_captured_before_dispatch() {
+    let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+    let scope = ToolModelScope::default();
+    scope.set("launch-provider", "vendor/background-model:literal");
+    let tool = tool
+        .with_model_scope(scope.clone())
+        .with_parent_model(scope.current());
+    scope.set("later-provider", "different-model");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let completion = runtime
+        .block_on(tool.run_background_tan("background assignment"))
+        .unwrap();
+    assert!(!completion.is_error);
+    let tool = tool.with_role_model_spec(Some("role-provider/background-role".to_string()));
+    let completion = runtime
+        .block_on(tool.run_background_tan("role assignment"))
+        .unwrap();
+    assert!(!completion.is_error);
+    assert_eq!(
+        recorded_models(&tool),
+        [
+            "launch-provider|vendor/background-model:literal",
+            "|role-provider/background-role",
+        ]
+    );
+}
+
 #[test]
 fn zero_exit_without_an_agent_completion_is_a_failed_delegation() {
     let (_dir, tool) = fixture("exit 0");

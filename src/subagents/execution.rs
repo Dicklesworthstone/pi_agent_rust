@@ -36,7 +36,7 @@ use std::time::Instant;
 mod ownership;
 #[cfg(unix)]
 mod pipes;
-use ownership::HubLease;
+use ownership::{HubLease, ProcessLease};
 
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,6 +48,7 @@ pub(super) struct ChildRunner {
     global_dir: PathBuf,
     child_binary: PathBuf,
     role_model_spec: Option<String>,
+    parent_model: Option<crate::tools::ToolModelSelection>,
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
@@ -67,6 +68,7 @@ impl ChildRunner {
             global_dir,
             child_binary,
             role_model_spec,
+            parent_model: None,
             hub_kind,
             deadline,
             revival: None,
@@ -75,6 +77,14 @@ impl ChildRunner {
 
     pub(super) fn with_revival(mut self, source: String, launch: RevivalSpec) -> Self {
         self.revival = Some((source, launch));
+        self
+    }
+
+    pub(super) fn with_parent_model(
+        mut self,
+        model: Option<crate::tools::ToolModelSelection>,
+    ) -> Self {
+        self.parent_model = model;
         self
     }
 
@@ -241,6 +251,7 @@ impl ChildRunner {
                 global_dir: self.global_dir.clone(),
                 child_binary: self.child_binary.clone(),
                 role_model_spec: self.role_model_spec.clone(),
+                parent_model: self.parent_model.clone(),
                 timeout: self.deadline.remaining(),
                 depth: child_depth(),
             },
@@ -358,7 +369,13 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = child_args(agent, &task.task, self.role_model_spec.as_deref(), schema);
+        let args = child_args(
+            agent,
+            &task.task,
+            self.role_model_spec.as_deref(),
+            launch.parent_model.as_ref(),
+            schema,
+        );
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
@@ -461,11 +478,10 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        // Declared before the process guard so it retires PID control only
-        // after that guard has reaped the child on every early-return/drop path.
-        let process_lease = attempt.hub.process_lifetime();
         let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
-            Ok(child) => child,
+            // Bind process authority before activation. The same guard then
+            // serializes reaping and retirement even when this future drops.
+            Ok(child) => child.with_process_lifetime(attempt.hub.process_lifetime()),
             Err(error) => {
                 attempt.result.fail(format!(
                     "Failed to launch {}: {error}",
@@ -520,7 +536,7 @@ impl ChildRunner {
         let mut protocol = protocol::ChildProtocol::default();
         loop {
             if !check_budget(owner, self.deadline, &mut attempt.result) {
-                process_lease.terminate(&mut child);
+                child.terminate();
                 break;
             }
             #[cfg(unix)]
@@ -530,10 +546,10 @@ impl ChildRunner {
             if !check_budget(owner, self.deadline, &mut attempt.result) {
                 // Invalid frames and expired budgets must stop the producer,
                 // including one that continues writing after agent_end.
-                process_lease.terminate(&mut child);
+                child.terminate();
                 break;
             }
-            match process_lease.try_wait(child.child.as_mut().expect("owned child")) {
+            match child.try_wait() {
                 Ok(Some(status)) => {
                     attempt.result.exit_code = status.code();
                     break;
@@ -543,7 +559,7 @@ impl ChildRunner {
                     attempt
                         .result
                         .fail(format!("Failed while waiting for child: {error}"));
-                    process_lease.terminate(&mut child);
+                    child.terminate();
                     break;
                 }
             }
@@ -775,6 +791,7 @@ impl Attempt {
 struct ChildProcessGuard {
     child: Option<std::process::Child>,
     descendants_stopped: bool,
+    process_lease: Option<ProcessLease>,
 }
 
 impl ChildProcessGuard {
@@ -789,10 +806,23 @@ impl ChildProcessGuard {
         Self {
             child: Some(child),
             descendants_stopped: false,
+            process_lease: None,
         }
+    }
+    fn with_process_lifetime(mut self, lease: ProcessLease) -> Self {
+        self.process_lease = Some(lease);
+        self
     }
     fn id(&self) -> u32 {
         self.child.as_ref().map_or(0, std::process::Child::id)
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let child = self.child.as_mut().expect("owned child");
+        if let Some(lease) = &self.process_lease {
+            lease.try_wait(child)
+        } else {
+            child.try_wait()
+        }
     }
     fn stop_descendants(&mut self) {
         if self.descendants_stopped {
@@ -814,6 +844,16 @@ impl ChildProcessGuard {
         crate::tools::kill_process_tree(Some(pid));
     }
     fn terminate(&mut self) {
+        if let Some(lease) = self.process_lease.take() {
+            // The lease holds the hub lock while terminating and retiring the
+            // PID. A separate destructor would leave a reused PID signalable
+            // between child.wait() and retirement when a future is dropped.
+            lease.terminate(self);
+        } else {
+            self.terminate_untracked();
+        }
+    }
+    fn terminate_untracked(&mut self) {
         self.stop_descendants();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

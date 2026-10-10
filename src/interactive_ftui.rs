@@ -6269,7 +6269,18 @@ async fn run_tan_command(
         }
     };
 
-    let tool = crate::subagents::SubagentTool::new(cwd).with_role_model_spec(role_spec);
+    // Capture before spawning: a later /model command must not retarget work
+    // the user has already delegated to this background child.
+    let parent_model = handle
+        .session()
+        .agent
+        .shared_tools()
+        .snapshot()
+        .model_scope()
+        .current();
+    let tool = crate::subagents::SubagentTool::new(cwd)
+        .with_role_model_spec(role_spec)
+        .with_parent_model(parent_model);
     // ubs:ignore Sender clone per background job — the task must own its sender
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {

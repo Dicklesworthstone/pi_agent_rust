@@ -490,6 +490,15 @@ Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
 definitions. The process inherits the parent's provider, router, authentication,
 and model-registry environment, including `PI_CODING_AGENT_DIR`.
 
+Children choose their model in this order: the agent definition's `model:` pin,
+the configured `task` role (or `smol` fallback), then the parent's active provider
+and model. Each request captures the parent selection once, including any
+manual switch or failover already in effect; queued children, chain steps,
+schema retries, and explicit revivals retain that selection. Children resolve
+credentials from their inherited environment and existing authentication
+configuration. Credentials supplied only to the parent's CLI or in memory are
+not copied into child arguments or new environment variables.
+
 ```markdown
 ---
 name: scout
@@ -512,12 +521,20 @@ stderr details, and are killed/reaped if the parent is cancelled. Child agents
 receive the declared tool allowlist; the default child allowlist deliberately
 excludes `subagent` to prevent accidental recursive delegation.
 
+With per-task `isolation: "worktree"`, a parallel batch captures each source
+workspace before launching children, including staged, unstaged, and untracked
+files. Queued children and corrective retries use that same baseline. Accepted
+patches apply after execution in task order; conflicts and cancelled work remain
+in their worktrees for inspection. `isoApply: "keep"` retains a result without
+applying it, and `isoApply: "drop"` discards its worktree after reporting the patch.
+
 In interactive mode, `/tan <work>` starts the same task-role child machinery
 without interrupting the main conversation. The child runs in the current
 directory, appears in `hub agent roster` with `kind=tan`, and sends its bounded
 completion summary through the follow-up queue at the next idle turn boundary.
 Because `/tan` inherits the delegation safety gate, it is available only when
-the opt-in `subagent` tool is enabled.
+the opt-in `subagent` tool is enabled. It captures the same model precedence when
+the command is submitted, so a later parent model switch does not retarget it.
 
 ### Session Management
 
