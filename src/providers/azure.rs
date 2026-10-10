@@ -210,10 +210,16 @@ impl AzureOpenAIProvider {
             });
         }
 
-        // Convert conversation messages
+        // Azure requires every tool reply before the next user message too.
+        // Images from parallel results share one attachment turn (GH #248).
+        let mut tool_images = Vec::new();
         for message in context.messages.iter() {
-            messages.extend(convert_message_to_azure(message));
+            if !matches!(message, Message::ToolResult(_)) {
+                append_tool_result_images(&mut messages, &mut tool_images);
+            }
+            messages.push(convert_message_to_azure(message, &mut tool_images));
         }
+        append_tool_result_images(&mut messages, &mut tool_images);
 
         messages
     }
@@ -923,23 +929,24 @@ struct AzureUsage {
 // ============================================================================
 
 #[allow(clippy::too_many_lines)]
-fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
+fn convert_message_to_azure(
+    message: &Message,
+    tool_images: &mut Vec<AzureContentPart>,
+) -> AzureMessage {
     match message {
-        Message::User(user) => vec![AzureMessage {
+        Message::User(user) => AzureMessage {
             role: "user".to_string(),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
-        }],
-        Message::Custom(custom) => vec![AzureMessage {
+        },
+        Message::Custom(custom) => AzureMessage {
             role: "user".to_string(),
             content: Some(AzureContent::Text(custom.content.clone())),
             tool_calls: None,
             tool_call_id: None,
-        }],
+        },
         Message::Assistant(assistant) => {
-            let mut messages = Vec::new();
-
             // Collect text content
             let text: String = assistant
                 .content
@@ -980,14 +987,12 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
                 Some(tool_calls)
             };
 
-            messages.push(AzureMessage {
+            AzureMessage {
                 role: "assistant".to_string(),
                 content,
                 tool_calls,
                 tool_call_id: None,
-            });
-
-            messages
+            }
         }
         Message::ToolResult(result) => {
             let mut text_parts = Vec::new();
@@ -1017,29 +1022,40 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
                 Some(AzureContent::Text(text_parts.join("\n")))
             };
 
-            let mut messages = vec![AzureMessage {
+            if !image_parts.is_empty() {
+                tool_images.push(AzureContentPart::Text {
+                    text: format!(
+                        "Images from {} (tool call {}):",
+                        result.tool_name, result.tool_call_id
+                    ),
+                });
+                tool_images.extend(image_parts);
+            }
+            AzureMessage {
                 role: "tool".to_string(),
                 content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
-            }];
-
-            if !image_parts.is_empty() {
-                let mut parts = vec![AzureContentPart::Text {
-                    text: "Attached image(s) from tool result:".to_string(),
-                }];
-                parts.extend(image_parts);
-                messages.push(AzureMessage {
-                    role: "user".to_string(),
-                    content: Some(AzureContent::Parts(parts)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
             }
-
-            messages
         }
     }
+}
+
+fn append_tool_result_images(messages: &mut Vec<AzureMessage>, images: &mut Vec<AzureContentPart>) {
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    parts.push(AzureContentPart::Text {
+        text: "Attached image(s) from tool results:".to_string(),
+    });
+    parts.append(images);
+    messages.push(AzureMessage {
+        role: "user".to_string(),
+        content: Some(AzureContent::Parts(parts)),
+        tool_calls: None,
+        tool_call_id: None,
+    });
 }
 
 fn convert_user_content(content: &UserContent) -> AzureContent {
@@ -1307,9 +1323,10 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
 
-        let azure_messages = convert_message_to_azure(&message);
-        assert_eq!(azure_messages.len(), 1);
-        assert_eq!(azure_messages[0].role, "user");
+        let mut tool_images = Vec::new();
+        let azure_message = convert_message_to_azure(&message, &mut tool_images);
+        assert_eq!(azure_message.role, "user");
+        assert!(tool_images.is_empty());
     }
 
     #[derive(Debug, Deserialize)]
@@ -1875,9 +1892,46 @@ mod tests {
         .to_string()
     }
 
-    fn make_tool_result(content: Vec<ContentBlock>) -> Message {
+    fn request_messages(messages: Vec<Message>) -> Vec<AzureMessage> {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: messages.into(),
+            tools: Vec::new().into(),
+        };
+        provider
+            .build_request(&context, &StreamOptions::default())
+            .messages
+    }
+
+    fn tool_call_message(ids: &[&str]) -> Message {
+        Message::assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: "test_tool".to_string(),
+                        arguments: json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn image_block(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    fn make_tool_result(id: &str, content: Vec<ContentBlock>) -> Message {
         Message::tool_result(ToolResultMessage {
-            tool_call_id: "call_123".to_string(),
+            tool_call_id: id.to_string(),
             tool_name: "test_tool".to_string(),
             content,
             details: None,
@@ -1888,11 +1942,14 @@ mod tests {
 
     #[test]
     fn tool_result_text_only_produces_single_tool_message() {
-        let msg = make_tool_result(vec![ContentBlock::Text(TextContent {
-            text: "result text".to_string(),
-            text_signature: None,
-        })]);
-        let azure_msgs = convert_message_to_azure(&msg);
+        let msg = make_tool_result(
+            "call_123",
+            vec![ContentBlock::Text(TextContent {
+                text: "result text".to_string(),
+                text_signature: None,
+            })],
+        );
+        let azure_msgs = request_messages(vec![msg]);
         assert_eq!(azure_msgs.len(), 1);
         assert_eq!(azure_msgs[0].role, "tool");
         assert_eq!(azure_msgs[0].tool_call_id.as_deref(), Some("call_123"));
@@ -1902,11 +1959,14 @@ mod tests {
 
     #[test]
     fn tool_result_image_only_produces_tool_plus_user_message() {
-        let msg = make_tool_result(vec![ContentBlock::Image(ImageContent {
-            data: "aW1hZ2U=".to_string(),
-            mime_type: "image/png".to_string(),
-        })]);
-        let azure_msgs = convert_message_to_azure(&msg);
+        let msg = make_tool_result(
+            "call_123",
+            vec![ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/png".to_string(),
+            })],
+        );
+        let azure_msgs = request_messages(vec![msg]);
         assert_eq!(
             azure_msgs.len(),
             2,
@@ -1920,11 +1980,12 @@ mod tests {
 
         let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
         let parts = user_json["content"].as_array().expect("parts array");
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["text"], "Images from test_tool (tool call call_123):");
+        assert_eq!(parts[2]["type"], "image_url");
         assert!(
-            parts[1]["image_url"]["url"]
+            parts[2]["image_url"]["url"]
                 .as_str()
                 .unwrap()
                 .starts_with("data:image/png;base64,")
@@ -1933,21 +1994,24 @@ mod tests {
 
     #[test]
     fn tool_result_mixed_text_and_image_splits_correctly() {
-        let msg = make_tool_result(vec![
-            ContentBlock::Text(TextContent {
-                text: "line one".to_string(),
-                text_signature: None,
-            }),
-            ContentBlock::Image(ImageContent {
-                data: "aW1hZ2U=".to_string(),
-                mime_type: "image/jpeg".to_string(),
-            }),
-            ContentBlock::Text(TextContent {
-                text: "line two".to_string(),
-                text_signature: None,
-            }),
-        ]);
-        let azure_msgs = convert_message_to_azure(&msg);
+        let msg = make_tool_result(
+            "call_123",
+            vec![
+                ContentBlock::Text(TextContent {
+                    text: "line one".to_string(),
+                    text_signature: None,
+                }),
+                ContentBlock::Image(ImageContent {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "line two".to_string(),
+                    text_signature: None,
+                }),
+            ],
+        );
+        let azure_msgs = request_messages(vec![msg]);
         assert_eq!(
             azure_msgs.len(),
             2,
@@ -1960,21 +2024,123 @@ mod tests {
 
         let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
         let parts = user_json["content"].as_array().expect("parts array");
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["text"], "Images from test_tool (tool call call_123):");
+        assert_eq!(parts[2]["type"], "image_url");
     }
 
     #[test]
     fn tool_result_empty_content_produces_single_tool_message_with_no_content() {
-        let msg = make_tool_result(vec![]);
-        let azure_msgs = convert_message_to_azure(&msg);
+        let msg = make_tool_result("call_123", vec![]);
+        let azure_msgs = request_messages(vec![msg]);
         assert_eq!(azure_msgs.len(), 1);
         assert_eq!(azure_msgs[0].role, "tool");
         let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
         assert!(
             json["content"].is_null(),
             "empty tool result should have null content"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_precede_one_ordered_image_bundle() {
+        let wire = serde_json::to_value(request_messages(vec![
+            tool_call_message(&["call_a", "call_b", "call_c", "call_empty"]),
+            make_tool_result(
+                "call_a",
+                vec![
+                    ContentBlock::Text(TextContent::new("first result")),
+                    image_block("AQ==", "image/png"),
+                    image_block("Ag==", "image/jpeg"),
+                ],
+            ),
+            Message::tool_result(ToolResultMessage {
+                tool_call_id: "call_b".to_string(),
+                tool_name: "test_tool".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("read failed"))],
+                details: None,
+                is_error: true,
+                timestamp: 0,
+            }),
+            make_tool_result("call_c", vec![image_block("Aw==", "image/webp")]),
+            make_tool_result("call_empty", Vec::new()),
+        ]))
+        .expect("serialize request messages");
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool", "tool", "user"]
+        );
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"].iter().enumerate() {
+            assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
+            assert_eq!(messages[index + 1]["tool_call_id"], *id);
+        }
+        assert_eq!(messages[1]["content"], "first result");
+        assert_eq!(messages[2]["content"], "read failed");
+        assert_eq!(messages[3]["content"], "(see attached image)");
+        assert!(messages[4]["content"].is_null());
+        assert_eq!(
+            messages[5]["content"],
+            json!([
+                {"type": "text", "text": "Attached image(s) from tool results:"},
+                {"type": "text", "text": "Images from test_tool (tool call call_a):"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Ag=="}},
+                {"type": "text", "text": "Images from test_tool (tool call call_c):"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,Aw=="}}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_image_bundles_stay_with_their_run_and_preserve_user_images() {
+        let wire = serde_json::to_value(request_messages(vec![
+            Message::User(UserMessage {
+                content: UserContent::Blocks(vec![image_block("AQ==", "image/png")]),
+                timestamp: 0,
+            }),
+            tool_call_message(&["call_a"]),
+            make_tool_result("call_a", vec![image_block("Ag==", "image/jpeg")]),
+            tool_call_message(&["call_b"]),
+            make_tool_result("call_b", vec![image_block("Aw==", "image/webp")]),
+            Message::User(UserMessage {
+                content: UserContent::Blocks(vec![image_block("BA==", "image/png")]),
+                timestamp: 0,
+            }),
+        ]))
+        .expect("serialize request messages");
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "user", "assistant", "tool", "user", "user"]
+        );
+        for (message_index, part_index, expected) in [
+            (0, 0, "data:image/png;base64,AQ=="),
+            (3, 2, "data:image/jpeg;base64,Ag=="),
+            (6, 2, "data:image/webp;base64,Aw=="),
+            (7, 0, "data:image/png;base64,BA=="),
+        ] {
+            assert_eq!(
+                messages[message_index]["content"][part_index]["image_url"]["url"],
+                expected
+            );
+        }
+        assert_eq!(messages[3]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(messages[6]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            messages[3]["content"][1]["text"],
+            "Images from test_tool (tool call call_a):"
+        );
+        assert_eq!(
+            messages[6]["content"][1]["text"],
+            "Images from test_tool (tool call call_b):"
         );
     }
 }

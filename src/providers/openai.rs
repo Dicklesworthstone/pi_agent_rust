@@ -511,10 +511,17 @@ impl OpenAIProvider {
             });
         }
 
-        // Convert conversation messages
+        // Every tool call in an assistant turn must be answered before a new
+        // user message. Collect images across the consecutive tool-result run
+        // and attach them only after all of its tool replies (GH #248).
+        let mut tool_images = Vec::new();
         for message in context.messages.iter() {
-            messages.extend(convert_message_to_openai(message));
+            if !matches!(message, Message::ToolResult(_)) {
+                append_tool_result_images(&mut messages, &mut tool_images);
+            }
+            messages.push(convert_message_to_openai(message, &mut tool_images));
         }
+        append_tool_result_images(&mut messages, &mut tool_images);
 
         messages
     }
@@ -1734,23 +1741,24 @@ struct OpenAIChunkError {
 // ============================================================================
 
 #[allow(clippy::too_many_lines)]
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
+fn convert_message_to_openai<'a>(
+    message: &'a Message,
+    tool_images: &mut Vec<OpenAIContentPart<'a>>,
+) -> OpenAIMessage<'a> {
     match message {
-        Message::User(user) => vec![OpenAIMessage {
+        Message::User(user) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
-        }],
-        Message::Custom(custom) => vec![OpenAIMessage {
+        },
+        Message::Custom(custom) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
-        }],
+        },
         Message::Assistant(assistant) => {
-            let mut messages = Vec::new();
-
             // Collect text content
             let text: String = assistant
                 .content
@@ -1796,14 +1804,12 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 Some(tool_calls)
             };
 
-            messages.push(OpenAIMessage {
+            OpenAIMessage {
                 role: Cow::Borrowed("assistant"),
                 content,
                 tool_calls,
                 tool_call_id: None,
-            });
-
-            messages
+            }
         }
         Message::ToolResult(result) => {
             let mut text_parts: Vec<Cow<'_, str>> = Vec::new();
@@ -1838,29 +1844,43 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 Some(OpenAIContent::Text(Cow::Owned(text_parts.join("\n"))))
             };
 
-            let mut messages = vec![OpenAIMessage {
+            if !image_parts.is_empty() {
+                tool_images.push(OpenAIContentPart::Text {
+                    text: Cow::Owned(format!(
+                        "Images from {} (tool call {}):",
+                        result.tool_name, result.tool_call_id
+                    )),
+                });
+                tool_images.extend(image_parts);
+            }
+            OpenAIMessage {
                 role: Cow::Borrowed("tool"),
                 content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
-            }];
-
-            if !image_parts.is_empty() {
-                let mut parts = vec![OpenAIContentPart::Text {
-                    text: Cow::Borrowed("Attached image(s) from tool result:"),
-                }];
-                parts.extend(image_parts);
-                messages.push(OpenAIMessage {
-                    role: Cow::Borrowed("user"),
-                    content: Some(OpenAIContent::Parts(parts)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
             }
-
-            messages
         }
     }
+}
+
+fn append_tool_result_images<'a>(
+    messages: &mut Vec<OpenAIMessage<'a>>,
+    images: &mut Vec<OpenAIContentPart<'a>>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    parts.push(OpenAIContentPart::Text {
+        text: Cow::Borrowed("Attached image(s) from tool results:"),
+    });
+    parts.append(images);
+    messages.push(OpenAIMessage {
+        role: Cow::Borrowed("user"),
+        content: Some(OpenAIContent::Parts(parts)),
+        tool_calls: None,
+        tool_call_id: None,
+    });
 }
 
 fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
@@ -2030,9 +2050,10 @@ mod tests {
             is_error: false,
             timestamp: 0,
         });
-        let messages = convert_message_to_openai(&result);
-        assert_eq!(messages.len(), 1, "no trailing image turn for media");
-        let wire = serde_json::to_value(&messages[0]).expect("serialize");
+        let mut tool_images = Vec::new();
+        let message = convert_message_to_openai(&result, &mut tool_images);
+        assert!(tool_images.is_empty(), "no trailing image turn for media");
+        let wire = serde_json::to_value(&message).expect("serialize");
         assert_eq!(wire["role"], "tool");
         assert_eq!(
             wire["content"],
@@ -2047,9 +2068,185 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_openai(&message);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
+        let mut tool_images = Vec::new();
+        let converted = convert_message_to_openai(&message, &mut tool_images);
+        assert_eq!(converted.role, "user");
+        assert!(tool_images.is_empty());
+    }
+
+    fn tool_call_message(ids: &[&str]) -> Message {
+        Message::assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn image_block(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(crate::model::ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    fn tool_result_message(id: &str, content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    fn request_messages(messages: Vec<Message>) -> Value {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: messages.into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let request = provider.build_request(&context, &options);
+        serde_json::to_value(request).expect("serialize request")["messages"].clone()
+    }
+
+    #[test]
+    fn parallel_tool_results_precede_one_ordered_image_bundle() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_a", "call_b", "call_c", "call_empty"]),
+            tool_result_message(
+                "call_a",
+                vec![
+                    ContentBlock::Text(TextContent::new("first result")),
+                    image_block("AQ==", "image/png"),
+                    image_block("Ag==", "image/jpeg"),
+                ],
+            ),
+            tool_result_message(
+                "call_b",
+                vec![ContentBlock::Text(TextContent::new("text-only result"))],
+            ),
+            tool_result_message("call_c", vec![image_block("Aw==", "image/webp")]),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool", "tool", "user"]
+        );
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"].iter().enumerate() {
+            assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
+            assert_eq!(messages[index + 1]["tool_call_id"], *id);
+        }
+        assert_eq!(messages[1]["content"], "first result");
+        assert_eq!(messages[2]["content"], "text-only result");
+        assert_eq!(messages[3]["content"], "(see attached image)");
+        assert_eq!(messages[4]["content"], "");
+        assert_eq!(
+            messages[5]["content"],
+            json!([
+                {"type": "text", "text": "Attached image(s) from tool results:"},
+                {"type": "text", "text": "Images from read (tool call call_a):"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Ag=="}},
+                {"type": "text", "text": "Images from read (tool call call_c):"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,Aw=="}}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_image_bundles_stay_with_their_run_and_preserve_user_images() {
+        let wire = request_messages(vec![
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("AQ==", "image/png")]),
+                timestamp: 0,
+            }),
+            tool_call_message(&["call_a"]),
+            tool_result_message("call_a", vec![image_block("Ag==", "image/jpeg")]),
+            tool_call_message(&["call_b"]),
+            tool_result_message("call_b", vec![image_block("Aw==", "image/webp")]),
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("BA==", "image/png")]),
+                timestamp: 0,
+            }),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "user", "assistant", "tool", "user", "user"]
+        );
+        for (message_index, part_index, expected) in [
+            (0, 0, "data:image/png;base64,AQ=="),
+            (3, 2, "data:image/jpeg;base64,Ag=="),
+            (6, 2, "data:image/webp;base64,Aw=="),
+            (7, 0, "data:image/png;base64,BA=="),
+        ] {
+            assert_eq!(
+                messages[message_index]["content"][part_index]["image_url"]["url"],
+                expected
+            );
+        }
+        assert_eq!(messages[3]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(messages[6]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            messages[3]["content"][1]["text"],
+            "Images from read (tool call call_a):"
+        );
+        assert_eq!(
+            messages[6]["content"][1]["text"],
+            "Images from read (tool call call_b):"
+        );
+    }
+
+    #[test]
+    fn text_and_media_tool_results_do_not_add_an_image_turn() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_text", "call_media", "call_empty"]),
+            tool_result_message(
+                "call_text",
+                vec![ContentBlock::Text(TextContent::new("plain result"))],
+            ),
+            tool_result_message(
+                "call_media",
+                vec![ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                })],
+            ),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool"]
+        );
+        assert_eq!(messages[1]["content"], "plain result");
+        assert_eq!(messages[2]["content"], "[media omitted: clip.mp4, video/mp4, 3 B]");
+        assert_eq!(messages[3]["content"], "");
+        assert!(!wire.to_string().contains("AAAA"));
     }
 
     #[test]

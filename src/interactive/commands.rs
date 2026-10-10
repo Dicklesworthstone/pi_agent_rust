@@ -1545,6 +1545,9 @@ impl PiApp {
         agent_guard.set_keyword_max_thinking_level(
             next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
+        agent_guard.set_model_accepts_images(
+            next.model.input.contains(&crate::provider::InputType::Image),
+        );
         let stream_options = agent_guard.stream_options_mut();
         stream_options.api_key.clone_from(&resolved_key_opt);
         stream_options.headers.clone_from(&next.headers);
@@ -1710,6 +1713,12 @@ impl PiApp {
             target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
         agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
+        agent_guard.set_model_accepts_images(
+            target_entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
         if target_entry.model.context_window > 0 {
             agent_guard
@@ -5541,6 +5550,86 @@ mod tests {
             auth_header: true,
             compat: None,
             oauth_config: None,
+        }
+    }
+
+    #[test]
+    fn classic_model_switch_restores_catalog_image_capability_and_original_images() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let image_message = ModelMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![crate::model::ContentBlock::Image(
+                crate::model::ImageContent {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            )]),
+            timestamp: 17,
+        });
+        let original = serde_json::to_value(&image_message).expect("native image message");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .add_message(image_message);
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+
+        for entry in [&vision, &text, &vision] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let mut agent = app.agent.try_lock().expect("agent after switch");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            assert_eq!(agent.model_accepts_images(), accepts_images);
+            let request = agent.request_context_json();
+            assert_eq!(
+                request["messages"][0]["content"][0]["type"],
+                if accepts_images { "image" } else { "text" },
+            );
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).unwrap(),
+                original,
+                "model switching must preserve the native image for later vision turns",
+            );
+        }
+    }
+
+    #[test]
+    fn classic_session_selection_restores_images_even_when_provider_already_matches() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+        app.available_models = vec![vision.clone(), text.clone()];
+
+        for entry in [&vision, &text, &vision] {
+            {
+                let mut stored = session.try_lock().expect("session");
+                stored.header.provider = Some(entry.model.provider.clone());
+                stored.header.model_id = Some(entry.model.id.clone());
+            }
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore session selection");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            let provider = {
+                let mut agent = app.agent.try_lock().expect("restored agent");
+                assert_eq!(agent.provider().model_id(), entry.model.id);
+                assert_eq!(agent.model_accepts_images(), accepts_images);
+                agent.set_model_accepts_images(!accepts_images);
+                agent.provider()
+            };
+
+            app.sync_runtime_selection_from_session_header()
+                .expect("repair capability without replacing the provider");
+            let agent = app.agent.try_lock().expect("reconciled agent");
+            assert!(Arc::ptr_eq(&provider, &agent.provider()));
+            assert_eq!(agent.model_accepts_images(), accepts_images);
         }
     }
 

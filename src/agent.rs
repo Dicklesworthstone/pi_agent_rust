@@ -724,9 +724,10 @@ pub struct AgentConfig {
     /// Default stream options.
     pub stream_options: StreamOptions,
 
-    /// Whether the active model accepts image inputs (bd-cv653.7.6).
-    /// When false, snapcompact compaction frames are stripped from the
-    /// outbound context with a logged degradation reason.
+    /// Whether the active model accepts image inputs.
+    /// When false, native images become omission explanations in outbound
+    /// context and snapcompact frames are stripped with a logged reason.
+    /// Session history retains the original images for later model switches.
     pub model_accepts_images: bool,
 
     /// Strip image blocks before sending context to providers.
@@ -2230,6 +2231,10 @@ impl Agent {
     }
 
     /// Replace the provider implementation (used for model/provider switching).
+    ///
+    /// Bare providers have no catalog metadata. This resets image support and
+    /// thinking to disabled and the tool-call dialect to native; catalog-aware
+    /// callers must install the selected model's capabilities afterwards.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
         self.tools
@@ -2238,10 +2243,11 @@ impl Agent {
             .set(self.provider.name(), self.provider.model_id());
         // A bare provider object does not carry registry capability metadata.
         // Reset fail-closed so a new or external call site cannot accidentally
-        // carry a high thinking cap from the previous model. Registry-aware
-        // switch paths immediately install the target model's clamped cap.
+        // carry capabilities from the previous model. Registry-aware switch
+        // paths immediately install the target model's thinking and image caps.
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
+        self.config.model_accepts_images = false;
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
@@ -2483,36 +2489,22 @@ impl Agent {
             .messages
             .iter()
             .any(|m| matches!(m, Message::Custom(c) if context_excluded_custom_message(c)));
-        let messages: Cow<'_, [Message]> = if self.config.block_images || has_excluded {
+        let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
+            && self.messages.iter().any(message_has_images);
+        let messages: Cow<'_, [Message]> = if needs_image_filter || has_excluded {
             let mut msgs = self.messages.clone();
             msgs.retain(|m| match m {
                 Message::Custom(c) => !context_excluded_custom_message(c),
                 _ => true,
             });
-            if self.config.block_images {
-                let stats = filter_images_for_provider(&mut msgs);
-                if stats.removed_images > 0 {
-                    tracing::debug!(
-                        filtered_images = stats.removed_images,
-                        affected_messages = stats.affected_messages,
-                        "Filtered image content from outbound provider context (images.block_images=true)"
-                    );
-                }
-            }
+            apply_image_input_policy(
+                &mut msgs,
+                self.config.block_images,
+                self.config.model_accepts_images,
+            );
             Cow::Owned(msgs)
         } else {
             Cow::Borrowed(self.messages.as_slice())
-        };
-
-        // Snapcompact vision gating (bd-cv653.7.6): text-only models never see
-        // rasterized compaction frames; the helper logs the degradation with a
-        // stable reason code and never touches user-pasted images.
-        let messages = if self.config.model_accepts_images {
-            messages
-        } else {
-            let mut owned = messages.into_owned();
-            let _stats = crate::compaction_snap::strip_snapcompact_images(&mut owned, false);
-            std::borrow::Cow::Owned(owned)
         };
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
@@ -4233,10 +4225,18 @@ impl Agent {
                 context.messages.to_vec(),
             )
         };
-        let messages = self
+        let mut messages = self
             .dispatch_context_event(&base_messages)
             .await
             .unwrap_or(base_messages);
+        // Context hooks can return new native image blocks. Enforce the active
+        // model's policy on the final request as well as the history projection;
+        // the durable messages keep their bytes for later vision-model turns.
+        apply_image_input_policy(
+            &mut messages,
+            self.config.block_images,
+            self.config.model_accepts_images,
+        );
         let context = Context::owned(system_prompt, messages, tools);
         // Secrets vault (bd-cv653.7.9): credential shapes in the outbound
         // context become stable placeholders (obfuscate) or a named refusal
@@ -18254,6 +18254,8 @@ fn log_repair_diagnostics(events: &[crate::extensions_js::ExtensionRepairEvent])
 }
 
 const BLOCK_IMAGES_PLACEHOLDER: &str = "Image reading is disabled.";
+const UNSUPPORTED_IMAGES_PLACEHOLDER: &str =
+    "[Image omitted: the active model does not support image input.]";
 
 #[derive(Debug, Default, Clone, Copy)]
 struct ImageFilterStats {
@@ -18261,10 +18263,55 @@ struct ImageFilterStats {
     affected_messages: usize,
 }
 
-fn filter_images_for_provider(messages: &mut [Message]) -> ImageFilterStats {
+fn apply_image_input_policy(
+    messages: &mut [Message],
+    block_images: bool,
+    model_accepts_images: bool,
+) {
+    let placeholder = if block_images {
+        BLOCK_IMAGES_PLACEHOLDER
+    } else if !model_accepts_images {
+        UNSUPPORTED_IMAGES_PLACEHOLDER
+    } else {
+        return;
+    };
+
+    if !model_accepts_images {
+        // Preserve snapcompact's named degradation and its text-only summary
+        // shape before replacing ordinary images with omission explanations.
+        crate::compaction_snap::strip_snapcompact_images(messages, false);
+    }
+    let stats = filter_images_for_provider(messages, placeholder);
+    if stats.removed_images > 0 {
+        tracing::debug!(
+            filtered_images = stats.removed_images,
+            affected_messages = stats.affected_messages,
+            block_images,
+            model_accepts_images,
+            "Filtered image content from outbound provider context"
+        );
+    }
+}
+
+fn message_has_images(message: &Message) -> bool {
+    let blocks = match message {
+        Message::User(UserMessage {
+            content: UserContent::Blocks(blocks),
+            ..
+        }) => blocks.as_slice(),
+        Message::Assistant(assistant) => assistant.content.as_slice(),
+        Message::ToolResult(result) => result.content.as_slice(),
+        Message::User(_) | Message::Custom(_) => return false,
+    };
+    blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+}
+
+fn filter_images_for_provider(messages: &mut [Message], placeholder: &str) -> ImageFilterStats {
     let mut stats = ImageFilterStats::default();
     for message in messages {
-        let removed = filter_images_from_message(message);
+        let removed = filter_images_from_message(message, placeholder);
         if removed > 0 {
             stats.removed_images += removed;
             stats.affected_messages += 1;
@@ -18273,24 +18320,29 @@ fn filter_images_for_provider(messages: &mut [Message]) -> ImageFilterStats {
     stats
 }
 
-fn filter_images_from_message(message: &mut Message) -> usize {
+fn filter_images_from_message(message: &mut Message, placeholder: &str) -> usize {
+    // Most text-only sessions contain no images. Keep their shared assistant
+    // and tool-result payloads intact instead of deep-cloning every Arc.
+    if !message_has_images(message) {
+        return 0;
+    }
     match message {
         Message::User(user) => match &mut user.content {
             UserContent::Text(_) => 0,
-            UserContent::Blocks(blocks) => filter_image_blocks(blocks),
+            UserContent::Blocks(blocks) => filter_image_blocks(blocks, placeholder),
         },
         Message::Assistant(assistant) => {
             let assistant = Arc::make_mut(assistant);
-            filter_image_blocks(&mut assistant.content)
+            filter_image_blocks(&mut assistant.content, placeholder)
         }
         Message::ToolResult(tool_result) => {
-            filter_image_blocks(&mut Arc::make_mut(tool_result).content)
+            filter_image_blocks(&mut Arc::make_mut(tool_result).content, placeholder)
         }
         Message::Custom(_) => 0,
     }
 }
 
-fn filter_image_blocks(blocks: &mut Vec<ContentBlock>) -> usize {
+fn filter_image_blocks(blocks: &mut Vec<ContentBlock>, placeholder: &str) -> usize {
     let mut removed = 0usize;
     let mut filtered = Vec::with_capacity(blocks.len());
 
@@ -18301,11 +18353,9 @@ fn filter_image_blocks(blocks: &mut Vec<ContentBlock>) -> usize {
                 let previous_is_placeholder =
                     filtered
                         .last()
-                        .is_some_and(|prev| matches!(prev, ContentBlock::Text(TextContent { text, .. }) if text.as_str().eq(BLOCK_IMAGES_PLACEHOLDER)));
+                        .is_some_and(|prev| matches!(prev, ContentBlock::Text(TextContent { text, .. }) if text.as_str().eq(placeholder)));
                 if !previous_is_placeholder {
-                    filtered.push(ContentBlock::Text(TextContent::new(
-                        BLOCK_IMAGES_PLACEHOLDER,
-                    )));
+                    filtered.push(ContentBlock::Text(TextContent::new(placeholder)));
                 }
             }
             other => filtered.push(other),
@@ -20936,7 +20986,7 @@ mod tests {
             sample_image_block(),
         ];
 
-        let removed = filter_image_blocks(&mut blocks);
+        let removed = filter_image_blocks(&mut blocks, BLOCK_IMAGES_PLACEHOLDER);
 
         assert_eq!(removed, 3);
         assert!(
@@ -20994,7 +21044,7 @@ mod tests {
             }),
         ];
 
-        let stats = filter_images_for_provider(&mut messages);
+        let stats = filter_images_for_provider(&mut messages, BLOCK_IMAGES_PLACEHOLDER);
 
         assert_eq!(stats.removed_images, 3);
         assert_eq!(stats.affected_messages, 3);
@@ -21074,6 +21124,227 @@ mod tests {
         let context = agent.build_context();
         assert_eq!(context.messages.len(), 1);
         assert_eq!(image_count_in_message(&context.messages[0]), 1);
+    }
+
+    #[test]
+    fn model_image_capability_filters_requests_without_losing_history() {
+        let mut assistant = assistant_message("assistant text");
+        assistant.content = vec![
+            ContentBlock::Text(TextContent {
+                text: "signed text".to_string(),
+                text_signature: Some("preserved-signature".to_string()),
+            }),
+            sample_image_block(),
+        ];
+        let media = ContentBlock::Media(crate::model::MediaContent {
+            data: "YXVkaW8=".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("recording.wav".to_string()),
+        });
+        let original = vec![
+            Message::User(UserMessage {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("before")),
+                    sample_image_block(),
+                    sample_image_block(),
+                    ContentBlock::Text(TextContent::new("after")),
+                ]),
+                timestamp: 7,
+            }),
+            Message::assistant(assistant),
+            Message::tool_result(ToolResultMessage {
+                tool_call_id: "read-image".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![sample_image_block(), media.clone()],
+                details: Some(json!({"type": "image", "data": "opaque tool metadata"})),
+                is_error: false,
+                timestamp: 11,
+            }),
+            Message::Custom(crate::model::CustomMessage {
+                content: "custom text".to_string(),
+                custom_type: "image-test".to_string(),
+                display: true,
+                details: Some(json!({"type": "image", "data": "opaque custom metadata"})),
+                timestamp: 13,
+            }),
+        ];
+        let original_json = serde_json::to_value(&original).unwrap();
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::from_tools(Vec::new()),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(original);
+        assert_eq!(
+            serde_json::to_value(&agent.build_context().messages).unwrap(),
+            original_json,
+        );
+
+        agent.set_model_accepts_images(false);
+        let context = agent.build_context();
+        assert_eq!(context.messages.len(), 4);
+        assert!(!context.messages.iter().any(message_has_images));
+        let projected = serde_json::to_value(&context.messages).unwrap();
+        assert_eq!(
+            projected[0]["content"],
+            json!([
+                {"type": "text", "text": "before"},
+                {"type": "text", "text": UNSUPPORTED_IMAGES_PLACEHOLDER},
+                {"type": "text", "text": "after"}
+            ]),
+        );
+        assert_eq!(projected[1]["content"][0], original_json[1]["content"][0]);
+        assert_eq!(projected[1]["usage"], original_json[1]["usage"]);
+        assert_eq!(projected[2]["toolCallId"], "read-image");
+        assert_eq!(projected[2]["content"][1], serde_json::to_value(media).unwrap());
+        assert_eq!(projected[2]["details"], original_json[2]["details"]);
+        assert_eq!(projected[3], original_json[3]);
+        drop(context);
+        assert_eq!(serde_json::to_value(agent.messages()).unwrap(), original_json);
+
+        agent.set_model_accepts_images(true);
+        assert_eq!(
+            serde_json::to_value(&agent.build_context().messages).unwrap(),
+            original_json,
+            "returning to a vision model must restore the original image bytes",
+        );
+    }
+
+    #[test]
+    fn image_policy_keeps_image_free_history_shared() {
+        let assistant = Arc::new(assistant_message("unchanged assistant"));
+        let tool = Arc::new(ToolResultMessage {
+            tool_call_id: "text-tool".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("unchanged tool result"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::from_tools(Vec::new()),
+            AgentConfig {
+                model_accepts_images: false,
+                ..AgentConfig::default()
+            },
+        );
+        agent.replace_messages(vec![
+            Message::Assistant(Arc::clone(&assistant)),
+            Message::ToolResult(Arc::clone(&tool)),
+        ]);
+        assert!(matches!(agent.build_context().messages, Cow::Borrowed(_)));
+
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![sample_image_block()]),
+            timestamp: 0,
+        }));
+        let context = agent.build_context();
+        assert!(
+            matches!(&context.messages[0], Message::Assistant(value) if Arc::ptr_eq(value, &assistant))
+        );
+        assert!(
+            matches!(&context.messages[1], Message::ToolResult(value) if Arc::ptr_eq(value, &tool))
+        );
+        assert!(!context.messages.iter().any(message_has_images));
+    }
+
+    #[test]
+    fn bare_provider_switch_does_not_inherit_image_capability() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::from_tools(Vec::new()),
+            AgentConfig::default(),
+        );
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![sample_image_block()]),
+            timestamp: 0,
+        }));
+        assert!(agent.build_context().messages.iter().any(message_has_images));
+        agent.set_provider(Arc::new(SilentProvider));
+        assert!(!agent.build_context().messages.iter().any(message_has_images));
+        assert!(agent.messages().iter().any(message_has_images));
+        agent.set_model_accepts_images(true);
+        assert!(agent.build_context().messages.iter().any(message_has_images));
+    }
+
+    #[test]
+    fn context_hook_images_obey_the_final_provider_image_policy() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("context-image.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("context", async (event) => ({
+                    messages: [...event.messages, {
+                      role: "user",
+                      content: [
+                        { type: "text", text: "context hook reached provider" },
+                        { type: "image", mimeType: "image/png", data: "aGVsbG8=" }
+                      ],
+                      timestamp: 17
+                    }]
+                  }));
+                }
+                "#,
+            )
+            .expect("write extension");
+
+            for (block_images, model_accepts_images, expected_images, placeholder) in [
+                (false, false, 0, Some(UNSUPPORTED_IMAGES_PLACEHOLDER)),
+                (true, true, 0, Some(BLOCK_IMAGES_PLACEHOLDER)),
+                (false, true, 1, None),
+            ] {
+                let provider = CapturingProvider::new("test-api");
+                let calls = provider.calls();
+                let agent = Agent::new(
+                    Arc::new(provider),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig {
+                        block_images,
+                        model_accepts_images,
+                        ..AgentConfig::default()
+                    },
+                );
+                let mut session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                session
+                    .enable_extensions(&[], temp_dir.path(), None, std::slice::from_ref(&entry_path))
+                    .await
+                    .expect("enable context extension");
+                session
+                    .run_text("hello".to_string(), |_| {})
+                    .await
+                    .expect("complete provider turn");
+
+                let recorded = calls.lock().expect("captured requests");
+                assert_eq!(recorded.len(), 1);
+                let messages = &recorded[0].messages;
+                assert_eq!(
+                    messages.iter().map(image_count_in_message).sum::<usize>(),
+                    expected_images,
+                );
+                let projected = serde_json::to_value(messages).unwrap();
+                let injected = projected.as_array().unwrap().last().unwrap();
+                assert_eq!(
+                    injected["content"][0]["text"],
+                    "context hook reached provider",
+                    "the extension must actually rewrite the provider context",
+                );
+                if let Some(placeholder) = placeholder {
+                    assert_eq!(injected["content"][1]["text"], placeholder);
+                }
+            }
+        });
     }
 
     #[test]
