@@ -161,6 +161,14 @@ impl HubLease {
         true
     }
 
+    /// Keep process-control retirement separate from result acceptance. This
+    /// guard outlives the OS reaper, but not a pending ordered writeback.
+    pub(super) fn process_lifetime(&self) -> ProcessLease {
+        ProcessLease {
+            id: self.id.clone(),
+        }
+    }
+
     pub(super) fn settle(&mut self, result: &SubagentResult) {
         if let Some(id) = self.id.take() {
             let status = match result.status {
@@ -169,6 +177,52 @@ impl HubLease {
                 _ => ChildStatus::Failed,
             };
             settle_in(registry(), &id, status);
+        }
+    }
+}
+
+pub(super) struct ProcessLease {
+    id: Option<String>,
+}
+
+impl ProcessLease {
+    /// Reaping and removing PID authority share the same lock as hub kill.
+    /// Never leave a reused PID controllable while asynchronous EOF drainage
+    /// or ordered result acceptance is still pending.
+    pub(super) fn try_wait(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut hub = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = child.try_wait();
+        if matches!(status, Ok(Some(_)))
+            && let Some(id) = &self.id
+        {
+            hub.mark_process_reaped(id);
+        }
+        status
+    }
+
+    pub(super) fn terminate(&self, child: &mut super::ChildProcessGuard) {
+        let mut hub = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        child.terminate();
+        if let Some(id) = &self.id {
+            hub.mark_process_reaped(id);
+        }
+    }
+}
+
+impl Drop for ProcessLease {
+    fn drop(&mut self) {
+        if let Some(id) = &self.id {
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mark_process_reaped(id);
         }
     }
 }

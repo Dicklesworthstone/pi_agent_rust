@@ -159,11 +159,8 @@ fn sanitize_id(task_id: &str) -> String {
     }
 }
 
-/// Create an isolated worktree carrying the parent's effective working files.
-///
-/// # Errors
-/// Named `PI_ISO_NOT_GIT` for non-git directories; snapshot/checkout errors otherwise.
-pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
+/// Resolve the source checkout before sharing a baseline across parallel tasks.
+pub(crate) fn isolation_root(repo_root: &Path) -> Result<PathBuf> {
     let is_git = git(repo_root, &["rev-parse", "--is-inside-work-tree"])
         .is_ok_and(|output| output.status.success());
     if !is_git {
@@ -176,32 +173,65 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
             ),
         ));
     }
-    let repo_root = snapshot::repository_root(repo_root)?;
-    let id = format!(
-        "{ISO_PREFIX}{}-{}",
-        sanitize_id(task_id),
-        uuid::Uuid::new_v4().simple()
-    );
-    let path = std::env::temp_dir().join(&id);
+    snapshot::repository_root(repo_root)
+}
+
+/// Immutable launch state shared by a parallel batch and its corrective retries.
+/// Capturing before any child starts prevents queued work from inheriting a
+/// faster sibling's edits, including edits made by non-isolated siblings.
+pub(crate) struct IsoBaseline {
+    repo_root: PathBuf,
+    captured: snapshot::Snapshot,
+}
+
+impl IsoBaseline {
+    /// The caller supplies a root resolved by [`isolation_root`]. No worktree
+    /// is created until a child actually obtains a launch slot.
+    pub(crate) fn capture(repo_root: PathBuf) -> Result<Self> {
+        let id = format!("{ISO_PREFIX}baseline-{}", uuid::Uuid::new_v4().simple());
+        let captured = snapshot::capture(&repo_root, &id)?;
+        Ok(Self {
+            repo_root,
+            captured,
+        })
+    }
+
+    pub(crate) fn isolate(&self, task_id: &str) -> Result<IsoHandle> {
+        let id = format!(
+            "{ISO_PREFIX}{}-{}",
+            sanitize_id(task_id),
+            uuid::Uuid::new_v4().simple()
+        );
+        let path = std::env::temp_dir().join(&id);
+        self.captured
+            .checkout(&self.repo_root, &path, &id)
+            .map_err(|error| {
+                Error::tool(
+                    "subagent",
+                    format!(
+                        "{error}; inspect {} for any incomplete checkout before retrying",
+                        path.display()
+                    ),
+                )
+            })?;
+        Ok(IsoHandle {
+            branch: id.clone(),
+            id,
+            path,
+            repo_root: self.repo_root.clone(),
+            baseline: self.captured.baseline.clone(),
+        })
+    }
+}
+
+/// Create an isolated worktree carrying the parent's effective working files.
+///
+/// # Errors
+/// Named `PI_ISO_NOT_GIT` for non-git directories; snapshot/checkout errors otherwise.
+pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
     // Capture first: unsupported modes and read failures must not launch an
     // incomplete child or create a half-materialized worktree.
-    let captured = snapshot::capture(&repo_root, &id)?;
-    captured.checkout(&repo_root, &path, &id).map_err(|error| {
-        Error::tool(
-            "subagent",
-            format!(
-                "{error}; inspect {} for any incomplete checkout before retrying",
-                path.display()
-            ),
-        )
-    })?;
-    Ok(IsoHandle {
-        branch: id.clone(),
-        id,
-        path,
-        repo_root,
-        baseline: captured.baseline,
-    })
+    IsoBaseline::capture(isolation_root(repo_root)?)?.isolate(task_id)
 }
 
 /// Collect the child's effective file state against its launch baseline.
@@ -244,8 +274,9 @@ pub fn collect_diff(handle: &IsoHandle) -> Result<(String, String)> {
     Ok((patch, diff_stat))
 }
 
-/// Serialize parent-tree application across sibling children. This mutex
-/// prevents simultaneous application, not ordering by task index.
+/// Serialize mutations from independent callers. The parallel child runner
+/// additionally waits for execution to finish and applies in authored task
+/// order; a mutex alone cannot provide that ordering or a common baseline.
 fn parent_apply_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));

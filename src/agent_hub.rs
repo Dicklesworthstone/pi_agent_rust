@@ -134,6 +134,9 @@ pub struct BusMessage {
 #[derive(Default)]
 pub struct AgentHubRegistry {
     entries: BTreeMap<String, ChildEntry>,
+    /// Process-control authority ends at reap, even when an accepted result
+    /// still awaits ordered worktree application. Entry PIDs remain history.
+    live_processes: BTreeMap<String, u32>,
     /// Complete user assignments, separate from display previews and from
     /// generated continuation prompts. Kept for the lifetime of this hub.
     original_tasks: BTreeMap<String, String>,
@@ -347,7 +350,19 @@ impl AgentHubRegistry {
         {
             entry.pid = Some(pid);
             entry.status = ChildStatus::Running;
+            self.live_processes.insert(id.to_string(), pid);
         }
+    }
+
+    /// A historical PID must never authorize signalling a reused OS process.
+    /// A reaped child can still be killed logically while writeback is pending.
+    #[must_use]
+    pub(crate) fn control_pid(&self, id: &str) -> Option<u32> {
+        self.live_processes.get(id).copied()
+    }
+
+    pub(crate) fn mark_process_reaped(&mut self, id: &str) {
+        self.live_processes.remove(id);
     }
 
     /// Latch the first terminal outcome. A process-reaping callback must not
@@ -356,6 +371,7 @@ impl AgentHubRegistry {
         if !status.settled() {
             return;
         }
+        self.mark_process_reaped(id);
         if let Some(entry) = self.entries.get_mut(id)
             && !entry.status.settled()
         {
@@ -1408,6 +1424,38 @@ mod tests {
         let serialized = serde_json::to_value(tan_roster).expect("serialize roster entry");
         assert_eq!(serialized["kind"], "tan");
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn reaped_child_keeps_history_but_loses_pid_control_before_writeback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        reg.dir = Some(temp.path().to_path_buf());
+        let first = reg.register("worker", "first").unwrap();
+        let second = reg.register("worker", "second").unwrap();
+        assert_eq!(reg.control_pid(&first.id), None);
+        reg.mark_running(&first.id, 4242);
+        reg.mark_running(&second.id, 4243);
+        assert_eq!(reg.control_pid(&first.id), Some(4242));
+
+        reg.mark_process_reaped(&first.id);
+        let waiting = reg.get(&first.id).unwrap();
+        assert_eq!(waiting.pid, Some(4242));
+        assert_eq!(waiting.status, ChildStatus::Running);
+        assert_eq!(reg.control_pid(&first.id), None);
+        assert_eq!(reg.control_pid(&second.id), Some(4243));
+        reg.mark_running(&first.id, 9999);
+        assert_eq!(reg.control_pid(&first.id), None);
+
+        reg.mark_killed(&first.id);
+        reg.settle(&first.id, ChildStatus::Done);
+        let killed = reg.get(&first.id).unwrap();
+        assert_eq!(killed.pid, Some(4242));
+        assert_eq!(killed.status, ChildStatus::Killed);
+        assert_eq!(reg.control_pid(&first.id), None);
+        reg.settle(&second.id, ChildStatus::Done);
+        assert_eq!(reg.control_pid(&second.id), None);
+        assert_eq!(reg.get(&second.id).unwrap().pid, Some(4243));
     }
 
     #[test]

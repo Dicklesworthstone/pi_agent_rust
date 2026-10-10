@@ -11,7 +11,6 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -338,37 +337,16 @@ impl SubagentTool {
                 self.run_one(&agents, task, None, on_update, deadline).await,
             ]),
             RequestMode::Parallel(tasks) => {
-                let cwd = self.cwd.clone();
-                let global_dir = self.global_dir.clone();
-                let binary = self.child_binary.clone();
-                let role_spec = self.role_model_spec.clone();
-                let update = on_update.clone();
-                let results = stream::iter(tasks.into_iter().enumerate())
-                    .map(move |(index, task)| {
-                        let agents = agents.clone();
-                        let cwd = cwd.clone();
-                        let global_dir = global_dir.clone();
-                        let binary = binary.clone();
-                        let role_spec = role_spec.clone();
-                        let update = update.clone();
-                        async move {
-                            let runner = ChildRunner::new(
-                                cwd,
-                                global_dir,
-                                binary,
-                                role_spec,
-                                crate::agent_hub::ChildKind::Subagent,
-                                deadline,
-                            );
-                            (index, runner.run_one(&agents, task, None, update).await)
-                        }
-                    })
-                    .buffer_unordered(concurrency)
-                    .collect::<Vec<_>>()
-                    .await;
-                let mut ordered = results;
-                ordered.sort_by_key(|(index, _)| *index);
-                Ok(ordered.into_iter().map(|(_, result)| result).collect())
+                Ok(ChildRunner::new(
+                    self.cwd.clone(),
+                    self.global_dir.clone(),
+                    self.child_binary.clone(),
+                    self.role_model_spec.clone(),
+                    crate::agent_hub::ChildKind::Subagent,
+                    deadline,
+                )
+                .run_parallel(&agents, tasks, concurrency, on_update)
+                .await)
             }
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
@@ -422,7 +400,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {

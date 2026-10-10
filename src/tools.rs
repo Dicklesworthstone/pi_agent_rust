@@ -9428,27 +9428,28 @@ impl HubTool {
             }
             "kill" => {
                 let id = id_required("kill")?;
-                let entry = {
-                    let reg = crate::agent_hub::registry()
+                {
+                    let mut reg = crate::agent_hub::registry()
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
-                    reg.get(&id)
-                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
-                };
-                if entry.status.settled() {
-                    return Err(Error::validation(format!(
-                        "hub: cannot kill '{id}' — already {}",
-                        entry.status.as_str()
-                    )));
+                    let entry = reg
+                        .get(&id)
+                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
+                    if entry.status.settled() {
+                        return Err(Error::validation(format!(
+                            "hub: cannot kill '{id}' — already {}",
+                            entry.status.as_str()
+                        )));
+                    }
+                    if let Some(pid) = reg.control_pid(&id) {
+                        // Historical PIDs remain in the roster after reaping.
+                        // Only a live process grants authority to signal it.
+                        crate::tools::kill_process_group_tree(Some(pid));
+                    }
+                    // A reaped child may still be awaiting ordered writeback.
+                    // Revoking it must prevent application even without a PID.
+                    reg.mark_killed(&id);
                 }
-                if let Some(pid) = entry.pid {
-                    // Process-tree kill so the child's bash descendants die too.
-                    crate::tools::kill_process_group_tree(Some(pid));
-                }
-                crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .mark_killed(&id);
                 let details = serde_json::json!({
                     "schema": "pi.agent-hub.kill/v1",
                     "id": id,

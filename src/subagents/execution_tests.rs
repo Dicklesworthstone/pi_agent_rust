@@ -314,6 +314,387 @@ fn initialize_git(root: &Path) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Force completion order through the real concurrency queue.
+fn parallel_worktree_writeback_follows_task_order_and_preserves_the_dirty_baseline() {
+    let control = tempfile::tempdir().unwrap();
+    let release = control.path().join("release-first");
+    let script = format!(
+        "for assignment do :; done\n\
+         test \"$(cat tracked.txt)\" = 'parent dirty' || exit 8\n\
+         test \"$(cat untracked.txt)\" = 'carry me' || exit 9\n\
+         case \"$assignment\" in\n\
+         'Task: first')\n\
+           while [ ! -f {} ]; do sleep 0.01; done\n\
+           printf 'first wins\\n' > tracked.txt ;;\n\
+         'Task: second') printf 'later patch\\n' > tracked.txt ;;\n\
+         'Task: queued') printf 'queued saw original dirty state\\n' > queued.txt ;;\n\
+         *) exit 10 ;;\n\
+         esac\n{}",
+        quote(release.to_str().unwrap()),
+        emit(&[ended("accepted child output", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    let tool = tool.with_timeout(Duration::from_secs(30));
+    initialize_git(&tool.cwd);
+    std::fs::write(tool.cwd.join("tracked.txt"), "parent staged\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&tool.cwd)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(tool.cwd.join("tracked.txt"), "parent dirty\n").unwrap();
+    std::fs::write(tool.cwd.join("untracked.txt"), "carry me\n").unwrap();
+    let parent_file = tool.cwd.join("tracked.txt");
+    let completions = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&completions);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let output = runtime
+        .block_on(tool.execute(
+            "ordered-apply",
+            json!({"concurrency":2,"tasks":[
+                {"agent":"worker","task":"first","isolation":"worktree"},
+                {"agent":"worker","task":"second","isolation":"worktree"},
+                {"agent":"worker","task":"queued","isolation":"worktree"}
+            ]}),
+            Some(Box::new(move |update| {
+                let value = &update.details.as_ref().unwrap()["result"];
+                if value["task"] == "queued" && value["status"] == "starting" {
+                    // The second task must have fully exited to free this
+                    // launch slot; the first cannot exit until we release it.
+                    assert_eq!(
+                        std::fs::read_to_string(&parent_file).unwrap(),
+                        "parent dirty\n",
+                        "a faster sibling applied before the batch finished"
+                    );
+                    std::fs::write(&release, b"ready").unwrap();
+                }
+                if value["status"] == "completed" {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(value["task"].as_str().unwrap().to_string());
+                }
+            })),
+        ))
+        .unwrap();
+    let values = output.details.as_ref().unwrap()["results"]
+        .as_array()
+        .unwrap();
+    assert!(
+        output.is_error,
+        "the later conflicting patch must be rejected"
+    );
+    assert_eq!(values[0]["task"], "first");
+    assert_eq!(values[0]["iso"]["applied"], true);
+    assert_eq!(values[1]["task"], "second");
+    assert_eq!(values[1]["status"], "failed");
+    assert_eq!(values[1]["iso"]["applied"], false);
+    assert!(values[1]["error"].as_str().unwrap().contains("PI_ISO_CONFLICT"));
+    assert_eq!(values[2]["task"], "queued");
+    assert_eq!(values[2]["iso"]["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+        "first wins\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("queued.txt")).unwrap(),
+        "queued saw original dirty state\n"
+    );
+    let staged = Command::new("git")
+        .args(["show", ":tracked.txt"])
+        .current_dir(&tool.cwd)
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    assert_eq!(staged.stdout, b"parent staged\n");
+    let kept = Path::new(values[1]["iso"]["worktreePath"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(kept.join("tracked.txt")).unwrap(),
+        "later patch\n"
+    );
+    assert_eq!(
+        *completions.lock().unwrap(),
+        vec!["first".to_string(), "queued".to_string()]
+    );
+}
+
+#[test]
+fn queued_isolated_schema_retry_uses_the_snapshot_before_nonisolated_siblings() {
+    let control = tempfile::tempdir().unwrap();
+    let marker = quote(control.path().join("attempted").to_str().unwrap());
+    let script = format!(
+        "for assignment do :; done\n\
+         case \"$assignment\" in\n\
+         'Task: shared writer')\n\
+           printf 'shared parent edit\\n' > tracked.txt\n\
+           printf 'sibling-only\\n' > sibling.txt\n{}\
+           exit 0 ;;\n\
+         esac\n\
+         test \"$(cat tracked.txt)\" = original || exit 8\n\
+         test ! -e sibling.txt || exit 9\n\
+         test ! -e rejected.txt || exit 10\n\
+         if [ -f {marker} ]; then\n\
+           printf 'accepted only\\n' > accepted.txt\n{}\
+         else\n\
+           : > {marker}\n\
+           printf 'rejected attempt\\n' > rejected.txt\n{}\
+         fi\n",
+        emit(&[ended("shared edit finished", "stop")]),
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    let output = run(
+        &tool,
+        json!({"concurrency":1,"tasks":[
+            {"agent":"worker","task":"shared writer"},
+            {"agent":"worker","task":"isolated writer","isolation":"worktree",
+             "outputSchema":{"type":"object","required":["accepted"]},"schemaMode":"strict"}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let value = &output.details.as_ref().unwrap()["results"][1];
+    assert_eq!(value["schemaRetries"], 1);
+    assert_eq!(value["schemaValid"], true);
+    assert_eq!(value["data"]["accepted"], true);
+    assert_eq!(value["iso"]["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+        "shared parent edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("accepted.txt")).unwrap(),
+        "accepted only\n"
+    );
+    assert!(tool.cwd.join("sibling.txt").exists());
+    assert!(!tool.cwd.join("rejected.txt").exists());
+    let rejected = &value["preservedWorktrees"][0];
+    assert_eq!(rejected["applyMode"], "keep");
+    assert_eq!(rejected["applied"], false);
+    let kept = Path::new(rejected["worktreePath"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(kept.join("rejected.txt")).unwrap(),
+        "rejected attempt\n"
+    );
+}
+
+struct PendingParallelFixture {
+    _workspace: TempDir,
+    _control: TempDir,
+    tool: SubagentTool,
+    request: Value,
+    ready_task: String,
+    waiting_task: String,
+    release: PathBuf,
+}
+
+fn pending_parallel_fixture() -> PendingParallelFixture {
+    let control = tempfile::tempdir().unwrap();
+    let release = control.path().join("release");
+    let ready_task = format!("ready-{}", uuid::Uuid::new_v4());
+    let waiting_task = format!("waiting-{}", uuid::Uuid::new_v4());
+    let script = format!(
+        "for assignment do :; done\n\
+         if [ \"$assignment\" = {} ]; then\n\
+           printf 'ready patch\\n' > tracked.txt\n\
+         else\n\
+           while [ ! -f {} ]; do sleep 0.01; done\n\
+           printf 'waiting patch\\n' > tracked.txt\n\
+         fi\n{}",
+        quote(&format!("Task: {ready_task}")),
+        quote(release.to_str().unwrap()),
+        emit(&[ended("accepted output", "stop")]),
+    );
+    let (workspace, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    let request = json!({"concurrency":1,"tasks":[
+        {"agent":"worker","task":ready_task,"isolation":"worktree"},
+        {"agent":"worker","task":waiting_task,"isolation":"worktree"}
+    ]});
+    PendingParallelFixture {
+        _workspace: workspace,
+        _control: control,
+        tool: tool.with_timeout(Duration::from_secs(30)),
+        request,
+        ready_task,
+        waiting_task,
+        release,
+    }
+}
+
+/// Notify only after a completed child has freed the sole execution slot and
+/// its successor begins. The public kill operation must see history without
+/// any remaining authority to signal the old PID or revive pending writeback.
+fn pending_writeback_callback(
+    fixture: &PendingParallelFixture,
+    sender: futures::channel::oneshot::Sender<String>,
+) -> Box<dyn Fn(ToolUpdate) + Send + Sync> {
+    let ready_task = fixture.ready_task.clone();
+    let waiting_task = fixture.waiting_task.clone();
+    let sender = Mutex::new(Some(sender));
+    Box::new(move |update| {
+        let value = &update.details.as_ref().unwrap()["result"];
+        if value["task"] != waiting_task || value["status"] != "starting" {
+            return;
+        }
+        let hub = crate::agent_hub::registry().lock().unwrap();
+        let entry = hub
+            .roster()
+            .into_iter()
+            .find(|entry| entry.task == ready_task)
+            .unwrap();
+        assert_eq!(entry.status, crate::agent_hub::ChildStatus::Running);
+        assert!(entry.pid.is_some());
+        assert_eq!(hub.control_pid(&entry.id), None);
+        assert!(hub.native_revival_source(&entry.id).is_err());
+        if let Some(sender) = sender.lock().unwrap().take() {
+            let _ = sender.send(entry.id);
+        }
+    })
+}
+
+#[test]
+fn hub_kill_rejects_reaped_pending_writeback_without_cancelling_its_sibling() {
+    let fixture = pending_parallel_fixture();
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let (output, ready_id) = runtime.block_on(async {
+        let run = Box::pin(fixture.tool.execute(
+            "kill-pending-writeback",
+            fixture.request.clone(),
+            Some(pending_writeback_callback(&fixture, sender)),
+        ));
+        let (ready_id, pending) = match futures::future::select(run, receiver).await {
+            futures::future::Either::Right((Ok(id), pending)) => (id, pending),
+            _ => panic!("a completed child must wait for the second child"),
+        };
+        let killed = crate::tools::HubTool::new(&fixture.tool.cwd)
+            .execute(
+                "kill-reaped-child",
+                json!({"op":"agent","action":"kill","name":ready_id}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!killed.is_error, "{killed:?}");
+        std::fs::write(&fixture.release, b"continue").unwrap();
+        (pending.await.unwrap(), ready_id)
+    });
+    assert!(output.is_error);
+    let values = &output.details.as_ref().unwrap()["results"];
+    assert_eq!(values[0]["status"], "cancelled");
+    assert_eq!(values[0]["iso"]["applyMode"], "keep");
+    assert_eq!(values[0]["iso"]["applied"], false);
+    let kept = Path::new(values[0]["iso"]["worktreePath"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(kept.join("tracked.txt")).unwrap(),
+        "ready patch\n"
+    );
+    assert_eq!(values[1]["status"], "completed");
+    assert_eq!(values[1]["iso"]["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(fixture.tool.cwd.join("tracked.txt")).unwrap(),
+        "waiting patch\n"
+    );
+    let hub = crate::agent_hub::registry().lock().unwrap();
+    assert_eq!(
+        hub.get(&ready_id).unwrap().status,
+        crate::agent_hub::ChildStatus::Killed
+    );
+    assert_eq!(hub.control_pid(&ready_id), None);
+}
+
+#[test]
+fn parent_cancellation_rejects_already_completed_parallel_writeback() {
+    let fixture = pending_parallel_fixture();
+    let owner = crate::agent_cx::AgentCx::for_request();
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let output = runtime.block_on(owner.with_current(async {
+        let run = Box::pin(fixture.tool.execute(
+            "cancel-pending-writeback",
+            fixture.request.clone(),
+            Some(pending_writeback_callback(&fixture, sender)),
+        ));
+        let pending = match futures::future::select(run, receiver).await {
+            futures::future::Either::Right((Ok(_), pending)) => pending,
+            _ => panic!("a completed child must wait for the second child"),
+        };
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel pending apply"),
+        );
+        pending.await.unwrap()
+    }));
+    assert!(output.is_error);
+    let values = &output.details.as_ref().unwrap()["results"];
+    for index in [0, 1] {
+        assert_eq!(values[index]["status"], "cancelled");
+        assert_eq!(values[index]["iso"]["applyMode"], "keep");
+        assert_eq!(values[index]["iso"]["applied"], false);
+    }
+    assert_eq!(
+        std::fs::read_to_string(fixture.tool.cwd.join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
+fn dropping_parallel_execution_preserves_completed_work_and_cancels_its_lease() {
+    let fixture = pending_parallel_fixture();
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let ready_id = runtime.block_on(async {
+        let run = Box::pin(fixture.tool.execute(
+            "drop-pending-writeback",
+            fixture.request.clone(),
+            Some(pending_writeback_callback(&fixture, sender)),
+        ));
+        match futures::future::select(run, receiver).await {
+            futures::future::Either::Right((Ok(id), pending)) => {
+                drop(pending);
+                id
+            }
+            _ => panic!("a completed child must wait for the second child"),
+        }
+    });
+    assert_eq!(
+        std::fs::read_to_string(fixture.tool.cwd.join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+    let worktrees = crate::worktree_iso::list_mine(&fixture.tool.cwd).unwrap();
+    assert!(worktrees.iter().any(|worktree| {
+        std::fs::read_to_string(Path::new(&worktree.path).join("tracked.txt"))
+            .is_ok_and(|text| text == "ready patch\n")
+    }));
+    let hub = crate::agent_hub::registry().lock().unwrap();
+    assert_eq!(
+        hub.get(&ready_id).unwrap().status,
+        crate::agent_hub::ChildStatus::Cancelled
+    );
+    assert_eq!(hub.control_pid(&ready_id), None);
+    let waiting = hub
+        .roster()
+        .into_iter()
+        .find(|entry| entry.task == fixture.waiting_task)
+        .unwrap();
+    assert_eq!(waiting.status, crate::agent_hub::ChildStatus::Cancelled);
+    assert_eq!(hub.control_pid(&waiting.id), None);
+}
+
+#[test]
 fn unsuccessful_child_protocol_never_applies_worktree_edits() {
     let (_dir, tool) = fixture(&format!(
         "printf 'unsafe edit\\n' > tracked.txt\n{}",

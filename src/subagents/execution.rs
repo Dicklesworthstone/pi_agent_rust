@@ -16,13 +16,15 @@ use super::{
 };
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::ChildKind;
-use crate::worktree_iso::{IsoApplyMode, IsoHandle, IsoOutcome};
+use crate::worktree_iso::{IsoApplyMode, IsoBaseline, IsoHandle, IsoOutcome};
+use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 #[cfg(any(not(unix), test))]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(any(not(unix), test))]
@@ -39,6 +41,7 @@ use ownership::HubLease;
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCELLED: &str = "Parent cancellation propagated to child process.";
+type BaselineCapture = Result<Arc<IsoBaseline>, String>;
 
 pub(super) struct ChildRunner {
     cwd: PathBuf,
@@ -75,10 +78,105 @@ impl ChildRunner {
         self
     }
 
-    /// At most one fresh corrective run. The first attempt's isolated edits
-    /// are retained, never applied as input to that retry. The original
-    /// deadline is retained too, including time spent waiting in the queue.
-    #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
+    /// Parallel execution never mutates the parent through isolated writeback.
+    /// Every source checkout is captured before launch, including tasks waiting
+    /// for a concurrency slot. Accepted patches are installed only after all
+    /// children finish, in authored task order. A pending attempt keeps its hub
+    /// lease so cancellation can still reject it before application.
+    pub(super) async fn run_parallel(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        tasks: Vec<SubagentTask>,
+        concurrency: usize,
+        on_update: Option<UpdateCallback>,
+    ) -> Vec<SubagentResult> {
+        let baselines = self.capture_parallel_baselines(agents, &tasks);
+        let update = on_update.as_ref();
+        let mut completed = stream::iter(tasks.into_iter().zip(baselines).enumerate())
+            .map(|(index, (task, baseline))| async move {
+                (
+                    index,
+                    self.run_pending(agents, task, None, update, baseline.as_ref())
+                        .await,
+                )
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        completed.sort_by_key(|(index, _)| *index);
+        completed
+            .into_iter()
+            .map(|(_, pending)| pending.finish(update))
+            .collect()
+    }
+
+    fn task_cwd(&self, task: &SubagentTask) -> PathBuf {
+        task.cwd.as_ref().map_or_else(
+            || self.cwd.clone(),
+            |path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.cwd.join(path)
+                }
+            },
+        )
+    }
+
+    /// Invalid or unauthorized tasks must not cause snapshot I/O. Preparation
+    /// failures stay attached to their task; unrelated repositories can run.
+    /// Reusing a captured failure also avoids quietly giving a later sibling a
+    /// different baseline after the source changes during preparation.
+    fn capture_parallel_baselines(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        tasks: &[SubagentTask],
+    ) -> Vec<Option<BaselineCapture>> {
+        let owner = AgentCx::for_current_or_request();
+        let capabilities = owner.capabilities();
+        if !capabilities.io || !capabilities.spawn || !capabilities.time {
+            return vec![None; tasks.len()];
+        }
+        let mut roots = BTreeMap::<PathBuf, BaselineCapture>::new();
+        tasks
+            .iter()
+            .map(|task| {
+                let agent = agents.get(&task.agent)?;
+                if !isolation_policy(task).ok()?.0
+                    || owner.checkpoint().is_err()
+                    || self.deadline.check().is_err()
+                {
+                    return None;
+                }
+                let schema = task.output_schema.as_ref().or(agent.output_schema.as_ref());
+                if schema.is_some_and(|schema| compile_output_schema(schema).is_err()) {
+                    return None;
+                }
+                let cwd = self.task_cwd(task);
+                if !cwd.is_dir() {
+                    return None;
+                }
+                let root = match crate::worktree_iso::isolation_root(&cwd) {
+                    Ok(root) => root,
+                    Err(error) => return Some(Err(error.to_string())),
+                };
+                if owner.checkpoint().is_err() || self.deadline.check().is_err() {
+                    return None;
+                }
+                Some(
+                    roots
+                        .entry(root.clone())
+                        .or_insert_with(|| {
+                            IsoBaseline::capture(root)
+                                .map(Arc::new)
+                                .map_err(|error| error.to_string())
+                        })
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(super) async fn run_one(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
@@ -86,11 +184,34 @@ impl ChildRunner {
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
+        let update = on_update.as_ref();
+        self.run_pending(agents, task, step, update, None)
+            .await
+            .finish(update)
+    }
+
+    /// At most one fresh corrective run. The first attempt's isolated edits
+    /// are retained, never applied as input to that retry. The original
+    /// deadline is retained too, including time spent waiting in the queue.
+    #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
+    async fn run_pending(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        task: SubagentTask,
+        step: Option<usize>,
+        update: Option<&UpdateCallback>,
+        baseline: Option<&BaselineCapture>,
+    ) -> PendingRun {
         let Some(agent) = agents.get(&task.agent) else {
-            return SubagentResult::unknown(task, step);
+            return PendingRun::Settled(SubagentResult::unknown(task, step));
         };
         if let Err(error) = self.deadline.check() {
-            return SubagentResult::failed(agent, task, step, error.to_string());
+            return PendingRun::Settled(SubagentResult::failed(
+                agent,
+                task,
+                step,
+                error.to_string(),
+            ));
         }
         let schema = task
             .output_schema
@@ -99,15 +220,14 @@ impl ChildRunner {
         if let Some(schema) = &schema
             && let Err(error) = compile_output_schema(schema)
         {
-            return SubagentResult::failed(
+            return PendingRun::Settled(SubagentResult::failed(
                 agent,
                 task,
                 step,
                 format!("Invalid outputSchema: {error}"),
-            );
+            ));
         }
         let owner = AgentCx::for_current_or_request();
-        let update = on_update.as_ref();
         // Capture before execution spends the budget. A later explicit
         // revival must not inherit a zero budget from a timed-out settlement.
         // Schema retries share this authored task and launch policy instead
@@ -136,10 +256,11 @@ impl ChildRunner {
                 &owner,
                 &launch,
                 self.revival.as_ref().map(|(id, _)| id.as_str()),
+                baseline,
             )
             .await;
         if attempt.result.is_error || schema.is_none() {
-            return attempt.finish(&owner, true, update);
+            return attempt.defer(owner, true, update);
         }
         let schema = schema.as_ref().expect("schema checked above");
         attempt.result.schema_retries = Some(0);
@@ -147,7 +268,7 @@ impl ChildRunner {
             Ok(data) => {
                 attempt.result.data = Some(data);
                 attempt.result.schema_valid = Some(true);
-                return attempt.finish(&owner, true, update);
+                return attempt.defer(owner, true, update);
             }
             Err(errors) => {
                 attempt.result.schema_valid = Some(false);
@@ -161,19 +282,19 @@ impl ChildRunner {
         // A hub kill during validation/settlement is not a schema failure to
         // repair by launching a replacement child behind the operator's back.
         if matches!(previous.status, SubagentStatus::Cancelled) {
-            return previous;
+            return PendingRun::Settled(previous);
         }
         // Finishing an attempt can perform a snapshot or invoke a host callback.
         // Never spend a new launch after either cancellation or budget expiry.
         if owner.checkpoint().is_err() {
             cancel(&mut previous, CANCELLED);
             emit_progress(update, &previous);
-            return previous;
+            return PendingRun::Settled(previous);
         }
         if let Err(error) = self.deadline.check() {
             previous.fail(error.to_string());
             emit_progress(update, &previous);
-            return previous;
+            return PendingRun::Settled(previous);
         }
         let corrective = SubagentTask {
             task: corrective_retry_task(&task.task, &errors),
@@ -189,6 +310,7 @@ impl ChildRunner {
                 &owner,
                 &launch,
                 previous.hub_id.as_deref(),
+                baseline,
             )
             .await;
         retry.result.schema_retries = Some(1);
@@ -201,7 +323,7 @@ impl ChildRunner {
         if retry.result.is_error {
             retry.result.schema_valid = Some(false);
             retry.result.validation_errors = Some(errors);
-            return retry.finish(&owner, false, update);
+            return retry.defer(owner, false, update);
         }
         match validate_child_output(&retry.result.output, schema) {
             Ok(data) => {
@@ -219,7 +341,7 @@ impl ChildRunner {
         // Permissive mode permits returning an invalid answer with a warning,
         // not installing edits that failed the requested acceptance contract.
         let accepted = retry.result.schema_valid == Some(true);
-        retry.finish(&owner, accepted, update)
+        retry.defer(owner, accepted, update)
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -233,17 +355,9 @@ impl ChildRunner {
         owner: &AgentCx,
         launch: &RevivalSpec,
         revived_from: Option<&str>,
+        baseline: Option<&BaselineCapture>,
     ) -> Attempt {
-        let cwd = task.cwd.as_ref().map_or_else(
-            || self.cwd.clone(),
-            |path| {
-                if path.is_absolute() {
-                    path.clone()
-                } else {
-                    self.cwd.join(path)
-                }
-            },
-        );
+        let cwd = self.task_cwd(&task);
         let args = child_args(agent, &task.task, self.role_model_spec.as_deref(), schema);
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
@@ -297,7 +411,15 @@ impl ChildRunner {
             return attempt;
         }
         if isolated {
-            match crate::worktree_iso::isolate(&cwd, &attempt.result.task) {
+            let isolated = match baseline {
+                Some(Ok(baseline)) => baseline.isolate(&attempt.result.task),
+                Some(Err(error)) => {
+                    attempt.result.fail(error.clone());
+                    return attempt;
+                }
+                None => crate::worktree_iso::isolate(&cwd, &attempt.result.task),
+            };
+            match isolated {
                 Ok(handle) => {
                     attempt.result.cwd.clone_from(&handle.path);
                     attempt.isolation = Some((handle, mode));
@@ -339,6 +461,9 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
+        // Declared before the process guard so it retires PID control only
+        // after that guard has reaped the child on every early-return/drop path.
+        let process_lease = attempt.hub.process_lifetime();
         let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
             Ok(child) => child,
             Err(error) => {
@@ -395,7 +520,7 @@ impl ChildRunner {
         let mut protocol = protocol::ChildProtocol::default();
         loop {
             if !check_budget(owner, self.deadline, &mut attempt.result) {
-                child.terminate();
+                process_lease.terminate(&mut child);
                 break;
             }
             #[cfg(unix)]
@@ -405,10 +530,10 @@ impl ChildRunner {
             if !check_budget(owner, self.deadline, &mut attempt.result) {
                 // Invalid frames and expired budgets must stop the producer,
                 // including one that continues writing after agent_end.
-                child.terminate();
+                process_lease.terminate(&mut child);
                 break;
             }
-            match child.child.as_mut().expect("owned child").try_wait() {
+            match process_lease.try_wait(child.child.as_mut().expect("owned child")) {
                 Ok(Some(status)) => {
                     attempt.result.exit_code = status.code();
                     break;
@@ -418,7 +543,7 @@ impl ChildRunner {
                     attempt
                         .result
                         .fail(format!("Failed while waiting for child: {error}"));
-                    child.terminate();
+                    process_lease.terminate(&mut child);
                     break;
                 }
             }
@@ -507,6 +632,28 @@ fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult
     !result.is_error
 }
 
+enum PendingRun {
+    Settled(SubagentResult),
+    AwaitingWriteback {
+        attempt: Attempt,
+        accepted: bool,
+        owner: AgentCx,
+    },
+}
+
+impl PendingRun {
+    fn finish(self, update: Option<&UpdateCallback>) -> SubagentResult {
+        match self {
+            Self::Settled(result) => result,
+            Self::AwaitingWriteback {
+                attempt,
+                accepted,
+                owner,
+            } => attempt.finish(&owner, accepted, update),
+        }
+    }
+}
+
 struct Attempt {
     result: SubagentResult,
     isolation: Option<(IsoHandle, IsoApplyMode)>,
@@ -521,6 +668,31 @@ impl Attempt {
             isolation: None,
             hub: HubLease::empty(),
             deadline,
+        }
+    }
+
+    fn defer(
+        self,
+        owner: AgentCx,
+        accepted: bool,
+        update: Option<&UpdateCallback>,
+    ) -> PendingRun {
+        if accepted
+            && !self.result.is_error
+            && matches!(self.result.status, SubagentStatus::Completed)
+            && matches!(self.isolation.as_ref(), Some((_, IsoApplyMode::Apply)))
+        {
+            // Keep ownership until ordered writeback. Dropping this value
+            // cancels its hub lease and leaves the worktree inspectable.
+            PendingRun::AwaitingWriteback {
+                attempt: self,
+                accepted,
+                owner,
+            }
+        } else {
+            // Non-isolated work and explicit keep/drop do not mutate the
+            // parent. Preserve their immediate completion and retry behavior.
+            PendingRun::Settled(self.finish(&owner, accepted, update))
         }
     }
 
