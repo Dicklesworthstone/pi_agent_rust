@@ -29,13 +29,14 @@ use crate::models::default_models_path;
 use crate::provider::ThinkingBudgets;
 use crate::providers;
 use clap::Parser;
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -959,24 +960,168 @@ impl Default for RpcTransportOptions {
 const RPC_MAX_LINE_BYTES: usize = 128 * 1024 * 1024;
 const RPC_MAX_PRE_ACK_EVENTS: usize = 256;
 const RPC_MAX_PRE_ACK_BYTES: usize = 256 * 1024 * 1024;
+const RPC_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub struct RpcTransportClient {
-    child: Child,
-    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
-    stdout: BufReader<ChildStdout>,
+    owner: Arc<RpcSubprocessOwner>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    stdout: futures::channel::mpsc::Receiver<Result<Value>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
+    writer_worker: Option<std::thread::JoinHandle<()>>,
     next_request_id: Arc<AtomicU64>,
+}
+
+struct RpcWriteRequest {
+    encoded: Vec<u8>,
+    completed: futures::channel::oneshot::Sender<Result<()>>,
+}
+
+/// Every operation shares this lifetime, including controls retained after the
+/// client is dropped. Closing it revokes writes before stopping the subprocess.
+struct RpcSubprocessOwner {
+    process: Mutex<RpcProcessCleanup>,
+    closed: Arc<AtomicBool>,
+    writer: Mutex<Option<std::sync::mpsc::SyncSender<RpcWriteRequest>>>,
+    reader_abort: futures::future::AbortHandle,
+}
+
+struct RpcProcessCleanup {
+    child: Option<crate::tools::ProcessGuard>,
+    reaper: Option<RpcProcessReaper>,
+}
+
+struct RpcProcessReaper {
+    worker: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    child: Arc<Mutex<Option<crate::tools::ProcessGuard>>>,
+}
+
+impl RpcSubprocessOwner {
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(Error::api("RPC subprocess transport is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close(&self, wait: bool) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+        self.reader_abort.abort();
+        drop(
+            self.writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        let mut process = self
+            .process
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = process.child.take() {
+            // Preserve ownership even if the OS refuses another worker. An
+            // interrupted future starts cleanup without waiting; a later
+            // shutdown still owns and joins this exact reap obligation.
+            let child = Arc::new(Mutex::new(Some(child)));
+            let reaper_child = Arc::clone(&child);
+            match std::thread::Builder::new()
+                .name("pi-sdk-rpc-reaper".to_string())
+                .spawn(move || {
+                    let mut child = reaper_child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    child
+                        .as_mut()
+                        .expect("RPC reaper owns its child")
+                        .terminate_and_wait()
+                })
+            {
+                Ok(worker) => process.reaper = Some(RpcProcessReaper { worker, child }),
+                Err(_) => {
+                    let mut child = child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("failed RPC reaper spawn retains its child");
+                    if let Err(error) = child.terminate_and_wait() {
+                        process.child = Some(child);
+                        return Err(Error::Io(Box::new(error)));
+                    }
+                }
+            }
+        }
+        let reaper = if wait { process.reaper.take() } else { None };
+        drop(process);
+        if let Some(reaper) = reaper {
+            let result = reaper
+                .worker
+                .join()
+                .map_err(|_| Error::api("RPC subprocess reaper panicked"))
+                .and_then(|result| result.map_err(|error| Error::Io(Box::new(error))));
+            if result.is_err() {
+                // A failed wait or worker panic does not release cleanup
+                // ownership. A later explicit shutdown or final owner drop
+                // can retry the same actual child handle and retained Job.
+                self.process
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .child = reaper
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RpcSubprocessOwner {
+    fn drop(&mut self) {
+        let _ = self.close(true);
+    }
+}
+
+/// A dropped request has no safe next frame boundary. Stop its connection rather
+/// than letting another call consume a delayed acknowledgement or terminal event.
+struct RpcOperation {
+    owner: Arc<RpcSubprocessOwner>,
+    finished: bool,
+}
+
+impl RpcOperation {
+    fn new(owner: &Arc<RpcSubprocessOwner>) -> Result<Self> {
+        owner.ensure_open()?;
+        Ok(Self {
+            owner: Arc::clone(owner),
+            finished: false,
+        })
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for RpcOperation {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.owner.close(false);
+        }
+    }
 }
 
 /// Write-only control lane for a running RPC prompt.
 ///
-/// The prompt task remains the sole stdout reader. A cloned control handle may
-/// be used from another thread or from a live event callback to dispatch steer,
+/// The prompt task remains the sole consumer of parsed stdout frames. A cloned
+/// control handle may be used from another thread or from a live event callback to dispatch steer,
 /// follow-up, or abort requests while that prompt is still active. Dispatch
 /// success means the command was written and flushed, not that the subprocess
 /// acknowledged or completed it.
 #[derive(Clone)]
 pub struct RpcControlHandle {
-    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    owner: Arc<RpcSubprocessOwner>,
+    stdin: Arc<Mutex<ChildStdin>>,
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -988,12 +1133,17 @@ impl std::fmt::Debug for RpcControlHandle {
 
 impl RpcControlHandle {
     fn send(&self, command: &str, payload: Map<String, Value>) -> Result<String> {
+        self.owner.ensure_open()?;
         let request_id = next_rpc_request_id(&self.next_request_id)?;
         let mut frame = Map::new();
         frame.insert("type".to_string(), Value::String(command.to_string()));
         frame.insert("id".to_string(), Value::String(request_id.clone()));
         frame.extend(payload);
-        write_rpc_json_line(&self.stdin, &Value::Object(frame))?;
+        let encoded = encode_rpc_json_line(&Value::Object(frame))?;
+        if let Err(error) = write_rpc_bytes(&self.stdin, &self.owner.closed, &encoded) {
+            let _ = self.owner.close(false);
+            return Err(error);
+        }
         Ok(request_id)
     }
 
@@ -1114,6 +1264,7 @@ impl SessionTransport {
 }
 
 impl RpcTransportClient {
+    #[allow(clippy::too_many_lines)]
     pub fn connect(options: RpcTransportOptions) -> Result<Self> {
         let mut command = Command::new(&options.binary_path);
         command
@@ -1124,44 +1275,141 @@ impl RpcTransportClient {
         if let Some(cwd) = options.cwd {
             command.current_dir(cwd);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
 
-        let mut child = command.spawn().map_err(|err| {
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command).map_err(|err| {
             Error::config(format!(
                 "Failed to spawn RPC subprocess {}: {err}",
                 options.binary_path.display()
             ))
         })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::config("RPC subprocess stdin is not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::config("RPC subprocess stdout is not piped"))?;
+        let mut child = crate::tools::ProcessGuard::new(
+            child,
+            crate::tools::ProcessCleanupMode::ProcessGroupTree,
+        );
+        let pipes = (|| {
+            let stdin = child
+                .take_stdin()
+                .ok_or_else(|| Error::config("RPC subprocess stdin is not piped"))?;
+            let stdout = child
+                .take_stdout()
+                .ok_or_else(|| Error::config("RPC subprocess stdout is not piped"))?;
+            #[cfg(unix)]
+            {
+                prepare_rpc_pipe(&stdin)?;
+                prepare_rpc_pipe(&stdout)?;
+            }
+            Ok::<_, Error>((stdin, stdout))
+        })();
+        let (stdin, stdout) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+        let stdin = Arc::new(Mutex::new(stdin));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<RpcWriteRequest>(1);
+        // A zero-capacity futures channel gives its sole sender one reserved
+        // slot. The pump can hold at most one additional bounded frame locally.
+        let (mut reader_tx, reader_rx) = futures::channel::mpsc::channel(0);
+        let (reader_abort, reader_registration) = futures::future::AbortHandle::new_pair();
+        let owner = Arc::new(RpcSubprocessOwner {
+            process: Mutex::new(RpcProcessCleanup {
+                child: Some(child),
+                reaper: None,
+            }),
+            closed: Arc::clone(&closed),
+            writer: Mutex::new(Some(writer_tx)),
+            reader_abort,
+        });
+
+        let read_closed = Arc::clone(&closed);
+        let reader_worker = std::thread::Builder::new()
+            .name("pi-sdk-rpc-reader".to_string())
+            .spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                let read = async move {
+                    while !read_closed.load(Ordering::Acquire) {
+                        let frame = read_rpc_json_line(&mut stdout, &read_closed);
+                        let terminal = frame.is_err();
+                        if reader_tx.send(frame).await.is_err() || terminal {
+                            break;
+                        }
+                    }
+                };
+                // This executor belongs to an OS pipe worker, never to the
+                // caller's runtime. Abort wakes it even under channel pressure.
+                let _ = futures::executor::block_on(futures::future::Abortable::new(
+                    read,
+                    reader_registration,
+                ));
+            });
+        let reader_worker = match reader_worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = owner.close(true);
+                return Err(Error::Io(Box::new(error)));
+            }
+        };
+        let write_stdin = Arc::clone(&stdin);
+        let write_closed = Arc::clone(&closed);
+        let writer_worker = std::thread::Builder::new()
+            .name("pi-sdk-rpc-writer".to_string())
+            .spawn(move || {
+                while let Ok(request) = writer_rx.recv() {
+                    if write_closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = write_rpc_bytes(&write_stdin, &write_closed, &request.encoded);
+                    let terminal = result.is_err();
+                    let _ = request.completed.send(result);
+                    if terminal {
+                        break;
+                    }
+                }
+            });
+        let writer_worker = match writer_worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                if let Err(cleanup_error) = owner.close(true) {
+                    // The owner's final drop retries its retained child. Do
+                    // not join a pipe that the OS has failed to unblock.
+                    return Err(Error::api(format!(
+                        "Failed to start RPC writer worker: {error}; subprocess cleanup failed: {cleanup_error}"
+                    )));
+                }
+                let _ = reader_worker.join();
+                return Err(Error::Io(Box::new(error)));
+            }
+        };
 
         Ok(Self {
-            child,
-            stdin: Arc::new(Mutex::new(BufWriter::new(stdin))),
-            stdout: BufReader::new(stdout),
+            owner,
+            stdin,
+            stdout: reader_rx,
+            reader_worker: Some(reader_worker),
+            writer_worker: Some(writer_worker),
             next_request_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
     /// Clone a write-only lane that remains usable while `prompt*` borrows
-    /// this client for its single stdout reader.
+    /// this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
+            owner: Arc::clone(&self.owner),
             stdin: Arc::clone(&self.stdin),
             next_request_id: Arc::clone(&self.next_request_id),
         }
     }
 
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
         if payload.contains_key("type") || payload.contains_key("id") {
             return Err(Error::validation(
@@ -1174,8 +1422,21 @@ impl RpcTransportClient {
         command_payload.insert("id".to_string(), Value::String(request_id.clone()));
         command_payload.extend(payload);
 
-        self.write_json_line(&Value::Object(command_payload))?;
-        self.wait_for_response(&request_id, command)
+        let mut operation = RpcOperation::new(&self.owner)?;
+        self.write_json_line(&Value::Object(command_payload)).await?;
+        let response = self.wait_for_response(&request_id, command).await?;
+        let success = response
+            .get("success")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::api("RPC response did not include a boolean success flag"))?;
+        // A valid failure response ends this request just as conclusively as a
+        // successful one. Only interrupted or malformed exchanges close the lane.
+        operation.finish();
+        if success {
+            Ok(response.get("data").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(rpc_error_from_response(&response, command))
+        }
     }
 
     fn parse_response_data<T: DeserializeOwned>(data: Value, command: &str) -> Result<T> {
@@ -1467,10 +1728,6 @@ impl RpcTransportClient {
     /// [`Self::prompt_with_options_streaming`]. Native content uses the same
     /// bounded pre-acknowledgement buffer and terminal `agent_end` handling as
     /// text and image prompts. Input is validated before dispatch.
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn prompt_with_content_streaming(
         &mut self,
         content: Vec<ContentBlock>,
@@ -1486,6 +1743,7 @@ impl RpcTransportClient {
             serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
         );
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+            .await
     }
 
     /// Run one RPC prompt while delivering raw events as soon as they are read.
@@ -1494,10 +1752,6 @@ impl RpcTransportClient {
     /// flushed. Those events are retained under explicit count/byte bounds and
     /// released in order once the matching success acknowledgement arrives.
     /// A failed acknowledgement never leaks speculative events to the caller.
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn prompt_with_options_streaming(
         &mut self,
         message: impl Into<String>,
@@ -1514,12 +1768,13 @@ impl RpcTransportClient {
             );
         }
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+            .await
     }
 
     /// Dispatch an already validated prompt through the single response owner.
     /// Public prompt methods choose their wire input shape before reaching
     /// this boundary; only this method allocates the ID and reads stdout.
-    fn prompt_payload_streaming(
+    async fn prompt_payload_streaming(
         &mut self,
         mut payload: Map<String, Value>,
         streaming_behavior: Option<&str>,
@@ -1534,7 +1789,8 @@ impl RpcTransportClient {
                 Value::String(streaming_behavior.to_string()),
             );
         }
-        self.write_json_line(&Value::Object(payload))?;
+        let mut operation = RpcOperation::new(&self.owner)?;
+        self.write_json_line(&Value::Object(payload)).await?;
 
         let mut saw_ack = false;
         let mut events = Vec::new();
@@ -1546,7 +1802,7 @@ impl RpcTransportClient {
         let mut pre_ack: Vec<Value> = Vec::new();
         let mut pre_ack_bytes = 0usize;
         loop {
-            let item = self.read_json_line()?;
+            let item = self.read_json_line().await?;
             let item_type = item.get("type").and_then(Value::as_str);
             if item_type == Some("response") {
                 if item.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
@@ -1557,15 +1813,18 @@ impl RpcTransportClient {
                         "RPC prompt acknowledgement used the matching id with the wrong command",
                     ));
                 }
+                if saw_ack {
+                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
+                }
                 let success = item
                     .get("success")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .ok_or_else(|| {
+                        Error::api("RPC prompt acknowledgement did not include a boolean success flag")
+                    })?;
                 if !success {
+                    operation.finish();
                     return Err(rpc_error_from_response(&item, "prompt"));
-                }
-                if saw_ack {
-                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
                 }
                 saw_ack = true;
                 // `mem::take` rather than `drain(..)`: same result (the buffer
@@ -1577,6 +1836,7 @@ impl RpcTransportClient {
                     on_event(event.clone());
                     events.push(event);
                     if reached_end {
+                        operation.finish();
                         return Ok(events);
                     }
                 }
@@ -1603,75 +1863,71 @@ impl RpcTransportClient {
             on_event(item.clone());
             events.push(item);
             if reached_end {
+                operation.finish();
                 return Ok(events);
             }
         }
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        if self
-            .child
-            .try_wait()
-            .map_err(|err| Error::Io(Box::new(err)))?
-            .is_none()
-        {
-            self.child.kill().map_err(|err| Error::Io(Box::new(err)))?;
+        let result = self.owner.close(true);
+        self.stdout.close();
+        // If the OS did not stop the child, a Windows pipe may still be in a
+        // blocking operation. Preserve the workers for a cleanup retry instead
+        // of turning the reported termination failure into an unbounded join.
+        result?;
+        let reader_panicked = self
+            .reader_worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        let writer_panicked = self
+            .writer_worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if reader_panicked || writer_panicked {
+            Err(Error::api("RPC subprocess pipe worker panicked"))
+        } else {
+            Ok(())
         }
-        let _ = self.child.wait();
-        Ok(())
     }
 
     fn next_request_id(&self) -> Result<String> {
         next_rpc_request_id(&self.next_request_id)
     }
 
-    fn write_json_line(&self, payload: &Value) -> Result<()> {
-        write_rpc_json_line(&self.stdin, payload)
+    async fn write_json_line(&self, payload: &Value) -> Result<()> {
+        self.owner.ensure_open()?;
+        let encoded = encode_rpc_json_line(payload)?;
+        let (completed, completion) = futures::channel::oneshot::channel();
+        {
+            let writer = self
+                .owner
+                .writer
+                .lock()
+                .map_err(|_| Error::api("RPC subprocess writer queue lock poisoned"))?;
+            let writer = writer
+                .as_ref()
+                .ok_or_else(|| Error::api("RPC subprocess transport is closed"))?;
+            writer
+                .try_send(RpcWriteRequest { encoded, completed })
+                .map_err(|_| Error::api("RPC subprocess writer is unavailable"))?;
+        }
+        completion
+            .await
+            .map_err(|_| Error::api("RPC subprocess writer stopped before completing the frame"))?
     }
 
-    fn read_json_line(&mut self) -> Result<Value> {
-        let mut line = Vec::new();
-        loop {
-            let available = self
-                .stdout
-                .fill_buf()
-                .map_err(|err| Error::Io(Box::new(err)))?;
-            if available.is_empty() {
-                if line.is_empty() {
-                    return Err(Error::api(
-                        "RPC subprocess exited before sending a response",
-                    ));
-                }
-                return Err(Error::api(
-                    "RPC subprocess ended in the middle of a JSON line",
-                ));
-            }
-            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-                if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
-                    let _ = self.shutdown();
-                    return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
-                }
-                line.extend_from_slice(&available[..newline]);
-                self.stdout.consume(newline + 1);
-                break;
-            }
-            if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
-                let _ = self.shutdown();
-                return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
-            }
-            let available_len = available.len();
-            line.extend_from_slice(available);
-            self.stdout.consume(available_len);
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
+    async fn read_json_line(&mut self) -> Result<Value> {
+        self.owner.ensure_open()?;
+        self.stdout
+            .next()
+            .await
+            .ok_or_else(|| Error::api("RPC subprocess reader stopped before sending a response"))?
     }
 
-    fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
+    async fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
         loop {
-            let item = self.read_json_line()?;
+            let item = self.read_json_line().await?;
             let Some(item_type) = item.get("type").and_then(Value::as_str) else {
                 continue;
             };
@@ -1682,17 +1938,11 @@ impl RpcTransportClient {
                 continue;
             }
             if item.get("command").and_then(Value::as_str) != Some(command) {
-                continue;
+                return Err(Error::api(
+                    "RPC response used the matching id with the wrong command",
+                ));
             }
-
-            let success = item
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if success {
-                return Ok(item.get("data").cloned().unwrap_or(Value::Null));
-            }
-            return Err(rpc_error_from_response(&item, command));
+            return Ok(item);
         }
     }
 }
@@ -1706,18 +1956,86 @@ fn next_rpc_request_id(counter: &AtomicU64) -> Result<String> {
     Ok(format!("rpc-{id}"))
 }
 
-fn write_rpc_json_line(stdin: &Mutex<BufWriter<ChildStdin>>, payload: &Value) -> Result<()> {
-    let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
+#[cfg(unix)]
+fn prepare_rpc_pipe(pipe: &impl std::os::fd::AsFd) -> Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)
+        .map_err(|error| Error::Io(Box::new(std::io::Error::from(error))))?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|error| Error::Io(Box::new(std::io::Error::from(error))))
+}
+
+fn encode_rpc_json_line(payload: &Value) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(payload).map_err(|err| Error::Json(Box::new(err)))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn write_rpc_bytes(stdin: &Mutex<ChildStdin>, closed: &AtomicBool, encoded: &[u8]) -> Result<()> {
+    if closed.load(Ordering::Acquire) {
+        return Err(Error::api("RPC subprocess transport is closed"));
+    }
     let mut stdin = stdin
         .lock()
         .map_err(|_| Error::api("RPC subprocess stdin writer lock poisoned"))?;
-    stdin
-        .write_all(encoded.as_bytes())
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    stdin
-        .write_all(b"\n")
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    stdin.flush().map_err(|err| Error::Io(Box::new(err)))
+    let mut written = 0;
+    while written < encoded.len() {
+        if closed.load(Ordering::Acquire) {
+            return Err(Error::api("RPC subprocess transport is closed"));
+        }
+        match stdin.write(&encoded[written..]) {
+            Ok(0) => return Err(Error::api("RPC subprocess stdin closed during a frame")),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RPC_PIPE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        }
+    }
+    Ok(())
+}
+
+fn read_rpc_json_line(stdout: &mut BufReader<ChildStdout>, closed: &AtomicBool) -> Result<Value> {
+    let mut line = Vec::new();
+    loop {
+        if closed.load(Ordering::Acquire) {
+            return Err(Error::api("RPC subprocess transport is closed"));
+        }
+        let available = match stdout.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RPC_PIPE_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        };
+        if available.is_empty() {
+            return Err(Error::api(if line.is_empty() {
+                "RPC subprocess exited before sending a response"
+            } else {
+                "RPC subprocess ended in the middle of a JSON line"
+            }));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
+            }
+            line.extend_from_slice(&available[..newline]);
+            stdout.consume(newline + 1);
+            break;
+        }
+        if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+            return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
+        }
+        let available_len = available.len();
+        line.extend_from_slice(available);
+        stdout.consume(available_len);
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
 }
 
 impl Drop for RpcTransportClient {

@@ -437,17 +437,54 @@ The returned `RpcEvents` vector still contains the delivered events for callers
 that need the completed transcript. Live callbacks are therefore additive, not a
 change to the completion payload.
 
+### Cancellation and subprocess ownership
+
+The ordinary `RpcTransportClient` request and prompt methods await pipe I/O
+without blocking the caller's executor. A slow reader, a partial JSON response,
+or a quiet provider stream leaves other futures on the same executor able to run.
+Each connection owns a stdin worker and a stdout worker. The stdin queue holds
+one pending frame; the stdout pump retains at most one queued frame and one
+additional frame it is preparing or delivering. The existing 128 MiB per-frame
+and pre-acknowledgement limits still apply. The completed event vector remains a
+caller-visible transcript and is not covered by the pump's queue bound.
+
+Dropping an in-flight request or prompt future closes the entire connection,
+revokes retained control handles, and starts owned process-tree cleanup. This is
+also the response to malformed acknowledgements, duplicate prompt acknowledgements,
+truncated frames, or transport failure. Reconnect before making another request;
+an interrupted exchange cannot safely donate its delayed response or terminal
+events to the next operation. The SDK does not replay interrupted operations,
+whose tool effects may already have happened. A well-formed server refusal
+completes that request and leaves the connection usable.
+
+To abort a turn while keeping its session and connection, keep polling the prompt
+future and send `RpcControlHandle::abort()` instead. Continue consuming through
+its terminal `agent_end`; the control method confirms dispatch, while the prompt
+stream reports the completed turn.
+
+`shutdown()` and client destruction stop the owned subprocess and join its pipe
+workers and reaper, including a reap started by earlier future cancellation.
+Unix subprocesses get a private process group; Windows subprocesses enter the
+existing Job discipline before running. Unix pipe workers also observe connection
+closure while polling, so an inherited descriptor held outside the owned process
+group does not keep a worker blocked on pipe EOF. If operating-system termination
+fails, explicit shutdown reports the error and retains cleanup ownership for a
+retry instead of waiting on pipe workers that may still be blocked.
+
 
 ### Mid-turn RPC control
 
 Call `RpcTransportClient::control_handle()` before starting a subprocess prompt
 when another thread, event loop, or the prompt's live callback may need to steer
-or abort it. The cloned `RpcControlHandle` shares only the serialized stdin
-writer and request-id allocator. The prompt remains the **only stdout reader**,
-so concurrent control never races a second parser over the RPC event stream.
+or abort it. The cloned `RpcControlHandle` shares the serialized stdin writer,
+request-id allocator, and connection lifetime. The prompt remains the **only
+consumer of parsed response frames**, so concurrent control never races a
+second consumer over the RPC event stream.
 
-`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write and
-flush a command and return its SDK-owned request id. A successful return means
+`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write a complete
+command to the pipe and return its SDK-owned request id. These control methods
+can wait on pipe backpressure; the async request and prompt methods use the I/O
+workers described above. A successful control return means
 the command was dispatched to the subprocess pipe; it does not claim the RPC
 server accepted or completed the operation. Its acknowledgement is consumed by
 the prompt's single reader. Use the ordinary `RpcTransportClient` methods when
@@ -455,5 +492,5 @@ you need an acknowledgement and no prompt currently owns the read lane.
 
 The control lane and ordinary requests use one atomic id sequence and one mutexed
 writer, preventing duplicate IDs or interleaved JSON lines. Holding a control
-handle does not keep the child process alive after the owning client shuts down;
-subsequent writes then fail.
+handle does not keep the child process alive after the owning client shuts down
+or an in-flight exchange is dropped; subsequent writes then fail.

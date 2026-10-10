@@ -332,3 +332,350 @@ fn sdk_rpc_control_handle_ids_share_the_client_sequence() {
         ["rpc-1", "rpc-2", "rpc-3"]
     );
 }
+
+#[cfg(unix)]
+fn rpc_pipe_fixture(script: &str, cwd: Option<PathBuf>) -> sdk::RpcTransportClient {
+    sdk::RpcTransportClient::connect(sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), script.into()],
+        cwd,
+    })
+    .expect("connect pipe fixture")
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_request_yields_and_cancelled_exchange_revokes_controls() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut client = rpc_pipe_fixture(
+        "IFS= read -r request; attempt=0; while [ ! -f release ] && [ \"$attempt\" -lt 500 ]; do sleep 0.02; attempt=$((attempt + 1)); done",
+        Some(directory.path().to_path_buf()),
+    );
+    let control = client.control_handle();
+    let request = Box::pin(client.request("get_state", serde_json::Map::new()));
+    match futures::executor::block_on(futures::future::select(
+        request,
+        futures::future::ready(()),
+    )) {
+        futures::future::Either::Right(((), pending)) => drop(pending),
+        futures::future::Either::Left((result, _)) => {
+            panic!("an unanswered request blocked its executor: {result:?}");
+        }
+    }
+    let error = control.abort().expect_err("cancelled transport is revoked");
+    assert!(error.to_string().contains("transport is closed"), "{error}");
+    let error = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+        .expect_err("a cancelled exchange cannot lend its unread frames to the next call");
+    assert!(error.to_string().contains("transport is closed"), "{error}");
+    client.shutdown().expect("join cancelled pipe workers");
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_stalled_stdin_write_yields_and_can_be_cancelled() {
+    // More than an OS pipe can hold. The fixture never reads stdin and exits
+    // eventually, so a regression fails rather than hanging the entire suite.
+    let directory = tempfile::tempdir().unwrap();
+    let mut client = rpc_pipe_fixture(
+        "attempt=0; while [ ! -f release ] && [ \"$attempt\" -lt 500 ]; do sleep 0.02; attempt=$((attempt + 1)); done",
+        Some(directory.path().to_path_buf()),
+    );
+    let control = client.control_handle();
+    let mut payload = serde_json::Map::new();
+    payload.insert("message".into(), json!("x".repeat(8 * 1024 * 1024)));
+    let request = Box::pin(client.request("prompt", payload));
+    match futures::executor::block_on(futures::future::select(
+        request,
+        futures::future::ready(()),
+    )) {
+        futures::future::Either::Right(((), pending)) => drop(pending),
+        futures::future::Either::Left((result, _)) => {
+            panic!("a full stdin pipe blocked its executor: {result:?}");
+        }
+    }
+    assert!(control.steer("too late").is_err());
+    client.shutdown().expect("join interrupted writer");
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_live_prompt_cancellation_runs_on_the_same_executor() {
+    let directory = tempfile::tempdir().unwrap();
+    let script = r#"
+IFS= read -r request
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+printf '{"type":"agent_start","sessionId":"cancel-live"}\n'
+attempt=0
+while [ ! -f release ] && [ "$attempt" -lt 500 ]; do
+  sleep 0.02
+  attempt=$((attempt + 1))
+done
+printf '{"type":"agent_end","messages":[]}\n'
+"#;
+    let mut client = rpc_pipe_fixture(script, Some(directory.path().to_path_buf()));
+    let control = client.control_handle();
+    let (cancel, cancelled) = futures::channel::oneshot::channel();
+    let mut cancel = Some(cancel);
+    let prompt = Box::pin(client.prompt_with_options_streaming(
+        "start a cancellable turn",
+        None,
+        None,
+        move |event| {
+            if event["type"] == "agent_start"
+                && let Some(cancel) = cancel.take()
+            {
+                cancel.send(()).unwrap();
+            }
+        },
+    ));
+    match futures::executor::block_on(futures::future::select(prompt, cancelled)) {
+        futures::future::Either::Right((Ok(()), pending)) => drop(pending),
+        futures::future::Either::Right((Err(error), _)) => {
+            panic!("prompt did not emit its start event: {error}");
+        }
+        futures::future::Either::Left((result, _)) => {
+            panic!("prompt kept the ready cancellation future from running: {result:?}");
+        }
+    }
+    let error = control
+        .abort()
+        .expect_err("cancelled live turn closes its connection");
+    assert!(error.to_string().contains("transport is closed"), "{error}");
+    client.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_fragmented_response_yields_and_resumes_without_losing_bytes() {
+    use std::future::Future as _;
+    use std::task::Poll;
+
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let script = r#"
+IFS= read -r request
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"value":"hel' "$id"
+printf ready > partial-ready
+attempt=0
+while [ ! -f release-response ] && [ "$attempt" -lt 1000 ]; do
+  sleep 0.02
+  attempt=$((attempt + 1))
+done
+printf 'lo"}}\r\n'
+"#;
+    let mut client = rpc_pipe_fixture(script, Some(directory.path().to_path_buf()));
+    let mut request = Box::pin(client.request("get_state", serde_json::Map::new()));
+    let first_poll = futures::executor::block_on(std::future::poll_fn(|cx| {
+        Poll::Ready(request.as_mut().poll(cx))
+    }));
+    assert!(
+        first_poll.is_pending(),
+        "a request must yield while awaiting pipe I/O"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !directory.path().join("partial-ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture did not write its prefix"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let partial_poll = futures::executor::block_on(std::future::poll_fn(|cx| {
+        Poll::Ready(request.as_mut().poll(cx))
+    }));
+    assert!(
+        partial_poll.is_pending(),
+        "an incomplete JSON frame must yield"
+    );
+    std::fs::write(directory.path().join("release-response"), "release").unwrap();
+    let response = futures::executor::block_on(request).expect("completed fragmented response");
+    assert_eq!(response, json!({"value": "hello"}));
+    client.shutdown().expect("shutdown fragmented fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_completed_server_rejections_preserve_the_connection() {
+    let script = r#"
+while IFS= read -r request; do
+  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  cmd=$(printf '%s\n' "$request" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  if [ "$cmd" = get_state ]; then
+    printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"alive":true}}\n' "$id"
+  else
+    printf '{"type":"response","id":"%s","command":"%s","success":false,"error":"fixture refusal"}\n' "$id" "$cmd"
+  fi
+done
+"#;
+    let mut client = rpc_pipe_fixture(script, None);
+    futures::executor::block_on(async {
+        assert!(client.prompt("refuse prompt").await.is_err());
+        assert!(
+            client
+                .request("unknown", serde_json::Map::new())
+                .await
+                .is_err()
+        );
+        let response = client
+            .request("get_state", serde_json::Map::new())
+            .await
+            .unwrap();
+        assert_eq!(response, json!({"alive": true}));
+    });
+    client.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_wrong_response_command_closes_the_protocol_lane() {
+    let script = r#"
+IFS= read -r request
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"wrong","success":true}\n' "$id"
+"#;
+    let mut client = rpc_pipe_fixture(script, None);
+    let control = client.control_handle();
+    let error = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+        .expect_err("matching IDs do not authorize the wrong command");
+    assert!(error.to_string().contains("wrong command"), "{error}");
+    let error = control
+        .abort()
+        .expect_err("invalid protocol closes controls too");
+    assert!(error.to_string().contains("transport is closed"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_duplicate_failure_acknowledgement_closes_the_live_turn() {
+    let script = r#"
+IFS= read -r request
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+printf '{"type":"response","id":"%s","command":"prompt","success":false,"error":"late refusal"}\n' "$id"
+printf '{"type":"agent_end","messages":[]}\n'
+"#;
+    let mut client = rpc_pipe_fixture(script, None);
+    let control = client.control_handle();
+    let error = futures::executor::block_on(client.prompt("hello"))
+        .expect_err("a duplicate failure is a protocol error, not a completed refusal");
+    assert!(
+        error.to_string().contains("duplicate acknowledgement"),
+        "{error}"
+    );
+    assert!(
+        control.abort().is_err(),
+        "later terminal frames cannot enter another turn"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_non_boolean_acknowledgements_close_requests_and_prompts() {
+    for prompt in [false, true] {
+        let script = r#"
+IFS= read -r request
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+cmd=$(printf '%s\n' "$request" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"%s","success":"false"}\n' "$id" "$cmd"
+"#;
+        let mut client = rpc_pipe_fixture(script, None);
+        let control = client.control_handle();
+        let error = if prompt {
+            futures::executor::block_on(client.prompt("hello")).map(|_| ())
+        } else {
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .map(|_| ())
+        }
+        .expect_err("malformed flags do not complete an operation");
+        assert!(
+            error.to_string().contains("boolean success flag"),
+            "{error}"
+        );
+        assert!(control.abort().is_err());
+    }
+}
+
+#[cfg(unix)]
+fn rpc_fixture_process_status(pid: u32) -> Option<sysinfo::ProcessStatus> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+    system
+        .process(sysinfo::Pid::from_u32(pid))
+        .map(sysinfo::Process::status)
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
+    for root_exits in [false, true] {
+        for explicit_shutdown in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let tail = if root_exits { "exit 0" } else { "wait" };
+            let script = format!(
+                "sleep 30 </dev/null &\nprintf '%s %s' \"$$\" \"$!\" > pids\n{tail}"
+            );
+            let mut client = rpc_pipe_fixture(&script, Some(directory.path().to_path_buf()));
+            let control = client.control_handle();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let pids = loop {
+                if let Ok(text) = std::fs::read_to_string(directory.path().join("pids")) {
+                    let pids: Vec<u32> = text
+                        .split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture did not publish its PIDs"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            if root_exits {
+                while rpc_fixture_process_status(pids[0]).is_some_and(|status| {
+                    !matches!(
+                        status,
+                        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                    )
+                }) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture root did not exit"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            if explicit_shutdown {
+                client.shutdown().expect("explicit tree shutdown");
+            }
+            drop(client);
+            assert!(
+                control.abort().is_err(),
+                "a retained control cannot retain a live child"
+            );
+            assert!(
+                rpc_fixture_process_status(pids[0]).is_none(),
+                "root must be reaped"
+            );
+            while rpc_fixture_process_status(pids[1]).is_some_and(|status| {
+                !matches!(
+                    status,
+                    sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                )
+            }) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant survived client shutdown"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
