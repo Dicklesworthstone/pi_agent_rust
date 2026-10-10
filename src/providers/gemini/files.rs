@@ -3,7 +3,9 @@
 //! Called after the request-rewrite hook, immediately before generation. The
 //! session's original media stays intact; only the outbound request is rewritten.
 //! File resources are reused by content hash, validated before reuse, and
-//! re-uploaded after expiry or deletion. No upload runs in a detached task.
+//! re-uploaded after expiry or deletion. One replacement budget spans staging
+//! and a file-not-found generation rejection, before streaming begins. No
+//! upload runs in a detached task.
 
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -11,6 +13,7 @@ use crate::http::client::{Client, RequestBuilder, Response};
 use crate::models::CompatConfig;
 use crate::provider::StreamOptions;
 use asupersync::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use asupersync::types::Time;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -265,6 +268,8 @@ struct CacheState {
 pub(super) struct FileCache {
     state: Mutex<CacheState>,
     policy: StagingPolicy,
+    #[cfg(test)]
+    test_endpoint: Option<Endpoint>,
 }
 
 struct UploadContext<'a> {
@@ -280,6 +285,40 @@ struct Candidate {
     encoded_bytes: usize,
 }
 
+/// Request-owned recovery data, never persisted or kept in the shared cache.
+/// The original encoded bytes are moved out of each staged part, once per
+/// distinct blob, rather than cloning the complete pre-upload request body.
+pub(super) struct PreparedFiles {
+    endpoint: Endpoint,
+    owner: AgentCx,
+    deadline: Time,
+    policy: StagingPolicy,
+    files: BTreeMap<ContentKey, PreparedFile>,
+    recovery_attempted: bool,
+}
+
+struct PreparedFile {
+    slot: FileSlot,
+    remote: RemoteFile,
+    mime: String,
+    encoded: String,
+    size: usize,
+    pointers: Vec<String>,
+    replacement_used: bool,
+}
+
+struct StagedFile {
+    slot: FileSlot,
+    remote: RemoteFile,
+    replacement_used: bool,
+}
+
+struct UploadInput<'a> {
+    mime: &'a str,
+    encoded: &'a str,
+    bytes: Option<Vec<u8>>,
+}
+
 impl FileCache {
     pub(super) async fn prepare(
         &self,
@@ -287,9 +326,14 @@ impl FileCache {
         base: &str,
         auth: &UploadAuth,
         body: &mut Value,
-    ) -> Result<()> {
-        let Some(endpoint) = Endpoint::for_provider(base) else {
-            return Ok(());
+    ) -> Result<Option<PreparedFiles>> {
+        let endpoint = Endpoint::for_provider(base);
+        // Exercise the complete provider request/recovery path against the
+        // local HTTP fixture without changing the production origin policy.
+        #[cfg(test)]
+        let endpoint = self.test_endpoint.clone().or(endpoint);
+        let Some(endpoint) = endpoint else {
+            return Ok(None);
         };
         self.prepare_at(client, &endpoint, auth, body).await
     }
@@ -300,10 +344,10 @@ impl FileCache {
         endpoint: &Endpoint,
         auth: &UploadAuth,
         body: &mut Value,
-    ) -> Result<()> {
+    ) -> Result<Option<PreparedFiles>> {
         let candidates = staging_plan(body, self.policy)?;
         if candidates.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         if auth.headers.is_empty() {
             return Err(files_error(
@@ -322,37 +366,52 @@ impl FileCache {
             ));
         }
         checkpoint(&owner)?;
-        let now = owner
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let now = owner_now(&owner);
+        let deadline = staging_deadline(&owner, now, self.policy.timeout);
+        let remaining = Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()));
+        if remaining.is_zero() {
+            return Err(files_error(
+                "media staging timed out; generation was not started",
+            ));
+        }
         let context = UploadContext {
             client,
             endpoint,
             auth,
             owner: &owner,
         };
-        asupersync::time::timeout(
-            now,
-            self.policy.timeout,
-            self.prepare_inner(&context, body, candidates),
-        )
-        .await
-        .map_err(|_| files_error("media staging timed out; generation was not started"))?
+        let files = owner
+            .with_current(asupersync::time::timeout(
+                now,
+                remaining,
+                self.prepare_inner(&context, body, candidates),
+            ))
+            .await
+            .map_err(|_| files_error("media staging timed out; generation was not started"))??;
+        Ok(Some(PreparedFiles {
+            endpoint: endpoint.clone(),
+            owner,
+            deadline,
+            policy: self.policy,
+            files,
+            recovery_attempted: false,
+        }))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prepare_inner(
         &self,
         context: &UploadContext<'_>,
         body: &mut Value,
         candidates: Vec<Candidate>,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<ContentKey, PreparedFile>> {
         if candidates.is_empty() {
-            return Ok(());
+            return Ok(BTreeMap::new());
         }
         let mut request_bytes = serialized_bytes(body)?;
         // Repeated parts in a single request share the already-validated URI,
         // without an extra files.get call for every occurrence.
-        let mut prepared: BTreeMap<ContentKey, String> = BTreeMap::new();
+        let mut prepared: BTreeMap<ContentKey, PreparedFile> = BTreeMap::new();
         for candidate in candidates {
             // Candidates are largest first. Once neither the per-part nor
             // complete-request policy requires another upload, all remaining
@@ -381,19 +440,48 @@ impl FileCache {
                 .to_ascii_lowercase();
             let data = required_string(inline, "data")?;
             let bytes = decode_media(data)?;
+            let size = bytes.len();
             let key = content_key(context.endpoint, context.auth, &mime, &bytes);
-            let uri = if let Some(uri) = prepared.get(&key) {
-                uri.clone()
+            let staged = if prepared.contains_key(&key) {
+                None
             } else {
-                let uri = self.stage_one(context, key, &mime, data, bytes).await?;
-                prepared.insert(key, uri.clone());
-                uri
+                Some(self.stage_one(context, key, &mime, data, bytes).await?)
             };
+            // Move the source out only after staging succeeded. Duplicate
+            // occurrences retain one source and one replacement budget.
+            let mut inline = part
+                .remove(candidate.inline_key)
+                .ok_or_else(|| files_error("inline media disappeared during staging"))?;
+            if let Some(staged) = staged {
+                let encoded = inline
+                    .get_mut("data")
+                    .map(Value::take)
+                    .and_then(|data| match data {
+                        Value::String(data) => Some(data),
+                        _ => None,
+                    })
+                    .ok_or_else(|| files_error("inline media changed during staging"))?;
+                prepared.insert(
+                    key,
+                    PreparedFile {
+                        slot: staged.slot,
+                        remote: staged.remote,
+                        mime: mime.clone(),
+                        encoded,
+                        size,
+                        pointers: Vec::new(),
+                        replacement_used: staged.replacement_used,
+                    },
+                );
+            }
+            let prepared_file = prepared
+                .get_mut(&key)
+                .ok_or_else(|| files_error("staged media lost its recovery source"))?;
+            prepared_file.pointers.push(candidate.pointer);
             // Retain every other part field, including thought signatures.
-            part.remove(candidate.inline_key);
             part.insert(
                 "fileData".to_string(),
-                json!({"mimeType": mime, "fileUri": uri}),
+                json!({"mimeType": mime, "fileUri": prepared_file.remote.uri}),
             );
             let replacement_part_bytes = serialized_bytes(part)?;
             request_bytes = request_bytes
@@ -403,7 +491,7 @@ impl FileCache {
         }
         // If the prompt itself exceeds the media budget, every inline part
         // has been staged. Do not impose a new limit on the remaining text.
-        Ok(())
+        Ok(prepared)
     }
 
     fn slot(&self, key: ContentKey) -> Result<FileSlot> {
@@ -452,7 +540,7 @@ impl FileCache {
         mime: &str,
         encoded: &str,
         bytes: Vec<u8>,
-    ) -> Result<String> {
+    ) -> Result<StagedFile> {
         let slot = self.slot(key)?;
         // OWNED guard, not a borrowed one: this is held across the metadata
         // fetch, the upload and the processing poll below, and
@@ -462,20 +550,15 @@ impl FileCache {
         // `OwnedMutexGuard` is `Send` for `T: Send` and keeps the lock held for
         // exactly the same span, so two requests for the same content still
         // cannot upload it twice.
-        let mut cached = OwnedMutexGuard::lock(slot, context.owner.cx())
+        let mut cached = OwnedMutexGuard::lock(Arc::clone(&slot), context.owner.cx())
             .await
             .map_err(|_| {
                 files_error("media upload cancelled while waiting for its content lock")
             })?;
         checkpoint(context.owner)?;
         let size = bytes.len();
-        let mut had_remote_file = cached.is_some();
+        let had_remote_file = cached.is_some();
         let mut replacement_used = false;
-        // The request body already retains the canonical encoded bytes. Move
-        // this decoded buffer into the first upload and decode again only for
-        // an actual replacement, rather than holding a second 64 MiB copy
-        // across every successful upload and processing poll.
-        let mut upload_bytes = Some(bytes);
         // Do not assume a still-live URI exists just because its TTL has not
         // elapsed: the user may have deleted the resource out of band.
         if let Some(file) = cached.as_ref()
@@ -485,49 +568,249 @@ impl FileCache {
             let name = file.name.clone();
             *cached = get_metadata(context, &name, mime, size).await?;
         }
-        loop {
-            checkpoint(context.owner)?;
-            if let Some(file) = cached.as_ref() {
-                if file.state == FileState::Failed {
-                    *cached = None;
-                    return Err(files_error(
-                        "media processing failed; generation was not started",
-                    ));
-                }
-                if !file.expires_soon(Utc::now()) {
-                    if file.state == FileState::Active {
-                        return Ok(file.uri.clone());
-                    }
-                    let name = file.name.clone();
-                    context.owner.time().sleep(self.policy.poll_interval).await;
-                    *cached = get_metadata(context, &name, mime, size).await?;
-                    continue;
-                }
-                *cached = None;
-            }
-            // One replacement budget covers both initial cache validation and
-            // every processing poll. A cold upload is free; replacing any
-            // expired/deleted reference spends the budget. The outer staging
-            // timeout remains the same absolute deadline across replacements.
-            if had_remote_file {
-                if replacement_used {
-                    return Err(files_error(
-                        "media file disappeared or expired again after one replacement; generation was not started",
-                    ));
-                }
-                replacement_used = true;
-            }
-            let bytes = match upload_bytes.take() {
-                Some(bytes) => bytes,
-                None => decode_media(encoded)?,
-            };
-            let uploaded = upload(context, mime, bytes).await?;
-            // Install PROCESSING metadata before awaiting the next poll. A
-            // cancelled/timeout request can resume waiting instead of uploading
-            // the same media again on the next turn.
-            *cached = Some(uploaded);
-            had_remote_file = true;
+        let remote = await_active(
+            context,
+            self.policy,
+            &mut cached,
+            UploadInput {
+                mime,
+                encoded,
+                bytes: Some(bytes),
+            },
+            size,
+            had_remote_file,
+            &mut replacement_used,
+        )
+        .await?;
+        Ok(StagedFile {
+            slot,
+            remote,
+            replacement_used,
+        })
+    }
+}
+
+impl PreparedFiles {
+    /// A transport retry is allowed only before any SSE events are exposed.
+    /// Google's GenerateContent contract identifies missing file inputs with
+    /// 404 / NOT_FOUND, but the same status can mean a missing model. Confirm
+    /// an exact staged resource is gone using authenticated files.get first:
+    /// https://ai.google.dev/gemini-api/docs/generate-content/api-errors
+    pub(super) async fn recover(
+        &mut self,
+        client: &Client,
+        auth: &UploadAuth,
+        body: &mut Value,
+        status: u16,
+        error_body: &str,
+    ) -> Result<bool> {
+        checkpoint(&self.owner)?;
+        if self.recovery_attempted || !missing_resource_error(status, error_body) {
+            return Ok(false);
         }
+        self.recovery_attempted = true;
+        let now = owner_now(&self.owner);
+        let remaining =
+            Duration::from_nanos(self.deadline.as_nanos().saturating_sub(now.as_nanos()));
+        if remaining.is_zero() {
+            return Err(files_error(
+                "media recovery timed out; generation was not retried",
+            ));
+        }
+        let context = UploadContext {
+            client,
+            endpoint: &self.endpoint,
+            auth,
+            owner: &self.owner,
+        };
+        let changed = self
+            .owner
+            .with_current(asupersync::time::timeout(
+                now,
+                remaining,
+                recover_files(&context, self.policy, &mut self.files, body),
+            ))
+            .await
+            .map_err(|_| files_error("media recovery timed out; generation was not retried"))??;
+        checkpoint(&self.owner)?;
+        Ok(changed)
+    }
+}
+
+fn owner_now(owner: &AgentCx) -> Time {
+    owner
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now())
+}
+
+fn staging_deadline(owner: &AgentCx, now: Time, timeout: Duration) -> Time {
+    let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    let requested = Time::from_nanos(now.as_nanos().saturating_add(nanos));
+    owner
+        .budget()
+        .deadline
+        .map_or(requested, |inherited| requested.min(inherited))
+}
+
+fn missing_resource_error(status: u16, body: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        error: ApiError,
+    }
+    #[derive(serde::Deserialize)]
+    struct ApiError {
+        code: u16,
+        status: String,
+    }
+
+    status == 404
+        && body.len() <= MAX_METADATA_BYTES
+        && serde_json::from_str::<Envelope>(body)
+            .is_ok_and(|value| value.error.code == 404 && value.error.status == "NOT_FOUND")
+}
+
+async fn recover_files(
+    context: &UploadContext<'_>,
+    policy: StagingPolicy,
+    files: &mut BTreeMap<ContentKey, PreparedFile>,
+    body: &mut Value,
+) -> Result<bool> {
+    let mut changed = false;
+    for file in files.values_mut() {
+        checkpoint(context.owner)?;
+        for pointer in &file.pointers {
+            let part = body.pointer(pointer).and_then(|part| part.get("fileData"));
+            if part
+                .and_then(|part| part.get("fileUri"))
+                .and_then(Value::as_str)
+                != Some(file.remote.uri.as_str())
+            {
+                return Err(files_error("staged media changed before recovery"));
+            }
+        }
+        // Pin the same slot used at preparation. An older generation must not
+        // evict or overwrite a newer request's replacement for this content.
+        let mut cached = OwnedMutexGuard::lock(Arc::clone(&file.slot), context.owner.cx())
+            .await
+            .map_err(|_| {
+                files_error("media recovery cancelled while waiting for its content lock")
+            })?;
+        let observed = get_metadata(context, &file.remote.name, &file.mime, file.size).await?;
+        if observed
+            .as_ref()
+            .is_some_and(|remote| remote.state == FileState::Failed)
+        {
+            return Err(files_error(
+                "media processing failed; generation was not retried",
+            ));
+        }
+        let stale = observed
+            .as_ref()
+            .is_none_or(|remote| remote.expires_at <= Utc::now());
+        if !stale {
+            // A still-live input does not turn a model/prompt failure into a
+            // media retry. In particular, FAILED is not a replacement signal.
+            continue;
+        }
+        if file.replacement_used {
+            return Err(replacement_exhausted());
+        }
+        if let Some(current) = cached.as_ref()
+            && current.uri != file.remote.uri
+        {
+            let name = current.name.clone();
+            *cached = get_metadata(context, &name, &file.mime, file.size).await?;
+            if cached
+                .as_ref()
+                .is_some_and(|remote| !remote.expires_soon(Utc::now()))
+            {
+                // Adopting another request's replacement spends this request's
+                // one replacement too; disappearance while polling it cannot
+                // cause a second upload.
+                file.replacement_used = true;
+            }
+        } else {
+            *cached = None;
+        }
+        let replacement = await_active(
+            context,
+            policy,
+            &mut cached,
+            UploadInput {
+                mime: &file.mime,
+                encoded: &file.encoded,
+                bytes: None,
+            },
+            file.size,
+            true,
+            &mut file.replacement_used,
+        )
+        .await?;
+        for pointer in &file.pointers {
+            let part = body
+                .pointer_mut(pointer)
+                .and_then(|part| part.get_mut("fileData"))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| files_error("staged media changed during recovery"))?;
+            part.insert("fileUri".to_string(), Value::String(replacement.uri.clone()));
+        }
+        file.remote = replacement;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn replacement_exhausted() -> Error {
+    files_error(
+        "media file disappeared or expired again after one replacement; generation was not started",
+    )
+}
+
+async fn await_active(
+    context: &UploadContext<'_>,
+    policy: StagingPolicy,
+    cached: &mut Option<RemoteFile>,
+    mut input: UploadInput<'_>,
+    size: usize,
+    mut had_remote_file: bool,
+    replacement_used: &mut bool,
+) -> Result<RemoteFile> {
+    loop {
+        checkpoint(context.owner)?;
+        if let Some(file) = cached.as_ref() {
+            if file.state == FileState::Failed {
+                *cached = None;
+                return Err(files_error(
+                    "media processing failed; generation was not started",
+                ));
+            }
+            if !file.expires_soon(Utc::now()) {
+                if file.state == FileState::Active {
+                    return Ok(file.clone());
+                }
+                let name = file.name.clone();
+                context.owner.time().sleep(policy.poll_interval).await;
+                *cached = get_metadata(context, &name, input.mime, size).await?;
+                continue;
+            }
+            *cached = None;
+        }
+        // A cold upload is free. All replacements, including disappearance
+        // during a recovery upload's processing polls, share this same bit.
+        if had_remote_file {
+            if *replacement_used {
+                return Err(replacement_exhausted());
+            }
+            *replacement_used = true;
+        }
+        let bytes = match input.bytes.take() {
+            Some(bytes) => bytes,
+            None => decode_media(input.encoded)?,
+        };
+        // Publish PROCESSING metadata before waiting, so cancellation does not
+        // force a future turn to upload the same bytes again.
+        *cached = Some(upload(context, input.mime, bytes).await?);
+        had_remote_file = true;
     }
 }
 
@@ -793,11 +1076,18 @@ async fn upload(context: &UploadContext<'_>, mime: &str, bytes: Vec<u8>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use super::super::GeminiProvider;
     use super::*;
+    use crate::model::{
+        ContentBlock, MediaContent, Message, StreamEvent, TextContent, UserContent, UserMessage,
+    };
+    use crate::provider::{BeforeProviderRequestHook, Context, Provider};
     use asupersync::runtime::RuntimeBuilder;
+    use futures::StreamExt;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread::JoinHandle;
     use std::time::Instant;
 
@@ -842,6 +1132,7 @@ mod tests {
 
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         RuntimeBuilder::current_thread()
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_wall_clock())
             .build()
             .expect("runtime")
             .block_on(future)
@@ -854,6 +1145,18 @@ mod tests {
         auth: &UploadAuth,
         body: &mut Value,
     ) -> Result<()> {
+        stage_for_recovery(cache, client, endpoint, auth, body)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stage_for_recovery(
+        cache: &FileCache,
+        client: &Client,
+        endpoint: &Endpoint,
+        auth: &UploadAuth,
+        body: &mut Value,
+    ) -> Result<PreparedFiles> {
         let owner = AgentCx::for_current_or_request();
         let context = UploadContext {
             client,
@@ -862,10 +1165,35 @@ mod tests {
             owner: &owner,
         };
         let candidates = staging_plan(body, cache.policy)?;
-        // Exercise the real HTTP/locking/processing path. Like the existing
-        // provider wire fixtures, do not let a virtual overall timer race the
-        // OS server thread. The outer deadline has its own non-I/O test below.
-        cache.prepare_inner(&context, body, candidates).await
+        // Isolate HTTP/locking/processing transitions from the outer timeout;
+        // provider-level tests below also cover prepare/recover's wrappers.
+        let deadline = staging_deadline(&owner, owner_now(&owner), cache.policy.timeout);
+        let files = cache.prepare_inner(&context, body, candidates).await?;
+        Ok(PreparedFiles {
+            endpoint: endpoint.clone(),
+            owner,
+            deadline,
+            policy: cache.policy,
+            files,
+            recovery_attempted: false,
+        })
+    }
+
+    async fn recover_fixture(
+        prepared: &mut PreparedFiles,
+        client: &Client,
+        auth: &UploadAuth,
+        body: &mut Value,
+    ) -> Result<bool> {
+        let context = UploadContext {
+            client,
+            endpoint: &prepared.endpoint,
+            auth,
+            owner: &prepared.owner,
+        };
+        // Isolate HTTP/cache transitions; provider-level tests also exercise
+        // recover's classification, ownership and absolute timeout wrapper.
+        recover_files(&context, prepared.policy, &mut prepared.files, body).await
     }
 
     struct Reply {
@@ -899,6 +1227,29 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: b"{}".to_vec(),
+            }
+        }
+
+        fn generation_error(status: u16, api_status: &str, message: &str) -> Self {
+            Self {
+                status,
+                ..Self::json(&json!({"error": {
+                    "code": status,
+                    "status": api_status,
+                    "message": message
+                }}))
+            }
+        }
+
+        fn sse(text: &str) -> Self {
+            let chunk = json!({"candidates": [{
+                "content": {"role": "model", "parts": [{"text": text}]},
+                "finishReason": "STOP"
+            }]});
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                body: format!("data: {chunk}\n\n").into_bytes(),
             }
         }
     }
@@ -1042,10 +1393,17 @@ mod tests {
                     let mut wire = Vec::new();
                     write!(
                         wire,
-                        "HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
                         reply.status, reply.body.len()
                     )
                     .unwrap();
+                    if !reply
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    {
+                        wire.extend_from_slice(b"Content-Type: application/json\r\n");
+                    }
                     for (name, value) in reply.headers {
                         write!(wire, "{name}: {value}\r\n").unwrap();
                     }
@@ -1074,6 +1432,81 @@ mod tests {
             if let Some(join) = self.join.take() {
                 let _ = join.join();
             }
+        }
+    }
+
+    fn fixture_provider(server: &Server) -> GeminiProvider {
+        let mut provider = GeminiProvider::new("gemini-2.0-flash")
+            .with_base_url(server.endpoint.base.as_str().trim_end_matches('/'))
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(HashMap::from([
+                    ("x-goog-api-key".to_string(), "compat-key".to_string()),
+                    ("authorization".to_string(), "Bearer compat-token".to_string()),
+                    ("x-goog-user-project".to_string(), "compat-project".to_string()),
+                ])),
+                ..CompatConfig::default()
+            }));
+        provider.files = FileCache {
+            test_endpoint: Some(server.endpoint.clone()),
+            ..cache()
+        };
+        provider
+    }
+
+    fn fixture_options() -> StreamOptions {
+        StreamOptions {
+            api_key: Some("unused-fallback".to_string()),
+            headers: HashMap::from([
+                ("X-Goog-Api-Key".to_string(), "request-key".to_string()),
+                ("Authorization".to_string(), "Bearer request-token".to_string()),
+                ("X-Goog-User-Project".to_string(), "request-project".to_string()),
+                ("X-Pi-Recovery-Marker".to_string(), "preserve-me".to_string()),
+            ]),
+            ..StreamOptions::default()
+        }
+    }
+
+    fn fixture_context() -> Context<'static> {
+        Context::owned(
+            None,
+            vec![Message::User(UserMessage {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("Describe this recording")),
+                    ContentBlock::Media(MediaContent {
+                        data: base64::engine::general_purpose::STANDARD.encode(b"abc"),
+                        mime_type: "audio/wav".to_string(),
+                        name: None,
+                    }),
+                ]),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        )
+    }
+
+    async fn fixture_events(
+        provider: &GeminiProvider,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Vec<StreamEvent>> {
+        let mut stream = provider.stream(context, options).await?;
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+        Ok(events)
+    }
+
+    fn assert_request_credentials(request: &CapturedRequest) {
+        for (header, expected) in [
+            ("x-goog-api-key", "request-key"),
+            ("authorization", "Bearer request-token"),
+            ("x-goog-user-project", "request-project"),
+        ] {
+            assert_eq!(
+                request.headers.get(header).map(String::as_str),
+                Some(expected)
+            );
         }
     }
 
@@ -1810,6 +2243,415 @@ mod tests {
     }
 
     #[test]
+    fn generation_recovery_adopts_concurrent_replacement_and_updates_every_occurrence() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::status(404),
+                Reply::json(&file_metadata(endpoint, "concurrent", "ACTIVE", 3)),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let mut body = media_body(b"abc");
+        let repeated = body["contents"][0]["parts"][1].clone();
+        body["contents"][0]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(repeated);
+        run_async(async {
+            let mut prepared =
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .unwrap();
+            assert_eq!(prepared.files.len(), 1);
+            let file = prepared.files.values().next().unwrap();
+            assert_eq!(file.encoded, "YWJj");
+            assert_eq!(file.pointers.len(), 2);
+            assert!(!body.to_string().contains("YWJj"));
+            let concurrent = RemoteFile::parse(
+                &file_metadata(&server.endpoint, "concurrent", "ACTIVE", 3),
+                &server.endpoint,
+                "audio/wav",
+                3,
+            )
+            .unwrap();
+            *file.slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
+            assert!(
+                recover_fixture(&mut prepared, &client, &auth, &mut body)
+                    .await
+                    .unwrap()
+            );
+            let file = prepared.files.values().next().unwrap();
+            assert!(file.replacement_used);
+            assert_eq!(file.remote.uri, concurrent.uri);
+            assert_eq!(
+                file.slot
+                    .lock(prepared.owner.cx())
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .uri,
+                concurrent.uri
+            );
+            for part in body["contents"][0]["parts"].as_array().unwrap().iter().skip(1) {
+                assert_eq!(part["fileData"]["fileUri"], concurrent.uri);
+                assert_eq!(part["thoughtSignature"], "keep-this-field");
+            }
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4, "no upload after a concurrent replacement");
+        assert_eq!(requests[2].path, "/v1beta/files/old");
+        assert_eq!(requests[3].path, "/v1beta/files/concurrent");
+        for index in [2, 3] {
+            assert_eq!(
+                requests[index].headers.get("x-goog-api-key").map(String::as_str),
+                Some("a")
+            );
+        }
+    }
+
+    #[test]
+    fn generation_replacement_disappearing_during_processing_cannot_upload_twice() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(
+                    endpoint, "replacement", "PROCESSING", 3
+                )})),
+                Reply::status(404),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let mut body = media_body(b"abc");
+        run_async(async {
+            let mut prepared =
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .unwrap();
+            let original = body.clone();
+            let error = recover_fixture(&mut prepared, &client, &auth, &mut body)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("after one replacement"));
+            assert_eq!(body, original, "no partially processed URI is published");
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[1].body, b"abc");
+        assert_eq!(requests[4].body, requests[1].body);
+        assert_eq!(
+            requests[3].headers.get("x-goog-api-key").map(String::as_str),
+            Some("a")
+        );
+        assert!(!requests[4].headers.contains_key("x-goog-api-key"));
+        assert_eq!(requests[5].path, "/v1beta/files/replacement");
+    }
+
+    #[test]
+    fn generation_recovery_metadata_authorization_failure_never_uploads() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::status(403),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let mut body = media_body(b"abc");
+        run_async(async {
+            let mut prepared =
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .unwrap();
+            let original = body.clone();
+            let error = recover_fixture(&mut prepared, &client, &auth, &mut body)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("metadata request failed (HTTP 403)")
+            );
+            assert_eq!(body, original);
+            assert!(!prepared.files.values().next().unwrap().replacement_used);
+        });
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn generation_recovery_retains_cancellation_and_the_original_deadline() {
+        for cancelled in [false, true] {
+            let server = Server::start(|endpoint| {
+                vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                ]
+            });
+            let cache = cache();
+            let client = Client::new();
+            let auth = auth("a");
+            let mut body = media_body(b"abc");
+            run_async(async {
+                let mut prepared =
+                    stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                        .await
+                        .unwrap();
+                if cancelled {
+                    prepared.owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel recovery"),
+                    );
+                } else {
+                    prepared.deadline = owner_now(&prepared.owner);
+                }
+                let error = prepared
+                    .recover(
+                        &client,
+                        &auth,
+                        &mut body,
+                        404,
+                        r#"{"error":{"code":404,"status":"NOT_FOUND"}}"#,
+                    )
+                    .await
+                    .unwrap_err();
+                let expected = if cancelled { "cancelled" } else { "timed out" };
+                assert!(error.to_string().contains(expected));
+            });
+            assert_eq!(server.finish().len(), 2, "no recovery dispatch after stop");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_recovers_deleted_file_using_the_rewrite_once_and_identical_credentials() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::generation_error(404, "NOT_FOUND", "file disappeared"),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "replacement", "ACTIVE", 3)})),
+                Reply::sse("recovered recording"),
+            ]
+        });
+        let provider = fixture_provider(&server);
+        let context = fixture_context();
+        let original_messages = serde_json::to_value(context.messages.as_ref()).unwrap();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&hook_calls);
+        let options = StreamOptions {
+            before_provider_request: Some(BeforeProviderRequestHook::new(move |event| {
+                called.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let mut body = event.payload;
+                    let parts = &mut body["contents"][0]["parts"];
+                    assert_eq!(parts[1]["inline_data"]["data"], "YWJj");
+                    parts[0]["text"] = json!("Use the extension's edited recording");
+                    parts[1]["inline_data"]["data"] = json!("eHl6");
+                    parts[1]["thoughtSignature"] = json!("preserve-this-signature");
+                    Some(body)
+                })
+            })),
+            ..fixture_options()
+        };
+        let events = run_async(fixture_events(&provider, &context, &options)).unwrap();
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(context.messages.as_ref()).unwrap(),
+            original_messages
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "recovered recording"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. }))
+        );
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 7);
+        for index in [0, 2, 3, 4, 6] {
+            assert_request_credentials(&requests[index]);
+        }
+        for index in [1, 5] {
+            assert_eq!(requests[index].body, b"xyz", "reuse the post-hook bytes");
+            for header in ["x-goog-api-key", "authorization", "x-goog-user-project"] {
+                assert!(!requests[index].headers.contains_key(header));
+            }
+        }
+        for index in [2, 6] {
+            assert_eq!(requests[index].method, "POST");
+            assert_eq!(
+                requests[index].path,
+                "/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+            );
+            assert_eq!(
+                requests[index]
+                    .headers
+                    .get("x-pi-recovery-marker")
+                    .map(String::as_str),
+                Some("preserve-me")
+            );
+            assert_eq!(
+                requests[index].headers.get("accept").map(String::as_str),
+                Some("text/event-stream")
+            );
+        }
+        assert_eq!(requests[3].method, "GET");
+        assert_eq!(requests[3].path, "/v1beta/files/old");
+        let first: Value = serde_json::from_slice(&requests[2].body).unwrap();
+        let retry: Value = serde_json::from_slice(&requests[6].body).unwrap();
+        let part = &retry["contents"][0]["parts"][1];
+        assert!(part.get("inlineData").is_none());
+        assert!(part.get("inline_data").is_none());
+        assert_eq!(part["thoughtSignature"], "preserve-this-signature");
+        assert_eq!(
+            retry["contents"][0]["parts"][0]["text"],
+            "Use the extension's edited recording"
+        );
+        assert_ne!(
+            first["contents"][0]["parts"][1]["fileData"]["fileUri"],
+            part["fileData"]["fileUri"]
+        );
+        let mut expected = first;
+        expected["contents"][0]["parts"][1]["fileData"]["fileUri"] =
+            part["fileData"]["fileUri"].clone();
+        assert_eq!(retry, expected, "only the dead URI changes on resubmission");
+    }
+
+    #[test]
+    fn provider_does_not_retry_unrelated_generation_errors_or_a_live_file() {
+        for (status, api_status, check_live_file) in [
+            (400, "INVALID_ARGUMENT", false),
+            (403, "PERMISSION_DENIED", false),
+            (429, "RESOURCE_EXHAUSTED", false),
+            (500, "INTERNAL", false),
+            (404, "PERMISSION_DENIED", false),
+            (404, "NOT_FOUND", true),
+        ] {
+            let server = Server::start(|endpoint| {
+                let mut replies = vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "live", "ACTIVE", 3)})),
+                    Reply::generation_error(status, api_status, "leave-this-generation-error"),
+                ];
+                if check_live_file {
+                    replies.push(Reply::json(&file_metadata(endpoint, "live", "ACTIVE", 3)));
+                }
+                replies
+            });
+            let provider = fixture_provider(&server);
+            let error = run_async(fixture_events(
+                &provider,
+                &fixture_context(),
+                &fixture_options(),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("Gemini API error (HTTP {status})")),
+                "{error}"
+            );
+            assert!(error.contains("leave-this-generation-error"), "{error}");
+            let requests = server.finish();
+            assert_eq!(requests.len(), if check_live_file { 4 } else { 3 });
+            if check_live_file {
+                assert_eq!(requests[3].path, "/v1beta/files/live");
+                assert_request_credentials(&requests[3]);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cannot_replace_again_after_preflight_spent_the_budget() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "replacement", "ACTIVE", 3)})),
+                Reply::generation_error(404, "NOT_FOUND", "replacement disappeared"),
+                Reply::status(404),
+            ]
+        });
+        let provider = fixture_provider(&server);
+        let options = fixture_options();
+        let context = fixture_context();
+        let auth = UploadAuth::for_request(&options, provider.compat.as_ref(), None);
+        let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+        run_async(async {
+            let owner = AgentCx::for_current_or_request();
+            let slot = provider.files.slot(key).unwrap();
+            let mut expired = file_metadata(&server.endpoint, "expired", "ACTIVE", 3);
+            expired["expirationTime"] =
+                json!((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+            *slot.lock(owner.cx()).await.unwrap() =
+                Some(RemoteFile::parse(&expired, &server.endpoint, "audio/wav", 3).unwrap());
+            let error = fixture_events(&provider, &context, &options)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("after one replacement"));
+        });
+        let requests = server.finish();
+        assert_eq!(
+            requests.len(),
+            4,
+            "only the preflight replacement was uploaded"
+        );
+        assert_eq!(requests[1].body, b"abc");
+        assert_eq!(requests[3].path, "/v1beta/files/replacement");
+    }
+
+    #[test]
+    fn provider_exposes_the_second_generation_error_without_a_third_attempt() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::generation_error(404, "NOT_FOUND", "first failure"),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "replacement", "ACTIVE", 3)})),
+                Reply::generation_error(404, "NOT_FOUND", "second failure"),
+            ]
+        });
+        let provider = fixture_provider(&server);
+        let error = run_async(fixture_events(
+            &provider,
+            &fixture_context(),
+            &fixture_options(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Gemini API error (HTTP 404)"));
+        assert!(error.contains("second failure"));
+        assert!(!error.contains("first failure"));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(requests[2].path, requests[6].path);
+        assert_eq!(requests[1].body, requests[5].body);
+    }
+
+    #[test]
     fn concurrent_requests_upload_identical_content_only_once() {
         let server = Server::start(|endpoint| {
             vec![
@@ -1945,7 +2787,8 @@ mod tests {
             let error = cache
                 .prepare_inner(&context, &mut body, plan)
                 .await
-                .unwrap_err();
+                .err()
+                .expect("cancelled staging");
             assert!(error.to_string().contains("cancelled"));
             assert!(cache.state.lock().unwrap().entries.is_empty());
         });
@@ -1989,7 +2832,8 @@ mod tests {
             let error = cache
                 .prepare_at(&client, &endpoint, &auth, &mut body)
                 .await
-                .unwrap_err();
+                .err()
+                .expect("expired staging deadline");
             assert!(error.to_string().contains("timed out"));
             assert_eq!(body, original);
             assert!(

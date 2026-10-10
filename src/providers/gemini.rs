@@ -4,7 +4,7 @@
 //! supporting streaming responses and function calling (tool use).
 
 use crate::error::{Error, Result};
-use crate::http::client::Client;
+use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage, UserContent,
 };
@@ -29,6 +29,7 @@ mod wire;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const MAX_GENERATION_ERROR_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 fn authorization_override(
@@ -137,6 +138,34 @@ impl GeminiProvider {
     pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
         self.compat = compat;
         self
+    }
+
+    /// Rebuild a Developer API request without re-running extension hooks or
+    /// resolving credentials again when one staged file needs replacement.
+    fn developer_request(
+        &self,
+        url: &str,
+        options: &StreamOptions,
+        fallback_api_key: Option<&str>,
+    ) -> RequestBuilder<'_> {
+        let mut request = self.client.post(url).header("Accept", "text/event-stream");
+        if let Some(key) = fallback_api_key {
+            request = request.header("x-goog-api-key", key);
+        }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-goog-api-key"],
+            );
+        }
+        super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization", "x-goog-api-key"],
+        )
     }
 
     /// Build the streaming URL.
@@ -306,10 +335,9 @@ impl Provider for GeminiProvider {
         let request_body = reasoning::prepare_request(&self.model, options, &request_body)?;
         let url = self.streaming_url();
 
-        // Build request (Content-Type set by .json() below)
-        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
-
         if self.google_cli_mode {
+            // Content-Type is set by .json() below.
+            let mut request = self.client.post(&url).header("Accept", "text/event-stream");
             let api_payload = options.api_key.clone().ok_or_else(|| {
                 Error::provider(
                     self.name(),
@@ -438,27 +466,6 @@ impl Provider for GeminiProvider {
 
         let upload_auth =
             files::UploadAuth::for_request(options, self.compat.as_ref(), auth_value.as_deref());
-        if let Some(auth_value) = auth_value {
-            request = request.header("x-goog-api-key", &auth_value);
-        }
-
-        // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat
-            && let Some(custom_headers) = &compat.custom_headers
-        {
-            request = super::apply_headers_ignoring_blank_auth_overrides(
-                request,
-                custom_headers,
-                &["authorization", "x-goog-api-key"],
-            );
-        }
-
-        // Per-request headers from StreamOptions (highest priority).
-        request = super::apply_headers_ignoring_blank_auth_overrides(
-            request,
-            &options.headers,
-            &["authorization", "x-goog-api-key"],
-        );
 
         let rewritten_body = super::offer_before_provider_request(
             options,
@@ -475,25 +482,44 @@ impl Provider for GeminiProvider {
         // Stage the final payload after extension rewrites. Session originals
         // stay inline and portable; remote file URIs are transport-only state.
         // Cloud Code Assist returned above; Vertex uses its separate provider.
-        Box::pin(
+        let mut prepared = Box::pin(
             self.files
                 .prepare(&self.client, &self.base_url, &upload_auth, &mut body),
         )
         .await?;
-        let request = request.json(&body)?;
-
-        let response = Box::pin(request.send()).await?;
-        let status = response.status();
-        if !(200..300).contains(&status) {
-            let body = response
-                .text()
+        let response = loop {
+            let request = self
+                .developer_request(&url, options, auth_value.as_deref())
+                .json(&body)?;
+            let response = Box::pin(request.send()).await?;
+            let status = response.status();
+            if (200..300).contains(&status) {
+                break response;
+            }
+            let error_body = response
+                .text_limited(MAX_GENERATION_ERROR_BYTES)
                 .await
-                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+                .unwrap_or_else(|_| "<failed to read bounded error body>".to_string());
+            // Recovery owns a single retry, and confirms stale Pi-staged file
+            // resources before changing the request. Once an SSE response is
+            // accepted, stream failures retain the normal agent retry policy.
+            if let Some(prepared) = prepared.as_mut()
+                && Box::pin(prepared.recover(
+                    &self.client,
+                    &upload_auth,
+                    &mut body,
+                    status,
+                    &error_body,
+                ))
+                .await?
+            {
+                continue;
+            }
             return Err(Error::provider(
                 self.name(),
-                format!("Gemini API error (HTTP {status}): {body}"),
+                format!("Gemini API error (HTTP {status}): {error_body}"),
             ));
-        }
+        };
 
         // Create SSE stream for streaming responses.
         let event_source = SseStream::new(response.bytes_stream());
