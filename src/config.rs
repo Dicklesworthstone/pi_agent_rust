@@ -609,7 +609,8 @@ pub struct BashSettings {
 /// `off` (default while experimental, omp's setting-gated posture) |
 /// `local` (per-project SQLite+FTS5 bank with
 /// retain/recall/reflect/memory_edit tools and a mental-model block on the
-/// first turn) | `cass` (reserved, not yet implemented).
+/// first turn) | `cass` (the local bank plus optional, read-only CASS
+/// history search scoped to the project).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemorySettings {
@@ -1083,7 +1084,7 @@ impl Config {
     }
 
     /// Memory backend (bd-cv653.4.1): `off` (default while experimental) |
-    /// `local` | `cass` (reserved). Unknown values degrade to off.
+    /// `local` | `cass` (local bank plus history). Unknown values degrade to off.
     pub fn memory_backend(&self) -> &str {
         match self
             .memory

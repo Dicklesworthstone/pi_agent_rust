@@ -213,6 +213,16 @@ pub trait Tool: Send + Sync {
         ToolEffects::write()
     }
 
+    /// Declare the effects of this invocation for execution and approval gates.
+    ///
+    /// Input-aware tools may narrow their coarse declaration only for branches
+    /// that cannot perform the stronger effects. Malformed inputs must retain
+    /// a conservative declaration. Ordinary tools keep their existing effects.
+    #[must_use]
+    fn effects_for_input(&self, _input: &serde_json::Value) -> ToolEffects {
+        self.effects()
+    }
+
     /// Attach the owning registry's live background-job session scope.
     /// Non-job tools intentionally ignore it.
     fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
@@ -5456,7 +5466,7 @@ pub struct ToolRegistry {
 }
 
 /// How the memory-bank tools are turned on, quoted in the `--tools` warning.
-const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" in settings.json";
+const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" or \"cass\" in settings.json";
 
 /// The requested tool names pi does not provide at all.
 ///
@@ -5781,9 +5791,9 @@ impl ToolRegistry {
         }
 
         // Memory bank (bd-cv653.4.1): retain/recall/reflect/memory_edit join
-        // the active set only when `memory.backend: local`; off (default)
-        // keeps them absent from the model's tool list entirely.
-        if config.is_some_and(|cfg| cfg.memory_backend() == "local")
+        // the active set with local or cass; cass adds read-only history to
+        // recall while retaining the local bank. Off keeps these tools absent.
+        if config.is_some_and(|cfg| matches!(cfg.memory_backend(), "local" | "cass"))
             && let Ok(store) = crate::memory::MemoryStore::open(cwd)
         {
             let store = std::sync::Arc::new(
@@ -5792,9 +5802,10 @@ impl ToolRegistry {
             tools.push(Box::new(crate::memory::RetainTool::new(
                 std::sync::Arc::clone(&store),
             )));
-            tools.push(Box::new(crate::memory::RecallTool::new(
-                std::sync::Arc::clone(&store),
-            )));
+            tools.push(Box::new(
+                crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
+                    .with_cass_history(config.is_some_and(|cfg| cfg.memory_backend() == "cass")),
+            ));
             tools.push(Box::new(
                 crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
                     .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),

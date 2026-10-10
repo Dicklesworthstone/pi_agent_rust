@@ -5712,10 +5712,7 @@ impl Agent {
                     .execute_with_auxiliary_privacy(&tool_call.id, inner_args, None, &protect)
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                output.details = Some(json!({
-                    "dispatchedVia": "xdev",
-                    "tool": name,
-                }));
+                output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
                 Some(output)
             }
             "promote" => {
@@ -5761,10 +5758,27 @@ impl Agent {
         }
     }
 
+    fn xdev_dispatch_details(name: &str, original: Option<Value>) -> Value {
+        let mut details = match original {
+            Some(Value::Object(fields))
+                if !fields.contains_key("dispatchedVia") && !fields.contains_key("tool") =>
+            {
+                fields
+            }
+            // Preserve non-object details and objects owning reserved routing
+            // keys intact, including any pre-existing resultDetails field.
+            Some(value) => serde_json::Map::from_iter([("resultDetails".to_string(), value)]),
+            None => serde_json::Map::new(),
+        };
+        details.insert("dispatchedVia".to_string(), json!("xdev"));
+        details.insert("tool".to_string(), json!(name));
+        Value::Object(details)
+    }
+
     /// Effective side effects for a tool call (bd-cv653.3.5): for `xdev run`
-    /// dispatches, the INNER tool's effects decide (read-only runs stay
-    /// allowed in plan mode); unknown names default to read-only here — the
-    /// not-found path produces its own error downstream.
+    /// dispatches, the INNER tool's actual arguments decide (read-only runs
+    /// stay allowed in plan mode). Unknown names default to read-only here;
+    /// the not-found path produces its own error downstream.
     fn effects_for_call(&self, tool_call: &ToolCall) -> crate::tools::ToolEffects {
         if tool_call.name == "xdev" {
             let action = tool_call
@@ -5780,16 +5794,24 @@ impl Agent {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // Match dispatch_xdev's default input exactly. Non-object inputs
+            // reach the tool unchanged so its conservative validation applies.
+            let default_args = json!({});
+            let inner_args = tool_call.arguments.get("args").unwrap_or(&default_args);
             return self
                 .tools
                 .snapshot()
                 .get(inner)
-                .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects);
+                .map_or_else(crate::tools::ToolEffects::read, |tool| {
+                    tool.effects_for_input(inner_args)
+                });
         }
         self.tools
             .snapshot()
             .get(&tool_call.name)
-            .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects)
+            .map_or_else(crate::tools::ToolEffects::read, |tool| {
+                tool.effects_for_input(&tool_call.arguments)
+            })
     }
 
     async fn execute_tool_without_hooks(
@@ -23155,7 +23177,174 @@ mod tests {
         assert!(full_registry.get("xdev").is_some(), "xdev auto-registered");
     }
 
+    #[test]
+    fn xdev_dispatch_preserves_result_details_without_routing_key_collisions() {
+        let original = json!({
+            "schema": "pi.memory.v1",
+            "memories": [{"id": 7}],
+            "history": {"status": "unavailable", "diagnostic": "CASS_NOT_INSTALLED"},
+            "resultDetails": {"existing": true}
+        });
+        let details = Agent::xdev_dispatch_details("recall", Some(original.clone()));
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(details.get(key), Some(value));
+        }
+        assert_eq!(details["dispatchedVia"], "xdev");
+        assert_eq!(details["tool"], "recall");
+
+        for original in [
+            Value::Null,
+            json!(42),
+            json!(["evidence"]),
+            json!("plain metadata"),
+            json!({"tool": "inner-tool", "resultDetails": {"existing": true}}),
+            json!({"dispatchedVia": "original-route", "history": {"status": "completed"}}),
+        ] {
+            let details = Agent::xdev_dispatch_details("recall", Some(original.clone()));
+            assert_eq!(details["resultDetails"], original);
+            assert_eq!(details["dispatchedVia"], "xdev");
+            assert_eq!(details["tool"], "recall");
+        }
+        assert_eq!(
+            Agent::xdev_dispatch_details("recall", None),
+            json!({"dispatchedVia": "xdev", "tool": "recall"})
+        );
+    }
+
     // === Plan mode (bd-cv653.3.5) ===
+
+    fn cass_recall_plan_test_agent(cwd: &Path, through_xdev: bool) -> Agent {
+        let config: crate::config::Config =
+            serde_json::from_value(json!({"memory": {"backend": "cass"}})).unwrap();
+        let mut tools = ToolRegistry::new(&[], cwd, Some(&config));
+        assert!(tools.is_discoverable("recall"));
+        if !through_xdev {
+            tools.mark_promoted("recall");
+        }
+        tools.bind_job_session_resolver(Arc::new(|| {
+            Box::pin(async { Some("cass-plan-owner".to_string()) })
+        }));
+        let store = Arc::new(crate::memory::MemoryStore::open(cwd).unwrap());
+        store
+            .retain(
+                crate::memory::MemoryKind::Fact,
+                "parser fact available while planning",
+                &[],
+                None,
+            )
+            .unwrap();
+        crate::memory::shared::SharedMemoryStore::new(store, "cass-plan-owner")
+            .unwrap()
+            .write("handoff", "exact planning handoff", None)
+            .unwrap();
+        let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+        agent.plan_state().enter_planning();
+        agent
+    }
+
+    #[test]
+    fn plan_gate_cass_recall_keeps_history_and_malformed_inputs_behind_process_barrier() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for through_xdev in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let agent = cass_recall_plan_test_agent(root.path(), through_xdev);
+                for input in [
+                    None,
+                    Some(json!({"query": "parser"})),
+                    Some(json!({"query": "parser", "includeHistory": true})),
+                    Some(json!({"query": "parser", "includeHistory": null})),
+                    Some(json!({"query": "parser", "includeHistory": "false"})),
+                    Some(Value::Null),
+                    Some(json!([{"includeHistory": false}])),
+                ] {
+                    let call = if through_xdev {
+                        let mut call = xdev_call("run", Some("recall"), input);
+                        // Outer dispatcher fields cannot suppress the inner
+                        // invocation's process effect or impersonate its scope.
+                        call.arguments["includeHistory"] = json!(false);
+                        call.arguments["scope"] = json!("session");
+                        call
+                    } else {
+                        ToolCall {
+                            id: "cass-blocked".to_string(),
+                            name: "recall".to_string(),
+                            arguments: input.unwrap_or_else(|| json!({})),
+                            thought_signature: None,
+                        }
+                    };
+                    let effects = agent.effects_for_call(&call);
+                    assert!(effects.processes(), "history input: {:?}", call.arguments);
+                    assert!(!agent.plan_state().allows_effects(effects));
+                    // Verify the real gate only after the effect assertions;
+                    // this test never dispatches a CASS search.
+                    let (output, is_error) = agent
+                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                        .await;
+                    assert!(is_error);
+                    let ContentBlock::Text(text) = &output.content[0] else {
+                        panic!("plan gate must return an explanation");
+                    };
+                    assert!(text.text.contains("PLAN_MODE_BLOCKED"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn plan_gate_allows_local_and_shared_recall_directly_and_through_xdev() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for through_xdev in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let agent = cass_recall_plan_test_agent(root.path(), through_xdev);
+                for (input, expected_text, details_key) in [
+                    (
+                        json!({"query": "parser", "includeHistory": false}),
+                        "parser fact available while planning",
+                        "memories",
+                    ),
+                    (
+                        json!({"scope": "session", "key": "handoff"}),
+                        "exact planning handoff",
+                        "value",
+                    ),
+                    (
+                        json!({"scope": "session", "limit": 1}),
+                        "handoff",
+                        "entries",
+                    ),
+                ] {
+                    let call = if through_xdev {
+                        xdev_call("run", Some("recall"), Some(input))
+                    } else {
+                        ToolCall {
+                            id: "cass-read-only".to_string(),
+                            name: "recall".to_string(),
+                            arguments: input,
+                            thought_signature: None,
+                        }
+                    };
+                    assert_eq!(agent.effects_for_call(&call), ToolEffects::read());
+                    let (output, is_error) = agent
+                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                        .await;
+                    assert!(!is_error, "read-only recall failed: {:?}", output.content);
+                    let ContentBlock::Text(text) = &output.content[0] else {
+                        panic!("recall must return readable results");
+                    };
+                    assert!(text.text.contains(expected_text));
+                    let details = output.details.unwrap();
+                    assert!(details.get(details_key).is_some());
+                    assert!(details.get("history").is_none());
+                    if through_xdev {
+                        assert_eq!(details["dispatchedVia"], "xdev");
+                        assert_eq!(details["tool"], "recall");
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     fn plan_gate_blocks_mutation_and_allows_reads() {

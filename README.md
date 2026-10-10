@@ -408,7 +408,7 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
   `xdev list/describe/run/promote`): `ast_grep`, `ast_edit`, `lsp`,
   `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
   `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
-  `local`
+  `local` or `cass` (local memory plus read-only project history)
 - **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
   service supervision), alongside the essential tier. The default `--tools`
   list names 19 tools; the registry always adds `manage_skill` and, when any

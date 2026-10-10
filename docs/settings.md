@@ -207,6 +207,38 @@ project-scoped SQLite memory bank, its `retain`, `recall`, `reflect`,
 }
 ```
 
+Set it to `"cass"` to keep those same local features and also search the
+project's historical agent sessions during `recall`:
+
+```json
+{
+  "memory": { "backend": "cass" }
+}
+```
+
+CASS history is optional and currently supported on Unix. It uses the
+installed `cass` executable with lexical search and index maintenance
+disabled. A recent CASS version supporting `--no-maintenance` is required.
+Pi does not install CASS or build, repair, or refresh its index. Missing,
+incompatible, busy, or unavailable archives leave local memory usable;
+the recall result distinguishes unavailable history from an empty search.
+
+History search stays within the canonical project workspace and adds up to
+20 excerpts with source paths, line numbers, agent names, and provenance.
+These appear separately from durable memory IDs in the tool's `history`
+details and use `[cass:N]` citations in its text. Archive hits are not
+automatically retained or injected at startup. `/memory` continues to show
+the local bank, and `scope: "session"` reads never query CASS.
+For project recall, `includeHistory: false` requests only the local bank.
+This option and exact session reads remain available in plan mode; history
+search requires the usual process permission.
+
+Pi screens complete archived messages before making 2 KiB excerpts. It
+rejects partial archive content, limits combined subprocess output to
+256 KiB and accepted history text to 64 KiB, and uses a five-second process
+deadline. Queries over 4 KiB, excessive output, and timeouts produce a
+history status while preserving local results. Cancellation aborts recall.
+
 Project facts, tags, edited memories, and learned skills use the shared
 credential detector, including `secrets.extra_patterns`. Detected values
 are replaced with irreversible `[REDACTED_*]` markers before storage and

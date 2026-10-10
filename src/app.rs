@@ -251,7 +251,7 @@ pub fn build_system_prompt(
     // project's top active facts/lessons on the first turn. Appended (never
     // inserted mid-history) so provider prompt caches stay valid.
     if !test_mode
-        && config.memory_backend() == "local"
+        && matches!(config.memory_backend(), "local" | "cass")
         && let Ok(store) = crate::memory::MemoryStore::open(cwd)
         && let Ok(model) = store
             .with_secrets_settings(config.secrets.as_ref())

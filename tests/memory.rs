@@ -11,7 +11,7 @@ use clap::Parser;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::provider::StreamOptions;
-use pi::tools::{Tool, ToolOutput, ToolRegistry};
+use pi::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -61,6 +61,24 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("failed to build test runtime");
     runtime.block_on(future)
+}
+
+fn block_on_with_io_only<F: std::future::Future>(future: F) -> F::Output {
+    type IoOnly = asupersync::cx::cap::CapSet<false, false, false, true, false>;
+
+    let mut future = std::pin::pin!(future);
+    block_on_local(std::future::poll_fn(|task_cx| {
+        let owner = asupersync::Cx::current().expect("runtime context");
+        // The restriction lasts for one poll, so no TLS authority survives
+        // Pending or changes the context used to poll another task.
+        let _guard = owner.restrict::<IoOnly>().set_current_restricted();
+        let capabilities = asupersync::Cx::current()
+            .expect("restricted context")
+            .capabilities();
+        assert!(capabilities.io);
+        assert!(!capabilities.spawn && !capabilities.time);
+        std::future::Future::poll(future.as_mut(), task_cx)
+    }))
 }
 
 fn project_dir(harness: &TestHarness, name: &str) -> std::path::PathBuf {
@@ -361,20 +379,50 @@ fn backend_gate_controls_tool_presence() {
     let case = "backend_gate_controls_tool_presence";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-    let local = ToolRegistry::new(&["read"], &root, Some(&memory_config("local")));
-    let local_names: Vec<&str> = local.tools().iter().map(|tool| tool.name()).collect();
-    harness
-        .log()
-        .info("verify", format!("local tools: {local_names:?}"));
-    for expected in ["retain", "recall", "reflect", "memory_edit"] {
-        assert!(
-            local_names.contains(&expected),
-            "backend=local must expose {expected}: {local_names:?}"
+    for backend in ["local", "cass"] {
+        let registry = ToolRegistry::new(&["read"], &root, Some(&memory_config(backend)));
+        let names: Vec<&str> = registry.tools().iter().map(|tool| tool.name()).collect();
+        harness
+            .log()
+            .info("verify", format!("{backend} tools: {names:?}"));
+        for expected in ["retain", "recall", "reflect", "memory_edit", "learn"] {
+            assert_eq!(
+                names.iter().filter(|name| **name == expected).count(),
+                1,
+                "backend={backend} must expose {expected} once: {names:?}"
+            );
+        }
+        let recall = registry
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "recall")
+            .unwrap();
+        let expected_effects = if backend == "cass" {
+            ToolEffects::read().union(ToolEffects::process())
+        } else {
+            ToolEffects::read()
+        };
+        assert_eq!(recall.effects(), expected_effects, "backend={backend}");
+        assert_eq!(recall.effects().parallel_safe(), backend == "local");
+        assert_eq!(
+            recall.effects_for_input(&json!({"query":"parser"})),
+            expected_effects
         );
+        assert_eq!(
+            recall.effects_for_input(&json!({"query":"parser", "includeHistory":true})),
+            expected_effects
+        );
+        for input in [
+            json!({"query":"parser", "includeHistory":false}),
+            json!({"scope":"session", "key":"handoff"}),
+            json!({"scope":"session", "prefix":"hand"}),
+        ] {
+            assert_eq!(recall.effects_for_input(&input), ToolEffects::read());
+        }
     }
     let off = ToolRegistry::new(&["read"], &root, Some(&memory_config("off")));
     let off_names: Vec<&str> = off.tools().iter().map(|tool| tool.name()).collect();
-    for absent in ["retain", "recall", "reflect", "memory_edit"] {
+    for absent in ["retain", "recall", "reflect", "memory_edit", "learn"] {
         assert!(
             !off_names.contains(&absent),
             "backend=off must hide {absent}: {off_names:?}"
@@ -382,10 +430,205 @@ fn backend_gate_controls_tool_presence() {
     }
     let default = ToolRegistry::new(&["read"], &root, None::<&pi::config::Config>);
     let default_names: Vec<&str> = default.tools().iter().map(|tool| tool.name()).collect();
-    assert!(
-        !default_names.contains(&"retain"),
-        "default posture must be off: {default_names:?}"
+    for absent in ["retain", "recall", "reflect", "memory_edit", "learn"] {
+        assert!(
+            !default_names.contains(&absent),
+            "default posture must hide {absent}: {default_names:?}"
+        );
+    }
+    finish_case(&harness, case);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cass_registry_preserves_local_operations_when_history_has_no_process_authority() {
+    let case = "cass_registry_preserves_local_operations_when_history_has_no_process_authority";
+    let harness = TestHarness::new(case);
+    let root = project_dir(&harness, "proj");
+    let mut config = memory_config("cass");
+    config.secrets = Some(pi::secrets::SecretsSettings {
+        mode: Some("off".to_string()),
+        extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+    });
+    let registry = ToolRegistry::new(&["read"], &root, Some(&config));
+    let run = |name: &str, input: Value| {
+        let tool = registry
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == name)
+            .expect("Cass backend memory tool");
+        let output = block_on_with_io_only(tool.execute("cass-local", input, None))
+            .expect("local memory remains available");
+        assert!(!output.is_error, "{output:?}");
+        output
+    };
+    let retained = run(
+        "retain",
+        json!({"content":"parser initially uses ACME-123456"}),
     );
+    let id = retained.details.as_ref().unwrap()["id"].as_i64().unwrap();
+    run(
+        "memory_edit",
+        json!({"id":id, "op":"update", "content":"parser now uses ACME-222222"}),
+    );
+    let learned = run("learn", json!({"lesson":"parser lessons use ACME-333333"}));
+    let lesson_id = learned.details.as_ref().unwrap()["memory"]["id"]
+        .as_i64()
+        .unwrap();
+    let recalled = run("recall", json!({"query":"parser"}));
+    let details = recalled.details.as_ref().unwrap();
+    let memories = details["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 2);
+    assert!(memories.iter().any(|memory| memory["id"] == id));
+    assert!(memories.iter().any(|memory| memory["id"] == lesson_id));
+    assert!(first_text(&recalled).contains("parser now uses [REDACTED_USER_PATTERN]"));
+    assert!(first_text(&recalled).contains("local memory remains available"));
+    let history = &details["history"];
+    assert_eq!(history["hits"], json!([]));
+    assert_eq!(history["truncated"], false);
+    if cfg!(unix) {
+        assert_eq!(history["status"], "unavailable");
+        assert_eq!(history["diagnostic"], "CASS_CAPABILITY_UNAVAILABLE");
+    } else {
+        assert_eq!(history["status"], "unsupported");
+        assert_eq!(history["diagnostic"], "CASS_PLATFORM_UNSUPPORTED");
+    }
+    let serialized = serde_json::to_string(details).unwrap();
+    for secret in ["ACME-123456", "ACME-222222", "ACME-333333"] {
+        assert!(!serialized.contains(secret));
+        assert!(!first_text(&recalled).contains(secret));
+    }
+
+    let empty = run("recall", json!({"query":"no_matching_project_memory"}));
+    assert_eq!(empty.details.as_ref().unwrap()["memories"], json!([]));
+    assert_eq!(empty.details.as_ref().unwrap()["history"], *history);
+    let without_history = run("recall", json!({"query":"parser", "includeHistory":false}));
+    assert!(
+        without_history
+            .details
+            .as_ref()
+            .unwrap()
+            .get("history")
+            .is_none()
+    );
+    assert_eq!(
+        without_history.details.as_ref().unwrap()["memories"],
+        details["memories"]
+    );
+    assert!(!first_text(&without_history).contains("CASS"));
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    assert_eq!(
+        store.list(10).unwrap().len(),
+        2,
+        "recall must not retain history"
+    );
+    let local = pi::memory::RecallTool::new(store)
+        .with_cass_history(true)
+        .with_cass_history(false);
+    assert_eq!(local.effects(), ToolEffects::read());
+    let local =
+        block_on_with_io_only(local.execute("local", json!({"query":"parser"}), None)).unwrap();
+    assert!(!local.is_error);
+    assert!(local.details.as_ref().unwrap().get("history").is_none());
+    assert_eq!(
+        local.details.as_ref().unwrap()["memories"],
+        details["memories"]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cass_recall_preserves_exact_session_values_and_excludes_them_from_project_history() {
+    let case = "cass_recall_preserves_exact_session_values_and_excludes_them_from_project_history";
+    let harness = TestHarness::new(case);
+    let root = project_dir(&harness, "proj");
+    let settings = pi::secrets::SecretsSettings {
+        mode: Some("off".to_string()),
+        extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+    };
+    let store = Arc::new(
+        pi::memory::MemoryStore::open(&root)
+            .unwrap()
+            .with_secrets_settings(Some(&settings)),
+    );
+    store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "projectonly parser fact",
+            &[],
+            None,
+        )
+        .unwrap();
+    let scope = pi::jobs::JobSessionScope::fixed("cass-session-a");
+    let mut retain = pi::memory::RetainTool::new(Arc::clone(&store));
+    let mut cass = pi::memory::RecallTool::new(Arc::clone(&store)).with_cass_history(true);
+    let mut local = pi::memory::RecallTool::new(Arc::clone(&store));
+    retain.bind_job_session_scope(scope.clone());
+    cass.bind_job_session_scope(scope.clone());
+    local.bind_job_session_scope(scope);
+    let exact = "handoff session credential ACME-456789";
+    let written = block_on_with_io_only(retain.execute(
+        "session-write",
+        json!({"scope":"session", "key":"handoff", "content":exact}),
+        None,
+    ))
+    .unwrap();
+    assert!(!written.is_error);
+    for input in [
+        json!({"scope":"session", "key":"handoff"}),
+        json!({"scope":"session", "prefix":"hand"}),
+    ] {
+        let output =
+            block_on_with_io_only(cass.execute("session-read", input.clone(), None)).unwrap();
+        let baseline =
+            block_on_with_io_only(local.execute("session-baseline", input, None)).unwrap();
+        assert!(!output.is_error);
+        assert_eq!(first_text(&output), first_text(&baseline));
+        assert_eq!(output.details, baseline.details);
+        let details = output.details.as_ref().unwrap();
+        assert_eq!(details["schema"], pi::memory::shared::SHARED_MEMORY_SCHEMA);
+        assert!(details.get("history").is_none());
+        assert!(details.get("memories").is_none());
+        assert!(serde_json::to_string(details).unwrap().contains(exact));
+    }
+    let project = block_on_with_io_only(cass.execute(
+        "project-search",
+        json!({"query":"handoff"}),
+        None,
+    ))
+    .unwrap();
+    assert!(!project.is_error);
+    assert_eq!(project.details.as_ref().unwrap()["memories"], json!([]));
+    assert!(
+        project.details.as_ref().unwrap()["history"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !serde_json::to_string(&project.details)
+            .unwrap()
+            .contains(exact)
+    );
+    assert_eq!(store.list(10).unwrap().len(), 1);
+    assert!(!store.mental_model().unwrap().contains("handoff"));
+
+    cass.bind_job_session_scope(pi::jobs::JobSessionScope::fixed("cass-session-b"));
+    let missing = block_on_with_io_only(cass.execute(
+        "other-session",
+        json!({"scope":"session", "key":"handoff"}),
+        None,
+    ))
+    .unwrap_err();
+    assert!(missing.to_string().contains("PI_SHARED_MEMORY_NOT_FOUND"));
+    let injected = block_on_with_io_only(cass.execute(
+        "forged-session",
+        json!({"scope":"session", "sessionId":"cass-session-a", "key":"handoff"}),
+        None,
+    ))
+    .unwrap_err();
+    assert!(injected.to_string().contains("PI_SHARED_MEMORY_INVALID_INPUT"));
     finish_case(&harness, case);
 }
 
@@ -787,35 +1030,44 @@ fn cross_instance_persistence_and_tombstones() {
 }
 
 #[test]
-fn startup_injection_includes_mental_model_when_local() {
-    let case = "startup_injection_includes_mental_model_when_local";
+fn startup_injection_includes_mental_model_for_local_and_cass() {
+    let case = "startup_injection_includes_mental_model_for_local_and_cass";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
     let store = pi::memory::MemoryStore::open(&root).expect("open");
     store
         .retain(
             pi::memory::MemoryKind::Decision,
-            "chose fsqlite over rusqlite for the store",
+            "chose fsqlite over rusqlite for the store; access uses ACME-123456",
             &[],
             None,
         )
         .expect("retain");
-    let prompt = build_prompt_for_test(&root, &memory_config("local"));
-    harness.log().info(
-        "verify",
-        format!(
-            "prompt contains memory block: {}",
-            prompt.contains("Project Memory")
-        ),
-    );
-    assert!(
-        prompt.contains("Project Memory"),
-        "backend=local must inject the mental model"
-    );
-    assert!(
-        prompt.contains("fsqlite over rusqlite"),
-        "mental model must carry the retained decision"
-    );
+    for backend in ["local", "cass"] {
+        let mut config = memory_config(backend);
+        config.secrets = Some(pi::secrets::SecretsSettings {
+            mode: Some("off".to_string()),
+            extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+        });
+        let prompt = build_prompt_for_test(&root, &config);
+        harness.log().info(
+            "verify",
+            format!(
+                "{backend} prompt contains memory block: {}",
+                prompt.contains("Project Memory")
+            ),
+        );
+        assert!(
+            prompt.contains("Project Memory"),
+            "backend={backend} must inject the mental model"
+        );
+        assert!(
+            prompt.contains("fsqlite over rusqlite"),
+            "mental model must carry the retained decision"
+        );
+        assert!(prompt.contains("[REDACTED_USER_PATTERN]"));
+        assert!(!prompt.contains("ACME-123456"));
+    }
     let off_prompt = build_prompt_for_test(&root, &memory_config("off"));
     assert!(
         !off_prompt.contains("Project Memory"),
