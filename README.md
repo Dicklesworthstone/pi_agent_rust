@@ -536,6 +536,31 @@ Because `/tan` inherits the delegation safety gate, it is available only when
 the opt-in `subagent` tool is enabled. It captures the same model precedence when
 the command is submitted, so a later parent model switch does not retarget it.
 
+Native children include `hub` in their default tool set and can exchange messages
+with other children of the same parent Pi process. Agent definitions with an
+explicit tool allowlist must include `hub` to enable this capability. A child's
+`hub` call with `{"op":"agent","action":"roster"}` returns its authenticated
+`selfId` and the parent's child roster. Use those run IDs as recipients:
+
+```json
+{"op":"agent","action":"send","name":"receiver-1","text":"The parser change is ready."}
+{"op":"agent","action":"inbox"}
+{"op":"agent","action":"send","name":"parent","text":"I found a blocking dependency."}
+```
+
+Sibling messages enter the recipient's steering queue between turns and remain
+available in its inbox. The parent reads child reports with
+`{"op":"agent","action":"inbox","name":"parent"}`. Inbox pages return
+`nextCursor`, `hasMore`, and `oldestCursor`; pass `nextCursor` as
+`cursor` to request later messages. Each recipient retains its latest 64
+messages, so clients can use `oldestCursor` to detect that earlier messages
+have fallen outside retention.
+
+The parent authenticates the child's sender identity. Children can read their
+own inbox, list peers, and send to a live sibling or the parent; transcript,
+steering, kill, and revival controls remain on the parent surface. The local
+connection closes when its owning child run ends or is cancelled.
+
 ### Session Management
 
 Sessions persist as JSONL files with full conversation history:

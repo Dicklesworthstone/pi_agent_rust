@@ -8921,7 +8921,7 @@ struct HubInput {
     ready: Option<HubReadyInput>,
     /// Survive session exit (state file re-discovery).
     detached: Option<bool>,
-    /// `logs`: opaque cursor from a previous page (incremental read).
+    /// `logs` or `agent inbox`: opaque cursor from a previous page.
     cursor: Option<u64>,
     /// `logs`: last N lines (snapshot read).
     tail: Option<usize>,
@@ -8942,7 +8942,7 @@ struct HubInput {
     action: Option<String>,
     /// `jobs`: job id for wait/cancel.
     job_id: Option<String>,
-    /// `agent steer|send`: sender label recorded on the bus message.
+    /// `agent steer|send`: parent label, or the authenticated child's own run id.
     from: Option<String>,
     /// `jobs`: wait budget in milliseconds.
     timeout_ms: Option<u64>,
@@ -8999,7 +8999,10 @@ impl Tool for HubTool {
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
          roster/transcript/steer/kill/revive/send/inbox; revive executes a \
          settled native child's original assignment with its retained launch \
-         policy and transcript context, and waits for the replacement result)."
+         policy and transcript context, and waits for the replacement result). \
+         Native children use agent roster/send/inbox to reach their parent's hub; \
+         roster returns selfId, send accepts a live sibling id or parent, and inbox \
+         defaults to the caller. Include hub in a child's declared tools to enable messaging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -9011,7 +9014,7 @@ impl Tool for HubTool {
                     "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
                     "description": "Operation"
                 },
-                "name": { "type": "string", "description": "Service name (unique per project)" },
+                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox; a child inbox defaults to itself" },
                 "application": { "type": "string", "description": "Program to spawn (start)" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
                 "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
@@ -9026,7 +9029,7 @@ impl Tool for HubTool {
                     "description": "Readiness gates; all supplied gates must pass"
                 },
                 "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
-                "cursor": { "type": "integer", "description": "logs: opaque cursor for incremental reads" },
+                "cursor": { "type": "integer", "description": "logs or agent inbox: nextCursor from the preceding page" },
                 "tail": { "type": "integer", "description": "logs: last N lines" },
                 "grep": { "type": "string", "description": "logs: substring filter" },
                 "waitMs": { "type": "integer", "description": "logs: bounded wait in ms (max 60000)" },
@@ -9035,7 +9038,7 @@ impl Tool for HubTool {
                 "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
                 "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
                 "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox" },
-                "from": { "type": "string", "description": "agent steer/send: sender label recorded on the bus message" },
+                "from": { "type": "string", "description": "agent steer/send: parent sender label; native children may only identify themselves" },
                 "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
                 "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
             },
@@ -9062,6 +9065,10 @@ impl Tool for HubTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
         let dispatched = if op == "agent"
+            && crate::agent_hub::ipc::inherited_channel_present()
+        {
+            Self::dispatch_inherited_agent(&input).await
+        } else if op == "agent"
             && input
                 .action
                 .as_deref()
@@ -9098,6 +9105,118 @@ impl Tool for HubTool {
 }
 
 impl HubTool {
+    async fn dispatch_inherited_agent(input: &HubInput) -> Result<ToolOutput> {
+        use crate::agent_hub::ipc::{Action, Request, call_from_env};
+
+        let action = input.action.as_deref().unwrap_or("roster").trim();
+        let action = if action.eq_ignore_ascii_case("roster") {
+            Action::Roster
+        } else if action.eq_ignore_ascii_case("send") {
+            Action::Send
+        } else if action.eq_ignore_ascii_case("inbox") {
+            Action::Inbox
+        } else {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_IPC_ACTION: a native child may only use agent roster, send, or inbox",
+            ));
+        };
+        let reply = call_from_env(Request {
+            action,
+            name: input.name.clone(),
+            text: input.text.clone(),
+            claimed_from: input.from.clone(),
+            cursor: input.cursor,
+        })
+        .await?
+        .ok_or_else(|| {
+            Error::tool("hub", "PI_HUB_IPC_CONFIG: inherited channel is unavailable")
+        })?;
+        let (text, details) = Self::format_agent_reply(reply);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn format_agent_reply(
+        reply: crate::agent_hub::ipc::Reply,
+    ) -> (String, serde_json::Value) {
+        use crate::agent_hub::ipc::Reply;
+
+        match reply {
+            Reply::Roster {
+                self_id,
+                children,
+                truncated,
+            } => {
+                let lines = children
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} [{} kind={}] {}",
+                            entry.id,
+                            entry.status.as_str(),
+                            entry.kind.as_str(),
+                            entry.task,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut text = format!(
+                    "You are {self_id}. {} child run(s):\n{}",
+                    children.len(),
+                    lines.join("\n"),
+                );
+                if truncated {
+                    text.push_str("\n[Roster exceeds the response limit; showing a bounded prefix.]");
+                }
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.roster/v1",
+                    "selfId": self_id,
+                    "children": children,
+                    "truncated": truncated,
+                });
+                (text, details)
+            }
+            Reply::Sent { message } => {
+                let text = format!(
+                    "Message queued for {} (seq {}).",
+                    message.to, message.seq,
+                );
+                (text, serde_json::json!(message))
+            }
+            Reply::Inbox {
+                id,
+                messages,
+                next_cursor,
+                has_more,
+                oldest_cursor,
+            } => {
+                let text = if messages.is_empty() {
+                    format!("{id}: inbox empty.")
+                } else {
+                    let lines = messages
+                        .iter()
+                        .map(|message| {
+                            format!("#{} from {}: {}", message.seq, message.from, message.body)
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
+                };
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.inbox/v1",
+                    "id": id,
+                    "messages": messages,
+                    "nextCursor": next_cursor,
+                    "hasMore": has_more,
+                    "oldestCursor": oldest_cursor,
+                });
+                (text, details)
+            }
+        }
+    }
+
     fn append_log_capture_notice(text: &mut String, capture: &crate::hub::LogCapture) {
         if capture.truncated {
             let _ = write!(
@@ -9483,15 +9602,25 @@ impl HubTool {
                     .ok_or_else(|| {
                         Error::validation(format!("hub agent {action} requires text"))
                     })?;
-                let message = crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .steer(&id, &from, &body)?;
-                let details = serde_json::to_value(&message)?;
-                (
-                    format!("Steering queued for {id} (seq {}).", message.seq),
-                    details,
-                )
+                let message = {
+                    let mut registry = crate::agent_hub::registry()
+                        .lock()
+                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+                    if action == "send" {
+                        registry.bus_send(&id, &from, &body)?
+                    } else {
+                        registry.steer(&id, &from, &body)?
+                    }
+                };
+                if action == "send" {
+                    Self::format_agent_reply(crate::agent_hub::ipc::Reply::Sent { message })
+                } else {
+                    let details = serde_json::to_value(&message)?;
+                    (
+                        format!("Steering queued for {id} (seq {}).", message.seq),
+                        details,
+                    )
+                }
             }
             "kill" => {
                 let id = id_required("kill")?;
@@ -9526,25 +9655,11 @@ impl HubTool {
             }
             "inbox" => {
                 let id = id_required("inbox")?;
-                let messages = crate::agent_hub::registry()
+                let page = crate::agent_hub::registry()
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .inbox(&id);
-                let details = serde_json::json!({
-                    "schema": "pi.agent-hub.inbox/v1",
-                    "id": id,
-                    "messages": messages,
-                });
-                let text = if messages.is_empty() {
-                    format!("{id}: inbox empty.")
-                } else {
-                    let lines: Vec<String> = messages
-                        .iter()
-                        .map(|m| format!("#{} from {}: {}", m.seq, m.from, m.body))
-                        .collect();
-                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
-                };
-                (text, details)
+                    .inbox_page(&id, input.cursor)?;
+                Self::format_agent_reply(page)
             }
             other => {
                 return Err(Error::validation(format!(

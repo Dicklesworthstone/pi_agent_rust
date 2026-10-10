@@ -9,6 +9,9 @@
 //! parent's in-memory registry is the roster of record; the on-disk queue
 //! files are the delivery mechanism. Writers and readers coordinate through
 //! a stable sidecar lock, including recovery of interrupted draining batches.
+//! Native children use an authenticated, process-owned loopback channel to read
+//! the parent's roster and their own inbox, and to send to peers or the parent.
+//! The parent reads its inbox explicitly; messages never start unsolicited turns.
 //!
 //! NTM layer distinction: this hub manages pi's OWN spawned children in this
 //! process. It does not rebuild ntm's cross-tmux fleet orchestration.
@@ -22,6 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+pub mod ipc;
 
 /// Maximum transcript bytes paged back per `transcript` call.
 const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
@@ -461,9 +466,73 @@ impl AgentHubRegistry {
         Ok(message)
     }
 
-    /// Peer bus send: deliver `body` into recipient child's steering channel.
+    /// Deliver to a child's steering channel, or retain an explicit parent
+    /// inbox message. Parent delivery does not inject a new model turn.
     pub fn bus_send(&mut self, to: &str, from: &str, body: &str) -> Result<BusMessage> {
-        self.steer(to, from, body)
+        if to != "parent" {
+            return self.steer(to, from, body);
+        }
+        let seq = self
+            .bus_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::validation("hub: messaging sequence exhausted"))?;
+        let message = BusMessage {
+            seq,
+            from: from.to_string(),
+            to: "parent".to_string(),
+            body: body.to_string(),
+            sent_ms: now_ms(),
+        };
+        if body.trim().is_empty() {
+            return Err(Error::validation("hub: parent message requires non-empty text"));
+        }
+        if body.len() > MAX_STEER_FRAME_BYTES
+            || serde_json::to_vec(&message)?.len().saturating_add(1) > MAX_STEER_FRAME_BYTES
+        {
+            return Err(Error::validation("hub: serialized message exceeds 64 KiB"));
+        }
+        self.bus_seq = seq;
+        let queue = self.bus.entry("parent".to_string()).or_default();
+        if queue.len() >= MAX_QUEUE_PER_CHILD {
+            queue.pop_front();
+        }
+        queue.push_back(message.clone());
+        Ok(message)
+    }
+
+    /// Return a bounded retained inbox page. Cursors are exclusive delivery
+    /// sequence numbers; reading a page does not consume steering delivery.
+    /// oldest_cursor exposes the oldest retained sequence after history rolls.
+    pub fn inbox_page(&self, id: &str, cursor: Option<u64>) -> Result<ipc::Reply> {
+        if id != "parent" && !self.entries.contains_key(id) {
+            return Err(Error::validation(format!("hub: unknown child '{id}'")));
+        }
+        let cursor = cursor.unwrap_or(0);
+        let queue = self.bus.get(id);
+        let oldest_cursor = queue.and_then(VecDeque::front).map_or(0, |message| message.seq);
+        let mut messages = Vec::new();
+        let mut bytes = 0_usize;
+        let mut next_cursor = cursor;
+        let mut has_more = false;
+        if let Some(queue) = queue {
+            for message in queue.iter().filter(|message| message.seq > cursor) {
+                let size = serde_json::to_vec(message)?.len();
+                if bytes.saturating_add(size) > ipc::MAX_INBOX_PAGE_BYTES {
+                    has_more = true;
+                    break;
+                }
+                bytes += size;
+                next_cursor = message.seq;
+                messages.push(message.clone());
+            }
+        }
+        Ok(ipc::Reply::Inbox {
+            id: id.to_string(),
+            messages,
+            next_cursor,
+            has_more,
+            oldest_cursor,
+        })
     }
 
     /// Inbox view for one child (parent-side record, in delivery order).

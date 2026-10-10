@@ -450,7 +450,23 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
+        let hub_channel = if attempt.result.tools.iter().any(|tool| tool == "hub") {
+            match crate::agent_hub::ipc::ChildChannel::bind(
+                &hub_entry.id,
+                owner,
+                self.deadline.remaining(),
+            ) {
+                Ok(channel) => Some(channel),
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            }
+        } else {
+            None
+        };
         let mut command = Command::new(&self.child_binary);
+        crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, hub_channel.as_ref());
         if let Err(error) = self.deadline.configure_child(&mut command) {
             attempt.result.fail(error.to_string());
             return attempt;
@@ -481,7 +497,9 @@ impl ChildRunner {
         let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
             // Bind process authority before activation. The same guard then
             // serializes reaping and retirement even when this future drops.
-            Ok(child) => child.with_process_lifetime(attempt.hub.process_lifetime()),
+            Ok(child) => child
+                .with_process_lifetime(attempt.hub.process_lifetime())
+                .with_hub_channel(hub_channel),
             Err(error) => {
                 attempt.result.fail(format!(
                     "Failed to launch {}: {error}",
@@ -539,6 +557,9 @@ impl ChildRunner {
                 child.terminate();
                 break;
             }
+            // Bounded nonblocking work keeps messaging inside the process
+            // lifetime and leaves every tick a cancellation checkpoint.
+            child.poll_hub();
             #[cfg(unix)]
             pipes.drain(&mut protocol, &mut attempt.result, update);
             #[cfg(not(unix))]
@@ -792,6 +813,7 @@ struct ChildProcessGuard {
     child: Option<std::process::Child>,
     descendants_stopped: bool,
     process_lease: Option<ProcessLease>,
+    hub_channel: Option<crate::agent_hub::ipc::ChildChannel>,
 }
 
 impl ChildProcessGuard {
@@ -807,22 +829,41 @@ impl ChildProcessGuard {
             child: Some(child),
             descendants_stopped: false,
             process_lease: None,
+            hub_channel: None,
         }
     }
     fn with_process_lifetime(mut self, lease: ProcessLease) -> Self {
         self.process_lease = Some(lease);
         self
     }
+    fn with_hub_channel(
+        mut self,
+        channel: Option<crate::agent_hub::ipc::ChildChannel>,
+    ) -> Self {
+        self.hub_channel = channel;
+        self
+    }
+    fn poll_hub(&mut self) {
+        if let Some(channel) = self.hub_channel.as_mut() {
+            channel.poll();
+        }
+    }
     fn id(&self) -> u32 {
         self.child.as_ref().map_or(0, std::process::Child::id)
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let child = self.child.as_mut().expect("owned child");
-        if let Some(lease) = &self.process_lease {
+        let status = if let Some(lease) = &self.process_lease {
             lease.try_wait(child)
         } else {
             child.try_wait()
+        };
+        if matches!(&status, Ok(Some(_))) {
+            // No listener or credential survives OS reaping, including while
+            // output acceptance or ordered writeback remains pending.
+            self.hub_channel = None;
         }
+        status
     }
     fn stop_descendants(&mut self) {
         if self.descendants_stopped {
@@ -844,6 +885,8 @@ impl ChildProcessGuard {
         crate::tools::kill_process_tree(Some(pid));
     }
     fn terminate(&mut self) {
+        // Revoke peer authority before any blocking termination or reaping.
+        self.hub_channel = None;
         if let Some(lease) = self.process_lease.take() {
             // The lease holds the hub lock while terminating and retiring the
             // PID. A separate destructor would leave a reused PID signalable
@@ -861,6 +904,7 @@ impl ChildProcessGuard {
         }
     }
     fn disarm(&mut self) {
+        self.hub_channel = None;
         let _ = self.child.take();
     }
 }

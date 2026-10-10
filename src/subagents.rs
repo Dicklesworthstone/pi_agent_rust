@@ -48,7 +48,7 @@ const STRUCTURED_BLOCK_LIMIT_BYTES: usize = 16 * 1024;
 const STRUCTURED_BLOCK_OPEN: &str = "<subagent-structured-result>";
 const STRUCTURED_BLOCK_CLOSE: &str = "</subagent-structured-result>";
 const STRUCTURED_TRUNCATION_MARKER: &str = "…[truncated]";
-const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit";
+const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit,hub";
 const TAN_RESULT_SCHEMA: &str = "pi.background-tan.result.v1";
 const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
@@ -1578,10 +1578,12 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--model", "ai-router/gpt-5.6-terra"])
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--tools", DEFAULT_CHILD_TOOLS])
-        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--tools",
+                "read,bash,edit,write,grep,find,ls,hashline_edit,hub",
+            ]
+        }));
         assert!(!args.iter().any(|arg| arg == "subagent"));
         assert!(
             args.windows(2)
