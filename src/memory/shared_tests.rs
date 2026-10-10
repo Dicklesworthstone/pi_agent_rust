@@ -13,6 +13,7 @@ fn bank(root: &Path) -> Arc<MemoryStore> {
         db_path: root.join("bank.sqlite"),
         project_key: "shared-test".to_string(),
         project_root: root.to_path_buf(),
+        secret_patterns: Vec::new(),
     })
 }
 

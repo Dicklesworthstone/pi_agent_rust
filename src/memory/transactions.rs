@@ -190,7 +190,7 @@ mod tests {
 
 #[cfg(test)]
 mod store_tests {
-    use crate::memory::{MemoryEditOp, MemoryKind, MemoryStore, RetainTool};
+    use crate::memory::{MemoryEditOp, MemoryEditTool, MemoryKind, MemoryStore, RetainTool};
     use crate::tools::Tool as _;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
@@ -201,6 +201,7 @@ mod store_tests {
             db_path: root.join("bank.sqlite"),
             project_key: "transaction-fixture".to_string(),
             project_root: root.to_path_buf(),
+            secret_patterns: Vec::new(),
         }
     }
 
@@ -229,6 +230,164 @@ mod store_tests {
                 .collect()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn project_mutations_screen_rows_tags_and_fts_before_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::secrets::SecretsSettings {
+            mode: Some("off".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        };
+        let bank = Arc::new(store(dir.path()).with_secrets_settings(Some(&settings)));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let retained = runtime
+            .block_on(RetainTool::new(Arc::clone(&bank)).execute(
+                "retain-screen",
+                serde_json::json!({
+                    "content": "parser api_key=opaqueCredential1234567",
+                    "tags": ["ACME-123456", "parser"]
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(!retained.is_error);
+        let details = retained.details.unwrap();
+        assert_eq!(details["content"], "parser api_key=[REDACTED_GENERIC_SECRET]");
+        assert_eq!(details["tags"][0], "[REDACTED_USER_PATTERN]");
+        assert_eq!(details["tags"][1], "parser");
+        let id = details["id"].as_i64().unwrap();
+
+        let edited = runtime
+            .block_on(MemoryEditTool::new(Arc::clone(&bank)).execute(
+                "edit-screen",
+                serde_json::json!({
+                    "id": id,
+                    "op": "update",
+                    "content": "parser credential\n-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY_CANARY\n-----END PRIVATE KEY-----\nkeep the surrounding guidance"
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(!edited.is_error);
+        let replacement = bank
+            .supersede(
+                id,
+                MemoryKind::Decision,
+                "parser connects via postgres://fixture:dsnPassword123@db.example/app",
+                &["ACME-654321".to_string()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            replacement.content,
+            "parser connects via [REDACTED_DSN]db.example/app"
+        );
+        assert_eq!(replacement.tags, vec!["[REDACTED_USER_PATTERN]".to_string()]);
+
+        // Read the real tables directly: screened read projections must not
+        // disguise a write that already persisted a raw credential.
+        bank.with_conn(|conn| {
+            for sql in [
+                "SELECT content, tags FROM memories",
+                "SELECT content, '' FROM memories_fts",
+            ] {
+                for row in conn.query_sync(sql, &[]).unwrap() {
+                    for index in 0..2 {
+                        let stored = crate::memory::row_text(&row, index)?;
+                        for secret in [
+                            "opaqueCredential1234567",
+                            "PRIVATE_BODY_CANARY",
+                            "dsnPassword123",
+                            "ACME-123456",
+                            "ACME-654321",
+                        ] {
+                            assert!(!stored.contains(secret), "raw credential reached storage");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let reopened = store(dir.path()).with_secrets_settings(Some(&settings));
+        let listed = reopened.list(10).unwrap();
+        let previous = listed.iter().find(|memory| memory.id == id).unwrap();
+        assert!(previous.content.contains("[REDACTED_PRIVATE_KEY]"));
+        assert!(previous.content.ends_with("keep the surrounding guidance"));
+        assert_eq!(previous.status, "superseded");
+        let hits = reopened.recall("parser", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, replacement.id);
+    }
+
+    #[test]
+    fn legacy_project_reads_screen_before_budgets_without_rewriting_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        let original = bank
+            .retain(MemoryKind::Fact, "legacy parser guidance", &[], None)
+            .unwrap();
+        let legacy = format!(
+            "legacy parser before\n-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\nuse the parser safely",
+            "PRIVATE_BODY_CANARY".repeat(400)
+        );
+        bank.with_conn(|conn| {
+            conn.execute_sync(
+                "UPDATE memories SET content = ?1, tags = ?2 WHERE id = ?3",
+                &[
+                    fsqlite::SqliteValue::Text(legacy.clone().into()),
+                    fsqlite::SqliteValue::Text("[\"ACME-123456\"]".to_string().into()),
+                    fsqlite::SqliteValue::Integer(original.id),
+                ],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "UPDATE memories_fts SET content = ?1 WHERE rowid = ?2",
+                &[
+                    fsqlite::SqliteValue::Text(legacy.clone().into()),
+                    fsqlite::SqliteValue::Integer(original.id),
+                ],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let settings = crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        };
+        let reopened = store(dir.path()).with_secrets_settings(Some(&settings));
+        for memories in [
+            reopened.list(10).unwrap(),
+            reopened.recall("parser", None).unwrap(),
+        ] {
+            assert_eq!(memories.len(), 1);
+            assert_eq!(
+                memories[0].content,
+                "legacy parser before\n[REDACTED_PRIVATE_KEY]\nuse the parser safely"
+            );
+            assert_eq!(memories[0].tags, vec!["[REDACTED_USER_PATTERN]".to_string()]);
+        }
+        let model = reopened.mental_model().unwrap();
+        assert!(model.contains("use the parser safely"));
+        assert!(model.contains("[REDACTED_PRIVATE_KEY]"));
+        assert!(!model.contains("PRIVATE_BODY_CANARY"));
+        assert!(model.len() < crate::memory::MENTAL_MODEL_BUDGET);
+        reopened
+            .with_conn(|conn| {
+                let rows = conn
+                    .query_sync(
+                        "SELECT content FROM memories WHERE id = ?1",
+                        &[fsqlite::SqliteValue::Integer(original.id)],
+                    )
+                    .unwrap();
+                assert_eq!(crate::memory::row_text(&rows[0], 0)?, legacy);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

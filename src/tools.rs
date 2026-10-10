@@ -5786,7 +5786,9 @@ impl ToolRegistry {
         if config.is_some_and(|cfg| cfg.memory_backend() == "local")
             && let Ok(store) = crate::memory::MemoryStore::open(cwd)
         {
-            let store = std::sync::Arc::new(store);
+            let store = std::sync::Arc::new(
+                store.with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+            );
             tools.push(Box::new(crate::memory::RetainTool::new(
                 std::sync::Arc::clone(&store),
             )));
@@ -8604,9 +8606,18 @@ impl Tool for LearnTool {
                 "learn requires a non-empty lesson".to_string(),
             ));
         }
-        let content = input.context.as_deref().map_or_else(
-            || input.lesson.clone(),
-            |ctx| format!("{}\n\nContext: {ctx}", input.lesson),
+        // Screen each source before composing the memory, and before
+        // truncating a description or slugifying a filename. Those operations
+        // can otherwise cut a key into an unrecognizable but still sensitive
+        // fragment, or defeat an anchored user credential pattern.
+        let lesson = self.store.screen_text(&input.lesson);
+        let context = input
+            .context
+            .as_deref()
+            .map(|context| self.store.screen_text(context));
+        let content = context.as_deref().map_or_else(
+            || lesson.clone(),
+            |context| format!("{lesson}\n\nContext: {context}"),
         );
         let memory = self.store.retain(
             crate::memory::MemoryKind::Lesson,
@@ -8617,14 +8628,17 @@ impl Tool for LearnTool {
         let mut lines = vec![format!("Lesson captured [{}].", memory.id)];
         let mut promoted: Option<serde_json::Value> = None;
         if input.promote.unwrap_or(false) {
-            let name = input
+            let requested_name = input
                 .skill_name
+                .as_deref()
+                .map(|name| self.store.screen_text(name));
+            let name = requested_name
                 .as_deref()
                 .map(slugify)
                 .filter(|slug| slug != "lesson")
-                .unwrap_or_else(|| slugify(&input.lesson));
-            let description: String = input.lesson.chars().take(200).collect();
-            match crate::skills_managed::create(&name, &description, &content) {
+                .unwrap_or_else(|| slugify(&lesson));
+            let description: String = lesson.chars().take(200).collect();
+            match crate::skills_managed::create(&name, &description, &memory.content) {
                 Ok(info) => {
                     lines.push(format!(
                         "Promoted to managed skill '{name}' ({}).",

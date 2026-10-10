@@ -194,6 +194,30 @@ Accessor defaults:
 }
 ```
 
+### Project memory
+
+`memory.backend` is `"off"` by default. Set it to `"local"` to enable the
+project-scoped SQLite memory bank, its `retain`, `recall`, `reflect`,
+`memory_edit`, and `learn` tools, and a budget-capped startup memory block.
+
+```json
+{
+  "memory": { "backend": "local" },
+  "secrets": { "extra_patterns": ["ACME-[A-Za-z0-9]{24}"] }
+}
+```
+
+Project facts, tags, edited memories, and learned skills use the shared
+credential detector, including `secrets.extra_patterns`. Detected values
+are replaced with irreversible `[REDACTED_*]` markers before storage and
+before a learned skill's filename or description is derived. This memory
+privacy floor applies even when `secrets.mode` is `"off"`. Reads also screen
+older records before recall or startup injection; existing database rows
+are not rewritten by reading them.
+
+Shared `scope: "session"` keys retain their separate exact-text contract.
+They remain outside project recall, reflection, and startup memory.
+
 ### Subagents
 
 - `subagent_structured_results` (bool): Default `false`. Alias: `subagentStructuredResults`.

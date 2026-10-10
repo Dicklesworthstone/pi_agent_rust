@@ -274,9 +274,13 @@ const MEMORY_USAGE: &str = "Usage: /memory [view|list|search <query>|forget <id>
 /// `/memory [view|list|search <query>|forget <id>]`: this project's memory
 /// bank (bd-cv653.4.1). `view` (the default) is the mental model the agent
 /// is given at session start.
-pub fn memory(cwd: &Path, args: &str) -> Report {
+pub fn memory(
+    cwd: &Path,
+    args: &str,
+    settings: Option<&crate::secrets::SecretsSettings>,
+) -> Report {
     match crate::memory::MemoryStore::open(cwd) {
-        Ok(store) => memory_in(&store, args),
+        Ok(store) => memory_in(&store.with_secrets_settings(settings), args),
         Err(e) => Report::status(format!("Memory bank unavailable: {e}")),
     }
 }
@@ -315,7 +319,10 @@ fn memory_in(store: &crate::memory::MemoryStore, args: &str) -> Report {
             Err(e) => Report::status(format!("Memory list failed: {e}")),
         },
         "search" if !rest.is_empty() => match store.recall(rest, Some(10)) {
-            Ok(memories) => listing(&format!("Memories matching \"{rest}\""), memories),
+            Ok(memories) => listing(
+                &format!("Memories matching \"{}\"", store.screen_text(rest)),
+                memories,
+            ),
             Err(e) => Report::status(format!("Memory search failed: {e}")),
         },
         "forget" => rest.trim_start_matches('#').parse::<i64>().map_or_else(
@@ -570,6 +577,66 @@ mod tests {
             format!("Forgot memory #{}", kept.id)
         );
         assert_eq!(memory_in(&store, "list").status, "Recent memories: none");
+    }
+
+    #[test]
+    fn memory_redacts_legacy_custom_patterns_in_cards_and_search_titles() {
+        let root = tempfile::tempdir().expect("project root");
+        let content_secret = "ACME-129834";
+        let tag_secret = "ACME-928374";
+        let content =
+            format!("the parser lives in src/parser.rs; staging access uses {content_secret}");
+        // This real bank predates the project's custom detector setting.
+        // Built-in rules do not recognize these fixture credentials.
+        let legacy_store = crate::memory::MemoryStore::open(root.path()).expect("legacy bank");
+        let retained = legacy_store
+            .retain(
+                crate::memory::MemoryKind::Fact,
+                &content,
+                &["layout".to_string(), tag_secret.to_string()],
+                None,
+            )
+            .expect("legacy memory");
+        assert_eq!(retained.content, content);
+        assert!(retained.tags.iter().any(|tag| tag == tag_secret));
+        drop(legacy_store);
+
+        let settings = crate::secrets::SecretsSettings {
+            mode: Some("off".to_string()),
+            extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+        };
+        let store = crate::memory::MemoryStore::open(root.path())
+            .expect("reopen bank")
+            .with_secrets_settings(Some(&settings));
+        for args in ["", "view", "list", "search parser", "search ACME-129834"] {
+            for (source, report) in [
+                ("configured bank", memory_in(&store, args)),
+                ("slash command", memory(root.path(), args, Some(&settings))),
+            ] {
+                let card = report.card.as_deref().expect("memory card");
+                assert!(card.contains("src/parser.rs"), "{source}: {args}: {report:?}");
+                assert!(
+                    card.contains("[REDACTED_USER_PATTERN]"),
+                    "{source}: {args}: {report:?}"
+                );
+                for secret in [content_secret, tag_secret] {
+                    assert!(!card.contains(secret), "{source}: {args}: card leaked");
+                    assert!(
+                        !report.status.contains(secret),
+                        "{source}: {args}: status leaked"
+                    );
+                }
+            }
+        }
+
+        // Privacy is applied when rendering historical data, without a read
+        // silently rewriting the user's existing bank.
+        let unchanged = crate::memory::MemoryStore::open(root.path())
+            .expect("unconfigured bank")
+            .list(1)
+            .expect("stored row");
+        assert_eq!(unchanged[0].content, content);
+        assert!(unchanged[0].tags.iter().any(|tag| tag == tag_secret));
     }
 
     /// A planted secret-shaped line is reported with its location; a clean

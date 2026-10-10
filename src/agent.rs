@@ -2098,6 +2098,12 @@ impl Agent {
         self.config.approval_state.clone()
     }
 
+    /// Credential rules shared with project-memory command projections.
+    #[must_use]
+    pub(crate) fn secrets_settings(&self) -> Option<&crate::secrets::SecretsSettings> {
+        self.config.secrets.as_ref()
+    }
+
     /// Report whether the dialect-repair audit ledger has pending entries.
     pub fn repair_ledger_is_empty(&self) -> Result<bool> {
         self.repair_ledger

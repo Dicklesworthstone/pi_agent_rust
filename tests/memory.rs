@@ -261,6 +261,102 @@ fn retain_tool_redacts_secrets() {
 }
 
 #[test]
+fn configured_registry_screens_all_project_memory_writes_and_startup_reads() {
+    let case = "configured_registry_screens_all_project_memory_writes_and_startup_reads";
+    let harness = TestHarness::new(case);
+    let root = project_dir(&harness, "proj");
+    let mut config = memory_config("local");
+    config.secrets = Some(pi::secrets::SecretsSettings {
+        mode: Some("off".to_string()),
+        extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+    });
+    // An older bank or an earlier policy can contain newly protected text.
+    // The host must also thread the current policy into reads and startup.
+    let historical = pi::memory::MemoryStore::open(&root).unwrap();
+    historical
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "legacy parser guidance ACME-777777",
+            &[],
+            None,
+        )
+        .unwrap();
+    let registry = ToolRegistry::new(&["read"], &root, Some(&config));
+    let run = |name: &str, input: Value| {
+        let tool = registry
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == name)
+            .expect("configured memory tool");
+        let output = block_on_local(tool.execute("configured-memory", input, None)).unwrap();
+        assert!(!output.is_error, "memory operation must succeed");
+        output
+    };
+    let retained = run(
+        "retain",
+        json!({"content":"parser initially uses ACME-123456", "tags":["ACME-654321"]}),
+    );
+    let details = retained.details.unwrap();
+    assert_eq!(
+        details["content"],
+        "parser initially uses [REDACTED_USER_PATTERN]"
+    );
+    assert_eq!(details["tags"][0], "[REDACTED_USER_PATTERN]");
+    let id = details["id"].as_i64().unwrap();
+    run(
+        "memory_edit",
+        json!({"id":id, "op":"update", "content":"parser now uses ACME-222222"}),
+    );
+    let learned = run(
+        "learn",
+        json!({"lesson":"parser lessons use ACME-333333", "context":"ACME-444444"}),
+    );
+    let learned = serde_json::to_string(&learned.details).unwrap();
+    assert!(!learned.contains("ACME-333333"));
+    assert!(!learned.contains("ACME-444444"));
+    assert!(learned.contains("[REDACTED_USER_PATTERN]"));
+
+    // Open without the policy to verify screening occurred before storage,
+    // rather than merely hiding unscreened writes at the output boundary.
+    let reopened = pi::memory::MemoryStore::open(&root).unwrap();
+    let edited = reopened
+        .list(10)
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.id == id)
+        .unwrap();
+    assert_eq!(edited.content, "parser now uses [REDACTED_USER_PATTERN]");
+    let recalled = run("recall", json!({"query":"parser"}));
+    let recalled = serde_json::to_string(&recalled.details).unwrap();
+    let prompt = build_prompt_for_test(&root, &config);
+    for visible in [&recalled, &prompt] {
+        for secret in [
+            "ACME-123456",
+            "ACME-222222",
+            "ACME-333333",
+            "ACME-444444",
+            "ACME-654321",
+            "ACME-777777",
+        ] {
+            assert!(
+                !visible.contains(secret),
+                "configured pattern escaped screening"
+            );
+        }
+        assert!(visible.contains("[REDACTED_USER_PATTERN]"));
+        assert!(visible.contains("legacy parser guidance"));
+    }
+    for query in ["ACME-777777", "ACME-888888"] {
+        let output = run("recall", json!({"query": query}));
+        let details = output.details.as_ref().unwrap();
+        assert_eq!(details["query"], "[REDACTED_USER_PATTERN]");
+        assert!(!serde_json::to_string(details).unwrap().contains(query));
+        assert!(!first_text(&output).contains(query));
+    }
+    finish_case(&harness, case);
+}
+
+#[test]
 fn backend_gate_controls_tool_presence() {
     let case = "backend_gate_controls_tool_presence";
     let harness = TestHarness::new(case);

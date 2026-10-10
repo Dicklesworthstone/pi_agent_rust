@@ -70,7 +70,11 @@ pub async fn run(
         WorkspaceCommand::Commit => render(workspace_reports::commit(cwd, args)),
         WorkspaceCommand::Review => render(workspace_reports::review(cwd, args)),
         WorkspaceCommand::Advisor => render(workspace_reports::advisor(advisor, args)),
-        WorkspaceCommand::Memory => render(workspace_reports::memory(cwd, args)),
+        WorkspaceCommand::Memory => render(workspace_reports::memory(
+            cwd,
+            args,
+            handle.session().agent.secrets_settings(),
+        )),
         WorkspaceCommand::Hub => render(workspace_reports::hub(args)),
         WorkspaceCommand::Security => render(workspace_reports::security(cwd, args)),
         WorkspaceCommand::Plugins => packages.map_or_else(
