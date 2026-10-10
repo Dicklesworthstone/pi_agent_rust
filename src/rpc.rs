@@ -5547,6 +5547,10 @@ async fn run_prompt_with_retry(
     // never replay the first attempt (which would re-add the user message and
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
     let mut first_attempt_done = false;
+    // The first attempt alone runs input/before_agent_start hooks. Their
+    // effective prompt belongs to this logical request, including retries,
+    // fallback providers and input drained at the finalization boundary.
+    let mut turn_system_prompt = None;
     let mut follow_up_first = false;
     let mut expected_follow_up_fetch: Option<(Arc<AtomicU64>, u64)> = None;
     let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
@@ -5617,9 +5621,10 @@ async fn run_prompt_with_retry(
                     let ready_for_callback = Arc::clone(&ready);
                     let expected_fetch = expected_follow_up_fetch.clone();
                     let result = guard
-                        .run_continue_with_follow_up_with_abort(
+                        .run_continue_with_follow_up_with_abort_and_system_prompt(
                             true,
                             Some(abort_signal),
+                            turn_system_prompt.as_deref(),
                             move || {
                                 let source_ready =
                                     expected_fetch
@@ -5645,23 +5650,38 @@ async fn run_prompt_with_retry(
                     result
                 } else {
                     guard
-                        .run_continue_with_abort(Some(abort_signal), event_handler)
+                        .run_continue_with_abort_and_system_prompt(
+                            Some(abort_signal),
+                            turn_system_prompt.as_deref(),
+                            event_handler,
+                        )
                         .await
                 }
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
+                turn_system_prompt = guard.agent.system_prompt().map(str::to_string);
                 guard
                     .agent
                     .set_magic_keyword_scan_override(keyword_scan_source.clone());
                 if attachments.is_empty() {
                     guard
-                        .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
+                        .run_text_with_abort_capturing_prompt(
+                            message.clone(),
+                            Some(abort_signal),
+                            &mut turn_system_prompt,
+                            event_handler,
+                        )
                         .await
                 } else {
                     let blocks = build_prompt_content_blocks(&message, &attachments);
                     guard
-                        .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
+                        .run_with_content_with_abort_capturing_prompt(
+                            blocks,
+                            Some(abort_signal),
+                            &mut turn_system_prompt,
+                            event_handler,
+                        )
                         .await
                 }
             }
@@ -7921,6 +7941,8 @@ mod retry_tests {
     struct FlakyProvider {
         calls: AtomicUsize,
         contexts: std::sync::Mutex<Vec<Vec<Message>>>,
+        prompts: std::sync::Mutex<Vec<Option<String>>>,
+        transport_error: bool,
     }
 
     impl FlakyProvider {
@@ -7928,6 +7950,8 @@ mod retry_tests {
             Self {
                 calls: AtomicUsize::new(0),
                 contexts: std::sync::Mutex::new(Vec::new()),
+                prompts: std::sync::Mutex::new(Vec::new()),
+                transport_error: false,
             }
         }
     }
@@ -7992,7 +8016,14 @@ mod retry_tests {
                 .lock()
                 .expect("capture retry context")
                 .push(context.messages.to_vec());
+            self.prompts
+                .lock()
+                .expect("capture retry system prompt")
+                .push(context.system_prompt.as_deref().map(str::to_string));
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 && self.transport_error {
+                return Err(Error::api("server error"));
+            }
 
             let mut partial = AssistantMessage {
                 content: Vec::new(),
@@ -8328,6 +8359,175 @@ mod retry_tests {
                 "the failed assistant tail must be absent from the active path"
             );
         });
+    }
+
+    async fn run_rpc_prompt_scope_fixture(
+        session: Arc<Mutex<AgentSession>>,
+        runtime_handle: RuntimeHandle,
+        auth_path: PathBuf,
+        attachments: Vec<ContentBlock>,
+    ) -> Vec<Value> {
+        let mut options = build_test_rpc_options(&runtime_handle, auth_path);
+        options.config.retry = Some(crate::config::RetrySettings {
+            enabled: Some(true),
+            max_retries: Some(1),
+            base_delay_ms: Some(0),
+            max_delay_ms: Some(0),
+            ..crate::config::RetrySettings::default()
+        });
+        let mut shared = RpcSharedState::new(&options.config);
+        shared.auto_compaction_enabled = false;
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(1024);
+        run_prompt_with_retry(
+            session,
+            Arc::new(Mutex::new(shared)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(())),
+            Arc::new(Mutex::new(None)),
+            out_tx,
+            Arc::new(AtomicBool::new(false)),
+            options,
+            "one user turn".to_string(),
+            None,
+            attachments,
+            AgentCx::for_request(),
+        )
+        .await;
+        out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).expect("RPC event"))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_recovery_preserves_hook_prompt_without_replaying_hooks_or_leaking_between_turns() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async {
+            for transport_error in [false, true] {
+                for with_image in [false, true] {
+                    for override_prompt in [Some("hook-system"), Some(""), None] {
+                        let root = tempfile::tempdir().expect("extension tempdir");
+                        let mut response = json!({"messages": [{
+                            "customType": "rpc-prompt-hook", "content": "hook ran once",
+                            "display": false
+                        }]});
+                        if let Some(prompt) = override_prompt {
+                            response["systemPrompt"] = json!(prompt);
+                        }
+                        let path = root.path().join("turn-prompt.native.json");
+                        let descriptor = json!({
+                            "id": "rpc-prompt-hook", "name": "rpc-prompt-hook",
+                            "version": "1.0.0", "apiVersion": crate::extensions::PROTOCOL_VERSION,
+                            "eventHooks": ["before_agent_start"],
+                            "eventResponses": {"before_agent_start": response}
+                        });
+                        std::fs::write(
+                            &path,
+                            serde_json::to_vec(&descriptor).expect("encode extension"),
+                        )
+                        .expect("write extension");
+                        let manager = ExtensionManager::new();
+                        manager.set_native_runtime(
+                            crate::extensions::NativeRustExtensionRuntimeHandle::start()
+                                .await
+                                .expect("native runtime"),
+                        );
+                        manager
+                            .load_native_extensions(vec![
+                                crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path)
+                                    .expect("native extension spec"),
+                            ])
+                            .await
+                            .expect("load extension");
+                        let mut fixture = FlakyProvider::new();
+                        fixture.transport_error = transport_error;
+                        let provider = Arc::new(fixture);
+                        let mut agent = Agent::new(
+                            Arc::clone(&provider) as Arc<dyn Provider>,
+                            ToolRegistry::new(&[], Path::new("."), None),
+                            AgentConfig {
+                                system_prompt: Some("ordinary-system".to_string()),
+                                ..AgentConfig::default()
+                            },
+                        );
+                        agent.set_model_accepts_images(true);
+                        let mut agent_session = AgentSession::new(
+                            agent,
+                            Arc::new(Mutex::new(Session::in_memory())),
+                            false,
+                            crate::compaction::ResolvedCompactionSettings {
+                                enabled: false,
+                                ..crate::compaction::ResolvedCompactionSettings::default()
+                            },
+                        );
+                        agent_session.extensions =
+                            Some(crate::extensions::ExtensionRegion::new(manager));
+                        let session = Arc::new(Mutex::new(agent_session));
+                        let attachments = if with_image {
+                            vec![ContentBlock::Image(crate::model::ImageContent {
+                                data: "aGVsbG8=".to_string(),
+                                mime_type: "image/png".to_string(),
+                            })]
+                        } else {
+                            Vec::new()
+                        };
+                        let events = run_rpc_prompt_scope_fixture(
+                            Arc::clone(&session),
+                            runtime_handle.clone(),
+                            root.path().join("auth.json"),
+                            attachments,
+                        )
+                        .await;
+                        assert_eq!(events.last().expect("terminal")["type"], "agent_end");
+                        assert!(events.last().expect("terminal")["error"].is_null());
+                        let expected = Some(override_prompt.unwrap_or("ordinary-system").to_string());
+                        assert_eq!(
+                            *provider.prompts.lock().expect("recorded prompts"),
+                            vec![expected.clone(), expected],
+                            "transport_error={transport_error}, image={with_image}, override={override_prompt:?}"
+                        );
+                        let cx = AgentCx::for_request();
+                        let old_extension = {
+                            let mut guard = session.lock(cx.cx()).await.expect("agent session");
+                            assert_eq!(guard.agent.system_prompt(), Some("ordinary-system"));
+                            let hook_count = guard
+                                .session
+                                .lock(cx.cx())
+                                .await
+                                .expect("stored session")
+                                .to_messages_for_current_path()
+                                .into_iter()
+                                .filter(|message| matches!(
+                                    message, Message::Custom(custom)
+                                        if custom.custom_type == "rpc-prompt-hook"
+                                ))
+                                .count();
+                            assert_eq!(hook_count, 1, "recovery must not replay start hooks");
+                            guard.extensions.take()
+                        };
+                        let events = run_rpc_prompt_scope_fixture(
+                            Arc::clone(&session),
+                            runtime_handle.clone(),
+                            root.path().join("auth.json"),
+                            Vec::new(),
+                        )
+                        .await;
+                        assert_eq!(events.last().expect("terminal")["type"], "agent_end");
+                        assert!(events.last().expect("terminal")["error"].is_null());
+                        assert_eq!(
+                            provider.prompts.lock().expect("next prompt").last(),
+                            Some(&Some("ordinary-system".to_string()))
+                        );
+                        drop(old_extension);
+                    }
+                }
+            }
+        }));
     }
 
     /// bd-2vmu6.1: a turn that swaps to a fallback chain entry closes its

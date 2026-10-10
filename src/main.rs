@@ -9856,6 +9856,10 @@ where
     H: Fn() -> EH + Sync,
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
+    // Hooks belong to the logical prompt, not its provider attempts. Capture
+    // their effective base once so a retry or provider swap retains the same
+    // instructions after each attempt restores the session's ordinary prompt.
+    let mut turn_system_prompt = session.agent.system_prompt().map(str::to_string);
     // First attempt.
     let first_result = match &input {
         PromptInput::Text {
@@ -9866,9 +9870,10 @@ where
                 .agent
                 .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
-                .run_text_with_abort(
+                .run_text_with_abort_capturing_prompt(
                     text.clone(),
                     Some(abort_signal.clone()),
+                    &mut turn_system_prompt,
                     make_event_handler(),
                 )
                 .await
@@ -9881,9 +9886,10 @@ where
                 .agent
                 .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
-                .run_with_content_with_abort(
+                .run_with_content_with_abort_capturing_prompt(
                     content.clone(),
                     Some(abort_signal.clone()),
+                    &mut turn_system_prompt,
                     make_event_handler(),
                 )
                 .await
@@ -9910,11 +9916,14 @@ where
         // the decision — JSON events, the backoff sleep, tail restoration and
         // the chain swap.
         //
-        // The context window is None here, which is print mode's long-standing
-        // behaviour and is preserved deliberately: RPC supplies the real window
-        // and so refuses a SILENT context overflow that print retries to budget
-        // exhaustion. Resolving the window on this path is a behaviour change
-        // and needs its own test.
+        // Resolve the live model again after every swap. A transient-looking
+        // error with an already oversized input cannot recover by resending
+        // the same prompt, and an embedder's compaction threshold is not the
+        // provider's context capacity. Zero means no known capacity.
+        let context_window = session
+            .current_model_entry()
+            .map(|entry| entry.model.context_window)
+            .filter(|window| *window > 0);
         let decision = {
             let progress = pi::failover::TurnProgress {
                 retry_count,
@@ -9928,13 +9937,13 @@ where
                     pi::failover::TurnOutcome::Completed(msg),
                     &progress,
                     &policy,
-                    None,
+                    context_window,
                 ),
                 Err(err) => pi::failover::decide(
                     pi::failover::TurnOutcome::Failed(err),
                     &progress,
                     &policy,
-                    None,
+                    context_window,
                 ),
             }
         };
@@ -9990,7 +9999,11 @@ where
                     return Err(restore_err);
                 }
                 current_result = session
-                    .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                    .run_continue_with_abort_and_system_prompt(
+                        Some(abort_signal.clone()),
+                        turn_system_prompt.as_deref(),
+                        make_event_handler(),
+                    )
                     .await;
             }
             Ok(msg) => {
@@ -10045,8 +10058,9 @@ where
                         failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
-                            .run_continue_with_abort(
+                            .run_continue_with_abort_and_system_prompt(
                                 Some(abort_signal.clone()),
+                                turn_system_prompt.as_deref(),
                                 make_event_handler(),
                             )
                             .await;
@@ -10146,7 +10160,11 @@ where
                         }
                     }
                     current_result = session
-                        .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                        .run_continue_with_abort_and_system_prompt(
+                            Some(abort_signal.clone()),
+                            turn_system_prompt.as_deref(),
+                            make_event_handler(),
+                        )
                         .await;
                 } else {
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
@@ -10187,8 +10205,9 @@ where
                         failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
-                            .run_continue_with_abort(
+                            .run_continue_with_abort_and_system_prompt(
                                 Some(abort_signal.clone()),
+                                turn_system_prompt.as_deref(),
                                 make_event_handler(),
                             )
                             .await;
@@ -12660,6 +12679,305 @@ mod tests {
         assert!(!message_marks_session_persistence(
             "500 internal server error"
         ));
+    }
+
+    struct PrintRecoveryProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: StdMutex<Vec<Option<String>>>,
+        input_tokens: u64,
+        transport_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl pi::provider::Provider for PrintRecoveryProvider {
+        fn name(&self) -> &str {
+            "print-recovery"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &pi::provider::Context<'_>,
+            _options: &pi::provider::StreamOptions,
+        ) -> pi::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+            >,
+        > {
+            self.prompts
+                .lock()
+                .expect("capture print prompt")
+                .push(context.system_prompt.as_deref().map(str::to_string));
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 && self.transport_error {
+                return Err(pi::error::Error::api("server error"));
+            }
+            let failed = call == 0;
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: pi::model::Usage {
+                    input: self.input_tokens,
+                    ..pi::model::Usage::default()
+                },
+                stop_reason: if failed {
+                    StopReason::Error
+                } else {
+                    StopReason::Stop
+                },
+                stop_details: None,
+                error_message: failed.then(|| "server error".to_string()),
+                timestamp: 0,
+            };
+            let terminal = if failed {
+                pi::model::StreamEvent::Error {
+                    reason: StopReason::Error,
+                    error: message.clone(),
+                }
+            } else {
+                pi::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: message.clone(),
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(pi::model::StreamEvent::Start { partial: message }),
+                Ok(terminal),
+            ])))
+        }
+    }
+
+    fn print_recovery_session(provider: &Arc<PrintRecoveryProvider>) -> AgentSession {
+        let mut agent = Agent::new(
+            Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                system_prompt: Some("ordinary-system".to_string()),
+                ..AgentConfig::default()
+            },
+        );
+        agent.set_model_accepts_images(true);
+        let mut stored = Session::in_memory();
+        stored.header.provider = Some("print-recovery".to_string());
+        stored.header.model_id = Some("test-model".to_string());
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            false,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    async fn run_print_recovery_fixture(
+        session: &mut AgentSession,
+        input: PromptInput,
+    ) -> Result<AssistantMessage> {
+        let config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(1),
+                base_delay_ms: Some(0),
+                max_delay_ms: Some(0),
+                ..pi::config::RetrySettings::default()
+            }),
+            ..Config::default()
+        };
+        let (_abort, signal) = AbortHandle::new();
+        run_print_prompt_with_retry(
+            session,
+            &config,
+            &signal,
+            &|| |_| {},
+            true,
+            1,
+            true,
+            &Arc::new(StdMutex::new(PrintTextStreamState::default())),
+            input,
+            None,
+            &mut PrintFailoverState::default(),
+        )
+        .await
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_recovery_preserves_hook_prompt_without_leaking_into_the_next_turn() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            for transport_error in [false, true] {
+                for with_image in [false, true] {
+                    for override_prompt in [Some("hook-system"), Some(""), None] {
+                        let provider = Arc::new(PrintRecoveryProvider {
+                            calls: std::sync::atomic::AtomicUsize::new(0),
+                            prompts: StdMutex::new(Vec::new()),
+                            input_tokens: 0,
+                            transport_error,
+                        });
+                        let mut session = print_recovery_session(&provider);
+                        let root = tempfile::tempdir().expect("extension tempdir");
+                        let path = root.path().join("turn-prompt.native.json");
+                        let mut response = json!({"messages": [{
+                            "customType": "print-prompt-hook", "content": "hook ran once",
+                            "display": false
+                        }]});
+                        if let Some(prompt) = override_prompt {
+                            response["systemPrompt"] = json!(prompt);
+                        }
+                        let descriptor = json!({
+                            "id": "print-prompt-hook", "name": "print-prompt-hook",
+                            "version": "1.0.0", "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                            "eventHooks": ["before_agent_start"],
+                            "eventResponses": {"before_agent_start": response}
+                        });
+                        fs::write(&path, serde_json::to_vec(&descriptor).expect("encode extension"))
+                            .expect("write extension");
+                        let manager = pi::extensions::ExtensionManager::new();
+                        manager.set_native_runtime(
+                            NativeRustExtensionRuntimeHandle::start()
+                                .await
+                                .expect("native runtime"),
+                        );
+                        manager
+                            .load_native_extensions(vec![
+                                pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path)
+                                    .expect("native extension spec"),
+                            ])
+                            .await
+                            .expect("load extension");
+                        session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+                        let input = if with_image {
+                            PromptInput::Content {
+                                content: vec![
+                                    ContentBlock::Text(pi::model::TextContent::new("first turn")),
+                                    ContentBlock::Image(pi::model::ImageContent {
+                                        data: "aGVsbG8=".to_string(),
+                                        mime_type: "image/png".to_string(),
+                                    }),
+                                ],
+                                keyword_scan_source: None,
+                            }
+                        } else {
+                            PromptInput::Text {
+                                text: "first turn".to_string(),
+                                keyword_scan_source: None,
+                            }
+                        };
+                        let result = run_print_recovery_fixture(&mut session, input)
+                            .await
+                            .expect("recovered turn");
+                        assert_eq!(result.stop_reason, StopReason::Stop);
+                        let expected = Some(override_prompt.unwrap_or("ordinary-system").to_string());
+                        assert_eq!(
+                            *provider.prompts.lock().expect("recorded prompts"),
+                            vec![expected.clone(), expected],
+                            "transport_error={transport_error}, image={with_image}, override={override_prompt:?}"
+                        );
+                        assert_eq!(session.agent.system_prompt(), Some("ordinary-system"));
+                        let cx = pi::agent_cx::AgentCx::for_request();
+                        let hook_count = session
+                            .session
+                            .lock(cx.cx())
+                            .await
+                            .expect("session lock")
+                            .to_messages_for_current_path()
+                            .into_iter()
+                            .filter(|message| matches!(
+                                message, pi::model::Message::Custom(custom)
+                                    if custom.custom_type == "print-prompt-hook"
+                            ))
+                            .count();
+                        assert_eq!(hook_count, 1, "recovery must not replay start hooks");
+                        let _extension = session.extensions.take();
+                        run_print_recovery_fixture(
+                            &mut session,
+                            PromptInput::Text {
+                                text: "next turn".to_string(),
+                                keyword_scan_source: None,
+                            },
+                        )
+                        .await
+                        .expect("next turn");
+                        assert_eq!(
+                            provider.prompts.lock().expect("next prompt").last(),
+                            Some(&Some("ordinary-system".to_string()))
+                        );
+                        assert_eq!(session.agent.system_prompt(), Some("ordinary-system"));
+                    }
+                }
+            }
+        }));
+    }
+
+    #[test]
+    fn print_recovery_uses_live_model_capacity_for_silent_overflow() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            for (capacity, tokens, expected_calls) in [
+                (Some(8_192), 8_193, 1),
+                (Some(8_192), 8_192, 2),
+                (Some(0), 8_193, 2),
+                (None, 8_193, 2),
+            ] {
+                let provider = Arc::new(PrintRecoveryProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    prompts: StdMutex::new(Vec::new()),
+                    input_tokens: tokens,
+                    transport_error: false,
+                });
+                let mut session = print_recovery_session(&provider);
+                let root = tempfile::tempdir().expect("auth tempdir");
+                if let Some(capacity) = capacity {
+                    let auth = AuthStorage::empty_at(root.path().join("auth.json"));
+                    let mut registry = ModelRegistry::load(&auth, None);
+                    let mut entry = pi::models::ad_hoc_model_entry("openai", "test-model")
+                        .expect("model entry");
+                    entry.model.provider = "print-recovery".to_string();
+                    entry.model.context_window = capacity;
+                    entry.api_key = Some("fixture-key".to_string());
+                    registry.merge_entries(vec![entry]);
+                    session.set_model_registry(registry);
+                }
+                let result = run_print_recovery_fixture(
+                    &mut session,
+                    PromptInput::Text {
+                        text: "hello".to_string(),
+                        keyword_scan_source: None,
+                    },
+                )
+                .await
+                .expect("classified turn");
+                assert_eq!(
+                    provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    expected_calls,
+                    "capacity={capacity:?}, input tokens={tokens}"
+                );
+                assert_eq!(
+                    result.stop_reason,
+                    if expected_calls == 1 {
+                        StopReason::Error
+                    } else {
+                        StopReason::Stop
+                    }
+                );
+            }
+        }));
     }
 
     struct PersistencePoisonProvider {

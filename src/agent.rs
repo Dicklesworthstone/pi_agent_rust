@@ -16718,10 +16718,12 @@ impl AgentSession {
             .await
     }
 
-    /// Capture the hook-selected base for the SDK's logical recovery turn.
+    /// Capture the hook-selected base for one logical recovery turn.
     /// Semantic context and keyword directives are applied later by the agent
     /// and must not become part of the base reapplied on every attempt.
-    pub(crate) async fn run_text_with_abort_capturing_prompt(
+    /// Keep this snapshot only until this logical turn completes; continue it
+    /// with [`Self::run_continue_with_abort_and_system_prompt`] after recovery.
+    pub async fn run_text_with_abort_capturing_prompt(
         &mut self,
         input: String,
         abort: Option<AbortSignal>,
@@ -16801,7 +16803,9 @@ impl AgentSession {
         .await
     }
 
-    pub(crate) async fn run_with_content_with_abort_capturing_prompt(
+    /// Capture the effective turn prompt while admitting native content once.
+    /// Recovery uses the captured prompt without replaying input/start hooks.
+    pub async fn run_with_content_with_abort_capturing_prompt(
         &mut self,
         content: Vec<ContentBlock>,
         abort: Option<AbortSignal>,
@@ -17646,18 +17650,40 @@ impl AgentSession {
     }
 
     /// Reuse the first attempt's extension prompt without replaying its hooks.
-    /// The SDK owns this snapshot only for the duration of one logical turn.
-    pub(crate) async fn run_continue_with_abort_and_system_prompt(
+    /// The caller owns this snapshot only for the duration of one logical turn.
+    /// The session's ordinary prompt is restored when this attempt ends.
+    pub async fn run_continue_with_abort_and_system_prompt(
         &mut self,
         abort: Option<AbortSignal>,
         turn_system_prompt: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_continue_with_follow_up_with_abort_and_system_prompt(
+            false,
+            abort,
+            turn_system_prompt,
+            || true,
+            on_event,
+        )
+        .await
+    }
+
+    /// Keep a logical turn's prompt while admitting follow-up input at the
+    /// existing durable continuation boundary. RPC uses this when input was
+    /// queued just as an attempt finished, including after a recovered attempt.
+    pub(crate) async fn run_continue_with_follow_up_with_abort_and_system_prompt(
+        &mut self,
+        follow_up_first: bool,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: Option<&str>,
+        on_ready: impl FnOnce() -> bool + Send + 'static,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         let prompt_scope =
             SessionTurnPromptGuard::new(self, turn_system_prompt.map(str::to_string));
         prompt_scope
             .session
-            .run_continue_with_abort(abort, on_event)
+            .run_continue_with_follow_up_with_abort(follow_up_first, abort, on_ready, on_event)
             .await
     }
 

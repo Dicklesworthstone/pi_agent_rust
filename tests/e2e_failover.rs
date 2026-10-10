@@ -257,6 +257,115 @@ fn e2e_failover_429_walks_chain_and_completes() {
     harness.record_artifact("e2e_failover_429.jsonl", &path);
 }
 
+/// Observe the actual provider request bodies: retries and the replacement
+/// provider must receive the same hook-selected instructions as attempt one.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_print_and_rpc_keep_extension_prompt_through_retry_and_failover() {
+    const TURN_PROMPT: &str = "Keep the approved per-turn instructions on every provider attempt.";
+    for mode in ["print", "rpc"] {
+        let harness = TestHarness::new(&format!("e2e_{mode}_recovery_prompt"));
+        let server = harness.start_mock_http_server();
+        server.add_route(
+            "POST",
+            "/primary/v1/chat/completions",
+            error_response(
+                429,
+                r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            ),
+        );
+        server.add_route(
+            "POST",
+            "/backup/v1/chat/completions",
+            sse_response(text_sse_body("recovered with the turn instructions")),
+        );
+        let env = PiEnv::new(&harness);
+        env.write_models(&server.base_url());
+        std::fs::write(
+            env.root.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "retry": {
+                    "enabled": true, "maxRetries": 1,
+                    "baseDelayMs": 1, "maxDelayMs": 1,
+                    "fallbackChains": {"default": ["e2ebackup/backup-model"]}
+                },
+                "checkForUpdates": false
+            }))
+            .expect("encode settings"),
+        )
+        .expect("write settings");
+        let extension = env.root.join("turn-prompt.native.json");
+        std::fs::write(
+            &extension,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "recovery-prompt", "name": "recovery-prompt", "version": "1.0.0",
+                "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                "eventHooks": ["before_agent_start"],
+                "eventResponses": {"before_agent_start": {"systemPrompt": TURN_PROMPT}}
+            }))
+            .expect("encode extension"),
+        )
+        .expect("write extension");
+        let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+        let mut command = env.command(&binary);
+        command
+            .args([
+                "--provider",
+                "e2eprimary",
+                "--model",
+                "primary-model",
+                "--system-prompt",
+                "ordinary-system",
+                "--no-extensions",
+                "-e",
+            ])
+            .arg(&extension);
+        if mode == "print" {
+            command.args(["--print", "--mode", "json", "--no-session", "ping"]);
+        } else {
+            command.arg("--rpc").stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().expect("spawn recovery process");
+        if mode == "rpc" {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("RPC stdin");
+            writeln!(stdin, r#"{{"type":"prompt","id":"prompt","message":"ping"}}"#)
+                .expect("write prompt");
+        }
+        let (stdout, stderr) = run_and_collect(child, 60);
+        assert!(
+            stdout.contains("recovered with the turn instructions"),
+            "{mode}: fallback did not complete\n{stdout}\n{stderr}"
+        );
+        let requests = server
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.ends_with("/chat/completions"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3, "{mode}: first attempt, retry and fallback");
+        assert_eq!(requests[0].path, "/primary/v1/chat/completions");
+        assert_eq!(requests[1].path, "/primary/v1/chat/completions");
+        assert_eq!(requests[2].path, "/backup/v1/chat/completions");
+        for request in requests {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("provider request JSON");
+            let systems = body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .map(|message| message["content"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                systems,
+                vec![serde_json::json!(TURN_PROMPT)],
+                "{mode}: {} lost or duplicated the hook prompt",
+                request.path
+            );
+        }
+    }
+}
+
 /// Run `pi --rpc` with ONE piped prompt against the mock server and return the
 /// parsed event stream plus the raw stdout/stderr for diagnostics.
 ///
