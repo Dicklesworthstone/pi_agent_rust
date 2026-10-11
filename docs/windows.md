@@ -52,6 +52,13 @@ Pi attempts to use the system clipboard for `/copy` and image pasting.
 - When configuring paths in JSON (e.g. `settings.json`), remember to escape backslashes: `C:\Users\Name\.pi`.
 - Use forward slashes in `settings.json` for cross-platform compatibility if possible (`C:/Users/Name/.pi`).
 
+Extensions importing `node:path` receive Windows path behavior on Windows,
+including drive letters, UNC shares, `sep = "\\"`, and `delimiter = ";"`.
+`path.win32` and `path.posix` are also available explicitly on every host.
+Relative paths resolve against the extension runtime's working directory.
+The runtime reports `process.platform` as `win32` on Windows even when access
+to environment variables is disabled.
+
 ## Shell Commands
 
 - The `bash` tool and `!command` shortcuts use the bash chosen above (see "Shell Requirements").

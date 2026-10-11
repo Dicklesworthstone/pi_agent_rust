@@ -15,7 +15,7 @@ capability-gated hostcall interface.
 
 | Module | Coverage | Key APIs |
 |--------|----------|----------|
-| `node:path` | Full | `join`, `dirname`, `resolve`, `basename`, `relative`, `isAbsolute`, `extname`, `normalize`, `parse`, `format`, `sep`, `delimiter`, `posix` |
+| `node:path` | Full | `join`, `dirname`, `resolve`, `basename`, `relative`, `isAbsolute`, `extname`, `normalize`, `parse`, `format`, `toNamespacedPath`, `sep`, `delimiter`, `posix`, `win32`; native platform default |
 | `node:os` | Full | `homedir`, `tmpdir`, `hostname`, `platform`, `arch`, `type`, `release`, `cpus`, `totalmem`, `freemem`, `uptime`, `loadavg`, `networkInterfaces`, `userInfo`, `endianness`, `EOL`, `devNull`, `constants` |
 | `node:fs` | Partial | `readFileSync`, `writeFileSync`, `existsSync`, `readdirSync`, `statSync`, `mkdirSync`, `rmdirSync`, `unlinkSync`, `renameSync`, `symlinkSync`, `readlinkSync`, `realpathSync`, `copyFileSync`, `appendFileSync`, `chmodSync`/`chownSync` path checks, `accessSync`, `lstatSync`, `openSync`, `closeSync`, `readSync`, `writeSync`, `fstatSync`, `createReadStream`, `createWriteStream`, `promises.*`, callback variants |
 | `node:buffer` | Full | `Buffer.from`, `Buffer.alloc`, `Buffer.allocUnsafe`, `Buffer.concat`, `Buffer.isBuffer`, `Buffer.byteLength`, `toString(encoding)` (utf8, hex, base64, latin1, ascii) |

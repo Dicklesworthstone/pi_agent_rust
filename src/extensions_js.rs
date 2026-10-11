@@ -10864,17 +10864,18 @@ export default { config, parse };
     modules.insert(
         "node:path".to_string(),
         compressed_js_literal!(r#"
+function buildPosixPath() {
 function __pi_is_abs(s) {
   return s.startsWith("/") || (s.length >= 3 && s[1] === ":" && s[2] === "/");
 }
 
-export function join(...parts) {
+function join(...parts) {
   const cleaned = parts.map((p) => String(p ?? "").replace(/\\/g, "/")).filter((p) => p.length > 0);
   if (cleaned.length === 0) return ".";
   return normalize(cleaned.join("/"));
 }
 
-export function dirname(p) {
+function dirname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const idx = s.lastIndexOf("/");
   if (idx <= 0) return s.startsWith("/") ? "/" : ".";
@@ -10884,7 +10885,7 @@ export function dirname(p) {
   return dir;
 }
 
-export function resolve(...parts) {
+function resolve(...parts) {
   const base =
     globalThis.pi && globalThis.pi.process && typeof globalThis.pi.process.cwd === "string"
       ? globalThis.pi.process.cwd
@@ -10907,7 +10908,7 @@ export function resolve(...parts) {
   return normalize(out);
 }
 
-export function basename(p, ext) {
+function basename(p, ext) {
   const s = String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = s.lastIndexOf("/");
   const name = idx === -1 ? s : s.slice(idx + 1);
@@ -10917,7 +10918,7 @@ export function basename(p, ext) {
   return name;
 }
 
-export function relative(from, to) {
+function relative(from, to) {
   const fromParts = String(from ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
   const toParts = String(to ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
 
@@ -10932,12 +10933,12 @@ export function relative(from, to) {
   return result.join("/") || ".";
 }
 
-export function isAbsolute(p) {
+function isAbsolute(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   return __pi_is_abs(s);
 }
 
-export function extname(p) {
+function extname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const b = s.lastIndexOf("/");
   const name = b === -1 ? s : s.slice(b + 1);
@@ -10946,7 +10947,7 @@ export function extname(p) {
   return name.slice(dot);
 }
 
-export function normalize(p) {
+function normalize(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = __pi_is_abs(s);
   const parts = s.split("/").filter(Boolean);
@@ -10960,7 +10961,7 @@ export function normalize(p) {
   return isAbs ? "/" + result : result || ".";
 }
 
-export function parse(p) {
+function parse(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = s.startsWith("/");
   const lastSlash = s.lastIndexOf("/");
@@ -10972,21 +10973,224 @@ export function parse(p) {
   return { root, dir, base, ext, name };
 }
 
-export function format(pathObj) {
+function format(pathObj) {
   const dir = pathObj.dir || pathObj.root || "";
   const base = pathObj.base || (pathObj.name || "") + (pathObj.ext || "");
   if (!dir) return base;
   return dir === pathObj.root ? dir + base : dir + "/" + base;
 }
 
-export const sep = "/";
-export const delimiter = ":";
-export const posix = { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter };
+return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+  sep: "/", delimiter: ":", toNamespacedPath: (p) => p };
+}
 
-const win32Stub = new Proxy({}, { get(_, prop) { throw new Error("path.win32." + String(prop) + " is not supported (Pi runs on POSIX only)"); } });
-export const win32 = win32Stub;
+function buildWindowsPath() {
+  const separator = (ch) => ch === "\\" || ch === "/";
+  function stringPath(p) {
+    if (typeof p !== "string") throw new TypeError("Path must be a string");
+    return p;
+  }
+  // Keep the root separate from lexical components: '..' must never remove a
+  // drive, UNC server or share. Preserve original separators for parse/dirname.
+  function rootOf(p, lexical = false) {
+    // Device namespaces resolve components after their prefix; parse/dirname
+    // retain the original device component in the returned root instead.
+    if (lexical && separator(p[0]) && separator(p[1]) && (p[2] === "?" || p[2] === ".") && separator(p[3])) {
+      return { device: "\\\\" + p[2], absolute: true, end: 4 };
+    }
+    if (/^[A-Za-z]:/.test(p)) {
+      const absolute = separator(p[2]);
+      return { device: p.slice(0, 2), absolute, end: absolute ? 3 : 2 };
+    }
+    if (!separator(p[0])) return { device: "", absolute: false, end: 0 };
+    if (separator(p[1]) && p.length > 2 && !separator(p[2])) {
+      let end = 2;
+      while (end < p.length && !separator(p[end])) end++;
+      const server = p.slice(2, end);
+      while (end < p.length && separator(p[end])) end++;
+      const shareStart = end;
+      while (end < p.length && !separator(p[end])) end++;
+      if (end > shareStart) {
+        return {
+          device: "\\\\" + server + "\\" + p.slice(shareStart, end),
+          absolute: true,
+          end: end < p.length ? end + 1 : end,
+        };
+      }
+    }
+    return { device: "", absolute: true, end: 1 };
+  }
+  function components(tail, absolute) {
+    const result = [];
+    for (const part of tail.split(/[\\/]+/)) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (result.length && result[result.length - 1] !== "..") result.pop();
+        else if (!absolute) result.push(part);
+      } else result.push(part);
+    }
+    return result.join("\\");
+  }
+  function normalize(p) {
+    stringPath(p);
+    if (!p) return ".";
+    const root = rootOf(p, true);
+    let tail = components(p.slice(root.end), root.absolute);
+    if (!tail && !root.absolute) tail = ".";
+    if (tail && separator(p[p.length - 1])) tail += "\\";
+    // Normalization may expose a drive-looking component after removing '..'.
+    // Keep a relative input relative instead of turning it into another drive.
+    if (!root.device && !root.absolute && (/^[A-Za-z]:/.test(tail) || /:(?:$|[\\/])/.test(p))) tail = ".\\" + tail;
+    return root.device + (root.absolute ? "\\" : "") + tail;
+  }
+  function cwd() {
+    // Only the runtime's configured process snapshot is consulted; path
+    // operations never inspect the host filesystem or ambient environment.
+    const process = globalThis.pi && globalThis.pi.process;
+    return process && typeof process.cwd === "string" ? process.cwd : "/";
+  }
+  function driveCwd(device) {
+    // The process env proxy reads the configured snapshot under its normal
+    // capability policy. An unavailable per-drive directory falls back safely.
+    const process = globalThis.process;
+    const saved = process && process.env && process.env["=" + device.toUpperCase()];
+    if (typeof saved === "string") {
+      const root = rootOf(saved);
+      if (root.absolute && root.device.toLowerCase() === device.toLowerCase()) return saved;
+    }
+    const current = cwd();
+    const root = rootOf(current);
+    if (root.device && root.device.toLowerCase() !== device.toLowerCase()) return device + "\\";
+    return current;
+  }
+  function resolve(...paths) {
+    // Validate even ignored left-hand segments, before interpreting any path.
+    paths.forEach(stringPath);
+    let device = "";
+    let absolute = false;
+    let tail = "";
+    for (let index = paths.length - 1; index >= -1; index--) {
+      const p = index >= 0 ? paths[index] : device ? driveCwd(device) : cwd();
+      if (!p) continue;
+      const root = rootOf(p, true);
+      if (root.device) {
+        if (device && root.device.toLowerCase() !== device.toLowerCase()) continue;
+        if (!device) device = root.device;
+      }
+      if (!absolute) {
+        tail = p.slice(root.end) + "\\" + tail;
+        absolute = root.absolute;
+      }
+      if (absolute && device) break;
+    }
+    tail = components(tail, absolute);
+    return device + (absolute ? "\\" : "") + tail || ".";
+  }
+  function join(...paths) {
+    paths.forEach(stringPath);
+    const parts = paths.filter((p) => p.length > 0);
+    if (!parts.length) return ".";
+    let joined = parts.join("\\");
+    const first = parts[0];
+    // Joining ordinary rooted segments must not accidentally invent a UNC
+    // share. A UNC prefix must already be present in the first segment.
+    if (!(separator(first[0]) && separator(first[1]) && first.length > 2 && !separator(first[2]))) {
+      joined = joined.replace(/^[\\/]{2,}/, "\\");
+    }
+    return normalize(joined);
+  }
+  function basename(p, suffix) {
+    stringPath(p);
+    if (suffix !== undefined) stringPath(suffix);
+    if (p === suffix) return "";
+    const floor = /^[A-Za-z]:/.test(p) ? 2 : 0;
+    let end = p.length;
+    while (end > floor && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > floor && !separator(p[start - 1])) start--;
+    let base = p.slice(start, end);
+    if (suffix && suffix.length < base.length && base.endsWith(suffix)) base = base.slice(0, -suffix.length);
+    return base;
+  }
+  function extension(base) {
+    const dot = base.lastIndexOf(".");
+    return dot <= 0 || base === ".." ? "" : base.slice(dot);
+  }
+  function extname(p) {
+    return extension(basename(p));
+  }
+  function parse(p) {
+    stringPath(p);
+    const root = rootOf(p);
+    let end = p.length;
+    while (end > root.end && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > root.end && !separator(p[start - 1])) start--;
+    const base = p.slice(start, end);
+    const ext = extension(base);
+    return {
+      root: p.slice(0, root.end),
+      dir: p.slice(0, start > root.end ? start - 1 : root.end),
+      base, ext, name: ext ? base.slice(0, -ext.length) : base,
+    };
+  }
+  function dirname(p) {
+    return parse(p).dir || ".";
+  }
+  function relative(from, to) {
+    const origin = resolve(stringPath(from));
+    const destination = resolve(stringPath(to));
+    if (origin.toLowerCase() === destination.toLowerCase()) return "";
+    const left = origin.split("\\").filter(Boolean);
+    const right = destination.split("\\").filter(Boolean);
+    let common = 0;
+    while (common < left.length && common < right.length && left[common].toLowerCase() === right[common].toLowerCase()) common++;
+    // Distinct drives or UNC hosts have no relative filesystem path.
+    if (!common || origin.startsWith("\\\\") !== destination.startsWith("\\\\")) return destination;
+    return [...Array(left.length - common).fill(".."), ...right.slice(common)].join("\\");
+  }
+  function isAbsolute(p) {
+    return rootOf(stringPath(p)).absolute;
+  }
+  function format(pathObj) {
+    if (!pathObj || typeof pathObj !== "object" || Array.isArray(pathObj)) throw new TypeError("Path object must be an object");
+    const dir = pathObj.dir || pathObj.root || "";
+    const ext = pathObj.ext || "";
+    const base = pathObj.base || (pathObj.name || "") + (ext && !ext.startsWith(".") ? "." + ext : ext);
+    if (!dir) return base;
+    return dir === pathObj.root ? dir + base : dir + "\\" + base;
+  }
+  function toNamespacedPath(p) {
+    if (typeof p !== "string" || !p) return p;
+    const full = resolve(p);
+    if (full.length <= 2) return p;
+    if (full.startsWith("\\\\") && full[2] !== "?" && full[2] !== ".") return "\\\\?\\UNC\\" + full.slice(2);
+    if (/^[A-Za-z]:\\/.test(full)) return "\\\\?\\" + full;
+    return full;
+  }
+  return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+    sep: "\\", delimiter: ";", toNamespacedPath };
+}
 
-export default { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter, posix, win32 };
+export const posix = buildPosixPath();
+export const win32 = buildWindowsPath();
+posix.posix = win32.posix = posix;
+posix.win32 = win32.win32 = win32;
+const nativePath = globalThis.process && globalThis.process.platform === "win32" ? win32 : posix;
+export const join = nativePath.join;
+export const dirname = nativePath.dirname;
+export const resolve = nativePath.resolve;
+export const basename = nativePath.basename;
+export const relative = nativePath.relative;
+export const isAbsolute = nativePath.isAbsolute;
+export const extname = nativePath.extname;
+export const normalize = nativePath.normalize;
+export const parse = nativePath.parse;
+export const format = nativePath.format;
+export const sep = nativePath.sep;
+export const delimiter = nativePath.delimiter;
+export const toNamespacedPath = nativePath.toNamespacedPath;
+export default nativePath;
 "#)
         .trim()
         .to_string(),
@@ -18510,6 +18714,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let default_hostcall_timeout_ms = self.config.limits.hostcall_timeout_ms;
         let process_cwd = self.config.cwd.clone();
         let process_args = self.config.args.clone();
+        // Platform is runtime metadata, independent of permission to read env.
+        // PI_PLATFORM was supplied by the host at runtime construction above.
+        let process_platform = self
+            .config
+            .env
+            .get("PI_PLATFORM")
+            .cloned()
+            .unwrap_or_else(|| std::env::consts::OS.to_string());
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -18992,6 +19204,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         move |_ctx: Ctx<'_>| -> rquickjs::Result<String> { Ok(process_cwd.clone()) }
                     }),
+                )?;
+
+                global.set(
+                    "__pi_process_platform_native",
+                    Func::from(move || process_platform.clone()),
                 )?;
 
                 // __pi_process_args_native() -> string[]
@@ -24256,17 +24473,14 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
 }
 
 if (typeof globalThis.process === 'undefined') {
-    const rawPlatform =
-        __pi_env_get_native('PI_PLATFORM') ||
-        __pi_env_get_native('OSTYPE') ||
-        __pi_env_get_native('OS') ||
-        'linux';
+    const rawPlatform = __pi_process_platform_native();
     // Normalize to Node.js conventions: strip version suffix from OSTYPE
     // (e.g. darwin24.0 -> darwin, linux-gnu -> linux, msys -> win32)
     const platform = (() => {
-        const s = String(rawPlatform).replace(/[0-9].*$/, '').split('-')[0].toLowerCase();
+        const raw = String(rawPlatform).toLowerCase();
+        if (raw === 'win32' || raw === 'windows' || raw === 'windows_nt' || raw === 'msys' || raw === 'cygwin') return 'win32';
+        const s = raw.replace(/[0-9].*$/, '').split('-')[0];
         if (s === 'darwin') return 'darwin';
-        if (s === 'msys' || s === 'cygwin' || s === 'windows_nt') return 'win32';
         return s || 'linux';
     })();
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
@@ -32197,7 +32411,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         globalThis.pathResults.isAbsRoot = path.isAbsolute('/foo/bar');
                         globalThis.pathResults.isAbsRel = path.isAbsolute('foo/bar');
                         globalThis.pathResults.extJs = path.extname('/a/b/file.js');
@@ -34138,7 +34352,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults2 = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         // relative
                         globalThis.pathResults2.relSameDir = path.relative('/a/b/c', '/a/b/c/d');
                         globalThis.pathResults2.relUp = path.relative('/a/b/c', '/a/b');
@@ -34189,6 +34403,195 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             // join doesn't normalize; normalize is separate
             let join_dots = r["joinDots"].as_str().unwrap();
             assert!(join_dots == "b" || join_dots == "a/../b");
+        });
+    }
+
+    #[test]
+    fn pijs_windows_path_defaults_survive_denied_environment_access() {
+        futures::executor::block_on(async {
+            for deny_env in [true, false] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: r"C:\work\project".to_string(),
+                    env: HashMap::from([
+                        ("PI_PLATFORM".to_string(), "win32".to_string()),
+                        ("=D:".to_string(), r"D:\saved".to_string()),
+                    ]),
+                    deny_env,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime =
+                    PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                        .await
+                        .expect("create Windows-path runtime");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const file = path.resolve('note.txt');
+                            fs.writeFileSync(file, 'windows path content');
+                            globalThis.windowsPathDefaults = {
+                                platform: process.platform,
+                                envPlatform: process.env.PI_PLATFORM ?? null,
+                                native: path === mod.win32 && mod.join === path.join,
+                                namespaces: path.posix === mod.posix && path.win32 === mod.win32,
+                                sep: mod.sep,
+                                delimiter: mod.delimiter,
+                                cwd: path.resolve(),
+                                currentDrive: path.resolve('c:src', '..', 'file.rs'),
+                                savedDrive: path.resolve('D:next'),
+                                otherDrive: path.resolve('E:next'),
+                                rooted: path.resolve('C:\\previous', '\\rooted'),
+                                read: fs.readFileSync(path.join(process.cwd(), '.', 'note.txt'), 'utf8'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsPathDefaults = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("eval Windows default path workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsPathDefaults").await;
+                let saved_drive = if deny_env { r"D:\next" } else { r"D:\saved\next" };
+                assert_eq!(
+                    actual,
+                    serde_json::json!({
+                        "platform": "win32",
+                        "envPlatform": if deny_env { serde_json::Value::Null } else { serde_json::json!("win32") },
+                        "native": true,
+                        "namespaces": true,
+                        "sep": "\\",
+                        "delimiter": ";",
+                        "cwd": r"C:\work\project",
+                        "currentDrive": r"c:\work\project\file.rs",
+                        "savedDrive": saved_drive,
+                        "otherDrive": r"E:\next",
+                        "rooted": r"C:\rooted",
+                        "read": "windows path content",
+                        "done": true,
+                    }),
+                    "Windows metadata and path behavior, deny_env={deny_env}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_explicit_windows_paths_preserve_drives_and_unc_roots_on_unix() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: "/virtual/project".to_string(),
+                env: HashMap::from([("PI_PLATFORM".to_string(), "linux".to_string())]),
+                deny_env: true,
+                disk_cache_dir: None,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create Unix-path runtime");
+            runtime
+                .eval(
+                    r"
+                    import('node:path').then((mod) => {
+                        const path = mod.win32;
+                        const invalid = [
+                            () => path.join('C:\\work', {}),
+                            () => path.resolve('C:\\work', null),
+                            () => path.basename('file.txt', 1),
+                            () => path.normalize(undefined),
+                            () => path.parse([]),
+                            () => path.format(null),
+                            () => path.relative('C:\\work', false),
+                        ];
+                        globalThis.windowsPathRoots = {
+                            nativePosix: mod.default === mod.posix && mod.sep === '/',
+                            posixUnchanged: mod.posix.normalize('/a/b/../c') === '/a/c',
+                            driveRoot: path.normalize('C:/../project'),
+                            driveRelative: path.normalize('C:../project'),
+                            uncRoot: path.normalize('\\\\server\\share\\dir\\..\\..\\file'),
+                            bareShare: path.normalize('\\\\server\\share'),
+                            joinShare: path.join('\\\\server', 'share', 'dir', '..', 'file'),
+                            ordinaryRoot: path.join('//', 'server', 'share'),
+                            relativeDrive: path.join('folder', 'C:', 'file'),
+                            exposedDrive: path.normalize('folder\\..\\C:\\file'),
+                            trailing: path.normalize('C:/temp//foo/../'),
+                            caseRelative: path.relative('C:\\Work\\src', 'c:\\work\\tests\\case.rs'),
+                            sameRelative: path.relative('C:\\Work', 'c:\\work'),
+                            differentDrive: path.relative('C:\\work', 'D:\\source\\file'),
+                            sharedServer: path.relative('\\\\srv\\one\\dir', '\\\\srv\\two\\file'),
+                            differentServer: path.relative('\\\\a\\share', '\\\\b\\share\\file'),
+                            resolveSequence: path.resolve('C:\\base', 'C:src', '..', 'out'),
+                            parseDrive: path.parse('C:/source/file.test.rs'),
+                            parseShare: path.parse('\\\\server\\share\\file.txt'),
+                            dirname: path.dirname('C:\\source\\child\\'),
+                            suffix: path.basename('C:\\source\\FILE.TXT', '.txt'),
+                            hiddenExtension: path.extname('C:\\source\\.env'),
+                            parentExtension: path.extname('..'),
+                            extension: path.extname('C:\\source\\file.rs\\'),
+                            format: path.format({ root: 'C:\\', name: 'file', ext: 'rs' }),
+                            absolute: [path.isAbsolute('C:relative'), path.isAbsolute('C:/root'), path.isAbsolute('\\root')],
+                            namespace: path.toNamespacedPath('\\\\server\\share\\file'),
+                            namespaceNormalize: path.normalize('\\\\?\\C:\\path\\..'),
+                            namespaceResolve: path.resolve('\\\\?\\C:\\path', '\\file'),
+                            invalid: invalid.map((call) => {
+                                try { call(); return false; } catch (error) { return error instanceof TypeError; }
+                            }),
+                            done: true,
+                        };
+                    }).catch((error) => {
+                        globalThis.windowsPathRoots = { error: String(error) };
+                    });
+                    ",
+                )
+                .await
+                .expect("eval Windows drive and share workflows");
+            drain_until_idle(&runtime, &clock).await;
+            let actual = get_global_json(&runtime, "windowsPathRoots").await;
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "nativePosix": true,
+                    "posixUnchanged": true,
+                    "driveRoot": r"C:\project",
+                    "driveRelative": r"C:..\project",
+                    "uncRoot": r"\\server\share\file",
+                    "bareShare": "\\\\server\\share\\",
+                    "joinShare": r"\\server\share\file",
+                    "ordinaryRoot": r"\server\share",
+                    "relativeDrive": r".\folder\C:\file",
+                    "exposedDrive": r".\C:\file",
+                    "trailing": "C:\\temp\\",
+                    "caseRelative": r"..\tests\case.rs",
+                    "sameRelative": "",
+                    "differentDrive": r"D:\source\file",
+                    "sharedServer": r"..\..\two\file",
+                    "differentServer": r"\\b\share\file",
+                    "resolveSequence": r"C:\base\out",
+                    "parseDrive": { "root": "C:/", "dir": "C:/source", "base": "file.test.rs", "ext": ".rs", "name": "file.test" },
+                    "parseShare": { "root": "\\\\server\\share\\", "dir": "\\\\server\\share\\", "base": "file.txt", "ext": ".txt", "name": "file" },
+                    "dirname": r"C:\source",
+                    "suffix": "FILE.TXT",
+                    "hiddenExtension": "",
+                    "parentExtension": "",
+                    "extension": ".rs",
+                    "format": r"C:\file.rs",
+                    "absolute": [false, true, true],
+                    "namespace": r"\\?\UNC\server\share\file",
+                    "namespaceNormalize": r"\\?\C:",
+                    "namespaceResolve": r"\\?\file",
+                    "invalid": [true, true, true, true, true, true, true],
+                    "done": true,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
         });
     }
 
