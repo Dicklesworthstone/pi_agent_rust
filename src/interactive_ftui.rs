@@ -65,7 +65,10 @@ use std::collections::{HashMap, VecDeque};
 mod info_commands;
 mod plan_commands;
 pub mod session_pins;
+mod settings;
 mod workspace_commands;
+
+pub use settings::{SettingsKey, SettingsSnapshot};
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -1337,6 +1340,8 @@ impl PickerOverlay {
                     || (item != id && crate::model_selector::fuzzy_match(query, item))
             }
             PickerKind::Theme
+            | PickerKind::Settings
+            | PickerKind::SettingValue(_)
             | PickerKind::Session
             | PickerKind::Rewind
             | PickerKind::ForkFrom
@@ -1391,6 +1396,9 @@ impl PickerOverlay {
 enum PickerKind {
     /// Built-in theme picker (`/theme`): applies the palette UI-side.
     Theme,
+    /// Driver-backed preferences, followed by one setting's validated values.
+    Settings,
+    SettingValue(SettingsKey),
     /// Model picker (`/model` with no arguments): items are
     /// `provider/model-id` strings; selection routes `UiCommand::SetModel`.
     Model,
@@ -1457,6 +1465,10 @@ pub enum UiCommand {
     InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
+    /// Read effective settings from the live session for `/settings` or F2.
+    Settings,
+    /// Save one preference, then apply it to the existing live session.
+    SetSetting { key: SettingsKey, value: String },
     /// Run a shell command. `!cmd` (exclude=false) shows the output AND
     /// submits it to the agent as a turn — the bubbletea semantics; `!!cmd`
     /// (exclude=true) is display-only.
@@ -1756,6 +1768,9 @@ pub struct PiFtuiModel {
     palette: FtuiPalette,
     /// Modal picker overlay; captures all keys while open.
     picker: Option<PickerOverlay>,
+    /// Last driver-confirmed preferences; never updated optimistically.
+    settings_snapshot: Option<SettingsSnapshot>,
+    settings_pending: bool,
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
@@ -2136,6 +2151,8 @@ impl PiFtuiModel {
             usage_line: None,
             palette: FtuiPalette::default(),
             picker: None,
+            settings_snapshot: None,
+            settings_pending: false,
             available_models: Vec::new(),
             model_names: HashMap::new(),
             pending_quit: false,
@@ -2837,6 +2854,14 @@ impl PiFtuiModel {
             PiMsg::AgentStart => {
                 self.state = AgentUiState::Working;
                 self.autocomplete.close();
+                if self.picker.as_ref().is_some_and(|picker| {
+                    matches!(
+                        picker.kind,
+                        PickerKind::Settings | PickerKind::SettingValue(_)
+                    )
+                }) {
+                    self.picker = None;
+                }
                 // Start the spinner tick chain; it dies naturally once the
                 // agent goes idle (Tick reschedules only while Working —
                 // same self-limiting pattern as the bubbletea spinner gate).
@@ -3085,6 +3110,40 @@ impl PiFtuiModel {
             }
             PiMsg::StatusSnapshot(snapshot) => {
                 self.status_snapshot = Some(snapshot);
+            }
+            PiMsg::Settings { snapshot, changed } => {
+                self.settings_pending = false;
+                match changed {
+                    Some(SettingsKey::HideThinking) => {
+                        self.show_thinking = !snapshot.hide_thinking;
+                    }
+                    Some(SettingsKey::MarkdownSpacing) => {
+                        self.markdown_spacing = snapshot.markdown_spacing;
+                    }
+                    Some(SettingsKey::DoubleEscape) => {
+                        self.double_escape_action = snapshot.double_escape;
+                        self.last_idle_escape = None;
+                    }
+                    Some(SettingsKey::AutocompleteRows) => {
+                        self.autocomplete.max_visible = snapshot.autocomplete_rows;
+                        self.autocomplete.close();
+                    }
+                    _ => {}
+                }
+                if matches!(
+                    changed,
+                    Some(SettingsKey::HideThinking | SettingsKey::MarkdownSpacing)
+                ) {
+                    self.render_cache.borrow_mut().clear();
+                }
+                self.settings_snapshot = Some(snapshot);
+                if self.state == AgentUiState::Ready
+                    && self.active_ask.is_none()
+                    && self.active_ext.is_none()
+                    && self.login_pending.is_none()
+                {
+                    self.open_settings_picker();
+                }
             }
             PiMsg::MessagePicker { fork, messages } => {
                 if messages.is_empty() {
@@ -3408,6 +3467,9 @@ impl PiFtuiModel {
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
+        if self.settings_pending {
+            return;
+        }
         let text = self.input.text();
         let trimmed = text.trim();
         if let Some((provider, accepts_empty_input)) = self.login_pending.clone() {
@@ -3621,6 +3683,14 @@ impl PiFtuiModel {
         }
         if canon == "/exit" || canon == "/quit" || canon == "/q" {
             self.pending_quit = true;
+            return true;
+        }
+        if let Some(args) = strip_command(clean, "/settings") {
+            if args.trim().is_empty() {
+                self.request_settings();
+            } else {
+                self.push_entry(EntryRole::Error, String::from("Usage: /settings"));
+            }
             return true;
         }
         // OMP's /plan-review re-opens the review of the latest plan.
@@ -3861,7 +3931,7 @@ impl PiFtuiModel {
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
-                     /context, /todo, /jobs, /stats, /help, \
+                     /context, /todo, /jobs, /stats, /settings (F2), /help, \
                      /restart, /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
@@ -4187,7 +4257,14 @@ impl PiFtuiModel {
                 }
             }
             AppAction::SelectCancel => {
+                let setting_value = self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| matches!(picker.kind, PickerKind::SettingValue(_)));
                 self.picker = None;
+                if setting_value {
+                    self.open_settings_picker();
+                }
             }
             AppAction::SelectConfirm => {
                 // Enter with nothing matching the filter keeps the picker
@@ -4239,6 +4316,46 @@ impl PiFtuiModel {
 
     fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
         match kind {
+            PickerKind::Settings => {
+                let Some(key) = SettingsKey::parse(choice) else {
+                    return;
+                };
+                let current = self
+                    .settings_snapshot
+                    .as_ref()
+                    .map(|settings| settings.value(key));
+                let (items, values) = key
+                    .choices()
+                    .iter()
+                    .map(|(value, label)| {
+                        let selected = current.as_deref() == Some(*value);
+                        (
+                            format!("{label}{}", if selected { " (current)" } else { "" }),
+                            (*value).to_string(),
+                        )
+                    })
+                    .unzip();
+                let mut picker = PickerOverlay::new(
+                    format!("{} (Enter saves, Esc returns)", key.label()),
+                    items,
+                    values,
+                    PickerKind::SettingValue(key),
+                );
+                picker.selected = key
+                    .choices()
+                    .iter()
+                    .position(|(value, _)| current.as_deref() == Some(*value))
+                    .unwrap_or(0);
+                self.picker = Some(picker);
+            }
+            PickerKind::SettingValue(key) => {
+                self.settings_pending = true;
+                self.begin_busy("saving settings ...");
+                self.send_settings_command(UiCommand::SetSetting {
+                    key,
+                    value: choice.to_string(),
+                });
+            }
             PickerKind::Theme => {
                 let theme = if choice == "light" {
                     crate::theme::Theme::light()
@@ -4296,6 +4413,61 @@ impl PiFtuiModel {
                 self.scroll_from_tail = 0;
             }
         }
+    }
+
+    fn request_settings(&mut self) {
+        if self.state != AgentUiState::Ready
+            || self.busy.is_some()
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || self.login_pending.is_some()
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Settings are available when the current operation finishes."),
+            );
+            return;
+        }
+        self.autocomplete.close();
+        self.settings_pending = true;
+        self.begin_busy("loading settings ...");
+        self.send_settings_command(UiCommand::Settings);
+    }
+
+    fn send_settings_command(&mut self, command: UiCommand) {
+        if !self
+            .submit_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(command).is_ok())
+        {
+            self.settings_pending = false;
+            self.busy = None;
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Settings require an active agent session."),
+            );
+        }
+    }
+
+    fn open_settings_picker(&mut self) {
+        let Some(snapshot) = &self.settings_snapshot else {
+            return;
+        };
+        let (items, values) = SettingsKey::ALL
+            .into_iter()
+            .map(|key| {
+                (
+                    format!("{}: {}", key.label(), snapshot.value(key)),
+                    key.id().to_string(),
+                )
+            })
+            .unzip();
+        self.picker = Some(PickerOverlay::new(
+            format!("Settings · {}", sanitize(&snapshot.path.display().to_string())),
+            items,
+            values,
+            PickerKind::Settings,
+        ));
     }
 
     /// Ask the driver for the messages on the current path; the picker opens
@@ -4594,6 +4766,13 @@ impl PiFtuiModel {
                     return Cmd::quit();
                 }
 
+                // A save is already in progress on the driver. Keep the
+                // editor draft and session selection stable until its reply;
+                // Ctrl+C above still works throughout slow filesystem I/O.
+                if self.settings_pending {
+                    return Cmd::none();
+                }
+
                 // Modal picker captures all input while open (same precedence
                 // as the bubbletea modal-capture chain).
                 if self.picker.is_some() {
@@ -4650,6 +4829,7 @@ impl PiFtuiModel {
                     // stack behind a slash command. Both keys are advertised by
                     // /hotkeys and did nothing here until they were routed.
                     .or_else(|| pick(AppAction::SelectModel))
+                    .or_else(|| pick(AppAction::OpenSettings))
                     .or_else(|| pick(AppAction::Help))
                     // shift+tab. Only the driver can see the model's catalog
                     // entry, so the cycle itself lives there; this is the
@@ -4793,6 +4973,10 @@ impl PiFtuiModel {
                         self.route_model_command("");
                         return Cmd::none();
                     }
+                    Some(AppAction::OpenSettings) => {
+                        self.request_settings();
+                        return self.take_busy_tick();
+                    }
                     Some(AppAction::Help) => {
                         self.route_slash_command_tail("/help");
                         return Cmd::none();
@@ -4922,6 +5106,7 @@ impl PiFtuiModel {
                     picker.push_query_str(&paste.text);
                 }
             }
+            Event::Paste(_) if self.settings_pending => {}
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
@@ -8873,11 +9058,34 @@ pub fn run(
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
     let mut driver_resources = autocomplete.resources.clone();
-    let resource_source = autocomplete.resource_source.clone();
+    let mut resource_source = autocomplete.resource_source.clone();
     // `images.autoResize` from settings; default on, as on the classic stack.
-    let auto_resize_images = resource_source
+    let mut auto_resize_images = resource_source
         .as_ref()
         .is_none_or(|source| source.config.image_auto_resize());
+    let mut settings_config = resource_source
+        .as_ref()
+        .map(|source| source.config.clone())
+        .unwrap_or_default();
+    // Match the effective launch preferences, including caller overrides.
+    settings_config.hide_thinking_block = Some(hide_thinking_block);
+    settings_config.markdown.get_or_insert_default().spacing = Some(markdown_spacing);
+    settings_config.autocomplete_max_visible = u32::try_from(autocomplete.max_visible.clamp(1, 20)).ok();
+    settings_config.double_escape_action = Some(
+        match double_escape_action {
+            DoubleEscapeAction::Rewind => "rewind",
+            DoubleEscapeAction::Fork => "fork",
+            DoubleEscapeAction::Tree => "tree",
+            DoubleEscapeAction::None => "none",
+        }
+        .to_string(),
+    );
+    let settings_path = settings::settings_destination(
+        crate::config::Config::config_path_override_from_env(&bash_cwd).as_deref(),
+        &crate::config::Config::global_dir(),
+        &bash_cwd,
+        session_options.workspace_trusted,
+    );
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     // Planning precedes every startup turn. Files have already been read by
@@ -8939,6 +9147,8 @@ pub fn run(
                     &driver_command_registry,
                 ))
                 .await?;
+                let mut settings_controller =
+                    settings::SettingsController::new(settings_config, settings_path, &handle);
                 // Replacements must retain the exact live root set, including
                 // saved roots the SDK restored and later /remove-dir changes.
                 resume_template.workspace = handle.workspace();
@@ -9010,6 +9220,45 @@ pub fn run(
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Settings) => {
+                            let _ = agent_tx.send(PiMsg::Settings {
+                                snapshot: settings_controller.snapshot(&handle),
+                                changed: None,
+                            });
+                        }
+                        Ok(UiCommand::SetSetting { key, value }) => {
+                            let (snapshot, changed) =
+                                match settings_controller.apply(&mut handle, key, &value) {
+                                    Ok(snapshot) => {
+                                        auto_resize_images = snapshot.auto_resize_images;
+                                        if key == SettingsKey::AutoRetry {
+                                            resume_template.retry = handle.retry_policy();
+                                        }
+                                        if key == SettingsKey::AutoCompaction
+                                            && let Some(compaction) =
+                                                &mut resume_template.compaction_settings
+                                        {
+                                            compaction.enabled = snapshot.auto_compaction;
+                                        }
+                                        if let Some(source) = &mut resource_source {
+                                            source.config = settings_controller.config().clone();
+                                        }
+                                        let _ = agent_tx.send(PiMsg::System(format!(
+                                            "{}: {} (saved)",
+                                            key.label(),
+                                            snapshot.value(key),
+                                        )));
+                                        (snapshot, Some(key))
+                                    }
+                                    Err(err) => {
+                                        let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                            "Settings could not be saved: {err}. Live settings are unchanged.",
+                                        )));
+                                        (settings_controller.snapshot(&handle), None)
+                                    }
+                                };
+                            let _ = agent_tx.send(PiMsg::Settings { snapshot, changed });
                         }
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
@@ -10462,8 +10711,8 @@ mod tests {
             "ctrl+o is routed on FTUI now: {text:?}"
         );
         assert!(
-            !text.contains("Open settings"),
-            "unsupported actions like OpenSettings must not be advertised on FTUI: {text:?}"
+            text.contains("Open settings"),
+            "the live settings editor must be advertised on FTUI: {text:?}"
         );
     }
 
@@ -10916,17 +11165,9 @@ mod tests {
     }
 
     #[test]
-    fn every_pi_command_is_either_routed_here_or_named_as_unimplemented() {
-        // Type each canonical pi slash command and see whether this stack
-        // claims it. Whatever it does not claim falls through to extension
-        // dispatch, and the message there must not call a real pi command
-        // "Unknown command" — that reads as "pi is broken" and sends the user
-        // to a /help that lists only what this stack already has.
-        //
-        // This also keeps the size of the ftui/charmed command gap measured
-        // rather than asserted: implementing one here moves it between the two
-        // buckets and the test keeps passing either way.
-        let mut routed = Vec::new();
+    fn every_pi_command_routes_on_the_default_stack() {
+        // /settings was the final advertised command that fell through to
+        // generic extension dispatch. Keep every built-in reachable here.
         let mut unrouted = Vec::new();
         for command in crate::interactive::SlashCommand::ALL {
             let name = command.canonical();
@@ -10937,38 +11178,213 @@ mod tests {
             sim.init();
             type_str(&mut sim, name);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            match submit_rx.try_recv() {
-                Ok(UiCommand::ExtensionCommand { name: sent, .. }) => unrouted.push(sent),
-                _ => routed.push(name),
+            if let Ok(UiCommand::ExtensionCommand { name: sent, .. }) = submit_rx.try_recv() {
+                unrouted.push(sent);
             }
         }
 
         assert!(
-            !routed.is_empty() && !unrouted.is_empty(),
-            "expected both buckets to be non-empty; routed {routed:?}, unrouted {unrouted:?}"
+            unrouted.is_empty(),
+            "the current pi commands must all route on the default stack; missing {unrouted:?}"
         );
-        // The bucket a command lands in is deliberately not frozen — that is
-        // the point of measuring rather than listing — but these five are what
-        // this stack is FOR, and one of them falling through to extension
-        // dispatch is a routing regression, not progress.
-        for core in ["/help", "/model", "/clear", "/new", "/exit"] {
+    }
+
+    fn settings_snapshot_fixture() -> SettingsSnapshot {
+        SettingsSnapshot {
+            path: std::path::PathBuf::from("/workspace/.pi/settings.json"),
+            auto_retry: true,
+            auto_compaction: true,
+            steering: crate::agent::QueueMode::OneAtATime,
+            follow_up: crate::agent::QueueMode::OneAtATime,
+            auto_resize_images: true,
+            hide_thinking: false,
+            markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
+            double_escape: DoubleEscapeAction::Rewind,
+            autocomplete_rows: 8,
+        }
+    }
+
+    #[test]
+    fn settings_picker_round_trip_saves_only_the_selected_choice_and_keeps_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "unfinished draft");
+        sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("F2 request"), UiCommand::Settings);
+        assert!(sim.model().settings_pending);
+        sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+            snapshot: settings_snapshot_fixture(),
+            changed: None,
+        }));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("settings").kind,
+            PickerKind::Settings
+        );
+        assert_eq!(sim.model().input.text(), "unfinished draft");
+
+        // Enter opens the first setting's choices; Down selects Off.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("choices").kind,
+            PickerKind::SettingValue(SettingsKey::AutoRetry)
+        );
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("save request"),
+            UiCommand::SetSetting {
+                key: SettingsKey::AutoRetry,
+                value: "off".to_string(),
+            }
+        );
+        assert!(
+            sim.model()
+                .settings_snapshot
+                .as_ref()
+                .expect("old snapshot")
+                .auto_retry,
+            "a selection is not an acknowledged save"
+        );
+        let mut saved = settings_snapshot_fixture();
+        saved.auto_retry = false;
+        sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+            snapshot: saved,
+            changed: Some(SettingsKey::AutoRetry),
+        }));
+        assert!(
+            !sim.model()
+                .settings_snapshot
+                .as_ref()
+                .expect("saved snapshot")
+                .auto_retry
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("back to settings").kind,
+            PickerKind::Settings
+        );
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+        assert_eq!(sim.model().input.text(), "unfinished draft");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "dismissing settings must not submit a prompt"
+        );
+    }
+
+    #[test]
+    fn settings_route_obeys_extension_ownership_busy_admission_and_custom_hotkeys() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        assert!(model.route_slash_command("/settings"));
+        assert_eq!(
+            submit_rx.try_recv().expect("slash request"),
+            UiCommand::Settings
+        );
+        model.handle_agent(PiMsg::Settings {
+            snapshot: settings_snapshot_fixture(),
+            changed: None,
+        });
+        model.picker = None;
+        model.state = AgentUiState::Working;
+        model.request_settings();
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "mid-turn settings must be refused"
+        );
+        model.state = AgentUiState::Ready;
+        model
+            .extension_commands
+            .push(crate::autocomplete::NamedEntry {
+                name: "settings".to_string(),
+                description: None,
+            });
+        assert!(model.route_slash_command("/settings extension-args"));
+        assert_eq!(
+            submit_rx.try_recv().expect("extension wins"),
+            UiCommand::RegisteredExtensionCommand {
+                name: "settings".to_string(),
+                args: "extension-args".to_string(),
+            }
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(&path, r#"{"openSettings":["ctrl+j"]}"#).expect("custom keybinding");
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_keybindings(KeyBindings::load(&path).expect("bindings"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(
+            submit_rx.try_recv().expect("custom settings shortcut"),
+            UiCommand::Settings
+        );
+    }
+
+    #[test]
+    fn unavailable_settings_driver_releases_the_editor_and_reports_failure() {
+        for disconnected in [false, true] {
+            let (_tx, mut model) = new_model();
+            if disconnected {
+                let (submit_tx, submit_rx) = mpsc::channel();
+                drop(submit_rx);
+                model = model.with_submit_channel(submit_tx);
+            }
+            model.input.set_text("unfinished draft");
+            model.request_settings();
+            assert!(!model.settings_pending);
+            assert!(model.busy.is_none());
+            assert_eq!(model.input.text(), "unfinished draft");
             assert!(
-                routed.contains(&core),
-                "{core} must be handled here, not dispatched as an extension command; \
-                 routed {routed:?}"
+                model
+                    .transcript
+                    .last()
+                    .expect("failure message")
+                    .text
+                    .contains("active agent session")
             );
         }
-        for name in &unrouted {
-            let message = unrouted_command_message(name, true);
-            assert!(
-                message.contains("does not implement yet") && message.contains("--classic"),
-                "/{name} is a real pi command; this stack must say so: {message}"
-            );
-            assert!(
-                !message.contains("Unknown command"),
-                "/{name} is a real pi command and must not be called unknown: {message}"
-            );
-        }
+    }
+
+    #[test]
+    fn settings_acknowledgement_updates_only_the_selected_live_display_preference() {
+        let (_tx, mut model) = new_model();
+        model.show_thinking = false; // An unsaved Ctrl+T preference.
+        let mut snapshot = settings_snapshot_fixture();
+        snapshot.markdown_spacing = crate::config::MarkdownSpacing::Compact;
+        model.handle_agent(PiMsg::Settings {
+            snapshot: snapshot.clone(),
+            changed: Some(SettingsKey::MarkdownSpacing),
+        });
+        assert_eq!(
+            model.markdown_spacing,
+            crate::config::MarkdownSpacing::Compact
+        );
+        assert!(
+            !model.show_thinking,
+            "unrelated settings must preserve Ctrl+T state"
+        );
+        snapshot.autocomplete_rows = 15;
+        model.handle_agent(PiMsg::Settings {
+            snapshot: snapshot.clone(),
+            changed: Some(SettingsKey::AutocompleteRows),
+        });
+        assert_eq!(model.autocomplete.max_visible, 15);
+        snapshot.double_escape = DoubleEscapeAction::None;
+        model.handle_agent(PiMsg::Settings {
+            snapshot,
+            changed: Some(SettingsKey::DoubleEscape),
+        });
+        assert_eq!(model.double_escape_action, DoubleEscapeAction::None);
     }
 
     #[test]

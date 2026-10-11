@@ -1222,7 +1222,7 @@ pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
 pub const fn is_inert_on_ftui(action: AppAction) -> bool {
     matches!(
         action,
-        AppAction::OpenSettings | AppAction::Copy | AppAction::Yank | AppAction::YankPop
+        AppAction::Copy | AppAction::Yank | AppAction::YankPop
     )
 }
 
@@ -3060,8 +3060,8 @@ mod tests {
             assert!(ftui_hotkeys.contains("Open in external editor"));
             assert!(ftui_hotkeys.contains("Clear editor"));
 
+            assert!(ftui_hotkeys.contains("Open settings"));
             // Inert actions on FTUI are omitted:
-            assert!(!ftui_hotkeys.contains("Open settings"));
             assert!(!ftui_hotkeys.contains("Copy selection"));
             // Routed: the pasted image becomes an `@file` attachment.
             assert!(ftui_hotkeys.contains("Paste image from clipboard"));

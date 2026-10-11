@@ -862,7 +862,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "settings",
-            description: "Show current settings summary",
+            description: "Edit and save session preferences",
         },
         BuiltinSlashCommand {
             name: "theme",

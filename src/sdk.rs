@@ -3058,6 +3058,19 @@ impl AgentSessionHandle {
         &mut self.session
     }
 
+    /// The recovery policy used by the next turn. `None` disables both
+    /// automatic retries and fallback-provider requests.
+    pub const fn retry_policy(&self) -> Option<crate::failover::RetryPolicy> {
+        self.retry
+    }
+
+    /// Change recovery for subsequent turns without discarding fallback
+    /// credentials, chain position, or the current primary's cooldown.
+    /// Hosts can retain [`Self::retry_policy`] when temporarily disabling it.
+    pub const fn set_retry_policy(&mut self, policy: Option<crate::failover::RetryPolicy>) {
+        self.retry = policy;
+    }
+
     /// Apply credentials changed by an interactive login/logout to both the
     /// live model and future fallback candidates, retaining the CLI key pin.
     pub(crate) fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
@@ -4413,6 +4426,41 @@ mod tests {
             base_delay_ms: 1,
             max_delay_ms: 1,
         }
+    }
+
+    #[test]
+    fn changing_retry_policy_controls_subsequent_turns_without_rebuilding_the_session() {
+        let (mut handle, calls) = flaky_handle(2);
+        let store = handle.session_store();
+        let policy = fast_retry_policy(3);
+        handle.set_retry_policy(None);
+        let first = run_async(handle.prompt("first", |_| {})).expect("first turn");
+        assert_eq!(first.stop_reason, crate::model::StopReason::Error);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        handle.set_retry_policy(Some(policy));
+        let second = run_async(handle.prompt("second", |_| {})).expect("recovered turn");
+        assert_eq!(second.stop_reason, crate::model::StopReason::Stop);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(Arc::ptr_eq(&store, &handle.session_store()));
+    }
+
+    #[test]
+    fn toggling_retry_preserves_the_active_fallback_and_primary_cooldown() {
+        let mut handle = handle_after_one_failover(3600);
+        let policy = handle.retry_policy().expect("recovery policy");
+        let fallback = Arc::clone(handle.failover.as_ref().expect("fallback configuration"));
+        let before = format!("{:?}", handle.failover_state);
+        let model = handle.model();
+        handle.set_retry_policy(None);
+        assert_eq!(handle.model(), model);
+        assert_eq!(format!("{:?}", handle.failover_state), before);
+        handle.set_retry_policy(Some(policy));
+        assert!(Arc::ptr_eq(
+            handle.failover.as_ref().expect("same fallback"),
+            &fallback
+        ));
+        assert_eq!(format!("{:?}", handle.failover_state), before);
     }
 
     /// The gap bd-u2qv4 names: a transient provider failure is a hard error on

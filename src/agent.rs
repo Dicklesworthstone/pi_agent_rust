@@ -14695,6 +14695,16 @@ impl AgentSession {
         &self.compaction_settings
     }
 
+    /// Enable or pause automatic compaction without changing the model's
+    /// context window or the configured summary/token budgets. Disabling it
+    /// also invalidates a summary already running in the background.
+    pub fn set_auto_compaction(&mut self, enabled: bool) {
+        if !enabled {
+            self.invalidate_background_compaction();
+        }
+        self.compaction_settings.enabled = enabled;
+    }
+
     pub(crate) fn provider_admission_gate(&self) -> ProviderAdmissionGate {
         self.provider_admission.clone()
     }

@@ -1979,6 +1979,13 @@ pub enum PiMsg {
     /// state the line shows. The charmed stack renders its own and ignores
     /// this.
     StatusSnapshot(FtuiStatusSnapshot),
+    /// Saved/effective preferences for the default stack's settings editor.
+    /// `changed` names the only live display preference to update.
+    #[cfg(feature = "ftui")]
+    Settings {
+        snapshot: crate::interactive_ftui::SettingsSnapshot,
+        changed: Option<crate::interactive_ftui::SettingsKey>,
+    },
     /// The user messages on the current path, oldest first, as
     /// `(summary, entry id)`, for the FTUI's `/branch` and double-Esc picker.
     /// `fork` means the pick forks a new session instead of rewinding in

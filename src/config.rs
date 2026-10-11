@@ -2323,13 +2323,19 @@ fn deep_merge_settings_value(dst: &mut Value, patch: Value) -> Result<()> {
             continue;
         }
 
-        match (dst_obj.get_mut(&key), value) {
-            (Some(Value::Object(dst_child)), Value::Object(patch_child)) => {
-                let mut child = Value::Object(std::mem::take(dst_child));
-                deep_merge_settings_value(&mut child, Value::Object(patch_child))?;
-                dst_obj.insert(key, child);
+        match value {
+            Value::Object(patch_child) => {
+                let child = dst_obj
+                    .entry(key)
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !child.is_object() {
+                    *child = Value::Object(serde_json::Map::new());
+                }
+                // Null means deletion at every depth, including when the
+                // parent object is newly created or replaces a scalar.
+                deep_merge_settings_value(child, Value::Object(patch_child))?;
             }
-            (_, other) => {
+            other => {
                 dst_obj.insert(key, other);
             }
         }
@@ -3134,6 +3140,35 @@ mod tests {
     }
 
     // ── deep_merge_settings_value ──────────────────────────────────────
+
+    #[test]
+    fn deep_merge_new_objects_consume_nested_deletions() {
+        for mut settings in [
+            json!({ "preserve": 42 }),
+            json!({ "preserve": 42, "images": false }),
+            json!({ "preserve": 42, "images": null }),
+            json!({ "preserve": 42, "images": [] }),
+        ] {
+            deep_merge_settings_value(
+                &mut settings,
+                json!({
+                    "images": {
+                        "auto_resize": false,
+                        "autoResize": null,
+                        "nested": { "keep": true, "remove": null },
+                    },
+                }),
+            )
+            .expect("merge new object");
+            assert_eq!(
+                settings,
+                json!({
+                    "preserve": 42,
+                    "images": { "auto_resize": false, "nested": { "keep": true } },
+                }),
+            );
+        }
+    }
 
     #[test]
     fn deep_merge_null_value_removes_key() {

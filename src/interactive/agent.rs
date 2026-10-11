@@ -894,6 +894,8 @@ impl PiApp {
             | PiMsg::StatusSnapshot(_)
             | PiMsg::UserInputSubmitted { .. }
             | PiMsg::MessagePicker { .. } => {}
+            #[cfg(feature = "ftui")]
+            PiMsg::Settings { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();
