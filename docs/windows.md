@@ -59,6 +59,11 @@ Relative paths resolve against the extension runtime's working directory.
 The runtime reports `process.platform` as `win32` on Windows even when access
 to environment variables is disabled.
 
+The extension filesystem shim retains UNC share roots and extended-length
+Windows path prefixes through reads, metadata queries, and directory listings.
+Path normalization stops at the drive or share root, and native access checks
+receive the same path representation as the filesystem operation.
+
 ## Shell Commands
 
 - The `bash` tool and `!command` shortcuts use the bash chosen above (see "Shell Requirements").

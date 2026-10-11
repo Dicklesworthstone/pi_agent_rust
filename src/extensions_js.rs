@@ -12154,6 +12154,18 @@ const __pi_vfs = (() => {
     nextFd: 100,
   };
   const extensionTmpRoot = "/__pi_extension_tmp";
+  const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
+
+  function childPrefix(path) {
+    return path.endsWith("/") ? path : `${path}/`;
+  }
+
+  function toHostPath(path) {
+    // Windows verbatim/device prefixes do not accept '/' separators. Keep
+    // slash-separated VFS keys, but preserve the native namespace at every
+    // authorization and host-I/O boundary.
+    return windowsPaths && /^\/\/[?.]\//.test(path) ? path.replace(/\//g, "\\") : path;
+  }
 
   function checkWriteAccess(resolved) {
     const normalized = normalizePath(resolved);
@@ -12161,7 +12173,7 @@ const __pi_vfs = (() => {
       return;
     }
     if (typeof globalThis.__pi_host_check_write_access === "function") {
-      globalThis.__pi_host_check_write_access(normalized);
+      globalThis.__pi_host_check_write_access(toHostPath(normalized));
     }
   }
 
@@ -12171,7 +12183,7 @@ const __pi_vfs = (() => {
       return;
     }
     if (typeof globalThis.__pi_host_check_read_access === "function") {
-      globalThis.__pi_host_check_read_access(normalized);
+      globalThis.__pi_host_check_read_access(toHostPath(normalized));
     }
   }
 
@@ -12185,7 +12197,7 @@ const __pi_vfs = (() => {
         ? globalThis.process.cwd()
         : "/"
     );
-    if (normalized !== cwd && !normalized.startsWith(`${cwd}/`)) {
+    if (normalized !== cwd && !normalized.startsWith(childPrefix(cwd))) {
       throw new Error("host write denied: path outside extension root");
     }
     checkWriteAccess(normalized);
@@ -12240,7 +12252,7 @@ const __pi_vfs = (() => {
   function pathIsWithin(path, root) {
     const candidate = comparablePath(path);
     const base = comparablePath(root);
-    return candidate === base || candidate.startsWith(`${base}/`);
+    return candidate === base || candidate.startsWith(childPrefix(base));
   }
 
   function isAbsolutePathInput(input) {
@@ -12262,12 +12274,13 @@ const __pi_vfs = (() => {
     }
     if (
       typeof globalThis.__pi_host_is_registered_fs_path === "function" &&
-      globalThis.__pi_host_is_registered_fs_path(normalized)
+      globalThis.__pi_host_is_registered_fs_path(toHostPath(normalized))
     ) {
       return normalized;
     }
     const root = currentExtensionTempRoot(tempBase);
-    return `${root}${normalized.slice(tempBase.length)}`;
+    const relative = normalized.slice(tempBase.length).replace(/^\/+/, "");
+    return relative ? `${childPrefix(root)}${relative}` : root;
   }
 
   function unmapExtensionTempPath(normalized) {
@@ -12280,7 +12293,7 @@ const __pi_vfs = (() => {
         return tempBase;
       }
       if (normalized.startsWith(`${root}/`)) {
-        return `${tempBase}${normalized.slice(root.length)}`;
+        return `${childPrefix(tempBase)}${normalized.slice(root.length + 1)}`;
       }
     }
     return normalized;
@@ -12293,21 +12306,39 @@ const __pi_vfs = (() => {
     });
   }
 
-  function normalizePath(input) {
-    let raw = String(input ?? "").replace(/\\/g, "/");
-    // Strip Windows UNC verbatim prefix that canonicalize() produces.
-    // \\?\C:\... becomes /?/C:/... after separator normalization.
-    if (raw.startsWith("/?/") && raw.length > 5 && /^[A-Za-z]:/.test(raw.substring(3, 5))) {
-      raw = raw.slice(3);
+  function splitRoot(path) {
+    const drive = /^[A-Za-z]:\//.exec(path);
+    if (drive) return { root: drive[0], tail: path.slice(3) };
+    if (windowsPaths) {
+      // A UNC share is one filesystem root. A verbatim UNC path additionally
+      // carries its namespace prefix; neither may be consumed by '..'.
+      const unc = /^\/\/([?.]\/UNC\/)?([^/]+)\/+([^/]+)(?=\/|$)/i.exec(path);
+      if (unc && (!/^\/\/[?.]\//.test(path) || unc[1])) {
+        return { root: `//${unc[1] || ""}${unc[2]}/${unc[3]}`, tail: path.slice(unc[0].length) };
+      }
+      const device = /^\/\/([?.])\/([^/]+)(?=\/|$)/.exec(path);
+      if (device) {
+        const root = `//${device[1]}/${device[2]}`;
+        return {
+          root: /^[A-Za-z]:$/.test(device[2]) ? `${root}/` : root,
+          tail: path.slice(device[0].length),
+        };
+      }
     }
+    return { root: path.startsWith("/") ? "/" : "", tail: path.startsWith("/") ? path.slice(1) : path };
+  }
+
+  function normalizePath(input) {
+    const raw = String(input ?? "").replace(/\\/g, "/");
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
     const base = isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
+    const { root, tail } = splitRoot(base);
     const parts = [];
-    for (const part of base.split("/")) {
+    for (const part of tail.split("/")) {
       if (!part || part === ".") continue;
       if (part === "..") {
         if (parts.length > 0) parts.pop();
@@ -12315,31 +12346,25 @@ const __pi_vfs = (() => {
       }
       parts.push(part);
     }
-    // Preserve drive letter prefix on Windows (D:/...) instead of /D:/...
-    if (parts.length > 0 && /^[A-Za-z]:$/.test(parts[0])) {
-      return `${parts[0]}/${parts.slice(1).join("/")}`;
-    }
-    return `/${parts.join("/")}`;
+    return parts.length ? `${childPrefix(root || "/")}${parts.join("/")}` : root || "/";
   }
 
   function dirname(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
-    if (/^[A-Za-z]:\/$/.test(normalized)) return normalized;
+    const { root } = splitRoot(normalized);
+    if (normalized === root) return root;
     const idx = normalized.lastIndexOf("/");
-    if (idx === 2 && /^[A-Za-z]:/.test(normalized)) return `${normalized.slice(0, 2)}/`;
-    return idx <= 0 ? "/" : normalized.slice(0, idx);
+    return idx < root.length ? root : normalized.slice(0, idx);
   }
 
   function ensureDir(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
-    const driveRoot = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(0, 3) : "";
-    const parts = (driveRoot ? normalized.slice(3) : normalized.slice(1)).split("/").filter(Boolean);
-    let current = driveRoot ? driveRoot.slice(0, 2) : "";
-    if (driveRoot) state.dirs.add(driveRoot);
+    const { root, tail } = splitRoot(normalized);
+    const parts = tail.split("/").filter(Boolean);
+    let current = root;
+    state.dirs.add(root);
     for (const part of parts) {
-      current = current ? `${current}/${part}` : `/${part}`;
+      current = `${childPrefix(current)}${part}`;
       if (state.files.has(current) || state.symlinks.has(current)) {
         throw new Error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
       }
@@ -12470,7 +12495,7 @@ const __pi_vfs = (() => {
       return { bytes: undefined, error: "" };
     }
     try {
-      const content = globalThis.__pi_host_read_file_sync(resolved);
+      const content = globalThis.__pi_host_read_file_sync(toHostPath(resolved));
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
@@ -12493,7 +12518,7 @@ const __pi_vfs = (() => {
       return undefined;
     }
     try {
-      return JSON.parse(globalThis.__pi_host_stat_sync(resolved, !!followSymlinks));
+      return JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(resolved), !!followSymlinks));
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
       // Standalone harness realms have no extension identity. Their virtual
@@ -12515,11 +12540,11 @@ const __pi_vfs = (() => {
   }
 
   function firstSymlinkComponent(path) {
-    const driveRoot = /^[A-Za-z]:\//.test(path) ? path.slice(0, 3) : "";
-    const parts = (driveRoot ? path.slice(3) : path.slice(1)).split("/").filter(Boolean);
-    let candidate = driveRoot ? driveRoot.slice(0, 2) : "";
+    const { root, tail } = splitRoot(path);
+    const parts = tail.split("/").filter(Boolean);
+    let candidate = root;
     for (let index = 0; index < parts.length; index += 1) {
-      candidate = candidate ? `${candidate}/${parts[index]}` : `/${parts[index]}`;
+      candidate = `${childPrefix(candidate)}${parts[index]}`;
       if (state.symlinks.has(candidate)) {
         return { linkPath: candidate, remaining: parts.slice(index + 1) };
       }
@@ -12672,7 +12697,7 @@ const __pi_vfs = (() => {
 
   function listChildren(path, withFileTypes) {
     const normalized = normalizePath(path);
-    const prefix = normalized === "/" ? "/" : `${normalized}/`;
+    const prefix = childPrefix(normalized);
     const children = new Map();
 
     for (const dir of state.dirs) {
@@ -12750,7 +12775,7 @@ const __pi_vfs = (() => {
     let hostStat = null;
     if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
       try {
-        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(normalized, !!followSymlinks));
+        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(normalized), !!followSymlinks));
       } catch (e) {
         /* not on host FS */
       }
@@ -12820,15 +12845,16 @@ const __pi_vfs = (() => {
 
   function authorizeTreeWrite(path) {
     const normalized = normalizePath(path);
+    const prefix = childPrefix(normalized);
     const descendants = [normalized];
     for (const candidate of state.files.keys()) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of state.dirs) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of state.symlinks.keys()) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of new Set(descendants)) {
       authorizeWriteResolution(resolvePathDetails(candidate, false));
@@ -12854,6 +12880,8 @@ const __pi_vfs = (() => {
   }
 
   state.normalizePath = normalizePath;
+  state.toHostPath = toHostPath;
+  state.childPrefix = childPrefix;
   state.dirname = dirname;
   state.ensureDir = ensureDir;
   state.toBytes = toBytes;
@@ -12995,7 +13023,7 @@ export function readdirSync(path, opts) {
   let hostError;
   if (!__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_dir_sync === "function") {
     try {
-      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(resolved));
+      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(__pi_vfs.toHostPath(resolved)));
       foundDir = true;
       for (const entry of hostEntries) {
         if (!entry || typeof entry.name !== "string") continue;
@@ -13063,6 +13091,7 @@ export function unlinkSync(path) {
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
@@ -13071,17 +13100,17 @@ export function rmdirSync(path, _opts) {
   }
   __pi_vfs.authorizeTreeWrite(normalized);
   for (const filePath of __pi_vfs.files.keys()) {
-    if (filePath.startsWith(`${normalized}/`)) {
+    if (filePath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const dirPath of __pi_vfs.dirs) {
-    if (dirPath.startsWith(`${normalized}/`)) {
+    if (dirPath !== normalized && dirPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const linkPath of __pi_vfs.symlinks.keys()) {
-    if (linkPath.startsWith(`${normalized}/`)) {
+    if (linkPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
@@ -13091,6 +13120,7 @@ export function rmdirSync(path, _opts) {
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
     return;
@@ -13107,17 +13137,17 @@ export function rmSync(path, opts) {
     }
     __pi_vfs.authorizeTreeWrite(normalized);
     for (const filePath of Array.from(__pi_vfs.files.keys())) {
-      if (filePath === normalized || filePath.startsWith(`${normalized}/`)) {
+      if (filePath === normalized || filePath.startsWith(prefix)) {
         __pi_vfs.files.delete(filePath);
       }
     }
     for (const dirPath of Array.from(__pi_vfs.dirs)) {
-      if (dirPath === normalized || dirPath.startsWith(`${normalized}/`)) {
+      if (dirPath === normalized || dirPath.startsWith(prefix)) {
         __pi_vfs.dirs.delete(dirPath);
       }
     }
     for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
-      if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
+      if (linkPath === normalized || linkPath.startsWith(prefix)) {
         __pi_vfs.symlinks.delete(linkPath);
       }
     }
@@ -25698,13 +25728,13 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            204_682,
-            "e9ff1234adb056259fdd01578b192fad89e853b567f0eadd7d7a66b42b07bad0",
+            204_644,
+            "604f528a04a890d0091b7243ad2286bf5a874d94712cacd8c45ae218ad276fb1",
         ),
         (
             "node:fs",
-            56_916,
-            "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
+            57_930,
+            "9180ce100adb7cf8e951b1f4d2e712a6ae3b72bd2720f9ad65e7eb1d5250cdb0",
         ),
         (
             "@mariozechner/pi-ai",
@@ -34475,6 +34505,285 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         "done": true,
                     }),
                     "Windows metadata and path behavior, deny_env={deny_env}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_windows_fs_preserves_paths_at_host_boundaries() {
+        // Probe the actual built-in modules in an isolated context. The full
+        // runtime seals its native hooks; this fixture leaves production
+        // authorization untouched and performs no host filesystem I/O.
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let state = Rc::new(RefCell::new(PiJsModuleState::new().with_disk_cache_dir(None)));
+        runtime.set_loader(
+            PiJsResolver {
+                state: Rc::clone(&state),
+            },
+            PiJsLoader { state },
+        );
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        context.with(|ctx| {
+            ctx.eval::<(), _>(
+                r"
+                const cwd = '\\\\server\\share\\project';
+                globalThis.pi = { process: { cwd } };
+                globalThis.process = { platform: 'win32', cwd: () => cwd, env: {} };
+                globalThis.windowsFsHostPaths = {};
+                let extensionId = 'ext.one';
+                const calls = [];
+                globalThis.__pi_get_current_extension_id = () => extensionId;
+                globalThis.__pi_host_temp_roots_json = () =>
+                    JSON.stringify(['T:/', '//?/Z:/', '//temp/share']);
+                globalThis.__pi_host_is_registered_fs_path = (path) => {
+                    calls.push(['registered', path]);
+                    return false;
+                };
+                globalThis.__pi_host_check_read_access = (path) => calls.push(['checkRead', path]);
+                globalThis.__pi_host_check_write_access = (path) => calls.push(['checkWrite', path]);
+                globalThis.__pi_host_read_file_sync = (path) => {
+                    calls.push(['read', path]);
+                    throw new Error('fixture read probe');
+                };
+                globalThis.__pi_host_stat_sync = (path, follow) => {
+                    calls.push(['stat', path, follow]);
+                    return JSON.stringify({ kind: 'file', size: 7 });
+                };
+                globalThis.__pi_host_read_dir_sync = (path) => {
+                    calls.push(['readdir', path]);
+                    return JSON.stringify([{ name: 'child.txt', kind: 'file' }]);
+                };
+                Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                    const path = mod.default;
+                    const inputs = [
+                        path.join('C:\\work', 'file.txt'),
+                        path.resolve('file.txt'),
+                        path.toNamespacedPath('C:\\work\\file.txt'),
+                        path.toNamespacedPath(path.resolve('file.txt')),
+                        path.join('\\\\.\\pipe', 'file.txt'),
+                    ];
+                    windowsFsHostPaths.rows = inputs.map((input) => {
+                        calls.length = 0;
+                        let readProbed = false;
+                        try { fs.readFileSync(input); } catch (error) {
+                            readProbed = String(error).includes('fixture read probe');
+                        }
+                        fs.statSync(input);
+                        fs.lstatSync(input);
+                        fs.readdirSync(path.dirname(input));
+                        fs.writeFileSync(input, new Uint8Array([1]));
+                        const normalized = __pi_vfs_api.normalizePath(input);
+                        return {
+                            readProbed,
+                            normalized,
+                            repeated: __pi_vfs_api.normalizePath(normalized),
+                            calls: calls.slice(),
+                        };
+                    });
+                    windowsFsHostPaths.temp = ['T:\\private.txt', '\\\\?\\Z:\\private.txt', '\\\\temp\\share\\private.txt'].map((input) => {
+                        calls.length = 0;
+                        fs.writeFileSync(input, new Uint8Array([1, 2]));
+                        const canonical = fs.realpathSync(input);
+                        extensionId = 'ext.two';
+                        const visibleToOther = fs.existsSync(input);
+                        extensionId = 'ext.one';
+                        const size = fs.statSync(input).size;
+                        return { canonical, visibleToOther, size, calls: calls.slice() };
+                    });
+                    windowsFsHostPaths.roots = [
+                        'C:\\..\\..', '\\\\server\\share\\..\\..',
+                        '\\\\?\\C:\\..\\..', '\\\\?\\UNC\\server\\share\\..\\..',
+                    ].map((input) => fs.realpathSync(input));
+                    windowsFsHostPaths.done = true;
+                }).catch((error) => {
+                    windowsFsHostPaths.error = String(error);
+                });
+                ",
+            )
+            .expect("evaluate Windows host-boundary fixture");
+        });
+        for _ in 0..64 {
+            if !runtime.execute_pending_job().expect("run import job") {
+                break;
+            }
+        }
+        let actual = context.with(|ctx| {
+            let value: Value<'_> = ctx.globals().get("windowsFsHostPaths").expect("result");
+            js_to_json(&value).expect("convert result")
+        });
+        assert_eq!(actual["done"], json!(true), "{actual}");
+        let expected_paths = [
+            (
+                "C:/work/file.txt",
+                "C:/work/file.txt",
+                "C:/work",
+                "C:/work/child.txt",
+            ),
+            (
+                "//server/share/project/file.txt",
+                "//server/share/project/file.txt",
+                "//server/share/project",
+                "//server/share/project/child.txt",
+            ),
+            (
+                "//?/C:/work/file.txt",
+                r"\\?\C:\work\file.txt",
+                r"\\?\C:\work",
+                r"\\?\C:\work\child.txt",
+            ),
+            (
+                "//?/UNC/server/share/project/file.txt",
+                r"\\?\UNC\server\share\project\file.txt",
+                r"\\?\UNC\server\share\project",
+                r"\\?\UNC\server\share\project\child.txt",
+            ),
+            (
+                "//./pipe/file.txt",
+                r"\\.\pipe\file.txt",
+                r"\\.\pipe",
+                r"\\.\pipe\child.txt",
+            ),
+        ];
+        assert_eq!(
+            actual["rows"].as_array().expect("rows").len(),
+            expected_paths.len()
+        );
+        for (row, (normalized, file, dir, child)) in actual["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .zip(expected_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "readProbed": true,
+                    "normalized": normalized,
+                    "repeated": normalized,
+                    "calls": [
+                        ["checkRead", file], ["read", file],
+                        ["checkRead", file], ["stat", file, true],
+                        ["checkRead", file], ["stat", file, false],
+                        ["checkRead", dir], ["readdir", dir], ["checkRead", child],
+                        ["checkWrite", file], ["stat", file, true],
+                    ],
+                }),
+                "host boundary for {normalized}"
+            );
+        }
+        let temp_paths = [
+            ("T:/private.txt", "T:/private.txt"),
+            ("//?/Z:/private.txt", r"\\?\Z:\private.txt"),
+            ("//temp/share/private.txt", "//temp/share/private.txt"),
+        ];
+        assert_eq!(
+            actual["temp"].as_array().expect("temp results").len(),
+            temp_paths.len()
+        );
+        for (row, (canonical, native)) in actual["temp"]
+            .as_array()
+            .expect("temp results")
+            .iter()
+            .zip(temp_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "canonical": canonical,
+                    "visibleToOther": false,
+                    "size": 2,
+                    "calls": [["registered", native], ["registered", native], ["registered", native], ["registered", native]],
+                }),
+                "private temp namespace for {canonical}"
+            );
+        }
+        assert_eq!(
+            actual["roots"],
+            json!(["C:/", "//server/share", "//?/C:/", "//?/UNC/server/share"])
+        );
+    }
+
+    #[test]
+    fn pijs_windows_fs_workflows_keep_drive_and_share_roots() {
+        futures::executor::block_on(async {
+            for (cwd, root, uses_unc) in [
+                (r"C:\", "C:/", false),
+                (r"\\server\share", "//server/share", true),
+                (r"\\?\C:\", "//?/C:/", false),
+                (r"\\?\UNC\server\share", "//?/UNC/server/share", true),
+            ] {
+                // UNC boundary and root behavior is covered without I/O by
+                // the probe fixture above. Do not contact an arbitrary live
+                // network share when this test runs on Windows.
+                if cfg!(windows) && uses_unc {
+                    continue;
+                }
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: cwd.to_string(),
+                    env: HashMap::from([("PI_PLATFORM".to_string(), "win32".to_string())]),
+                    deny_env: true,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime =
+                    PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                        .await
+                        .expect("create Windows filesystem runtime");
+                let fixture = format!("pijs-roots-{}", uuid::Uuid::new_v4().simple());
+                runtime
+                    .context
+                    .with(|ctx| ctx.globals().set("windowsFsFixture", fixture))
+                    .await
+                    .expect("set unique fixture prefix");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const fileName = windowsFsFixture + '-file.txt';
+                            const projectName = windowsFsFixture + '-project';
+                            const aliasName = windowsFsFixture + '-alias';
+                            const owned = new Map([[aliasName, 'alias'], [fileName, 'file.txt'], [projectName, 'project']]);
+                            const file = path.resolve(fileName);
+                            fs.writeFileSync(file, 'root file');
+                            fs.mkdirSync(path.resolve(projectName, 'links'));
+                            fs.symlinkSync('..\\..\\' + fileName, path.resolve(projectName, 'links', 'file-link'));
+                            fs.symlinkSync(path.resolve(projectName), path.resolve(aliasName));
+                            const clamped = process.cwd() + '\\..\\..\\' + fileName;
+                            globalThis.windowsFsRoots = {
+                                native: path === mod.win32,
+                                root: fs.realpathSync(process.cwd()),
+                                clamped: fs.readFileSync(clamped, 'utf8'),
+                                linked: fs.readFileSync(path.resolve(aliasName, 'links', 'file-link'), 'utf8'),
+                                entries: fs.readdirSync(process.cwd()).filter((name) => owned.has(name)).map((name) => owned.get(name)),
+                                aliasEntries: fs.readdirSync(path.resolve(aliasName)).filter((name) => name === 'links'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsFsRoots = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("evaluate Windows filesystem workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsFsRoots").await;
+                assert_eq!(
+                    actual,
+                    json!({
+                        "native": true,
+                        "root": root,
+                        "clamped": "root file",
+                        "linked": "root file",
+                        "entries": ["alias", "file.txt", "project"],
+                        "aliasEntries": ["links"],
+                        "done": true,
+                    }),
+                    "filesystem workflow at {cwd}"
                 );
                 assert!(runtime.drain_hostcall_requests().is_empty());
             }
