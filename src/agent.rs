@@ -5339,7 +5339,12 @@ impl Agent {
         // arguments become the real values before approval/execution (the
         // operator approves the REAL command), and restored values are
         // masked again in the result heading back to the model.
-        let tool_call = self.restore_secrets_inbound(tool_call);
+        let tool_call = match self.restore_secrets_inbound(tool_call) {
+            Ok(tool_call) => tool_call,
+            Err(error) => {
+                return (Self::xdev_text_output(&error.to_string(), true), true);
+            }
+        };
 
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set before
@@ -5408,36 +5413,20 @@ impl Agent {
 
     /// Inbound restore (bd-cv653.7.9): placeholders in tool-call arguments
     /// become real values before approval/execution.
-    pub fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> ToolCall {
+    ///
+    /// # Errors
+    /// Refuses excessive nesting or distinct object keys that would restore
+    /// to the same key. Ambiguous arguments must never reach approval or a tool.
+    pub fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> Result<ToolCall> {
         if crate::secrets::SecretsMode::from_setting(
             self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
         ) == crate::secrets::SecretsMode::Off
         {
-            return tool_call;
+            return Ok(tool_call);
         }
-        tool_call.arguments = Self::restore_json_value(&self.secrets_vault, tool_call.arguments);
-        tool_call
-    }
-
-    fn restore_json_value(
-        vault: &crate::secrets::SecretVault,
-        value: serde_json::Value,
-    ) -> serde_json::Value {
-        match value {
-            serde_json::Value::String(text) => serde_json::Value::String(vault.restore(&text)),
-            serde_json::Value::Array(items) => serde_json::Value::Array(
-                items
-                    .into_iter()
-                    .map(|item| Self::restore_json_value(vault, item))
-                    .collect(),
-            ),
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.into_iter()
-                    .map(|(key, item)| (vault.restore(&key), Self::restore_json_value(vault, item)))
-                    .collect(),
-            ),
-            other => other,
-        }
+        tool_call.arguments =
+            crate::secrets::restore_inbound_json(&tool_call.arguments, &self.secrets_vault)?;
+        Ok(tool_call)
     }
 
     /// Echo hygiene (bd-cv653.7.9): restored real values in tool output are
@@ -5454,17 +5443,18 @@ impl Agent {
                 t.text = self.secrets_vault.mask(&t.text);
             }
         }
-        if let Some(details) = &mut output.details
-            && let Some(text) = serde_json::to_string(details).ok()
-        {
-            // Mask maps real secret values back to placeholders; only
-            // re-parse when something actually changed.
-            let masked = self.secrets_vault.mask(&text);
-            if masked != text
-                && let Ok(value) = serde_json::from_str(&masked)
-            {
-                *details = value;
-            }
+        if let Some(details) = &mut output.details {
+            *details = crate::secrets::mask_known_json(details, &self.secrets_vault)
+                .unwrap_or_else(|error| {
+                    // A diagnostic cannot retain raw output as a fallback.
+                    // Keep the tool's execution outcome, but replace unsafe
+                    // details with an explicit, value-free omission record.
+                    json!({
+                        "schema": crate::secrets::SECRETS_SCHEMA,
+                        "detailsOmitted": true,
+                        "reason": error.to_string(),
+                    })
+                });
         }
     }
 
@@ -24537,6 +24527,79 @@ mod tests {
     }
 
     #[test]
+    fn colliding_restored_tool_keys_are_refused_before_approval_and_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target = temp.path().join("credential.txt");
+            std::fs::write(&target, "original").expect("existing file");
+            let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_approvals = Arc::clone(&approvals);
+            let config = AgentConfig {
+                tool_approval: Some(Arc::new(move |_| {
+                    observed_approvals.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { ToolApprovalDecision::Allow })
+                })),
+                ..AgentConfig::default()
+            };
+            let tools = ToolRegistry::new(&["write"], temp.path(), None);
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, config);
+            let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+            let placeholder = agent
+                .secrets_transform_outbound_text(secret)
+                .expect("establish credential mapping");
+            let mut fields = serde_json::Map::new();
+            fields.insert(secret.to_string(), json!("first field"));
+            fields.insert(placeholder.clone(), json!("second field"));
+            let call = ToolCall {
+                id: "ambiguous-write".to_string(),
+                name: "write".to_string(),
+                arguments: json!({
+                    "path": "credential.txt",
+                    "content": placeholder,
+                    "metadata": [Value::Object(fields)],
+                }),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool(
+                    call,
+                    Arc::new(|_| panic!("refused arguments must not reach approval or tools")),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
+                .await;
+            assert!(is_error && output.is_error);
+            let report = serde_json::to_string(&output).expect("error output");
+            assert!(report.contains("PI_SECRET_JSON_RESTORE_KEY_COLLISION"));
+            assert!(!report.contains(secret));
+            assert_eq!(approvals.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+
+            // The same real tool and vault remain usable after a rejected call.
+            let (output, is_error) = agent
+                .execute_tool(
+                    ToolCall {
+                        id: "valid-write".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({
+                            "path": "credential.txt",
+                            "content": placeholder,
+                        }),
+                        thought_signature: None,
+                    },
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
+                .await;
+            assert!(!is_error && !output.is_error);
+            assert_eq!(approvals.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), secret);
+        });
+    }
+
+    #[test]
     fn session_state_reset_drops_secret_placeholders_and_plan_gate() {
         let provider = Arc::new(SilentProvider);
         let tools = ToolRegistry::new(&[], Path::new("."), None);
@@ -24548,23 +24611,27 @@ mod tests {
         assert_ne!(placeholder, raw_secret);
         agent.plan_state().enter_planning();
 
-        let before_reset = agent.restore_secrets_inbound(ToolCall {
-            id: "before".to_string(),
-            name: "read".to_string(),
-            arguments: json!({"token": placeholder}),
-            thought_signature: None,
-        });
+        let before_reset = agent
+            .restore_secrets_inbound(ToolCall {
+                id: "before".to_string(),
+                name: "read".to_string(),
+                arguments: json!({"token": placeholder}),
+                thought_signature: None,
+            })
+            .expect("restore source session credential");
         assert_eq!(before_reset.arguments["token"], raw_secret);
 
         agent.reset_session_scoped_state(crate::plan::PlanMode::Off);
 
         assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
-        let after_reset = agent.restore_secrets_inbound(ToolCall {
-            id: "after".to_string(),
-            name: "read".to_string(),
-            arguments: json!({"token": placeholder}),
-            thought_signature: None,
-        });
+        let after_reset = agent
+            .restore_secrets_inbound(ToolCall {
+                id: "after".to_string(),
+                name: "read".to_string(),
+                arguments: json!({"token": placeholder}),
+                thought_signature: None,
+            })
+            .expect("unknown placeholder remains literal");
         assert_eq!(after_reset.arguments["token"], placeholder);
         assert_eq!(agent.mask_secrets_text(raw_secret), raw_secret);
     }

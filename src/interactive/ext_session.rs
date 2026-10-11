@@ -2094,12 +2094,14 @@ mod tests {
                 {
                     let guard = agent.try_lock().expect("replacement agent");
                     assert_eq!(guard.mask_secrets_text(raw_secret), raw_secret);
-                    let inbound = guard.restore_secrets_inbound(crate::model::ToolCall {
-                        id: "new-session".to_string(),
-                        name: "read".to_string(),
-                        arguments: json!({"token": placeholder}),
-                        thought_signature: None,
-                    });
+                    let inbound = guard
+                        .restore_secrets_inbound(crate::model::ToolCall {
+                            id: "new-session".to_string(),
+                            name: "read".to_string(),
+                            arguments: json!({"token": placeholder}),
+                            thought_signature: None,
+                        })
+                        .expect("unknown placeholder remains literal");
                     assert_eq!(inbound.arguments["token"], placeholder);
                     assert_eq!(
                         guard.plan_state().mode(),

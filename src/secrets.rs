@@ -24,7 +24,9 @@ use crate::error::{Error, Result};
 
 mod structured;
 pub use structured::transform_outbound_json;
-pub(crate) use structured::{discover_outbound_json, transform_assistant_replay_json};
+pub(crate) use structured::{
+    discover_outbound_json, mask_known_json, restore_inbound_json, transform_assistant_replay_json,
+};
 
 /// Tool-result schema tag for secrets operations.
 pub const SECRETS_SCHEMA: &str = "pi.secrets.v1";
@@ -480,48 +482,6 @@ impl SecretVault {
         out
     }
 
-    fn mask_json_value(
-        &self,
-        value: &mut serde_json::Value,
-        replacements: &MaskReplacements<'_>,
-    ) -> bool {
-        match value {
-            serde_json::Value::String(text) => {
-                let masked = self.mask_literal_text(text, replacements);
-                let changed = masked != *text;
-                *text = masked;
-                changed
-            }
-            serde_json::Value::Array(items) => {
-                let mut changed = false;
-                for item in items {
-                    changed |= self.mask_json_value(item, replacements);
-                }
-                changed
-            }
-            serde_json::Value::Object(map) => {
-                let mut changed = false;
-                for (key, mut item) in std::mem::take(map) {
-                    let masked_key = self.mask_literal_text(&key, replacements);
-                    changed |= masked_key != key;
-                    changed |= self.mask_json_value(&mut item, replacements);
-                    map.insert(masked_key, item);
-                }
-                changed
-            }
-            other => {
-                // A remembered numeric token may be echoed as a JSON number.
-                // Preserve nonsecret primitives; secret ones become strings
-                // holding placeholders rather than disclosing their value.
-                let Some(placeholder) = self.by_value.get(&other.to_string()) else {
-                    return false;
-                };
-                *other = serde_json::Value::String(placeholder.clone());
-                true
-            }
-        }
-    }
-
     fn mask_json_document(
         &self,
         text: &str,
@@ -530,14 +490,21 @@ impl SecretVault {
         if !matches!(text.trim_start().chars().next()?, '{' | '[' | '"') {
             return None;
         }
-        let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
-        if let Some(placeholder) = self.by_value.get(text.trim()) {
-            value = serde_json::Value::String(placeholder.clone());
-        } else if !self.mask_json_value(&mut value, replacements) {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let masked = if let Some(placeholder) = self.by_value.get(text.trim()) {
+            serde_json::Value::String(placeholder.clone())
+        } else {
+            // A collision is not a successful projection with fewer fields.
+            // Exports cannot return an error, so make the whole omitted JSON
+            // document visible without disclosing any of its original bytes.
+            structured::mask_known_json_with_replacements(&value, self, replacements)
+                .unwrap_or_else(|_| serde_json::Value::String(OVERLAP_REDACTION.to_string()))
+        };
+        if masked == value {
             // Screening must not reformat clean structured data.
             return Some(text.to_string());
         }
-        Some(serde_json::to_string(&value).expect("serialize masked JSON value"))
+        Some(serde_json::to_string(&masked).expect("serialize masked JSON value"))
     }
 
     fn mask_json_lines(&self, text: &str, replacements: &MaskReplacements<'_>) -> Option<String> {
@@ -1221,6 +1188,48 @@ mod tests {
         assert_eq!(records[0]["safe"], true);
         assert_eq!(records[1]["token"], numeric);
         assert_eq!(records[1]["safe"], 7);
+    }
+
+    #[test]
+    fn plain_scalar_text_masking_preserves_text_semantics() {
+        let mut vault = SecretVault::default();
+        let number = vault.placeholder_for("1234567890123456", "user");
+        let boolean = vault.placeholder_for("true", "user");
+        let empty = vault.placeholder_for("null", "user");
+
+        for (text, expected) in [
+            ("1234567890123456", number),
+            ("true", boolean),
+            ("null", empty),
+        ] {
+            let masked = vault.mask(text);
+            assert_eq!(masked, expected, "bare text must not acquire JSON quotes");
+            assert_eq!(vault.restore(&masked), text);
+            assert_eq!(vault.mask(&masked), masked);
+        }
+        assert_eq!(vault.mask(" 42 \n"), " 42 \n");
+    }
+
+    #[test]
+    fn ambiguous_json_exports_redact_instead_of_silently_discarding_members() {
+        let mut vault = SecretVault::default();
+        let secret = "credential-for-export";
+        let placeholder = vault.placeholder_for(secret, "user");
+        let input = serde_json::json!({
+            secret: "original member",
+            placeholder: "different member",
+        });
+
+        let output = vault.mask(&input.to_string());
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!(OVERLAP_REDACTION),
+            "ambiguous documents must not look like successful partial exports",
+        );
+        assert!(!output.contains(secret));
+        assert_eq!(input.as_object().unwrap().len(), 2);
+        assert_eq!(vault.mask(&output), output);
     }
 
     #[test]

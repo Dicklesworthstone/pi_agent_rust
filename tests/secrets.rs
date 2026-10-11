@@ -219,7 +219,9 @@ fn inbound_restore_writes_real_value_and_masks_echo() {
         }),
         thought_signature: None,
     };
-    let restored = agent.restore_secrets_inbound(tool_call);
+    let restored = agent
+        .restore_secrets_inbound(tool_call)
+        .expect("restore unambiguous arguments");
     let args = serde_json::to_string(&restored.arguments).expect("args");
     harness
         .log()
@@ -276,12 +278,14 @@ fn dotted_key_round_trips_through_the_agent() {
         "placeholder must not be re-vaulted on the second turn: {joined}"
     );
 
-    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "t1".to_string(),
-        name: "bash".to_string(),
-        arguments: json!({ "command": "curl -H 'Authorization: Bearer <pi-secret:000001>'" }),
-        thought_signature: None,
-    });
+    let restored = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": "curl -H 'Authorization: Bearer <pi-secret:000001>'" }),
+            thought_signature: None,
+        })
+        .expect("restore dotted credential");
     let args = serde_json::to_string(&restored.arguments).expect("args");
     assert!(
         args.contains(DOTTED),
@@ -623,12 +627,14 @@ fn json_credentials_stay_protected_after_the_assignment_leaves_history() {
         .secrets_transform_outbound_text(&format!("side question quotes {OPAQUE_SECRET}"))
         .expect("auxiliary outbound screening");
     assert_eq!(side_context, "side question quotes <pi-secret:000001>");
-    let call = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "remembered-value".to_string(),
-        name: "write".to_string(),
-        arguments: json!({"path": "key.txt", "content": "<pi-secret:000001>"}),
-        thought_signature: None,
-    });
+    let call = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "remembered-value".to_string(),
+            name: "write".to_string(),
+            arguments: json!({"path": "key.txt", "content": "<pi-secret:000001>"}),
+            thought_signature: None,
+        })
+        .expect("restore remembered credential");
     assert_eq!(call.arguments["content"], OPAQUE_SECRET);
     finish_case(&harness, case);
 }
@@ -680,6 +686,71 @@ fn multiline_credentials_are_masked_inside_nested_tool_result_details() {
     assert_eq!(details["count"], 7);
     assert!(!serde_json::to_string(details).unwrap().contains(PEM_BODY));
     finish_case(&harness, case);
+}
+
+#[test]
+fn scalar_tool_details_are_masked_without_falling_back_to_the_original_value() {
+    let harness = TestHarness::new("scalar_tool_details_are_masked");
+    let root = harness.temp_path(".");
+    for value in [
+        json!(123_456_789_012_345_678_u64),
+        json!(true),
+        json!(false),
+        json!(null),
+    ] {
+        let rendered = value.to_string();
+        let (mut agent, _) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some("obfuscate".to_string()),
+                extra_patterns: Some(vec![format!("^{}$", regex::escape(&rendered))]),
+            }),
+        );
+        let placeholder = agent
+            .secrets_transform_outbound_text(&rendered)
+            .expect("remember a scalar credential");
+        assert!(placeholder.starts_with("<pi-secret:"));
+        let mut output = ToolOutput {
+            content: Vec::new(),
+            details: Some(value),
+            is_error: false,
+        };
+        agent.mask_secrets_in_output(&mut output);
+        assert_eq!(output.details, Some(json!(placeholder)));
+        assert!(!output.is_error, "masking does not change execution status");
+    }
+}
+
+#[test]
+fn ambiguous_masked_tool_details_are_explicitly_omitted_without_losing_the_result() {
+    let harness = TestHarness::new("ambiguous_masked_tool_details_are_omitted");
+    let root = harness.temp_path(".");
+    let (mut agent, _) = build_agent(&root, None);
+    let placeholder = agent
+        .secrets_transform_outbound_text(SECRET)
+        .expect("remember credential");
+    let mut fields = serde_json::Map::new();
+    fields.insert(SECRET.to_string(), json!("first field"));
+    fields.insert(placeholder, json!("second field"));
+    let mut output = ToolOutput {
+        content: vec![pi::model::ContentBlock::Text(pi::model::TextContent::new(
+            format!("completed using {SECRET}"),
+        ))],
+        details: Some(json!({"nested": [serde_json::Value::Object(fields)]})),
+        is_error: false,
+    };
+    agent.mask_secrets_in_output(&mut output);
+    assert_eq!(first_text(&output), "completed using <pi-secret:000001>");
+    let details = output.details.as_ref().expect("explicit omission record");
+    assert_eq!(details["detailsOmitted"], true);
+    assert!(
+        details["reason"]
+            .as_str()
+            .unwrap()
+            .contains("PI_SECRET_JSON_MASK_KEY_COLLISION")
+    );
+    assert!(!serde_json::to_string(&output).unwrap().contains(SECRET));
+    assert!(!output.is_error, "the completed operation remains successful");
 }
 
 #[test]
@@ -795,12 +866,14 @@ fn structured_custom_and_tool_arguments_are_screened_request_wide() {
         "content, details and structured arguments should all be protected: {joined}"
     );
 
-    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "restore".to_string(),
-        name: "fixture".to_string(),
-        arguments: json!({"value": "<pi-secret:000001>"}),
-        thought_signature: None,
-    });
+    let restored = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "restore".to_string(),
+            name: "fixture".to_string(),
+            arguments: json!({"value": "<pi-secret:000001>"}),
+            thought_signature: None,
+        })
+        .expect("restore structured discovery");
     assert_eq!(restored.arguments["value"], OPAQUE);
 }
 
@@ -1001,7 +1074,10 @@ fn unsigned_numeric_tool_arguments_survive_same_origin_continuations() {
             "strings and keys still need protection"
         );
         assert_eq!(
-            agent.restore_secrets_inbound(replayed.clone()).arguments,
+            agent
+                .restore_secrets_inbound(replayed.clone())
+                .expect("restore replayed arguments")
+                .arguments,
             arguments,
             "string placeholders still restore without changing primitive types"
         );
