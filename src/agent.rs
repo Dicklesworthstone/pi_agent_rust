@@ -26,10 +26,10 @@ use crate::extension_events::{
 };
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionDeliverAs,
-    ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec, ExtensionManager, ExtensionPolicy,
-    ExtensionRegion, ExtensionRuntimeHandle, ExtensionSendMessage, ExtensionSendUserMessage,
-    JsExtensionLoadSpec, JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionCompactionOptions,
+    ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec, ExtensionManager,
+    ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle, ExtensionSendMessage,
+    ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
     NativeRustExtensionRuntimeHandle, RepairPolicyMode, SessionActionOrigin,
     SessionActionOriginSource, resolve_extension_load_spec,
 };
@@ -6556,7 +6556,132 @@ struct ExtensionAiCompletionHostState {
     provider: Arc<dyn Provider>,
     stream_options: StreamOptions,
     models: Vec<Value>,
+    compaction_models: ExtensionCompactionModelState,
     compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
+}
+
+#[derive(Clone, Default)]
+struct ExtensionCompactionModelState {
+    registry: Option<Arc<ModelRegistry>>,
+    auth: Option<Arc<AuthStorage>>,
+    js_provider_ids: Vec<String>,
+}
+
+impl ExtensionCompactionModelState {
+    fn resolve(
+        &self,
+        current_provider: Arc<dyn Provider>,
+        mut stream_options: StreamOptions,
+        options: &ExtensionCompactionOptions,
+    ) -> Result<(Arc<dyn Provider>, StreamOptions)> {
+        let (provider_id, model_id) = options.model.as_ref().map_or_else(
+            || (current_provider.name(), current_provider.model_id()),
+            |model| (model.provider.trim(), model.id.trim()),
+        );
+        if provider_id.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "compact: model provider and id must be non-empty strings",
+            ));
+        }
+        let entry = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider_id, model_id));
+        let (resolved_provider, resolved_model) =
+            entry.as_ref().map_or((provider_id, model_id), |entry| {
+                (entry.model.provider.as_str(), entry.model.id.as_str())
+            });
+        if self.js_provider_ids.iter().any(|id| id == resolved_provider) {
+            return Err(Error::validation(
+                "compact: extension streamSimple models cannot be called from a compaction hook",
+            ));
+        }
+
+        let same_provider = resolved_provider == current_provider.name();
+        let same_model = same_provider && resolved_model == current_provider.model_id();
+        let requested_thinking = options
+            .thinking_level
+            .or(stream_options.thinking_level)
+            .unwrap_or(crate::model::ThinkingLevel::High);
+        stream_options.thinking_level = Some(
+            entry
+                .as_ref()
+                .map_or(requested_thinking, |entry| {
+                    entry.clamp_thinking_level(requested_thinking)
+                }),
+        );
+        // The normal provider hook can itself be the extension awaiting this
+        // request. The summary engine also clears it for ordinary callers.
+        stream_options.before_provider_request = None;
+        if same_model {
+            return Ok((current_provider, stream_options));
+        }
+
+        let mut entry = entry.ok_or_else(|| {
+            Error::validation(format!(
+                "compact: model {provider_id}/{model_id} is not registered"
+            ))
+        })?;
+        let target_key = same_provider
+            .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
+            .flatten()
+            .or_else(|| {
+                self.auth.as_ref().and_then(|auth| {
+                    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+                })
+            })
+            .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+        // Some providers bind credentials during construction (Copilot's
+        // token exchange). They must see the same resolved target credential
+        // as providers that read it from StreamOptions for each request.
+        entry.api_key.clone_from(&target_key);
+        let provider =
+            crate::providers::create_provider_with_auth(&entry, None, self.auth.as_deref())?;
+        if model_requires_configured_credential(&entry)
+            && target_key.is_none()
+            && !Self::has_registered_header_auth(&entry, provider.as_ref())
+        {
+            return Err(Error::auth(format!(
+                "compact: missing credentials for {}/{}",
+                entry.model.provider, entry.model.id
+            )));
+        }
+        // A model override never carries the source provider's key or
+        // authorization headers into a different provider. Endpoints and
+        // target headers come exclusively from the registered host entry.
+        stream_options.api_key = target_key;
+        stream_options.headers.clone_from(&entry.headers);
+        stream_options.max_tokens = Some(entry.model.max_tokens);
+        Ok((provider, stream_options))
+    }
+
+    fn has_registered_header_auth(entry: &ModelEntry, provider: &dyn Provider) -> bool {
+        if crate::provider_metadata::canonical_provider_id(provider.name()) == Some("github-copilot") {
+            // Copilot reports openai-completions but requires its own GitHub
+            // token exchange before it can send a completion request.
+            return false;
+        }
+        let names: &[&str] = match provider.api() {
+            "openai-completions" | "openai-responses" | "openai-codex-responses"
+            | "google-vertex" => &["authorization"],
+            "anthropic-messages" => &["authorization", "x-api-key"],
+            "azure-openai" => &["authorization", "api-key"],
+            "google-generative-ai" => &["authorization", "x-goog-api-key"],
+            // Gemini CLI and other providers still require their native
+            // credential payloads; unrelated headers do not make them ready.
+            _ => return false,
+        };
+        let has_auth = |headers| {
+            crate::providers::first_non_empty_header_value_case_insensitive(headers, names)
+                .is_some()
+        };
+        has_auth(&entry.headers)
+            || entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .is_some_and(has_auth)
+    }
 }
 
 impl AgentSessionHostActions {
@@ -6748,7 +6873,11 @@ impl ExtensionHostActions for AgentSessionHostActions {
         Ok(Value::Array(state.models.clone()))
     }
 
-    async fn compact_session(&self, preparation: Value) -> Result<Value> {
+    async fn compact_session(
+        &self,
+        preparation: Value,
+        options: ExtensionCompactionOptions,
+    ) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
         // gh #167 / bd-i28yz: bridge ctx.compact() / pi-coding-agent
         // compact() to the native compaction engine. The preparation JSON is
@@ -6756,28 +6885,26 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // malformed shapes instead of defaulting them.
         let preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
 
-        // Always compact with the SESSION's own provider + resolved API key
-        // (the same state the agent's auto-compaction path reads via
-        // `agent.provider()` / `agent.stream_options().api_key`, mirrored
-        // into the ai-completion host state and refreshed on model change).
-        // `custom_instructions` is None to match the auto-compaction path.
-        //
         // Lock order / re-entrancy: this briefly locks only the
         // ai-completion `StdMutex` (exactly like `complete_ai` /
         // `list_ai_models`) and never touches the session mutex, while
         // `dispatch_before_compact` holds neither when awaiting extension
         // handlers -- so an extension calling compact() from inside
         // `session_before_compact` cannot deadlock.
-        let (provider, api_key, privacy) = {
+        let (provider, stream_options, models, privacy) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
             (
                 Arc::clone(&state.provider),
-                state.stream_options.api_key.clone().unwrap_or_default(),
+                state.stream_options.clone(),
+                state.compaction_models.clone(),
                 Arc::clone(&state.compaction_privacy),
             )
         };
+        // Registry/auth resolution can evaluate a host-configured credential
+        // command, so it runs after releasing the shared completion mutex.
+        let (provider, stream_options) = models.resolve(provider, stream_options, &options)?;
 
         let privacy = privacy
             .lock()
@@ -6785,8 +6912,14 @@ impl ExtensionHostActions for AgentSessionHostActions {
                 Error::extension("extension compaction privacy state mutex poisoned".to_string())
             })?
             .clone();
-        let result =
-            crate::compaction::compact(preparation, provider, &api_key, None, &privacy).await?;
+        let result = crate::compaction::compact(
+            preparation,
+            provider,
+            &stream_options,
+            options.custom_instructions.as_deref(),
+            &privacy,
+        )
+        .await?;
         serde_json::to_value(&result).map_err(|err| {
             Error::extension(format!("serialize extension compaction result: {err}"))
         })
@@ -8709,6 +8842,7 @@ mod extensions_integration_tests {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
                     )),
@@ -8778,6 +8912,7 @@ mod extensions_integration_tests {
                     provider: Arc::new(NoopProvider),
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
                     )),
@@ -8892,6 +9027,7 @@ mod extensions_integration_tests {
     pub(super) struct PiAiCapturedProviderContext {
         pub(super) system_prompt: Option<String>,
         pub(super) messages: Vec<Message>,
+        pub(super) options: StreamOptions,
     }
 
     #[derive(Debug)]
@@ -8916,7 +9052,7 @@ mod extensions_integration_tests {
         async fn stream(
             &self,
             context: &Context<'_>,
-            _options: &StreamOptions,
+            options: &StreamOptions,
         ) -> crate::error::Result<
             std::pin::Pin<
                 Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>,
@@ -8928,6 +9064,7 @@ mod extensions_integration_tests {
                 .push(PiAiCapturedProviderContext {
                     system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
                     messages: context.messages.iter().cloned().collect(),
+                    options: options.clone(),
                 });
             let final_message = AssistantMessage {
                 content: vec![ContentBlock::Text(TextContent::new("captured"))],
@@ -8975,6 +9112,7 @@ mod extensions_integration_tests {
                         "provider": "capturing-provider",
                         "api": "test-api",
                     })],
+                    compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
                     )),
@@ -9080,8 +9218,18 @@ mod extensions_integration_tests {
                 pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
                 ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
                     provider,
-                    stream_options: StreamOptions::default(),
+                    stream_options: StreamOptions {
+                        api_key: Some("host-managed-key".to_string()),
+                        headers: std::collections::HashMap::from([(
+                            "x-compaction-route".to_string(),
+                            "required-route".to_string(),
+                        )]),
+                        max_tokens: Some(4096),
+                        thinking_level: Some(crate::model::ThinkingLevel::High),
+                        ..StreamOptions::default()
+                    },
                     models: Vec::new(),
+                    compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
                     )),
@@ -9113,7 +9261,17 @@ mod extensions_integration_tests {
             });
 
             let result = actions
-                .compact_session(preparation)
+                .compact_session(
+                    preparation,
+                    ExtensionCompactionOptions {
+                        model: Some(crate::extensions::ExtensionCompactionModel {
+                            provider: "capturing-provider".to_string(),
+                            id: "capture-model".to_string(),
+                        }),
+                        custom_instructions: Some("Preserve the retry-count decision".to_string()),
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                    },
+                )
                 .await
                 .expect("compact through session provider");
 
@@ -9134,10 +9292,39 @@ mod extensions_integration_tests {
                 Err(poisoned) => poisoned.into_inner().len(),
             };
             assert_eq!(captured_len, 1);
+            {
+                let captured = calls.lock().expect("captured request");
+                let call = &captured[0];
+                assert_eq!(call.options.api_key.as_deref(), Some("host-managed-key"));
+                assert_eq!(call.options.headers["x-compaction-route"], "required-route");
+                assert_eq!(call.options.max_tokens, Some(4096));
+                assert_eq!(
+                    call.options.thinking_level,
+                    Some(crate::model::ThinkingLevel::Low)
+                );
+                assert!(
+                    serde_json::to_string(&call.messages)
+                        .unwrap()
+                        .contains("Preserve the retry-count decision")
+                );
+            }
+            assert_eq!(
+                actions
+                    .ai_completion
+                    .lock()
+                    .unwrap()
+                    .stream_options
+                    .thinking_level,
+                Some(crate::model::ThinkingLevel::High),
+                "per-compaction options must not change the active session",
+            );
 
             // Malformed preparation is rejected with a validation error.
             let err = actions
-                .compact_session(json!({ "firstKeptEntryId": "" }))
+                .compact_session(
+                    json!({ "firstKeptEntryId": "" }),
+                    ExtensionCompactionOptions::default(),
+                )
                 .await
                 .expect_err("empty firstKeptEntryId must be rejected");
             assert!(
@@ -9147,7 +9334,10 @@ mod extensions_integration_tests {
             );
 
             let err = actions
-                .compact_session(json!("not-an-object"))
+                .compact_session(
+                    json!("not-an-object"),
+                    ExtensionCompactionOptions::default(),
+                )
                 .await
                 .expect_err("non-object preparation must be rejected");
             assert!(
@@ -9156,6 +9346,319 @@ mod extensions_integration_tests {
                 "unexpected error: {err}"
             );
         });
+    }
+
+    fn compaction_override_entry(provider: &str, id: &str, requires_key: bool) -> ModelEntry {
+        ModelEntry {
+            model: crate::provider::Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://compaction.example.invalid/v1".to_string(),
+                reasoning: false,
+                input: vec![crate::provider::InputType::Text],
+                cost: crate::provider::ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 32_768,
+                max_tokens: 2048,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: None,
+            headers: std::collections::HashMap::from([(
+                "x-target-route".to_string(),
+                "target-only".to_string(),
+            )]),
+            auth_header: requires_key,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn compaction_override(provider: &str, id: &str) -> ExtensionCompactionOptions {
+        ExtensionCompactionOptions {
+            model: Some(crate::extensions::ExtensionCompactionModel {
+                provider: provider.to_string(),
+                id: id.to_string(),
+            }),
+            thinking_level: Some(crate::model::ThinkingLevel::Max),
+            ..ExtensionCompactionOptions::default()
+        }
+    }
+
+    #[test]
+    fn extension_compaction_override_uses_target_auth_headers_and_model_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        auth.set(
+            "compaction-target",
+            crate::auth::AuthCredential::ApiKey {
+                key: "target-auth-key".to_string(),
+            },
+        );
+        let mut entry = compaction_override_entry("compaction-target", "summary-model", true);
+        entry.api_key = Some("catalog-fallback-key".to_string());
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![entry]);
+        let state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            auth: Some(Arc::new(auth)),
+            js_provider_ids: Vec::new(),
+        };
+        let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let original = StreamOptions {
+            api_key: Some("source-provider-key".to_string()),
+            headers: std::collections::HashMap::from([(
+                "authorization".to_string(),
+                "Bearer source-private-header".to_string(),
+            )]),
+            max_tokens: Some(8192),
+            ..StreamOptions::default()
+        };
+        let (provider, options) = state
+            .resolve(
+                Arc::clone(&current),
+                original.clone(),
+                &compaction_override("compaction-target", "summary-model"),
+            )
+            .expect("resolve registered model");
+        assert_eq!(provider.name(), "compaction-target");
+        assert_eq!(provider.model_id(), "summary-model");
+        assert!(!Arc::ptr_eq(&provider, &current));
+        assert_eq!(options.api_key.as_deref(), Some("target-auth-key"));
+        assert_eq!(options.headers["x-target-route"], "target-only");
+        assert!(!options.headers.contains_key("authorization"));
+        assert_eq!(options.max_tokens, Some(2048));
+        assert_eq!(options.thinking_level, Some(crate::model::ThinkingLevel::Off));
+        assert_eq!(original.api_key.as_deref(), Some("source-provider-key"));
+        assert_eq!(current.name(), "capturing-provider");
+    }
+
+    #[test]
+    fn extension_compaction_override_accepts_registered_header_auth_without_a_key() {
+        let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        for api in ["openai-completions", "openai-responses"] {
+            for use_compat in [false, true] {
+                for (header, value, ready) in [
+                    ("AUTHORIZATION", "Bearer target-header", true),
+                    ("Authorization", "   ", false),
+                    ("x-tenant", "not-an-auth-header", false),
+                ] {
+                    let mut entry =
+                        compaction_override_entry("compaction-header", "summary-model", true);
+                    entry.model.api = api.to_string();
+                    let headers = std::collections::HashMap::from([(
+                        header.to_string(),
+                        value.to_string(),
+                    )]);
+                    if use_compat {
+                        entry.compat = Some(crate::models::CompatConfig {
+                            custom_headers: Some(headers),
+                            ..crate::models::CompatConfig::default()
+                        });
+                    } else {
+                        entry.headers.extend(headers);
+                    }
+                    let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+                    registry.merge_entries(vec![entry]);
+                    let state = ExtensionCompactionModelState {
+                        registry: Some(Arc::new(registry)),
+                        ..ExtensionCompactionModelState::default()
+                    };
+                    let result = state.resolve(
+                        Arc::clone(&current),
+                        StreamOptions {
+                            api_key: Some("unrelated-source-key".to_string()),
+                            headers: std::collections::HashMap::from([(
+                                "x-source-private".to_string(),
+                                "source-only".to_string(),
+                            )]),
+                            ..StreamOptions::default()
+                        },
+                        &compaction_override("compaction-header", "summary-model"),
+                    );
+                    if ready {
+                        let (provider, options) = result.expect("registered header authentication");
+                        assert_eq!(provider.api(), api);
+                        assert!(options.api_key.is_none());
+                        assert!(!options.headers.contains_key("x-source-private"));
+                        if !use_compat {
+                            assert_eq!(options.headers[header], value);
+                        }
+                    } else {
+                        let error = result.err().expect("no usable target credential");
+                        assert!(error.to_string().contains("missing credentials"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extension_compaction_override_supplies_fresh_constructor_auth() {
+        const CHILD_ENV: &str = "PI_COMPACTION_CONSTRUCTOR_AUTH_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Copilot can otherwise hide a missing constructor credential by
+            // falling back to the test runner's ambient GitHub credentials.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "agent::extensions_integration_tests::extension_compaction_override_supplies_fresh_constructor_auth",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env_remove("GITHUB_COPILOT_API_KEY")
+                .env_remove("GITHUB_TOKEN")
+                .output()
+                .expect("run isolated constructor-auth regression");
+            assert!(
+                output.status.success(),
+                "constructor-auth child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        auth.set(
+            "github-copilot",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-target-github-token".to_string(),
+            },
+        );
+        let entry = compaction_override_entry("github-copilot", "copilot-summary", true);
+        assert!(entry.api_key.is_none(), "catalog intentionally has no credential");
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![entry]);
+        let state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            auth: Some(Arc::new(auth)),
+            js_provider_ids: Vec::new(),
+        };
+        let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let (provider, options) = state
+            .resolve(
+                current,
+                StreamOptions::default(),
+                &compaction_override("github-copilot", "copilot-summary"),
+            )
+            .expect("factory receives auth resolved after the catalog was loaded");
+        assert_eq!(provider.name(), "github-copilot");
+        assert_eq!(options.api_key.as_deref(), Some("fresh-target-github-token"));
+    }
+
+    #[test]
+    fn extension_compaction_override_rejects_unknown_uncredentialed_and_js_models() {
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![
+            compaction_override_entry("compaction-private", "requires-key", true),
+            compaction_override_entry("compaction-js", "js-model", false),
+            compaction_override_entry("compaction-local", "local-model", false),
+        ]);
+        let state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            auth: None,
+            js_provider_ids: vec!["compaction-js".to_string()],
+        };
+        let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        for (provider, model, expected) in [
+            ("compaction-missing", "absent", "not registered"),
+            ("compaction-private", "requires-key", "missing credentials"),
+            ("compaction-js", "js-model", "streamSimple"),
+            ("", "bad-id", "non-empty"),
+        ] {
+            let error = state
+                .resolve(
+                    Arc::clone(&current),
+                    StreamOptions {
+                        api_key: Some("unrelated-key".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    &compaction_override(provider, model),
+                )
+                .err()
+                .expect("invalid target must fail before provider work");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+        let (_, options) = state
+            .resolve(
+                current,
+                StreamOptions {
+                    api_key: Some("unrelated-key".to_string()),
+                    ..StreamOptions::default()
+                },
+                &compaction_override("compaction-local", "local-model"),
+            )
+            .expect("keyless registered model");
+        assert!(
+            options.api_key.is_none(),
+            "keyless target must not inherit a source credential"
+        );
+    }
+
+    #[test]
+    fn extension_compaction_registry_and_auth_follow_session_updates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let provider: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let mut session = AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        );
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![compaction_override_entry(
+            "compaction-live",
+            "live-model",
+            true,
+        )]);
+        session.set_model_registry(registry);
+        for key in ["first-live-key", "replacement-live-key"] {
+            auth.set(
+                "compaction-live",
+                crate::auth::AuthCredential::ApiKey {
+                    key: key.to_string(),
+                },
+            );
+            session.set_auth_storage(auth.clone());
+            let state = session.extension_ai_completion.lock().unwrap().clone();
+            let (_, options) = state
+                .compaction_models
+                .resolve(
+                    state.provider,
+                    state.stream_options,
+                    &compaction_override("compaction-live", "live-model"),
+                )
+                .expect("updated target auth");
+            assert_eq!(options.api_key.as_deref(), Some(key));
+        }
+        assert_eq!(session.agent.provider().name(), "capturing-provider");
     }
 
     struct NativePrivacyCapture {
@@ -9633,6 +10136,7 @@ mod extensions_integration_tests {
                     provider,
                     stream_options: StreamOptions::default(),
                     models: Vec::new(),
+                    compaction_models: ExtensionCompactionModelState::default(),
                     compaction_privacy: Arc::new(StdMutex::new(
                         compaction::CompactionPrivacy::default(),
                     )),
@@ -13950,6 +14454,7 @@ impl AgentSession {
             provider: agent.provider(),
             stream_options: agent.stream_options().clone(),
             models: Vec::new(),
+            compaction_models: ExtensionCompactionModelState::default(),
             compaction_privacy: Arc::clone(&agent.compaction_privacy_state),
         }));
 
@@ -14030,7 +14535,7 @@ impl AgentSession {
 
     #[must_use]
     pub fn with_auth_storage(mut self, auth: AuthStorage) -> Self {
-        self.auth_storage = Some(auth);
+        self.set_auth_storage(auth);
         self
     }
 
@@ -14057,10 +14562,12 @@ impl AgentSession {
                 .set_extension_models(pi_ai_model_registry_values(&registry));
         }
         self.model_registry = Some(registry);
+        self.refresh_extension_compaction_models();
     }
 
     pub fn set_auth_storage(&mut self, auth: AuthStorage) {
         self.auth_storage = Some(auth);
+        self.refresh_extension_compaction_models();
     }
 
     pub(crate) fn scope_auth_storage(&self, auth: &mut AuthStorage) {
@@ -14074,7 +14581,7 @@ impl AgentSession {
     /// CLI override, then stored credential, then the catalog entry's key.
     pub(crate) fn adopt_auth_storage(&mut self, mut auth: AuthStorage) {
         self.scope_auth_storage(&mut auth);
-        self.auth_storage = Some(auth);
+        self.set_auth_storage(auth);
         let entry = self.current_model_entry();
         let key = entry.as_ref().map_or_else(
             || {
@@ -14112,6 +14619,34 @@ impl AgentSession {
         };
         state.provider = self.agent.provider();
         state.stream_options = self.agent.stream_options().clone();
+    }
+
+    fn refresh_extension_compaction_models(&self) {
+        let models = ExtensionCompactionModelState {
+            registry: self.model_registry.clone().map(Arc::new),
+            auth: self.auth_storage.clone().map(Arc::new),
+            js_provider_ids: self.extensions.as_ref().map_or_else(Vec::new, |region| {
+                region
+                    .manager()
+                    .extension_providers()
+                    .iter()
+                    .filter(|spec| {
+                        spec.get("hasStreamSimple")
+                            .and_then(Value::as_bool)
+                            .or_else(|| spec.get("streamSimple").and_then(Value::as_bool))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|spec| spec.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            }),
+        };
+        let Ok(mut state) = self.extension_ai_completion.lock() else {
+            tracing::error!(
+                "extension completion host state mutex poisoned; keeping stale compaction registry"
+            );
+            return;
+        };
+        state.compaction_models = models;
     }
 
     fn set_extension_ai_models(&self, models: Vec<Value>) {
@@ -15736,12 +16271,7 @@ impl AgentSession {
             }
 
             let provider = self.agent.provider();
-            let credential = self
-                .agent
-                .stream_options()
-                .api_key
-                .clone()
-                .unwrap_or_default();
+            let stream_options = self.agent.stream_options().clone();
 
             let runtime_handle = match self.compaction_runtime_handle() {
                 Ok(runtime_handle) => runtime_handle,
@@ -15784,7 +16314,7 @@ impl AgentSession {
                 &runtime_handle,
                 prep,
                 provider,
-                credential,
+                stream_options,
                 None,
                 self.agent.compaction_privacy(),
             ) {
@@ -16153,12 +16683,7 @@ impl AgentSession {
             }
 
             let provider = self.agent.provider();
-            let credential = self
-                .agent
-                .stream_options()
-                .api_key
-                .clone()
-                .unwrap_or_default();
+            let stream_options = self.agent.stream_options().clone();
 
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -16192,7 +16717,7 @@ impl AgentSession {
                 compaction::compact(
                     prep,
                     provider,
-                    &credential,
+                    &stream_options,
                     None,
                     &self.agent.compaction_privacy(),
                 )
@@ -16595,6 +17120,7 @@ impl AgentSession {
         self.agent.extend_tools(wrappers);
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
+        self.refresh_extension_compaction_models();
         Ok(())
     }
 

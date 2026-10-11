@@ -9830,55 +9830,76 @@ export function rawKeyHint(key, description = "") {
   return keyLabel && label ? `${keyLabel} ${label}` : keyLabel || label;
 }
 
-// compact performs conversation compaction host-side via pi's native
-// compaction engine (gh #167 / bd-i28yz). The model / apiKey /
-// customInstructions arguments are DELIBERATELY ignored: the host always
-// compacts with the SESSION's own provider, model, and credentials, so a
-// sandboxed extension can neither choose the endpoint nor supply (or
-// observe) a credential. On malformed preparation or provider failure the
-// returned Promise rejects -- pi's fail-open session_before_compact
-// handling then continues normal compaction; no placeholder summary is
-// ever fabricated.
-// When the second argument is an options object carrying a string
-// `strategy` (gh #167: `compact(preparation, { strategy:
-// "openai-responses-native", request })`), the strategy and the
-// extension-composed request cross the bridge for host-side sanitization
-// and a host-credentialed POST to the provider's native compact endpoint.
-// A legacy Model object in that position (no `strategy` key) keeps the
-// original summary-compaction path.
+// Summary compaction accepts public model identity, custom instructions and
+// thinking level. The host resolves registered models and credentials;
+// caller-supplied credentials, headers, endpoints and custom stream functions
+// never control the request. The positional form follows the current exported
+// compact(preparation, model, apiKey, headers, customInstructions, signal,
+// thinkingLevel, streamFn, env) signature. Host-owned arguments must be absent.
+// ctx.compact uses this same implementation with an options object.
 //
-// Cancellation (gh #178): a signal (`options.signal`, or the legacy fifth
+// Cancellation (gh #178): a signal (`options.signal`, or the sixth
 // argument) that has already aborted rejects before any host work starts.
 // An abort that fires mid-call is NOT propagated: hostcalls are serialized on
 // the extension runtime thread, so no JS abort handler can run until the
 // compact hostcall returns. The host's dedicated compact event budget bounds
 // that round-trip instead.
-export async function compact(preparation, modelOrOptions, _apiKey, _customInstructions, _signal) {
-  const signal =
-    (modelOrOptions && typeof modelOrOptions === "object" && modelOrOptions.signal) || _signal;
-  if (signal && signal.aborted) {
-    if (signal.reason !== undefined) {
-      throw signal.reason;
+export async function compact(preparation, modelOrOptions, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env) {
+  const supplied = modelOrOptions ?? {};
+  if (typeof supplied !== "object" || Array.isArray(supplied)) {
+    throw new TypeError("compact: model/options must be an object");
+  }
+  const positionalModel = "provider" in supplied || "id" in supplied;
+  const positional = positionalModel || (modelOrOptions == null && arguments.length > 2);
+  const options = positional
+    ? { model: positionalModel ? supplied : undefined, customInstructions, signal, thinkingLevel }
+    : supplied;
+  const abortSignal = options.signal ?? signal;
+  if (abortSignal && abortSignal.aborted) {
+    if (abortSignal.reason !== undefined) {
+      throw abortSignal.reason;
     }
     const aborted = new Error("This operation was aborted");
     aborted.name = "AbortError";
     throw aborted;
   }
+  if ([apiKey, headers, streamFn, env].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: credentials, headers, streamFn and env are host-owned; pass only a public model identity and summary options");
+  }
+  if (!positional && [customInstructions, thinkingLevel].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: use customInstructions and thinkingLevel inside the options object");
+  }
+  const allowed = new Set(["model", "customInstructions", "thinkingLevel", "signal", "strategy", "request"]);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) throw new TypeError(`compact: unsupported option ${key}`);
+  }
+  const summaryOptions = {};
+  if (options.model !== undefined && options.model !== null) {
+    const model = options.model;
+    if (typeof model !== "object" || Array.isArray(model) || typeof model.provider !== "string" || !model.provider.trim() || typeof model.id !== "string" || !model.id.trim()) {
+      throw new TypeError("compact: model provider and id must be non-empty strings");
+    }
+    summaryOptions.model = { provider: model.provider, id: model.id };
+  }
+  if (options.customInstructions !== undefined && options.customInstructions !== null) {
+    if (typeof options.customInstructions !== "string") throw new TypeError("compact: customInstructions must be a string");
+    summaryOptions.customInstructions = options.customInstructions;
+  }
+  if (options.thinkingLevel !== undefined && options.thinkingLevel !== null) {
+    if (typeof options.thinkingLevel !== "string") throw new TypeError("compact: thinkingLevel must be a string");
+    summaryOptions.thinkingLevel = options.thinkingLevel;
+  }
   if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
     throw new Error("compact() host bridge is unavailable in this runtime");
   }
-  if (
-    modelOrOptions &&
-    typeof modelOrOptions === "object" &&
-    typeof modelOrOptions.strategy === "string"
-  ) {
-    return await globalThis.pi.events("compact", {
-      preparation: preparation ?? null,
-      strategy: modelOrOptions.strategy,
-      request: modelOrOptions.request ?? null,
-    });
+  const payload = { preparation: preparation ?? null, options: summaryOptions };
+  if (options.strategy !== undefined && options.strategy !== null) {
+    payload.strategy = options.strategy;
+    payload.request = options.request ?? null;
+  } else if (options.request !== undefined && options.request !== null) {
+    throw new TypeError("compact: request requires a native strategy");
   }
-  return await globalThis.pi.events("compact", { preparation: preparation ?? null });
+  return await globalThis.pi.events("compact", payload);
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -22192,22 +22213,13 @@ function __pi_make_extension_ctx(ctx_payload) {
             // pi-better-compaction feature-detects the absence and fails
             // open to normal compaction.
         },
-        // Host-side compaction bridge (gh #167 / bd-i28yz): summarizes the
-        // given preparation with the SESSION's own provider, model, and
-        // credentials. Rejects on malformed preparation or provider failure;
-        // no fabricated summary is ever returned. With an options object
-        // ({ strategy: 'openai-responses-native', request }) the host runs
-        // the provider's native compact endpoint instead and returns
-        // details.compactedWindow (still host-credentialed; the request is
-        // sanitized host-side and the model pinned to the session's own).
-        compact: async (preparation, options) =>
-            options && typeof options === 'object' && typeof options.strategy === 'string'
-                ? pi.events('compact', {
-                      preparation: preparation ?? null,
-                      strategy: options.strategy,
-                      request: options.request ?? null,
-                  })
-                : pi.events('compact', { preparation: preparation ?? null }),
+        // Share the public summary options, credential checks and pre-abort
+        // behavior with the exported API. Native strategy requests remain
+        // host-sanitized and pinned to the current session model.
+        compact: async (preparation, options) => {
+            const codingAgent = await import('@mariozechner/pi-coding-agent');
+            return codingAgent.compact(preparation, options);
+        },
     };
 }
 
@@ -25472,8 +25484,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            205_300,
-            "0da93a4217162f652a4f99960a7393c241112a4f230a63feb354ac030cd6f9bb",
+            204_682,
+            "e9ff1234adb056259fdd01578b192fad89e853b567f0eadd7d7a66b42b07bad0",
         ),
         (
             "node:fs",
@@ -25495,11 +25507,11 @@ mod tests {
             17_837,
             "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
         ),
-        // Re-pinned for 99c07f823 (gh #178): compact() rejects a pre-aborted signal.
+        // Re-pinned with public compaction options and the nine-argument API.
         (
             "@mariozechner/pi-coding-agent",
-            27_870,
-            "cec3aa92f03004f4e4ed5ddcecaec0da0061dc53569214a5f15d8f9c28a03f48",
+            29_603,
+            "90cd8ffeb6ad50922ad4e5923efe2ede8e5d68f8d8507655fdc3ae989704968e",
         ),
         (
             "@mariozechner/pi-tui",
@@ -25923,7 +25935,7 @@ mod tests {
     }
 
     /// gh #178: a signal that has already aborted, in either the options form
-    /// or the legacy fifth argument, rejects `compact()` with the abort reason
+    /// or the current sixth argument, rejects `compact()` with the abort reason
     /// before any host compaction is requested.
     #[test]
     fn pi_coding_agent_compact_rejects_a_pre_aborted_signal_without_host_work() {
@@ -25951,7 +25963,7 @@ mod tests {
                             { strategy: 'openai-responses-native', request: {}, signal: controller.signal }));
                         record(mod.compact(
                             { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
-                            undefined, undefined, undefined, AbortSignal.abort()));
+                            undefined, undefined, undefined, undefined, AbortSignal.abort()));
                     });
                     ",
                 )
@@ -25979,10 +25991,8 @@ mod tests {
         });
     }
 
-    /// gh #167 / bd-i28yz: the pi-coding-agent `compact()` export bridges to
-    /// the host `compact` events op with only the preparation (extension-
-    /// supplied model/apiKey are dropped host-side by design) and resolves
-    /// with the bridged compaction result shape.
+    /// The current positional API forwards public model identity, guidance
+    /// and thinking level without trusting model endpoint/header metadata.
     #[test]
     fn pi_coding_agent_compact_bridges_to_host_compaction_op() {
         futures::executor::block_on(async {
@@ -25998,8 +26008,12 @@ mod tests {
                     import('@mariozechner/pi-coding-agent')
                         .then((mod) => mod.compact(
                             { firstKeptEntryId: 'entry-9', tokensBefore: 4200 },
-                            { id: 'attacker-model' },
-                            'attacker-key',
+                            { provider: 'summary-provider', id: 'summary-model', baseUrl: 'https://untrusted.invalid', headers: { authorization: 'untrusted' } },
+                            undefined,
+                            undefined,
+                            'Preserve decisions',
+                            undefined,
+                            'low',
                             undefined,
                             undefined))
                         .then((value) => { globalThis.compactProbe.value = value; })
@@ -26024,8 +26038,6 @@ mod tests {
                         panic!("expected events hostcall, got {:?}", request.kind);
                     };
                     assert_eq!(op.as_str(), "compact", "unexpected events op");
-                    // Only the preparation crosses the bridge; the
-                    // extension-chosen model/apiKey never do.
                     assert_eq!(
                         request.payload["preparation"]["firstKeptEntryId"],
                         json!("entry-9")
@@ -26033,6 +26045,14 @@ mod tests {
                     assert_eq!(request.payload["preparation"]["tokensBefore"], json!(4200));
                     assert_eq!(request.payload.get("model"), None);
                     assert_eq!(request.payload.get("apiKey"), None);
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "summary-provider", "id": "summary-model" },
+                            "customInstructions": "Preserve decisions",
+                            "thinkingLevel": "low"
+                        })
+                    );
                     runtime.complete_hostcall(
                         request.call_id,
                         HostcallOutcome::Success(json!({
@@ -26054,6 +26074,122 @@ mod tests {
             assert_eq!(probe["value"]["summary"], json!("bridged summary"));
             assert_eq!(probe["value"]["firstKeptEntryId"], json!("entry-9"));
             assert_eq!(probe["value"]["tokensBefore"], json!(4200));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_compact_rejects_credentials_and_invalid_options_before_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(
+                    r"
+                globalThis.compactInvalid = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const preparation = { firstKeptEntryId: 'keep' };
+                    const model = { provider: 'p', id: 'm' };
+                    const calls = [
+                        () => mod.compact(preparation, model, 'caller-key'),
+                        () => mod.compact(preparation, model, undefined, { authorization: 'caller-header' }),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, () => {}),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, undefined, { TOKEN: 'caller-env' }),
+                        () => mod.compact(preparation, { model, headers: {} }),
+                        () => mod.compact(preparation, { model: { id: 'missing-provider' } }),
+                    ];
+                    for (const call of calls) {
+                        try { await call(); compactInvalid.errors.push('resolved'); }
+                        catch (error) { compactInvalid.errors.push(error.name); }
+                    }
+                    compactInvalid.done = true;
+                });
+                    ",
+                )
+                .await
+                .expect("invoke invalid compactions");
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(runtime.drain_hostcall_requests().is_empty());
+                if get_global_json(&runtime, "compactInvalid").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "compactInvalid").await;
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!([
+                    "TypeError", "TypeError", "TypeError", "TypeError", "TypeError", "TypeError"
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn extension_context_compact_forwards_options_and_checks_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                __pi_begin_extension(__pi_test_secret, 'ext.compact-options', { name: 'ext.compact-options' });
+                globalThis.ctxCompactProbe = { done: false };
+                pi.on('session_before_compact', async (event, ctx) => {
+                    try { await ctx.compact(event.preparation, { signal: AbortSignal.abort() }); }
+                    catch (error) { ctxCompactProbe.aborted = error.name; }
+                    ctxCompactProbe.result = await ctx.compact(event.preparation, {
+                        model: { provider: 'p', id: 'm' },
+                        customInstructions: 'Keep open blockers',
+                        thinkingLevel: 'medium',
+                    });
+                });
+                __pi_end_extension(__pi_test_secret);
+                __pi_dispatch_extension_event(__pi_test_secret, 'session_before_compact', {
+                    preparation: { firstKeptEntryId: 'keep', tokensBefore: 1234 },
+                }, { hasUI: false, cwd: '/workspace' })
+                    .catch((error) => { ctxCompactProbe.error = String(error); })
+                    .finally(() => { ctxCompactProbe.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch compaction extension");
+            let mut calls = 0;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                for request in runtime.drain_hostcall_requests() {
+                    assert!(
+                        matches!(&request.kind, HostcallKind::Events { op } if op == "compact")
+                    );
+                    calls += 1;
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "p", "id": "m" },
+                            "customInstructions": "Keep open blockers",
+                            "thinkingLevel": "medium"
+                        })
+                    );
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({ "summary": "ctx summary" })),
+                    );
+                }
+                if get_global_json(&runtime, "ctxCompactProbe").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "ctxCompactProbe").await;
+            assert_eq!(calls, 1, "pre-aborted context call must not reach the host");
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(probe["aborted"], json!("AbortError"));
+            assert_eq!(probe["result"]["summary"], json!("ctx summary"));
+            assert_eq!(probe["error"], serde_json::Value::Null);
         });
     }
 
@@ -26170,7 +26306,7 @@ mod tests {
                     r"
                     globalThis.compactProbe = { done: false };
                     import('@mariozechner/pi-coding-agent')
-                        .then((mod) => mod.compact({}, {}, 'api-key', undefined, undefined))
+                        .then((mod) => mod.compact({}, {}))
                         .then((value) => { globalThis.compactProbe.value = value; })
                         .catch((error) => {
                             globalThis.compactProbe.error = String((error && error.message) || error);
@@ -26181,6 +26317,7 @@ mod tests {
                 .await
                 .expect("invoke compact bridge");
 
+            let mut dispatched = 0;
             for _ in 0..32 {
                 drain_until_idle(&runtime, &clock).await;
                 let state = get_global_json(&runtime, "compactProbe").await;
@@ -26192,6 +26329,7 @@ mod tests {
                         panic!("expected events hostcall, got {:?}", request.kind);
                     };
                     assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    dispatched += 1;
                     runtime.complete_hostcall(
                         request.call_id,
                         HostcallOutcome::Error {
@@ -26204,6 +26342,7 @@ mod tests {
                 }
             }
 
+            assert_eq!(dispatched, 1, "rejection must come from the host bridge");
             drain_until_idle(&runtime, &clock).await;
             let probe = get_global_json(&runtime, "compactProbe").await;
             assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");

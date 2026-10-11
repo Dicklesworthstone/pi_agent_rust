@@ -913,13 +913,7 @@ impl PiApp {
             return None;
         };
         let provider = agent_guard.provider();
-        // Keyless providers (replay/test/local) summarize fine without a
-        // key; credentialed ones carry theirs.
-        let api_key = agent_guard
-            .stream_options()
-            .api_key
-            .clone()
-            .unwrap_or_default();
+        let stream_options = agent_guard.stream_options().clone();
         let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
@@ -999,7 +993,7 @@ impl PiApp {
             let summary = crate::checkpoint::summarize_span(
                 &span,
                 provider,
-                &api_key,
+                &stream_options,
                 &settings,
                 &privacy,
             )
@@ -1331,7 +1325,7 @@ impl PiApp {
             return None;
         };
         let provider = agent_guard.provider();
-        let api_key_opt = agent_guard.stream_options().api_key.clone();
+        let stream_options = agent_guard.stream_options().clone();
         let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
@@ -1351,11 +1345,6 @@ impl PiApp {
         } else {
             trimmed_args
         };
-
-        if !shake_mode && api_key_opt.is_none() {
-            self.status_message = Some("No API key configured; cannot run compaction".to_string());
-            return None;
-        }
 
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
@@ -1479,7 +1468,7 @@ impl PiApp {
                         crate::compaction::compact(
                             prep,
                             Arc::clone(&provider),
-                            api_key_opt.as_deref().unwrap_or_default(),
+                            &stream_options,
                             custom_instructions.as_deref(),
                             &privacy,
                         )

@@ -2196,7 +2196,7 @@ async fn complete_simple(
     provider: Arc<dyn Provider>,
     system_prompt: &str,
     prompt_text: String,
-    api_key: &str,
+    stream_options: &StreamOptions,
     reserve_tokens: u32,
     max_tokens_factor: f64,
 ) -> Result<AssistantMessage> {
@@ -2214,12 +2214,18 @@ async fn complete_simple(
         tools: Vec::new().into(),
     };
 
-    let options = StreamOptions {
-        api_key: Some(api_key.to_string()),
-        max_tokens: Some(max_tokens),
-        thinking_level: Some(ThinkingLevel::High),
-        ..Default::default()
-    };
+    let mut options = stream_options.clone();
+    options.max_tokens = Some(
+        options
+            .max_tokens
+            .filter(|limit| *limit > 0)
+            .map_or(max_tokens, |limit| limit.min(max_tokens)),
+    );
+    options.thinking_level.get_or_insert(ThinkingLevel::High);
+    // Compaction has already screened its inputs and can be called from an
+    // extension event. Re-entering that runtime through the ordinary request
+    // hook can deadlock and would let it rewrite the screened summary input.
+    options.before_provider_request = None;
 
     let mut stream = provider.stream(&context, &options).await?;
     let mut final_message: Option<AssistantMessage> = None;
@@ -2300,7 +2306,7 @@ async fn complete_summary(
     provider: Arc<dyn Provider>,
     system_prompt: &str,
     prompt: String,
-    api_key: &str,
+    stream_options: &StreamOptions,
     settings: &ResolvedCompactionSettings,
     max_tokens_factor: f64,
 ) -> Result<String> {
@@ -2308,7 +2314,7 @@ async fn complete_summary(
         provider,
         system_prompt,
         prompt,
-        api_key,
+        stream_options,
         settings.reserve_tokens,
         max_tokens_factor,
     )
@@ -2585,7 +2591,7 @@ pub fn prepare_compaction(
 pub async fn summarize_entries(
     entries: &[SessionEntry],
     provider: Arc<dyn Provider>,
-    api_key: &str,
+    stream_options: &StreamOptions,
     reserve_tokens: u32,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
@@ -2628,7 +2634,7 @@ pub async fn summarize_entries(
         &mut privacy,
     )?;
     let mut summary =
-        generate_llm_summary(&preparation.settings, provider, api_key, requests).await?;
+        generate_llm_summary(&preparation.settings, provider, stream_options, requests).await?;
     let mut fields = SummaryFields::default();
     fields.text(&mut summary)?;
     fields.screen(&mut privacy)?;
@@ -2700,7 +2706,7 @@ fn prepare_summary_requests(
 async fn generate_llm_summary(
     settings: &ResolvedCompactionSettings,
     provider: Arc<dyn Provider>,
-    api_key: &str,
+    stream_options: &StreamOptions,
     requests: PreparedSummaryRequests,
 ) -> Result<String> {
     let history_summary = if let Some(history) = requests.history {
@@ -2708,7 +2714,7 @@ async fn generate_llm_summary(
             Arc::clone(&provider),
             &requests.system,
             history,
-            api_key,
+            stream_options,
             settings,
             0.8,
         )
@@ -2721,7 +2727,7 @@ async fn generate_llm_summary(
             provider,
             &requests.system,
             turn_prefix,
-            api_key,
+            stream_options,
             settings,
             0.5,
         )
@@ -2785,7 +2791,7 @@ fn finish_compaction(
 pub async fn compact(
     mut preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
-    api_key: &str,
+    stream_options: &StreamOptions,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
 ) -> Result<CompactionResult> {
@@ -2801,8 +2807,13 @@ pub async fn compact(
         &mut privacy,
     )?;
     let snap_transcript = requests.snap_transcript.take();
-    let summary = match generate_llm_summary(&preparation.settings, provider, api_key, requests)
-        .await
+    let summary = match generate_llm_summary(
+        &preparation.settings,
+        provider,
+        stream_options,
+        requests,
+    )
+    .await
     {
         Ok(summary) => summary,
         Err(error) => {
@@ -3045,7 +3056,7 @@ pub const fn estimate_text_tokens(text: &str) -> u64 {
 pub async fn compact_auto(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
-    api_key: &str,
+    stream_options: &StreamOptions,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
 ) -> Result<CompactionResult> {
@@ -3060,7 +3071,14 @@ pub async fn compact_auto(
             return Ok(compact_shake(preparation, privacy));
         }
     }
-    compact(preparation, provider, api_key, custom_instructions, privacy).await
+    compact(
+        preparation,
+        provider,
+        stream_options,
+        custom_instructions,
+        privacy,
+    )
+    .await
 }
 
 /// Estimate what the compacted span would shrink to under a shake.
@@ -5139,7 +5157,7 @@ mod tests {
             .block_on(compact_auto(
                 prep,
                 Arc::new(PanickingProvider),
-                "unused",
+                &StreamOptions::default(),
                 None,
                 &CompactionPrivacy::default(),
             ))
@@ -5748,7 +5766,7 @@ mod tests {
                 let result = compact(
                     make_preparation(),
                     Arc::new(FailingProvider),
-                    "key",
+                    &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
                 )
@@ -5794,7 +5812,7 @@ mod tests {
                 let result = compact(
                     prep,
                     Arc::new(FailingProvider),
-                    "key",
+                    &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
                 )
@@ -5811,7 +5829,7 @@ mod tests {
                 let result = compact(
                     make_preparation(),
                     Arc::new(FixedSummaryProvider),
-                    "key",
+                    &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
                 )
@@ -5853,7 +5871,7 @@ mod tests {
                 let error = compact(
                     prep,
                     Arc::new(FailingProvider),
-                    "key",
+                    &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
                 )

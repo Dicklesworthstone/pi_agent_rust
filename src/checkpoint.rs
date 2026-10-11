@@ -180,7 +180,7 @@ pub struct RewindOutcome {
 pub async fn summarize_span(
     span: &[Message],
     provider: std::sync::Arc<dyn crate::provider::Provider>,
-    api_key: &str,
+    stream_options: &crate::provider::StreamOptions,
     settings: &crate::compaction::ResolvedCompactionSettings,
     privacy: &crate::compaction::CompactionPrivacy,
 ) -> Result<String> {
@@ -203,7 +203,7 @@ pub async fn summarize_span(
     let result = crate::compaction::compact(
         preparation,
         provider,
-        api_key,
+        stream_options,
         Some(
             "Summarize this span as a concise rewind report: what was explored, \
              what was decided, what remains open. Preserve file paths, \

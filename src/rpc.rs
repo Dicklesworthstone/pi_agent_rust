@@ -3885,13 +3885,7 @@ pub async fn run(
                         .cloned()
                         .collect::<Vec<_>>();
 
-                    let key = guard
-                        .agent
-                        .stream_options()
-                        .api_key
-                        .clone()
-                        .ok_or_else(|| Error::auth("Missing API key for compaction"))?;
-
+                    let stream_options = guard.agent.stream_options().clone();
                     let provider = guard.agent.provider();
 
                     let settings = ResolvedCompactionSettings {
@@ -3913,7 +3907,7 @@ pub async fn run(
                     let compact_res = compact(
                         prep,
                         provider,
-                        &key,
+                        &stream_options,
                         custom_instructions.as_deref(),
                         &privacy,
                     )
@@ -4064,14 +4058,7 @@ pub async fn run(
                     let _provider_transition = state.provider_admission.acquire(&cx).await?;
                     state.provider_admission.ensure_allowed()?;
                     let provider = guard.agent.provider();
-                    // Keyless providers (replay/test/local) summarize fine
-                    // without a key; credentialed ones carry theirs.
-                    let api_key = guard
-                        .agent
-                        .stream_options()
-                        .api_key
-                        .clone()
-                        .unwrap_or_default();
+                    let stream_options = guard.agent.stream_options().clone();
                     let settings = crate::compaction::ResolvedCompactionSettings {
                         enabled: true,
                         ..Default::default()
@@ -4080,7 +4067,7 @@ pub async fn run(
                     let summary = crate::checkpoint::summarize_span(
                         &span,
                         provider,
-                        &api_key,
+                        &stream_options,
                         &settings,
                         &privacy,
                     )
@@ -13785,18 +13772,10 @@ async fn maybe_auto_compact(
         emit_auto_compaction_error(&out_tx, err.to_string());
         return;
     }
-    let Some(key) = guard.agent.stream_options().api_key.clone() else {
-        let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
-            result: None,
-            aborted: false,
-            will_retry: false,
-            error_message: Some("Missing API key for compaction".to_string()),
-        }));
-        return;
-    };
+    let stream_options = guard.agent.stream_options().clone();
     let provider = guard.agent.provider();
     let privacy = guard.agent.compaction_privacy();
-    let result = compact_auto(prep, provider, &key, None, &privacy).await;
+    let result = compact_auto(prep, provider, &stream_options, None, &privacy).await;
 
     match result {
         Ok(result) => {

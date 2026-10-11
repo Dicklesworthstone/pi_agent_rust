@@ -176,6 +176,72 @@ API calls:
 | `pi.events("getAllTools")`           | List all registered tools       |
 | `pi.events("registerMessageRenderer")`| Register message renderer      |
 
+### Compaction from extensions
+
+`ctx.compact(preparation, options)` runs the host's summary compaction engine
+and returns its compaction result. A `session_before_compact` handler can
+return that result as `{ compaction }` to replace the ordinary summary:
+
+```javascript
+export default function (pi) {
+  pi.on("session_before_compact", async (event, ctx) => {
+    const compaction = await ctx.compact(event.preparation, {
+      customInstructions:
+        event.customInstructions ?? "Preserve open blockers and key decisions.",
+      thinkingLevel: "low",
+    });
+    return { compaction };
+  });
+}
+```
+
+Summary options are optional:
+
+| Option | Behavior |
+|--------|----------|
+| `model: { provider, id }` | Select the current model or another model registered in the host's model registry for this compaction only. |
+| `customInstructions: string` | Add summary guidance, subject to the normal compaction privacy policy. |
+| `thinkingLevel` | Request `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the host clamps the request to the registered model's capabilities. When omitted, the current stream setting is used, with `high` as the unset fallback. |
+| `signal: AbortSignal` | Reject before host work if already aborted. Mid-call JavaScript abort propagation is not implemented. |
+
+For example, add `model: { provider: "configured-provider", id: "summary-model" }`
+to use a separately configured summary model. The host resolves its endpoint,
+authentication and required headers from the registered entry. Selecting the
+current model reuses the active provider instance and stream settings. Selecting
+another provider never forwards the current provider's key or authorization
+headers. The active session model and thinking level remain unchanged.
+Extension providers implemented with JavaScript `streamSimple` are rejected
+because they would reenter the runtime awaiting compaction.
+
+The `compact` export from `@mariozechner/pi-coding-agent` accepts the same
+options object. Its positional signature is:
+
+```javascript
+compact(preparation, model, apiKey, headers, customInstructions,
+        signal, thinkingLevel, streamFn, env)
+```
+
+Leave `apiKey`, `headers`, `streamFn`, and `env` undefined or null: those inputs
+belong to the host, and supplying them rejects the call. Only `provider` and
+`id` are read from a public model object; extra catalog metadata cannot change
+the endpoint or headers. Unknown options and malformed model identities are
+errors. The raw host payload is `{ preparation, options }`, where `options`
+contains only `model`, `customInstructions`, and `thinkingLevel`.
+
+The native Responses strategy uses
+`{ strategy: "openai-responses-native", request }`. It stays pinned to the
+current model and accepts guidance through the sanitized
+`request.instructions` and `request.reasoning` fields. Summary options cannot
+be combined with that strategy, and `request` requires a native strategy.
+
+All summary paths preserve the host's stream options, including required
+headers, thinking budgets, cache settings and service tier. Output is capped
+by both the selected model/operation limit and the compaction reserve budget.
+The ordinary `before_provider_request` hook is excluded to prevent recursive
+extension calls and preserve privacy-screened summary inputs. The existing
+compaction event timeout still bounds the host round trip; it does not make a
+signal that aborts mid-call observable to the serialized JavaScript runtime.
+
 ## Capability Policy
 
 ### Policy Model (`src/extensions.rs`)

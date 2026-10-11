@@ -3852,7 +3852,11 @@ impl ExtensionHostActions for CompactBridgeSpyHostActions {
         Ok(())
     }
 
-    async fn compact_session(&self, preparation: Value) -> pi::error::Result<Value> {
+    async fn compact_session(
+        &self,
+        preparation: Value,
+        _options: pi::extensions::ExtensionCompactionOptions,
+    ) -> pi::error::Result<Value> {
         let first_kept = preparation
             .get("firstKeptEntryId")
             .and_then(Value::as_str)

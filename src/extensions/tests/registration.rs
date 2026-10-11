@@ -1548,6 +1548,7 @@ pub(super) struct MockHostActions {
     user_messages: std::sync::Mutex<Vec<ExtensionSendUserMessage>>,
     ai_requests: std::sync::Mutex<Vec<ExtensionAiCompletionRequest>>,
     ai_models: std::sync::Mutex<Value>,
+    compactions: std::sync::Mutex<Vec<(Value, ExtensionCompactionOptions)>>,
 }
 
 impl MockHostActions {
@@ -1556,6 +1557,7 @@ impl MockHostActions {
             messages: std::sync::Mutex::new(Vec::new()),
             user_messages: std::sync::Mutex::new(Vec::new()),
             ai_requests: std::sync::Mutex::new(Vec::new()),
+            compactions: std::sync::Mutex::new(Vec::new()),
             ai_models: std::sync::Mutex::new(json!([
                 {
                     "id": "mock-model",
@@ -1611,6 +1613,116 @@ impl ExtensionHostActions for MockHostActions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone())
     }
+
+    async fn compact_session(
+        &self,
+        preparation: Value,
+        options: ExtensionCompactionOptions,
+    ) -> Result<Value> {
+        self.compactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((preparation, options));
+        Ok(json!({ "summary": "host summary" }))
+    }
+}
+
+#[test]
+fn events_compact_preserves_public_model_and_summary_options() {
+    asupersync::test_utils::run_test(|| async {
+        let manager = ExtensionManager::new();
+        let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+        let actions = Arc::new(MockHostActions::new());
+        manager.set_host_actions(actions.clone());
+        let outcome = dispatch_hostcall_events(
+            "compact-options",
+            &manager,
+            &tools,
+            "compact",
+            json!({
+                "preparation": { "firstKeptEntryId": "keep" },
+                "options": {
+                    "model": { "provider": "summary-provider", "id": "summary-model" },
+                    "customInstructions": "Preserve open work and decisions",
+                    "thinkingLevel": "medium"
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        let calls = actions.compactions.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0["firstKeptEntryId"], "keep");
+        let options = &calls[0].1;
+        assert_eq!(options.model.as_ref().unwrap().provider, "summary-provider");
+        assert_eq!(options.model.as_ref().unwrap().id, "summary-model");
+        assert_eq!(
+            options.custom_instructions.as_deref(),
+            Some("Preserve open work and decisions")
+        );
+        assert_eq!(
+            options.thinking_level,
+            Some(crate::model::ThinkingLevel::Medium)
+        );
+    });
+}
+
+#[test]
+fn events_compact_rejects_invalid_or_host_owned_options_before_dispatch() {
+    asupersync::test_utils::run_test(|| async {
+        let manager = ExtensionManager::new();
+        let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+        let actions = Arc::new(MockHostActions::new());
+        manager.set_host_actions(actions.clone());
+        for options in [
+            json!({ "model": {
+                "provider": "p", "id": "m", "baseUrl": "https://untrusted.invalid"
+            } }),
+            json!({ "model": { "provider": "", "id": "m" } }),
+            json!({ "model": { "provider": "p", "id": 7 } }),
+            json!({ "apiKey": "untrusted" }),
+            json!({ "headers": { "authorization": "untrusted" } }),
+            json!({ "env": {} }),
+            json!({ "customInstructions": 7 }),
+            json!({ "thinkingLevel": "unknown" }),
+            json!([]),
+        ] {
+            let outcome = dispatch_hostcall_events(
+                "compact-invalid",
+                &manager,
+                &tools,
+                "compact",
+                json!({ "preparation": {}, "options": options }),
+            )
+            .await;
+            assert!(
+                matches!(outcome, HostcallOutcome::Error { ref code, .. } if code == "invalid_request")
+            );
+        }
+        for payload in [
+            json!({ "preparation": {}, "apiKey": "untrusted" }),
+            json!({ "preparation": {}, "model": { "provider": "p", "id": "m" } }),
+            json!({ "preparation": {}, "request": {} }),
+            json!({ "preparation": {}, "strategy": null, "request": {} }),
+            json!({
+                "preparation": {}, "strategy": "openai-responses-native",
+                "request": {}, "options": { "thinkingLevel": "low" }
+            }),
+        ] {
+            let outcome = dispatch_hostcall_events(
+                "compact-invalid",
+                &manager,
+                &tools,
+                "compact",
+                payload,
+            )
+            .await;
+            assert!(
+                matches!(outcome, HostcallOutcome::Error { ref code, .. } if code == "invalid_request")
+            );
+        }
+        assert!(actions.compactions.lock().unwrap().is_empty());
+    });
 }
 
 // ========================================================================

@@ -521,7 +521,7 @@ impl PiApp {
             return false;
         };
         let provider = agent_guard.provider();
-        let key_opt = agent_guard.stream_options().api_key.clone();
+        let stream_options = agent_guard.stream_options().clone();
         let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
@@ -565,15 +565,13 @@ impl PiApp {
                 }
             }
 
-            let summary_skipped =
-                summary_requested && key_opt.is_none() && !pending.entries_to_summarize.is_empty();
             let summary_text = if !summary_requested || pending.entries_to_summarize.is_empty() {
                 None
-            } else if let Some(key) = key_opt.as_deref() {
+            } else {
                 match crate::compaction::summarize_entries(
                     &pending.entries_to_summarize,
                     provider,
-                    key,
+                    &stream_options,
                     reserve_tokens,
                     custom_instructions.as_deref(),
                     &privacy,
@@ -591,8 +589,6 @@ impl PiApp {
                         return;
                     }
                 }
-            } else {
-                None
             };
 
             // Keep Agent and Session branch histories atomic. Acquiring Agent
@@ -653,13 +649,7 @@ impl PiApp {
             let status = match persistence {
                 TreeNavigationPersistenceOutcome::Confirmed
                 | TreeNavigationPersistenceOutcome::Disabled => {
-                    if summary_skipped {
-                        Some(format!(
-                            "Switched to {switched_to} (no summary: missing API key)"
-                        ))
-                    } else {
-                        Some(format!("Switched to {switched_to}"))
-                    }
+                    Some(format!("Switched to {switched_to}"))
                 }
                 TreeNavigationPersistenceOutcome::ReconciledButUnconfirmed => Some(format!(
                     "Persistence warning: branch switch is present in the current disk and active session state, but final durability was not confirmed (switched to {switched_to})"

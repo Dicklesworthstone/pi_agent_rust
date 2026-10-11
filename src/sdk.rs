@@ -2702,8 +2702,6 @@ impl AgentSessionHandle {
                 checkpoint.name
             )));
         }
-        // Keyless providers (replay/test/local) summarize fine without a key.
-        let api_key = agent.stream_options().api_key.clone().unwrap_or_default();
         let privacy = agent.compaction_privacy();
         let settings = crate::compaction::ResolvedCompactionSettings {
             enabled: true,
@@ -2712,7 +2710,7 @@ impl AgentSessionHandle {
         let summary = crate::checkpoint::summarize_span(
             &span,
             agent.provider(),
-            &api_key,
+            agent.stream_options(),
             &settings,
             &privacy,
         )

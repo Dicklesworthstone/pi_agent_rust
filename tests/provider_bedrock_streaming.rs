@@ -851,13 +851,13 @@ fn check_saved_workspace_auth_reload(root: &std::path::Path) {
     conflicting_auth.save().expect("conflicting relative auth file");
     std::env::set_current_dir(&later_workspace).expect("change isolated child cwd");
 
-    // Rewind/compaction creates fresh StreamOptions and clones the provider.
-    // No API key or workspace is passed through the summary options.
+    // The bound provider must also work for a summary whose operation options
+    // do not contain an API key or a workspace.
     let span = context().messages.into_owned();
     let summary = run(pi::checkpoint::summarize_span(
         &span,
         Arc::clone(&provider),
-        "",
+        &StreamOptions::default(),
         &pi::compaction::ResolvedCompactionSettings::default(),
         &pi::compaction::CompactionPrivacy::default(),
     ))

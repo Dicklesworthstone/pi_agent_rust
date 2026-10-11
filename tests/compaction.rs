@@ -29,6 +29,13 @@ use std::sync::{Arc, Mutex};
 
 const TS: &str = "2026-02-03T00:00:00.000Z";
 
+fn test_options(api_key: &str) -> StreamOptions {
+    StreamOptions {
+        api_key: Some(api_key.to_string()),
+        ..StreamOptions::default()
+    }
+}
+
 struct ScriptedProvider {
     responses: Mutex<VecDeque<String>>,
     prompts: Mutex<Vec<String>>,
@@ -1025,7 +1032,7 @@ fn compact_non_split_turn_calls_provider_once() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1089,9 +1096,15 @@ fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
                     prep.file_ops.read.insert("ACME-123456".to_string());
                 }
             }
-            let error = compact(prep, provider.clone(), "auth-kept", custom, &privacy)
-                .await
-                .expect_err("block mode must reject the full unsliced field");
+            let error = compact(
+                prep,
+                provider.clone(),
+                &test_options("auth-kept"),
+                custom,
+                &privacy,
+            )
+            .await
+            .expect_err("block mode must reject the full unsliced field");
             assert!(error.to_string().contains("PI_SECRET_BLOCK"));
             assert!(!error.to_string().contains("ACME-123456"));
             assert!(
@@ -1152,7 +1165,7 @@ fn compaction_obfuscates_complete_fields_and_remembered_values_across_both_reque
         let result = compact(
             prep.clone(),
             provider.clone(),
-            "auth-kept",
+            &test_options("auth-kept"),
             Some("ACME-123456"),
             &privacy,
         )
@@ -1221,8 +1234,14 @@ fn compaction_screens_secrets_assembled_from_adjacent_text_blocks_before_dispatc
                     // Only the second request contains the assembled secret.
                     prep.turn_prefix_messages = vec![message];
                     let original = pi::compaction::compaction_preparation_to_value(&prep);
-                    let result =
-                        compact(prep.clone(), provider.clone(), "auth-kept", None, &privacy).await;
+                    let result = compact(
+                        prep.clone(),
+                        provider.clone(),
+                        &test_options("auth-kept"),
+                        None,
+                        &privacy,
+                    )
+                    .await;
                     if mode == "block" {
                         let error = result.expect_err("assembled secret must block both requests");
                         assert!(error.to_string().contains("PI_SECRET_BLOCK"));
@@ -1315,9 +1334,15 @@ fn compaction_fallback_screens_assembled_echoes_and_appended_file_lists() {
         )];
         prep.file_ops.read.insert(secret.to_string());
         let privacy = CompactionPrivacy::default();
-        let result = compact(prep.clone(), provider.clone(), "auth-kept", None, &privacy)
-            .await
-            .expect("empty provider response uses a screened deterministic fallback");
+        let result = compact(
+            prep.clone(),
+            provider.clone(),
+            &test_options("auth-kept"),
+            None,
+            &privacy,
+        )
+        .await
+        .expect("empty provider response uses a screened deterministic fallback");
         assert!(result.summary.contains("deterministic fallback"));
         assert!(!result.summary.contains(secret));
         assert!(result.summary.contains("<pi-secret:redacted>"));
@@ -1376,7 +1401,7 @@ fn compaction_accepts_large_context_and_refuses_aggregate_scan_overflow() {
         compact(
             prep,
             provider.clone(),
-            "auth-kept",
+            &test_options("auth-kept"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1391,7 +1416,7 @@ fn compaction_accepts_large_context_and_refuses_aggregate_scan_overflow() {
         let error = compact(
             prep,
             refused.clone(),
-            "auth-kept",
+            &test_options("auth-kept"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1435,7 +1460,7 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1481,7 +1506,7 @@ fn compact_appends_file_operations_and_sorts_lists() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1536,7 +1561,7 @@ fn compact_seeds_file_ops_from_previous_compaction_details() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1590,7 +1615,7 @@ fn compact_does_not_seed_file_ops_when_previous_compaction_from_hook() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1625,7 +1650,7 @@ fn compact_includes_previous_summary_in_prompt_for_incremental_update() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1779,7 +1804,7 @@ fn compact_prompt_includes_thinking_and_tool_calls_in_serialized_conversation() 
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1893,7 +1918,7 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -1994,7 +2019,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
         compact(
             prep1,
             provider1_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -2062,7 +2087,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
         compact(
             prep2,
             provider2_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -2163,7 +2188,7 @@ fn prepare_compaction_ignores_malformed_previous_compaction_details() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -2245,7 +2270,7 @@ fn compact_returns_error_when_provider_stops_with_error() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )
@@ -2285,7 +2310,7 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
         compact(
             prep,
             provider_dyn,
-            "test-key",
+            &test_options("test-key"),
             None,
             &CompactionPrivacy::default(),
         )

@@ -1099,6 +1099,28 @@ pub struct ExtensionAiCompletionRequest {
     pub simple: bool,
 }
 
+/// Public model identity for a host-resolved compaction request. Endpoints,
+/// headers and credentials are deliberately absent from this contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionCompactionModel {
+    pub provider: String,
+    pub id: String,
+}
+
+/// Per-operation controls for summary compaction. The host resolves the
+/// model against its own registry and applies its own credential boundary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionCompactionOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ExtensionCompactionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<crate::model::ThinkingLevel>,
+}
+
 #[async_trait]
 pub trait ExtensionHostActions: Send + Sync {
     async fn send_message(
@@ -1124,12 +1146,14 @@ pub trait ExtensionHostActions: Send + Sync {
         ))
     }
 
-    /// Host-side compaction bridge (gh #167 / bd-i28yz): run the native
-    /// compaction engine over `preparation` using the SESSION's own provider,
-    /// model, and credentials. Sandboxed extensions can neither choose the
-    /// endpoint nor observe the credential; malformed preparation or provider
-    /// failure must surface as an `Err` (never a fabricated summary).
-    async fn compact_session(&self, _preparation: Value) -> Result<Value> {
+    /// Run summary compaction using the session provider or a registered
+    /// public model identity. The host owns endpoint and credential resolution;
+    /// extensions can supply summary guidance and a requested thinking level.
+    async fn compact_session(
+        &self,
+        _preparation: Value,
+        _options: ExtensionCompactionOptions,
+    ) -> Result<Value> {
         Err(Error::extension(
             "@mariozechner/pi-coding-agent compact host bridge is not configured".to_string(),
         ))
@@ -19428,11 +19452,19 @@ async fn dispatch_hostcall_events_ref(
             }
         }
         EventsHostcallOp::Compact => {
-            // gh #167 / bd-i28yz: host-side compaction with the session's own
-            // provider/model/credentials. The payload carries only the
-            // preparation; extensions cannot pick a model or supply an API
-            // key, and validation/deserialization of the untrusted
-            // preparation happens inside the host action.
+            if !payload.is_object()
+                || payload.as_object().is_some_and(|fields| {
+                    fields.keys().any(|key| {
+                        !matches!(key.as_str(), "preparation" | "options" | "strategy" | "request")
+                    })
+                })
+            {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "compact: expected preparation and optional options/strategy/request; credentials and endpoint fields are not accepted"
+                        .to_string(),
+                };
+            }
             let Some(actions) = manager.host_actions() else {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -19441,19 +19473,57 @@ async fn dispatch_hostcall_events_ref(
             };
 
             let preparation = payload.get("preparation").cloned().unwrap_or(Value::Null);
+            let options = match payload.get("options") {
+                None | Some(Value::Null) => ExtensionCompactionOptions::default(),
+                Some(value) => {
+                    match serde_json::from_value::<ExtensionCompactionOptions>(value.clone()) {
+                        Ok(options) => options,
+                        Err(err) => {
+                            return HostcallOutcome::Error {
+                                code: "invalid_request".to_string(),
+                                message: format!("compact: invalid options: {err}"),
+                            };
+                        }
+                    }
+                }
+            };
+            if let Some(model) = &options.model {
+                if model.provider.trim().is_empty() || model.id.trim().is_empty() {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "compact: model provider and id must be non-empty strings"
+                            .to_string(),
+                    };
+                }
+                if manager.provider_has_stream_simple(model.provider.trim()) {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "compact: extension streamSimple model overrides are unsupported"
+                            .to_string(),
+                    };
+                }
+            }
             // Optional native strategy (gh #167): `strategy` +
             // extension-composed `request` route to the host-mediated
             // native compact bridge; absent/null keeps the summary bridge.
             // Unknown strategies error loudly so callers fail open instead
             // of silently getting the wrong compaction kind.
             match payload.get("strategy") {
-                None | Some(Value::Null) => match actions.compact_session(preparation).await {
-                    Ok(value) => HostcallOutcome::Success(value),
-                    Err(err) => HostcallOutcome::Error {
-                        code: "provider".to_string(),
-                        message: err.to_string(),
-                    },
-                },
+                None | Some(Value::Null) => {
+                    if payload.get("request").is_some_and(|request| !request.is_null()) {
+                        return HostcallOutcome::Error {
+                            code: "invalid_request".to_string(),
+                            message: "compact: request requires a native strategy".to_string(),
+                        };
+                    }
+                    match actions.compact_session(preparation, options).await {
+                        Ok(value) => HostcallOutcome::Success(value),
+                        Err(err) => HostcallOutcome::Error {
+                            code: "provider".to_string(),
+                            message: err.to_string(),
+                        },
+                    }
+                }
                 // A non-string strategy is a caller bug: error loudly rather
                 // than silently running the wrong compaction kind.
                 Some(other) if !other.is_string() => HostcallOutcome::Error {
@@ -19463,6 +19533,16 @@ async fn dispatch_hostcall_events_ref(
                     ),
                 },
                 Some(Value::String(strategy)) if strategy == "openai-responses-native" => {
+                    if options.model.is_some()
+                        || options.custom_instructions.is_some()
+                        || options.thinking_level.is_some()
+                    {
+                        return HostcallOutcome::Error {
+                            code: "invalid_request".to_string(),
+                            message: "compact: native strategy uses the current model and request.instructions/request.reasoning; summary options are unsupported"
+                                .to_string(),
+                        };
+                    }
                     let request = payload.get("request").cloned().unwrap_or(Value::Null);
                     match actions.compact_session_native(preparation, request).await {
                         Ok(value) => HostcallOutcome::Success(value),
