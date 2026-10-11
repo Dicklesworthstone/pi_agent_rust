@@ -1478,28 +1478,36 @@ fn save_jsonl_full_rewrite_blocking(
 }
 
 struct JsonlAppendPlan {
-    ordered_entries: Vec<SessionEntry>,
+    stored_entries: Vec<attachments::StoredEntry>,
     entries_appended: Vec<SessionEntry>,
     message_count: u64,
     session_name: Option<String>,
 }
 
 fn plan_jsonl_incremental_append(
-    disk_session: &Session,
-    new_entries: &[SessionEntry],
+    source: &Path,
+    stored_entries: Vec<attachments::StoredEntry>,
+    new_entries: Vec<SessionEntry>,
 ) -> Result<JsonlAppendPlan> {
-    let mut persisted_entries = HashMap::with_capacity(disk_session.entries.len());
-    for entry in &disk_session.entries {
+    let mut persisted_entries = HashMap::with_capacity(stored_entries.len());
+    let mut message_count = 0_u64;
+    let mut session_name = None;
+    for (index, entry) in stored_entries.iter().enumerate() {
         let id = entry
-            .base_id()
+            .base()
+            .id
+            .as_ref()
             .ok_or_else(|| Error::session("persisted session entry is missing its ID"))?;
-        if persisted_entries
-            .insert(id.clone(), serde_json::to_vec(entry)?)
-            .is_some()
-        {
+        if persisted_entries.insert(id.as_str(), index).is_some() {
             return Err(Error::session(format!(
                 "persisted session contains duplicate entry ID {id}"
             )));
+        }
+        if entry.entry_type() == "message" {
+            message_count = message_count.saturating_add(1);
+        }
+        if let Some(name) = entry.session_name() {
+            session_name = Some(name.to_string());
         }
     }
 
@@ -1514,12 +1522,10 @@ fn plan_jsonl_incremental_append(
                 "incremental session append contains duplicate entry ID {id}"
             )));
         }
-        let serialized = serde_json::to_vec(entry)?;
-        let serialized_len = u64::try_from(serialized.len())
-            .map_err(|_| Error::session("serialized session entry length exceeds u64"))?;
-        ensure_jsonl_line_len_within_limit(serialized_len, MAX_JSONL_LINE_BYTES, "session entry")?;
-        if let Some(persisted) = persisted_entries.get(id) {
-            if persisted != &serialized {
+        if let Some(index) = persisted_entries.get(id.as_str()).copied() {
+            if stored_entries[index].native_fingerprint(source)?
+                != attachments::native_entry_fingerprint(&entry)?
+            {
                 return Err(Error::session(format!(
                     "session entry ID {id} has conflicting persisted and in-memory payloads"
                 )));
@@ -1527,28 +1533,19 @@ fn plan_jsonl_incremental_append(
             continue;
         }
 
-        persisted_entries.insert(id.clone(), serialized);
-        pending_entries.push(entry.clone());
+        pending_entries.push(entry);
     }
 
-    let pending_entry_ids = pending_entries
+    let bases = stored_entries
         .iter()
-        .filter_map(SessionEntry::base_id)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut merged_entries = disk_session.entries.clone();
-    merged_entries.extend(pending_entries);
-    ensure_session_parent_links_closed(&merged_entries)?;
-    let ordered_entries = stable_parent_topological_order(merged_entries)?;
-    let mut entries_appended = Vec::new();
-    let mut message_count = disk_session.cached_message_count;
-    let mut session_name = disk_session.cached_name.clone();
-    for entry in ordered_entries.iter().filter(|entry| {
-        entry
-            .base_id()
-            .is_some_and(|id| pending_entry_ids.contains(id))
-    }) {
-        entries_appended.push(entry.clone());
+        .map(attachments::StoredEntry::base)
+        .chain(pending_entries.iter().map(SessionEntry::base))
+        .collect::<Vec<_>>();
+    validate_entry_base_graph(&bases, false)?;
+    // Existing rows retain their exact disk order. Among pending rows, parents
+    // precede children and the caller's order breaks ties between branches.
+    let entries_appended = stable_parent_topological_order(pending_entries)?;
+    for entry in &entries_appended {
         match entry {
             SessionEntry::Message(_) => message_count = message_count.saturating_add(1),
             SessionEntry::SessionInfo(info) if info.name.is_some() => {
@@ -1559,43 +1556,149 @@ fn plan_jsonl_incremental_append(
     }
 
     Ok(JsonlAppendPlan {
-        ordered_entries,
+        stored_entries,
         entries_appended,
         message_count,
         session_name,
     })
 }
 
+struct JsonlReusableEntry {
+    position: usize,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Debug)]
+enum JsonlPersistedEntry {
+    Reuse(usize),
+    Hydrated(Box<SessionEntry>),
+}
+
+#[derive(Debug)]
+struct JsonlAppendOutcome {
+    header: SessionHeader,
+    entries: Vec<JsonlPersistedEntry>,
+}
+
+impl JsonlAppendOutcome {
+    /// The writer never owns the caller's complete history. Until its receipt
+    /// is accepted, cancellation therefore leaves every in-memory byte intact.
+    fn accept(self, current: &mut Vec<SessionEntry>) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+        let mut reused = HashSet::new();
+        for entry in &self.entries {
+            if let JsonlPersistedEntry::Reuse(position) = entry
+                && (*position >= current.len() || !reused.insert(*position))
+            {
+                return Err(Error::session("invalid session append reuse receipt"));
+            }
+        }
+        // No fallible operation follows taking the entries out of the caller.
+        // A receipt only reuses rows whose complete native payload matched the
+        // authoritative disk row, so public entry mutations cannot leak back.
+        let mut slots = std::mem::take(current)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                JsonlPersistedEntry::Reuse(position) => slots[position]
+                    .take()
+                    .expect("reuse positions were validated before consuming entries"),
+                JsonlPersistedEntry::Hydrated(entry) => *entry,
+            })
+            .collect();
+        Ok((self.header, entries))
+    }
+}
+
+async fn jsonl_reusable_entries(
+    entries: &[SessionEntry],
+) -> Result<HashMap<String, JsonlReusableEntry>> {
+    let mut reusable = HashMap::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let id = entry
+            .base_id()
+            .ok_or_else(|| Error::session("in-memory session entry is missing its ID"))?;
+        reusable.insert(
+            id.clone(),
+            JsonlReusableEntry {
+                position,
+                fingerprint: attachments::native_entry_fingerprint(entry)?,
+            },
+        );
+        // Public entries can be mutated in place, so cached IDs or allocation
+        // addresses cannot prove payload equality. Yield between bounded rows
+        // while inspecting the caller's data, before admitting a disk writer.
+        asupersync::runtime::yield_now().await;
+    }
+    Ok(reusable)
+}
+
+fn open_jsonl_for_append(path: &Path) -> Result<(SessionHeader, Vec<attachments::StoredEntry>)> {
+    let file = open_existing_session_file_for_read(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let header_line = read_capped_utf8_line(&mut reader)?
+        .filter(|line| !line.trim().is_empty())
+        .ok_or_else(|| Error::session("Empty session file"))?;
+    let header: SessionHeader = serde_json::from_str(&header_line)
+        .map_err(|error| Error::session(format!("Invalid header: {error}")))?;
+    header
+        .validate()
+        .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
+    let (header, _) = normalize_loaded_header(header);
+    let entries = read_jsonl_entries_for_v2(&mut reader, path).map_err(|error| {
+        let invalid_source = matches!(&error, Error::Json(_) | Error::Session(_))
+            || matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData);
+        if invalid_source && !attachments::is_attachment_error(&error) {
+            Error::session(format!(
+                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to append to recovered session {}: {error}",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    })?;
+    Ok((header, entries))
+}
+
+#[allow(clippy::too_many_lines)]
 fn append_jsonl_entries_blocking(
     path: &Path,
     sessions_root: &Path,
     expected_session_id: &str,
-    new_entries: &[SessionEntry],
-) -> Result<(SessionHeader, Vec<SessionEntry>)> {
-    validate_jsonl_entries_for_write(new_entries)?;
+    new_entries: Vec<SessionEntry>,
+    reusable: &HashMap<String, JsonlReusableEntry>,
+) -> Result<JsonlAppendOutcome> {
+    validate_jsonl_entries_for_write(&new_entries)?;
     let resolved_path = resolve_session_persistence_path(path)?;
     let path = resolved_path.as_path();
     ensure_session_file_writable(path).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let _lock = lock_session_persistence(path)?;
-    let (disk_session, _) = open_jsonl_blocking(path)?;
-    if disk_session.source_integrity_failed {
-        return Err(Error::session(format!(
-            "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to append to recovered session {}",
-            path.display()
-        )));
-    }
-    if disk_session.header.id != expected_session_id {
+    let (header, stored_entries) = open_jsonl_for_append(path)?;
+    if header.id != expected_session_id {
         return Err(Error::session(
             "persisted session header ID does not match the in-memory session ID",
         ));
     }
 
     let JsonlAppendPlan {
-        ordered_entries,
+        stored_entries,
         entries_appended,
         message_count,
         session_name,
-    } = plan_jsonl_incremental_append(&disk_session, new_entries)?;
+    } = plan_jsonl_incremental_append(path, stored_entries, new_entries)?;
+
+    let binding_entries = stored_entries
+        .iter()
+        .filter_map(attachments::StoredEntry::workdir_binding)
+        .chain(entries_appended.iter().filter(|entry| {
+            matches!(entry, SessionEntry::Custom(custom)
+                if custom.custom_type.starts_with(crate::session_workdir::WORKDIR_BINDING_PREFIX))
+        }))
+        .cloned()
+        .collect::<Vec<_>>();
 
     let mut attachments = attachments::EntryEncoder::new(path);
     let mut serialized_entries = Vec::new();
@@ -1605,20 +1708,73 @@ fn append_jsonl_entries_blocking(
     }
 
     let rewrite_unterminated = !serialized_entries.is_empty() && !jsonl_ends_with_newline(path)?;
-    let index_generation = if serialized_entries.is_empty() {
-        None
-    } else {
-        Some(begin_session_index_namespace_change(sessions_root)?)
-    };
     let persisted_entries = if rewrite_unterminated {
         // A complete final record can survive an interrupted delimiter write.
         // Never concatenate the next object onto it: atomically rewrite the
         // already-validated rows with their delimiters restored. An invalid
         // torn record is diagnosed during open and rejected above so its bytes
         // remain available for explicit recovery.
-        persist_jsonl_snapshot_locked(path, &disk_session.header, &ordered_entries)?;
-        ordered_entries
+        let mut entries = stored_entries
+            .into_iter()
+            .map(|entry| entry.into_hydrated(path))
+            .collect::<Result<Vec<_>>>()?;
+        entries.extend(entries_appended);
+        let entries = stable_parent_topological_order(entries)?;
+        let generation = begin_session_index_namespace_change(sessions_root)?;
+        persist_jsonl_snapshot_locked(path, &header, &entries)?;
+        enqueue_session_index_snapshot_update(
+            sessions_root,
+            path,
+            &header,
+            &entries,
+            message_count,
+            session_name,
+            Some(generation),
+        );
+        return Ok(JsonlAppendOutcome {
+            header,
+            entries: entries
+                .into_iter()
+                .map(|entry| JsonlPersistedEntry::Hydrated(Box::new(entry)))
+                .collect(),
+        });
     } else {
+        // Materialize only rows genuinely adopted from another writer (or a
+        // partial V2 view). Existing media stays in the caller's owned entries.
+        // Build this receipt before publishing any append bytes so adoption
+        // failures leave both the caller and authoritative JSONL unchanged.
+        let mut entries = Vec::with_capacity(stored_entries.len() + entries_appended.len());
+        for stored in stored_entries {
+            let reusable_entry = stored
+                .base()
+                .id
+                .as_ref()
+                .and_then(|id| reusable.get(id));
+            if let Some(known) = reusable_entry
+                && known.fingerprint == stored.native_fingerprint(path)?
+            {
+                entries.push(JsonlPersistedEntry::Reuse(known.position));
+            } else {
+                entries.push(JsonlPersistedEntry::Hydrated(Box::new(
+                    stored.into_hydrated(path)?,
+                )));
+            }
+        }
+        for entry in entries_appended {
+            let reusable_entry = entry.base_id().and_then(|id| reusable.get(id));
+            if let Some(known) = reusable_entry
+                && known.fingerprint == attachments::native_entry_fingerprint(&entry)?
+            {
+                entries.push(JsonlPersistedEntry::Reuse(known.position));
+            } else {
+                entries.push(JsonlPersistedEntry::Hydrated(Box::new(entry)));
+            }
+        }
+        let index_generation = if serialized_entries.is_empty() {
+            None
+        } else {
+            Some(begin_session_index_namespace_change(sessions_root)?)
+        };
         if !serialized_entries.is_empty() {
             attachments.validate()?;
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
@@ -1631,21 +1787,22 @@ fn append_jsonl_entries_blocking(
                 Some("append_sync_completed=true"),
             )?;
         }
-        let mut persisted_entries = disk_session.entries.clone();
-        persisted_entries.extend(entries_appended);
-        persisted_entries
+        enqueue_session_index_snapshot_update(
+            sessions_root,
+            path,
+            &header,
+            &binding_entries,
+            message_count,
+            session_name,
+            index_generation,
+        );
+        entries
     };
 
-    enqueue_session_index_snapshot_update(
-        sessions_root,
-        path,
-        &disk_session.header,
-        &persisted_entries,
-        message_count,
-        session_name,
-        index_generation,
-    );
-    Ok((disk_session.header, persisted_entries))
+    Ok(JsonlAppendOutcome {
+        header,
+        entries: persisted_entries,
+    })
 }
 
 fn session_persistence_lock_path(path: &Path) -> PathBuf {
@@ -4768,26 +4925,27 @@ impl Session {
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
                         let new_entries = self.entries[new_start..].to_vec();
+                        let reusable_entries = jsonl_reusable_entries(&self.entries).await?;
                         let expected_session_id = self.header.id.clone();
 
                         let path_for_task = path_clone.clone();
                         let sessions_root_for_task = sessions_root.clone();
-                        let (saved_header, saved_entries) =
-                            asupersync::runtime::spawn_blocking(move || {
-                                append_jsonl_entries_blocking(
-                                    &path_for_task,
-                                    &sessions_root_for_task,
-                                    &expected_session_id,
-                                    &new_entries,
-                                )
-                            })
-                            .await?;
+                        let saved = asupersync::runtime::spawn_blocking(move || {
+                            append_jsonl_entries_blocking(
+                                &path_for_task,
+                                &sessions_root_for_task,
+                                &expected_session_id,
+                                new_entries,
+                                &reusable_entries,
+                            )
+                        })
+                        .await?;
+                        let (saved_header, saved_entries) = saved.accept(&mut self.entries)?;
 
-                        // Incremental reconciliation reads and returns the full
-                        // authoritative JSONL, even when this handle started
-                        // from a bounded V2 hydration. Normalize that bookkeeping
-                        // before rebuilding caches so the hidden-message offset
-                        // is not added to a now-complete entry set.
+                        // The accepted receipt represents the full authoritative
+                        // JSONL, even if this handle began as a partial V2 view.
+                        // Reset its hidden-message offset before rebuilding
+                        // caches over the now-complete entry set.
                         if self.v2_partial_hydration {
                             self.v2_partial_hydration = false;
                             self.v2_resume_mode = Some(V2OpenMode::Full);
@@ -16136,8 +16294,14 @@ mod tests {
 
         session.append_message(make_test_message("replayed after cancellation"));
         let replay = session.entries[1].clone();
-        append_jsonl_entries_blocking(&path, temp_dir.path(), &session.header.id, &[replay])
-            .expect("simulate writer reaching disk before cancellation");
+        append_jsonl_entries_blocking(
+            &path,
+            temp_dir.path(),
+            &session.header.id,
+            vec![replay],
+            &HashMap::new(),
+        )
+        .expect("simulate writer reaching disk before cancellation");
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         run_async(async { session.save().await })
@@ -16171,7 +16335,8 @@ mod tests {
             &path,
             temp_dir.path(),
             "different-session-id",
-            &[pending],
+            vec![pending],
+            &HashMap::new(),
         )
         .expect_err("incremental append must bind to the expected session identity");
 

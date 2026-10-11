@@ -80,6 +80,19 @@ without materializing its base64 representation. Legacy rows without an entry
 ID are hydrated one at a time when needed to preserve their deterministic IDs.
 Ordinary session loading still returns complete in-memory messages.
 
+Incremental JSONL saves reconcile the authoritative history using compact
+attachment records. The writer streams blob verification and the corresponding
+native serialization fingerprint through bounded buffers; entries that match
+the caller's complete in-memory payload are reused after the save succeeds.
+Only entries absent or different in the caller's view are fully hydrated,
+including concurrent writes and hidden V2 branches. A changed public entry never
+replaces its authoritative persisted payload during append, and a cancelled
+save can safely replay an identical row
+without appending it twice. Missing or corrupted blobs still fail the save even
+when their complete payload is already present in memory. Initial loading,
+full checkpoint rewrites, and repair of a complete final record lacking its
+newline retain their existing hydration behavior.
+
 Forking, or saving a hydrated session clone to a new path, writes the destination's
 own blobs. It can subsequently be opened without access to the parent session.
 HTML exports embed images and playable audio/video payloads and remain
