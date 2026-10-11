@@ -229,6 +229,95 @@ fn pull_only_server_populates_existing_diagnostics_surface_and_reuses_result_ids
 }
 
 #[test]
+fn notification_loss_during_pull_rejects_old_reports_and_recovers() {
+    for stale in [
+        json!({"kind":"full","resultId":"stale","items":[]}),
+        json!({"kind":"unchanged","resultId":"stale"}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = peer(temp.path()) else {
+            return;
+        };
+        let (_, uri) = source(&peer, temp.path(), "source");
+        let fresh_error = diagnostic("server found an error");
+        peer.configure(json!({"textDocument/diagnostic":[
+            {"result":{"kind":"full","resultId":"baseline","items":[]}},
+            {"hold":true},
+            {"result":{"kind":"full","resultId":"fresh","items":[fresh_error]}},
+            {"result":{"kind":"unchanged","resultId":"verified"}}
+        ]}));
+        refresh(&peer, &uri).unwrap();
+        assert!(peer.client.diagnostics_snapshot()[&uri].is_empty());
+
+        let error = peer
+            .runtime
+            .block_on(async {
+                let mut pending = Box::pin(
+                    peer.client
+                        .refresh_document_diagnostics(&uri, Duration::from_secs(5)),
+                );
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                peer.client
+                    .call_no_wait_notify("test/release", json!({"result":stale}))
+                    .expect("release old diagnostic response");
+
+                // Leave the pull future unpolled until the transport reader
+                // has buffered its response and dropped a later error push.
+                let mut flood = vec![
+                    json!({
+                        "jsonrpc":"2.0","method":"window/logMessage",
+                        "params":{"type":3,"message":"server is analyzing"}
+                    });
+                    1024
+                ];
+                flood.push(json!({
+                    "jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
+                    "params":{"uri":uri,"diagnostics":[fresh_error]}
+                }));
+                let (id, response) = peer
+                    .client
+                    .rpc
+                    .request("test/notifications", json!({"notifications":flood}))
+                    .expect("notification batch request");
+                crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+                    peer.client.rpc.cancel_request(id);
+                })
+                .await
+                .expect("notification batch acknowledgement")
+                .expect("notification batch succeeded");
+                assert_eq!(peer.client.dropped_notifications(), 1);
+                pending.await
+            })
+            .expect_err("a pre-loss response must not restore a clean report");
+        assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"));
+        assert!(error.to_string().contains("notifications were lost"));
+        assert!(!peer.client.diagnostics_snapshot().contains_key(&uri));
+        assert!(peer.client.is_alive());
+
+        // The refused result must not replace the previous opaque result ID.
+        // A new request can revalidate that baseline after the loss boundary.
+        refresh(&peer, &uri).unwrap();
+        assert_eq!(
+            peer.client.diagnostics_snapshot()[&uri],
+            vec![fresh_error.clone()]
+        );
+        refresh(&peer, &uri).unwrap();
+        assert_eq!(peer.client.diagnostics_snapshot()[&uri], vec![fresh_error]);
+        let frames = peer.frames();
+        let pulls: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["method"] == "textDocument/diagnostic")
+            .collect();
+        assert_eq!(pulls.len(), 4);
+        assert_eq!(pulls[1]["params"]["previousResultId"], "baseline");
+        assert_eq!(pulls[2]["params"]["previousResultId"], "baseline");
+        assert_eq!(pulls[3]["params"]["previousResultId"], "fresh");
+        assert_eq!(peer.client.dropped_notifications(), 1);
+        assert!(peer.client.is_alive());
+    }
+}
+
+#[test]
 fn resynchronized_source_does_not_send_or_accept_an_old_result_baseline() {
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = peer(temp.path()) else {

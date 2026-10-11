@@ -304,8 +304,9 @@ impl LspClient {
     /// baseline sent on this request. Failures never manufacture a clean report.
     ///
     /// # Errors
-    /// Returns protocol, timeout, cancellation or stale-document errors. A
-    /// dropped request uses the client request layer's cancellation discipline.
+    /// Returns protocol, timeout, cancellation or stale-document errors, and
+    /// `LSP_DIAGNOSTICS_PENDING` if notification loss invalidates the response.
+    /// A dropped request uses the client request layer's cancellation discipline.
     pub async fn refresh_document_diagnostics(&self, uri: &str, timeout: Duration) -> Result<()> {
         let budget = RequestBudget::new(timeout);
         self.refresh_document_diagnostics_with_budget(uri, &budget)
@@ -338,6 +339,7 @@ impl LspClient {
                 }
             }
         };
+        let dropped_before = self.rpc.dropped_notifications();
         let (revision, source, ticket, previous) = {
             let docs = Self::lock(&self.open_docs);
             let doc = docs.get(&uri).ok_or_else(|| {
@@ -369,6 +371,18 @@ impl LspClient {
         let mut report = parse_report(&raw, revision, previous.as_ref())?;
         report.bytes = report.bytes.saturating_add(uri.len());
         budget.remaining().map_err(Error::from)?;
+        // A buffered response can predate a lost push that call_with_budget
+        // has already observed. Do not let that old response restore the
+        // invalidated cache. Retain the generation lock through publication
+        // so a concurrent notification poll cannot invalidate and then lose.
+        let mut generation = Self::lock(&self.notification_generation);
+        self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
+        if *generation != dropped_before {
+            return Err(Error::tool(
+                "lsp",
+                "[LSP_DIAGNOSTICS_PENDING] notifications were lost; retry for a fresh report",
+            ));
+        }
         // Same lock order as push acceptance and document synchronization.
         // A result cannot pass freshness checks, wait for a resync, then win.
         let docs = Self::lock(&self.open_docs);
