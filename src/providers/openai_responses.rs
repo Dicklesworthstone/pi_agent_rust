@@ -1089,6 +1089,9 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         let chunk: OpenAIResponsesChunk = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
@@ -1460,15 +1463,13 @@ where
             });
         }
 
-        let parsed_args: serde_json::Value =
-            serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    raw = %tc.arguments,
-                    "Failed to parse tool arguments as JSON"
-                );
-                serde_json::Value::Null
-            });
+        let parsed_args = match super::openai::parse_final_tool_arguments(&tc.arguments) {
+            Ok(arguments) => arguments,
+            Err(message) => {
+                self.reject_tool_arguments(tc.content_index, message);
+                return;
+            }
+        };
 
         self.partial.stop_reason = StopReason::ToolUse;
         self.pending_events.push_back(StreamEvent::ToolCallEnd {
@@ -1488,6 +1489,30 @@ where
             block.arguments = parsed_args;
             block.thought_signature = Some(item_id.to_string());
         }
+    }
+
+    fn reject_tool_arguments(&mut self, content_index: usize, message: &str) {
+        // A completed item is an execution boundary, unlike the incremental
+        // argument deltas. Do not promote malformed/truncated JSON (or a JSON
+        // scalar) into an executable tool call with invented null arguments.
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error_message = Some(format!(
+            "Invalid OpenAI Responses tool arguments at content index {content_index}: {message}"
+        ));
+        // `finish` may have queued other calls from the same batch before it
+        // reached this one. None of those buffered completions can authorize
+        // execution after the batch has failed validation.
+        self.pending_events
+            .retain(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }));
+        self.pending_events.push_back(StreamEvent::Error {
+            reason: StopReason::Error,
+            error: std::mem::take(&mut self.partial),
+        });
+        self.tool_calls_by_item_id.clear();
+        self.orphan_tool_call_arguments.clear();
+        self.terminal_response_seen = false;
+        self.terminal_incomplete_reason = None;
+        self.finished = true;
     }
 
     fn terminal_content_snapshots(&self) -> Vec<TerminalContentSnapshot> {
@@ -1565,6 +1590,9 @@ where
                         .next_if(|(tool_content_index, ..)| *tool_content_index == content_index)
                     {
                         self.end_tool_call(&item_id, &call_id, &name, &arguments);
+                        if self.finished {
+                            return;
+                        }
                     }
                 }
             }
@@ -1573,6 +1601,9 @@ where
         // Best-effort: close any tool calls whose content block disappeared unexpectedly.
         for (_, item_id, call_id, name, arguments) in open_tool_calls {
             self.end_tool_call(&item_id, &call_id, &name, &arguments);
+            if self.finished {
+                return;
+            }
         }
 
         // Infer stop reason.
@@ -3459,6 +3490,264 @@ mod tests {
             .expect("tool call end");
         assert_eq!(tool_end.id, "call_4");
         assert_eq!(tool_end.arguments, json!({ "text": "buffered" }));
+    }
+
+    fn tool_item_event(kind: &str, id: &str, name: &str, arguments: &str) -> Value {
+        json!({
+            "type": kind,
+            "item": {
+                "type": "function_call",
+                "id": format!("fc_{id}"),
+                "call_id": format!("call_{id}"),
+                "name": name,
+                "arguments": arguments
+            }
+        })
+    }
+
+    fn completed_response_event() -> Value {
+        json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        })
+    }
+
+    #[test]
+    fn malformed_completed_tool_arguments_cannot_become_executable_calls() {
+        for raw in [
+            r#"{"command":"sensitive-argument""#,
+            r#"{"command":"sensitive-argument"} trailing"#,
+            "null",
+            "false",
+            "42",
+            "[]",
+            r#""sensitive-argument""#,
+        ] {
+            // The same strict boundary applies to done-only items, accumulated
+            // deltas, authoritative final snapshots and terminal fallback.
+            for route in 0..4 {
+                let mut events = Vec::new();
+                if route != 0 {
+                    events.push(tool_item_event(
+                        "response.output_item.added",
+                        "bad",
+                        "write",
+                        "",
+                    ));
+                    events.push(json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_bad",
+                        "delta": if route == 2 { "{}" } else { raw }
+                    }));
+                }
+                if route != 3 {
+                    events.push(tool_item_event(
+                        "response.output_item.done",
+                        "bad",
+                        "write",
+                        if route == 1 { "" } else { raw },
+                    ));
+                }
+                events.push(completed_response_event());
+                let out = collect_events(&events);
+                assert_eq!(
+                    out.iter()
+                        .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                        .count(),
+                    1,
+                    "one error terminal for route {route}, raw {raw:?}",
+                );
+                assert!(!out.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+                )));
+                let Some(StreamEvent::Error { reason, error }) = out.last() else {
+                    panic!("expected terminal error");
+                };
+                assert_eq!(*reason, StopReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                let detail = error.error_message.as_deref().unwrap();
+                assert!(detail.contains("Invalid OpenAI Responses tool arguments"));
+                assert!(!detail.contains("sensitive-argument"));
+                assert!(matches!(
+                    error.content.last(),
+                    Some(ContentBlock::ToolCall(call)) if call.arguments.is_null()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_tool_arguments_accept_objects_and_complete_final_snapshots() {
+        for raw in ["", " \n\t ", "{}", r#"{"items":[1,{"ok":true}],"n":null}"#] {
+            let out = collect_events(&[
+                tool_item_event("response.output_item.done", "valid", "echo", raw),
+                completed_response_event(),
+            ]);
+            let calls = out
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1);
+            let expected = if raw.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(raw).unwrap()
+            };
+            assert_eq!(calls[0].arguments, expected);
+            assert!(matches!(
+                out.last(),
+                Some(StreamEvent::Done { reason: StopReason::ToolUse, .. })
+            ));
+        }
+
+        let out = collect_events(&[
+            tool_item_event("response.output_item.added", "snapshot", "echo", "{\"text\":"),
+            tool_item_event(
+                "response.output_item.done",
+                "snapshot",
+                "echo",
+                r#"{"text":"complete final snapshot"}"#,
+            ),
+            completed_response_event(),
+        ]);
+        assert!(out.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd { tool_call, .. }
+                if tool_call.arguments == json!({"text": "complete final snapshot"})
+        )));
+        assert!(!out.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
+    }
+
+    #[test]
+    fn fallback_finalization_discards_buffered_tool_ends_when_one_call_is_invalid() {
+        let out = collect_events(&[
+            tool_item_event("response.output_item.added", "first", "write", "{}"),
+            tool_item_event("response.output_item.added", "bad", "write", "[1]"),
+            tool_item_event("response.output_item.added", "last", "write", "{}"),
+            completed_response_event(),
+        ]);
+        assert!(!out.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+        )));
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn invalid_tool_completion_is_terminal_on_sse_and_ndjson_transports() {
+        let events = [
+            tool_item_event("response.output_item.done", "bad", "write", "null"),
+            tool_item_event("response.output_item.done", "later", "write", "{}"),
+            completed_response_event(),
+        ];
+        for ndjson in [false, true] {
+            let body = if ndjson {
+                ndjson_body_from_events(&events)
+            } else {
+                events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>()
+                    + "data: [DONE]\n\n"
+            };
+            let content_type = if ndjson {
+                "application/x-ndjson"
+            } else {
+                "text/event-stream"
+            };
+            let (base_url, _requests) = spawn_test_server(200, content_type, &body);
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+            let context = Context::owned(None, Vec::new(), Vec::new());
+            let options = StreamOptions {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut errors = 0;
+                while let Some(event) = stream.next().await {
+                    match event.unwrap() {
+                        StreamEvent::Error { reason, .. } => {
+                            assert_eq!(reason, StopReason::Error);
+                            errors += 1;
+                        }
+                        StreamEvent::ToolCallStart { id, .. } => assert_eq!(id, "call_bad"),
+                        StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. } => {
+                            panic!("failed tool completion must not authorize execution");
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(errors, 1);
+                assert!(stream.next().await.is_none(), "terminal stream stays fused");
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_parallel_tool_batch_never_executes_the_valid_sibling() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-be-written.txt");
+        let events = [
+            tool_item_event(
+                "response.output_item.done",
+                "valid",
+                "write",
+                &json!({"path": marker, "content": "must not execute"}).to_string(),
+            ),
+            tool_item_event("response.output_item.done", "bad", "write", "null"),
+            completed_response_event(),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+        let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+        let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+            crate::tools::WriteTool::new(dir.path()),
+        )]);
+        let mut agent = crate::agent::Agent::new(
+            Arc::new(provider),
+            tools,
+            crate::agent::AgentConfig {
+                max_tool_iterations: 1,
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+                ..crate::agent::AgentConfig::default()
+            },
+        );
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let message = runtime
+            .block_on(agent.run("Read the files", move |event| {
+                if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }))
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(!marker.exists(), "valid sibling of a malformed batch must not run");
+        assert!(!agent.messages().iter().any(|message| matches!(message, Message::ToolResult(_))));
     }
 
     #[test]
