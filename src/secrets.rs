@@ -111,7 +111,9 @@ fn dotted_without_digit(value: &str) -> bool {
 /// v4 recognizes quoted assignment keys in JSON/configuration text too.
 /// v5 no longer matches `sk-` keys directly after a letter, so identifiers
 /// such as `task-management-service` are not credentials.
-pub const SECRETS_RULESET_VERSION: u32 = 5;
+/// v6 recognizes keys after literal control escapes in debug/serialized text
+/// without allowing matches inside ordinary identifiers.
+pub const SECRETS_RULESET_VERSION: u32 = 6;
 
 /// Token body: `min` or more characters from `class`, with single dots
 /// permitted between characters, ending on a `tail_class` character (the
@@ -127,24 +129,26 @@ fn rules() -> &'static Vec<Rule> {
     static RULES: std::sync::LazyLock<Vec<Rule>> = std::sync::LazyLock::new(|| {
         const TOKEN: &str = r"A-Za-z0-9_\-";
         const ALNUM: &str = "A-Za-z0-9";
-        let sk_body = dotted_body(TOKEN, ALNUM, 16);
         // Not directly after a letter: identifiers such as
         // `task-management-service` or an MCP tool `mcp__task-master-ai__x`
         // contain `sk-` mid-word. Group 1 is the key, so `_sk-`, `2sk-` and
         // percent-encoded `%22sk-` are still found (`\b` would miss them).
+        // Debug/JSON text can spell a preceding control character as `\n`
+        // or `\t`. Recognize the complete escape as a boundary, keeping its
+        // bytes outside group 1 so redaction never changes the encoding.
+        const SK_PREFIX: &str = r"(?:^|[^A-Za-z]|\\[bfnrtv])";
+        let sk_body = dotted_body(TOKEN, ALNUM, 16);
         vec![
             // Before `openai-key`: same prefix, tighter shape.
             Rule {
                 name: "anthropic-key",
-                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-ant-{sk_body})"))
-                    .expect("rule"),
+                regex: regex::Regex::new(&format!(r"{SK_PREFIX}(sk-ant-{sk_body})")).expect("rule"),
                 label: "anthropic_key",
                 reject: None,
             },
             Rule {
                 name: "openai-key",
-                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-{sk_body})"))
-                    .expect("rule"),
+                regex: regex::Regex::new(&format!(r"{SK_PREFIX}(sk-{sk_body})")).expect("rule"),
                 label: "openai_key",
                 reject: None,
             },
@@ -688,6 +692,10 @@ mod tests {
             "mcp__task-master-ai__get_tasks",
             "cd risk-assessment-pipeline-v2",
             "disk-ant-performance-tuning-guide",
+            r"\ntask-management-service",
+            r"\tmcp__task-master-ai__get_tasks",
+            "nsk-0123456789abcdefghijklmn",
+            "rsk-ant-api03-aaaaaaaaaaaaaaaaaaaa",
         ] {
             assert!(!contains_secret(clean, &[]), "{clean}");
         }
@@ -705,6 +713,34 @@ mod tests {
         let detections = scan("token:sk-0123456789abcdefghijklmn", &[]);
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].start, "token:".len());
+    }
+
+    #[test]
+    fn sk_rules_detect_keys_after_escaped_control_boundaries() {
+        for (key, rule) in [
+            ("sk-0123456789abcdefghijklmn", "openai-key"),
+            ("sk-ant-api03-aaaaaaaaaaaaaaaaaaaa", "anthropic-key"),
+        ] {
+            for escape in [r"\n", r"\t", r"\r", r"\b", r"\f", r"\v", r"\r\n", r"\\n"] {
+                let prefix = format!("π: before{escape}");
+                let input = format!("{prefix}{key}{escape}after");
+                let detections = scan(&input, &[]);
+                assert_eq!(detections.len(), 1, "{input}");
+                let detection = &detections[0];
+                assert_eq!(detection.start, prefix.len());
+                assert_eq!(&input[detection.start..detection.end], key);
+                assert_eq!(detection.rule, rule);
+
+                let mut vault = SecretVault::default();
+                let (protected, audit) = obfuscate(&input, &mut vault, &[]);
+                assert_eq!(protected, format!("{prefix}<pi-secret:000001>{escape}after"));
+                assert_eq!(audit.detections, 1);
+                assert_eq!(vault.restore(&protected), input);
+                let error = gate_outbound(&input, SecretsMode::Block, &[]).unwrap_err();
+                assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+                assert!(!error.to_string().contains(key));
+            }
+        }
     }
 
     #[test]
