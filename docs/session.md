@@ -73,6 +73,13 @@ does not substitute cached media for a missing or corrupt referenced blob.
 Metadata listing does not read media payloads. Context-free low-level V2 frame
 decoding cannot resolve attachment references without a source path.
 
+V2 migration, dry runs, source verification, and frame integrity checks keep
+stored attachment references compact. Blob verification streams through a
+16 KiB buffer and checks the complete payload's size, digest, and file identity
+without materializing its base64 representation. Legacy rows without an entry
+ID are hydrated one at a time when needed to preserve their deterministic IDs.
+Ordinary session loading still returns complete in-memory messages.
+
 Forking, or saving a hydrated session clone to a new path, writes the destination's
 own blobs. It can subsequently be opened without access to the parent session.
 HTML exports embed images and playable audio/video payloads and remain

@@ -1921,10 +1921,18 @@ fn validate_session_entry_graph_inner(
     entries: &[SessionEntry],
     allow_missing_parents: bool,
 ) -> Result<()> {
+    let bases = entries.iter().map(SessionEntry::base).collect::<Vec<_>>();
+    validate_entry_base_graph(&bases, allow_missing_parents)
+}
+
+/// Graph checks depend only on entry metadata. Reference-preserving migration
+/// shares this validator without cloning or hydrating conversation payloads.
+fn validate_entry_base_graph(entries: &[&EntryBase], allow_missing_parents: bool) -> Result<()> {
     let mut positions = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let id = entry
-            .base_id()
+            .id
+            .as_ref()
             .ok_or_else(|| Error::session("session entry is missing its ID"))?;
         if positions.insert(id.as_str(), index).is_some() {
             return Err(Error::session(format!(
@@ -1936,7 +1944,7 @@ fn validate_session_entry_graph_inner(
     let mut indegree = vec![0_u8; entries.len()];
     let mut children = vec![Vec::new(); entries.len()];
     for (index, entry) in entries.iter().enumerate() {
-        let Some(parent_id) = entry.base().parent_id.as_deref() else {
+        let Some(parent_id) = entry.parent_id.as_deref() else {
             continue;
         };
         let Some(parent_index) = positions.get(parent_id).copied() else {
@@ -1945,7 +1953,7 @@ fn validate_session_entry_graph_inner(
             }
             return Err(Error::session(format!(
                 "session entry {} references missing parent {parent_id}",
-                entry.base_id().map_or("<missing-id>", String::as_str)
+                entry.id.as_deref().unwrap_or("<missing-id>")
             )));
         };
         indegree[index] = 1;
@@ -8168,10 +8176,8 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
         }
         let mut store = SessionStoreV2::create(v2_root, 64 * 1024 * 1024)?;
 
-        for (entry, references) in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
-            let (entry_id, parent_entry_id, entry_type, _) =
-                session_store_v2::session_entry_to_frame_args(&entry)?;
-            let payload = references.payload(&entry)?;
+        for entry in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+            let (entry_id, parent_entry_id, entry_type, payload) = entry.frame_args()?;
             store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
         }
 
@@ -8188,46 +8194,28 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
 }
 
 /// Strictly parse the entry portion of a JSONL session and apply the same
-/// deterministic legacy-ID synthesis used by normal JSONL loading.
+/// deterministic legacy-ID synthesis used by normal JSONL loading. Keep
+/// referenced attachments compact throughout graph checks and index writing.
 fn read_jsonl_entries_for_v2<R: std::io::BufRead>(
     reader: &mut R,
     jsonl_source: &Path,
-) -> Result<Vec<(SessionEntry, attachments::ReferencePlan)>> {
+) -> Result<Vec<attachments::StoredEntry>> {
     let mut entries = Vec::new();
-    let mut references = Vec::new();
     while let Some(line) =
         read_capped_utf8_line(reader).map_err(|err| crate::Error::Io(Box::new(err)))?
     {
         if line.trim().is_empty() {
             continue;
         }
-        let (entry, plan) = attachments::decode_entry_with_references(Some(jsonl_source), &line)?;
-        entries.push(entry);
-        references.push(plan);
+        entries.push(attachments::decode_stored_entry(Some(jsonl_source), &line)?);
     }
     // Legacy rows without IDs must be normalized before validating the graph,
     // but migration must never turn an ambiguous authoritative JSONL history
     // into an apparently verified indexed store. In particular, the V2 index
     // is keyed by entry ID, so accepting duplicates would silently overwrite
     // graph semantics even when sequence and payload hashes still matched.
-    finalize_loaded_entries(&mut entries);
-    let mut entry_ids = HashSet::with_capacity(entries.len());
-    for entry in &entries {
-        let id = entry
-            .base_id()
-            .ok_or_else(|| Error::session("normalized JSONL entry is missing its ID"))?;
-        if !entry_ids.insert(id.clone()) {
-            return Err(Error::session(format!(
-                "authoritative JSONL contains duplicate entry ID {id}; refusing V2 migration"
-            )));
-        }
-    }
-    ensure_session_parent_links_closed(&entries)?;
-    // Validation only: preserve authoritative source order in the staged V2
-    // log while using the same graph walk as JSONL rewrite reconciliation to
-    // reject cycles.
-    drop(stable_parent_topological_order(entries.clone())?);
-    Ok(entries.into_iter().zip(references).collect())
+    attachments::StoredEntry::normalize_and_validate(&mut entries, jsonl_source)?;
+    Ok(entries)
 }
 
 fn unique_sidecar_aux_path(v2_root: &Path, suffix: &str) -> PathBuf {
@@ -8442,14 +8430,14 @@ pub fn verify_v2_against_jsonl(
     let mut jsonl_ids: Vec<String> = Vec::with_capacity(entries.len());
     let mut jsonl_chain_hash = V2_CHAIN_HASH_GENESIS.to_string();
 
-    for (entry, references) in entries {
+    for entry in entries {
         let id = entry
-            .base_id()
-            .cloned()
+            .base()
+            .id
+            .clone()
             .expect("V2 JSONL normalization assigns every entry an ID");
         jsonl_ids.push(id);
-        jsonl_chain_hash =
-            session_payload_chain_hash_step(&jsonl_chain_hash, &references.payload(&entry)?)?;
+        jsonl_chain_hash = session_payload_chain_hash_step(&jsonl_chain_hash, &entry.payload()?)?;
     }
 
     // Read V2 store entries.
@@ -8776,10 +8764,8 @@ pub fn migrate_dry_run(jsonl_path: &Path) -> Result<session_store_v2::MigrationV
 
     // Exercise the exact entry-normalization contract used by a real
     // migration, including deterministic IDs for legacy ID-less rows.
-    for (entry, references) in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
-        let (entry_id, parent_entry_id, entry_type, _) =
-            session_store_v2::session_entry_to_frame_args(&entry)?;
-        let payload = references.payload(&entry)?;
+    for entry in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+        let (entry_id, parent_entry_id, entry_type, payload) = entry.frame_args()?;
         store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
     }
     store.write_manifest(header.id, "jsonl_v3")?;

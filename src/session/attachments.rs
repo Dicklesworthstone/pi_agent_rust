@@ -16,13 +16,15 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::file_identity::FileIdentity;
+use crate::model::{ContentBlock, UserContent};
 use crate::session_store_v2::{self, ArtifactWriteMode};
 
-use super::{MAX_JSONL_LINE_BYTES, SessionEntry};
+use super::{MAX_JSONL_LINE_BYTES, SessionEntry, SessionMessage};
 
 const INLINE_BYTES: usize = 64 * 1024;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REFERENCES: usize = 4096;
+const BLOB_READ_BUFFER_BYTES: usize = 16 * 1024;
 const ERROR_PREFIX: &str = "PI_SESSION_ATTACHMENT_INVALID:";
 
 fn blob_error(reason: impl std::fmt::Display) -> Error {
@@ -201,6 +203,24 @@ impl BlobDirectory {
     }
 
     fn read(&self, reference: &BlobRef) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.visit_verified(reference, |chunk| {
+            if bytes.is_empty() {
+                bytes.reserve_exact(reference.size_bytes);
+            }
+            bytes.extend_from_slice(chunk);
+        })?;
+        Ok(bytes)
+    }
+
+    /// Index construction and validation need proof of the bytes, not a
+    /// base64 copy of them. Keep the same file/directory identity checks as
+    /// hydration while admitting at most one fixed-size read buffer.
+    fn verify(&self, reference: &BlobRef) -> Result<()> {
+        self.visit_verified(reference, |_| {})
+    }
+
+    fn visit_verified(&self, reference: &BlobRef, mut visit: impl FnMut(&[u8])) -> Result<()> {
         self.validate()?;
         let path = self.path.join(reference.filename());
         let file = session_store_v2::open_regular_file_for_read(&path)
@@ -210,19 +230,37 @@ impl BlobDirectory {
         if file.metadata().map_err(blob_error)?.len() != reference.size_bytes as u64 {
             return Err(blob_error("attachment byte count does not match"));
         }
-        let mut bytes = Vec::with_capacity(reference.size_bytes);
-        (&file)
-            .take(reference.size_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(blob_error)?;
-        if bytes.len() != reference.size_bytes || digest(&bytes) != reference.digest {
+        let mut reader = (&file).take(reference.size_bytes as u64 + 1);
+        let mut buffer = [0_u8; BLOB_READ_BUFFER_BYTES];
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0usize;
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(blob_error(error)),
+            };
+            if count == 0 {
+                break;
+            }
+            bytes_read += count;
+            hasher.update(&buffer[..count]);
+            visit(&buffer[..count]);
+        }
+        let observed_digest = format!(
+            "sha256:{}",
+            crate::package_manager::hex_encode(&hasher.finalize())
+        );
+        if bytes_read != reference.size_bytes || observed_digest != reference.digest {
             return Err(blob_error("attachment digest or byte count does not match"));
         }
-        if FileIdentity::of_path_nofollow(&path).map_err(blob_error)? != identity {
+        if FileIdentity::of_open_file(&file).map_err(blob_error)? != identity
+            || FileIdentity::of_path_nofollow(&path).map_err(blob_error)? != identity
+        {
             return Err(blob_error("attachment changed while being read"));
         }
         self.validate()?;
-        Ok(bytes)
+        Ok(())
     }
 
     fn store(&self, reference: &BlobRef, bytes: &[u8]) -> Result<()> {
@@ -337,7 +375,7 @@ fn json_size(value: &Value) -> Result<usize> {
 }
 
 /// Positions refer only to typed native message content, never arbitrary JSON.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct ReferencePlan(Vec<(usize, BlobRef)>);
 
 impl ReferencePlan {
@@ -385,6 +423,130 @@ impl ReferencePlan {
         }
         Ok(payload)
     }
+}
+
+/// A validated persistence entry whose attachment bytes remain in their
+/// sidecar. The private typed entry is only a schema/metadata projection:
+/// referenced data slots are empty there and cannot escape into a Session.
+/// Consumers can obtain graph metadata or the complete stored payload only.
+#[derive(Debug)]
+pub(crate) struct StoredEntry {
+    entry: SessionEntry,
+    references: ReferencePlan,
+}
+
+impl StoredEntry {
+    pub(crate) const fn base(&self) -> &super::EntryBase {
+        self.entry.base()
+    }
+
+    pub(crate) const fn entry_type(&self) -> &'static str {
+        session_store_v2::session_entry_type(&self.entry)
+    }
+
+    pub(super) fn payload(&self) -> Result<Value> {
+        self.references.payload(&self.entry)
+    }
+
+    pub(super) fn frame_args(&self) -> Result<(String, Option<String>, String, Value)> {
+        let base = self.base();
+        let id = base
+            .id
+            .clone()
+            .ok_or_else(|| Error::session("stored session entry is missing its ID"))?;
+        Ok((
+            id,
+            base.parent_id.clone(),
+            self.entry_type().to_string(),
+            self.payload()?,
+        ))
+    }
+
+    /// Fill only attachment data on a temporary native row. Re-deserializing
+    /// the stored payload would apply metadata sanitizers twice and could
+    /// change the exact native serialization used by legacy-ID hashing.
+    fn hydrate_for_legacy_id(&self, source: &Path) -> Result<SessionEntry> {
+        let mut entry = self.entry.clone();
+        let SessionEntry::Message(message) = &mut entry else {
+            return Err(blob_error("attachment reference is outside a native message"));
+        };
+        let blocks = match &mut message.message {
+            SessionMessage::User {
+                content: UserContent::Blocks(blocks),
+                ..
+            }
+            | SessionMessage::ToolResult {
+                content: blocks, ..
+            } => blocks,
+            SessionMessage::Assistant { message } => &mut message.content,
+            _ => return Err(blob_error("attachment reference is outside native content blocks")),
+        };
+        let directory = BlobDirectory::open(source, false)?;
+        for (index, reference) in &self.references.0 {
+            let data = match blocks.get_mut(*index) {
+                Some(ContentBlock::Image(image)) => &mut image.data,
+                Some(ContentBlock::Media(media)) => &mut media.data,
+                _ => return Err(blob_error("attachment reference is outside a native data slot")),
+            };
+            let bytes = directory.read(reference)?;
+            *data = reference.encoding.encode(&bytes);
+        }
+        Ok(entry)
+    }
+
+    /// Legacy IDs hash the native payload, not the stored reference. Hydrate
+    /// only the ID-less row being normalized, preserving the existing collision
+    /// order, and discard its bytes before advancing to the next row.
+    pub(super) fn normalize_and_validate(entries: &mut [Self], source: &Path) -> Result<()> {
+        let mut existing = entries
+            .iter()
+            .filter_map(|entry| entry.base().id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for stored in entries.iter_mut() {
+            if stored.base().id.is_none() {
+                let id = if stored.references.0.is_empty() {
+                    super::generate_loaded_entry_id(&stored.entry, &existing)
+                } else {
+                    let hydrated = stored.hydrate_for_legacy_id(source)?;
+                    super::generate_loaded_entry_id(&hydrated, &existing)
+                };
+                stored.entry.base_mut().id = Some(id.clone());
+                existing.insert(id);
+            }
+        }
+        let bases = entries.iter().map(Self::base).collect::<Vec<_>>();
+        super::validate_entry_base_graph(&bases, false)
+    }
+}
+
+/// Validate the native schema and every referenced blob without retaining
+/// attachment bytes. Only migration/integrity consumers use this projection;
+/// ordinary Session loading continues through the fully hydrating decoder.
+pub(crate) fn decode_stored_entry(source: Option<&Path>, json: &str) -> Result<StoredEntry> {
+    let original_error = match serde_json::from_str::<SessionEntry>(json) {
+        Ok(entry) => {
+            return Ok(StoredEntry {
+                entry,
+                references: ReferencePlan::default(),
+            });
+        }
+        Err(error) => error,
+    };
+    let spans = native_reference_spans(json)?;
+    if spans.is_empty() {
+        return Err(original_error.into());
+    }
+    let entry = validate_reference_entry_shape(json, &spans)?;
+    let mut value: Value = serde_json::from_str(json)?;
+    let references = ReferencePlan::build(&mut value)?;
+    let source = source.ok_or_else(|| {
+        blob_error("attachment references require the authoritative JSONL source path")
+    })?;
+    let directory = BlobDirectory::open(source, false)?;
+    for (_, reference) in &references.0 {
+        directory.verify(reference)?;
+    }
+    Ok(StoredEntry { entry, references })
 }
 
 pub(crate) fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionEntry> {
@@ -476,7 +638,7 @@ fn native_reference_spans(json: &str) -> Result<Vec<&RawValue>> {
 /// Validate native structure without collapsing duplicate keys into a Value.
 /// Replacing only the borrowed native data spans preserves the typed reader's
 /// treatment of every other field, including opaque tool/custom JSON values.
-fn validate_reference_entry_shape(json: &str, spans: &[&RawValue]) -> Result<()> {
+fn validate_reference_entry_shape(json: &str, spans: &[&RawValue]) -> Result<SessionEntry> {
     let mut placeholder = String::with_capacity(json.len());
     let mut cursor = 0usize;
     for raw in spans {
@@ -499,8 +661,7 @@ fn validate_reference_entry_shape(json: &str, spans: &[&RawValue]) -> Result<()>
     }
     placeholder.push_str(&json[cursor..]);
     serde_json::from_str::<SessionEntry>(&placeholder)
-        .map_err(|_| blob_error("duplicate or malformed native attachment-bearing entry"))?;
-    Ok(())
+        .map_err(|_| blob_error("duplicate or malformed native attachment-bearing entry"))
 }
 
 pub(super) fn decode_entry_with_references(
@@ -632,6 +793,42 @@ mod tests {
             "expected named attachment error: {error}"
         );
         assert!(error.to_string().contains(detail), "{error}");
+    }
+
+    #[test]
+    fn verification_reads_bounded_chunks_and_checks_the_last_byte() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("streaming.jsonl");
+        let mut bytes = vec![0x38; INLINE_BYTES + 47];
+        let mut session = session_at(&path);
+        session.append_message(message(vec![image(STANDARD.encode(&bytes))]));
+        save(&mut session);
+        let wire = wire_entries(&path);
+        let reference = BlobRef::parse(&wire[0]["message"]["content"][0]["data"])
+            .expect("stored reference");
+        let blob_directory = BlobDirectory::open(&path, false).expect("open blob directory");
+        let mut offset = 0usize;
+        let mut chunks = 0usize;
+        blob_directory
+            .visit_verified(&reference, |chunk| {
+                assert!(chunk.len() <= BLOB_READ_BUFFER_BYTES);
+                assert_eq!(chunk, &bytes[offset..offset + chunk.len()]);
+                offset += chunk.len();
+                chunks += 1;
+            })
+            .expect("verify every chunk");
+        assert!(chunks > 1);
+        assert_eq!(offset, bytes.len());
+
+        *bytes.last_mut().expect("last byte") ^= 1;
+        fs::write(blob_directory.path.join(reference.filename()), bytes)
+            .expect("corrupt final byte");
+        assert_attachment_error(
+            blob_directory
+                .verify(&reference)
+                .expect_err("tail must be hashed"),
+            "digest",
+        );
     }
 
     #[test]
@@ -804,6 +1001,11 @@ mod tests {
                 open(&path).expect_err("bad ref cannot become skipped history"),
                 ERROR_PREFIX,
             );
+            assert_attachment_error(
+                decode_stored_entry(Some(&path), &wire[0].to_string())
+                    .expect_err("migration must reject the same malformed reference"),
+                ERROR_PREFIX,
+            );
         }
     }
 
@@ -835,6 +1037,11 @@ mod tests {
                 decode_entry(Some(&path), &source).expect_err("duplicate data is never skipped"),
                 "duplicate",
             );
+            assert_attachment_error(
+                decode_stored_entry(Some(&path), &source)
+                    .expect_err("stored projection cannot collapse duplicate data"),
+                "duplicate",
+            );
         }
         let duplicate_content =
             format!(r#"{entry_prefix}{{"role":"user","content":{content},"content":"hidden"}}}}"#);
@@ -849,6 +1056,11 @@ mod tests {
         for source in [duplicate_content, duplicate_message, duplicate_type] {
             assert_attachment_error(
                 decode_entry(Some(&path), &source).expect_err("duplicate wrapper cannot hide ref"),
+                "duplicate",
+            );
+            assert_attachment_error(
+                decode_stored_entry(Some(&path), &source)
+                    .expect_err("stored projection cannot collapse duplicate wrappers"),
                 "duplicate",
             );
         }
@@ -895,6 +1107,9 @@ mod tests {
             serde_json::to_value(decoded).unwrap()["message"]["details"]["key"],
             2
         );
+        let stored = decode_stored_entry(Some(&path), &with_duplicate_details)
+            .expect("stored projection retains opaque Value semantics");
+        assert_eq!(stored.payload().unwrap()["message"]["details"]["key"], 2);
     }
 
     #[test]
@@ -906,6 +1121,8 @@ mod tests {
             let mut session = session_at(&path);
             session.append_message(message(vec![image(STANDARD.encode(&bytes))]));
             save(&mut session);
+            let store = crate::session::create_v2_sidecar_from_jsonl(&path)
+                .expect("index valid attachment before damaging it");
             let blob = blobs(&path).pop().expect("blob");
             match scenario {
                 "missing" => fs::rename(&blob, directory.path().join("unavailable")).unwrap(),
@@ -924,6 +1141,23 @@ mod tests {
             }
             let source = fs::read(&path).unwrap();
             assert_attachment_error(open(&path).expect_err(scenario), ERROR_PREFIX);
+            assert_attachment_error(
+                store
+                    .validate_session_integrity_with_source(Some(&path))
+                    .expect_err("compact frame verification must reject damaged bytes"),
+                ERROR_PREFIX,
+            );
+            assert_attachment_error(
+                crate::session::verify_v2_against_jsonl(&path, &store)
+                    .expect_err("compact source verification must reject damaged bytes"),
+                ERROR_PREFIX,
+            );
+            assert_attachment_error(
+                crate::session::create_v2_sidecar_from_jsonl(&path)
+                    .err()
+                    .expect("migration must reject damaged bytes"),
+                ERROR_PREFIX,
+            );
             session.append_message(text_message("must not overwrite damaged source"));
             assert_attachment_error(run_async(session.save()).expect_err(scenario), ERROR_PREFIX);
             assert_eq!(fs::read(&path).unwrap(), source);
@@ -1125,6 +1359,25 @@ mod tests {
         )]));
         assert!(session.navigate_to(&active));
         save(&mut session);
+        let wire = wire_entries(&path);
+        let source_entries = wire
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_entries = crate::session::read_jsonl_entries_for_v2(
+            &mut std::io::Cursor::new(source_entries),
+            &path,
+        )
+        .expect("parse compact entries for migration");
+        assert_eq!(compact_entries.len(), wire.len());
+        for (stored, original) in compact_entries.iter().zip(&wire) {
+            assert!(
+                serde_json::to_vec(&stored.entry).unwrap().len() < 2048,
+                "graph validation must not retain hydrated attachment strings"
+            );
+            assert_eq!(stored.payload().unwrap(), *original);
+        }
         let store =
             crate::session::create_v2_sidecar_from_jsonl(&path).expect("migrate compact source");
         let verification = crate::session::verify_v2_against_jsonl(&path, &store).unwrap();
@@ -1137,6 +1390,14 @@ mod tests {
         assert!(frames[0].payload.get().contains("$piBlob"));
         assert!(frames[2].payload.get().contains("$piBlob"));
         assert!(frames.iter().all(|frame| frame.payload.get().len() < 2048));
+        for (frame, original) in frames.iter().zip(&session.entries) {
+            let hydrated = session_store_v2::frame_to_session_entry_with_source(frame, Some(&path))
+                .expect("public session entries contain complete native attachments");
+            assert_eq!(
+                serde_json::to_value(hydrated).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        }
         assert_attachment_error(
             session_store_v2::frame_to_session_entry(&frames[0])
                 .expect_err("context-free decoder cannot guess source"),
@@ -1169,6 +1430,167 @@ mod tests {
         let dry_run =
             crate::session::migrate_dry_run(&path).expect("portable dry-run source context");
         assert!(dry_run.entry_count_match && dry_run.hash_chain_match && dry_run.index_consistent);
+    }
+
+    #[test]
+    fn legacy_media_migration_preserves_native_ids_and_collision_order() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-media.jsonl");
+        let bytes = vec![0x49; INLINE_BYTES + 3];
+        let mut session = session_at(&path);
+        session.append_message(message(vec![
+            image(STANDARD.encode(&bytes)),
+            media(STANDARD_NO_PAD.encode(&bytes), "audio/wav"),
+        ]));
+        save(&mut session);
+        let mut legacy = wire_entries(&path).pop().unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("id");
+        object.remove("parentId");
+        let native = decode_entry(Some(&path), &legacy.to_string()).expect("hydrate legacy row");
+        let reserved_id = crate::session::generate_loaded_entry_id(
+            &native,
+            &std::collections::HashSet::new(),
+        );
+        let mut reserved = legacy.clone();
+        reserved["id"] = Value::String(reserved_id.clone());
+        reserved["message"]["content"] =
+            Value::String("reserve the first hash candidate".to_string());
+        rewrite_wire(&path, &[legacy.clone(), reserved, legacy]);
+
+        let (native_session, diagnostics) =
+            crate::session::open_jsonl_blocking(&path).expect("load native legacy ID contract");
+        assert!(diagnostics.skipped_entries.is_empty());
+        let expected_ids = native_session
+            .entries
+            .iter()
+            .map(|entry| entry.base().id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(expected_ids[1], reserved_id);
+        assert_ne!(expected_ids[0], reserved_id);
+        assert_ne!(expected_ids[0], expected_ids[2]);
+
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path)
+            .expect("migrate ID-less image and media rows");
+        let frames = store.read_all_entries().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.entry_id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(frames.iter().all(|frame| frame.payload.get().len() < 2048));
+        for (frame, expected) in frames.iter().zip(&native_session.entries) {
+            let hydrated = session_store_v2::frame_to_session_entry_with_source(frame, Some(&path))
+                .expect("rehydrate migrated media row");
+            assert_eq!(
+                serde_json::to_value(hydrated).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        let verification = crate::session::verify_v2_against_jsonl(&path, &store).unwrap();
+        assert!(verification.entry_count_match && verification.hash_chain_match);
+    }
+
+    #[test]
+    fn legacy_media_ids_apply_metadata_deserializers_exactly_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-media-metadata.jsonl");
+        let data = STANDARD_NO_PAD.encode(vec![0x4b; INLINE_BYTES + 3]);
+        let mut session = session_at(&path);
+        session.append_message(message(vec![media(data.clone(), "audio/wav")]));
+        session.append_message(SessionMessage::Assistant {
+            message: crate::model::AssistantMessage {
+                content: vec![media(data.clone(), "audio/wav")],
+                ..crate::model::AssistantMessage::default()
+            },
+        });
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "legacy-media-call".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![media(data, "audio/wav")],
+            details: None,
+            is_error: false,
+            timestamp: Some(0),
+        });
+        save(&mut session);
+        let mut wire = wire_entries(&path);
+        for entry in &mut wire {
+            let object = entry.as_object_mut().unwrap();
+            object.remove("id");
+            object.remove("parentId");
+            // Trimming precedes control removal: one deserialize yields
+            // "  clip", while deserializing that result again yields "clip".
+            entry["message"]["content"][0]["name"] = json!("\u{0001}  clip");
+        }
+        rewrite_wire(&path, &wire);
+        let (native_session, diagnostics) =
+            crate::session::open_jsonl_blocking(&path).expect("load original legacy metadata");
+        assert!(diagnostics.skipped_entries.is_empty());
+        for entry in &native_session.entries {
+            assert_eq!(
+                serde_json::to_value(entry).unwrap()["message"]["content"][0]["name"],
+                "  clip"
+            );
+        }
+
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path)
+            .expect("migrate without re-deserializing native metadata");
+        let frames = store.read_all_entries().unwrap();
+        assert_eq!(frames.len(), native_session.entries.len());
+        for (frame, native) in frames.iter().zip(&native_session.entries) {
+            assert_eq!(Some(&frame.entry_id), native.base_id());
+            let payload: Value = serde_json::from_str(frame.payload.get()).unwrap();
+            assert_eq!(payload["message"]["content"][0]["name"], "  clip");
+        }
+        let verification = crate::session::verify_v2_against_jsonl(&path, &store).unwrap();
+        assert!(
+            verification.entry_count_match
+                && verification.hash_chain_match
+                && verification.index_consistent
+        );
+    }
+
+    #[test]
+    fn compact_migration_rejects_duplicate_ids_missing_parents_and_cycles() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("invalid-graph.jsonl");
+        let mut session = session_at(&path);
+        session.append_message(message(vec![image(
+            STANDARD.encode(vec![0x4a; INLINE_BYTES + 2]),
+        )]));
+        save(&mut session);
+        let mut root = wire_entries(&path).pop().unwrap();
+        root["id"] = json!("root");
+        root["parentId"] = Value::Null;
+        let mut missing_parent = root.clone();
+        missing_parent["parentId"] = json!("missing");
+        let mut self_cycle = root.clone();
+        self_cycle["parentId"] = json!("root");
+        let mut cycle_root = root.clone();
+        cycle_root["parentId"] = json!("child");
+        let mut cycle_child = root.clone();
+        cycle_child["id"] = json!("child");
+        cycle_child["parentId"] = json!("root");
+        for (entries, detail) in [
+            (vec![root.clone(), root], "duplicate entry ID"),
+            (vec![missing_parent], "missing parent"),
+            (vec![self_cycle], "cycle"),
+            (vec![cycle_root, cycle_child], "cycle"),
+        ] {
+            let source = entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = crate::session::read_jsonl_entries_for_v2(
+                &mut std::io::Cursor::new(source),
+                &path,
+            )
+            .expect_err("compact references cannot weaken strict graph validation");
+            assert!(error.to_string().contains(detail), "{error}");
+        }
     }
 
     #[test]
