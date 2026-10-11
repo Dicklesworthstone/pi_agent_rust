@@ -1081,7 +1081,8 @@ Resolution order for a request, first match wins:
 1. A bypass match — `http.no_proxy` in settings.json, else `NO_PROXY` /
    `no_proxy`. Entries follow the usual convention: `*` bypasses everything,
    `example.com` or `.example.com` matches the domain and its subdomains, and
-   `example.com:8443` restricts the match to that port.
+   `example.com:8443` restricts the match to that port. Loopback destinations
+   also bypass the proxy by default, unless `http.proxyLoopback` is enabled.
 2. `http.https_proxy` / `http.http_proxy` (scheme-specific settings).
 3. `http.proxy` (both schemes).
 4. `PI_HTTPS_PROXY` / `PI_HTTP_PROXY`.
@@ -1094,12 +1095,18 @@ turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
 `PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
 endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
 proxy), with optional username/password authentication; SOCKS credentials are
-not encrypted on the hop to the proxy. There is no automatic loopback bypass:
-requests to local model servers (Ollama, LM Studio) go through the proxy too
-unless `localhost` and `127.0.0.1` are in `NO_PROXY` or `http.noProxy`. An
-unusable ambient value
-(e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
-than failing requests.
+not encrypted on the hop to the proxy. Requests to `localhost` (case-insensitive,
+with an optional trailing dot), literal IPv4 addresses in `127.0.0.0/8`, and
+IPv6 `::1` or IPv4-mapped loopback addresses go directly to the local server.
+This keeps Ollama and LM Studio reachable when a global proxy is configured.
+Pi makes this decision without DNS lookups; private-network addresses and other
+hostnames retain the configured proxy routing.
+
+To intentionally send loopback destinations through the proxy, such as to reach
+a service on the proxy host or capture local traffic, set
+`"http": { "proxyLoopback": true }`. Explicit `NO_PROXY` / `http.noProxy`
+matches still take precedence. An unusable ambient value (e.g. an `https://`
+or `socks4://` endpoint) is skipped with a warning rather than failing requests.
 
 The `bash` tool's child environment overrides advertise only HTTP proxy
 endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
@@ -1112,6 +1119,8 @@ This preserves existing `curl`/`git` SOCKS configuration without forcing tools
 that lack SOCKS support to use it through HTTP-specific variables. A SOCKS
 proxy set only in Pi settings or `PI_*_PROXY` does not configure child tools;
 use their standard proxy environment variables or their own configuration.
+The automatic loopback bypass applies to Pi's own HTTP requests; child tools
+continue to follow their own proxy and bypass configuration.
 
 ### Configuration Precedence
 

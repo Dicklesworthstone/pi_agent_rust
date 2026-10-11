@@ -1861,6 +1861,7 @@ fn merge_http_settings(
             https_proxy: other.https_proxy.or(base.https_proxy),
             http_proxy: other.http_proxy.or(base.http_proxy),
             no_proxy: other.no_proxy.or(base.no_proxy),
+            proxy_loopback: other.proxy_loopback.or(base.proxy_loopback),
             ignore_env_proxy: other.ignore_env_proxy.or(base.ignore_env_proxy),
         }),
         (None, Some(other)) => Some(other),
@@ -2433,6 +2434,84 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn http_loopback_proxy_setting_accepts_camel_and_snake_case() {
+        for (content, expected) in [
+            (r#"{"http":{"proxyLoopback":true}}"#, true),
+            (r#"{"http":{"proxy_loopback":true}}"#, true),
+            (r#"{"http":{"proxyLoopback":false}}"#, false),
+            (r#"{"http":{"proxy_loopback":false}}"#, false),
+        ] {
+            let config: Config = serde_json::from_str(content).expect("parse HTTP settings");
+            assert_eq!(
+                config.http.expect("HTTP settings").proxy_loopback,
+                Some(expected)
+            );
+            assert!(
+                unrecognised_setting_keys(content).is_empty(),
+                "the settings checker must recognize {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_loopback_proxy_setting_survives_partial_merge_and_false_override() {
+        let global: Config = serde_json::from_value(json!({
+            "http": {
+                "proxy": "http://proxy.example:8080",
+                "proxyLoopback": true,
+                "noProxy": ["internal.example"],
+                "ignoreEnvProxy": true
+            }
+        }))
+        .expect("global HTTP settings");
+        let project: Config = serde_json::from_value(json!({
+            "http": {"httpsProxy": "http://secure.example:8443"}
+        }))
+        .expect("partial project HTTP settings");
+        let merged = Config::merge(global, project);
+        let inherited = merged.http.as_ref().expect("merged HTTP settings");
+        assert_eq!(inherited.proxy_loopback, Some(true));
+        assert_eq!(inherited.proxy.as_deref(), Some("http://proxy.example:8080"));
+        assert_eq!(
+            inherited.https_proxy.as_deref(),
+            Some("http://secure.example:8443")
+        );
+
+        let project: Config = serde_json::from_value(json!({
+            "http": {"proxyLoopback": false}
+        }))
+        .expect("project disables loopback proxying");
+        let merged = Config::merge(merged, project);
+        let settings = merged.http.as_ref().expect("merged HTTP settings");
+        assert_eq!(settings.proxy_loopback, Some(false));
+        assert_eq!(settings.ignore_env_proxy, Some(true));
+        assert_eq!(
+            settings.no_proxy.as_deref(),
+            Some(["internal.example".to_string()].as_slice())
+        );
+        let (resolved, warnings) =
+            crate::http::proxy::ProxyConfig::resolve(Some(settings), &|_| None);
+        assert!(warnings.is_empty());
+        assert!(resolved.endpoint_for(false, "127.0.0.1", 11434).is_none());
+        assert!(resolved.endpoint_for(true, "localhost", 443).is_none());
+        assert!(resolved.endpoint_for(true, "internal.example", 443).is_none());
+        assert_eq!(
+            resolved
+                .endpoint_for(true, "remote.example", 443)
+                .expect("secure proxy retained")
+                .redacted_url(),
+            "http://secure.example:8443"
+        );
+        assert_eq!(
+            resolved
+                .endpoint_for(false, "remote.example", 80)
+                .expect("generic proxy retained")
+                .redacted_url(),
+            "http://proxy.example:8080"
+        );
+    }
 
     #[test]
     fn failover_settings_parse_chains_cooldown_and_cap() {
