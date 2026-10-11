@@ -125,6 +125,24 @@ pub(super) struct QueuedWriter {
     alive: Arc<AtomicBool>,
 }
 
+/// Wake an idle writer and release queued frame reservations on retirement.
+/// This owns only the queue, never the writer or its thread handle.
+#[derive(Clone)]
+pub(super) struct ShutdownHandle {
+    queue: Arc<Queue>,
+}
+
+impl ShutdownHandle {
+    pub(super) fn close(&self) {
+        let mut state = lock(&self.queue.state);
+        state.writer_closed = true;
+        state.frames.clear();
+        state.cancellations.clear();
+        drop(state);
+        self.queue.ready.notify_one();
+    }
+}
+
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "server writer is closed")
 }
@@ -172,14 +190,20 @@ impl QueuedWriter {
         mut pipe: impl Write + Send + 'static,
         pending: Arc<PendingMap>,
         alive: Arc<AtomicBool>,
-    ) -> io::Result<Self> {
+        process: Option<Arc<super::ServerProcess>>,
+    ) -> io::Result<(Self, std::thread::JoinHandle<()>)> {
         let (writer, receiver) =
             Self::channel(Arc::clone(&alive), MAX_QUEUED_FRAMES, MAX_OUTBOUND_BYTES);
-        // Intentional detach, just like the stdout/stderr pumps. Killing the
-        // owned child breaks a blocked write; dropping the writer ends recv.
-        let _writer_thread = std::thread::Builder::new()
+        let cleanup = process.map(|process| super::ServerWorkerGuard {
+            process,
+            pending: Arc::clone(&pending),
+            alive: Arc::clone(&alive),
+            writer: writer.shutdown_handle(),
+        });
+        let worker = std::thread::Builder::new()
             .name("pi-lsp-stdin".to_string())
             .spawn(move || {
+                let _cleanup = cleanup;
                 let error = loop {
                     let Ok(frame) = receiver.recv() else {
                         break TransportError::Closed("server writer queue closed".to_string());
@@ -199,7 +223,19 @@ impl QueuedWriter {
                 close_pending(&pending, &alive, &error);
                 // Dropping the receiver also releases every queued reservation.
             })?;
-        Ok(writer)
+        Ok((writer, worker))
+    }
+
+    pub(super) fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_in_flight_frame(&self) -> bool {
+        lock(&self.queue.state).frames.is_empty()
+            && self.budget.used.load(Ordering::Acquire) != 0
     }
 
     pub(super) fn write_request(&self, bytes: &[u8], id: u64) -> io::Result<()> {
@@ -263,7 +299,7 @@ impl QueuedWriter {
             _reservation: Some(reservation),
         };
         let mut state = lock(&self.queue.state);
-        if state.receiver_closed {
+        if state.receiver_closed || state.writer_closed {
             return Err(closed());
         }
         if state.frames.len() >= state.capacity {
@@ -679,6 +715,7 @@ mod tests {
         resume: SyncSender<()>,
         reader: std::io::PipeReader,
         _original: QueuedWriter,
+        writer_worker: std::thread::JoinHandle<()>,
     }
 
     #[cfg(unix)]
@@ -687,7 +724,7 @@ mod tests {
         let (reader, pipe) = std::io::pipe().expect("pipe");
         let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
         let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
-        let writer = QueuedWriter::start(
+        let (writer, writer_worker) = QueuedWriter::start(
             PausedPipe {
                 pipe,
                 entered: Some(entered_tx),
@@ -695,6 +732,7 @@ mod tests {
             },
             Arc::clone(&client.pending),
             Arc::clone(&client.alive),
+            None,
         )
         .expect("production pump");
         let original = std::mem::replace(&mut *lock(&client.writer), writer);
@@ -704,6 +742,7 @@ mod tests {
             resume,
             reader,
             _original: original,
+            writer_worker,
         }
     }
 
@@ -735,7 +774,7 @@ mod tests {
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(true));
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let mut writer = QueuedWriter::start(
+        let (mut writer, writer_worker) = QueuedWriter::start(
             PausedPipe {
                 pipe,
                 entered: Some(entered_tx),
@@ -743,6 +782,7 @@ mod tests {
             },
             Arc::clone(&pending),
             Arc::clone(&alive),
+            None,
         )
         .expect("production pump");
         let first = serde_json::json!({"jsonrpc":"2.0", "method":"initialized"});
@@ -789,6 +829,7 @@ mod tests {
         reader_thread.join().expect("reader completed");
         assert_eq!(received, expected);
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        writer_worker.join().expect("writer completed");
     }
 
     #[test]
@@ -840,7 +881,8 @@ mod tests {
         let (reader, pipe) = std::io::pipe().expect("pipe");
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
+        let (mut writer, writer_worker) =
+            QueuedWriter::start(pipe, pending, alive, None).expect("pump");
         let first = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize"});
         let second = serde_json::json!({"jsonrpc":"2.0", "method":"initialized"});
         writer
@@ -860,6 +902,7 @@ mod tests {
             Some(second)
         );
         assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
+        writer_worker.join().expect("writer completed");
     }
 
     #[cfg(unix)]
@@ -872,6 +915,7 @@ mod tests {
             resume,
             reader,
             _original,
+            writer_worker,
         } = paused_transport(root.path());
         client
             .notify("initialized", Value::Null)
@@ -907,6 +951,9 @@ mod tests {
         assert_eq!(frames[0]["method"], "initialized");
         assert_eq!(frames[1]["method"], "test/next");
         assert!(client.is_alive());
+        drop(_original);
+        client.kill();
+        writer_worker.join().expect("writer completed");
     }
 
     #[cfg(unix)]
@@ -919,6 +966,7 @@ mod tests {
             resume,
             reader,
             _original,
+            writer_worker,
         } = paused_transport(root.path());
         let (id, response) = client
             .request(
@@ -979,6 +1027,9 @@ mod tests {
             "completed"
         );
         assert!(client.is_alive());
+        drop(_original);
+        client.kill();
+        writer_worker.join().expect("writer completed");
     }
 
     #[test]
@@ -989,8 +1040,9 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&pending).insert(7, sender);
         let alive = Arc::new(AtomicBool::new(true));
-        let mut writer =
-            QueuedWriter::start(pipe, Arc::clone(&pending), Arc::clone(&alive)).expect("pump");
+        let (mut writer, writer_worker) =
+            QueuedWriter::start(pipe, Arc::clone(&pending), Arc::clone(&alive), None)
+                .expect("pump");
         writer.write_all(b"frame").expect("queue admission");
         let result = receiver
             .recv_timeout(Duration::from_secs(5))
@@ -1002,6 +1054,7 @@ mod tests {
             writer.write(b"later").unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+        writer_worker.join().expect("writer completed");
     }
 
     #[test]

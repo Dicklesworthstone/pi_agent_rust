@@ -9,10 +9,12 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -33,6 +35,9 @@ const NOTIFICATION_QUEUE_CAP: usize = 1024;
 const STDERR_TAIL_CAP: usize = 32 * 1024;
 /// A server that never answers cannot accumulate unbounded completion slots.
 const MAX_PENDING_REQUESTS: usize = 1024;
+/// Only dedicated pipe workers wait here, never a runtime worker. A retired
+/// connection must stop even if an escaped descendant still owns a pipe.
+const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// A JSON-RPC error object returned by the server.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -371,6 +376,236 @@ fn apply_env_policy(cmd: &mut Command, policy: &EnvPolicy, env: &[(String, Strin
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 }
 
+/// Blocking adapters belong only to the dedicated pipe workers. Retrying
+/// WouldBlock inside Read/Write preserves the parser's partially read body and
+/// the writer's partially sent frame while still observing retirement.
+struct InterruptiblePipe<P> {
+    pipe: P,
+    alive: Arc<AtomicBool>,
+}
+
+impl<P> InterruptiblePipe<P> {
+    fn new(pipe: P, alive: &Arc<AtomicBool>) -> Self {
+        Self {
+            pipe,
+            alive: Arc::clone(alive),
+        }
+    }
+
+    fn check_open(&self) -> std::io::Result<()> {
+        if self.alive.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server transport retired",
+            ))
+        }
+    }
+}
+
+impl<P: Read> Read for InterruptiblePipe<P> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            self.check_open()?;
+            match self.pipe.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PIPE_POLL_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<P: Write> Write for InterruptiblePipe<P> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            self.check_open()?;
+            match self.pipe.write(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PIPE_POLL_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            self.check_open()?;
+            match self.pipe.flush() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PIPE_POLL_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_pipe(pipe: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+/// Keep the actual child handle until a reap succeeds. Cancellation starts a
+/// worker without waiting; final drop still owns and joins that same worker.
+struct ServerProcess {
+    cleanup: Mutex<ProcessCleanup>,
+}
+
+struct ProcessCleanup {
+    child: Option<ProcessGuard>,
+    reaper: Option<ProcessReaper>,
+}
+
+struct ProcessReaper {
+    worker: JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    child: Arc<Mutex<Option<ProcessGuard>>>,
+}
+
+impl ServerProcess {
+    fn new(child: ProcessGuard) -> Self {
+        Self {
+            cleanup: Mutex::new(ProcessCleanup {
+                child: Some(child),
+                reaper: None,
+            }),
+        }
+    }
+
+    fn take_pipes(
+        &self,
+    ) -> std::io::Result<(
+        std::process::ChildStdin,
+        std::process::ChildStdout,
+        std::process::ChildStderr,
+    )> {
+        let mut cleanup = lock(&self.cleanup);
+        let child = cleanup
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("server process already retired"))?;
+        let stdin = child
+            .take_stdin()
+            .ok_or_else(|| std::io::Error::other("missing server stdin"))?;
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| std::io::Error::other("missing server stdout"))?;
+        let stderr = child
+            .take_stderr()
+            .ok_or_else(|| std::io::Error::other("missing server stderr"))?;
+        #[cfg(unix)]
+        {
+            prepare_pipe(&stdin)?;
+            prepare_pipe(&stdout)?;
+            prepare_pipe(&stderr)?;
+        }
+        Ok((stdin, stdout, stderr))
+    }
+
+    fn child_exited(&self) -> bool {
+        let mut cleanup = lock(&self.cleanup);
+        match cleanup.child.as_mut() {
+            Some(child) => matches!(child.try_wait_child(), Ok(Some(_))),
+            None => cleanup
+                .reaper
+                .as_ref()
+                .is_none_or(|reaper| reaper.worker.is_finished()),
+        }
+    }
+
+    fn close(&self, wait: bool) -> std::io::Result<()> {
+        let mut cleanup = lock(&self.cleanup);
+        if let Some(child) = cleanup.child.take() {
+            let child = Arc::new(Mutex::new(Some(child)));
+            let worker_child = Arc::clone(&child);
+            match std::thread::Builder::new()
+                .name("pi-lsp-reaper".to_string())
+                .spawn(move || {
+                    lock(&worker_child)
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("server reaper lost its child"))?
+                        .terminate_and_wait()
+                })
+            {
+                Ok(worker) => cleanup.reaper = Some(ProcessReaper { worker, child }),
+                Err(_) => {
+                    // The OS can refuse another thread. Cleanup still owns
+                    // the child and must not silently drop its reap obligation.
+                    let mut child = lock(&child)
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("server cleanup lost its child"))?;
+                    if let Err(error) = child.terminate_and_wait() {
+                        cleanup.child = Some(child);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let reaper = if wait { cleanup.reaper.take() } else { None };
+        drop(cleanup);
+        if let Some(reaper) = reaper {
+            let result = reaper
+                .worker
+                .join()
+                .map_err(|_| std::io::Error::other("server reaper panicked"))
+                .and_then(std::convert::identity);
+            if result.is_err() {
+                // A failed wait or panic leaves the guarded child available
+                // for a later close or final owner drop to retry.
+                lock(&self.cleanup).child = lock(&reaper.child).take();
+            }
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        if let Err(error) = self.close(true) {
+            tracing::warn!("Failed to reap language server: {error}");
+        }
+    }
+}
+
+/// A failed pipe or panicking callback must retire the connection and its
+/// process even when the caller retains the client without issuing more work.
+struct ServerWorkerGuard {
+    process: Arc<ServerProcess>,
+    pending: Arc<PendingMap>,
+    alive: Arc<AtomicBool>,
+    writer: outbound::ShutdownHandle,
+}
+
+impl Drop for ServerWorkerGuard {
+    fn drop(&mut self) {
+        outbound::close_pending(
+            &self.pending,
+            &self.alive,
+            &TransportError::Closed("server pipe worker stopped".to_string()),
+        );
+        self.writer.close();
+        if let Err(error) = self.process.close(false) {
+            tracing::warn!("Failed to start language server cleanup: {error}");
+        }
+    }
+}
+
+#[derive(Default)]
+struct ServerWorkers {
+    stdin: Option<JoinHandle<()>>,
+    stdout: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+
 /// Build the reader-thread body: parse frames, complete pending requests,
 /// queue notifications, answer server→client requests. On exit the
 /// transport flips dead and every pending request fails fast.
@@ -389,8 +624,16 @@ fn reader_loop(
         let mut reader = BufReader::new(stdout);
         let mut scratch = Vec::new();
         let close_reason = loop {
+            if !alive.load(Ordering::Acquire) {
+                break "server transport retired".to_string();
+            }
             match read_frame_with_scratch(&mut reader, &mut scratch) {
                 Ok(Some(message)) => {
+                    // BufReader/scratch can hold complete frames even after
+                    // retirement, without another call to the pipe adapter.
+                    if !alive.load(Ordering::Acquire) {
+                        break "server transport retired".to_string();
+                    }
                     if let Err(err) = handle_message(
                         &message,
                         &pending,
@@ -417,7 +660,8 @@ fn reader_loop(
 
 /// One JSON-RPC connection to a language-server child process.
 pub struct JsonRpcClient {
-    child: Mutex<ProcessGuard>,
+    process: Arc<ServerProcess>,
+    workers: Mutex<ServerWorkers>,
     writer: std::sync::Arc<SharedWriter>,
     pending: std::sync::Arc<PendingMap>,
     next_id: AtomicU64,
@@ -473,7 +717,8 @@ impl JsonRpcClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_env_policy(&mut cmd, policy, env);
-        let mut child: Child = cmd.spawn().map_err(|err| {
+        crate::tools::isolate_command_process_group(&mut cmd);
+        let child = crate::tools::spawn_command_with_job_discipline(&mut cmd).map_err(|err| {
             Error::tool(
                 flavor,
                 format!(
@@ -482,63 +727,84 @@ impl JsonRpcClient {
                 ),
             )
         })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::tool("lsp", "missing child stdin".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::tool("lsp", "missing child stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::tool("lsp", "missing child stderr".to_string()))?;
-        // Own cleanup before starting any fallible pump construction.
-        let child = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
-        let pending: std::sync::Arc<PendingMap> = std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let queued_writer = outbound::QueuedWriter::start(
-            stdin,
-            std::sync::Arc::clone(&pending),
-            std::sync::Arc::clone(&alive),
+        // Install the process owner before any fallible pipe/worker setup.
+        // Its Drop explicitly terminates and reaps even an already-exited
+        // root's surviving process group or retained Windows Job.
+        let process = Arc::new(ServerProcess::new(ProcessGuard::new(
+            child,
+            ProcessCleanupMode::ProcessGroupTree,
+        )));
+        let (stdin, stdout, stderr) = process
+            .take_pipes()
+            .map_err(|err| Error::tool(flavor, format!("failed to prepare server pipes: {err}")))?;
+        let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (queued_writer, stdin_worker) = outbound::QueuedWriter::start(
+            InterruptiblePipe::new(stdin, &alive),
+            Arc::clone(&pending),
+            Arc::clone(&alive),
+            Some(Arc::clone(&process)),
         )
         .map_err(|err| Error::tool(flavor, format!("failed to start server writer: {err}")))?;
-        let writer = std::sync::Arc::new(Mutex::new(queued_writer));
-        let stderr_tail = std::sync::Arc::new(Mutex::new(TailBuffer {
-            data: String::new(),
-            cap: STDERR_TAIL_CAP,
-        }));
         let (notification_tx, notification_rx) =
             std::sync::mpsc::sync_channel::<ServerNotification>(NOTIFICATION_QUEUE_CAP);
-        let dropped_notifications = std::sync::Arc::new(AtomicU64::new(0));
-        let server_request_handler: std::sync::Arc<Mutex<Option<ServerRequestHandler>>> =
-            std::sync::Arc::new(Mutex::new(None));
+        let client = Self {
+            process,
+            workers: Mutex::new(ServerWorkers {
+                stdin: Some(stdin_worker),
+                ..ServerWorkers::default()
+            }),
+            writer: Arc::new(Mutex::new(queued_writer)),
+            pending,
+            next_id: AtomicU64::new(1),
+            alive,
+            stderr_tail: Arc::new(Mutex::new(TailBuffer {
+                data: String::new(),
+                cap: STDERR_TAIL_CAP,
+            })),
+            notification_rx: Mutex::new(notification_rx),
+            dropped_notifications: Arc::new(AtomicU64::new(0)),
+            server_request_handler: Arc::new(Mutex::new(None)),
+        };
 
         // Reader thread: parse frames, complete pending requests, queue
         // notifications, answer server->client requests with null.
         {
+            let cleanup = ServerWorkerGuard {
+                process: Arc::clone(&client.process),
+                pending: Arc::clone(&client.pending),
+                alive: Arc::clone(&client.alive),
+                writer: lock(&client.writer).shutdown_handle(),
+            };
             let reader_body = reader_loop(
-                stdout,
-                std::sync::Arc::clone(&pending),
-                std::sync::Arc::clone(&alive),
-                std::sync::Arc::clone(&writer),
-                std::sync::Arc::clone(&stderr_tail),
+                InterruptiblePipe::new(stdout, &client.alive),
+                Arc::clone(&client.pending),
+                Arc::clone(&client.alive),
+                Arc::clone(&client.writer),
+                Arc::clone(&client.stderr_tail),
                 notification_tx,
-                std::sync::Arc::clone(&dropped_notifications),
-                std::sync::Arc::clone(&server_request_handler),
+                Arc::clone(&client.dropped_notifications),
+                Arc::clone(&client.server_request_handler),
             );
-            // Intentional detach: the reader exits on pipe EOF when the child dies.
-            std::thread::spawn(reader_body); // ubs:ignore intentional detach (EOF-exit)
+            let worker = std::thread::Builder::new()
+                .name("pi-lsp-stdout".to_string())
+                .spawn(move || {
+                    let _cleanup = cleanup;
+                    reader_body();
+                })
+                .map_err(|err| Error::tool(flavor, format!("failed to start server reader: {err}")))?;
+            lock(&client.workers).stdout = Some(worker);
         }
 
         // Stderr pump: retain a bounded tail for diagnostics surfacing.
         {
-            let stderr_tail = std::sync::Arc::clone(&stderr_tail);
+            let stderr_tail = Arc::clone(&client.stderr_tail);
+            let alive = Arc::clone(&client.alive);
+            let stderr = InterruptiblePipe::new(stderr, &alive);
             let pump_body = move || {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = [0u8; 4096];
-                loop {
+                while alive.load(Ordering::Acquire) {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
@@ -548,21 +814,14 @@ impl JsonRpcClient {
                     }
                 }
             };
-            // Intentional detach: the pump exits on pipe EOF when the child dies.
-            std::thread::spawn(pump_body); // ubs:ignore intentional detach (EOF-exit)
+            let worker = std::thread::Builder::new()
+                .name("pi-lsp-stderr".to_string())
+                .spawn(pump_body)
+                .map_err(|err| Error::tool(flavor, format!("failed to start server stderr: {err}")))?;
+            lock(&client.workers).stderr = Some(worker);
         }
 
-        Ok(Self {
-            child: Mutex::new(child),
-            writer,
-            pending,
-            next_id: AtomicU64::new(1),
-            alive,
-            stderr_tail,
-            notification_rx: Mutex::new(notification_rx),
-            dropped_notifications,
-            server_request_handler,
-        })
+        Ok(client)
     }
 
     /// Install a handler for server→client requests. The handler runs on the
@@ -712,8 +971,13 @@ impl JsonRpcClient {
     /// Whether the child process has exited (reaps the exit status if so).
     #[must_use]
     pub fn child_exited(&self) -> bool {
-        let status = lock(&self.child).try_wait_child();
-        matches!(status, Ok(Some(_)))
+        let exited = self.process.child_exited();
+        if exited {
+            // Helpers can keep both output pipes open after the root exits.
+            // Retire them even when no more request is sent on this client.
+            self.kill();
+        }
+        exited
     }
 
     /// Best-effort exit notification, then a hard stop. The client layer owns
@@ -723,23 +987,52 @@ impl JsonRpcClient {
         self.kill();
     }
 
-    /// Retire every pending request and kill the owned child immediately.
-    /// This does not depend on the stdout reader observing EOF first.
+    /// Retire every pending request and start owned process-tree cleanup.
+    /// No pipe or worker join is performed here. Cleanup uses a reaper thread;
+    /// only OS thread-creation failure falls back to synchronous termination.
     pub fn kill(&self) {
         outbound::close_pending(
             &self.pending,
             &self.alive,
             &TransportError::Closed("server transport stopped".to_string()),
         );
-        let _ = lock(&self.child).kill();
+        lock(&self.writer).shutdown_handle().close();
+        if let Err(error) = self.process.close(false) {
+            lock(&self.stderr_tail).push(&format!("[cleanup] {error}\n"));
+        }
+    }
+
+    fn finish_cleanup(&self) -> std::io::Result<()> {
+        // Do not join potentially blocked Windows pipes if the OS failed to
+        // terminate the owned Job. Keep the handles for a later retry.
+        self.process.close(true)?;
+        let workers = std::mem::take(&mut *lock(&self.workers));
+        let current = std::thread::current().id();
+        let mut panicked = false;
+        for worker in [workers.stdin, workers.stdout, workers.stderr]
+            .into_iter()
+            .flatten()
+        {
+            // A server callback may release the final client owner. Its own
+            // reader will exit after the callback; a thread cannot join itself.
+            if worker.thread().id() != current && worker.join().is_err() {
+                panicked = true;
+            }
+        }
+        if panicked {
+            Err(std::io::Error::other("server pipe worker panicked"))
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl Drop for JsonRpcClient {
     fn drop(&mut self) {
-        // ProcessGuard's Drop kills the child if still running; nothing else
-        // to do, but be explicit about the intent.
         self.kill();
+        if let Err(error) = self.finish_cleanup() {
+            tracing::warn!("Failed to finish language server cleanup: {error}");
+        }
     }
 }
 
@@ -1076,5 +1369,385 @@ mod tests {
             client.request("later", Value::Null),
             Err(TransportError::Closed(_))
         ));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fixture(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_status(pid: u32) -> Option<sysinfo::ProcessStatus> {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).map(sysinfo::Process::status)
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_running(pid: u32) -> bool {
+        fixture_process_status(pid).is_some_and(|status| {
+            !matches!(
+                status,
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    fn fixture_pids(root: &Path) -> (u32, u32) {
+        let mut pids = None;
+        assert!(
+            wait_for_fixture(|| {
+                pids = std::fs::read_to_string(root.join("pids"))
+                    .ok()
+                    .and_then(|text| {
+                        let mut values = text.split_whitespace();
+                        Some((values.next()?.parse().ok()?, values.next()?.parse().ok()?))
+                    });
+                pids.is_some()
+            }),
+            "server fixture did not publish its process identities"
+        );
+        pids.expect("fixture identities")
+    }
+
+    #[cfg(unix)]
+    fn tree_fixture(root: &Path, exit_root: bool) -> (JsonRpcClient, u32, u32) {
+        // The helper explicitly inherits stdin as well as stdout/stderr, so
+        // killing only the shell cannot unblock any of the three pipe workers.
+        let ending = if exit_root { "exit 0" } else { "wait" };
+        let script =
+            format!("sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n{ending}\n");
+        let client = JsonRpcClient::spawn("/bin/sh", &["-c".to_string(), script], &[], root)
+            .expect("server tree");
+        let (parent, helper) = fixture_pids(root);
+        assert!(fixture_process_running(helper), "helper must start alive");
+        if exit_root {
+            assert!(wait_for_fixture(|| client.process.child_exited()));
+            assert!(
+                fixture_process_running(helper),
+                "root exit must leave inherited pipes open"
+            );
+        }
+        (client, parent, helper)
+    }
+
+    #[cfg(unix)]
+    fn workers_finished(client: &JsonRpcClient) -> bool {
+        let workers = lock(&client.workers);
+        [&workers.stdin, &workers.stdout, &workers.stderr]
+            .into_iter()
+            .all(|worker| worker.as_ref().is_none_or(JoinHandle::is_finished))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_reaps_live_and_exited_root_trees_with_a_retained_client() {
+        for exit_root in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let (client, parent, helper) = tree_fixture(root.path(), exit_root);
+            let client = Arc::new(client);
+            let retained = Arc::clone(&client);
+            let (_, response) = client
+                .request("test/pending", Value::Null)
+                .expect("request");
+            client.shutdown();
+            assert!(matches!(
+                response.try_recv(),
+                Ok(Err(TransportError::Closed(_)))
+            ));
+            assert!(!retained.is_alive());
+            assert!(
+                wait_for_fixture(|| workers_finished(&retained)),
+                "pipe workers survived retirement"
+            );
+            retained.finish_cleanup().expect("owned cleanup");
+            assert_eq!(fixture_process_status(parent), None, "root must be reaped");
+            assert!(
+                wait_for_fixture(|| !fixture_process_running(helper)),
+                "helper survived shutdown"
+            );
+            assert!(matches!(
+                retained.request("later", Value::Null),
+                Err(TransportError::Closed(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_client_reaps_live_and_exited_root_descendants() {
+        for exit_root in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let (client, parent, helper) = tree_fixture(root.path(), exit_root);
+            drop(client);
+            assert_eq!(
+                fixture_process_status(parent),
+                None,
+                "drop must reap its root"
+            );
+            assert!(
+                wait_for_fixture(|| !fixture_process_running(helper)),
+                "helper survived client drop"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pipe_setup_reaps_an_exited_root_and_its_remaining_group() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\nexit 0\n",
+            ])
+            .current_dir(root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::tools::isolate_command_process_group(&mut command);
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .expect("incomplete pipe fixture");
+        let process = ServerProcess::new(ProcessGuard::new(
+            child,
+            ProcessCleanupMode::ProcessGroupTree,
+        ));
+        let (parent, helper) = fixture_pids(root.path());
+        assert!(wait_for_fixture(|| process.child_exited()));
+        assert!(fixture_process_running(helper));
+        assert!(
+            process.take_pipes().is_err(),
+            "stdin was deliberately not piped"
+        );
+        drop(process);
+        assert_eq!(fixture_process_status(parent), None);
+        assert!(wait_for_fixture(|| !fixture_process_running(helper)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observing_root_exit_retires_the_connection_before_pipe_eof() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (client, parent, helper) = tree_fixture(root.path(), true);
+        assert!(client.is_alive(), "inherited output prevents reader EOF");
+        assert!(client.child_exited());
+        assert!(!client.is_alive());
+        assert!(wait_for_fixture(|| workers_finished(&client)));
+        client.finish_cleanup().expect("owned cleanup");
+        assert_eq!(fixture_process_status(parent), None);
+        assert!(wait_for_fixture(|| !fixture_process_running(helper)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_stalled_stdin_write_stops_and_joins_all_workers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (client, parent, helper) = tree_fixture(root.path(), false);
+        let (_, response) = client
+            .request(
+                "test/large",
+                serde_json::json!({"data":"x".repeat(8 * 1024 * 1024)}),
+            )
+            .expect("bounded queue admits the frame");
+        // Neither process reads stdin; this frame is larger than pipe capacity.
+        // Observe the real writer claiming it, rather than timing a scheduler.
+        assert!(wait_for_fixture(|| lock(&client.writer)
+            .has_in_flight_frame()));
+        client.kill();
+        assert!(matches!(
+            response.try_recv(),
+            Ok(Err(TransportError::Closed(_)))
+        ));
+        assert!(
+            wait_for_fixture(|| workers_finished(&client)),
+            "stdin worker stayed blocked"
+        );
+        client.finish_cleanup().expect("all workers joined");
+        assert_eq!(fixture_process_status(parent), None);
+        assert!(wait_for_fixture(|| !fixture_process_running(helper)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_output_retires_a_retained_client_and_its_process_tree() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let script = "sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\nwhile [ ! -f release ]; do sleep 0.01; done\nprintf 'Content-Length: 1\\r\\n\\r\\n?'\nwait\n";
+        let client = JsonRpcClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+            root.path(),
+        )
+        .expect("malformed server");
+        let (parent, helper) = fixture_pids(root.path());
+        let (_, response) = client.request("test/pending", Value::Null).expect("request");
+        std::fs::write(root.path().join("release"), b"").expect("release bad frame");
+        assert!(matches!(
+            response.recv_timeout(Duration::from_secs(5)),
+            Ok(Err(TransportError::Closed(_)))
+        ));
+        assert!(!client.is_alive());
+        assert!(
+            wait_for_fixture(|| workers_finished(&client)),
+            "failure left pipe workers alive"
+        );
+        client.finish_cleanup().expect("failure cleanup");
+        assert_eq!(fixture_process_status(parent), None);
+        assert!(wait_for_fixture(|| !fixture_process_running(helper)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fragmented_headers_and_bodies_survive_nonblocking_waits_without_replay() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = encode_frame(
+            &serde_json::json!({"jsonrpc":"2.0", "id":1, "result":"snowman ☃"}),
+        );
+        let second = encode_frame(&serde_json::json!({"jsonrpc":"2.0", "id":2, "result":"second"}));
+        let body_start = find_subslice(&first, b"\r\n\r\n").expect("headers") + 4;
+        std::fs::write(root.path().join("first"), &first[..10]).expect("first fragment");
+        std::fs::write(root.path().join("middle"), &first[10..body_start + 9])
+            .expect("middle fragment");
+        let mut final_bytes = first[body_start + 9..].to_vec();
+        final_bytes.extend_from_slice(&second);
+        std::fs::write(root.path().join("last"), final_bytes).expect("final frames");
+        let script = "cat first\nprintf ready > stage1\nwhile [ ! -f release1 ]; do sleep 0.01; done\ncat middle\nprintf ready > stage2\nwhile [ ! -f release2 ]; do sleep 0.01; done\ncat last\nexec sleep 30\n";
+        let client = JsonRpcClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+            root.path(),
+        )
+        .expect("fragmented server");
+        let (_, first_response) = client
+            .request("test/first", Value::Null)
+            .expect("first request");
+        let (_, second_response) = client
+            .request("test/second", Value::Null)
+            .expect("second request");
+        assert!(wait_for_fixture(|| root.path().join("stage1").exists()));
+        assert!(matches!(
+            first_response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        std::fs::write(root.path().join("release1"), b"").expect("finish headers");
+        assert!(wait_for_fixture(|| root.path().join("stage2").exists()));
+        assert!(matches!(
+            first_response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        std::fs::write(root.path().join("release2"), b"").expect("finish bodies");
+        assert_eq!(
+            first_response
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first delivered")
+                .expect("first success"),
+            "snowman ☃"
+        );
+        assert_eq!(
+            second_response
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second delivered")
+                .expect("second success"),
+            "second"
+        );
+        assert!(lock(&client.pending).is_empty());
+        assert!(client.is_alive());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_client_drop_inside_a_server_callback_does_not_join_its_own_reader() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let request = encode_frame(
+            &serde_json::json!({"jsonrpc":"2.0", "id":"peer", "method":"test/dropOwner"}),
+        );
+        std::fs::write(root.path().join("callback"), request).expect("callback frame");
+        let script = "sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\nwhile [ ! -f release ]; do sleep 0.01; done\ncat callback\nwait\n";
+        let client = Arc::new(
+            JsonRpcClient::spawn(
+                "/bin/sh",
+                &["-c".to_string(), script.to_string()],
+                &[],
+                root.path(),
+            )
+            .expect("callback server"),
+        );
+        let (parent, helper) = fixture_pids(root.path());
+        let owner = Arc::new(Mutex::new(Some(Arc::clone(&client))));
+        let weak = Arc::downgrade(&client);
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        client.set_server_request_handler(Arc::new(move |_, _| {
+            let last_owner = lock(&owner).take().expect("final client owner");
+            drop(last_owner);
+            completed.send(()).expect("callback completed");
+            None
+        }));
+        drop(client);
+        std::fs::write(root.path().join("release"), b"").expect("release callback");
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("callback must not self-join");
+        assert!(weak.upgrade().is_none());
+        assert_eq!(fixture_process_status(parent), None);
+        assert!(wait_for_fixture(|| !fixture_process_running(helper)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_pipe_holder_cannot_keep_retired_workers_alive() {
+        struct EscapeCleanup(u32);
+        impl Drop for EscapeCleanup {
+            fn drop(&mut self) {
+                if let Ok(raw) = i32::try_from(self.0)
+                    && let Some(group) = rustix::process::Pid::from_raw(raw)
+                {
+                    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let script = "setsid /bin/sh -c 'printf \"%s\" \"$$\" > escaped; exec sleep 30' <&0 &\nwhile [ ! -s escaped ]; do sleep 0.01; done\nexit 0\n";
+        let client = JsonRpcClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+            root.path(),
+        )
+        .expect("escaped pipe server");
+        let mut escaped = None;
+        assert!(wait_for_fixture(|| {
+            escaped = std::fs::read_to_string(root.path().join("escaped"))
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok());
+            escaped.is_some()
+        }));
+        let escaped = escaped.expect("escaped helper identity");
+        let cleanup = EscapeCleanup(escaped);
+        assert!(wait_for_fixture(|| client.process.child_exited()));
+        assert!(fixture_process_running(escaped));
+        client.kill();
+        assert!(
+            wait_for_fixture(|| workers_finished(&client)),
+            "escaped descriptors pinned a worker"
+        );
+        client.finish_cleanup().expect("workers join without pipe EOF");
+        assert!(
+            fixture_process_running(escaped),
+            "fixture must keep its descriptors open throughout cleanup"
+        );
+        drop(cleanup);
+        assert!(wait_for_fixture(|| !fixture_process_running(escaped)));
     }
 }
