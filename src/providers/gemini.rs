@@ -727,6 +727,12 @@ where
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
+        // A failed generation cannot be made executable by a later STOP or
+        // function-call chunk. Usage metadata is still collected by the
+        // response handler before candidates reach this boundary.
+        if self.partial.stop_reason == StopReason::Error {
+            return Ok(());
+        }
         let has_finish_reason = candidate.finish_reason.is_some();
         self.saw_terminal |= has_finish_reason;
 
@@ -734,11 +740,42 @@ where
         if let Some(reason) = candidate.finish_reason.as_deref() {
             self.partial.stop_reason = match reason {
                 "MAX_TOKENS" => StopReason::Length,
-                "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
+                // Developer API and Vertex both report failed generations
+                // through finishReason, including invalid function calls.
+                // Such candidates must never dispatch otherwise valid peers.
+                "SAFETY"
+                | "RECITATION"
+                | "LANGUAGE"
+                | "OTHER"
+                | "BLOCKLIST"
+                | "PROHIBITED_CONTENT"
+                | "SPII"
+                | "MALFORMED_FUNCTION_CALL"
+                | "MODEL_ARMOR"
+                | "IMAGE_SAFETY"
+                | "IMAGE_PROHIBITED_CONTENT"
+                | "IMAGE_OTHER"
+                | "NO_IMAGE"
+                | "IMAGE_RECITATION"
+                | "UNEXPECTED_TOOL_CALL"
+                | "TOO_MANY_TOOL_CALLS"
+                | "MISSING_THOUGHT_SIGNATURE"
+                | "MALFORMED_RESPONSE"
+                | "ESCALATION"
+                | "PUP_LIMITED_DISABLED" => StopReason::Error,
                 "FUNCTION_CALL" => StopReason::ToolUse,
-                // STOP and any other reason treated as normal stop
+                // Preserve compatibility with unrecognized finish strings.
                 _ => StopReason::Stop,
             };
+            if self.partial.stop_reason == StopReason::Error {
+                self.partial.error_message = Some(format!(
+                    "{} stopped generation: {reason}",
+                    self.service_label()
+                ));
+                self.content_state
+                    .close(&self.partial, &mut self.pending_events);
+                return Ok(());
+            }
         }
 
         // Process content parts — queue all events into pending_events
@@ -1503,6 +1540,8 @@ mod tests {
     fn test_blocked_prompt_is_terminal_error_not_empty_success() {
         let body = [
             r#"data: {"promptFeedback":{"blockReason":"SAFETY","safetyRatings":[]}}"#,
+            "",
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"write","args":{}}}]},"finishReason":"STOP"}]}"#,
             "",
             "",
         ]
@@ -2550,6 +2589,7 @@ mod tests {
         let test_cases = vec![
             ("STOP", StopReason::Stop),
             ("MAX_TOKENS", StopReason::Length),
+            ("FUNCTION_CALL", StopReason::ToolUse),
             ("SAFETY", StopReason::Error),
             ("RECITATION", StopReason::Error),
             ("OTHER", StopReason::Error),
@@ -2743,12 +2783,14 @@ mod tests {
             parts[1]["functionCall"]["args"],
             serde_json::json!({"path": "b.txt"})
         );
+        assert_eq!(wire["contents"].as_array().unwrap().len(), 3);
+        assert_eq!(wire["contents"][2]["parts"].as_array().unwrap().len(), 2);
         assert_eq!(
             wire["contents"][2]["parts"][0]["functionResponse"]["name"],
             "read"
         );
         assert_eq!(
-            wire["contents"][3]["parts"][0]["functionResponse"]["name"],
+            wire["contents"][2]["parts"][1]["functionResponse"]["name"],
             "read"
         );
     }
@@ -2839,6 +2881,212 @@ mod tests {
                 };
                 assert_eq!(reason, expected);
                 assert_eq!(message.stop_reason, expected);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failed_generations_reject_adjoining_and_late_calls_across_google_transports() {
+        // Published GenerateContent FinishReason values from the Developer
+        // API and Vertex. Unknown strings retain the separate mapping test's
+        // compatibility behavior.
+        let failures = [
+            "SAFETY",
+            "RECITATION",
+            "LANGUAGE",
+            "OTHER",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "MALFORMED_FUNCTION_CALL",
+            "MODEL_ARMOR",
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "IMAGE_RECITATION",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE",
+            "MALFORMED_RESPONSE",
+            "ESCALATION",
+            "PUP_LIMITED_DISABLED",
+        ];
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        for (api, cloud_cli_mode, service) in [
+            ("google-generative-ai", false, "Gemini"),
+            ("google-vertex", false, "Vertex AI"),
+            ("google-gemini-cli", true, "Gemini"),
+        ] {
+            for finish in failures {
+                for prior_call in [false, true] {
+                    let mut frames = Vec::new();
+                    if prior_call {
+                        frames.push(serde_json::json!({"candidates": [{"content": {
+                            "parts": [{"functionCall": {"name": "prior", "args": {}}}]
+                        }}]}));
+                    }
+                    frames.extend([
+                        serde_json::json!({"candidates": [{
+                            "content": {"parts": [
+                                {"text": "discarded failed candidate"},
+                                {"functionCall": {"name": "failed", "args": {}}}
+                            ]},
+                            "finishReason": finish
+                        }]}),
+                        serde_json::json!({"candidates": [{
+                            "content": {"parts": [{"functionCall": {
+                                "name": "late", "args": {}
+                            }}]},
+                            "finishReason": "STOP"
+                        }]}),
+                        serde_json::json!({"usageMetadata": {
+                            "promptTokenCount": 21,
+                            "candidatesTokenCount": 7,
+                            "thoughtsTokenCount": 3,
+                            "totalTokenCount": 31
+                        }}),
+                    ]);
+                    let chunks = frames
+                        .into_iter()
+                        .map(|frame| {
+                            let wire = if cloud_cli_mode {
+                                serde_json::json!({"response": frame})
+                            } else {
+                                frame
+                            };
+                            Ok(format!("data: {wire}\n\n").into_bytes())
+                        })
+                        .collect::<Vec<std::io::Result<Vec<u8>>>>();
+                    let events = runtime.block_on(async {
+                        let source = SseStream::new(stream::iter(chunks));
+                        let mut output = Box::pin(
+                            StreamState::new(source, "gemini-test".into(), api.into(), api.into())
+                                .into_stream(cloud_cli_mode),
+                        );
+                        let mut events = Vec::new();
+                        while let Some(event) = output.next().await {
+                            events.push(event.expect("recognized failure is a terminal outcome"));
+                        }
+                        assert!(output.next().await.is_none());
+                        events
+                    });
+                    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                        panic!("missing terminal failure: {api}/{finish}/{prior_call}: {events:?}");
+                    };
+                    assert_eq!(*reason, StopReason::Error, "{api}/{finish}/{prior_call}");
+                    assert_eq!(message.stop_reason, StopReason::Error);
+                    assert_eq!(
+                        message.error_message.as_deref(),
+                        Some(format!("{service} stopped generation: {finish}").as_str())
+                    );
+                    assert_eq!(message.usage.input, 21);
+                    assert_eq!(message.usage.output, 10);
+                    assert_eq!(message.usage.total_tokens, 31);
+                    assert_eq!(message.content.len(), usize::from(prior_call));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+                            .count(),
+                        usize::from(prior_call)
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                            .count(),
+                        usize::from(prior_call)
+                    );
+                    for event in &events {
+                        if let StreamEvent::ToolCallEnd { tool_call, .. } = event {
+                            assert_eq!(tool_call.name, "prior");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_gemini_tool_batches_never_execute_a_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for finish in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MODEL_ARMOR"] {
+            for prior_call in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let marker = dir.path().join("must-not-be-written.txt");
+                let candidate = serde_json::json!({"content": {"parts": [{
+                    "functionCall": {
+                        "name": "write",
+                        "args": {"path": marker, "content": "must not execute"}
+                    }
+                }]}});
+                let mut frames = Vec::new();
+                if prior_call {
+                    frames.push(serde_json::json!({"candidates": [candidate.clone()]}));
+                }
+                let mut failed = candidate.clone();
+                failed["finishReason"] = serde_json::json!(finish);
+                frames.push(serde_json::json!({"candidates": [failed]}));
+                let mut late = candidate;
+                late["finishReason"] = serde_json::json!("STOP");
+                frames.push(serde_json::json!({"candidates": [late]}));
+                let body = frames
+                    .iter()
+                    .map(|frame| format!("data: {frame}\n\n"))
+                    .collect::<String>();
+                let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+                let provider = GeminiProvider::new("gemini-test").with_base_url(base_url);
+                let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                    crate::tools::WriteTool::new(dir.path()),
+                )]);
+                let mut agent = crate::agent::Agent::new(
+                    Arc::new(provider),
+                    tools,
+                    crate::agent::AgentConfig {
+                        max_tool_iterations: 1,
+                        stream_options: StreamOptions {
+                            api_key: Some("test-key".to_string()),
+                            ..StreamOptions::default()
+                        },
+                        ..crate::agent::AgentConfig::default()
+                    },
+                );
+                let executions = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&executions);
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let message = runtime
+                    .block_on(agent.run("Write the requested file", move |event| {
+                        if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }))
+                    .unwrap();
+                assert_eq!(message.stop_reason, StopReason::Error, "{finish}/{prior_call}");
+                assert!(
+                    message.error_message.as_deref().is_some_and(|error| error.contains(finish))
+                );
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                assert!(
+                    !marker.exists(),
+                    "a rejected tool batch must not run: {finish}/{prior_call}"
+                );
+                assert!(
+                    !agent
+                        .messages()
+                        .iter()
+                        .any(|message| matches!(message, Message::ToolResult(_)))
+                );
             }
         }
     }
