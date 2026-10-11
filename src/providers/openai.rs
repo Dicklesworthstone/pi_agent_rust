@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 
@@ -1149,16 +1149,19 @@ where
     fn finalize_tool_call_arguments(&mut self) -> Result<()> {
         // Validate the whole batch before exposing any completed tool call.
         // Best-effort streaming snapshots are for display, never execution.
+        let mut ids = HashSet::new();
         let arguments = self
             .tool_calls
             .iter()
             .map(|tc| {
-                parse_final_tool_arguments(&tc.arguments).map_err(|message| {
-                    Error::api(format!(
-                        "Invalid OpenAI tool arguments at index {}: {message}",
-                        tc.index
-                    ))
-                })
+                validate_final_tool_identity(&mut ids, &tc.id, &tc.name)
+                    .and_then(|()| parse_final_tool_arguments(&tc.arguments))
+                    .map_err(|message| {
+                        Error::api(format!(
+                            "Invalid OpenAI tool call at index {}: {message}",
+                            tc.index
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1475,6 +1478,27 @@ where
             self.finalize_content();
         }
     }
+}
+
+/// Each completed call needs an unambiguous result identity and a function
+/// name. Validate the accumulated wire values without repairing them: changing
+/// an ID here would no longer answer the call the provider actually emitted.
+/// Diagnostics exclude the values, which can contain sensitive provider data.
+pub(super) fn validate_final_tool_identity<'a>(
+    ids: &mut HashSet<&'a str>,
+    id: &'a str,
+    name: &str,
+) -> std::result::Result<(), &'static str> {
+    if id.trim().is_empty() {
+        return Err("tool call ID is empty");
+    }
+    if name.trim().is_empty() {
+        return Err("tool function name is empty");
+    }
+    if !ids.insert(id) {
+        return Err("tool call ID is duplicated");
+    }
+    Ok(())
 }
 
 /// Parse final tool arguments without the repairs used for streaming previews.

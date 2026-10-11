@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 
 // ============================================================================
@@ -476,16 +476,19 @@ where
     fn finalize_tool_call_arguments(&mut self) -> Result<()> {
         // Validate the whole batch before exposing any completed tool call.
         // Best-effort streaming snapshots are for display, never execution.
+        let mut ids = HashSet::new();
         let arguments = self
             .tool_calls
             .iter()
             .map(|tc| {
-                super::openai::parse_final_tool_arguments(&tc.arguments).map_err(|message| {
-                    Error::api(format!(
-                        "Invalid Azure OpenAI tool arguments at index {}: {message}",
-                        tc.index
-                    ))
-                })
+                super::openai::validate_final_tool_identity(&mut ids, &tc.id, &tc.name)
+                    .and_then(|()| super::openai::parse_final_tool_arguments(&tc.arguments))
+                    .map_err(|message| {
+                        Error::api(format!(
+                            "Invalid Azure OpenAI tool call at index {}: {message}",
+                            tc.index
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
