@@ -5,16 +5,33 @@
 //! is not itself an error. Once a block emits an end, however, another indexed
 //! event cannot reopen it. End payloads must agree with the partial that the
 //! extension supplied in that same event, before either reaches consumers.
+//! Successful terminal messages must also preserve every observed block type
+//! and every completed block payload. A terminal is not permission to replace
+//! a tool call after its completed preview has already been displayed.
 
 use super::{MAX_BLOCKS, limit, protocol};
 use crate::error::Result;
 use crate::model::{AssistantMessageEvent, ContentBlock};
+use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Text,
     Thinking,
     Tool,
+}
+
+impl Kind {
+    fn matches(self, block: &ContentBlock) -> bool {
+        matches!(
+            (self, block),
+            (Self::Text, ContentBlock::Text(_))
+                | (Self::Thinking, ContentBlock::Thinking(_))
+                | (Self::Tool, ContentBlock::ToolCall(_))
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,7 +44,9 @@ enum Phase {
 #[derive(Clone, Copy)]
 struct State {
     kind: Kind,
-    closed: bool,
+    // A fixed-size commitment, not a retained copy of potentially huge tool
+    // arguments or cumulative text. None denotes an unfinished preview.
+    fingerprint: Option<[u8; 32]>,
 }
 
 pub(super) struct Ledger {
@@ -87,7 +106,8 @@ impl Ledger {
                 partial,
                 ..
             } => (*content_index, Kind::Tool, Phase::End, partial),
-            E::Start { .. } | E::Done { .. } | E::Error { .. } => return Ok(()),
+            E::Done { message, .. } => return self.admit_terminal(&message.content),
+            E::Start { .. } | E::Error { .. } => return Ok(()),
         };
         // Check before index + 1 or any allocation, even when called without
         // the outer decoder's message-shape validation.
@@ -98,12 +118,7 @@ impl Ledger {
             .content
             .get(index)
             .ok_or_else(|| protocol("content index does not identify the event's block type"))?;
-        if !matches!(
-            (kind, block),
-            (Kind::Text, ContentBlock::Text(_))
-                | (Kind::Thinking, ContentBlock::Thinking(_))
-                | (Kind::Tool, ContentBlock::ToolCall(_))
-        ) {
+        if !kind.matches(block) {
             return Err(protocol(
                 "content index does not identify the event's block type",
             ));
@@ -137,7 +152,7 @@ impl Ledger {
             _ => {}
         }
         if let Some(Some(previous)) = self.entries.get(index) {
-            if previous.closed {
+            if previous.fingerprint.is_some() {
                 return Err(protocol("content event received after its block ended"));
             }
             if previous.kind != kind {
@@ -151,15 +166,105 @@ impl Ledger {
                 ));
             }
         }
+        let fingerprint = if phase == Phase::End {
+            Some(block_fingerprint(block)?)
+        } else {
+            None
+        };
         if self.entries.len() <= index {
             self.entries.resize(index + 1, None);
         }
         self.entries[index] = Some(State {
             kind,
-            closed: phase == Phase::End,
+            fingerprint,
         });
         Ok(())
     }
+
+    fn admit_terminal(&self, content: &[ContentBlock]) -> Result<()> {
+        if content.len() > MAX_BLOCKS {
+            return Err(limit());
+        }
+        for (index, state) in self.entries.iter().enumerate() {
+            let Some(state) = state else {
+                continue;
+            };
+            let block = content
+                .get(index)
+                .ok_or_else(|| protocol("terminal message omitted an observed content block"))?;
+            if !state.kind.matches(block) {
+                return Err(protocol("terminal message changed an observed block type"));
+            }
+            if let Some(expected) = state.fingerprint
+                && block_fingerprint(block)? != expected
+            {
+                return Err(protocol(
+                    "terminal message changed a completed content block",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+// Serialize directly into the digest: retaining each completed payload would
+// otherwise let many individually bounded previews accumulate unbounded data.
+struct FingerprintWriter(Sha256);
+
+impl Write for FingerprintWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// Object key order is not part of a tool call's meaning, including when a
+// downstream dependency enables serde_json's preserve_order feature. Sort
+// borrowed entries recursively rather than cloning the arguments into a second
+// JSON tree. Array order and scalar types remain significant.
+struct CanonicalValue<'a>(&'a serde_json::Value);
+
+impl Serialize for CanonicalValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.0 {
+            serde_json::Value::Array(items) => {
+                serializer.collect_seq(items.iter().map(CanonicalValue))
+            }
+            serde_json::Value::Object(items) => {
+                let mut entries: Vec<_> = items.iter().collect();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                serializer.collect_map(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, CanonicalValue(value))),
+                )
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
+
+fn block_fingerprint(block: &ContentBlock) -> Result<[u8; 32]> {
+    let mut writer = FingerprintWriter(Sha256::new());
+    writer.0.update(b"pi:extension:completed-block:v1\0");
+    let result = match block {
+        ContentBlock::ToolCall(call) => serde_json::to_writer(
+            &mut writer,
+            &(
+                &call.id,
+                &call.name,
+                CanonicalValue(&call.arguments),
+                &call.thought_signature,
+            ),
+        ),
+        _ => serde_json::to_writer(&mut writer, block),
+    };
+    result.map_err(|_| protocol("completed block could not be fingerprinted"))?;
+    Ok(writer.0.finalize().into())
 }
 
 #[cfg(test)]
@@ -523,5 +628,189 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.entries.len(), MAX_BLOCKS);
         assert!(ledger.entries[..MAX_BLOCKS - 1].iter().all(Option::is_none));
+    }
+
+    fn terminal(reason: StopReason, content: Vec<ContentBlock>) -> AssistantMessageEvent {
+        let mut complete = (*message(content)).clone();
+        complete.stop_reason = reason;
+        if matches!(reason, StopReason::Error | StopReason::Aborted) {
+            AssistantMessageEvent::Error {
+                reason,
+                error: Arc::new(complete),
+            }
+        } else {
+            AssistantMessageEvent::Done {
+                reason,
+                message: Arc::new(complete),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_cannot_replace_a_completed_tool_preview() {
+        for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::PauseTurn] {
+            for changed in 0..4 {
+                let mut decoder = decoder();
+                push(&mut decoder, block_event(Kind::Tool, Phase::End)).unwrap();
+                let mut supplied = call();
+                match changed {
+                    0 => supplied.id = "PRIVATE-CANARY".into(),
+                    1 => supplied.name = "PRIVATE-CANARY".into(),
+                    2 => supplied.arguments = json!({"content": "PRIVATE-CANARY"}),
+                    _ => supplied.thought_signature = Some("PRIVATE-CANARY".into()),
+                }
+                reject(
+                    &mut decoder,
+                    terminal(reason, vec![ContentBlock::ToolCall(supplied)]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_preserves_completed_text_thinking_and_signatures() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            let mut decoder = decoder();
+            push(&mut decoder, block_event(kind, Phase::End)).unwrap();
+            let changed = if kind == Kind::Text {
+                text("PRIVATE-CANARY")
+            } else {
+                thinking("PRIVATE-CANARY")
+            };
+            reject(&mut decoder, terminal(StopReason::Stop, vec![changed]));
+        }
+        let mut decoder = decoder();
+        push(&mut decoder, block_event(Kind::Thinking, Phase::End)).unwrap();
+        reject(
+            &mut decoder,
+            terminal(
+                StopReason::Stop,
+                vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "complete".into(),
+                    thinking_signature: Some("PRIVATE-CANARY".into()),
+                })],
+            ),
+        );
+    }
+
+    #[test]
+    fn terminal_cannot_drop_or_retype_observed_blocks() {
+        for kind in [Kind::Text, Kind::Thinking, Kind::Tool] {
+            for phase in [Phase::Start, Phase::Delta, Phase::End] {
+                for replacement in [vec![], vec![text("complete"), thinking("complete")]] {
+                    let mut decoder = decoder();
+                    // Track index 2 so an unrelated earlier block cannot stand
+                    // in for an omitted observed block, even of the same kind.
+                    let mut event = serde_json::to_value(block_event(kind, phase)).unwrap();
+                    let block = event["partial"]["content"][0].clone();
+                    event["contentIndex"] = json!(2);
+                    event["partial"]["content"] = json!([text(""), text(""), block]);
+                    decoder.push(event).unwrap();
+                    reject(&mut decoder, terminal(StopReason::Stop, replacement));
+                }
+                let mut decoder = decoder();
+                push(&mut decoder, block_event(kind, phase)).unwrap();
+                let replacement = if kind == Kind::Text {
+                    thinking("complete")
+                } else {
+                    text("complete")
+                };
+                reject(&mut decoder, terminal(StopReason::Stop, vec![replacement]));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_can_complete_open_previews_and_unobserved_blocks() {
+        for kind in [Kind::Text, Kind::Thinking, Kind::Tool] {
+            let mut decoder = decoder();
+            push(&mut decoder, block_event(kind, Phase::Delta)).unwrap();
+            let block = match kind {
+                Kind::Text => text("complete with additional text"),
+                Kind::Thinking => thinking("complete with additional thinking"),
+                Kind::Tool => ContentBlock::ToolCall(ToolCall {
+                    arguments: json!({"path": "output.txt", "content": "final arguments"}),
+                    ..call()
+                }),
+            };
+            let result = push(
+                &mut decoder,
+                terminal(StopReason::Stop, vec![block, text("unobserved final block")]),
+            )
+            .unwrap();
+            assert!(matches!(&result[0], StreamEvent::Done { .. }));
+            assert!(decoder.finished());
+        }
+    }
+
+    #[test]
+    fn unchanged_completed_tool_preserves_success_normalization() {
+        for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::PauseTurn] {
+            let mut decoder = decoder();
+            push(&mut decoder, block_event(Kind::Tool, Phase::End)).unwrap();
+            let output = push(
+                &mut decoder,
+                terminal(reason, vec![ContentBlock::ToolCall(call())]),
+            )
+            .unwrap();
+            let expected = if reason == StopReason::Stop {
+                StopReason::ToolUse
+            } else {
+                reason
+            };
+            assert!(matches!(
+                &output[0],
+                StreamEvent::Done { reason, message }
+                    if *reason == expected && message.stop_reason == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_streams_may_discard_their_partial_blocks() {
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            let mut decoder = decoder();
+            push(&mut decoder, block_event(Kind::Tool, Phase::End)).unwrap();
+            let output = push(&mut decoder, terminal(reason, vec![])).unwrap();
+            assert!(matches!(&output[0], StreamEvent::Error { .. }));
+            assert!(decoder.finished());
+        }
+    }
+
+    #[test]
+    fn tool_fingerprints_ignore_object_order_but_bind_array_order_and_types() {
+        let original = ContentBlock::ToolCall(ToolCall {
+            arguments: serde_json::from_str(
+                r#"{"z":1,"a":{"y":[{"b":2,"a":1},true],"x":"text"}}"#,
+            )
+            .unwrap(),
+            ..call()
+        });
+        let reordered = ContentBlock::ToolCall(ToolCall {
+            arguments: serde_json::from_str(
+                r#"{"a":{"x":"text","y":[{"a":1,"b":2},true]},"z":1}"#,
+            )
+            .unwrap(),
+            ..call()
+        });
+        assert_eq!(
+            block_fingerprint(&original).unwrap(),
+            block_fingerprint(&reordered).unwrap()
+        );
+        for arguments in [
+            json!({"z": 1, "a": {"y": [true, {"a": 1, "b": 2}], "x": "text"}}),
+            json!({"z": "1", "a": {"y": [{"a": 1, "b": 2}, true], "x": "text"}}),
+        ] {
+            let changed = ContentBlock::ToolCall(ToolCall {
+                arguments,
+                ..call()
+            });
+            assert_ne!(
+                block_fingerprint(&original).unwrap(),
+                block_fingerprint(&changed).unwrap()
+            );
+        }
+        // Payload size cannot change the per-block retained memory budget.
+        assert!(std::mem::size_of::<State>() <= 40);
     }
 }
