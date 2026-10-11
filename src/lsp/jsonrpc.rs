@@ -95,6 +95,9 @@ impl TransportError {
 pub struct ServerNotification {
     pub method: String,
     pub params: Value,
+    /// Losses observed before this notification was queued. Consumers can
+    /// reject cached state and older queued reports across an overflow.
+    pub(super) dropped_before: u64,
 }
 
 /// How a spawned server's environment is composed.
@@ -1116,6 +1119,7 @@ fn handle_message<W: Write>(
         let notification = ServerNotification {
             method: method.to_string(),
             params: message.get("params").cloned().unwrap_or(Value::Null),
+            dropped_before: dropped.load(Ordering::SeqCst),
         };
         match notification_tx.try_send(notification) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
@@ -1347,8 +1351,25 @@ mod tests {
             .expect("route notification");
         }
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
-        assert!(notification_rx.try_recv().is_ok());
-        assert!(notification_rx.try_recv().is_ok());
+        let first = notification_rx.try_recv().expect("first queued notification");
+        assert_eq!(first.params["i"], 0);
+        assert_eq!(first.dropped_before, 0);
+        handle_message(
+            &serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"i":4}}),
+            &pending,
+            &writer,
+            &notification_tx,
+            &dropped,
+            &stderr_tail,
+            &Mutex::new(None),
+        )
+        .expect("notification after capacity is released");
+        let older = notification_rx.try_recv().expect("older queued notification");
+        assert_eq!(older.params["i"], 1);
+        assert_eq!(older.dropped_before, 0);
+        let fresh = notification_rx.try_recv().expect("notification after loss");
+        assert_eq!(fresh.params["i"], 4);
+        assert_eq!(fresh.dropped_before, 2);
         assert!(notification_rx.try_recv().is_err());
     }
 

@@ -132,6 +132,9 @@ pub struct LspClient {
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
     diagnostics: Mutex<HashMap<String, Vec<Value>>>,
+    // Serialize draining and applying notifications, retaining the loss
+    // generation so older queued reports cannot restore invalidated state.
+    notification_generation: Mutex<u64>,
     pull_reports: Mutex<pull_diagnostics::ReportCache>,
     request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
@@ -163,6 +166,7 @@ impl LspClient {
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
+            notification_generation: Mutex::new(0),
             pull_reports: Mutex::new(pull_diagnostics::ReportCache::default()),
             request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
             capabilities: Mutex::new(ServerCapabilities::default()),
@@ -344,7 +348,15 @@ impl LspClient {
     }
 
     pub fn poll_notifications(&self) {
+        // Hold one owner across drain and apply: concurrent callers must not
+        // publish an earlier batch after a newer one has already been applied.
+        let mut generation = Self::lock(&self.notification_generation);
+        self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
         for notification in self.rpc.drain_notifications() {
+            if notification.dropped_before < *generation {
+                continue;
+            }
+            self.observe_notification_loss(&mut generation, notification.dropped_before);
             if notification.method == "textDocument/publishDiagnostics" {
                 self.accept_diagnostics(&notification.params);
             } else if notification.method == "experimental/serverStatus"
@@ -355,6 +367,22 @@ impl LspClient {
             {
                 self.quiescent.store(quiescent, Ordering::SeqCst);
             }
+        }
+        // A producer can overflow while this batch is being consumed. None
+        // of the reports before that gap can remain evidence of a clean file.
+        self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
+    }
+
+    fn observe_notification_loss(&self, generation: &mut u64, dropped: u64) {
+        if dropped > *generation {
+            Self::lock(&self.diagnostics).clear();
+            self.quiescent.store(false, Ordering::SeqCst);
+            *generation = dropped;
+            // Retain pull_reports: a later pull sends its exact previous
+            // resultId and requires a fresh full/unchanged server response
+            // tied to the current document and latest request. Clearing the
+            // visible cache alone makes push-only readers report unknown
+            // until a new report arrives; it never manufactures zero issues.
         }
     }
 
@@ -539,6 +567,91 @@ mod tests {
         assert!(!is_warmup_empty_retryable("codeAction/resolve"));
         assert!(is_warmup_empty_retryable("textDocument/definition"));
         assert!(is_warmup_empty_retryable("workspace/willRenameFiles"));
+    }
+
+    #[test]
+    fn notification_overflow_invalidates_clean_reports_and_recovers() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let path = temp.path().join("source.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("source");
+        let Some(peer) = test_server::Fixture::connect(
+            temp.path(),
+            serde_json::json!({"textDocumentSync": 1}),
+        ) else {
+            return;
+        };
+        let uri = peer.client.ensure_synced(&path, "rust").expect("document");
+        let snapshots = peer.client.document_snapshots();
+        let version = snapshots.values().next().expect("synced snapshot").version;
+        let clean = serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "version": version, "diagnostics": []}
+        });
+        let settled = serde_json::json!({
+            "jsonrpc": "2.0", "method": "experimental/serverStatus",
+            "params": {"quiescent": true}
+        });
+        peer.notifications(&[clean.clone(), settled.clone()]);
+        assert!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("explicit initial clean report")
+                .is_empty()
+        );
+        let diagnostic = serde_json::json!({
+            "message": "dependency now fails", "severity": 1,
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 0, "character": 1}}
+        });
+        let failed = serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "version": version, "diagnostics": [diagnostic]}
+        });
+        // Keep both an old clean report and old quiescence in the backlog.
+        // The final error report must overflow the production queue without
+        // any client drain until the peer's following response acknowledges it.
+        let mut flood = vec![clean.clone(), settled.clone()];
+        flood.resize(
+            1024,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "window/logMessage",
+                "params": {"type": 3, "message": "server is analyzing"}
+            }),
+        );
+        flood.push(failed.clone());
+        peer.notifications(&flood);
+        assert_eq!(peer.client.dropped_notifications(), 1);
+        assert!(peer.client.diagnostics_snapshot().is_empty());
+        assert!(!peer.client.quiescent.load(Ordering::SeqCst));
+        let error = peer
+            .runtime
+            .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+            .expect_err("a lost report must not preserve a clean result");
+        assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"));
+        assert!(peer.client.is_alive());
+
+        peer.notifications(&[failed]);
+        assert_eq!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("fresh error report"),
+            vec![diagnostic]
+        );
+        peer.notifications(&[clean, settled]);
+        assert!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("fresh explicit clean report")
+                .is_empty()
+        );
+        assert_eq!(
+            peer.runtime
+                .block_on(peer.client.call("test/success", Value::Null, Duration::from_secs(5)))
+                .expect("unrelated requests remain usable"),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(peer.client.dropped_notifications(), 1);
+        assert!(peer.client.is_alive());
     }
 
     fn workspace_peer(root: &Path) -> Option<test_server::Fixture> {

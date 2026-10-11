@@ -46,6 +46,10 @@ while True:
     elif method == 'test/configure':
         replies.update(params['replies'])
         response['result'] = None
+    elif method == 'test/notifications':
+        for notification in params['notifications']:
+            send(notification)
+        response['result'] = None
     elif method == 'test/hang':
         held.append(message['id'])
         continue
@@ -112,6 +116,24 @@ impl Fixture {
             .as_array()
             .expect("frame array")
             .clone()
+    }
+
+    /// Wait for the reader to receive an entire notification batch without
+    /// draining it through `LspClient::call`'s normal notification polling.
+    pub(super) fn notifications(&self, notifications: &[Value]) {
+        let (id, response) = self
+            .client
+            .rpc
+            .request("test/notifications", json!({"notifications": notifications}))
+            .expect("notification batch request");
+        self.runtime
+            .block_on(crate::lsp::jsonrpc::await_completion(
+                response,
+                Duration::from_secs(5),
+                || self.client.rpc.cancel_request(id),
+            ))
+            .expect("notification batch acknowledgement")
+            .expect("notification batch succeeded");
     }
 
     pub(super) fn configure(&self, replies: Value) {
