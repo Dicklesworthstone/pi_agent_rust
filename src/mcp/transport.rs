@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
 use std::time::Duration;
 
@@ -85,6 +85,68 @@ const STDIO_CANCEL_GRACE: Duration = Duration::from_millis(20);
 type StdioOutcome = std::result::Result<Value, McpStdioError>;
 type StdioPending = Mutex<HashMap<u64, StdSyncSender<StdioOutcome>>>;
 
+/// Queue admission is not dispatch. The writer and request owner race for
+/// this lease before the first pipe write, so an abandoned queued tools/call
+/// can never become a remote side effect after its caller has gone away.
+struct StdioRequestDispatch(AtomicU8);
+
+impl StdioRequestDispatch {
+    const QUEUED: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const REVOKED: u8 = 2;
+    const ABANDONED: u8 = 3;
+
+    const fn new() -> Self {
+        Self(AtomicU8::new(Self::QUEUED))
+    }
+
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CLAIMED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Revoke unsent work, or return true exactly once for a request whose
+    /// writer already claimed it and may have sent part or all of the frame.
+    fn cancel(&self) -> bool {
+        if self.0.compare_exchange(
+            Self::QUEUED,
+            Self::REVOKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) != Err(Self::CLAIMED)
+        {
+            return false;
+        }
+        self.0
+            .compare_exchange(
+                Self::CLAIMED,
+                Self::ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn may_have_been_sent(&self) -> bool {
+        matches!(
+            self.0.load(Ordering::SeqCst),
+            Self::CLAIMED | Self::ABANDONED
+        )
+    }
+}
+
+struct StdioRequest {
+    id: u64,
+    response: StdReceiver<StdioOutcome>,
+    dispatch: std::sync::Arc<StdioRequestDispatch>,
+}
+
 #[derive(Debug, Clone)]
 enum McpStdioError {
     Server(RpcErrorObject),
@@ -135,6 +197,10 @@ impl McpStdioError {
 }
 
 enum WriterCommand {
+    Request {
+        message: Vec<u8>,
+        dispatch: std::sync::Arc<StdioRequestDispatch>,
+    },
     Message(Vec<u8>),
     Cancellation(Vec<u8>),
     Close,
@@ -512,6 +578,25 @@ fn writer_loop(
 ) {
     while let Ok(command) = writer_rx.recv() {
         match command {
+            WriterCommand::Request { message, dispatch } => {
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !dispatch.claim() {
+                    continue;
+                }
+                if let Err(error) = stdin.write_all(&message).and_then(|()| stdin.flush()) {
+                    stop_connection(
+                        &pending,
+                        &alive,
+                        &closing,
+                        &tree_cleanup_state,
+                        pid,
+                        McpStdioError::Io(format!("stdio write failed: {error}")),
+                    );
+                    return;
+                }
+            }
             WriterCommand::Message(message) => {
                 if !alive.load(Ordering::SeqCst) {
                     return;
@@ -839,7 +924,7 @@ impl McpStdioClient {
         &self,
         method: &str,
         params: Value,
-    ) -> std::result::Result<(u64, StdReceiver<StdioOutcome>), McpStdioError> {
+    ) -> std::result::Result<StdioRequest, McpStdioError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if id == u64::MAX {
             self.abort();
@@ -854,13 +939,22 @@ impl McpStdioClient {
         });
         append_client_params(&mut message, params)?;
         let encoded = encode_stdio_message(&message)?;
+        let dispatch = std::sync::Arc::new(StdioRequestDispatch::new());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&self.pending).insert(id, sender);
-        if let Err(error) = self.enqueue(WriterCommand::Message(encoded)) {
+        if let Err(error) = self.enqueue(WriterCommand::Request {
+            message: encoded,
+            dispatch: std::sync::Arc::clone(&dispatch),
+        }) {
+            dispatch.cancel();
             lock(&self.pending).remove(&id);
             return Err(error);
         }
-        Ok((id, receiver))
+        Ok(StdioRequest {
+            id,
+            response: receiver,
+            dispatch,
+        })
     }
 
     fn notify(&self, method: &str, params: Value) -> std::result::Result<(), McpStdioError> {
@@ -872,9 +966,17 @@ impl McpStdioClient {
         self.enqueue(WriterCommand::Message(encode_stdio_message(&message)?))
     }
 
-    fn cancel_request(&self, id: u64, send_notification: bool) {
+    fn cancel_request(
+        &self,
+        id: u64,
+        dispatch: &StdioRequestDispatch,
+        send_notification: bool,
+    ) {
+        // Revoke before removing the waiter: the writer must not gain
+        // permission to send an abandoned frame during cancellation cleanup.
+        let cancel_dispatched = dispatch.cancel();
         lock(&self.pending).remove(&id);
-        if send_notification && self.alive.load(Ordering::SeqCst) {
+        if cancel_dispatched && send_notification && self.alive.load(Ordering::SeqCst) {
             let cancellation = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/cancelled",
@@ -980,13 +1082,27 @@ fn append_client_params(
 struct PendingStdioRequest<'a> {
     client: &'a McpStdioClient,
     id: u64,
+    dispatch: std::sync::Arc<StdioRequestDispatch>,
     send_cancellation: bool,
     armed: bool,
 }
 
 impl PendingStdioRequest<'_> {
-    const fn cancellation_was_sent(&mut self) {
-        self.send_cancellation = false;
+    async fn finish_cancellation(&mut self) {
+        self.client
+            .cancel_request(self.id, &self.dispatch, self.send_cancellation);
+        if self.dispatch.may_have_been_sent() {
+            if self.send_cancellation {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let now = cx
+                    .cx()
+                    .timer_driver()
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
+            }
+            self.client.abort();
+        }
+        self.disarm();
     }
 
     const fn disarm(&mut self) {
@@ -997,8 +1113,11 @@ impl PendingStdioRequest<'_> {
 impl Drop for PendingStdioRequest<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.client.cancel_request(self.id, self.send_cancellation);
-            self.client.abort();
+            self.client
+                .cancel_request(self.id, &self.dispatch, self.send_cancellation);
+            if self.dispatch.may_have_been_sent() {
+                self.client.abort();
+            }
         }
     }
 }
@@ -1054,7 +1173,18 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let (id, rx) = self
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| tool_err("MCP_CANCELLED", "cancelled before request dispatch"))?;
+        if timeout.is_zero() {
+            return Err(tool_err("MCP_TIMEOUT", "request timed out before dispatch"));
+        }
+        let StdioRequest {
+            id,
+            response,
+            dispatch,
+        } = self
             .rpc
             .request(method, params)
             .map_err(|error| tool_err(error.code(), error.message()))?;
@@ -1062,11 +1192,12 @@ impl McpTransport for StdioTransport {
         let mut pending_request = PendingStdioRequest {
             client: &self.rpc,
             id,
+            dispatch: std::sync::Arc::clone(&dispatch),
             send_cancellation,
             armed: true,
         };
-        let outcome = await_completion(rx, timeout, || {
-            self.rpc.cancel_request(id, send_cancellation);
+        let outcome = await_completion(response, timeout, || {
+            self.rpc.cancel_request(id, &dispatch, send_cancellation);
         })
         .await;
         match outcome {
@@ -1082,34 +1213,14 @@ impl McpTransport for StdioTransport {
                 Err(tool_err(error.code(), error.message()))
             }
             Err(CompletionWaitError::Timeout) => {
-                pending_request.cancellation_was_sent();
-                if send_cancellation {
-                    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                    let now = cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
-                }
-                self.rpc.abort();
-                pending_request.disarm();
+                pending_request.finish_cancellation().await;
                 Err(tool_err(
                     "MCP_TIMEOUT",
                     format!("request timed out after {} ms", timeout.as_millis()),
                 ))
             }
             Err(CompletionWaitError::Cancelled) => {
-                pending_request.cancellation_was_sent();
-                if send_cancellation {
-                    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                    let now = cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
-                }
-                self.rpc.abort();
-                pending_request.disarm();
+                pending_request.finish_cancellation().await;
                 Err(tool_err("MCP_CANCELLED", "cancelled by ambient context"))
             }
             Err(CompletionWaitError::Closed) => {
@@ -3184,6 +3295,339 @@ mod tests {
             completed_after_wake,
             "stopped writer must exit after the full-queue wake seam"
         );
+    }
+
+    #[cfg(unix)]
+    struct HeldStdioPipe {
+        pipe: std::io::PipeWriter,
+        entered: Option<StdSyncSender<()>>,
+        resume: StdReceiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl Write for HeldStdioPipe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered
+                    .send(())
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.resume
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
+            self.pipe.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.pipe.flush()
+        }
+    }
+
+    /// The production queue and pump write to a real pipe whose first write
+    /// is held by a handshake. A fixture peer records every frame and returns
+    /// correlated replies through the production router. The idle child gives
+    /// the unmodified transport an owned process to retire on abandonment.
+    #[cfg(unix)]
+    struct HeldStdioTransport {
+        transport: StdioTransport,
+        entered: StdReceiver<()>,
+        resume: StdSyncSender<()>,
+        writer: Option<std::thread::JoinHandle<()>>,
+        server: Option<std::thread::JoinHandle<Vec<Value>>>,
+    }
+
+    #[cfg(unix)]
+    impl HeldStdioTransport {
+        fn new() -> Self {
+            let mut command = std::process::Command::new("sleep");
+            command
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::tools::isolate_command_process_group(&mut command);
+            let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                .expect("owned fixture process");
+            let pid = child.id();
+            let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(STDIO_WRITER_QUEUE_CAP);
+            let client = McpStdioClient {
+                child: Mutex::new(ProcessGuard::new(child, ProcessCleanupMode::ChildOnly)),
+                pid,
+                writer_tx,
+                pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
+                next_id: AtomicU64::new(1),
+                alive: std::sync::Arc::new(AtomicBool::new(true)),
+                closing: std::sync::Arc::new(AtomicBool::new(false)),
+                tree_cleanup_state: std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending)),
+                stderr_tail: std::sync::Arc::new(Mutex::new(PublicTailBuffer::new())),
+            };
+            let (reader, pipe) = std::io::pipe().expect("fixture pipe");
+            let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+            let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
+            let pending = std::sync::Arc::clone(&client.pending);
+            let alive = std::sync::Arc::clone(&client.alive);
+            let closing = std::sync::Arc::clone(&client.closing);
+            let cleanup = std::sync::Arc::clone(&client.tree_cleanup_state);
+            let writer = std::thread::spawn(move || {
+                writer_loop(
+                    HeldStdioPipe {
+                        pipe,
+                        entered: Some(entered_tx),
+                        resume: resume_rx,
+                    },
+                    writer_rx,
+                    pending,
+                    alive,
+                    closing,
+                    cleanup,
+                    pid,
+                );
+            });
+            let pending = std::sync::Arc::clone(&client.pending);
+            let writer_tx = client.writer_tx.clone();
+            let server = std::thread::spawn(move || {
+                let mut reader = BufReader::new(reader);
+                let mut messages = Vec::new();
+                while let Some(message) = read_stdio_message(&mut reader).expect("fixture frame") {
+                    if let Some(id) = message.get("id") {
+                        route_stdio_message(
+                            &serde_json::json!({"jsonrpc":"2.0","id":id,"result":message["method"]}),
+                            &pending,
+                            &writer_tx,
+                        )
+                        .expect("fixture response");
+                    }
+                    messages.push(message);
+                }
+                messages
+            });
+            Self {
+                transport: StdioTransport { rpc: client },
+                entered,
+                resume,
+                writer: Some(writer),
+                server: Some(server),
+            }
+        }
+
+        fn release(&self) {
+            let _ = self.resume.try_send(());
+        }
+
+        fn finish(&mut self) -> Vec<Value> {
+            self.release();
+            self.transport.rpc.abort();
+            self.writer
+                .take()
+                .expect("fixture writer")
+                .join()
+                .expect("fixture writer finished");
+            self.server
+                .take()
+                .expect("fixture server")
+                .join()
+                .expect("fixture server finished")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HeldStdioTransport {
+        fn drop(&mut self) {
+            // Release and join on assertion failure too, so a red regression
+            // cannot strand its process or either side of the pipe.
+            self.release();
+            self.transport.rpc.abort();
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_queued_abandonment_never_dispatches_tools_or_retires_sibling_requests() {
+        for ending in ["drop", "cancel", "timeout"] {
+            let mut fixture = HeldStdioTransport::new();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let owner = crate::agent_cx::AgentCx::from_cx(
+                runtime.request_cx_with_budget(asupersync::Budget::new()),
+            );
+            runtime.block_on(async {
+                let mut first = Box::pin(fixture.transport.request(
+                    "test/first",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                fixture
+                    .entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("first request owns the held writer");
+                let timeout = if ending == "timeout" {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(10)
+                };
+                let mut second = Box::pin(owner.with_current(fixture.transport.request(
+                    "tools/call",
+                    serde_json::json!({"name":"must-not-run","arguments":{}}),
+                    timeout,
+                )));
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 2);
+                match ending {
+                    "drop" => drop(second),
+                    "cancel" => {
+                        owner.cancel_with(asupersync::types::CancelKind::User, Some("fixture"));
+                        let error = second.await.expect_err("queued call cancelled");
+                        assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
+                    }
+                    "timeout" => {
+                        let error = second.await.expect_err("queued call timed out");
+                        assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    fixture.transport.is_alive(),
+                    "{ending} killed an unsent call's server"
+                );
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 1);
+                let mut third = Box::pin(fixture.transport.request(
+                    "test/third",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ));
+                assert!(futures::poll!(third.as_mut()).is_pending());
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 2);
+                fixture.release();
+                let (first, third) = futures::join!(first, third);
+                assert_eq!(first.expect("first response"), "test/first");
+                assert_eq!(third.expect("third response"), "test/third");
+                assert!(fixture.transport.is_alive());
+                assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            });
+            let messages = fixture.finish();
+            let methods: Vec<_> = messages
+                .iter()
+                .map(|message| message["method"].as_str().expect("fixture method"))
+                .collect();
+            assert_eq!(
+                methods,
+                vec!["test/first", "test/third"],
+                "{ending}: {messages:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_dropping_a_writer_claimed_request_still_retires_the_connection() {
+        let mut fixture = HeldStdioTransport::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut request = Box::pin(fixture.transport.request(
+                "tools/call",
+                serde_json::json!({"name":"claimed","arguments":{}}),
+                Duration::from_secs(10),
+            ));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            fixture
+                .entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer claimed the request before cancellation");
+            drop(request);
+            assert!(
+                !fixture.transport.is_alive(),
+                "claimed delivery is indeterminate"
+            );
+            assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            assert_eq!(
+                *lock(&fixture.transport.rpc.tree_cleanup_state),
+                TreeCleanupState::Killed
+            );
+        });
+        let _ = fixture.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_repeated_abandonment_sends_one_cancellation_for_a_claimed_request() {
+        let mut fixture = HeldStdioTransport::new();
+        let request = fixture
+            .transport
+            .rpc
+            .request("tools/call", serde_json::json!({"name":"claimed"}))
+            .expect("queued request");
+        fixture
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer claimed the request");
+        for _ in 0..2 {
+            fixture
+                .transport
+                .rpc
+                .cancel_request(request.id, &request.dispatch, true);
+        }
+        assert!(lock(&fixture.transport.rpc.pending).is_empty());
+        fixture.release();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(fixture.transport.request(
+                "test/next",
+                Value::Null,
+                Duration::from_secs(10),
+            ))
+            .expect("successor drains the earlier cancellation");
+        let messages = fixture.finish();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[0]["method"], "tools/call");
+        assert_eq!(messages[1]["method"], "notifications/cancelled");
+        assert_eq!(messages[1]["params"]["requestId"], request.id);
+        assert_eq!(messages[2]["method"], "test/next");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_zero_budget_and_precancelled_calls_are_rejected_before_queue_admission() {
+        let mut fixture = HeldStdioTransport::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(async {
+            let error = fixture
+                .transport
+                .request("tools/call", Value::Null, Duration::ZERO)
+                .await
+                .expect_err("zero request budget");
+            assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("before admission"));
+            let error = owner
+                .with_current(fixture.transport.request(
+                    "tools/call",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ))
+                .await
+                .expect_err("cancelled owner");
+            assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
+            assert_eq!(fixture.transport.rpc.next_id.load(Ordering::SeqCst), 1);
+            assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            assert!(fixture.transport.is_alive());
+        });
+        assert!(fixture.finish().is_empty());
     }
 
     #[test]
