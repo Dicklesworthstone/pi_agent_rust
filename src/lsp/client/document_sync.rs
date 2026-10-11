@@ -361,6 +361,7 @@ impl LspClient {
                 language_id: language_id.to_string(),
                 text: Arc::from(text),
                 opened: policy.open_close,
+                push_generation: 0,
             },
         );
         drop(docs);
@@ -399,7 +400,7 @@ impl LspClient {
         };
         // Same lock order as synchronization: a notification cannot pass the
         // version check, wait for a change, then publish stale diagnostics.
-        let docs = Self::lock(&self.open_docs);
+        let mut docs = Self::lock(&self.open_docs);
         if let Some(version) = params.get("version") {
             let Some(version) = version
                 .as_u64()
@@ -410,6 +411,9 @@ impl LspClient {
             if docs.get(&uri).is_none_or(|doc| doc.version != version) {
                 return;
             }
+        }
+        if let Some(doc) = docs.get_mut(&uri) {
+            doc.push_generation = doc.push_generation.saturating_add(1);
         }
         Self::lock(&self.diagnostics).insert(uri, diagnostics.clone());
     }

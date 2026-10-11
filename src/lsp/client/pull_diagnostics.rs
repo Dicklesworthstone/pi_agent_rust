@@ -305,7 +305,8 @@ impl LspClient {
     ///
     /// # Errors
     /// Returns protocol, timeout, cancellation or stale-document errors, and
-    /// `LSP_DIAGNOSTICS_PENDING` if notification loss invalidates the response.
+    /// `LSP_DIAGNOSTICS_PENDING` if notification loss or an accepted push for
+    /// this document invalidates the response.
     /// A dropped request uses the client request layer's cancellation discipline.
     pub async fn refresh_document_diagnostics(&self, uri: &str, timeout: Duration) -> Result<()> {
         let budget = RequestBudget::new(timeout);
@@ -340,7 +341,7 @@ impl LspClient {
             }
         };
         let dropped_before = self.rpc.dropped_notifications();
-        let (revision, source, ticket, previous) = {
+        let (revision, source, push_generation, ticket, previous) = {
             let docs = Self::lock(&self.open_docs);
             let doc = docs.get(&uri).ok_or_else(|| {
                 protocol_error("synchronize the document before pulling diagnostics")
@@ -349,10 +350,11 @@ impl LspClient {
             // Retain the source allocation only for the in-flight request.
             // Pointer identity also detects close/reopen when version == 0.
             let source = Arc::clone(&doc.text);
+            let push_generation = doc.push_generation;
             let mut cache = Self::lock(&self.pull_reports);
             let ticket = cache.start(&uri, &docs)?;
             let previous = cache.previous(&uri, revision);
-            (revision, source, ticket, previous)
+            (revision, source, push_generation, ticket, previous)
         };
         let mut params = json!({"textDocument":{"uri":uri}});
         if let Some(identifier) = identifier {
@@ -401,6 +403,18 @@ impl LspClient {
             ));
         }
         let mut diagnostics = Self::lock(&self.diagnostics);
+        if docs.get(&uri).is_none_or(|doc| {
+            doc.push_generation != push_generation || doc.push_generation == u64::MAX
+        }) {
+            // The response and accepted push have no comparable server-side
+            // revision. Keep neither as a clean result, and leave the prior
+            // pull resultId available for a new request to revalidate.
+            diagnostics.remove(&uri);
+            return Err(Error::tool(
+                "lsp",
+                "[LSP_DIAGNOSTICS_PENDING] a push arrived during the diagnostic request; retry",
+            ));
+        }
         budget.remaining().map_err(Error::from)?;
         diagnostics.insert(uri.clone(), report.items.as_ref().clone());
         for evicted in cache.insert(uri, report) {

@@ -318,6 +318,112 @@ fn notification_loss_during_pull_rejects_old_reports_and_recovers() {
 }
 
 #[test]
+fn accepted_push_during_pull_invalidates_only_the_affected_document() {
+    for (push_case, refuse) in [
+        ("current", true),
+        ("unversioned", true),
+        ("stale", false),
+        ("other", false),
+    ] {
+        for candidate in [
+            json!({"kind":"full","resultId":"candidate","items":[]}),
+            json!({"kind":"unchanged","resultId":"candidate"}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let Some(peer) = peer(temp.path()) else {
+                return;
+            };
+            let (path, uri) = source(&peer, temp.path(), "before");
+            std::fs::write(&path, "after").unwrap();
+            peer.client.ensure_synced(&path, "rust").unwrap();
+            let snapshots = peer.client.document_snapshots();
+            let version = snapshots.values().next().unwrap().version;
+            assert!(version > 1);
+            let push_uri = if push_case == "other" {
+                let other = temp.path().join("other.rs");
+                std::fs::write(&other, "other source").unwrap();
+                peer.client.ensure_synced(&other, "rust").unwrap()
+            } else {
+                uri.clone()
+            };
+            let push_error = diagnostic("later server push");
+            let fresh_report = diagnostic("fresh pull report");
+            let mut push = json!({
+                "jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
+                "params":{"uri":push_uri,"diagnostics":[push_error]}
+            });
+            if push_case == "current" {
+                push["params"]["version"] = json!(version);
+            } else if push_case == "stale" {
+                push["params"]["version"] = json!(version - 1);
+            }
+            peer.configure(json!({"textDocument/diagnostic":[
+                {"result":{"kind":"full","resultId":"baseline","items":[]}},
+                {"hold":true},
+                {"result":{"kind":"full","resultId":"fresh","items":[fresh_report]}}
+            ]}));
+            refresh(&peer, &uri).unwrap();
+            assert!(peer.client.diagnostics_snapshot()[&uri].is_empty());
+
+            let outcome = peer.runtime.block_on(async {
+                let mut pending = Box::pin(
+                    peer.client
+                        .refresh_document_diagnostics(&uri, Duration::from_secs(5)),
+                );
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                peer.client
+                    .call_no_wait_notify("test/release", json!({"result":candidate}))
+                    .expect("release buffered pull response");
+                // The old response precedes this push on the wire. Await its
+                // separate acknowledgement while the pull stays unpolled.
+                let (id, response) = peer
+                    .client
+                    .rpc
+                    .request("test/notifications", json!({"notifications":[push]}))
+                    .expect("push notification request");
+                crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+                    peer.client.rpc.cancel_request(id);
+                })
+                .await
+                .expect("push acknowledgement")
+                .expect("push succeeded");
+                assert_eq!(peer.client.dropped_notifications(), 0);
+                pending.await
+            });
+            if refuse {
+                let error = outcome.expect_err("accepted target push must invalidate old pull");
+                assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"));
+                assert!(error.to_string().contains("push arrived"));
+                assert!(!peer.client.diagnostics_snapshot().contains_key(&uri));
+            } else {
+                outcome.expect("unrelated or rejected push must preserve the active pull");
+                assert!(peer.client.diagnostics_snapshot()[&uri].is_empty());
+            }
+
+            refresh(&peer, &uri).unwrap();
+            let snapshot = peer.client.diagnostics_snapshot();
+            assert_eq!(snapshot[&uri], vec![fresh_report]);
+            if push_case == "other" {
+                assert_eq!(snapshot[&push_uri], vec![push_error]);
+            }
+            let frames = peer.frames();
+            let pulls: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                .collect();
+            assert_eq!(pulls.len(), 3);
+            assert_eq!(pulls[1]["params"]["previousResultId"], "baseline");
+            assert_eq!(
+                pulls[2]["params"]["previousResultId"],
+                if refuse { "baseline" } else { "candidate" }
+            );
+            assert_eq!(peer.client.dropped_notifications(), 0);
+            assert!(peer.client.is_alive());
+        }
+    }
+}
+
+#[test]
 fn resynchronized_source_does_not_send_or_accept_an_old_result_baseline() {
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = peer(temp.path()) else {

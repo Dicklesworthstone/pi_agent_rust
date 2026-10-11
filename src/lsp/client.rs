@@ -116,6 +116,9 @@ struct OpenDoc {
     language_id: String,
     text: std::sync::Arc<str>,
     opened: bool,
+    // Accepted pushes for this document incarnation. An exhausted counter
+    // never authorizes a pull, so saturation cannot make old output current.
+    push_generation: u64,
 }
 
 #[derive(Debug, Clone, Default)]
