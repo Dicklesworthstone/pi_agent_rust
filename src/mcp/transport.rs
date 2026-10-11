@@ -47,6 +47,22 @@ fn tool_err(code: &str, message: impl Into<String>) -> Error {
 pub trait McpTransport: Send + Sync {
     /// Send a request and await its response.
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value>;
+    /// Send with a manager-owned dispatch lease. A transport that queues work
+    /// may claim the lease immediately before its first write. The default
+    /// conservatively claims before entering `request`, preserving uncertain
+    /// delivery handling for transports without finer dispatch information.
+    async fn request_with_dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        dispatch: std::sync::Arc<RequestDispatch>,
+    ) -> Result<Value> {
+        if !dispatch.claim() {
+            return Err(tool_err("MCP_CANCELLED", "request revoked before dispatch"));
+        }
+        self.request(method, params, timeout).await
+    }
     /// Send a notification.
     async fn notify(&self, method: &str, params: Value) -> Result<()>;
     /// Whether the transport is still usable.
@@ -85,22 +101,28 @@ const STDIO_CANCEL_GRACE: Duration = Duration::from_millis(20);
 type StdioOutcome = std::result::Result<Value, McpStdioError>;
 type StdioPending = Mutex<HashMap<u64, StdSyncSender<StdioOutcome>>>;
 
-/// Queue admission is not dispatch. The writer and request owner race for
-/// this lease before the first pipe write, so an abandoned queued tools/call
-/// can never become a remote side effect after its caller has gone away.
-struct StdioRequestDispatch(AtomicU8);
+/// A single request's permission to reach the server. Queue admission is not
+/// dispatch: the writer and manager race for this lease before the first pipe
+/// write, so abandoned queued work cannot gain remote effects afterward.
+///
+/// Transports overriding [`McpTransport::request_with_dispatch`] must claim
+/// this lease before sending any request bytes and send nothing if it fails.
+pub struct RequestDispatch(AtomicU8);
 
-impl StdioRequestDispatch {
+impl RequestDispatch {
     const QUEUED: u8 = 0;
     const CLAIMED: u8 = 1;
     const REVOKED: u8 = 2;
     const ABANDONED: u8 = 3;
 
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(AtomicU8::new(Self::QUEUED))
     }
 
-    fn claim(&self) -> bool {
+    /// Claim permission immediately before dispatch. A false result forbids
+    /// sending this request, including retries or work deferred to a writer.
+    #[must_use]
+    pub fn claim(&self) -> bool {
         self.0
             .compare_exchange(
                 Self::QUEUED,
@@ -109,6 +131,20 @@ impl StdioRequestDispatch {
                 Ordering::SeqCst,
             )
             .is_ok()
+    }
+
+    /// Revoke only unclaimed work. Unlike transport cancellation this does
+    /// not consume the once-only cancellation notification for a sent frame.
+    pub(crate) fn revoke_unsent(&self) -> bool {
+        matches!(
+            self.0.compare_exchange(
+                Self::QUEUED,
+                Self::REVOKED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ),
+            Ok(_) | Err(Self::REVOKED)
+        )
     }
 
     /// Revoke unsent work, or return true exactly once for a request whose
@@ -144,7 +180,7 @@ impl StdioRequestDispatch {
 struct StdioRequest {
     id: u64,
     response: StdReceiver<StdioOutcome>,
-    dispatch: std::sync::Arc<StdioRequestDispatch>,
+    dispatch: std::sync::Arc<RequestDispatch>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +235,7 @@ impl McpStdioError {
 enum WriterCommand {
     Request {
         message: Vec<u8>,
-        dispatch: std::sync::Arc<StdioRequestDispatch>,
+        dispatch: std::sync::Arc<RequestDispatch>,
     },
     Message(Vec<u8>),
     Cancellation(Vec<u8>),
@@ -924,6 +960,7 @@ impl McpStdioClient {
         &self,
         method: &str,
         params: Value,
+        dispatch: std::sync::Arc<RequestDispatch>,
     ) -> std::result::Result<StdioRequest, McpStdioError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if id == u64::MAX {
@@ -939,7 +976,6 @@ impl McpStdioClient {
         });
         append_client_params(&mut message, params)?;
         let encoded = encode_stdio_message(&message)?;
-        let dispatch = std::sync::Arc::new(StdioRequestDispatch::new());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&self.pending).insert(id, sender);
         if let Err(error) = self.enqueue(WriterCommand::Request {
@@ -969,7 +1005,7 @@ impl McpStdioClient {
     fn cancel_request(
         &self,
         id: u64,
-        dispatch: &StdioRequestDispatch,
+        dispatch: &RequestDispatch,
         send_notification: bool,
     ) {
         // Revoke before removing the waiter: the writer must not gain
@@ -1082,7 +1118,7 @@ fn append_client_params(
 struct PendingStdioRequest<'a> {
     client: &'a McpStdioClient,
     id: u64,
-    dispatch: std::sync::Arc<StdioRequestDispatch>,
+    dispatch: std::sync::Arc<RequestDispatch>,
     send_cancellation: bool,
     armed: bool,
 }
@@ -1173,6 +1209,22 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.request_with_dispatch(
+            method,
+            params,
+            timeout,
+            std::sync::Arc::new(RequestDispatch::new()),
+        )
+        .await
+    }
+
+    async fn request_with_dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        dispatch: std::sync::Arc<RequestDispatch>,
+    ) -> Result<Value> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         owner
             .checkpoint()
@@ -1186,7 +1238,7 @@ impl McpTransport for StdioTransport {
             dispatch,
         } = self
             .rpc
-            .request(method, params)
+            .request(method, params, dispatch)
             .map_err(|error| tool_err(error.code(), error.message()))?;
         let send_cancellation = method != "initialize";
         let mut pending_request = PendingStdioRequest {
@@ -3095,7 +3147,7 @@ impl McpTransport for HttpTransport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Captured (headers, body) pairs shared with a fixture server thread.
@@ -3328,8 +3380,8 @@ mod tests {
     /// correlated replies through the production router. The idle child gives
     /// the unmodified transport an owned process to retire on abandonment.
     #[cfg(unix)]
-    struct HeldStdioTransport {
-        transport: StdioTransport,
+    pub(crate) struct HeldStdioTransport {
+        pub(crate) transport: std::sync::Arc<StdioTransport>,
         entered: StdReceiver<()>,
         resume: StdSyncSender<()>,
         writer: Option<std::thread::JoinHandle<()>>,
@@ -3338,7 +3390,7 @@ mod tests {
 
     #[cfg(unix)]
     impl HeldStdioTransport {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut command = std::process::Command::new("sleep");
             command
                 .arg("60")
@@ -3402,7 +3454,7 @@ mod tests {
                 messages
             });
             Self {
-                transport: StdioTransport { rpc: client },
+                transport: std::sync::Arc::new(StdioTransport { rpc: client }),
                 entered,
                 resume,
                 writer: Some(writer),
@@ -3410,11 +3462,17 @@ mod tests {
             }
         }
 
-        fn release(&self) {
+        pub(crate) fn wait_for_writer(&self) {
+            self.entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fixture writer claimed the first request");
+        }
+
+        pub(crate) fn release(&self) {
             let _ = self.resume.try_send(());
         }
 
-        fn finish(&mut self) -> Vec<Value> {
+        pub(crate) fn finish(&mut self) -> Vec<Value> {
             self.release();
             self.transport.rpc.abort();
             self.writer
@@ -3564,7 +3622,11 @@ mod tests {
         let request = fixture
             .transport
             .rpc
-            .request("tools/call", serde_json::json!({"name":"claimed"}))
+            .request(
+                "tools/call",
+                serde_json::json!({"name":"claimed"}),
+                std::sync::Arc::new(RequestDispatch::new()),
+            )
             .expect("queued request");
         fixture
             .entered
