@@ -131,12 +131,15 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
     let mut providers = BTreeSet::new();
     let mut parsed_oauth = false;
     let mut oauth_has_unmigrated_entries = false;
+    let mut oauth_snapshot = None;
+    let mut settings_update = None;
 
     if oauth_path.exists() {
         match fs::read_to_string(&oauth_path) {
             Ok(content) => match serde_json::from_str::<Value>(&content) {
                 Ok(Value::Object(entries)) => {
                     parsed_oauth = true;
+                    oauth_snapshot = Some(content);
                     for (provider, credential) in entries {
                         if let Value::Object(mut object) = credential {
                             object.insert("type".to_string(), Value::String("oauth".to_string()));
@@ -206,31 +209,11 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
                                 }
                             }
                             match serde_json::to_string_pretty(&settings_value) {
-                                    Ok(updated) => {
-                                        let tmp = settings_path.with_extension("json.tmp");
-                                        let mut opts = fs::OpenOptions::new();
-                                        opts.write(true).create(true).truncate(true);
-                                        #[cfg(unix)]
-                                        {
-                                            use std::os::unix::fs::OpenOptionsExt;
-                                            opts.mode(0o600);
-                                        }
-                                        let res = opts.open(&tmp).and_then(|mut f| {
-                                            use std::io::Write;
-                                            f.write_all(updated.as_bytes())?;
-                                            f.sync_all()
-                                        }).and_then(|()| fs::rename(&tmp, &settings_path));
-
-                                        if let Err(err) = res {
-                                            warnings.push(format!(
-                                                "could not persist settings.json after apiKeys migration: {err}"
-                                            ));
-                                        }
-                                    }
-                                    Err(err) => warnings.push(format!(
-                                        "could not serialize settings.json after apiKeys migration: {err}"
-                                    )),
-                                }
+                                Ok(updated) => settings_update = Some((content, updated)),
+                                Err(err) => warnings.push(format!(
+                                    "could not serialize settings.json after apiKeys migration: {err}"
+                                )),
+                            }
                         }
                     }
                 }
@@ -244,57 +227,130 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
         }
     }
 
-    let mut auth_persisted = migrated.is_empty();
-    if !migrated.is_empty() {
-        if let Err(err) = fs::create_dir_all(agent_dir) {
-            warnings.push(format!(
-                "could not create agent dir for auth.json migration: {err}"
-            ));
-            return providers.into_iter().collect();
-        }
+    AuthMigration {
+        credentials: migrated,
+        providers,
+        settings_update,
+        oauth_snapshot: if parsed_oauth && !oauth_has_unmigrated_entries {
+            oauth_snapshot
+        } else {
+            None
+        },
+    }
+    .commit(agent_dir, warnings)
+}
 
-        match serde_json::to_string_pretty(&Value::Object(migrated)) {
-            Ok(contents) => {
-                let tmp = auth_path.with_extension("json.tmp");
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
+/// Preparation is read-only. A durable, private, no-clobber auth publication
+/// must precede any cleanup of either legacy source. An unsuccessful cleanup
+/// leaves duplicate credentials, never the only copy of a credential.
+struct AuthMigration {
+    credentials: Map<String, Value>,
+    providers: BTreeSet<String>,
+    settings_update: Option<(String, String)>,
+    oauth_snapshot: Option<String>,
+}
+
+impl AuthMigration {
+    fn commit(self, agent_dir: &Path, warnings: &mut Vec<String>) -> Vec<String> {
+        if !self.credentials.is_empty() {
+            let contents = match serde_json::to_string_pretty(&self.credentials) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    warnings.push(format!("could not serialize migrated auth.json: {err}"));
+                    return Vec::new();
                 }
-
-                let res = options
-                    .open(&tmp)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        f.write_all(contents.as_bytes())?;
-                        f.sync_all()
-                    })
-                    .and_then(|()| fs::rename(&tmp, &auth_path));
-
-                if let Err(err) = res {
-                    warnings.push(format!("could not write auth.json during migration: {err}"));
-                } else if let Err(err) = set_owner_only_permissions(&auth_path) {
-                    warnings.push(format!("could not set auth.json permissions to 600: {err}"));
-                } else {
-                    auth_persisted = true;
-                }
+            };
+            if let Err(err) = publish_private_migration_file(&agent_dir.join("auth.json"), &contents) {
+                warnings.push(format!(
+                    "could not write auth.json during migration; legacy credentials retained: {err}"
+                ));
+                return Vec::new();
             }
-            Err(err) => warnings.push(format!("could not serialize migrated auth.json: {err}")),
         }
-    }
 
-    if parsed_oauth && !oauth_has_unmigrated_entries && auth_persisted && oauth_path.exists() {
-        let migrated_path = oauth_path.with_extension("json.migrated");
-        if let Err(err) = fs::rename(&oauth_path, migrated_path) {
-            warnings.push(format!(
-                "could not rename oauth.json after migration: {err}"
-            ));
+        if let Some((original, updated)) = self.settings_update {
+            let path = agent_dir.join("settings.json");
+            if let Err(err) = replace_unchanged_migration_file(&path, &original, &updated) {
+                warnings.push(format!(
+                    "could not persist settings.json after apiKeys migration (auth.json is already saved): {err}"
+                ));
+            }
         }
+        if let Some(original) = self.oauth_snapshot {
+            let path = agent_dir.join("oauth.json");
+            let archived = path.with_extension("json.migrated");
+            // Never replace an older recovery copy or archive a new credential
+            // that appeared after preparation. Publication syncs the backup
+            // before removing the original name.
+            let result = require_unchanged_migration_file(&path, &original)
+                .and_then(|()| publish_private_migration_file(&archived, &original))
+                .and_then(|()| require_unchanged_migration_file(&path, &original))
+                .and_then(|()| fs::remove_file(&path))
+                .and_then(|()| sync_migration_directory(agent_dir));
+            if let Err(err) = result {
+                warnings.push(format!("could not archive oauth.json after migration: {err}"));
+            }
+        }
+        self.providers.into_iter().collect()
     }
+}
 
-    providers.into_iter().collect()
+fn stage_private_migration_file(path: &Path, content: &str) -> std::io::Result<tempfile::NamedTempFile> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing migration parent"))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".pi-migration-")
+        .tempfile_in(parent)?;
+    set_owner_only_permissions(staged.path())?;
+    staged.write_all(content.as_bytes())?;
+    staged.as_file().sync_all()?;
+    Ok(staged)
+}
+
+fn publish_private_migration_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let staged = stage_private_migration_file(path, content)?;
+    // A concurrent startup/login, existing directory, or dangling symlink
+    // must not be overwritten, even if the earlier exists() check was false.
+    drop(staged.persist_noclobber(path).map_err(|error| error.error)?);
+    sync_migration_directory(path.parent().expect("staging checked parent"))
+}
+
+fn require_unchanged_migration_file(path: &Path, original: &str) -> std::io::Result<()> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() || fs::read_to_string(path)? != original {
+        return Err(std::io::Error::other(
+            "legacy source changed during migration; leaving it in place",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_unchanged_migration_file(path: &Path, original: &str, updated: &str) -> std::io::Result<()> {
+    require_unchanged_migration_file(path, original)?;
+    let staged = stage_private_migration_file(path, updated)?;
+    require_unchanged_migration_file(path, original)?;
+    drop(staged.persist(path).map_err(|error| error.error)?);
+    sync_migration_directory(path.parent().expect("staging checked parent"))
+}
+
+// Directory durability is available through the standard library on Unix.
+// Files themselves are synced on every platform before publication.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
+fn sync_migration_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn migrate_sessions_from_agent_root(agent_dir: &Path, warnings: &mut Vec<String>) -> usize {
@@ -500,6 +556,164 @@ mod tests {
             fs::create_dir_all(parent).expect("create parent directory");
         }
         fs::write(path, content).expect("write fixture file");
+    }
+
+    fn prepared_auth_migration(agent_dir: &std::path::Path) -> super::AuthMigration {
+        let settings = r#"{"apiKeys":{"openai":"legacy-key"},"theme":"dark"}"#;
+        let oauth = r#"{"anthropic":{"access_token":"legacy-token"}}"#;
+        write(&agent_dir.join("settings.json"), settings);
+        write(&agent_dir.join("oauth.json"), oauth);
+        super::AuthMigration {
+            credentials: serde_json::json!({
+                "openai": {"type": "api_key", "key": "legacy-key"},
+                "anthropic": {"type": "oauth", "access_token": "legacy-token"},
+            })
+            .as_object()
+            .expect("object")
+            .clone(),
+            providers: std::collections::BTreeSet::from([
+                "anthropic".to_string(),
+                "openai".to_string(),
+            ]),
+            settings_update: Some((settings.to_string(), r#"{"theme":"dark"}"#.to_string())),
+            oauth_snapshot: Some(oauth.to_string()),
+        }
+    }
+
+    #[test]
+    fn failed_auth_publication_keeps_both_legacy_sources_and_reports_no_migration() {
+        let temp = TempDir::new().expect("tempdir");
+        let agent_dir = temp.path();
+        let migration = prepared_auth_migration(agent_dir);
+        let settings = fs::read(agent_dir.join("settings.json")).expect("settings");
+        let oauth = fs::read(agent_dir.join("oauth.json")).expect("oauth");
+        // A real publication failure, after preparation, independent of uid.
+        fs::create_dir(agent_dir.join("auth.json")).expect("block destination");
+        let mut warnings = Vec::new();
+
+        assert!(migration.commit(agent_dir, &mut warnings).is_empty());
+        assert_eq!(fs::read(agent_dir.join("settings.json")).unwrap(), settings);
+        assert_eq!(fs::read(agent_dir.join("oauth.json")).unwrap(), oauth);
+        assert!(agent_dir.join("auth.json").is_dir());
+        assert!(!agent_dir.join("oauth.json.migrated").exists());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("legacy credentials retained"))
+        );
+        assert_eq!(
+            fs::read_dir(agent_dir).unwrap().count(),
+            3,
+            "no staging debris"
+        );
+    }
+
+    #[test]
+    fn concurrent_auth_publication_is_not_overwritten_or_used_to_authorize_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let migration = prepared_auth_migration(temp.path());
+        let settings = fs::read(temp.path().join("settings.json")).unwrap();
+        let oauth = fs::read(temp.path().join("oauth.json")).unwrap();
+        let current = r#"{"openai":{"type":"api_key","key":"new-login"}}"#;
+        write(&temp.path().join("auth.json"), current);
+        let mut warnings = Vec::new();
+
+        assert!(migration.commit(temp.path(), &mut warnings).is_empty());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+            current
+        );
+        assert_eq!(fs::read(temp.path().join("settings.json")).unwrap(), settings);
+        assert_eq!(fs::read(temp.path().join("oauth.json")).unwrap(), oauth);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn changed_legacy_sources_are_retained_after_auth_is_published() {
+        let temp = TempDir::new().expect("tempdir");
+        let migration = prepared_auth_migration(temp.path());
+        let settings = r#"{"apiKeys":{"openai":"new-key"},"theme":"light"}"#;
+        let oauth = r#"{"anthropic":{"access_token":"new-token"}}"#;
+        write(&temp.path().join("settings.json"), settings);
+        write(&temp.path().join("oauth.json"), oauth);
+        let mut warnings = Vec::new();
+
+        assert_eq!(migration.commit(temp.path(), &mut warnings).len(), 2);
+        let auth: Value =
+            serde_json::from_str(&fs::read_to_string(temp.path().join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["openai"]["key"], "legacy-key");
+        assert_eq!(auth["anthropic"]["access_token"], "legacy-token");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("settings.json")).unwrap(),
+            settings
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("oauth.json")).unwrap(),
+            oauth
+        );
+        assert!(!temp.path().join("oauth.json.migrated").exists());
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn existing_oauth_recovery_copy_is_never_replaced() {
+        let temp = TempDir::new().expect("tempdir");
+        let migration = prepared_auth_migration(temp.path());
+        let original = fs::read(temp.path().join("oauth.json")).unwrap();
+        write(&temp.path().join("oauth.json.migrated"), "old recovery copy");
+        let mut warnings = Vec::new();
+
+        assert_eq!(migration.commit(temp.path(), &mut warnings).len(), 2);
+        assert_eq!(fs::read(temp.path().join("oauth.json")).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("oauth.json.migrated")).unwrap(),
+            "old recovery copy"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("could not archive"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_migration_refuses_dangling_destination_without_losing_legacy_keys() {
+        let temp = TempDir::new().expect("tempdir");
+        let _migration = prepared_auth_migration(temp.path());
+        let settings = fs::read(temp.path().join("settings.json")).unwrap();
+        let oauth = fs::read(temp.path().join("oauth.json")).unwrap();
+        let target = temp.path().join("missing-auth");
+        let auth_path = temp.path().join("auth.json");
+        std::os::unix::fs::symlink(&target, &auth_path).expect("symlink");
+        let mut warnings = Vec::new();
+
+        assert!(super::migrate_auth_to_auth_json(temp.path(), &mut warnings).is_empty());
+        assert_eq!(fs::read_link(&auth_path).unwrap(), target);
+        assert_eq!(fs::read(temp.path().join("settings.json")).unwrap(), settings);
+        assert_eq!(fs::read(temp.path().join("oauth.json")).unwrap(), oauth);
+        assert!(!temp.path().join("oauth.json.migrated").exists());
+        assert!(!warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_migration_never_opens_predictable_legacy_temporary_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let migration = prepared_auth_migration(temp.path());
+        let victim = temp.path().join("unrelated");
+        write(&victim, "do not truncate");
+        for name in ["auth.json.tmp", "settings.json.tmp"] {
+            std::os::unix::fs::symlink(&victim, temp.path().join(name)).expect("symlink");
+        }
+        let mut warnings = Vec::new();
+
+        assert_eq!(migration.commit(temp.path(), &mut warnings).len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fs::read_to_string(victim).unwrap(), "do not truncate");
+        assert!(temp.path().join("oauth.json.migrated").exists());
+        assert!(!temp.path().join("oauth.json").exists());
     }
 
     #[test]
@@ -841,7 +1055,7 @@ mod tests {
                     ..Default::default()
                 };
                 let msgs = report.messages();
-                // warning + guide URL + docs URL
+                // warning + guide URL + docs URLs
                 assert_eq!(msgs.len(), 3);
                 assert!(msgs[1].contains("Migration guide:"));
                 assert!(msgs[2].contains("Extensions docs:"));
