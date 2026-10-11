@@ -242,6 +242,16 @@ impl QueuedWriter {
         self.enqueue(bytes, Some(id)).map(|_| ())
     }
 
+    pub(super) fn validate_frame_size(&self, bytes: usize) -> io::Result<()> {
+        if bytes > self.budget.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server frame exceeds the writer byte budget",
+            ));
+        }
+        Ok(())
+    }
+
     /// Withdraw an unclaimed request, or cancel it immediately after the
     /// current write. This never touches the pipe or the ordinary admission
     /// budget. The caller holds request admission while retiring its pending
@@ -277,6 +287,20 @@ impl QueuedWriter {
         if bytes.is_empty() {
             return Ok(0);
         }
+        self.validate_frame_size(bytes.len())?;
+        let mut state = lock(&self.queue.state);
+        if state.receiver_closed || state.writer_closed {
+            return Err(closed());
+        }
+        if state.frames.len() >= state.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "server writer frame queue full",
+            ));
+        }
+        // Reject count pressure before reserving or copying a potentially
+        // large frame on every admission retry. The pump never holds this
+        // lock while writing the pipe.
         self.budget
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -298,16 +322,6 @@ impl QueuedWriter {
             request_id,
             _reservation: Some(reservation),
         };
-        let mut state = lock(&self.queue.state);
-        if state.receiver_closed || state.writer_closed {
-            return Err(closed());
-        }
-        if state.frames.len() >= state.capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "server writer frame queue full",
-            ));
-        }
         state.frames.push_back(frame);
         drop(state);
         self.queue.ready.notify_one();
@@ -436,8 +450,8 @@ mod tests {
             let _original = std::mem::replace(&mut *lock(&client.writer), queued);
             let (first_id, first_rx) = client.request("test/first", Value::Null).expect("first");
             assert!(matches!(
-                client.request("test/rejected", Value::Null),
-                Err(TransportError::Io(_))
+                client.request("test/other", Value::Null),
+                Err(TransportError::Backpressure(_))
             ));
             assert!(
                 client.is_alive(),
@@ -481,6 +495,107 @@ mod tests {
                 Ok(Err(TransportError::Closed(_)))
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_retries_keep_one_identity_and_never_post_a_command_twice() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let client =
+            super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).expect("transport");
+        let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, 4096);
+        let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+        let (first_id, _response) = client.request("test/first", Value::Null).expect("first");
+        let mut command = client
+            .prepare_request(
+                "workspace/executeCommand",
+                serde_json::json!({"command":"run-once"}),
+            )
+            .expect("prepare once");
+        for _ in 0..4 {
+            assert!(matches!(
+                client.try_admit_request(&mut command),
+                Err(TransportError::Backpressure(_))
+            ));
+            assert!(client.is_alive());
+            assert_eq!(lock(&client.pending).len(), 1);
+            assert!(lock(&client.pending).contains_key(&first_id));
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 3);
+        }
+        drop(receiver.try_recv().expect("free capacity"));
+        let (command_id, _response) = client
+            .try_admit_request(&mut command)
+            .expect("admit after drainage");
+        assert_eq!(command_id, 2);
+        assert!(matches!(
+            client.try_admit_request(&mut command),
+            Err(TransportError::Io(_))
+        ));
+        let frame = receiver.try_recv().expect("one command");
+        let decoded = super::super::read_frame(&mut BufReader::new(frame.bytes.as_slice()))
+            .expect("complete frame")
+            .expect("command frame");
+        assert_eq!(decoded["method"], "workspace/executeCommand");
+        assert_eq!(decoded["params"]["command"], "run-once");
+        assert_eq!(decoded["id"], serde_json::json!(command_id));
+        assert!(receiver.try_recv().is_err(), "accepted work cannot be retried");
+        assert!(client.is_alive());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanently_oversized_requests_do_not_wait_or_retire_other_work() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let client =
+            super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).expect("transport");
+        let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, 4096);
+        let budget = Arc::clone(&queued.budget);
+        let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+        let (first_id, _response) = client.request("test/first", Value::Null).expect("first");
+        let used = budget.used.load(Ordering::Acquire);
+        assert!(matches!(
+            client.request("test/oversized", Value::String("x".repeat(4096))),
+            Err(TransportError::Io(reason)) if reason.contains("exceeds the writer byte budget")
+        ));
+        assert!(client.is_alive());
+        assert_eq!(budget.used.load(Ordering::Acquire), used);
+        assert_eq!(lock(&client.pending).len(), 1);
+        assert!(lock(&client.pending).contains_key(&first_id));
+        assert_eq!(
+            receiver.try_recv().expect("earlier request preserved").request_id,
+            Some(first_id)
+        );
+        assert!(receiver.try_recv().is_err());
+        client
+            .request("test/next", Value::Null)
+            .expect("valid request remains admissible");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_frame_is_rejected_even_when_all_completion_slots_are_occupied() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let client =
+            super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).expect("transport");
+        let (queued, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), 1, 256);
+        let _original = std::mem::replace(&mut *lock(&client.writer), queued);
+        for _ in 0..super::super::MAX_PENDING_REQUESTS {
+            client
+                .request("test/pending", Value::Null)
+                .expect("admit unanswered request");
+            drop(receiver.try_recv().expect("writer claims request"));
+        }
+        assert!(matches!(
+            client.request("test/full", Value::Null),
+            Err(TransportError::Backpressure(_))
+        ));
+        assert!(matches!(
+            client.request("test/oversized", Value::String("x".repeat(256))),
+            Err(TransportError::Io(reason)) if reason.contains("exceeds the writer byte budget")
+        ));
+        assert!(client.is_alive());
+        assert_eq!(lock(&client.pending).len(), super::super::MAX_PENDING_REQUESTS);
+        assert!(receiver.try_recv().is_err(), "rejected work was never posted");
     }
 
     #[cfg(unix)]
@@ -863,7 +978,7 @@ mod tests {
         let (mut writer, receiver) = QueuedWriter::channel(Arc::new(AtomicBool::new(true)), 1, 4);
         assert_eq!(
             writer.write(b"12345").unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
+            io::ErrorKind::InvalidInput
         );
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
         writer.write_all(b"1234").expect("exact limit");

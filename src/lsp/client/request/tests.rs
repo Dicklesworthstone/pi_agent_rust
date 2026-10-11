@@ -23,6 +23,164 @@ async fn observe_dispatched_request(peer: &Fixture, method: &str) {
     );
 }
 
+fn saturate_request_admission(peer: &Fixture) -> Vec<u64> {
+    let mut pending = Vec::new();
+    // Reach the production limit with unanswered requests. The independent
+    // bound makes a regression to unbounded admission fail promptly.
+    for _ in 0..4096 {
+        match peer.client.rpc.request("test/hang", Value::Null) {
+            Ok((id, _response)) => pending.push(id),
+            Err(TransportError::Backpressure(_)) => {
+                assert!(!pending.is_empty());
+                return pending;
+            }
+            Err(error) => panic!("unexpected admission error: {error:?}"),
+        }
+    }
+    panic!("unanswered requests must have a bounded admission limit");
+}
+
+#[test]
+fn admission_backpressure_waits_and_posts_a_command_only_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    peer.configure(json!({"workspace/executeCommand":[{"result":{"executed":true}}]}));
+    let pending = saturate_request_admission(&peer);
+    peer.runtime.block_on(async {
+        let mut command = Box::pin(peer.client.call(
+            "workspace/executeCommand",
+            json!({"command":"run-once"}),
+            Duration::from_secs(5),
+        ));
+        assert!(
+            futures::poll!(command.as_mut()).is_pending(),
+            "saturation must suspend within the request budget"
+        );
+        assert!(peer.client.is_alive());
+        peer.client.rpc.cancel_request(pending[0]);
+        assert_eq!(command.await.unwrap(), json!({"executed":true}));
+    });
+    let frames = peer.frames();
+    let commands: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "workspace/executeCommand")
+        .collect();
+    assert_eq!(commands.len(), 1, "queue admission must not replay a command");
+    assert_eq!(commands[0]["params"]["command"], "run-once");
+    assert!(peer.client.is_alive());
+}
+
+#[test]
+fn admission_backpressure_spends_the_original_deadline_without_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    let pending = saturate_request_admission(&peer);
+    let started = std::time::Instant::now();
+    let error = peer
+        .runtime
+        .block_on(peer.client.call(
+            "test/must-not-run",
+            Value::Null,
+            Duration::from_millis(30),
+        ))
+        .unwrap_err();
+    assert!(matches!(error, LspCallError::Timeout { timeout_ms: 30 }));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(peer.client.is_alive());
+    assert!(matches!(
+        peer.client.rpc.request("test/still-full", Value::Null),
+        Err(TransportError::Backpressure(_))
+    ));
+    peer.client.rpc.cancel_request(pending[0]);
+    assert!(
+        !peer
+            .frames()
+            .iter()
+            .any(|frame| frame["method"] == "test/must-not-run")
+    );
+}
+
+#[test]
+fn owner_cancellation_while_waiting_for_capacity_prevents_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    let pending = saturate_request_admission(&peer);
+    let owner = AgentCx::for_request();
+    let budget = RequestBudget {
+        start: now(&owner),
+        owner,
+        timeout: Duration::from_secs(5),
+    };
+    peer.runtime.block_on(async {
+        let mut request = Box::pin(peer.client.call_with_budget(
+            "test/must-not-run",
+            Value::Null,
+            &budget,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        budget.owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel admission wait"),
+        );
+        assert!(matches!(request.await, Err(LspCallError::Cancelled)));
+    });
+    assert!(peer.client.is_alive());
+    peer.client.rpc.cancel_request(pending[0]);
+    assert!(
+        !peer
+            .frames()
+            .iter()
+            .any(|frame| frame["method"] == "test/must-not-run")
+    );
+}
+
+#[test]
+fn dropping_an_admission_wait_releases_the_lane_without_cancelling_other_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+        return;
+    };
+    let pending = saturate_request_admission(&peer);
+    peer.runtime.block_on(async {
+        let mut request = Box::pin(peer.client.call(
+            "test/must-not-run",
+            Value::Null,
+            Duration::from_secs(30),
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        drop(request);
+        assert!(matches!(
+            peer.client.rpc.request("test/still-full", Value::Null),
+            Err(TransportError::Backpressure(_))
+        ));
+        peer.client.rpc.cancel_request(pending[0]);
+        assert_eq!(
+            peer.client
+                .call("test/success", Value::Null, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            json!({"ok":true})
+        );
+    });
+    let frames = peer.frames();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame["method"] == "test/must-not-run")
+    );
+    assert!(frames
+        .iter()
+        .filter(|frame| frame["method"] == "$/cancelRequest")
+        .all(|frame| frame["params"]["id"] == json!(pending[0])));
+    assert!(peer.client.is_alive());
+}
+
 #[test]
 fn zero_budget_never_dispatches_a_request() {
     let temp = tempfile::tempdir().unwrap();

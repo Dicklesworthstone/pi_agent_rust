@@ -180,10 +180,21 @@ impl LspClient {
     ) -> Result<Value, LspCallError> {
         let _lane = budget.acquire(&self.request_lane).await?;
         budget.remaining()?;
-        let (id, rx) = self
+        let mut request = self
             .rpc
-            .request(method, params)
+            .prepare_request(method, params)
             .map_err(LspCallError::Transport)?;
+        let (id, rx) = loop {
+            // Encoding and queue admission spend the same budget as the lane
+            // and response. The retained frame has not been posted yet, so
+            // even a command may wait here without replaying remote effects.
+            budget.remaining()?;
+            match self.rpc.try_admit_request(&mut request) {
+                Ok(completion) => break completion,
+                Err(TransportError::Backpressure(_)) => budget.pause(WAIT_TICK).await?,
+                Err(error) => return Err(LspCallError::Transport(error)),
+            }
+        };
         let mut pending = PendingRequest {
             rpc: &self.rpc,
             id,

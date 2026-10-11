@@ -59,6 +59,9 @@ pub enum TransportError {
     Closed(String),
     /// Local I/O failure writing to or reading from the server.
     Io(String),
+    /// No request was admitted because bounded transport capacity is in use.
+    /// Callers may wait within their original deadline before trying again.
+    Backpressure(String),
 }
 
 impl TransportError {
@@ -69,6 +72,7 @@ impl TransportError {
             Self::Server(_) => "LSP_SERVER_ERROR",
             Self::Closed(_) => "LSP_TRANSPORT_CLOSED",
             Self::Io(_) => "LSP_TRANSPORT_IO",
+            Self::Backpressure(_) => "LSP_TRANSPORT_BUSY",
         }
     }
 
@@ -86,6 +90,7 @@ impl TransportError {
             Self::Server(err) => format!("server error {}: {}", err.code, err.message),
             Self::Closed(reason) => format!("transport closed: {reason}"),
             Self::Io(reason) => format!("transport I/O error: {reason}"),
+            Self::Backpressure(reason) => format!("transport capacity busy: {reason}"),
         }
     }
 }
@@ -140,6 +145,13 @@ type SharedWriter = Mutex<outbound::QueuedWriter>;
 
 /// Pending request completions: reader thread sends exactly one result.
 type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, TransportError>>>>;
+
+/// Retain one identity and encoded frame while waiting for admission. Taking
+/// the frame after acceptance prevents another attempt from posting it twice.
+pub(super) struct PreparedRequest {
+    id: u64,
+    frame: Option<Vec<u8>>,
+}
 
 /// Hook for server→client requests (e.g. `workspace/applyEdit`). Returning
 /// `Some(result)` overrides the default null response.
@@ -847,7 +859,7 @@ impl JsonRpcClient {
     ///
     /// # Errors
     /// Returns an error for a dead transport, exhausted request slots/ids, or
-    /// outbound admission failure. A full queue refuses only this unposted
+    /// outbound admission failure. `Backpressure` refuses only this unposted
     /// request; it has made no remote change and is not retried here. Broken
     /// transport errors still retire the connection and all pending work.
     pub fn request(
@@ -858,12 +870,58 @@ impl JsonRpcClient {
         (u64, StdReceiver<std::result::Result<Value, TransportError>>),
         TransportError,
     > {
+        let mut request = self.prepare_request(method, params)?;
+        self.try_admit_request(&mut request)
+    }
+
+    pub(super) fn prepare_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<PreparedRequest, TransportError> {
+        if !self.is_alive() {
+            return Err(TransportError::Closed(
+                "server transport is not alive".to_string(),
+            ));
+        }
         let id = self
             .next_id
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| TransportError::Io("request id space exhausted".to_string()))?;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        {
+        let mut frame_value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+        frame_value["params"] = params;
+        Ok(PreparedRequest {
+            id,
+            frame: Some(encode_frame(&frame_value)),
+        })
+    }
+
+    /// Retry only a frame that has never been accepted by the writer. No
+    /// completion slot or queue reservation survives a backpressure result.
+    pub(super) fn try_admit_request(
+        &self,
+        request: &mut PreparedRequest,
+    ) -> std::result::Result<
+        (u64, StdReceiver<std::result::Result<Value, TransportError>>),
+        TransportError,
+    > {
+        let frame = request
+            .frame
+            .as_ref()
+            .ok_or_else(|| TransportError::Io("request was already admitted".to_string()))?;
+        let id = request.id;
+        // Check permanent rejection before any transient pending-slot limit.
+        // Keep the same writer -> pending lock order used by cancellation;
+        // this mutex only guards bounded admission, never the blocking pipe.
+        let mut writer = lock(&self.writer);
+        writer
+            .validate_frame_size(frame.len())
+            .map_err(|error| TransportError::Io(format!("request queue failed: {error}")))?;
+        let rx = {
             // Closure marks the transport dead before taking this same lock.
             // No request can appear after the terminal pending-map drain.
             let mut pending = lock(&self.pending);
@@ -873,33 +931,34 @@ impl JsonRpcClient {
                 ));
             }
             if pending.len() >= MAX_PENDING_REQUESTS {
-                return Err(TransportError::Io(
+                return Err(TransportError::Backpressure(
                     "pending request limit exceeded".to_string(),
                 ));
             }
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
             pending.insert(id, tx);
-        }
-        let mut frame_value = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-        });
-        frame_value["params"] = params;
-        let frame = encode_frame(&frame_value);
-        let write_result = {
-            let mut guard = lock(&self.writer);
-            guard.write_request(&frame, id).and_then(|()| guard.flush())
+            rx
         };
+        let write_result = writer.write_request(frame, id).and_then(|()| writer.flush());
+        drop(writer);
         if let Err(err) = write_result {
             lock(&self.pending).remove(&id);
             // QueuedWriter admits complete frames atomically. WouldBlock
             // means no bytes were accepted, unlike a partially written pipe:
             // preserve earlier requests and document synchronization state.
-            if err.kind() != std::io::ErrorKind::WouldBlock {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(TransportError::Backpressure(format!(
+                    "request queue failed: {err}"
+                )));
+            }
+            // A frame larger than the entire budget can never fit, but it
+            // was not posted either. Reject it without disrupting older work.
+            if err.kind() != std::io::ErrorKind::InvalidInput {
                 self.kill();
             }
             return Err(TransportError::Io(format!("request queue failed: {err}")));
         }
+        request.frame = None;
         Ok((id, rx))
     }
 
