@@ -188,7 +188,7 @@ impl VertexProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> GeminiRequest {
-        let contents = Self::build_contents(context);
+        let contents = gemini::convert_messages_to_gemini(&context.messages);
         let system_instruction = context.system_prompt.as_deref().map(|s| GeminiContent {
             role: None,
             parts: vec![GeminiPart::Text {
@@ -227,15 +227,6 @@ impl VertexProvider {
                 candidate_count: Some(1),
             }),
         }
-    }
-
-    /// Build the contents array from context messages.
-    fn build_contents(context: &Context<'_>) -> Vec<GeminiContent> {
-        let mut contents = Vec::new();
-        for message in context.messages.iter() {
-            contents.extend(gemini::convert_message_to_gemini(message));
-        }
-        contents
     }
 }
 
@@ -606,6 +597,71 @@ mod tests {
             .expect("declarations");
         assert_eq!(decls[0]["name"], "read");
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+    }
+
+    #[test]
+    fn parallel_tool_results_reach_vertex_as_one_response_turn() {
+        let calls = ["call_a", "call_b"];
+        let mut messages = vec![Message::assistant(crate::model::AssistantMessage {
+            content: calls
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    crate::model::ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: (*id).to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": id}),
+                        thought_signature: (index == 0).then(|| "c2ln".to_string()),
+                    })
+                })
+                .collect(),
+            api: "google-vertex".to_string(),
+            model: "gemini-3-pro".to_string(),
+            stop_reason: crate::model::StopReason::ToolUse,
+            ..crate::model::AssistantMessage::default()
+        })];
+        for (index, id) in calls.iter().enumerate() {
+            let content = if index == 0 {
+                vec![crate::model::ContentBlock::Image(crate::model::ImageContent {
+                    data: "AQ==".to_string(),
+                    mime_type: "image/png".to_string(),
+                })]
+            } else {
+                vec![crate::model::ContentBlock::Text(crate::model::TextContent::new(
+                    "text result",
+                ))]
+            };
+            messages.push(Message::tool_result(crate::model::ToolResultMessage {
+                tool_call_id: (*id).to_string(),
+                tool_name: "read".to_string(),
+                content,
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+        }
+        let context = Context::owned(None, messages, Vec::new());
+        let provider = VertexProvider::new("gemini-3-pro");
+        let wire = serde_json::to_value(
+            provider.build_gemini_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        let contents = wire["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "c2ln");
+        assert!(contents[0]["parts"][1].get("thoughtSignature").is_none());
+        assert_eq!(contents[1]["role"], "user");
+        assert_eq!(
+            contents[1]["parts"],
+            serde_json::json!([
+                {"functionResponse": {"name": "read", "response": {"result": "(see attached media)"}}},
+                {"functionResponse": {"name": "read", "response": {"result": "text result"}}}
+            ]),
+        );
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][1]["text"], "Media from read (tool call call_a):");
+        assert_eq!(contents[2]["parts"][2]["inline_data"]["data"], "AQ==");
     }
 
     #[test]

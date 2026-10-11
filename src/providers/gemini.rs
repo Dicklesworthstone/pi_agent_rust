@@ -197,7 +197,7 @@ impl GeminiProvider {
     /// model-specific thinking controls before the request-rewrite hook.
     #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
-        let contents = Self::build_contents(context);
+        let contents = convert_messages_to_gemini(&context.messages);
         let system_instruction = context.system_prompt.as_deref().map(|s| GeminiContent {
             role: None,
             parts: vec![GeminiPart::Text {
@@ -232,17 +232,6 @@ impl GeminiProvider {
                 candidate_count: Some(1),
             }),
         }
-    }
-
-    /// Build the contents array from context messages.
-    fn build_contents(context: &Context<'_>) -> Vec<GeminiContent> {
-        let mut contents = Vec::with_capacity(context.messages.len());
-
-        for message in context.messages.iter() {
-            contents.extend(convert_message_to_gemini(message));
-        }
-
-        contents
     }
 }
 
@@ -1071,6 +1060,29 @@ pub(crate) struct GeminiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
+/// Keep every parallel function response in the same user turn. Gemini
+/// validates that the response turn answers all calls in the preceding model
+/// turn; separate user turns fail that contract even for text-only results.
+/// Media follows the complete response turn, with its originating call named.
+///
+/// Shared by the Developer API, Cloud Code Assist and Vertex adapters.
+/// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#parallel-function-calling-example
+pub(crate) fn convert_messages_to_gemini(messages: &[Message]) -> Vec<GeminiContent> {
+    let mut contents = Vec::with_capacity(messages.len());
+    let mut responses = Vec::new();
+    let mut media = Vec::new();
+    for message in messages {
+        if let Message::ToolResult(result) = message {
+            append_tool_result_parts(result, &mut responses, &mut media);
+        } else {
+            append_tool_result_turns(&mut contents, &mut responses, &mut media);
+            contents.extend(convert_message_to_gemini(message));
+        }
+    }
+    append_tool_result_turns(&mut contents, &mut responses, &mut media);
+    contents
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     match message {
@@ -1144,48 +1156,77 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
             }]
         }
         Message::ToolResult(result) => {
-            // Gemini expects function responses as user role with functionResponse part
-            let inline_parts = tool_result_inline_parts(result);
-            let mut content_text = result
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if content_text.is_empty() && !inline_parts.is_empty() {
-                content_text = "(see attached media)".to_string();
-            }
-
-            let response_value = if result.is_error {
-                serde_json::json!({ "error": content_text })
-            } else {
-                serde_json::json!({ "result": content_text })
-            };
-
-            let mut contents = vec![GeminiContent {
-                role: Some("user".into()),
-                parts: vec![GeminiPart::FunctionResponse {
-                    function_response: GeminiFunctionResponse {
-                        name: result.tool_name.clone(),
-                        response: response_value,
-                    },
-                }],
-            }];
-            if !inline_parts.is_empty() {
-                let mut parts = vec![GeminiPart::Text {
-                    text: "Tool result media:".to_string(),
-                }];
-                parts.extend(inline_parts);
-                contents.push(GeminiContent {
-                    role: Some("user".into()),
-                    parts,
-                });
-            }
+            let mut contents = Vec::new();
+            let mut responses = Vec::new();
+            let mut media = Vec::new();
+            append_tool_result_parts(result, &mut responses, &mut media);
+            append_tool_result_turns(&mut contents, &mut responses, &mut media);
             contents
         }
+    }
+}
+
+fn append_tool_result_parts(
+    result: &crate::model::ToolResultMessage,
+    responses: &mut Vec<GeminiPart>,
+    media: &mut Vec<GeminiPart>,
+) {
+    let inline_parts = tool_result_inline_parts(result);
+    let mut content_text = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content_text.is_empty() && !inline_parts.is_empty() {
+        content_text = "(see attached media)".to_string();
+    }
+    let response = if result.is_error {
+        serde_json::json!({ "error": content_text })
+    } else {
+        serde_json::json!({ "result": content_text })
+    };
+    responses.push(GeminiPart::FunctionResponse {
+        function_response: GeminiFunctionResponse {
+            name: result.tool_name.clone(),
+            response,
+        },
+    });
+    if !inline_parts.is_empty() {
+        media.push(GeminiPart::Text {
+            text: format!(
+                "Media from {} (tool call {}):",
+                result.tool_name, result.tool_call_id
+            ),
+        });
+        media.extend(inline_parts);
+    }
+}
+
+fn append_tool_result_turns(
+    contents: &mut Vec<GeminiContent>,
+    responses: &mut Vec<GeminiPart>,
+    media: &mut Vec<GeminiPart>,
+) {
+    if responses.is_empty() {
+        return;
+    }
+    contents.push(GeminiContent {
+        role: Some("user".into()),
+        parts: std::mem::take(responses),
+    });
+    if !media.is_empty() {
+        let mut parts = vec![GeminiPart::Text {
+            text: "Tool result media:".to_string(),
+        }];
+        parts.append(media);
+        contents.push(GeminiContent {
+            role: Some("user".into()),
+            parts,
+        });
     }
 }
 
@@ -2127,6 +2168,7 @@ mod tests {
             wire,
             serde_json::json!([
                 { "text": "Tool result media:" },
+                { "text": "Media from read_media (tool call call_media):" },
                 { "inline_data": { "mimeType": "video/mp4", "data": "AAAA" } },
             ])
         );
@@ -2162,6 +2204,214 @@ mod tests {
             timestamp: 0,
         });
         assert_eq!(convert_message_to_gemini(&text_only).len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parallel_function_results_share_one_turn_before_their_media() {
+        for with_media in [false, true] {
+            let image = ContentBlock::Image(crate::model::ImageContent {
+                data: "AQ==".to_string(),
+                mime_type: "image/png".to_string(),
+            });
+            let video = ContentBlock::Media(crate::model::MediaContent {
+                data: "Ag==".to_string(),
+                mime_type: "video/mp4".to_string(),
+                name: Some("clip.mp4".to_string()),
+            });
+            let audio = ContentBlock::Media(crate::model::MediaContent {
+                data: "Aw==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: None,
+            });
+            let calls = [
+                ("call_image", "read"),
+                ("call_text", "read"),
+                ("call_media", "read_media"),
+                ("call_error", "read"),
+                ("call_empty", "read"),
+            ];
+            let mut messages = vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Read the files in parallel".to_string()),
+                    timestamp: 1,
+                }),
+                Message::assistant(AssistantMessage {
+                    content: calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (id, name))| {
+                            ContentBlock::ToolCall(ToolCall {
+                                id: (*id).to_string(),
+                                name: (*name).to_string(),
+                                arguments: serde_json::json!({"path": id}),
+                                thought_signature: (index == 0).then(|| "c2ln".to_string()),
+                            })
+                        })
+                        .collect(),
+                    api: "google-generative-ai".to_string(),
+                    provider: "google".to_string(),
+                    model: "gemini-3-pro".to_string(),
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                }),
+            ];
+            for (index, (id, name)) in calls.iter().enumerate() {
+                let mut content = match index {
+                    0 => vec![ContentBlock::Text(TextContent::new("image result"))],
+                    1 => vec![ContentBlock::Text(TextContent::new("text result"))],
+                    3 => vec![ContentBlock::Text(TextContent::new("not found"))],
+                    _ => Vec::new(),
+                };
+                if with_media {
+                    match index {
+                        0 => content.push(image.clone()),
+                        2 => content.extend([video.clone(), audio.clone()]),
+                        _ => {}
+                    }
+                }
+                messages.push(Message::tool_result(crate::model::ToolResultMessage {
+                    tool_call_id: (*id).to_string(),
+                    tool_name: (*name).to_string(),
+                    content,
+                    details: Some(serde_json::json!({"kept_in_history": true})),
+                    is_error: index == 3,
+                    timestamp: 2,
+                }));
+            }
+            let context = Context::owned(None, messages, Vec::new());
+            let original = serde_json::to_value(&context.messages).unwrap();
+            let provider = GeminiProvider::new("gemini-3-pro");
+            let wire = serde_json::to_value(
+                provider.build_request(&context, &StreamOptions::default()),
+            )
+            .unwrap();
+            let contents = wire["contents"].as_array().unwrap();
+            assert_eq!(contents.len(), if with_media { 4 } else { 3 });
+            assert_eq!(contents[1]["role"], "model");
+            assert_eq!(contents[1]["parts"].as_array().unwrap().len(), calls.len());
+            assert_eq!(contents[1]["parts"][0]["thoughtSignature"], "c2ln");
+            assert!(contents[1]["parts"][1].get("thoughtSignature").is_none());
+            assert_eq!(contents[2]["role"], "user");
+            assert_eq!(
+                contents[2]["parts"],
+                serde_json::json!([
+                    {"functionResponse": {"name": "read", "response": {"result": "image result"}}},
+                    {"functionResponse": {"name": "read", "response": {"result": "text result"}}},
+                    {"functionResponse": {"name": "read_media", "response": {
+                        "result": if with_media { "(see attached media)" } else { "" }
+                    }}},
+                    {"functionResponse": {"name": "read", "response": {"error": "not found"}}},
+                    {"functionResponse": {"name": "read", "response": {"result": ""}}}
+                ]),
+            );
+            if with_media {
+                assert_eq!(contents[3]["role"], "user");
+                assert_eq!(
+                    contents[3]["parts"],
+                    serde_json::json!([
+                        {"text": "Tool result media:"},
+                        {"text": "Media from read (tool call call_image):"},
+                        {"inline_data": {"mimeType": "image/png", "data": "AQ=="}},
+                        {"text": "Media from read_media (tool call call_media):"},
+                        {"inline_data": {"mimeType": "video/mp4", "data": "Ag=="}},
+                        {"inline_data": {"mimeType": "audio/wav", "data": "Aw=="}}
+                    ]),
+                );
+            }
+            for is_antigravity in [false, true] {
+                let cli = build_google_cli_request(
+                    "gemini-3-pro",
+                    "test-project",
+                    wire.clone(),
+                    is_antigravity,
+                )
+                .unwrap();
+                let wrapped = serde_json::to_value(cli).unwrap();
+                assert_eq!(wrapped["request"]["contents"], wire["contents"]);
+            }
+            assert_eq!(serde_json::to_value(&context.messages).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn function_response_batches_preserve_turn_boundaries_and_user_images() {
+        let call = |id: &str| {
+            Message::assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": id}),
+                    thought_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::default()
+            })
+        };
+        let image = |data: &str| {
+            ContentBlock::Image(crate::model::ImageContent {
+                data: data.to_string(),
+                mime_type: "image/png".to_string(),
+            })
+        };
+        let result = |id: &str, data: &str| {
+            Message::tool_result(crate::model::ToolResultMessage {
+                tool_call_id: id.to_string(),
+                tool_name: "read".to_string(),
+                content: vec![image(data)],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            })
+        };
+        let context = Context::owned(
+            None,
+            vec![
+                call("call_a"),
+                result("call_a", "AQ=="),
+                Message::Custom(crate::model::CustomMessage {
+                    custom_type: "context".to_string(),
+                    content: "Keep the second result separate".to_string(),
+                    display: false,
+                    details: None,
+                    timestamp: 0,
+                }),
+                call("call_b"),
+                result("call_b", "Ag=="),
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Blocks(vec![image("Aw==")]),
+                    timestamp: 0,
+                }),
+            ],
+            Vec::new(),
+        );
+        let provider = GeminiProvider::new("gemini-2.5-pro");
+        let wire = serde_json::to_value(
+            provider.build_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        let contents = wire["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 8);
+        for (model_index, response_index, media_index, id, data) in [
+            (0, 1, 2, "call_a", "AQ=="),
+            (4, 5, 6, "call_b", "Ag=="),
+        ] {
+            assert_eq!(contents[model_index]["role"], "model");
+            assert_eq!(contents[response_index]["parts"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                contents[response_index]["parts"][0]["functionResponse"]["response"]["result"],
+                "(see attached media)",
+            );
+            assert_eq!(contents[media_index]["parts"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                contents[media_index]["parts"][1]["text"],
+                format!("Media from read (tool call {id}):"),
+            );
+            assert_eq!(contents[media_index]["parts"][2]["inline_data"]["data"], data);
+        }
+        assert_eq!(contents[3]["parts"][0]["text"], "Keep the second result separate");
+        assert_eq!(contents[7]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "Aw==");
     }
 
     #[test]
