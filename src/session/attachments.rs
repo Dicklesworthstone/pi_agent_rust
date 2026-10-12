@@ -681,6 +681,19 @@ pub(crate) fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionE
     decode_entry_with_references(source, json).map(|(entry, _)| entry)
 }
 
+/// Validate the shared persistence reference format without reading any blobs.
+/// SQLite must apply the same native-envelope validation as JSONL before
+/// hydrating a `Value`, which otherwise collapses duplicate member names.
+/// Opaque tool arguments and custom data retain their usual JSON semantics.
+#[cfg(feature = "sqlite-sessions")]
+pub(crate) fn validate_native_attachment_references(json: &str) -> Result<()> {
+    let spans = native_reference_spans(json)?;
+    if !spans.is_empty() {
+        validate_reference_entry_shape(json, &spans)?;
+    }
+    Ok(())
+}
+
 /// Keep every member occurrence while inspecting only native content paths.
 /// Opaque tool arguments and custom data are never recursively interpreted.
 struct RawObject<'a>(Vec<(String, &'a RawValue)>);

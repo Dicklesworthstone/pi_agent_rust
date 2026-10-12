@@ -340,6 +340,10 @@ pub(super) fn decode_entry(conn: &SqliteConnection, json: &str) -> Result<Sessio
         // rows, including its handling of duplicate native message fields.
         return parse_sqlite_json("session entry", json);
     }
+    // `Value` retains only the last occurrence of a member. Validate the raw
+    // native envelope and every reference first, so a duplicate cannot hide
+    // a missing blob or silently change an immutable persisted message.
+    crate::session::attachments::validate_native_attachment_references(json)?;
     if let Some(blocks) = message_blocks(&mut value) {
         for (index, reference) in plan {
             let bytes = load_blob(conn, &reference)?;
@@ -363,6 +367,7 @@ mod tests {
         save_session,
     };
     use serde_json::json;
+    use std::path::Path;
 
     fn base(id: &str) -> EntryBase {
         EntryBase {
@@ -419,6 +424,54 @@ mod tests {
         conn.query_sync("SELECT digest FROM pi_session_blobs", &[])
             .expect("blob rows")
             .len()
+    }
+
+    fn persisted_entry(path: &Path, original: &SessionEntry) -> String {
+        let header = SessionHeader {
+            id: "attachment-validation".to_string(),
+            ..SessionHeader::default()
+        };
+        futures::executor::block_on(save_session(
+            path,
+            &header,
+            std::slice::from_ref(original),
+            true,
+        ))
+        .expect("save public SQLite session");
+        run_on_sqlite_thread(|| {
+            let conn = map_sqlite_result(SqliteConnection::open_read_only(path))?;
+            let rows = map_sqlite_result(conn.query_sync(
+                "SELECT json FROM pi_session_entries WHERE seq = 1",
+                &[],
+            ))?;
+            let json = super::super::row_get_string(&rows[0], 0, "json")?;
+            map_sqlite_result(conn.close())?;
+            Ok(json)
+        })
+        .expect("read stored attachment reference")
+    }
+
+    fn replace_stored_entry(path: &Path, json: &str) {
+        run_on_sqlite_thread(|| {
+            let conn = map_sqlite_result(SqliteConnection::open_read_write(path))?;
+            let changed = map_sqlite_result(conn.execute_sync(
+                "UPDATE pi_session_entries SET json = ?1 WHERE seq = 1",
+                &[SqliteValue::from(json.to_string())],
+            ))?;
+            assert_eq!(changed, 1, "mutate the persisted entry used by load_session");
+            map_sqlite_result(conn.close())
+        })
+        .expect("replace stored entry");
+    }
+
+    fn assert_public_load_rejects(path: &Path, json: &str, detail: &str) {
+        replace_stored_entry(path, json);
+        let error = futures::executor::block_on(load_session(path))
+            .expect_err("corrupt attachment-bearing history cannot be loaded")
+            .to_string();
+        assert!(error.contains("PI_SESSION_ATTACHMENT_INVALID:"), "{error}");
+        assert!(error.contains(detail), "{error}");
+        assert!(!error.contains("PRIVATE_PAYLOAD"), "{error}");
     }
 
     #[test]
@@ -680,6 +733,137 @@ mod tests {
             let error = BlobRef::parse(&value).expect_err("invalid reference");
             assert!(!error.to_string().contains("PRIVATE"));
         }
+    }
+
+    #[test]
+    fn public_load_rejects_duplicate_native_members_that_hide_missing_blobs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("duplicate-native.sqlite");
+        let original = fixture("duplicate-native", 3);
+        let stored = persisted_entry(&path, &original);
+        let value: Value = serde_json::from_str(&stored).expect("stored JSON");
+        let reference = value["message"]["content"][0]["data"].to_string();
+        let mut missing = value["message"]["content"][0]["data"].clone();
+        missing["$piBlob"] = json!(format!("sha256:{}", "0".repeat(64)));
+        let healthy = value["message"]["content"][0].to_string();
+        let entry_prefix = r#"{"type":"message","id":"duplicate-native",
+            "timestamp":"2026-09-19T00:00:00.000Z","message":"#;
+        let mut cases = Vec::new();
+        for data in [
+            format!(r#""data":{missing},"data":{reference}"#),
+            format!(r#""data":{reference},"data":{missing}"#),
+            format!(r#""data":{missing},"data":"AA==""#),
+            format!(r#""data":"AA==","data":{missing}"#),
+        ] {
+            // The healthy peer keeps the attachment hydration path active
+            // even when the duplicate's final value is an inline string.
+            cases.push(format!(
+                r#"{entry_prefix}{{"role":"user","content":[
+                    {{"type":"image","mimeType":"image/png",{data}}},{healthy}]}}}}"#
+            ));
+        }
+        let message = value["message"].to_string();
+        let missing_message = format!(
+            r#"{{"role":"user","content":[
+                {{"type":"image","mimeType":"image/png","data":{missing}}}]}}"#
+        );
+        cases.push(format!(
+            r#"{entry_prefix}{missing_message},"message":{message}}}"#
+        ));
+        cases.push(format!(
+            r#"{entry_prefix}{{"role":"user","content":[
+                {{"type":"image","mimeType":"image/png","data":{missing}}}],
+                "content":[{healthy}]}}}}"#
+        ));
+        cases.push(format!(
+            r#"{{"type":"custom","type":"message","id":"duplicate-native",
+                "timestamp":"2026-09-19T00:00:00.000Z","message":{message}}}"#
+        ));
+        for source in cases {
+            assert_public_load_rejects(&path, &source, "duplicate");
+        }
+        // An unambiguous missing reference must still reach blob validation.
+        assert_public_load_rejects(
+            &path,
+            &format!("{entry_prefix}{missing_message}}}"),
+            "referenced attachment is missing",
+        );
+        replace_stored_entry(&path, &stored);
+        let (_, loaded) = futures::executor::block_on(load_session(&path))
+            .expect("healthy original history remains readable");
+        assert_eq!(encoded(&loaded[0]), encoded(&original));
+    }
+
+    #[test]
+    fn public_load_rejects_duplicate_reference_metadata_before_using_the_last_value() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("duplicate-reference.sqlite");
+        let original = fixture("duplicate-reference", 5);
+        let stored = persisted_entry(&path, &original);
+        let value: Value = serde_json::from_str(&stored).expect("stored JSON");
+        let reference = &value["message"]["content"][0]["data"];
+        let digest = reference["$piBlob"].as_str().expect("digest");
+        let size = reference["sizeBytes"].as_u64().expect("size");
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        for altered in [
+            format!(
+                r#"{{"$piBlob":"{wrong}","$piBlob":"{digest}",
+                    "sizeBytes":{size},"encoding":"base64"}}"#
+            ),
+            format!(
+                r#"{{"$piBlob":"{digest}","sizeBytes":1,"sizeBytes":{size},
+                    "encoding":"base64"}}"#
+            ),
+            format!(
+                r#"{{"$piBlob":"{digest}","sizeBytes":{size},
+                    "encoding":"PRIVATE_PAYLOAD","encoding":"base64"}}"#
+            ),
+        ] {
+            let source = stored.replacen(&reference.to_string(), &altered, 1);
+            assert_ne!(source, stored, "change the real stored reference");
+            assert_public_load_rejects(&path, &source, "malformed attachment reference");
+        }
+        replace_stored_entry(&path, &stored);
+        let (_, loaded) = futures::executor::block_on(load_session(&path))
+            .expect("canonical reference still resolves");
+        assert_eq!(encoded(&loaded[0]), encoded(&original));
+    }
+
+    #[test]
+    fn public_load_keeps_opaque_tool_json_semantics_beside_native_attachments() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("opaque-tool-json.sqlite");
+        let data = STANDARD.encode(vec![7; INLINE_BYTES + 11]);
+        let original = SessionEntry::Message(MessageEntry {
+            base: base("opaque-tool-json"),
+            message: SessionMessage::from(Message::tool_result(ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read_media".to_string(),
+                content: vec![ContentBlock::Media(MediaContent {
+                    data: data.clone(),
+                    mime_type: "audio/wav".to_string(),
+                    name: Some("clip.wav".to_string()),
+                })],
+                details: Some(json!({"opaque": true})),
+                is_error: false,
+                timestamp: 1,
+            })),
+        });
+        let stored = persisted_entry(&path, &original);
+        let altered = stored.replacen(
+            r#""details":{"opaque":true}"#,
+            r#""details":{"key":1,"key":2,"type":"media",
+                "data":{"$piBlob":"PRIVATE_PAYLOAD","$piBlob":"opaque"}}"#,
+            1,
+        );
+        assert_ne!(altered, stored, "mutate opaque details in the stored row");
+        replace_stored_entry(&path, &altered);
+        let (_, loaded) = futures::executor::block_on(load_session(&path))
+            .expect("opaque tool JSON must not become attachment metadata");
+        let value = serde_json::to_value(&loaded[0]).expect("native message");
+        assert_eq!(value["message"]["content"][0]["data"], data);
+        assert_eq!(value["message"]["details"]["key"], 2);
+        assert_eq!(value["message"]["details"]["data"]["$piBlob"], "opaque");
     }
 
     #[test]
