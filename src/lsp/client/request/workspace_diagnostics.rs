@@ -1,8 +1,9 @@
 //! Whole-workspace pull diagnostics, including documents Pi has never opened.
 //!
-//! Each invocation requests a full report. No previous result IDs or partial
-//! result tokens are sent: an `unchanged` report has no usable baseline, and
-//! a failed request must never be filled in from the document diagnostic cache.
+//! Each invocation requests full document reports, optionally streamed through
+//! a request-owned partial-result token. No previous result IDs are sent: an
+//! unchanged report has no baseline. Only a successful terminal response can
+//! authorize the complete, validated collection; errors never reuse the cache.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -140,6 +141,50 @@ fn validate_reports(raw: Value, open_docs: &HashMap<String, OpenDoc>) -> Result<
     Ok(reports)
 }
 
+fn validate_streamed_reports(
+    terminal: Value,
+    fragments: Vec<Value>,
+    open_docs: &HashMap<String, OpenDoc>,
+) -> Result<Vec<Value>> {
+    if fragments.is_empty() {
+        return validate_reports(terminal, open_docs);
+    }
+    // LSP partial-result progress appends the entire result; it is not a
+    // preview superseded by the terminal response. Refuse ambiguous mixtures
+    // rather than quietly replacing reported errors with a final clean set.
+    if !terminal.is_null()
+        && !terminal
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        return Err(report_error(
+            "streamed workspace diagnostics require an empty terminal result",
+        ));
+    }
+    let mut byte_budget = ByteBudget(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut byte_budget, &terminal)
+        .map_err(|_| report_error("workspace report exceeds 8 MiB"))?;
+    let mut combined = Vec::new();
+    for fragment in fragments {
+        serde_json::to_writer(&mut byte_budget, &fragment)
+            .map_err(|_| report_error("workspace report exceeds 8 MiB"))?;
+        let Value::Object(mut object) = fragment else {
+            return Err(report_error("workspace fragment must contain an items array"));
+        };
+        let Some(Value::Array(mut items)) = object.remove("items") else {
+            return Err(report_error("workspace fragment must contain an items array"));
+        };
+        if combined.len().saturating_add(items.len()) > MAX_DOCUMENTS {
+            return Err(report_error("workspace report has too many documents"));
+        }
+        combined.append(&mut items);
+    }
+    // URI uniqueness, versions, ranges and diagnostic counts apply to the
+    // entire collection, not independently to each transport fragment.
+    validate_reports(json!({"items":combined}), open_docs)
+}
+
 impl LspClient {
     /// Pull a full diagnostic report from a workspace-capable language server.
     ///
@@ -147,6 +192,7 @@ impl LspClient {
     /// virtual documents. Returned URIs are metadata and are never opened here.
     /// Reports are validated and sorted by URI. They do not modify the cached
     /// push/document diagnostics or reuse result IDs from another request.
+    /// Servers may stream fragments, but no incomplete result is delivered.
     ///
     /// The timeout covers lane admission, retries, response validation and
     /// delivery. Any local document synchronization during the call invalidates
@@ -155,7 +201,8 @@ impl LspClient {
     ///
     /// # Errors
     /// Refuses unsupported servers, malformed/oversized/incremental responses,
-    /// version mismatches, local document changes, cancellation and timeout.
+    /// version mismatches, local document changes, cancellation, notification
+    /// loss and timeout. Failed attempts discard all of their fragments.
     pub async fn workspace_diagnostics(&self, timeout: Duration) -> Result<Vec<Value>> {
         let budget = RequestBudget::new(timeout);
         budget.remaining().map_err(Error::from)?;
@@ -189,11 +236,10 @@ impl LspClient {
                 self.next_document_version.load(Ordering::SeqCst),
             )
         };
-        let raw = self
-            .call_with_budget("workspace/diagnostic", params, &budget)
-            .await
-            .map_err(Error::from)?;
-        let reports = validate_reports(raw, &before)?;
+        let (raw, fragments) = self
+            .call_with_partial_results("workspace/diagnostic", params, &budget, MAX_REPORT_BYTES)
+            .await?;
+        let reports = validate_streamed_reports(raw, fragments, &before)?;
         // Hold the same lock as document synchronization through final
         // validation. No await or callback can interleave with this check.
         let docs = Self::lock(&self.open_docs);
@@ -268,10 +314,13 @@ mod tests {
             .filter(|frame| frame["method"] == "workspace/diagnostic")
             .collect();
         assert_eq!(calls.len(), 1);
+        let token = calls[0]["params"]["partialResultToken"].as_str().unwrap();
+        assert!(token.starts_with("pi-partial-"));
         assert_eq!(
             calls[0]["params"],
             json!({
-                "identifier": "workspace-fixture", "previousResultIds": []
+                "identifier": "workspace-fixture", "previousResultIds": [],
+                "partialResultToken": token
             })
         );
         assert!(!frames.iter().any(|frame| matches!(
@@ -422,5 +471,57 @@ mod tests {
                 if retrigger { 2 } else { 1 }
             );
         }
+    }
+
+    #[test]
+    fn streamed_reports_are_combined_sorted_and_require_an_empty_terminal() {
+        let a = report("untitled:a", "first");
+        let b = report("untitled:b", "second");
+        let parts = vec![json!({"items":[b]}), json!({"items":[a]})];
+        for terminal in [Value::Null, json!({"items":[]})] {
+            assert_eq!(
+                validate_streamed_reports(terminal, parts.clone(), &HashMap::new()).unwrap(),
+                vec![a.clone(), b.clone()]
+            );
+        }
+        for terminal in [json!({}), json!({"items":null}), json!({"items":[a]})] {
+            assert!(validate_streamed_reports(terminal, parts.clone(), &HashMap::new()).is_err());
+        }
+        assert!(validate_streamed_reports(Value::Null, Vec::new(), &HashMap::new()).is_err());
+        assert!(
+            validate_streamed_reports(Value::Null, vec![json!({"items":[]})], &HashMap::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fragment_validation_never_hides_malformed_or_duplicate_document_reports() {
+        let good = json!({"items":[report("untitled:a", "first")]});
+        for bad in [Value::Null, json!({}), json!({"items":null}), good.clone()] {
+            assert!(
+                validate_streamed_reports(
+                    json!({"items":[]}), vec![good.clone(), bad], &HashMap::new()
+                ).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn document_and_diagnostic_limits_apply_across_fragment_boundaries() {
+        let empty = json!({"uri":"untitled:source","version":null,"kind":"full","items":[]});
+        let parts = vec![
+            json!({"items":vec![empty.clone(); MAX_DOCUMENTS]}),
+            json!({"items":[empty]}),
+        ];
+        let error = validate_streamed_reports(Value::Null, parts, &HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("too many documents"));
+        let mut a = report("untitled:a", "problem");
+        a["items"] = json!(vec![a["items"][0].clone(); MAX_DIAGNOSTICS]);
+        let b = report("untitled:b", "one too many");
+        let error = validate_streamed_reports(
+            Value::Null, vec![json!({"items":[a]}), json!({"items":[b]})], &HashMap::new()
+        ).unwrap_err();
+        assert!(error.to_string().contains("too many diagnostics"));
     }
 }

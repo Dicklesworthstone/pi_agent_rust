@@ -138,6 +138,9 @@ pub struct LspClient {
     // Serialize draining and applying notifications, retaining the loss
     // generation so older queued reports cannot restore invalidated state.
     notification_generation: Mutex<u64>,
+    // Request-owned fragments share the ordered notification router; snapshot
+    // readers must not silently consume another caller's partial results.
+    partial_results: Mutex<request::PartialResults>,
     pull_reports: Mutex<pull_diagnostics::ReportCache>,
     request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
@@ -170,6 +173,7 @@ impl LspClient {
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
             notification_generation: Mutex::new(0),
+            partial_results: Mutex::new(request::PartialResults::default()),
             pull_reports: Mutex::new(pull_diagnostics::ReportCache::default()),
             request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
             capabilities: Mutex::new(ServerCapabilities::default()),
@@ -360,7 +364,9 @@ impl LspClient {
                 continue;
             }
             self.observe_notification_loss(&mut generation, notification.dropped_before);
-            if notification.method == "textDocument/publishDiagnostics" {
+            if notification.method == "$/progress" {
+                Self::lock(&self.partial_results).accept(notification.params);
+            } else if notification.method == "textDocument/publishDiagnostics" {
                 self.accept_diagnostics(&notification.params);
             } else if notification.method == "experimental/serverStatus"
                 && let Some(quiescent) = notification

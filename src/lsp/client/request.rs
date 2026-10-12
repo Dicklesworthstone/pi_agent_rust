@@ -20,7 +20,9 @@ use super::{
 };
 use crate::agent_cx::AgentCx;
 
+mod partial_results;
 mod workspace_diagnostics;
+pub(super) use partial_results::PartialResults;
 
 pub(super) struct RequestBudget {
     owner: AgentCx,
@@ -179,6 +181,18 @@ impl LspClient {
         budget: &RequestBudget,
     ) -> Result<Value, LspCallError> {
         let _lane = budget.acquire(&self.request_lane).await?;
+        self.call_once_in_lane(method, params, budget).await
+    }
+
+    /// The caller retains the lane through response observation and any
+    /// request-owned partial-result collection. Wire admission/cancellation
+    /// remain identical for ordinary and streaming requests.
+    async fn call_once_in_lane(
+        &self,
+        method: &str,
+        params: Value,
+        budget: &RequestBudget,
+    ) -> Result<Value, LspCallError> {
         budget.remaining()?;
         let mut request = self
             .rpc

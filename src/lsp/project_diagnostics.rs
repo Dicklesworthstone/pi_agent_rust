@@ -216,19 +216,37 @@ while True:
             'interFileDependencies':True}}}
     elif method == 'test/frames': response['result'] = frames
     elif method == 'workspace/diagnostic':
+        params = message['params']
+        token = params.get('partialResultToken')
         if mode == 'error': response['error'] = {'code':-32603,'message':'project analysis failed'}
         elif mode == 'malformed': response['result'] = {'items':None}
         elif mode == 'empty': response['result'] = {'items':[]}
         elif mode == 'hang': continue
-        elif message['params'] != {'identifier':'project-fixture','previousResultIds':[]}:
+        elif (not isinstance(token, str) or not token.startswith('pi-partial-') or
+              params != {'identifier':'project-fixture','previousResultIds':[], 'partialResultToken':token}):
             response['error'] = {'code':-32602,'message':'unexpected workspace request parameters'}
         else:
             diagnostic = {'message':'unopened diagnostic','severity':1,
                 'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':1}}}
             warning = dict(diagnostic, message='virtual warning', severity=2)
-            response['result'] = {'items':[
+            reports = [
                 {'uri':(root.resolve()/'never-opened.piproject').as_uri(),'version':None,'kind':'full','items':[diagnostic]},
-                {'uri':'untitled:virtual-project','version':None,'kind':'full','items':[warning]}]}
+                {'uri':'untitled:virtual-project','version':None,'kind':'full','items':[warning]}]
+            if mode.startswith('streamed'):
+                send({'jsonrpc':'2.0','method':'$/progress','params':{
+                    'token':'unrelated-work-token','value':{'kind':'begin','title':'analyzing'}}})
+                chunks = [{'items':[item]} for item in reversed(reports)]
+                if mode == 'streamed_empty': chunks = [{'items':[]}]
+                if mode == 'streamed_duplicate': chunks.append(chunks[0])
+                if mode == 'streamed_malformed': chunks.append({'items':None})
+                for chunk in chunks:
+                    send({'jsonrpc':'2.0','method':'$/progress','params':{'token':token,'value':chunk}})
+                if mode == 'streamed_error':
+                    response['error'] = {'code':-32603,'message':'analysis failed after progress'}
+                else:
+                    response['result'] = None if mode in ('streamed_null', 'streamed_empty') else {'items':[]}
+            else:
+                response['result'] = {'items':reports}
     elif method == 'shutdown': response['result'] = None
     else: response['error'] = {'code':-32601,'message':'unexpected per-document request'}
     send(response)
@@ -352,6 +370,9 @@ while True:
             ("unsupported", "LSP_UNSUPPORTED"),
             ("error", "project analysis failed"),
             ("malformed", "LSP_WORKSPACE_DIAGNOSTIC_REPORT"),
+            ("streamed_error", "analysis failed after progress"),
+            ("streamed_duplicate", "duplicate document URIs"),
+            ("streamed_malformed", "workspace fragment must contain an items array"),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let Some(tool) = tool(temp.path(), mode) else {
@@ -396,6 +417,34 @@ while True:
         assert_eq!(details["responseComplete"], true);
         assert_eq!(details["totalDocuments"], 0);
         assert_eq!(details["totalDiagnostics"], 0);
+    }
+
+    #[test]
+    fn streamed_project_reports_reach_the_agent_with_complete_totals() {
+        for mode in ["streamed", "streamed_null", "streamed_empty"] {
+            let temp = tempfile::tempdir().unwrap();
+            let Some(tool) = tool(temp.path(), mode) else {
+                return;
+            };
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let output = runtime.block_on(tool.execute(
+                "streamed-project-test",
+                json!({"action":"project_diagnostics","file":"anchor.piproject","timeout":5,"limit":1}),
+                None,
+            )).unwrap();
+            assert!(!output.is_error);
+            let details = output.details.unwrap();
+            let empty = mode == "streamed_empty";
+            assert_eq!(details["responseComplete"], true);
+            assert_eq!(details["totalDocuments"], if empty { 0 } else { 2 });
+            assert_eq!(details["totalDiagnostics"], if empty { 0 } else { 2 });
+            assert_eq!(details["errorCount"], if empty { 0 } else { 1 });
+            assert_eq!(details["warningCount"], if empty { 0 } else { 1 });
+            assert_eq!(details["returnedDocuments"], if empty { 0 } else { 1 });
+            assert_eq!(details["truncated"], !empty);
+            assert_eq!(details["complete"], empty);
+            assert!(!temp.path().join("never-opened.piproject").exists());
+        }
     }
 
     #[test]
