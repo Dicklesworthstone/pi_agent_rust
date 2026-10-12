@@ -1,8 +1,8 @@
-//! Deterministic numeric snippet expansion; never read variables or run code.
+//! Deterministic snippet expansion; never read ambient variables or run code.
 //!
 //! Parse the whole snippet before applying any caller substitutions. Defaults
 //! may nest and references may precede their definition. Values are literal
-//! text, never reparsed as snippets. Bounded numeric-placeholder transforms
+//! text, never reparsed as snippets. Bounded placeholder and variable transforms
 //! derive individual occurrences without changing their source field. The
 //! server's cached item stays immutable.
 
@@ -23,12 +23,23 @@ const MAX_NODES: usize = 2048;
 const MAX_WORK: usize = 32_768;
 const MAX_TEXT: usize = 64 * 1024;
 const MAX_MEMO: usize = 2 * 1024 * 1024;
+const MAX_VARIABLE_NAME: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Node {
     Text(String),
     Field(u32),
     Transformed(u32, transform::Transform),
+    Variable(String, VariableValue),
+}
+
+// Unlike numbered placeholders, a variable's default belongs to this exact
+// occurrence. `${NAME:a} ${NAME:b}` is valid and expands to `a b` when unset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VariableValue {
+    Unset,
+    Default(Vec<Node>),
+    Transform(transform::Transform),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +54,7 @@ struct Parser<'a> {
     nodes: usize,
     transforms: usize,
     ids: BTreeSet<u32>,
+    variables: BTreeSet<String>,
     defaults: BTreeMap<u32, DefaultValue>,
 }
 
@@ -53,6 +65,15 @@ fn limit() -> crate::error::Error {
     )
 }
 
+fn variable_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    name.len() <= MAX_VARIABLE_NAME
+        && bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 pub(super) fn validate_values(values: &Values) -> Result<()> {
     if values.len() > MAX_FIELDS {
         return Err(limit());
@@ -60,10 +81,10 @@ pub(super) fn validate_values(values: &Values) -> Result<()> {
     let mut bytes = 0usize;
     for (key, value) in values {
         let index = key.parse::<u32>().ok().filter(|index| *index <= 65535);
-        if index.is_none_or(|index| index.to_string() != *key) {
+        if index.is_none_or(|index| index.to_string() != *key) && !variable_name(key) {
             return Err(tool_err(
                 "LSP_USAGE",
-                "snippetValues keys must be canonical decimal indices from 0 to 65535",
+                "snippetValues keys must be canonical decimal indices from 0 to 65535 or ASCII variable names up to 128 bytes",
             ));
         }
         bytes = bytes.saturating_add(value.len());
@@ -85,6 +106,7 @@ impl<'a> Parser<'a> {
             nodes: 0,
             transforms: 0,
             ids: BTreeSet::new(),
+            variables: BTreeSet::new(),
             defaults: BTreeMap::new(),
         })
     }
@@ -144,11 +166,14 @@ impl<'a> Parser<'a> {
         if braced {
             let _ = self.take();
         }
+        if self
+            .peek()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        {
+            return self.variable(braced, depth);
+        }
         if !self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-            return Err(tool_err(
-                "LSP_COMPLETION_UNSUPPORTED",
-                "snippet variables are not supported; no environment or clipboard is read",
-            ));
+            return Err(malformed("expected a snippet index or variable name"));
         }
         let start = self.offset;
         while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
@@ -160,7 +185,7 @@ impl<'a> Parser<'a> {
             .filter(|index| *index <= 65535)
             .ok_or_else(limit)?;
         self.ids.insert(id);
-        if self.ids.len() > MAX_FIELDS {
+        if self.ids.len() + self.variables.len() > MAX_FIELDS {
             return Err(limit());
         }
         if !braced {
@@ -171,11 +196,7 @@ impl<'a> Parser<'a> {
             Some(':') => DefaultValue::Nodes(self.sequence(true, depth + 1)?),
             Some('|') => DefaultValue::Choices(self.choices()?),
             Some('/') => {
-                self.transforms += 1;
-                if self.transforms > transform::MAX_TRANSFORMS {
-                    return Err(limit());
-                }
-                let transform = transform::Transform::parse(self.input, &mut self.offset)?;
+                let transform = self.transform()?;
                 return Ok(Node::Transformed(id, transform));
             }
             _ => return Err(malformed("invalid snippet placeholder suffix")),
@@ -191,6 +212,44 @@ impl<'a> Parser<'a> {
         }
         self.defaults.insert(id, default);
         Ok(Node::Field(id))
+    }
+
+    fn variable(&mut self, braced: bool, depth: usize) -> Result<Node> {
+        let start = self.offset;
+        while self
+            .peek()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            let _ = self.take();
+        }
+        let name = &self.input[start..self.offset];
+        if !variable_name(name) {
+            return Err(limit());
+        }
+        let name = name.to_string();
+        self.variables.insert(name.clone());
+        if self.ids.len() + self.variables.len() > MAX_FIELDS {
+            return Err(limit());
+        }
+        let value = if braced {
+            match self.take() {
+                Some('}') => VariableValue::Unset,
+                Some(':') => VariableValue::Default(self.sequence(true, depth + 1)?),
+                Some('/') => VariableValue::Transform(self.transform()?),
+                _ => return Err(malformed("invalid snippet variable suffix")),
+            }
+        } else {
+            VariableValue::Unset
+        };
+        Ok(Node::Variable(name, value))
+    }
+
+    fn transform(&mut self) -> Result<transform::Transform> {
+        self.transforms += 1;
+        if self.transforms > transform::MAX_TRANSFORMS {
+            return Err(limit());
+        }
+        transform::Transform::parse(self.input, &mut self.offset)
     }
 
     fn choices(&mut self) -> Result<Vec<String>> {
@@ -225,10 +284,13 @@ impl<'a> Parser<'a> {
 struct Renderer<'a> {
     defaults: &'a BTreeMap<u32, DefaultValue>,
     values: BTreeMap<u32, &'a str>,
+    variable_values: BTreeMap<&'a str, &'a str>,
     memo: BTreeMap<u32, String>,
     active: BTreeSet<u32>,
     used: BTreeSet<u32>,
     missing: BTreeSet<u32>,
+    used_variables: BTreeSet<String>,
+    missing_variables: BTreeSet<String>,
     work: usize,
     transform_scan: usize,
     memo_bytes: usize,
@@ -259,9 +321,40 @@ impl Renderer<'_> {
                         transform.apply(&source, &mut self.work, &mut self.transform_scan)?;
                     append(&mut output, &text)?;
                 }
+                Node::Variable(name, value) => {
+                    append(&mut output, &self.variable(name, value, depth + 1)?)?;
+                }
             }
         }
         Ok(output)
+    }
+
+    fn variable(&mut self, name: &str, value: &VariableValue, depth: usize) -> Result<String> {
+        if depth > MAX_DEPTH {
+            return Err(limit());
+        }
+        self.used_variables.insert(name.to_string());
+        let source = if let Some(text) = self.variable_values.get(name) {
+            // Explicit empty strings are deliberate values, not permission
+            // to read the host or to fall back to a server-authored default.
+            (*text).to_string()
+        } else if let VariableValue::Default(nodes) = value {
+            return self.sequence(nodes, depth);
+        } else {
+            self.missing_variables.insert(name.to_string());
+            // Unresolved variables are editable fields, not host lookups.
+            // The preview may show their name, but apply requires a value.
+            if matches!(value, VariableValue::Transform(_)) {
+                String::new()
+            } else {
+                name.to_string()
+            }
+        };
+        if let VariableValue::Transform(transform) = value {
+            transform.apply(&source, &mut self.work, &mut self.transform_scan)
+        } else {
+            Ok(source)
+        }
     }
 
     fn field(&mut self, id: u32, depth: usize) -> Result<String> {
@@ -307,16 +400,18 @@ pub(super) struct Expanded {
     pub(super) item: Value,
     pub(super) fields: Value,
     pub(super) missing: Vec<u32>,
+    pub(super) variables: Value,
+    pub(super) missing_variables: Vec<String>,
 }
 
 impl Expanded {
     pub(super) fn require_values(&self) -> Result<()> {
-        if !self.missing.is_empty() {
+        if !self.missing.is_empty() || !self.missing_variables.is_empty() {
             return Err(tool_err(
                 "LSP_COMPLETION_VALUES_REQUIRED",
                 format!(
-                    "provide snippetValues for placeholders {:?}; unresolved arguments were not inserted",
-                    self.missing
+                    "provide snippetValues for placeholders {:?} and variables {:?}; unresolved arguments were not inserted",
+                    self.missing, self.missing_variables
                 ),
             ));
         }
@@ -345,6 +440,8 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
             item: item.clone(),
             fields: Value::Null,
             missing: Vec::new(),
+            variables: Value::Null,
+            missing_variables: Vec::new(),
         });
     }
     if format.is_none_or(|value| value.as_u64() != Some(2)) {
@@ -365,29 +462,31 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
         .ok_or_else(|| malformed("snippet insertion text must be a string"))?;
     let mut parser = Parser::new(text)?;
     let nodes = parser.sequence(false, 0)?;
-    let values = values
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .map(|(key, value)| {
-            (
-                key.parse::<u32>().expect("validated snippet key"),
-                value.as_str(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if values.keys().any(|key| !parser.ids.contains(key)) {
-        return Err(tool_err(
-            "LSP_USAGE",
-            "snippetValues contains an unknown placeholder index",
-        ));
+    let mut numbered = BTreeMap::new();
+    let mut named = BTreeMap::new();
+    for (key, value) in values.into_iter().flatten() {
+        if let Ok(id) = key.parse::<u32>() {
+            if !parser.ids.contains(&id) {
+                return Err(tool_err("LSP_USAGE", "snippetValues contains an unknown placeholder index"));
+            }
+            numbered.insert(id, value.as_str());
+        } else {
+            if !parser.variables.contains(key) {
+                return Err(tool_err("LSP_USAGE", "snippetValues contains an unknown variable name"));
+            }
+            named.insert(key.as_str(), value.as_str());
+        }
     }
     let mut renderer = Renderer {
         defaults: &parser.defaults,
-        values,
+        values: numbered,
+        variable_values: named,
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
         used: BTreeSet::new(),
         missing: BTreeSet::new(),
+        used_variables: BTreeSet::new(),
+        missing_variables: BTreeSet::new(),
         work: MAX_WORK,
         transform_scan: transform::SCAN_BUDGET,
         memo_bytes: 0,
@@ -397,10 +496,14 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
         .values
         .keys()
         .any(|key| !renderer.used.contains(key))
+        || renderer
+            .variable_values
+            .keys()
+            .any(|key| !renderer.used_variables.contains(*key))
     {
         return Err(tool_err(
             "LSP_USAGE",
-            "snippetValues contains a placeholder suppressed by an outer replacement",
+            "snippetValues contains a placeholder or variable suppressed by an outer replacement",
         ));
     }
     let fields = renderer
@@ -421,10 +524,17 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
         prepared["insertText"] = json!(text);
     }
     prepared["insertTextFormat"] = json!(1);
+    let variables = renderer
+        .used_variables
+        .iter()
+        .map(|name| json!({"name":name,"missing":renderer.missing_variables.contains(name)}))
+        .collect::<Vec<_>>();
     Ok(Expanded {
         item: prepared,
         fields: json!(fields),
         missing: renderer.missing.into_iter().collect(),
+        variables: json!(variables),
+        missing_variables: renderer.missing_variables.into_iter().collect(),
     })
 }
 

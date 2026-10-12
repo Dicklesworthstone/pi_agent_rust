@@ -1,7 +1,7 @@
 //! Native semantic completion: list, resolve/preview, explicitly apply.
 //!
 //! Handles retain one bounded listing, its immutable synchronized source and
-//! its exact server connection. Numeric snippets accept explicit literal
+//! its exact server connection. Snippet fields and variables accept explicit literal
 //! substitutions; no command permission is implied. Insertion and auto-import
 //! edits share the existing transaction.
 
@@ -519,7 +519,7 @@ impl LspTool {
             "action":"completion","file":display_path(&source.path, &self.cwd),"position":position,
             "server":entry.spec_name,"count":count,"matched":matched,"isIncomplete":incomplete,
             "truncated":count < matched,"items":summaries,
-            "note":"Select completionId to resolve and preview; supply snippetValues for numeric placeholders and repeat them with apply:true. Commands, variables and transforms are not executed."
+            "note":"Select completionId to resolve and preview; supply snippetValues using numeric placeholder indices or variable names, and repeat them with apply:true. Bounded snippet transforms are supported; commands, environment and clipboard access are not."
         });
         bounded_size(&payload, MAX_PAYLOAD_BYTES)?;
         lock(&self.completions.0).items = retained;
@@ -598,11 +598,12 @@ impl LspTool {
         });
         if !apply {
             let payload = json!({"action":"completion","completionId":id,"applied":false,
-                "canApply":expanded.missing.is_empty(),"label":selected.item["label"],"file":display_path(&source.path, &self.cwd),
+                "canApply":expanded.require_values().is_ok(),"label":selected.item["label"],"file":display_path(&source.path, &self.cwd),
                 "detail":clipped(selected.item.get("detail"), 4096),"documentation":clipped(documentation, 8192),
                 "edits":edits,"editMode":"replace","additionalEdits":edits.len().saturating_sub(1),
                 "snippetPlaceholders":expanded.fields,"missingPlaceholders":expanded.missing,
-                "note":"Preview substitutions are not cached; repeat snippetValues when applying. Missing positive tabstops require explicit values, including an empty string to intentionally omit one."});
+                "snippetVariables":expanded.variables,"missingVariables":expanded.missing_variables,
+                "note":"Preview substitutions are not cached; repeat snippetValues when applying. Missing positive tabstops and variables require explicit values, including an empty string to intentionally omit one. No ambient environment or clipboard is read."});
             bounded_size(&payload, MAX_PAYLOAD_BYTES)?;
             return Ok(text_output(payload.to_string(), payload));
         }
