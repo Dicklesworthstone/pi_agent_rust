@@ -143,8 +143,9 @@ A failed query marks SARIF `executionSuccessful: false`.
 Dependency fingerprints cover ecosystem, name, version and advisory ID rather
 than line numbers. They occupy the `pi/dependency/v1` namespace. Existing source
 `compare` and `disposition` operations continue to operate on source-rule scans;
-do not pass dependency SARIF to source `compare`. Dependency suppression and
-cross-audit comparison are not implemented in this increment. A known-advisory
+do not pass dependency SARIF to source `compare`. Use the offline
+[`compare_dependencies` operation](dependency-review.md) for saved dependency
+audits. Dependency suppression is not yet implemented. A known-advisory
 match is not proof of exploitability, and absence of matches is not proof that
 code has no vulnerabilities. Installed dependencies, build reachability, patched
 forks and lockfile provenance require separate analysis.

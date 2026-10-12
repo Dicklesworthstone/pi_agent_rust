@@ -4,6 +4,7 @@
 //! reports unsupported origins instead of guessing a public package identity.
 
 pub mod dependencies;
+mod dependency_review;
 mod osv;
 mod source;
 
@@ -61,7 +62,7 @@ impl Tool for SecurityScanTool {
         "security scan"
     }
     fn description(&self) -> &'static str {
-        "Review local source with plan/run/disposition/compare. dependency_plan inventories Cargo/npm lockfiles offline. audit_dependencies sends eligible public-registry package names, ecosystems and exact versions to OSV, returning known advisory matches and explicit completeness/exclusions. Source code, lockfile paths and private-registry entries are not uploaded. An optional new root-level .sarif report is never overwritten. This is not exploitability or installed-code analysis."
+        "Review local source with plan/run/disposition/compare. dependency_plan inventories Cargo/npm lockfiles offline. audit_dependencies sends eligible public-registry package names, ecosystems and exact versions to OSV, returning known advisory matches and explicit completeness/exclusions. compare_dependencies compares two saved native audit reports offline with paged findings and per-package uncertainty. Source code, lockfile paths and private-registry entries are not uploaded. An optional new root-level .sarif report is never overwritten. This is not exploitability or installed-code analysis."
     }
     fn parameters(&self) -> Value {
         let mut schema = self.source.parameters();
@@ -71,10 +72,11 @@ impl Tool for SecurityScanTool {
             "disposition",
             "compare",
             "dependency_plan",
-            "audit_dependencies"
+            "audit_dependencies",
+            "compare_dependencies"
         ]);
         schema["properties"]["op"]["description"] = json!(
-            "Source review: plan/run/disposition/compare. dependency_plan: offline lockfile inventory. audit_dependencies: native OSV known-vulnerability lookup."
+            "Source review: plan/run/disposition/compare. dependency_plan: offline lockfile inventory. audit_dependencies: OSV lookup. compare_dependencies: offline comparison of saved native dependency SARIF."
         );
         schema["properties"]["paths"]["description"] = json!(
             "Source ops: relative files/directories. Dependency ops: up to 32 relative Cargo.lock or package-lock.json/npm-shrinkwrap.json files; default root Cargo.lock and package-lock.json only."
@@ -84,6 +86,15 @@ impl Tool for SecurityScanTool {
         schema["properties"]["sarifOut"]["description"] = json!(
             "run: source report path. audit_dependencies: optional NEW root-level .sarif filename; existing files are never overwritten, no default export."
         );
+        schema["properties"]["baseline"]["description"] = json!(
+            "compare: source baseline. compare_dependencies: required root-level baseline .sarif filename from audit_dependencies."
+        );
+        schema["properties"]["current"] = json!({"type":"string",
+            "description":"compare_dependencies: required root-level current .sarif filename; same selected lockfile paths as baseline"});
+        schema["properties"]["offset"] = json!({"type":"integer","minimum":0,"default":0,
+            "description":"compare_dependencies: stable page offset; compare returned report hashes across pages"});
+        schema["properties"]["limit"] = json!({"type":"integer","minimum":1,"maximum":50,"default":20,
+            "description":"compare_dependencies: findings per page; counts always cover the full comparison"});
         schema
     }
     fn effects(&self) -> ToolEffects {
@@ -104,6 +115,9 @@ impl Tool for SecurityScanTool {
             .to_ascii_lowercase();
         if op == "audit_dependencies" {
             return self.osv.execute(&self.cwd, input).await;
+        }
+        if op == "compare_dependencies" {
+            return dependency_review::compare(&self.cwd, input).await;
         }
         if op != "dependency_plan" {
             return self.source.execute(call_id, input, on_update).await;
@@ -170,6 +184,7 @@ mod tests {
             "compare",
             "dependency_plan",
             "audit_dependencies",
+            "compare_dependencies",
         ] {
             assert!(
                 schema["properties"]["op"]["enum"]
