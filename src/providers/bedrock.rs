@@ -24,12 +24,14 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use url::Url;
 
 mod request_options;
@@ -359,6 +361,47 @@ impl BedrockProvider {
         Ok(url)
     }
 
+    /// Prepare the actual destination-aware request before hooks or signing.
+    /// Bedrock reasoning is model-owned replay data, including opaque encrypted
+    /// blocks. A shared Converse API name does not make another model or
+    /// configured provider able to validate it. Keep ordinary history and tool
+    /// pairs, but omit foreign reasoning without changing the stored transcript.
+    fn prepare_request(&self, context: &Context<'_>, options: &StreamOptions) -> Result<Value> {
+        let mut messages = Cow::Borrowed(context.messages.as_ref());
+        for (index, message) in context.messages.iter().enumerate() {
+            let Message::Assistant(assistant) = message else {
+                continue;
+            };
+            let same_origin = assistant.api == self.api()
+                && assistant.provider == self.name()
+                && assistant.model == self.model_id();
+            if same_origin
+                || !assistant.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Thinking(_) | ContentBlock::RedactedThinking(_)
+                    )
+                })
+            {
+                continue;
+            }
+            if let Message::Assistant(projected) = &mut messages.to_mut()[index] {
+                Arc::make_mut(projected).content.retain(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Thinking(_) | ContentBlock::RedactedThinking(_)
+                    )
+                });
+            }
+        }
+        let projected = Context {
+            system_prompt: context.system_prompt.as_deref().map(Cow::Borrowed),
+            messages,
+            tools: Cow::Borrowed(context.tools.as_ref()),
+        };
+        request_options::prepare(&self.model, self.compat.as_ref(), &projected, options)
+    }
+
     pub fn build_request(context: &Context<'_>, options: &StreamOptions) -> BedrockConverseRequest {
         let mut system = Vec::new();
         if let Some(system_prompt) = context
@@ -649,8 +692,7 @@ impl Provider for BedrockProvider {
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         // Apply model controls before hooks, auth discovery, and body signing.
-        let request_body =
-            request_options::prepare(&self.model, self.compat.as_ref(), context, options)?;
+        let request_body = self.prepare_request(context, options)?;
 
         let auth_context = self.resolve_auth_context(options).await?;
         // Reject caller-owned signing headers before endpoint parsing or an inference request.
@@ -1641,6 +1683,149 @@ mod tests {
         assert_eq!(
             value["toolConfig"]["tools"][0]["toolSpec"]["name"],
             "search"
+        );
+    }
+
+    fn replay_context(api: &str, provider: &str, model: &str) -> Context<'static> {
+        let mut context = test_context_with_tools();
+        let Message::Assistant(assistant) = &mut context.messages.to_mut()[1] else {
+            panic!("fixture must contain an assistant tool call");
+        };
+        let assistant = Arc::make_mut(assistant);
+        assistant.api = api.to_string();
+        assistant.provider = provider.to_string();
+        assistant.model = model.to_string();
+        drop(assistant.content.splice(
+            0..0,
+            [
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "model-owned reasoning".to_string(),
+                    thinking_signature: Some("signed-reasoning".to_string()),
+                }),
+                ContentBlock::RedactedThinking(RedactedThinkingContent {
+                    data: "ZW5jcnlwdGVkLXJlYXNvbmluZw==".to_string(),
+                }),
+                ContentBlock::Text(TextContent::new("Searching the docs.")),
+            ],
+        ));
+        context
+    }
+
+    #[test]
+    fn prepared_request_replays_reasoning_only_to_its_exact_origin() {
+        let destination = BedrockProvider::new("m").with_provider_name("configured-bedrock");
+        for (api, provider, model, same_origin) in [
+            ("bedrock-converse-stream", "configured-bedrock", "m", true),
+            ("bedrock-converse-stream", "configured-bedrock", "other", false),
+            ("bedrock-converse-stream", "amazon-bedrock", "m", false),
+            ("anthropic-messages", "configured-bedrock", "m", false),
+            ("", "configured-bedrock", "m", false),
+            ("bedrock-converse-stream", "", "m", false),
+            ("bedrock-converse-stream", "configured-bedrock", "", false),
+            ("", "", "", false),
+        ] {
+            let context = replay_context(api, provider, model);
+            let original = serde_json::to_value(context.messages.as_ref()).unwrap();
+            let body = destination
+                .prepare_request(&context, &StreamOptions::default())
+                .expect("prepare replay request");
+            let mut expected = Vec::new();
+            if same_origin {
+                expected.extend([
+                    json!({"reasoningContent": {"reasoningText": {
+                        "text": "model-owned reasoning", "signature": "signed-reasoning"
+                    }}}),
+                    json!({"reasoningContent": {
+                        "redactedContent": "ZW5jcnlwdGVkLXJlYXNvbmluZw=="
+                    }}),
+                ]);
+            }
+            expected.extend([
+                json!({"text": "Searching the docs."}),
+                json!({"toolUse": {
+                    "toolUseId": "tool_1", "name": "search", "input": {"q": "rust"}
+                }}),
+            ]);
+            assert_eq!(
+                body["messages"][1]["content"],
+                json!(expected),
+                "source {api}/{provider}/{model}"
+            );
+            assert_eq!(body["messages"][0]["content"], json!([{"text": "Ping"}]));
+            assert_eq!(
+                body["messages"][2]["content"],
+                json!([{"toolResult": {
+                    "toolUseId": "tool_1", "content": [{"text": "result"}], "status": "success"
+                }}])
+            );
+            assert_eq!(
+                serde_json::to_value(context.messages.as_ref()).unwrap(),
+                original,
+                "replay must not erase reasoning from the saved conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_request_omits_foreign_reasoning_only_messages() {
+        let mut context = replay_context("bedrock-converse-stream", "amazon-bedrock", "other");
+        let Message::Assistant(assistant) = &mut context.messages.to_mut()[1] else {
+            panic!("fixture must contain an assistant message");
+        };
+        Arc::make_mut(assistant).content.truncate(2);
+        // This fixture has no tool call once only reasoning remains.
+        context.messages.to_mut().truncate(2);
+        let body = BedrockProvider::new("m")
+            .prepare_request(&context, &StreamOptions::default())
+            .expect("prepare reasoning-only foreign history");
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "user", "content": [{"text": "Ping"}]}])
+        );
+        let Message::Assistant(original) = &context.messages[1] else {
+            panic!("original assistant message must remain");
+        };
+        assert_eq!(original.content.len(), 2);
+    }
+
+    #[test]
+    fn stream_sends_foreign_history_without_model_owned_reasoning() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let provider = BedrockProvider::new("m").with_base_url(format!("{base_url}/converse"));
+        let context = replay_context("bedrock-converse-stream", "amazon-bedrock", "other");
+        let options = StreamOptions {
+            api_key: Some("fixture-bearer-token".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.unwrap();
+            let mut completed = false;
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::Done { reason, message } = event.unwrap() {
+                    assert_eq!(reason, StopReason::Stop);
+                    assert_eq!(message.model, "m");
+                    completed = true;
+                }
+            }
+            assert!(completed, "foreign-history turn must reach a terminal response");
+        });
+        let captured = captured_request
+            .recv_timeout(FIXTURE_BUDGET)
+            .expect("capture destination-aware Bedrock request");
+        let body: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([
+                {"text": "Searching the docs."},
+                {"toolUse": {"toolUseId": "tool_1", "name": "search", "input": {"q": "rust"}}}
+            ])
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+            "tool_1"
         );
     }
 
