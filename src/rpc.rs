@@ -189,18 +189,84 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
         .map_err(|_| Error::Validation(format!("{field} exceeds the maximum supported value")))
 }
 
-fn future_with_current_cx<F>(
-    current_cx: asupersync::Cx,
-    future: F,
-) -> impl Future<Output = F::Output> + Send + 'static
+/// Keep an accepted turn runnable until its terminal event and persistence
+/// finish. Client cancellation is cooperative: cancelling the ambient context
+/// used by its timers can otherwise park the turn before it can answer.
+async fn run_rpc_turn<F, Fut>(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    turn: F,
+)
 where
-    F: Future + Send + 'static,
+    F: FnOnce(AgentCx) -> Fut,
+    Fut: Future<Output = ()>,
 {
-    let mut future = Box::pin(future);
-    std::future::poll_fn(move |poll_cx| {
-        let _guard = asupersync::Cx::set_current(Some(current_cx.clone()));
-        future.as_mut().poll(poll_cx)
-    })
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+    let supervisor = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+    let owner = {
+        // Preserve the client's budget and capability restrictions without
+        // sharing its cancellation bit. The supervisor retains a separate
+        // lifetime so it can deliver abort even while the work is pending.
+        let capabilities = client_cx.capabilities();
+        let mut mask = CapMask::all();
+        for (allowed, restriction) in [
+            (
+                capabilities.spawn,
+                CapSet::<false, true, true, true, true>::MASK,
+            ),
+            (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
+            (
+                capabilities.entropy,
+                CapSet::<true, true, false, true, true>::MASK,
+            ),
+            (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
+            (
+                capabilities.remote,
+                CapSet::<true, true, true, true, false>::MASK,
+            ),
+        ] {
+            if !allowed {
+                mask = mask.intersect(restriction);
+            }
+        }
+        let _owner = runtime
+            .request_cx_with_budget(client_cx.budget())
+            .set_current_restricted();
+        let _restriction = asupersync::Cx::push_restriction(mask);
+        AgentCx::for_current_or_request()
+    };
+    let future = owner.with_current(turn(owner.clone()));
+    supervisor
+        .with_current(async {
+            let cancellation = async {
+                loop {
+                    if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                        retry_abort.store(true, Ordering::SeqCst);
+                        if let Ok(guard) =
+                            OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await
+                            && let Some(handle) = guard.as_ref()
+                        {
+                            handle.abort();
+                        }
+                        break;
+                    }
+                    supervisor.time().sleep(Duration::from_millis(25)).await;
+                }
+            };
+            futures::pin_mut!(cancellation, future);
+            if let futures::future::Either::Left(((), pending_turn)) =
+                futures::future::select(cancellation, future).await
+            {
+                // Never drop the turn to cancel it: completed tool effects
+                // still need to reach the durable transcript, and the client
+                // still owns an accepted prompt awaiting agent_end.
+                pending_turn.await;
+            }
+        })
+        .await;
 }
 
 fn normalize_command_type(command_type: &str) -> &str {
@@ -1161,18 +1227,10 @@ impl Drop for ClearFlagOnDrop {
 /// channel send, so this fires on every path that actually drops the future —
 /// panic/unwind and runtime teardown included.
 ///
-/// WHAT THIS DOES NOT COVER, measured rather than assumed: when the task's
-/// ambient region becomes cancel-requested, asupersync 0.5 stops polling the
-/// task at its next `.await` WITHOUT dropping it. The future stays alive and
-/// unpolled, so no destructor runs and this guard never fires. Probing
-/// `rpc_prompt_command_inherits_cancelled_context_from_run` showed the retry
-/// delay loop tick exactly once, await, and never be scheduled again — no
-/// further ticks, no drop. Handing a fresh `AgentCx::for_request()` to the
-/// individual awaits does not rescue it either, because the region that stops
-/// the task is the task's own, established at spawn, not the one passed to an
-/// awaited call. Fixing that case needs the turn to stop being spawned inside
-/// the client's cancel region, with cancellation delivered through the
-/// `retry_abort` flag and `AbortHandle` that already exist for it.
+/// `run_rpc_turn` separately handles client cancellation with an independent
+/// ambient owner and cooperative abort signals. A destructor cannot recover a
+/// future parked in a cancelled timer or lock, so this guard remains a backstop
+/// for actual drops and unwinding rather than the normal cancellation path.
 struct TerminalAgentEndOnDrop {
     out_tx: std::sync::mpsc::SyncSender<String>,
     cx: AgentCx,
@@ -2500,6 +2558,9 @@ pub async fn run(
                     continue;
                 }
 
+                // Reset cancellation before ACK; a client may abort as soon as
+                // it sees acceptance, before the spawned turn is first polled.
+                retry_abort.store(false, Ordering::SeqCst);
                 // Acknowledge only after all pre-turn fallible transitions.
                 let _ = out_tx.send(response_ok(id, "prompt", None));
 
@@ -2515,15 +2576,19 @@ pub async fn run(
                 let runtime_handle = options.runtime_handle.clone();
                 if let Some((command_name, args)) = extension_command {
                     let command_runtime = runtime_handle.clone();
-                    let command_cx = cx.clone();
+                    let retry_abort = Arc::clone(&retry_abort);
                     let command_output = output.for_turn();
-                    runtime_handle.spawn(future_with_current_cx(
-                        command_cx.cx().clone(),
-                        async move {
+                    runtime_handle.spawn(run_rpc_turn(
+                        runtime_handle.clone(),
+                        cx.clone(),
+                        Arc::clone(&retry_abort),
+                        Arc::clone(&abort_handle_slot),
+                        move |command_cx| async move {
                             run_extension_command(
                                 session,
                                 is_streaming,
                                 abort_handle_slot,
+                                retry_abort,
                                 out_tx,
                                 command_runtime,
                                 command_name,
@@ -2538,10 +2603,12 @@ pub async fn run(
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
                     let expanded = options.resources.expand_input(&message);
-                    let prompt_cx = cx.clone();
-                    runtime_handle.spawn(future_with_current_cx(
-                        prompt_cx.cx().clone(),
-                        async move {
+                    runtime_handle.spawn(run_rpc_turn(
+                        runtime_handle.clone(),
+                        cx.clone(),
+                        Arc::clone(&retry_abort),
+                        Arc::clone(&abort_handle_slot),
+                        move |prompt_cx| async move {
                             run_prompt_with_retry(
                                 session,
                                 shared_state,
@@ -2641,6 +2708,7 @@ pub async fn run(
                     continue;
                 }
 
+                retry_abort.store(false, Ordering::SeqCst);
                 let _ = out_tx.send(response_ok(id, "steer", None));
 
                 is_streaming.store(true, Ordering::SeqCst);
@@ -2656,25 +2724,30 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                let prompt_cx = cx.clone();
-                runtime_handle.spawn(future_with_current_cx(prompt_cx.cx().clone(), async move {
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        turn_phase_linearizer,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Some(message),
-                        attachments,
-                        prompt_cx,
-                    )
-                    .await;
-                }));
+                runtime_handle.spawn(run_rpc_turn(
+                    runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle_slot),
+                    move |prompt_cx| async move {
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            turn_phase_linearizer,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            expanded,
+                            Some(message),
+                            attachments,
+                            prompt_cx,
+                        )
+                        .await;
+                    },
+                ));
             }
 
             "follow_up" => {
@@ -2757,6 +2830,7 @@ pub async fn run(
                     continue;
                 }
 
+                retry_abort.store(false, Ordering::SeqCst);
                 let _ = out_tx.send(response_ok(id, "follow_up", None));
 
                 is_streaming.store(true, Ordering::SeqCst);
@@ -2772,28 +2846,34 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                let prompt_cx = cx.clone();
-                runtime_handle.spawn(future_with_current_cx(prompt_cx.cx().clone(), async move {
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        turn_phase_linearizer,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Some(message),
-                        attachments,
-                        prompt_cx,
-                    )
-                    .await;
-                }));
+                runtime_handle.spawn(run_rpc_turn(
+                    runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle_slot),
+                    move |prompt_cx| async move {
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            turn_phase_linearizer,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            expanded,
+                            Some(message),
+                            attachments,
+                            prompt_cx,
+                        )
+                        .await;
+                    },
+                ));
             }
 
             "abort" => {
+                retry_abort.store(true, Ordering::SeqCst);
                 let handle = abort_handle
                     .lock(&cx)
                     .await
@@ -4281,6 +4361,7 @@ pub async fn run(
                     UserContent::Text(text) => (text, Vec::new()),
                     UserContent::Blocks(blocks) => (String::new(), blocks),
                 };
+                retry_abort.store(false, Ordering::SeqCst);
                 let _ = out_tx.send(response_ok(
                     id,
                     "retry",
@@ -4300,10 +4381,13 @@ pub async fn run(
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
-                let prompt_cx = cx.clone();
-                options.runtime_handle.clone().spawn(future_with_current_cx(
-                    prompt_cx.cx().clone(),
-                    async move {
+                let runtime_handle = options.runtime_handle.clone();
+                runtime_handle.spawn(run_rpc_turn(
+                    runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle_slot),
+                    move |prompt_cx| async move {
                         run_prompt_with_retry(
                             session,
                             shared_state,
@@ -5208,6 +5292,14 @@ pub async fn run(
         }
     }
 
+    // EOF and client cancellation both drain accepted work. Cleanup must not
+    // inherit the cancelled receive context or its exhausted deadline.
+    let cx = AgentCx::from_cx(
+        options
+            .runtime_handle
+            .request_cx_with_budget(asupersync::Budget::INFINITE),
+    );
+
     // stdin has closed. No future ask_response frame can arrive, so dismiss
     // every pending picker before waiting for the in-flight turn to drain.
     // Otherwise a turn blocked in `ask` and this drain loop wait on each
@@ -5248,11 +5340,7 @@ pub async fn run(
         {
             break;
         }
-        let now = cx
-            .cx()
-            .timer_driver()
-            .map_or_else(wall_now, |timer| timer.now());
-        sleep(now, Duration::from_millis(25)).await;
+        cx.time().sleep(Duration::from_millis(25)).await;
     }
 
     // Explicitly shut down extension runtimes before the session drops.
@@ -5263,7 +5351,7 @@ pub async fn run(
         .ok()
         .and_then(|mut guard| guard.extensions.take());
     if let Some(ext) = extension_region {
-        ext.shutdown().await;
+        cx.with_current(ext.shutdown()).await;
     }
 
     let preservation_cx = AgentCx::for_request();
@@ -5788,10 +5876,12 @@ async fn run_prompt_with_retry(
     attachments: Vec<ContentBlock>,
     cx: AgentCx,
 ) {
-    retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
     let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
+    // The prompt was accepted before this task started. Cover its first
+    // await as well as provider execution, persistence and retry cleanup.
+    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
 
     let initial_state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await;
     let (provider_reentry_blocked, output) = match initial_state {
@@ -5804,6 +5894,7 @@ async fn run_prompt_with_retry(
                 "error": error.to_string(),
             });
             payload["errorHints"] = error_hints_value(&error);
+            terminal_guard.disarm();
             let _ = out_tx.send(event(&payload));
             return;
         }
@@ -5816,15 +5907,10 @@ async fn run_prompt_with_retry(
             "error": error.to_string(),
         });
         payload["errorHints"] = error_hints_value(&error);
+        terminal_guard.disarm();
         let _ = out_tx.send(event(&payload));
         return;
     }
-
-    // Armed for the whole turn: from here on the client has been told the
-    // prompt was accepted, so it is entitled to exactly one terminal frame no
-    // matter how this task ends. Both normal exits disarm it before sending
-    // their own.
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
 
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
@@ -5846,7 +5932,7 @@ async fn run_prompt_with_retry(
     let mut final_error_hints: Option<Value> = None;
 
     loop {
-        if retry_count > 0 && cx.checkpoint().is_err() {
+        if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
             final_error = Some("Retry aborted".to_string());
             final_error_hints = None;
             break;
@@ -5854,6 +5940,12 @@ async fn run_prompt_with_retry(
 
         let (abort_handle, abort_signal) = AbortHandle::new();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
+            // Cancellation may win while acquiring the slot, before the
+            // monitor can find this attempt's handle. Publish and recheck
+            // under the same lock so that handoff cannot lose an abort.
+            if retry_abort.load(Ordering::SeqCst) {
+                abort_handle.abort();
+            }
             *guard = Some(abort_handle);
         } else {
             final_error = Some("abort handle lock failed".to_string());
@@ -6756,6 +6848,7 @@ async fn run_extension_command(
     session: Arc<Mutex<AgentSession>>,
     is_streaming: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    retry_abort: Arc<AtomicBool>,
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     command_name: String,
@@ -6765,11 +6858,21 @@ async fn run_extension_command(
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
+    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
 
     let (abort_handle, abort_signal) = AbortHandle::new();
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
+        if retry_abort.load(Ordering::SeqCst) {
+            abort_handle.abort();
+        }
         *guard = Some(abort_handle);
     } else {
+        terminal_guard.disarm();
+        let _ = out_tx.send(event(&json!({
+            "type": "agent_end",
+            "messages": [],
+            "error": "abort handle lock failed",
+        })));
         is_streaming.store(false, Ordering::SeqCst);
         return;
     }
@@ -6787,32 +6890,39 @@ async fn run_extension_command(
                     "error": err.to_string(),
                 });
                 payload["errorHints"] = error_hints_value(&err);
+                terminal_guard.disarm();
                 let _ = out_tx.send(event(&payload));
                 is_streaming.store(false, Ordering::SeqCst);
                 return;
             }
         };
-        let extensions = guard
-            .extensions
-            .as_ref()
-            .map(|region| region.manager().clone());
-        let event_handler = rpc_agent_event_handler(
-            out_tx.clone(),
-            runtime_handle,
-            extensions,
-            Some(Arc::clone(&deferred_agent_end)),
-            false,
-            output.clone(),
-        );
-        guard
-            .execute_extension_command_with_abort(
-                &command_name,
-                &args,
-                EXTENSION_EVENT_TIMEOUT_MS,
-                Some(abort_signal),
-                event_handler,
-            )
-            .await
+        if abort_signal.is_aborted() {
+            // An extension with no pending idle actions can enter its JS
+            // command without otherwise observing the abort signal.
+            Err(Error::session("Retry aborted"))
+        } else {
+            let extensions = guard
+                .extensions
+                .as_ref()
+                .map(|region| region.manager().clone());
+            let event_handler = rpc_agent_event_handler(
+                out_tx.clone(),
+                runtime_handle,
+                extensions,
+                Some(Arc::clone(&deferred_agent_end)),
+                false,
+                output.clone(),
+            );
+            guard
+                .execute_extension_command_with_abort(
+                    &command_name,
+                    &args,
+                    EXTENSION_EVENT_TIMEOUT_MS,
+                    Some(abort_signal),
+                    event_handler,
+                )
+                .await
+        }
     };
 
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -6835,6 +6945,7 @@ async fn run_extension_command(
         payload["error"] = Value::String(err.to_string());
         payload["errorHints"] = error_hints_value(&err);
     }
+    terminal_guard.disarm();
     let _ = out_tx.send(event(&payload));
     is_streaming.store(false, Ordering::SeqCst);
 }
@@ -11883,6 +11994,125 @@ mod retry_tests {
 
     #[test]
     fn rpc_abort_retry_command_drives_retry_timeline_to_terminal_frames() {
+        run_rpc_retry_cancellation_case(false);
+    }
+
+    #[test]
+    fn rpc_prompt_command_inherits_cancelled_context_from_run() {
+        run_rpc_retry_cancellation_case(true);
+    }
+
+    #[test]
+    fn rpc_abort_before_first_turn_poll_never_enters_provider() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(FlakyProvider::new());
+            let session = Arc::new(Mutex::new(AgentSession::new(
+                Agent::new(
+                    provider.clone(),
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig::default(),
+                ),
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            )));
+            let options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+            let state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
+            let streaming = Arc::new(AtomicBool::new(true));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            run_prompt_with_retry(
+                session,
+                state,
+                Arc::clone(&streaming),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::Mutex::new(())),
+                Arc::new(Mutex::new(None)),
+                out_tx,
+                Arc::new(AtomicBool::new(true)),
+                options,
+                "accepted then immediately aborted".to_string(),
+                None,
+                Vec::new(),
+                AgentCx::for_request(),
+            )
+            .await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(!streaming.load(Ordering::SeqCst));
+            let terminal: Vec<Value> = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                .filter(|value: &Value| value["type"] == "agent_end")
+                .collect();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0]["error"], "Retry aborted");
+        });
+    }
+
+    #[test]
+    fn rpc_turn_keeps_client_capabilities_and_deadline_but_drains_after_cancel() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            let deadline = wall_now() + Duration::from_secs(30);
+            let client = handle.request_cx_with_budget(asupersync::Budget {
+                deadline: Some(deadline),
+                ..asupersync::Budget::INFINITE
+            });
+            let client = {
+                let _restriction = client
+                    .restrict::<asupersync::cx::cap::CapSet<true, true, true, false, true>>()
+                    .set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let expected_capabilities = client.capabilities();
+            assert!(!expected_capabilities.io);
+            let retry_abort = Arc::new(AtomicBool::new(false));
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let (entered, mut entry) = oneshot::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let finished_turn = Arc::clone(&finished);
+            let temp = tempfile::tempdir().expect("tempdir");
+            let forbidden_path = temp.path().join("must-not-write.txt");
+            let turn_path = forbidden_path.clone();
+            let task = handle.spawn(run_rpc_turn(
+                handle.clone(),
+                client.clone(),
+                Arc::clone(&retry_abort),
+                Arc::new(Mutex::new(Some(abort_handle))),
+                move |owner| async move {
+                    assert_eq!(owner.capabilities(), expected_capabilities);
+                    assert_eq!(
+                        AgentCx::for_current_or_request().budget().deadline,
+                        Some(deadline)
+                    );
+                    let error = owner.fs().write(turn_path, b"forbidden").await.unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    entered.send(owner.cx(), ()).expect("turn entered");
+                    abort_signal.wait().await;
+                    assert!(!owner.is_cancel_requested());
+                    owner.time().sleep(Duration::from_millis(1)).await;
+                    finished_turn.store(true, Ordering::SeqCst);
+                },
+            ));
+            entry.recv(AgentCx::for_request().cx()).await.expect("entry");
+            client.set_cancel_requested(true);
+            asupersync::time::timeout(wall_now(), Duration::from_secs(5), task)
+                .await
+                .expect("cancelled turn must drain");
+            assert!(retry_abort.load(Ordering::SeqCst));
+            assert!(finished.load(Ordering::SeqCst));
+            assert!(!forbidden_path.exists());
+        });
+    }
+
+    fn run_rpc_retry_cancellation_case(cancel_context: bool) {
         // Watchdog (bd-yqo76 hang policy). A hang here stalls the whole lib
         // test binary and every test scheduled after it, which is how the
         // original context-cancellation variant silently blocked the DSR test
@@ -11936,13 +12166,11 @@ mod retry_tests {
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
                 let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
 
-                // Keep an ambient context (run() and tools resolve
-                // for_current_or_request against it) but never cancel it:
-                // asupersync 0.5.0 parks a cancel-requested task without
-                // dropping it, so a context-cancelled turn can never emit
-                // terminal frames (bd-todkd, upstream scheduler contract).
-                // Cancellation arrives through the abort_retry wire command.
-                let _current = asupersync::Cx::set_current(Some(asupersync::Cx::for_testing()));
+                // Only the server inherits this context. The observing client
+                // retains a live timer so a cancellation regression fails at
+                // its deadline instead of also cancelling the test watchdog.
+                let server_cx = AgentCx::for_testing();
+                let cancel_cx = server_cx.clone();
 
                 let client_out_rx = Arc::clone(&out_rx);
                 let client = async move {
@@ -12018,18 +12246,18 @@ mod retry_tests {
                                     };
                                     timeline.push(kind.to_string());
                                     if kind == "auto_retry_start" && !abort_retry_sent {
-                                        // Cancel through the wire command path the
-                                        // production surface uses; context
-                                        // cancellation cannot reach this task
-                                        // (bd-todkd, asupersync 0.5.0 scheduler).
-                                        let abort_cx = asupersync::Cx::for_testing();
-                                        abort_tx
-                                            .send(
-                                                &abort_cx,
-                                                r#"{"id":"2","type":"abort_retry"}"#.to_string(),
-                                            )
-                                            .await
-                                            .expect("send abort_retry command");
+                                        if cancel_context {
+                                            cancel_cx.set_cancel_requested(true);
+                                        } else {
+                                            let abort_cx = asupersync::Cx::for_testing();
+                                            abort_tx
+                                                .send(
+                                                    &abort_cx,
+                                                    r#"{"id":"2","type":"abort_retry"}"#.to_string(),
+                                                )
+                                                .await
+                                                .expect("send abort_retry command");
+                                        }
                                         abort_retry_sent = true;
                                     }
                                     if kind == "agent_end" {
@@ -12094,9 +12322,22 @@ mod retry_tests {
 
                 let (server_result, ()) =
                 // Boxed: clippy::large_futures.
-                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
-                    .await;
+                futures::future::join(
+                    Box::pin(server_cx.with_current(run(agent_session, options, in_rx, out_tx))),
+                    client,
+                )
+                .await;
                 assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+                let remaining: Vec<Value> = out_rx
+                    .lock()
+                    .expect("output after drain")
+                    .try_iter()
+                    .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                    .collect();
+                assert!(
+                    remaining.iter().all(|value| value["type"] != "agent_end"),
+                    "cancellation must emit exactly one terminal frame: {remaining:?}",
+                );
             });
             let _ = done_tx.send(());
         });
@@ -12107,7 +12348,7 @@ mod retry_tests {
                 body.join().expect("test body thread panicked");
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                "rpc_prompt_command_inherits_cancelled_context_from_run hung for 120s: the \
+                "RPC cancellation (context={cancel_context}) hung for 120s: the \
                  cancelled context never reached the retry timeline, so the agent_end frame the \
                  client waits for was never emitted (bd-yqo76 hang policy)"
             ),
@@ -17929,6 +18170,79 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_aborted_extension_prompt_never_dispatches_its_command() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("abort-probe.mjs");
+            std::fs::write(
+                &entry,
+                r#"
+export default function init(pi) {
+    pi.registerCommand("abort-probe", {
+        handler: async () => {
+            throw new Error("abort-probe-command-entered");
+        }
+    });
+}
+"#,
+            )
+            .expect("write extension");
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], temp.path(), None, &[entry])
+                .await
+                .expect("enable extension");
+            let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+
+            // The first dispatch proves the fixture really enters JS. An
+            // abort recorded before the second dispatch must bypass it.
+            for aborted in [false, true] {
+                let streaming = Arc::new(AtomicBool::new(true));
+                let slot = Arc::new(asupersync::sync::Mutex::new(None));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    run_extension_command(
+                        Arc::clone(&session),
+                        Arc::clone(&streaming),
+                        Arc::clone(&slot),
+                        Arc::new(AtomicBool::new(aborted)),
+                        out_tx,
+                        handle.clone(),
+                        "abort-probe".to_string(),
+                        String::new(),
+                        AgentCx::for_request(),
+                        RpcOutput::default(),
+                    ),
+                )
+                .await
+                .expect("extension turn must finish");
+                assert!(!streaming.load(Ordering::SeqCst));
+                assert!(slot.try_lock().unwrap().is_none());
+                let terminal: Vec<Value> = out_rx
+                    .try_iter()
+                    .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                    .filter(|value: &Value| value["type"] == "agent_end")
+                    .collect();
+                assert_eq!(terminal.len(), 1);
+                let error = terminal[0]["error"].as_str().expect("terminal error");
+                if aborted {
+                    assert!(error.contains("Retry aborted"));
+                    assert!(!error.contains("abort-probe-command-entered"));
+                } else {
+                    assert!(error.contains("abort-probe-command-entered"));
+                }
+            }
+        });
+    }
+
+    #[test]
     fn rpc_busy_extension_command_rejects_follow_on_extension_prompt_without_blocking() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -21211,6 +21525,15 @@ export default function init(pi) {
 
     #[test]
     fn terminal_provider_error_preserves_follow_up_acknowledged_while_streaming() {
+        run_terminal_provider_preservation_case(false);
+    }
+
+    #[test]
+    fn cancelled_rpc_context_aborts_pending_provider_and_persists_accepted_input() {
+        run_terminal_provider_preservation_case(true);
+    }
+
+    fn run_terminal_provider_preservation_case(cancel_context: bool) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -21241,9 +21564,11 @@ export default function init(pi) {
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
             let out_rx = Arc::new(Mutex::new(out_rx));
-            let server = runtime_handle
-                // Boxed: clippy::large_futures.
-                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+            let server_cx = AgentCx::for_testing();
+            let cancel_cx = server_cx.clone();
+            let server = runtime_handle.spawn(async move {
+                Box::pin(server_cx.with_current(run(agent_session, options, in_rx, out_tx))).await
+            });
 
             let prompt = send_recv(
                 &in_tx,
@@ -21276,12 +21601,18 @@ export default function init(pi) {
             )
             .await;
             assert_ok(&follow_up, "follow_up");
-            drop(in_tx);
-
-            let release_cx = AgentCx::for_request();
-            release
-                .send(release_cx.cx(), ())
-                .expect("release terminal provider");
+            // Keep both channels open in the cancellation case. Neither EOF
+            // nor a released provider can accidentally make the turn finish.
+            let (open_input, unreleased_provider) = if cancel_context {
+                cancel_cx.set_cancel_requested(true);
+                (Some(in_tx), Some(release))
+            } else {
+                drop(in_tx);
+                release
+                    .send(AgentCx::for_request().cx(), ())
+                    .expect("release terminal provider");
+                (None, None)
+            };
 
             let terminal_event = loop {
                 let line = recv_line(&out_rx, "terminal provider completion")
@@ -21292,10 +21623,15 @@ export default function init(pi) {
                     break value;
                 }
             };
+            let expected_error = if cancel_context {
+                "abort"
+            } else {
+                "invalid API key from gated provider"
+            };
             assert!(
                 terminal_event["error"]
                     .as_str()
-                    .is_some_and(|error| error.contains("invalid API key from gated provider")),
+                    .is_some_and(|error| error.to_ascii_lowercase().contains(expected_error)),
                 "terminal error must remain observable: {terminal_event}"
             );
             let session_path = inner_session
@@ -21323,6 +21659,8 @@ export default function init(pi) {
                 durable_accepted_count, 1,
                 "terminal agent_end must follow durable accepted input"
             );
+            drop(open_input);
+            drop(unreleased_provider);
             server.await.expect("RPC server run");
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
