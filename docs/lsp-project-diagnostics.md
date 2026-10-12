@@ -50,8 +50,37 @@ opens or downloads automatically.
 The display defaults to 100 documents, capped at 1000, within a 200 KiB JSON
 budget. Native responses are separately limited to 8 MiB, 2048 document reports
 and 16,384 diagnostics. Exceeding a native limit is an explicit error, not partial
-success. Requests send no previous result IDs or partial-result token, and reject
-an `unchanged` report without a baseline.
+success. Requests send no previous result IDs and reject an `unchanged` report
+without a baseline.
+
+## Streamed server reports
+
+Requests include a fresh `partialResultToken`. A server may ignore it and return
+one complete report, or stream workspace fragments through matching `$/progress`
+notifications. Pi combines and validates the fragments before returning the same
+agent-visible result shape; no new tool argument is required.
+
+Progress alone is not completion. A streamed request must finish successfully
+with an empty terminal result (`null` or an object with an empty `items` array).
+A terminal response containing additional documents after streamed fragments is
+rejected rather than interpreted as a replacement or an extra batch. All
+fragments must contain `items` arrays of full document reports. Duplicate URIs,
+version mismatches and malformed diagnostics are rejected across the complete
+collection, not just within individual fragments.
+
+The 8 MiB encoded-byte allowance is cumulative across fragment values and the
+terminal result. At most 2048 matching progress fragments are retained, including
+empty fragments. Byte/count overflow and notification queue loss return
+`LSP_PARTIAL_RESULT`; neither can turn a missing fragment into a clean report.
+The existing document and diagnostic limits also apply across all fragments.
+
+Every retry gets a new token and discards the previous attempt's fragments.
+Late progress for a cancelled or abandoned attempt cannot enter its successor's
+collection. Snapshot readers share the notification router and do not steal
+fragments from the active request. Work-done progress and foreign tokens are
+not diagnostic data. Request failure, cancellation or timeout returns an error,
+not cached or partial success. Collected workspace data does not replace the
+push or per-document diagnostic caches.
 
 `timeout` covers server startup and response processing after the tool's workflow
 lane is acquired, capped at 120 seconds; zero uses the configured request default.
@@ -64,4 +93,5 @@ while waiting. Unversioned external disk changes still cannot be ruled out.
 Embedders with an initialized `pi::lsp::client::LspClient` can call
 `client.workspace_diagnostics(timeout).await`. It returns URI-sorted, validated
 full document reports without modifying the push or per-document diagnostic
-caches. The same cancellation, deadline, capability and response limits apply.
+caches. Streamed and nonstreamed servers use the same API. The same cancellation,
+deadline, capability and response limits apply.

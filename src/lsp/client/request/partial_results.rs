@@ -106,7 +106,9 @@ impl<'a> PartialOwner<'a> {
         let token = format!("pi-partial-{}", uuid::Uuid::new_v4());
         let mut inbox = LspClient::lock(&client.partial_results);
         if inbox.active.is_some() {
-            return Err(partial_error("another partial result still owns the request lane"));
+            return Err(partial_error(
+                "another partial result still owns the request lane",
+            ));
         }
         inbox.active = Some(Collection {
             token: token.clone(),
@@ -115,7 +117,11 @@ impl<'a> PartialOwner<'a> {
             failure: None,
         });
         drop(inbox);
-        Ok(Self { client, token, dropped_before })
+        Ok(Self {
+            client,
+            token,
+            dropped_before,
+        })
     }
 
     fn check(&self) -> Result<()> {
@@ -137,17 +143,30 @@ impl<'a> PartialOwner<'a> {
     }
 
     fn finish(self, result: &Value) -> Result<Vec<Value>> {
-        self.check()?;
-        let mut inbox = LspClient::lock(&self.client.partial_results);
-        let active = inbox
-            .active
-            .take()
-            .ok_or_else(|| partial_error("partial result ownership was retired"))?;
+        // Retire and inspect the SAME owned collection. Another snapshot
+        // caller must not fail/clear it between a check and a later take,
+        // turning a rejected stream into an empty successful collection.
+        let active = {
+            let mut inbox = LspClient::lock(&self.client.partial_results);
+            if inbox.active.as_ref().is_none_or(|active| active.token != self.token) {
+                return Err(partial_error("partial result ownership was retired"));
+            }
+            inbox
+                .active
+                .take()
+                .ok_or_else(|| partial_error("partial result ownership was retired"))?
+        };
+        if self.client.rpc.dropped_notifications() != self.dropped_before {
+            return Err(partial_error("notifications were lost during the request"));
+        }
+        if let Some(reason) = active.failure {
+            return Err(partial_error(reason));
+        }
         // The terminal response shares the fragments' byte budget. Do not
         // allow N bounded fragments plus another independently bounded result.
-        serde_json::to_writer(&mut ByteBudget(active.remaining_bytes), result)
-            .map_err(|_| partial_error("response and fragments exceeded the cumulative byte limit"))?;
-        drop(inbox);
+        serde_json::to_writer(&mut ByteBudget(active.remaining_bytes), result).map_err(|_| {
+            partial_error("response and fragments exceeded the cumulative byte limit")
+        })?;
         Ok(active.values)
     }
 }
@@ -155,7 +174,11 @@ impl<'a> PartialOwner<'a> {
 impl Drop for PartialOwner<'_> {
     fn drop(&mut self) {
         let mut inbox = LspClient::lock(&self.client.partial_results);
-        if inbox.active.as_ref().is_some_and(|active| active.token == self.token) {
+        if inbox
+            .active
+            .as_ref()
+            .is_some_and(|active| active.token == self.token)
+        {
             inbox.active = None;
         }
     }
@@ -172,14 +195,20 @@ impl LspClient {
         max_bytes: usize,
     ) -> Result<(Value, Vec<Value>)> {
         loop {
-            let lane = budget.acquire(&self.request_lane).await.map_err(Error::from)?;
+            let lane = budget
+                .acquire(&self.request_lane)
+                .await
+                .map_err(Error::from)?;
             budget.remaining().map_err(Error::from)?;
             let partials = PartialOwner::register(self, max_bytes)?;
             let mut attempt_params = params.clone();
-            let object = attempt_params
-                .as_object_mut()
-                .ok_or_else(|| partial_error("partial-result request parameters must be an object"))?;
-            object.insert("partialResultToken".to_string(), Value::String(partials.token.clone()));
+            let object = attempt_params.as_object_mut().ok_or_else(|| {
+                partial_error("partial-result request parameters must be an object")
+            })?;
+            object.insert(
+                "partialResultToken".to_string(),
+                Value::String(partials.token.clone()),
+            );
             // Declare the request after its owners so Drop cancels its pending
             // transport slot before retiring the inbox and releasing the lane.
             let mut call = Box::pin(self.call_once_in_lane(method, attempt_params, budget));
@@ -214,12 +243,18 @@ impl LspClient {
                     {
                         return Err(Error::from(error));
                     }
-                    budget.pause(WARMUP_RETRY_CADENCE).await.map_err(Error::from)?;
+                    budget
+                        .pause(WARMUP_RETRY_CADENCE)
+                        .await
+                        .map_err(Error::from)?;
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+mod wire_tests;
 
 #[cfg(test)]
 mod tests {
@@ -228,8 +263,10 @@ mod tests {
 
     fn collection(bytes: usize) -> Collection {
         Collection {
-            token: "owned".to_string(), values: Vec::new(),
-            remaining_bytes: bytes, failure: None,
+            token: "owned".to_string(),
+            values: Vec::new(),
+            remaining_bytes: bytes,
+            failure: None,
         }
     }
 
@@ -258,7 +295,10 @@ mod tests {
         assert!(active.failure.is_some());
         assert!(active.values.is_empty());
         active.accept(json!({"token":"owned","value":null}));
-        assert!(active.values.is_empty(), "a failed stream cannot repopulate its result");
+        assert!(
+            active.values.is_empty(),
+            "a failed stream cannot repopulate its result"
+        );
     }
 
     #[test]
