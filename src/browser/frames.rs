@@ -13,6 +13,9 @@ use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+mod targets;
+pub(super) use targets::Targets;
+
 const MAX_FRAMES: usize = 256;
 const MAX_DEPTH: usize = 32;
 
@@ -37,6 +40,7 @@ struct Identity {
     parent: Option<String>,
     loader: String,
     url: String,
+    session: String,
 }
 
 struct Frame {
@@ -51,6 +55,10 @@ struct Tree {
 
 impl Tree {
     fn parse(response: &Value) -> Result<Self> {
+        Self::parse_in_session(response, "")
+    }
+
+    fn parse_in_session(response: &Value, session: &str) -> Result<Self> {
         let root = response
             .get("frameTree")
             .filter(|value| value.is_object())
@@ -59,11 +67,11 @@ impl Tree {
             frames: BTreeMap::new(),
             order: Vec::new(),
         };
-        tree.visit(root, None, 0)?;
+        tree.visit(root, None, 0, session)?;
         Ok(tree)
     }
 
-    fn visit(&mut self, node: &Value, parent: Option<&str>, depth: usize) -> Result<()> {
+    fn visit(&mut self, node: &Value, parent: Option<&str>, depth: usize, session: &str) -> Result<()> {
         if depth > MAX_DEPTH || self.frames.len() >= MAX_FRAMES {
             return Err(error(
                 "browser frame tree exceeds its depth or frame-count limit",
@@ -104,6 +112,7 @@ impl Tree {
                     parent: parent.map(str::to_owned),
                     loader,
                     url,
+                    session: session.to_owned(),
                 },
                 name,
             },
@@ -116,10 +125,29 @@ impl Tree {
                 return Err(error("browser frame tree exceeds its frame-count limit"));
             }
             for child in children {
-                self.visit(child, Some(&id), depth + 1)?;
+                self.visit(child, Some(&id), depth + 1, session)?;
             }
         }
         Ok(())
+    }
+
+    /// Chromium's Page tree contains only local frames. A related iframe's
+    /// root has an external parentId, which must belong to its owning parent
+    /// session before that subtree may join this page's frame inventory.
+    fn append_remote(&mut self, response: &Value, link: &targets::Link) -> Result<()> {
+        let root = response.get("frameTree")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| error("iframe session returned no frame tree"))?;
+        let frame = &root["frame"];
+        if identifier(frame, "id", false)? != link.target {
+            return Err(error("iframe target does not match its root frame"));
+        }
+        let parent = identifier(frame, "parentId", false)?;
+        if self.frames.get(&parent).is_none_or(|frame| frame.identity.session != link.parent) {
+            return Err(error("iframe root is not owned by its attached parent session"));
+        }
+        let depth = self.path(&parent)?.len();
+        self.visit(root, Some(&parent), depth, &link.session)
     }
 
     fn path(&self, id: &str) -> Result<Vec<Identity>> {
@@ -139,6 +167,24 @@ impl Tree {
         path.reverse();
         Ok(path)
     }
+}
+
+async fn inventory(owner: &AgentCx, cdp: &mut Cdp) -> Result<Tree> {
+    let root = cdp.page_session_id()?.to_owned();
+    let links = targets::discover(owner, cdp).await?;
+    let generation = cdp.frame_targets.generation();
+    let response = cdp.frame_command(owner, &root, "Page.getFrameTree", json!({})).await?;
+    let mut tree = Tree::parse_in_session(&response, &root)?;
+    for link in &links {
+        let response = cdp.frame_command(owner, &link.session, "Page.getFrameTree", json!({})).await?;
+        tree.append_remote(&response, link)?;
+    }
+    // Never return a silently incomplete snapshot when a process swap or
+    // newly attached subtree races the collection of its component trees.
+    if cdp.frame_targets.generation() != generation {
+        return Err(error("iframe targets changed during discovery; use list_frames again"));
+    }
+    Ok(tree)
 }
 
 fn admit_path(path: &[Identity], allowlist: Option<&[String]>) -> Result<()> {
@@ -268,8 +314,7 @@ pub(super) async fn list(
     tab: &str,
     allowlist: Option<&[String]>,
 ) -> Result<ToolOutput> {
-    let response = cdp.command(owner, "Page.getFrameTree", json!({})).await?;
-    let tree = Tree::parse(&response)?;
+    let tree = inventory(owner, cdp).await?;
     let mut rows = Vec::with_capacity(tree.order.len());
     for id in &tree.order {
         let frame = &tree.frames[id];
@@ -278,6 +323,7 @@ pub(super) async fn list(
             "frame_id": id,
             "parent_id": frame.identity.parent,
             "is_main": frame.identity.parent.is_none(),
+            "out_of_process": frame.identity.session != cdp.page_session_id()?,
             "allowed": allowed,
             "url": allowed.then_some(frame.identity.url.as_str()),
             "name": allowed.then_some(frame.name.as_str()),
@@ -309,6 +355,90 @@ pub(super) async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_link(parent: &str, session: &str, target: &str) -> targets::Link {
+        let mut targets = Targets::default();
+        targets.observe(&json!({
+            "sessionId": parent, "method": "Target.attachedToTarget",
+            "params": {"sessionId": session, "waitingForDebugger": false,
+                "targetInfo": {"targetId": target, "type": "iframe"}},
+        }), Some(parent)).unwrap();
+        targets.ordered(parent).unwrap().remove(0)
+    }
+
+    fn remote_tree(id: &str, parent: &str, url: &str) -> Value {
+        let mut root = node(id, url);
+        root["frame"]["parentId"] = json!(parent);
+        json!({"frameTree": root})
+    }
+
+    #[test]
+    fn remote_subtrees_join_only_through_their_owning_frame_and_session() {
+        let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
+        let remote = remote_link("page", "remote-session", "remote");
+        let mut response = remote_tree("remote", "child", "https://other.example/");
+        response["frameTree"]["childFrames"] = json!([node("remote-local", "about:blank")]);
+        tree.append_remote(&response, &remote).unwrap();
+        let nested = remote_link("remote-session", "nested-session", "remote-nested");
+        tree.append_remote(
+            &remote_tree("remote-nested", "remote-local", "https://nested.example/"),
+            &nested,
+        ).unwrap();
+        let path = tree.path("remote-nested").unwrap();
+        assert_eq!(path.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            ["main", "child", "remote", "remote-local", "remote-nested"]);
+        assert_eq!(path[2].session, "remote-session");
+        assert_eq!(path[3].session, "remote-session");
+        assert_eq!(path[4].session, "nested-session");
+    }
+
+    #[test]
+    fn remote_roots_cannot_import_foreign_reparented_or_duplicate_frames() {
+        let link = remote_link("page", "remote-session", "remote");
+        for response in [
+            remote_tree("wrong-target", "child", "https://example.com"),
+            remote_tree("remote", "other-tab-frame", "https://example.com"),
+            remote_tree("remote", "remote", "https://example.com"),
+            json!({"frameTree": node("remote", "https://example.com")}),
+        ] {
+            let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
+            assert!(tree.append_remote(&response, &link).is_err());
+        }
+        let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
+        let response = remote_tree("remote", "child", "https://example.com");
+        let foreign = remote_link("foreign-session", "remote-session", "remote");
+        assert!(tree.append_remote(&response, &foreign).is_err());
+        tree.append_remote(&response, &link).unwrap();
+        assert!(tree.append_remote(&response, &link).is_err());
+    }
+
+    #[test]
+    fn remote_frames_keep_the_same_ancestor_url_policy() {
+        let mut source = tree();
+        source["frameTree"]["childFrames"][0]["frame"]["url"] =
+            json!("https://blocked.test/PRIVATE-CANARY");
+        let mut tree = Tree::parse_in_session(&source, "page").unwrap();
+        tree.append_remote(
+            &remote_tree("remote", "child", "https://example.com/allowed"),
+            &remote_link("page", "remote-session", "remote"),
+        ).unwrap();
+        let rules = vec!["example.com".to_owned()];
+        let error = admit_path(&tree.path("remote").unwrap(), Some(&rules)).unwrap_err();
+        assert!(!error.to_string().contains("PRIVATE-CANARY"));
+        assert!(admit_path(&tree.path("remote").unwrap(), None).is_ok());
+    }
+
+    #[test]
+    fn frame_count_budget_is_shared_across_process_trees() {
+        let mut tree = Tree::parse_in_session(&json!({"frameTree": node("main", "about:blank")}), "page").unwrap();
+        for i in 1..MAX_FRAMES {
+            let id = format!("remote-{i}");
+            let session = format!("session-{i}");
+            tree.append_remote(&remote_tree(&id, "main", "about:blank"), &remote_link("page", &session, &id)).unwrap();
+        }
+        assert_eq!(tree.frames.len(), MAX_FRAMES);
+        assert!(tree.append_remote(&remote_tree("overflow", "main", "about:blank"), &remote_link("page", "overflow", "overflow")).is_err());
+    }
 
     fn node(id: &str, url: &str) -> Value {
         json!({"frame":{"id":id,"loaderId":format!("loader-{id}"),"url":url}})

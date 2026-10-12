@@ -285,6 +285,7 @@ pub(super) struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     frame_scope: Option<frames::Scope>,
+    pub(super) frame_targets: frames::Targets,
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
     timeout_ms: u64,
@@ -338,6 +339,7 @@ impl Cdp {
             next_id: 0,
             session_id: None,
             frame_scope: None,
+            frame_targets: frames::Targets::default(),
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
             timeout_ms: 30_000,
@@ -375,6 +377,8 @@ impl Cdp {
                         self.loaded.insert((frame.into(), loader.into()));
                     }
                     self.record_download_event(&value)?;
+                    self.frame_targets
+                        .observe(&value, self.session_id.as_deref())?;
                     if value["method"] == "Inspector.targetCrashed" {
                         return Err(Error::tool("browser", "browser target crashed"));
                     }
@@ -401,18 +405,30 @@ impl Cdp {
         params: Value,
         page: bool,
     ) -> Result<u64> {
+        let session = if page {
+            Some(self.page_session_id()?.to_owned())
+        } else {
+            None
+        };
+        self.send_session_request(owner, method, params, session.as_deref())
+            .await
+    }
+
+    async fn send_session_request(
+        &mut self,
+        owner: &AgentCx,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+    ) -> Result<u64> {
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or_else(|| Error::tool("browser", "CDP request ID exhausted"))?;
         let id = self.next_id;
         let mut request = json!({"id": id, "method": method, "params": params});
-        if page {
-            request["sessionId"] = json!(
-                self.session_id
-                    .as_ref()
-                    .ok_or_else(|| Error::tool("browser", "no attached page"))?
-            );
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
         }
         self.socket
             .send(owner.cx(), Message::text(request.to_string()))
@@ -536,6 +552,61 @@ impl Cdp {
         self.call(owner, method, params, false).await
     }
 
+    pub(super) fn page_session_id(&self) -> Result<&str> {
+        self.session_id
+            .as_deref()
+            .filter(|session| {
+                !session.is_empty()
+                    && session.len() <= 256
+                    && !session.chars().any(char::is_control)
+            })
+            .ok_or_else(|| Error::tool("browser", "no attached page"))
+    }
+
+    /// Route to a live related frame without changing the page attachment.
+    /// Frame operations never accept dialogs implicitly. The outer operation
+    /// owns the deadline/cancellation and drops every attachment with the socket.
+    pub(super) async fn frame_command(
+        &mut self,
+        owner: &AgentCx,
+        session: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        if !self.frame_targets.admits(self.session_id.as_deref(), session) {
+            return Err(Error::tool("browser", "frame session is no longer attached"));
+        }
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("browser", "browser operation cancelled"))?;
+        let id = self
+            .send_session_request(owner, method, params, Some(session))
+            .await?;
+        for _ in 0..MAX_EVENTS {
+            let response = self.receive(owner).await?;
+            if !self.frame_targets.admits(self.session_id.as_deref(), session) {
+                return Err(Error::tool("browser", "frame detached during browser operation"));
+            }
+            if response["method"] == "Page.javascriptDialogOpening"
+                && response["sessionId"].as_str().is_some_and(|session| {
+                    self.frame_targets.admits(self.session_id.as_deref(), session)
+                })
+            {
+                return Err(Error::tool(
+                    "browser",
+                    "a dialog interrupted the frame operation; handle it explicitly",
+                ));
+            }
+            if let Some(result) = frame_command_result(&response, id, session)? {
+                return Ok(result);
+            }
+        }
+        Err(Error::tool(
+            "browser",
+            "too many CDP events without a frame command response",
+        ))
+    }
+
     pub(super) async fn pump_event(&mut self, owner: &AgentCx) -> Result<()> {
         self.receive(owner).await.map(|_| ())
     }
@@ -638,6 +709,32 @@ impl Cdp {
         }
         Ok(())
     }
+}
+
+fn frame_command_result(response: &Value, id: u64, session: &str) -> Result<Option<Value>> {
+    if response["id"].as_u64() != Some(id) {
+        return Ok(None);
+    }
+    if response["sessionId"].as_str() != Some(session) {
+        return Err(Error::tool(
+            "browser",
+            "CDP frame response has the wrong session identity",
+        ));
+    }
+    if response.get("error").is_some() {
+        // A remote diagnostic can contain page contents or credentials. It is
+        // not safe to echo it as a browser-tool error or treat it as a fallback.
+        return Err(Error::tool(
+            "browser",
+            "CDP frame command failed; refresh frames before retrying",
+        ));
+    }
+    response
+        .get("result")
+        .filter(|value| value.is_object())
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| Error::tool("browser", "CDP frame response has no object result"))
 }
 
 pub(super) fn evaluation_value(response: &Value) -> Result<Value> {
@@ -1017,6 +1114,25 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_responses_are_bound_to_both_request_and_session_without_payload_leaks() {
+        let response = json!({"id": 7, "sessionId": "child", "result": {"value": 42}});
+        assert_eq!(
+            frame_command_result(&response, 7, "child").unwrap(),
+            Some(json!({"value": 42}))
+        );
+        assert!(frame_command_result(&response, 8, "child").unwrap().is_none());
+        assert!(frame_command_result(&response, 7, "page").is_err());
+        for invalid in [
+            json!({"id": 7, "result": {}}),
+            json!({"id": 7, "sessionId": "child", "result": null}),
+            json!({"id": 7, "sessionId": "child", "error": {"message": "PRIVATE-CANARY"}}),
+        ] {
+            let error = frame_command_result(&invalid, 7, "child").unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+        }
+    }
 
     #[test]
     fn javascript_exceptions_and_unserializable_values_are_not_fake_successes() {
