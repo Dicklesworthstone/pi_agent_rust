@@ -77,6 +77,48 @@ pub struct IsoHandle {
     pub baseline: String,
 }
 
+impl IsoHandle {
+    /// Resolve a launch directory captured relative to the source repository.
+    /// Git does not materialize empty or ignored-only directories. Refuse such
+    /// a location instead of silently running the child at the repository root.
+    pub(crate) fn working_directory(&self, relative: &Path) -> Result<PathBuf> {
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(Error::tool(
+                "subagent",
+                "PI_ISO_CWD: captured working directory is not repository-relative",
+            ));
+        }
+        let root = self.path.canonicalize().map_err(|error| {
+            Error::tool(
+                "subagent",
+                format!("PI_ISO_CWD: cannot resolve isolated workspace: {error}"),
+            )
+        })?;
+        let cwd = root.join(relative).canonicalize().map_err(|error| {
+            Error::tool(
+                "subagent",
+                format!(
+                    "PI_ISO_CWD: requested working directory '{}' is absent from the captured workspace: {error}",
+                    relative.display()
+                ),
+            )
+        })?;
+        if !cwd.starts_with(&root) || !cwd.is_dir() {
+            return Err(Error::tool(
+                "subagent",
+                format!(
+                    "PI_ISO_CWD: requested working directory '{}' is not a directory inside the captured workspace",
+                    relative.display()
+                ),
+            ));
+        }
+        Ok(cwd)
+    }
+}
+
 /// The outcome of an isolated run.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +216,32 @@ pub(crate) fn isolation_root(repo_root: &Path) -> Result<PathBuf> {
         ));
     }
     snapshot::repository_root(repo_root)
+}
+
+/// Capture the physical package location before another task can rename a
+/// directory or retarget a source symlink. `repo_root` is the canonical root
+/// returned by [`isolation_root`]. Retries reuse this path with their baseline.
+pub(crate) fn relative_working_directory(repo_root: &Path, cwd: &Path) -> Result<PathBuf> {
+    let cwd = cwd.canonicalize().map_err(|error| {
+        Error::tool(
+            "subagent",
+            format!("PI_ISO_CWD: cannot resolve requested working directory: {error}"),
+        )
+    })?;
+    if !cwd.is_dir() {
+        return Err(Error::tool(
+            "subagent",
+            "PI_ISO_CWD: requested working directory is not a directory",
+        ));
+    }
+    cwd.strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            Error::tool(
+                "subagent",
+                "PI_ISO_CWD: requested working directory is outside the captured repository",
+            )
+        })
 }
 
 /// Immutable launch state shared by a parallel batch and its corrective retries.

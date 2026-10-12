@@ -41,7 +41,14 @@ use ownership::{HubLease, ProcessLease};
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCELLED: &str = "Parent cancellation propagated to child process.";
-type BaselineCapture = Result<Arc<IsoBaseline>, String>;
+
+#[derive(Clone)]
+struct TaskBaseline {
+    workspace: Arc<IsoBaseline>,
+    relative_cwd: PathBuf,
+}
+
+type BaselineCapture = Result<TaskBaseline, String>;
 
 pub(super) struct ChildRunner {
     cwd: PathBuf,
@@ -100,7 +107,7 @@ impl ChildRunner {
         concurrency: usize,
         on_update: Option<UpdateCallback>,
     ) -> Vec<SubagentResult> {
-        let baselines = self.capture_parallel_baselines(agents, &tasks);
+        let baselines = self.capture_baselines(agents, &tasks);
         let update = on_update.as_ref();
         let mut completed = stream::iter(tasks.into_iter().zip(baselines).enumerate())
             .map(|(index, (task, baseline))| async move {
@@ -137,7 +144,7 @@ impl ChildRunner {
     /// failures stay attached to their task; unrelated repositories can run.
     /// Reusing a captured failure also avoids quietly giving a later sibling a
     /// different baseline after the source changes during preparation.
-    fn capture_parallel_baselines(
+    fn capture_baselines(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
         tasks: &[SubagentTask],
@@ -147,7 +154,7 @@ impl ChildRunner {
         if !capabilities.io || !capabilities.spawn || !capabilities.time {
             return vec![None; tasks.len()];
         }
-        let mut roots = BTreeMap::<PathBuf, BaselineCapture>::new();
+        let mut roots = BTreeMap::<PathBuf, Result<Arc<IsoBaseline>, String>>::new();
         tasks
             .iter()
             .map(|task| {
@@ -164,12 +171,20 @@ impl ChildRunner {
                 }
                 let cwd = self.task_cwd(task);
                 if !cwd.is_dir() {
-                    return None;
+                    return Some(Err(format!(
+                        "PI_ISO_CWD: working directory does not exist: {}",
+                        cwd.display()
+                    )));
                 }
                 let root = match crate::worktree_iso::isolation_root(&cwd) {
                     Ok(root) => root,
                     Err(error) => return Some(Err(error.to_string())),
                 };
+                let relative_cwd =
+                    match crate::worktree_iso::relative_working_directory(&root, &cwd) {
+                        Ok(relative) => relative,
+                        Err(error) => return Some(Err(error.to_string())),
+                    };
                 if owner.checkpoint().is_err() || self.deadline.check().is_err() {
                     return None;
                 }
@@ -181,7 +196,11 @@ impl ChildRunner {
                                 .map(Arc::new)
                                 .map_err(|error| error.to_string())
                         })
-                        .clone(),
+                        .clone()
+                        .map(|workspace| TaskBaseline {
+                            workspace,
+                            relative_cwd,
+                        }),
                 )
             })
             .collect()
@@ -257,6 +276,17 @@ impl ChildRunner {
             },
             |(_, launch)| launch.clone(),
         );
+        // Serial tasks also capture once before launch. Their corrective retry
+        // must inherit the same package and files, even if a callback or another
+        // writer changes the parent directory after the first attempt.
+        let captured = if baseline.is_none() {
+            self.capture_baselines(agents, std::slice::from_ref(&task))
+                .pop()
+                .flatten()
+        } else {
+            None
+        };
+        let baseline = baseline.or(captured.as_ref());
         let mut attempt = self
             .run_child_process(
                 agent,
@@ -400,7 +430,9 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        if !cwd.is_dir() {
+        // Isolated tasks use the captured directory, which may no longer exist
+        // in the live parent after a queued sibling has run.
+        if !isolated && !cwd.is_dir() {
             attempt.result.fail(format!(
                 "Working directory does not exist: {}",
                 cwd.display()
@@ -428,18 +460,32 @@ impl ChildRunner {
             return attempt;
         }
         if isolated {
-            let isolated = match baseline {
-                Some(Ok(baseline)) => baseline.isolate(&attempt.result.task),
+            let baseline = match baseline {
+                Some(Ok(baseline)) => baseline,
                 Some(Err(error)) => {
                     attempt.result.fail(error.clone());
                     return attempt;
                 }
-                None => crate::worktree_iso::isolate(&cwd, &attempt.result.task),
+                None => {
+                    attempt.result.fail(
+                        "PI_ISO_CWD: isolated task has no captured launch directory".to_string(),
+                    );
+                    return attempt;
+                }
             };
-            match isolated {
+            match baseline.workspace.isolate(&attempt.result.task) {
                 Ok(handle) => {
-                    attempt.result.cwd.clone_from(&handle.path);
+                    let working_directory = handle.working_directory(&baseline.relative_cwd);
+                    // Retain the checkout even when its requested directory is
+                    // missing. The rejected task must never launch at its root.
                     attempt.isolation = Some((handle, mode));
+                    match working_directory {
+                        Ok(cwd) => attempt.result.cwd = cwd,
+                        Err(error) => {
+                            attempt.result.fail(error.to_string());
+                            return attempt;
+                        }
+                    }
                 }
                 Err(error) => {
                     attempt.result.fail(error.to_string());

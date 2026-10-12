@@ -452,6 +452,147 @@ fn initialize_git(root: &Path) {
 }
 
 #[test]
+fn isolated_serial_task_preserves_the_parents_package_directory() {
+    let script = format!(
+        "test \"$(cat tracked.txt)\" = 'package original' || exit 8\n\
+         printf 'package changed\\n' > tracked.txt\n{}",
+        emit(&[ended("package edit accepted", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    let package = tool.cwd.join("packages/api");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("tracked.txt"), "package original\n").unwrap();
+    let nested = SubagentTool::with_paths(
+        package.clone(),
+        tool.global_dir.clone(),
+        tool.child_binary.clone(),
+    );
+    let output = run(
+        &nested,
+        json!({"chain":[
+            {"agent":"worker","task":"edit this package","isolation":"worktree"}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let value = result(&output);
+    assert_eq!(value["iso"]["applied"], true);
+    assert!(Path::new(value["cwd"].as_str().unwrap()).ends_with("packages/api"));
+    assert_eq!(
+        std::fs::read_to_string(package.join("tracked.txt")).unwrap(),
+        "package changed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+        "original\n",
+        "a package-relative edit must not target the root file"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Drive queueing, symlink retargeting and schema retry through real children.
+fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
+    let script = format!(
+        "for assignment do :; done\n\
+         case \"$assignment\" in\n\
+         'Task: retarget source alias')\n\
+           mv selected selected-before\n\
+           ln -s packages/other selected\n{}\
+           exit 0 ;;\n\
+         esac\n\
+         test \"$(cat tracked.txt)\" = 'api original' || exit 8\n\
+         test ! -e rejected.txt || exit 9\n\
+         if [ -f \"$PI_CODING_AGENT_DIR/corrective-attempt\" ]; then\n\
+           printf 'accepted in api\\n' > accepted.txt\n{}\
+         else\n\
+           : > \"$PI_CODING_AGENT_DIR/corrective-attempt\"\n\
+           printf 'rejected in api\\n' > rejected.txt\n{}\
+         fi\n",
+        emit(&[ended("alias changed", "stop")]),
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    let package = tool.cwd.join("packages/api");
+    let other = tool.cwd.join("packages/other");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(package.join("tracked.txt"), "api original\n").unwrap();
+    std::fs::write(other.join("tracked.txt"), "other original\n").unwrap();
+    std::os::unix::fs::symlink("packages/api", tool.cwd.join("selected")).unwrap();
+    let output = run(
+        &tool,
+        json!({"concurrency":1,"tasks":[
+            {"agent":"worker","task":"retarget source alias"},
+            {"agent":"worker","task":"edit captured package","cwd":"selected",
+             "isolation":"worktree","schemaMode":"strict",
+             "outputSchema":{"type":"object","required":["accepted"]}}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let value = &output.details.as_ref().unwrap()["results"][1];
+    assert_eq!(value["schemaRetries"], 1);
+    assert_eq!(value["schemaValid"], true);
+    assert_eq!(value["data"]["accepted"], true);
+    assert_eq!(value["iso"]["applied"], true);
+    assert!(Path::new(value["cwd"].as_str().unwrap()).ends_with("packages/api"));
+    assert_eq!(
+        std::fs::read_to_string(package.join("accepted.txt")).unwrap(),
+        "accepted in api\n"
+    );
+    assert!(!package.join("rejected.txt").exists());
+    assert!(!other.join("accepted.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(other.join("tracked.txt")).unwrap(),
+        "other original\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(
+        std::fs::read_link(tool.cwd.join("selected")).unwrap(),
+        Path::new("packages/other")
+    );
+    let rejected = &value["preservedWorktrees"][0];
+    assert_eq!(rejected["applied"], false);
+    let kept = Path::new(rejected["worktreePath"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(kept.join("packages/api/rejected.txt")).unwrap(),
+        "rejected in api\n"
+    );
+}
+
+#[test]
+fn an_isolated_task_rejects_a_working_directory_absent_from_its_snapshot() {
+    let script = format!(
+        ": > \"$PI_CODING_AGENT_DIR/launched\"\n{}",
+        emit(&[ended("must not launch at the root", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    std::fs::create_dir_all(tool.cwd.join("packages/empty")).unwrap();
+    let output = run(
+        &tool,
+        json!({"chain":[
+            {"agent":"worker","task":"empty package","cwd":"packages/empty",
+             "isolation":"worktree"}
+        ]}),
+    );
+    assert!(output.is_error, "{output:?}");
+    let value = result(&output);
+    assert!(value["error"].as_str().unwrap().contains("PI_ISO_CWD"));
+    assert_eq!(value["iso"]["applied"], false);
+    assert_eq!(value["iso"]["applyMode"], "keep");
+    assert!(!tool.global_dir.join("launched").exists());
+    assert_eq!(
+        std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Force completion order through the real concurrency queue.
 fn parallel_worktree_writeback_follows_task_order_and_preserves_the_dirty_baseline() {
     let control = tempfile::tempdir().unwrap();
