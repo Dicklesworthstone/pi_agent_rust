@@ -257,9 +257,16 @@ enable-ansi-support = "0.3"
 # These are used exclusively by the interactive terminal front-end and are
 # gated behind the `tui` feature so SDK/library consumers can build the lib
 # with `--no-default-features` without pulling in the terminal stack.
-bubbletea = { package = "charmed-bubbletea", version = "0.2.0", optional = true }
+# bubbletea and bubbles are pinned to exactly 0.2.0. The 0.2.1..0.2.4 renderer
+# diffs only changed rows and overwrites the soft-wrapped tail of a line longer
+# than the terminal width, which hides the end of long classic-TUI status
+# lines (bd-charmed-bubbletea-024-wrapped-tail-drtao; pinned by
+# e2e_tui_share_rejects_public_argument_without_invoking_gh). A caret
+# requirement let a lockfile refresh move them to 0.2.4 once already
+# (bada02307). Lift the pin when a charmed_rust release fixes the renderer.
+bubbletea = { package = "charmed-bubbletea", version = "=0.2.0", optional = true }
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0", optional = true }
-bubbles = { package = "charmed-bubbles", version = "0.2.0", optional = true }
+bubbles = { package = "charmed-bubbles", version = "=0.2.0", optional = true }
 # 0.2.4 is the first release that re-pads table cells truncated at a
 # wide-char boundary (charmed_rust 4150912, GH #195).
 glamour = { package = "charmed-glamour", version = "0.2.4", optional = true }
