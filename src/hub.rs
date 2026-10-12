@@ -1255,14 +1255,15 @@ fn push_service_bytes(ring: &mut Ring, bytes: &[u8]) -> usize {
 fn write_service_artifact<W: Write>(artifact: &mut W, capture: &mut LogCapture, data: &[u8]) {
     capture.observed_bytes = capture.observed_bytes.saturating_add(data.len() as u64);
     let remaining = capture.byte_limit.saturating_sub(capture.retained_bytes);
-    let count = data.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+    let count = data
+        .len()
+        .min(usize::try_from(remaining).unwrap_or(usize::MAX));
     let mut offset = 0;
     while offset < count && capture.write_error.is_none() {
         match artifact.write(&data[offset..count]) {
             Ok(0) => {
-                capture.write_error = Some(
-                    "PI_HUB_LOG_WRITE_FAILED: artifact writer made no progress".to_string(),
-                );
+                capture.write_error =
+                    Some("PI_HUB_LOG_WRITE_FAILED: artifact writer made no progress".to_string());
             }
             Ok(written) => {
                 offset += written;
@@ -1274,7 +1275,9 @@ fn write_service_artifact<W: Write>(artifact: &mut W, capture: &mut LogCapture, 
             }
         }
     }
-    capture.dropped_bytes = capture.observed_bytes.saturating_sub(capture.retained_bytes);
+    capture.dropped_bytes = capture
+        .observed_bytes
+        .saturating_sub(capture.retained_bytes);
     capture.truncated = capture.dropped_bytes != 0;
 }
 
@@ -1954,7 +1957,9 @@ mod tests {
     fn capped_artifact_keeps_draining_and_observes_readiness_after_the_cap() {
         let prefix_len = SERVICE_LOG_BYTE_CAP + 8192;
         let tail = b"\nready-after-artifact-cap\nlast line";
-        let reader = std::io::repeat(b'x').take(prefix_len).chain(tail.as_slice());
+        let reader = std::io::repeat(b'x')
+            .take(prefix_len)
+            .chain(tail.as_slice());
         let mut output = Ring::new(8);
         output.watch_readiness(Some(
             regex::Regex::new("(?m)^ready-after-artifact-cap$").expect("regex"),

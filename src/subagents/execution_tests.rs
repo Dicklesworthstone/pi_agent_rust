@@ -673,7 +673,12 @@ fn parallel_worktree_writeback_follows_task_order_and_preserves_the_dirty_baseli
     assert_eq!(values[1]["task"], "second");
     assert_eq!(values[1]["status"], "failed");
     assert_eq!(values[1]["iso"]["applied"], false);
-    assert!(values[1]["error"].as_str().unwrap().contains("PI_ISO_CONFLICT"));
+    assert!(
+        values[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("PI_ISO_CONFLICT")
+    );
     assert_eq!(values[2]["task"], "queued");
     assert_eq!(values[2]["iso"]["applied"], true);
     assert_eq!(

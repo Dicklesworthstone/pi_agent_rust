@@ -1534,9 +1534,9 @@ async fn resolve_cli_session_workdir(
     cli.session = Some(session_path.clone());
     if let Some(target) = &cli.session_workdir {
         let target = invocation_path(target, invocation_cwd);
-        let (mut session, diagnostics) =
-            Session::open_with_diagnostics(&session_path).await?;
-        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
+        let (mut session, diagnostics) = Session::open_with_diagnostics(&session_path).await?;
+        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
+        {
             bail!(
                 "PI_SESSION_RECOVERY_DIAGNOSTICS: inspect this session with --session-audit before workdir recovery"
             );
@@ -2200,8 +2200,8 @@ async fn run(
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let mut session = startup_session
-        .ok_or_else(|| anyhow::anyhow!("Runtime session was not initialized"))?;
+    let mut session =
+        startup_session.ok_or_else(|| anyhow::anyhow!("Runtime session was not initialized"))?;
 
     let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
         &mut cli,
@@ -2518,9 +2518,8 @@ async fn run(
         Some(&foreign_rules),
         &config,
     )?;
-    let provider =
-        providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
-            .map_err(anyhow::Error::new)?;
+    let provider = providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
+        .map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
 
@@ -10420,17 +10419,22 @@ mod tests {
             fs::create_dir_all(caller.join(".pi")).expect("caller workspace");
             fs::create_dir_all(project.join(".pi")).expect("saved workspace");
             fs::create_dir(&global).expect("global configuration root");
-            fs::write(caller.join(".pi/settings.json"), r#"{"requestTimeoutSecs":99}"#)
-                .expect("caller config");
-            fs::write(project.join(".pi/settings.json"), r#"{"requestTimeoutSecs":23}"#)
-                .expect("saved config");
+            fs::write(
+                caller.join(".pi/settings.json"),
+                r#"{"requestTimeoutSecs":99}"#,
+            )
+            .expect("caller config");
+            fs::write(
+                project.join(".pi/settings.json"),
+                r#"{"requestTimeoutSecs":23}"#,
+            )
+            .expect("saved config");
             let path = caller.join("saved.jsonl");
             let original = saved_cli_workdir_fixture(&path, &project).await;
             let before = fs::read(&path).expect("original bytes");
             let process_cwd = std::env::current_dir().expect("process cwd");
-            let mut cli = cli::Cli::parse_from([
-                "pi", "--session", "saved.jsonl", "--continue", "--resume",
-            ]);
+            let mut cli =
+                cli::Cli::parse_from(["pi", "--session", "saved.jsonl", "--continue", "--resume"]);
             let saved = resolve_cli_session_workdir(&mut cli, &caller)
                 .await
                 .expect("resolve saved workspace")
@@ -10443,13 +10447,20 @@ mod tests {
             let config = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
                 .expect("selected project config");
             assert_eq!(config.request_timeout_secs, Some(23));
-            let loaded = Session::new(&cli, &config).await.expect("native session open");
-            saved.check_loaded_session(&loaded).expect("same original source");
+            let loaded = Session::new(&cli, &config)
+                .await
+                .expect("native session open");
+            saved
+                .check_loaded_session(&loaded)
+                .expect("same original source");
             assert_eq!(loaded.header.id, original.header.id);
             assert_eq!(loaded.header.cwd, original.header.cwd);
             assert_eq!(loaded.header.parent_session, original.header.parent_session);
             assert_eq!(fs::read(&path).expect("source after discovery"), before);
-            assert_eq!(std::env::current_dir().expect("unchanged process cwd"), process_cwd);
+            assert_eq!(
+                std::env::current_dir().expect("unchanged process cwd"),
+                process_cwd
+            );
         });
     }
 
@@ -10469,46 +10480,70 @@ mod tests {
                 .expect("metadata remains readable")
                 .expect("existing session");
             assert!(
-                saved.resolve_runtime_cwd(None).unwrap_err().to_string()
+                saved
+                    .resolve_runtime_cwd(None)
+                    .unwrap_err()
+                    .to_string()
                     .contains("PI_SESSION_WORKDIR_UNAVAILABLE")
             );
             assert_eq!(fs::read(&path).expect("unchanged source"), before);
 
             let mut cli = cli::Cli::parse_from([
-                "pi", "--session", "saved.jsonl", "--session-workdir", "replacement",
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "replacement",
             ]);
             let saved = resolve_cli_session_workdir(&mut cli, root.path())
                 .await
                 .expect("explicit attachment")
                 .expect("attached metadata");
             let cwd = replacement.canonicalize().expect("canonical replacement");
-            assert_eq!(saved.resolve_runtime_cwd(None).expect("attached runtime"), cwd);
+            assert_eq!(
+                saved.resolve_runtime_cwd(None).expect("attached runtime"),
+                cwd
+            );
             let reopened = Session::open(cli.session.as_deref().expect("selected source"))
                 .await
                 .expect("attachment was persisted before launch");
-            saved.check_loaded_session(&reopened).expect("fresh observation after save");
+            saved
+                .check_loaded_session(&reopened)
+                .expect("fresh observation after save");
             assert_eq!(reopened.header.id, original.header.id);
             assert_eq!(reopened.header.cwd, original.header.cwd);
-            assert_eq!(reopened.header.parent_session, original.header.parent_session);
+            assert_eq!(
+                reopened.header.parent_session,
+                original.header.parent_session
+            );
             assert_eq!(
                 serde_json::to_value(reopened.entries.first()).expect("reopened entry"),
                 serde_json::to_value(original.entries.first()).expect("original entry")
             );
-            let attachment = reopened.entries.iter().find_map(|entry| match entry {
-                pi::session::SessionEntry::Custom(custom)
-                    if custom.custom_type == pi::session_workdir::WORKDIR_BINDING_TYPE =>
-                {
-                    custom.data.as_ref()
-                }
-                _ => None,
-            }).expect("persisted attachment");
+            let attachment = reopened
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    pi::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == pi::session_workdir::WORKDIR_BINDING_TYPE =>
+                    {
+                        custom.data.as_ref()
+                    }
+                    _ => None,
+                })
+                .expect("persisted attachment");
             assert_eq!(attachment["originalCwd"], original.header.cwd);
             assert_eq!(attachment["previousCwd"], original.header.cwd);
             assert_eq!(attachment["cwd"], cwd.to_str().expect("UTF-8 replacement"));
 
             let attached_bytes = fs::read(&path).expect("attached bytes");
-            resolve_cli_session_workdir(&mut cli, root.path()).await.expect("idempotent attach");
-            assert_eq!(fs::read(&path).expect("after repeated attach"), attached_bytes);
+            resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("idempotent attach");
+            assert_eq!(
+                fs::read(&path).expect("after repeated attach"),
+                attached_bytes
+            );
         });
     }
 
@@ -10520,19 +10555,41 @@ mod tests {
             saved_cli_workdir_fixture(&path, root.path()).await;
             let before = fs::read(&path).expect("original bytes");
             let mut cli = cli::Cli::parse_from([
-                "pi", "--session", "saved.jsonl", "--session-workdir", "missing",
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "missing",
             ]);
-            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.is_err());
-            assert_eq!(fs::read(&path).expect("source after rejected target"), before);
-            let mut cli = cli::Cli::parse_from([
-                "pi", "--session", "new.jsonl", "--session-workdir", ".",
-            ]);
-            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.is_err());
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&path).expect("source after rejected target"),
+                before
+            );
+            let mut cli =
+                cli::Cli::parse_from(["pi", "--session", "new.jsonl", "--session-workdir", "."]);
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .is_err()
+            );
             assert!(!root.path().join("new.jsonl").exists());
 
             let mut cli = cli::Cli::parse_from(["pi", "--session", "new.jsonl"]);
-            assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.unwrap().is_none());
-            assert_eq!(cli.session.as_deref(), root.path().join("new.jsonl").to_str());
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                cli.session.as_deref(),
+                root.path().join("new.jsonl").to_str()
+            );
             assert!(!root.path().join("new.jsonl").exists());
         });
     }
@@ -10548,7 +10605,12 @@ mod tests {
                 vec!["pi", "--no-session", "--session", "missing.jsonl"],
             ] {
                 let mut cli = cli::Cli::parse_from(args);
-                assert!(resolve_cli_session_workdir(&mut cli, root.path()).await.unwrap().is_none());
+                assert!(
+                    resolve_cli_session_workdir(&mut cli, root.path())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
             assert!(!root.path().join("missing.jsonl").exists());
         });
@@ -10562,13 +10624,24 @@ mod tests {
             let mut original = saved_cli_workdir_fixture(&path, root.path()).await;
             let mut cli = cli::Cli::parse_from(["pi", "--session", "saved.jsonl"]);
             let saved = resolve_cli_session_workdir(&mut cli, root.path())
-                .await.unwrap().expect("saved observation");
+                .await
+                .unwrap()
+                .expect("saved observation");
             original.append_custom_entry("concurrent-update".to_owned(), Some(json!({"v": 1})));
-            original.save().await.expect("another writer updated the source");
+            original
+                .save()
+                .await
+                .expect("another writer updated the source");
             let loaded = Session::open(cli.session.as_deref().expect("selected source"))
-                .await.expect("native open sees latest source");
-            assert!(saved.check_loaded_session(&loaded).unwrap_err().to_string()
-                .contains("PI_SESSION_WORKDIR_SOURCE_CHANGED"));
+                .await
+                .expect("native open sees latest source");
+            assert!(
+                saved
+                    .check_loaded_session(&loaded)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_SESSION_WORKDIR_SOURCE_CHANGED")
+            );
         });
     }
 

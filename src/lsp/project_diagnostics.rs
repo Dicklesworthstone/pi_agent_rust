@@ -372,7 +372,10 @@ while True:
             ("malformed", "LSP_WORKSPACE_DIAGNOSTIC_REPORT"),
             ("streamed_error", "analysis failed after progress"),
             ("streamed_duplicate", "duplicate document URIs"),
-            ("streamed_malformed", "workspace fragment must contain an items array"),
+            (
+                "streamed_malformed",
+                "workspace fragment must contain an items array",
+            ),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let Some(tool) = tool(temp.path(), mode) else {
@@ -426,7 +429,9 @@ while True:
             let Some(tool) = tool(temp.path(), mode) else {
                 return;
             };
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let output = runtime.block_on(tool.execute(
                 "streamed-project-test",
                 json!({"action":"project_diagnostics","file":"anchor.piproject","timeout":5,"limit":1}),

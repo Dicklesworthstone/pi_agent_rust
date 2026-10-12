@@ -260,7 +260,9 @@ impl AuthMigration {
                     return Vec::new();
                 }
             };
-            if let Err(err) = publish_private_migration_file(&agent_dir.join("auth.json"), &contents) {
+            if let Err(err) =
+                publish_private_migration_file(&agent_dir.join("auth.json"), &contents)
+            {
                 warnings.push(format!(
                     "could not write auth.json during migration; legacy credentials retained: {err}"
                 ));
@@ -288,14 +290,19 @@ impl AuthMigration {
                 .and_then(|()| fs::remove_file(&path))
                 .and_then(|()| sync_migration_directory(agent_dir));
             if let Err(err) = result {
-                warnings.push(format!("could not archive oauth.json after migration: {err}"));
+                warnings.push(format!(
+                    "could not archive oauth.json after migration: {err}"
+                ));
             }
         }
         self.providers.into_iter().collect()
     }
 }
 
-fn stage_private_migration_file(path: &Path, content: &str) -> std::io::Result<tempfile::NamedTempFile> {
+fn stage_private_migration_file(
+    path: &Path,
+    content: &str,
+) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write as _;
 
     let parent = path
@@ -314,7 +321,11 @@ fn publish_private_migration_file(path: &Path, content: &str) -> std::io::Result
     let staged = stage_private_migration_file(path, content)?;
     // A concurrent startup/login, existing directory, or dangling symlink
     // must not be overwritten, even if the earlier exists() check was false.
-    drop(staged.persist_noclobber(path).map_err(|error| error.error)?);
+    drop(
+        staged
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?,
+    );
     sync_migration_directory(path.parent().expect("staging checked parent"))
 }
 
@@ -327,7 +338,11 @@ fn require_unchanged_migration_file(path: &Path, original: &str) -> std::io::Res
     Ok(())
 }
 
-fn replace_unchanged_migration_file(path: &Path, original: &str, updated: &str) -> std::io::Result<()> {
+fn replace_unchanged_migration_file(
+    path: &Path,
+    original: &str,
+    updated: &str,
+) -> std::io::Result<()> {
     require_unchanged_migration_file(path, original)?;
     let staged = stage_private_migration_file(path, updated)?;
     require_unchanged_migration_file(path, original)?;
@@ -623,7 +638,10 @@ mod tests {
             fs::read_to_string(temp.path().join("auth.json")).unwrap(),
             current
         );
-        assert_eq!(fs::read(temp.path().join("settings.json")).unwrap(), settings);
+        assert_eq!(
+            fs::read(temp.path().join("settings.json")).unwrap(),
+            settings
+        );
         assert_eq!(fs::read(temp.path().join("oauth.json")).unwrap(), oauth);
         assert!(!warnings.is_empty());
     }
@@ -661,7 +679,10 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let migration = prepared_auth_migration(temp.path());
         let original = fs::read(temp.path().join("oauth.json")).unwrap();
-        write(&temp.path().join("oauth.json.migrated"), "old recovery copy");
+        write(
+            &temp.path().join("oauth.json.migrated"),
+            "old recovery copy",
+        );
         let mut warnings = Vec::new();
 
         assert_eq!(migration.commit(temp.path(), &mut warnings).len(), 2);
@@ -691,7 +712,10 @@ mod tests {
 
         assert!(super::migrate_auth_to_auth_json(temp.path(), &mut warnings).is_empty());
         assert_eq!(fs::read_link(&auth_path).unwrap(), target);
-        assert_eq!(fs::read(temp.path().join("settings.json")).unwrap(), settings);
+        assert_eq!(
+            fs::read(temp.path().join("settings.json")).unwrap(),
+            settings
+        );
         assert_eq!(fs::read(temp.path().join("oauth.json")).unwrap(), oauth);
         assert!(!temp.path().join("oauth.json.migrated").exists());
         assert!(!warnings.is_empty());

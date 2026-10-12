@@ -580,7 +580,11 @@ while True:
     let output = block_on_local(async {
         let call = with_hub_owner(
             &owner,
-            tool.execute("cancel-restart", json!({"op": "restart", "name": name}), None),
+            tool.execute(
+                "cancel-restart",
+                json!({"op": "restart", "name": name}),
+                None,
+            ),
         );
         let cancel = async {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -589,11 +593,8 @@ while True:
                     std::time::Instant::now() < deadline,
                     "restart must reach the old service's graceful shutdown"
                 );
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(),
-                    Duration::from_millis(10),
-                )
-                .await;
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
             }
             owner.cancel_with(
                 asupersync::types::CancelKind::User,
@@ -607,7 +608,10 @@ while True:
     .expect("hub cancellation is a domain result");
     assert!(output.is_error);
     assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
-    assert_eq!(std::fs::read_to_string(root.join("launch-count")).unwrap(), "1");
+    assert_eq!(
+        std::fs::read_to_string(root.join("launch-count")).unwrap(),
+        "1"
+    );
     let settled = pi::hub::describe(name).expect("old service settles");
     assert_eq!(settled.status, "killed");
     assert_eq!(settled.exit_code, Some(0));

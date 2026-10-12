@@ -156,7 +156,10 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
             )
             .await
             .expect("hashline edit over ssh");
-        assert_eq!(hashline_out.details.as_ref().unwrap()["contentGuarded"], true);
+        assert_eq!(
+            hashline_out.details.as_ref().unwrap()["contentGuarded"],
+            true
+        );
         assert_eq!(
             std::fs::read_to_string(&tags_remote).expect("spliced"),
             "l0\nappended\nl1\nl2\n"
@@ -190,8 +193,8 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         // unrelated lines that would pass the original replacement/anchor.
         logger.info(BEAD, "case=writeback-conflict begin");
         let guarded_url = url_for(&work, "out.txt");
-        let original = url_router::ssh_fetch_document(&guarded_url, 1024)
-            .expect("capture complete source");
+        let original =
+            url_router::ssh_fetch_document(&guarded_url, 1024).expect("capture complete source");
         let external = b"edited-over-ssh\nexternal addition\n";
         std::fs::write(work.join("out.txt"), external).expect("concurrent remote edit");
         let conflict = url_router::ssh_replace_document(
@@ -202,8 +205,8 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         .expect_err("writeback must preserve the concurrent edit");
         assert!(conflict.to_string().contains("PI_SSH_EDIT_CONFLICT"));
         assert_eq!(std::fs::read(work.join("out.txt")).unwrap(), external);
-        let refreshed = url_router::ssh_fetch_document(&guarded_url, 1024)
-            .expect("re-read after conflict");
+        let refreshed =
+            url_router::ssh_fetch_document(&guarded_url, 1024).expect("re-read after conflict");
         let updated = url_router::ssh_replace_document(
             &guarded_url,
             &refreshed,
@@ -220,7 +223,10 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         logger.info(BEAD, "case=edit-read-limit begin");
         let exact_url = url_for(&work, "limit.txt");
         std::fs::write(work.join("limit.txt"), b"1234").unwrap();
-        assert_eq!(url_router::ssh_fetch_document(&exact_url, 4).unwrap(), b"1234");
+        assert_eq!(
+            url_router::ssh_fetch_document(&exact_url, 4).unwrap(),
+            b"1234"
+        );
         std::fs::write(work.join("limit.txt"), vec![b'x'; 1024 * 1024]).unwrap();
         let oversized = url_router::ssh_fetch_document(&exact_url, 4)
             .expect_err("oversized source cannot become a partial edit input");

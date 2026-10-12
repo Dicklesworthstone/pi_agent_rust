@@ -1546,7 +1546,9 @@ impl PiApp {
             next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
         agent_guard.set_model_accepts_images(
-            next.model.input.contains(&crate::provider::InputType::Image),
+            next.model
+                .input
+                .contains(&crate::provider::InputType::Image),
         );
         let stream_options = agent_guard.stream_options_mut();
         stream_options.api_key.clone_from(&resolved_key_opt);
@@ -5400,7 +5402,10 @@ mod tests {
         let _ = app.handle_pi_message(terminal);
         assert!(matches!(app.agent_state, AgentState::Idle));
         assert_eq!(current_session_id(&app), original_id);
-        assert_eq!(std::fs::read(&path).expect("unchanged target"), original_bytes);
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged target"),
+            original_bytes
+        );
     }
 
     #[test]

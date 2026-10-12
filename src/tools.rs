@@ -190,12 +190,11 @@ impl ToolModelScope {
     }
 
     pub(crate) fn set(&self, provider: &str, model: &str) {
-        let selection = (!provider.trim().is_empty() && !model.trim().is_empty()).then(|| {
-            ToolModelSelection {
+        let selection =
+            (!provider.trim().is_empty() && !model.trim().is_empty()).then(|| ToolModelSelection {
                 provider: provider.to_string(),
                 model: model.to_string(),
-            }
-        });
+            });
         *self
             .current
             .lock()
@@ -9064,9 +9063,7 @@ impl Tool for HubTool {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = if op == "agent"
-            && crate::agent_hub::ipc::inherited_channel_present()
-        {
+        let dispatched = if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
             Self::dispatch_inherited_agent(&input).await
         } else if op == "agent"
             && input
@@ -9129,9 +9126,7 @@ impl HubTool {
             cursor: input.cursor,
         })
         .await?
-        .ok_or_else(|| {
-            Error::tool("hub", "PI_HUB_IPC_CONFIG: inherited channel is unavailable")
-        })?;
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_IPC_CONFIG: inherited channel is unavailable"))?;
         let (text, details) = Self::format_agent_reply(reply);
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(text))],
@@ -9140,9 +9135,7 @@ impl HubTool {
         })
     }
 
-    fn format_agent_reply(
-        reply: crate::agent_hub::ipc::Reply,
-    ) -> (String, serde_json::Value) {
+    fn format_agent_reply(reply: crate::agent_hub::ipc::Reply) -> (String, serde_json::Value) {
         use crate::agent_hub::ipc::Reply;
 
         match reply {
@@ -9169,7 +9162,9 @@ impl HubTool {
                     lines.join("\n"),
                 );
                 if truncated {
-                    text.push_str("\n[Roster exceeds the response limit; showing a bounded prefix.]");
+                    text.push_str(
+                        "\n[Roster exceeds the response limit; showing a bounded prefix.]",
+                    );
                 }
                 let details = serde_json::json!({
                     "schema": "pi.agent-hub.roster/v1",
@@ -9180,10 +9175,7 @@ impl HubTool {
                 (text, details)
             }
             Reply::Sent { message } => {
-                let text = format!(
-                    "Message queued for {} (seq {}).",
-                    message.to, message.seq,
-                );
+                let text = format!("Message queued for {} (seq {}).", message.to, message.seq,);
                 (text, serde_json::json!(message))
             }
             Reply::Inbox {
@@ -9354,8 +9346,7 @@ impl HubTool {
                 let name = name_required("stop")?;
                 let stop_name = name.clone();
                 let snapshot =
-                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name))
-                        .await?;
+                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name)).await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
                 Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
@@ -9376,8 +9367,7 @@ impl HubTool {
             "describe" => {
                 let name = name_required("describe")?;
                 let snapshot =
-                    crate::hub::run_service_request(move |_| crate::hub::describe(&name))
-                        .await?;
+                    crate::hub::run_service_request(move |_| crate::hub::describe(&name)).await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default(),

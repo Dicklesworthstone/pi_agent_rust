@@ -9,7 +9,10 @@ use pi::tools::Tool;
 use serde_json::{Value, json};
 
 async fn call(tool: &BrowserTool, args: Value) -> Value {
-    let result = tool.execute("remote-pointer-integration", args, None).await.unwrap();
+    let result = tool
+        .execute("remote-pointer-integration", args, None)
+        .await
+        .unwrap();
     assert!(!result.is_error);
     result.details.expect("browser details")
 }
@@ -34,7 +37,9 @@ fn live_remote_pointer_input_projects_transforms_scroll_and_rejects_parent_overl
             ..Default::default()
         })
         .with_domain_allowlist(Some(Vec::new()));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"pointer","url":"about:blank"})).await;
         let child = r#"<!doctype html><title>Remote pointer fixture</title>

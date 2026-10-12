@@ -124,7 +124,10 @@ impl Fixture {
         let (id, response) = self
             .client
             .rpc
-            .request("test/notifications", json!({"notifications": notifications}))
+            .request(
+                "test/notifications",
+                json!({"notifications": notifications}),
+            )
             .expect("notification batch request");
         self.runtime
             .block_on(crate::lsp::jsonrpc::await_completion(

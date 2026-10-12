@@ -692,7 +692,10 @@ mod tests {
             let options = StreamOptions {
                 api_key: None,
                 headers: std::collections::HashMap::from([
-                    ("authorization".to_string(), "Bearer worker-token".to_string()),
+                    (
+                        "authorization".to_string(),
+                        "Bearer worker-token".to_string(),
+                    ),
                     ("x-tenant".to_string(), "worker-tenant".to_string()),
                 ]),
                 max_tokens: Some(512),
@@ -729,9 +732,15 @@ mod tests {
             assert_eq!(options.headers["x-tenant"], "worker-tenant");
             assert_eq!(options.max_tokens, Some(512));
             assert_eq!(options.temperature, Some(0.25));
-            assert_eq!(options.thinking_level, Some(crate::model::ThinkingLevel::Low));
+            assert_eq!(
+                options.thinking_level,
+                Some(crate::model::ThinkingLevel::Low)
+            );
             assert_eq!(options.thinking_budgets.as_ref().expect("budgets").low, 128);
-            assert_eq!(options.cache_retention, crate::provider::CacheRetention::Long);
+            assert_eq!(
+                options.cache_retention,
+                crate::provider::CacheRetention::Long
+            );
             assert_eq!(options.session_id.as_deref(), Some("worker-session"));
             assert_eq!(options.prompt_cache_key.as_deref(), Some("worker-cache"));
             assert_eq!(options.service_tier.as_deref(), Some("priority"));

@@ -57,7 +57,9 @@ struct HttpPeer {
 
 impl HttpPeer {
     fn spawn(listener: TcpListener, body: &'static str) -> Self {
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
@@ -221,7 +223,8 @@ fn assert_loopback_route(expected: ExpectedRoute, configure: impl FnOnce(u16) ->
             let head = origin_head.expect("local model received the request");
             assert!(
                 !head.iter().any(|line| {
-                    line.to_ascii_lowercase().starts_with("proxy-authorization:")
+                    line.to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
                 }),
                 "proxy credentials must not reach the local model: {head:?}"
             );
@@ -229,7 +232,10 @@ fn assert_loopback_route(expected: ExpectedRoute, configure: impl FnOnce(u16) ->
         }
         ExpectedRoute::Proxy => {
             assert_eq!(body, "proxied-ok");
-            assert!(origin_head.is_none(), "the origin must not be dialed directly");
+            assert!(
+                origin_head.is_none(),
+                "the origin must not be dialed directly"
+            );
             let head = proxy_head.expect("proxy received the request");
             assert!(
                 head.iter()

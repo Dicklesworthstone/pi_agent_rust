@@ -738,7 +738,11 @@ mod structured_outbound_tests {
 
         let error = mask_known_json(&input, &vault).expect_err("ambiguous output must refuse");
 
-        assert!(error.to_string().contains("PI_SECRET_JSON_MASK_KEY_COLLISION"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SECRET_JSON_MASK_KEY_COLLISION")
+        );
         assert!(!error.to_string().contains(KEY));
         assert_eq!(input, original);
         assert_eq!(input["nested"].as_object().unwrap().len(), 2);

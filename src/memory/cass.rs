@@ -391,11 +391,7 @@ fn parse_output(
 }
 
 #[cfg(any(unix, test))]
-fn screen_hit(
-    raw: WireHit,
-    project_root: &Path,
-    screen: Screener<'_>,
-) -> Option<(CassHit, bool)> {
+fn screen_hit(raw: WireHit, project_root: &Path, screen: Screener<'_>) -> Option<(CassHit, bool)> {
     let workspace = raw.workspace?;
     // Validate identity on the raw path, before redaction can change it.
     // Do not canonicalize arbitrary paths supplied by another process. The
@@ -571,7 +567,10 @@ mod tests {
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].source_path, "/archive/agent-session.jsonl");
         assert_eq!(result.hits[0].line_number, Some(42));
-        assert_eq!(result.hits[0].provenance.source_id.as_deref(), Some("local"));
+        assert_eq!(
+            result.hits[0].provenance.source_id.as_deref(),
+            Some("local")
+        );
         assert_eq!(result.diagnostic, Some("CASS_RESULTS_FILTERED"));
         assert!(
             !serde_json::to_string(&result)
@@ -814,8 +813,7 @@ mod tests {
 
         #[test]
         fn real_subprocess_receives_scoped_read_only_flags_and_literal_query() {
-            let (directory, program) =
-                fixture("printf '%s\\n' \"$@\" > argv.txt\ncat result.json");
+            let (directory, program) = fixture("printf '%s\\n' \"$@\" > argv.txt\ncat result.json");
             let root = directory.path().canonicalize().unwrap();
             fs::write(
                 root.join("result.json"),
@@ -847,7 +845,11 @@ mod tests {
                 .find(|pair| pair[0] == "--fields")
                 .unwrap()[1];
             assert!(fields.split(',').any(|field| field == "content"));
-            assert!(!fields.split(',').any(|field| matches!(field, "snippet" | "title")));
+            assert!(
+                !fields
+                    .split(',')
+                    .any(|field| matches!(field, "snippet" | "title"))
+            );
             assert!(
                 arguments
                     .windows(2)

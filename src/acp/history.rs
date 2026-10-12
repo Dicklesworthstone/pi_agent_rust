@@ -6,8 +6,8 @@
 //! branches, and does not grant authority to historic tool calls.
 
 use super::{
-    AcpOptions, AcpOutput, AcpPermissionClient, AcpSessionsMap, AgentCx, INTERNAL_ERROR, INVALID_PARAMS,
-    PROMPT_IN_PROGRESS, SESSION_NOT_FOUND, build_acp_session, classify_tool_kind,
+    AcpOptions, AcpOutput, AcpPermissionClient, AcpSessionsMap, AgentCx, INTERNAL_ERROR,
+    INVALID_PARAMS, PROMPT_IN_PROGRESS, SESSION_NOT_FOUND, build_acp_session, classify_tool_kind,
     config_options_for, content, json_rpc_notification,
 };
 use crate::model::{ContentBlock, Message, UserContent};
@@ -296,7 +296,8 @@ pub(super) async fn send_line(out: &AcpOutput, mut line: String) -> HistoryResul
     timeout(wall_now(), Duration::from_secs(30), Box::pin(send))
         .await
         .map_err(|_| {
-            out.shared.fail("ACP client stalled during history delivery");
+            out.shared
+                .fail("ACP client stalled during history delivery");
             HistoryError::internal("ACP client stalled during history delivery")
         })?
 }
@@ -315,11 +316,7 @@ async fn send_update(out: &AcpOutput, id: &str, update: Value) -> HistoryResult<
 /// Use durable entries instead of provider context: compaction must not erase
 /// earlier turns from the editor's history. A rewind remains an explicit marker
 /// in this transcript; replay does not re-execute or restore its old effects.
-async fn replay_session(
-    session: &Session,
-    id: &str,
-    out: &AcpOutput,
-) -> HistoryResult<()> {
+async fn replay_session(session: &Session, id: &str, out: &AcpOutput) -> HistoryResult<()> {
     for entry in session.entries_for_current_path() {
         match entry {
             SessionEntry::Message(entry) => {
@@ -366,12 +363,7 @@ async fn replay_session(
     Ok(())
 }
 
-async fn replay_text(
-    kind: &str,
-    text: &str,
-    id: &str,
-    out: &AcpOutput,
-) -> HistoryResult<()> {
+async fn replay_text(kind: &str, text: &str, id: &str, out: &AcpOutput) -> HistoryResult<()> {
     send_update(
         out,
         id,
@@ -417,11 +409,7 @@ async fn replay_blocks(
     Ok(())
 }
 
-async fn replay_message(
-    message: &Message,
-    id: &str,
-    out: &AcpOutput,
-) -> HistoryResult<()> {
+async fn replay_message(message: &Message, id: &str, out: &AcpOutput) -> HistoryResult<()> {
     match message {
         Message::User(message) => {
             replay_user_content(&message.content, "user_message_chunk", id, out).await?

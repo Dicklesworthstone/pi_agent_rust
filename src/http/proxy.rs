@@ -873,7 +873,10 @@ mod tests {
                 ),
                 ("ALL_PROXY", resolve(None, &[("ALL_PROXY", &endpoint)])),
                 ("all_proxy", resolve(None, &[("all_proxy", &endpoint)])),
-                ("PI_HTTP_PROXY", resolve(None, &[("PI_HTTP_PROXY", &endpoint)])),
+                (
+                    "PI_HTTP_PROXY",
+                    resolve(None, &[("PI_HTTP_PROXY", &endpoint)]),
+                ),
             ];
             for (source, config) in configurations {
                 for (https, port) in [(false, 11434), (true, 443)] {

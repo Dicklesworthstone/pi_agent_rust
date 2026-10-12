@@ -37,8 +37,12 @@ struct Observed {
 }
 
 fn headers(socket: &mut TcpStream) -> String {
-    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         assert!(bytes.len() < 16384);
@@ -58,7 +62,10 @@ fn accept(listener: &TcpListener) -> TcpStream {
                 return socket;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "frame peer received no connection");
+                assert!(
+                    Instant::now() < deadline,
+                    "frame peer received no connection"
+                );
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => panic!("frame peer accept: {error}"),
@@ -70,7 +77,14 @@ fn read_frame(socket: &mut TcpStream) -> Option<Value> {
     let mut head = [0; 2];
     match socket.read_exact(&mut head) {
         Ok(()) => {}
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset) => return None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return None;
+        }
         Err(error) => panic!("frame peer receive: {error}"),
     }
     if head[0] & 0xf == 8 {
@@ -172,7 +186,10 @@ fn pointer_hit(session: &str, params: &Value, fault: Fault, observed: &mut Obser
     assert_eq!(params["ignorePointerEventsNone"], false);
     if session == "nested-session" {
         assert_eq!(params["x"], 105);
-        assert_eq!(params["y"], 920, "leaf hit test must include document scrolling");
+        assert_eq!(
+            params["y"], 920,
+            "leaf hit test must include document scrolling"
+        );
         return json!({"backendNodeId":123,"frameId":"nested"});
     }
     let (_, parent, backend) = pointer_owner(session);
@@ -197,7 +214,9 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
     let mut observed = Observed::default();
     let mut configured = std::collections::BTreeSet::new();
     for _ in 0..512 {
-        let Some(request) = read_frame(socket) else { return observed };
+        let Some(request) = read_frame(socket) else {
+            return observed;
+        };
         let method = request["method"].as_str().unwrap();
         let session = request["sessionId"].as_str().unwrap_or_default();
         let params = &request["params"];
@@ -221,14 +240,23 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 assert_eq!(params["autoAttach"], true);
                 assert_eq!(params["flatten"], true);
                 assert_eq!(params["waitForDebuggerOnStart"], false);
-                assert_eq!(params["filter"], json!([{"type":"iframe","exclude":false},{"exclude":true}]));
+                assert_eq!(
+                    params["filter"],
+                    json!([{"type":"iframe","exclude":false},{"exclude":true}])
+                );
                 if configured.insert(session.to_owned()) {
                     match session {
                         "page" => {
                             write_frame(socket, &attached("page", "remote-session", "remote"));
-                            write_frame(socket, &attached("other-page", "foreign-session", "foreign-frame"));
+                            write_frame(
+                                socket,
+                                &attached("other-page", "foreign-session", "foreign-frame"),
+                            );
                         }
-                        "remote-session" => write_frame(socket, &attached("remote-session", "nested-session", "nested")),
+                        "remote-session" => write_frame(
+                            socket,
+                            &attached("remote-session", "nested-session", "nested"),
+                        ),
                         "nested-session" => {}
                         _ => panic!("auto-attached unrelated target"),
                     }
@@ -236,9 +264,12 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 json!({})
             }
             "Page.getFrameTree" => {
-                let tree_fault = if fault == Fault::ProjectionNavigate && observed.projection_reads > 0 {
-                    Fault::Navigate
-                } else { fault };
+                let tree_fault =
+                    if fault == Fault::ProjectionNavigate && observed.projection_reads > 0 {
+                        Fault::Navigate
+                    } else {
+                        fault
+                    };
                 frame_tree(session, tree_fault, observed.worlds > 0)
             }
             "Page.createIsolatedWorld" => {
@@ -258,13 +289,21 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 };
                 observed.worlds += 1;
                 if fault == Fault::Detach {
-                    write_frame(socket, &json!({"method":"Target.detachedFromTarget",
-                        "sessionId":"remote-session","params":{"sessionId":"nested-session"}}));
+                    write_frame(
+                        socket,
+                        &json!({"method":"Target.detachedFromTarget",
+                        "sessionId":"remote-session","params":{"sessionId":"nested-session"}}),
+                    );
                     return observed;
                 }
                 json!({"executionContextId":context})
             }
-            "Runtime.evaluate" if params["expression"].as_str().unwrap().contains("innerWidth") => {
+            "Runtime.evaluate"
+                if params["expression"]
+                    .as_str()
+                    .unwrap()
+                    .contains("innerWidth") =>
+            {
                 let context = match session {
                     "nested-session" => 7,
                     "remote-session" => 8,
@@ -280,11 +319,18 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 assert_eq!(params["contextId"], 7);
                 observed.evaluations += 1;
                 if fault == Fault::WrongSession {
-                    write_frame(socket, &json!({"id":request["id"],"sessionId":"foreign-session",
-                        "result":{"result":{"value":"PRIVATE-CANARY"}}}));
+                    write_frame(
+                        socket,
+                        &json!({"id":request["id"],"sessionId":"foreign-session",
+                        "result":{"result":{"value":"PRIVATE-CANARY"}}}),
+                    );
                     return observed;
                 }
-                if params["expression"].as_str().unwrap().contains("location.href") {
+                if params["expression"]
+                    .as_str()
+                    .unwrap()
+                    .contains("location.href")
+                {
                     json!({"result":{"type":"object","value":{"url":"https://example.com/form","title":"Remote form"}}})
                 } else {
                     json!({"result":{"type":"string","value":"REMOTE-CANARY"}})
@@ -307,14 +353,21 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
             }
             "Runtime.callFunctionOn" => {
                 assert_eq!(session, "nested-session");
-                if params["functionDeclaration"].as_str().unwrap().contains("Document.prototype.querySelector") {
+                if params["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Document.prototype.querySelector")
+                {
                     assert_eq!(params["executionContextId"], 7);
                     json!({"result":{"type":"object","objectId":"field-handle"}})
                 } else {
                     assert_eq!(params["objectId"], "field-handle");
                     let result = if params["arguments"][0]["value"] == "verify_fill" {
-                        params["arguments"][1]["value"]["text"].as_str() == Some(observed.text.as_str())
-                    } else { true };
+                        params["arguments"][1]["value"]["text"].as_str()
+                            == Some(observed.text.as_str())
+                    } else {
+                        true
+                    };
                     json!({"result":{"type":"boolean","value":result}})
                 }
             }
@@ -341,13 +394,13 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 let (_, _, backend) = pointer_owner(session);
                 assert_eq!(params["backendNodeId"], backend);
                 let quad = if fault == Fault::BadGeometry {
-                    json!([0,0,100,100,0,100,100,0])
+                    json!([0, 0, 100, 100, 0, 100, 100, 0])
                 } else if session == "remote-session" {
-                    json!([100,50,500,50,500,350,100,350])
+                    json!([100, 50, 500, 50, 500, 350, 100, 350])
                 } else if matches!(fault, Fault::Fractional | Fault::GridOverlay) {
-                    json!([50.25,30.75,650.25,30.75,650.25,480.75,50.25,480.75])
+                    json!([50.25, 30.75, 650.25, 30.75, 650.25, 480.75, 50.25, 480.75])
                 } else {
-                    json!([50,30,650,30,650,480,50,480])
+                    json!([50, 30, 650, 30, 650, 480, 50, 480])
                 };
                 // Deliberately different border geometry detects use of the
                 // border box instead of the child viewport's content quad.
@@ -398,15 +451,21 @@ fn peer(fault: Fault) -> (String, thread::JoinHandle<Observed>) {
     let handle = thread::spawn(move || {
         let mut discovery = accept(&listener);
         assert!(headers(&mut discovery).starts_with("GET /json/version "));
-        let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/frames")}).to_string();
+        let body =
+            json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/frames")})
+                .to_string();
         write!(discovery, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         drop(discovery);
         let mut socket = accept(&listener);
         let request = headers(&mut socket);
-        let key = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-        }).unwrap();
+        let key = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .unwrap();
         let key = asupersync::net::websocket::compute_accept_key(key);
         write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {key}\r\n\r\n").unwrap();
         serve(&mut socket, fault)
@@ -419,10 +478,13 @@ fn run(fault: Fault, mut args: Value) -> (Result<ToolOutput>, Observed) {
     args["timeout_ms"] = json!(5000);
     let (endpoint, handle) = peer(fault);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false)
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
         .with_cdp_endpoint(endpoint)
         .with_domain_allowlist(Some(vec!["example.com".into()]));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let result = runtime.block_on(tool.execute("cross-process-frames", args, None));
     drop(tool);
     (result, handle.join().unwrap())
@@ -434,10 +496,23 @@ fn public_list_and_evaluation_follow_nested_owned_renderer_sessions() {
     let details = result.unwrap().details.unwrap();
     let frames = details["frames"].as_array().unwrap();
     assert_eq!(frames.len(), 4);
-    assert!(!frames.iter().any(|frame| frame["frame_id"] == "foreign-frame"));
-    assert_eq!(frames.iter().find(|frame| frame["frame_id"] == "nested").unwrap()["out_of_process"], true);
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame["frame_id"] == "foreign-frame")
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .find(|frame| frame["frame_id"] == "nested")
+            .unwrap()["out_of_process"],
+        true
+    );
     assert_eq!(observed.worlds, 0);
-    let (result, observed) = run(Fault::None, json!({"action":"evaluate","frame":"nested","script":"document.title"}));
+    let (result, observed) = run(
+        Fault::None,
+        json!({"action":"evaluate","frame":"nested","script":"document.title"}),
+    );
     assert_eq!(result.unwrap().details.unwrap()["result"], "REMOTE-CANARY");
     assert_eq!(observed.evaluations, 1);
     assert_eq!(observed.inputs, 0);
@@ -451,7 +526,10 @@ fn public_remote_snapshot_and_fill_use_the_selected_dom_not_the_root() {
     assert_eq!(details["snapshot"]["elements"][0]["text"], "Remote field");
     assert_eq!(details["frame_id"], "nested");
     let text = "  literal \"🦀\"  ";
-    let (result, observed) = run(Fault::None, json!({"action":"fill","frame":"nested","selector":"#field","text":text}));
+    let (result, observed) = run(
+        Fault::None,
+        json!({"action":"fill","frame":"nested","selector":"#field","text":text}),
+    );
     assert!(!result.unwrap().is_error);
     assert_eq!(observed.inputs, 1);
     assert_eq!(observed.text, text);
@@ -459,10 +537,16 @@ fn public_remote_snapshot_and_fill_use_the_selected_dom_not_the_root() {
 
 #[test]
 fn remote_wait_and_focused_keypress_keep_document_and_input_routes_separate() {
-    let (result, observed) = run(Fault::None, json!({"action":"wait_for","frame":"nested","selector":"#field"}));
+    let (result, observed) = run(
+        Fault::None,
+        json!({"action":"wait_for","frame":"nested","selector":"#field"}),
+    );
     assert_eq!(result.unwrap().details.unwrap()["found"], true);
     assert_eq!(observed.inputs, 0);
-    let (result, observed) = run(Fault::None, json!({"action":"press","frame":"nested","selector":"#field","key":"End"}));
+    let (result, observed) = run(
+        Fault::None,
+        json!({"action":"press","frame":"nested","selector":"#field","key":"End"}),
+    );
     assert!(!result.unwrap().is_error);
     assert!(observed.inputs > 0);
 }
@@ -470,18 +554,30 @@ fn remote_wait_and_focused_keypress_keep_document_and_input_routes_separate() {
 #[test]
 fn remote_navigation_detach_and_response_mixups_never_fall_back_to_main() {
     for fault in [Fault::Navigate, Fault::Detach, Fault::WrongSession] {
-        let (result, observed) = run(fault, json!({"action":"evaluate","frame":"nested","script":"document.title"}));
+        let (result, observed) = run(
+            fault,
+            json!({"action":"evaluate","frame":"nested","script":"document.title"}),
+        );
         let error = result.unwrap_err().to_string();
         assert!(!error.contains("PRIVATE-CANARY"));
-        assert_eq!(observed.evaluations, usize::from(fault == Fault::WrongSession));
+        assert_eq!(
+            observed.evaluations,
+            usize::from(fault == Fault::WrongSession)
+        );
         assert_eq!(observed.inputs, 0);
     }
 }
 
 #[test]
 fn blocked_ancestors_and_foreign_frames_are_rejected_before_entering_a_world() {
-    for (fault, frame) in [(Fault::BlockedAncestor, "nested"), (Fault::None, "foreign-frame")] {
-        let (result, observed) = run(fault, json!({"action":"evaluate","frame":frame,"script":"document.title"}));
+    for (fault, frame) in [
+        (Fault::BlockedAncestor, "nested"),
+        (Fault::None, "foreign-frame"),
+    ] {
+        let (result, observed) = run(
+            fault,
+            json!({"action":"evaluate","frame":frame,"script":"document.title"}),
+        );
         assert!(result.is_err());
         assert_eq!(observed.worlds, 0);
         assert_eq!(observed.evaluations, 0);
@@ -492,7 +588,10 @@ fn blocked_ancestors_and_foreign_frames_are_rejected_before_entering_a_world() {
 #[test]
 fn remote_pointer_actions_never_dispatch_unprojected_coordinates() {
     for action in ["click", "scroll"] {
-        let (result, observed) = run(Fault::None, json!({"action":action,"frame":"nested","selector":"#field","delta_y":50}));
+        let (result, observed) = run(
+            Fault::None,
+            json!({"action":action,"frame":"nested","selector":"#field","delta_y":50}),
+        );
         assert!(!result.unwrap().is_error);
         assert_eq!(observed.projection_reads, 3);
         assert_eq!(observed.ancestor_hits, 2);
@@ -512,12 +611,23 @@ fn remote_pointer_actions_never_dispatch_unprojected_coordinates() {
 
 #[test]
 fn remote_pointer_projection_refuses_occlusion_geometry_navigation_and_zoom() {
-    for fault in [Fault::Overlay, Fault::BadGeometry, Fault::ProjectionNavigate, Fault::Zoomed] {
+    for fault in [
+        Fault::Overlay,
+        Fault::BadGeometry,
+        Fault::ProjectionNavigate,
+        Fault::Zoomed,
+    ] {
         for action in ["click", "scroll"] {
-            let (result, observed) = run(fault, json!({"action":action,"frame":"nested","selector":"#field"}));
+            let (result, observed) = run(
+                fault,
+                json!({"action":action,"frame":"nested","selector":"#field"}),
+            );
             let error = result.unwrap_err().to_string();
             assert!(!error.contains("PRIVATE-CANARY"));
-            assert!(observed.projection_reads > 0, "reach the actual projection path");
+            assert!(
+                observed.projection_reads > 0,
+                "reach the actual projection path"
+            );
             assert_eq!(observed.inputs, 0);
         }
     }
@@ -525,11 +635,20 @@ fn remote_pointer_projection_refuses_occlusion_geometry_navigation_and_zoom() {
 
 #[test]
 fn fractional_projection_preserves_native_coordinates_and_checks_enclosing_pixels() {
-    let (result, observed) = run(Fault::Fractional, json!({"action":"click","frame":"nested","selector":"#field"}));
+    let (result, observed) = run(
+        Fault::Fractional,
+        json!({"action":"click","frame":"nested","selector":"#field"}),
+    );
     assert!(!result.unwrap().is_error);
     assert_eq!(observed.inputs, 2);
-    assert_eq!(observed.ancestor_hits, 5, "one inner hit plus four root grid points");
-    let (result, observed) = run(Fault::GridOverlay, json!({"action":"click","frame":"nested","selector":"#field"}));
+    assert_eq!(
+        observed.ancestor_hits, 5,
+        "one inner hit plus four root grid points"
+    );
+    let (result, observed) = run(
+        Fault::GridOverlay,
+        json!({"action":"click","frame":"nested","selector":"#field"}),
+    );
     assert!(result.unwrap_err().to_string().contains("occluded"));
     assert_eq!(observed.ancestor_hits, 5);
     assert_eq!(observed.inputs, 0);

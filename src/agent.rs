@@ -27,11 +27,11 @@ use crate::extension_events::{
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionCompactionOptions,
-    ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec, ExtensionManager,
-    ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle, ExtensionSendMessage,
-    ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
-    NativeRustExtensionRuntimeHandle, RepairPolicyMode, SessionActionOrigin,
-    SessionActionOriginSource, resolve_extension_load_spec,
+    ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec,
+    ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
+    ExtensionSendMessage, ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle, RepairPolicyMode,
+    SessionActionOrigin, SessionActionOriginSource, resolve_extension_load_spec,
 };
 #[cfg(feature = "wasm-host")]
 use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
@@ -4916,18 +4916,16 @@ impl Agent {
                     // Failures, refusals, and server-tool pauses must win over
                     // a stale success reason in the final message snapshot.
                     let terminal_override = match reason {
-                        StopReason::Error | StopReason::Aborted | StopReason::Refusal => !matches!(
-                            message.stop_reason,
-                            StopReason::Error | StopReason::Aborted
-                        ),
+                        StopReason::Error | StopReason::Aborted | StopReason::Refusal => {
+                            !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                        }
                         StopReason::PauseTurn => matches!(
                             message.stop_reason,
                             StopReason::Stop | StopReason::ToolUse | StopReason::Length
                         ),
-                        StopReason::Length => matches!(
-                            message.stop_reason,
-                            StopReason::Stop | StopReason::ToolUse
-                        ),
+                        StopReason::Length => {
+                            matches!(message.stop_reason, StopReason::Stop | StopReason::ToolUse)
+                        }
                         _ => false,
                     };
                     if terminal_override {
@@ -6616,7 +6614,11 @@ impl ExtensionCompactionModelState {
             entry.as_ref().map_or((provider_id, model_id), |entry| {
                 (entry.model.provider.as_str(), entry.model.id.as_str())
             });
-        if self.js_provider_ids.iter().any(|id| id == resolved_provider) {
+        if self
+            .js_provider_ids
+            .iter()
+            .any(|id| id == resolved_provider)
+        {
             return Err(Error::validation(
                 "compact: extension streamSimple models cannot be called from a compaction hook",
             ));
@@ -6628,13 +6630,9 @@ impl ExtensionCompactionModelState {
             .thinking_level
             .or(stream_options.thinking_level)
             .unwrap_or(crate::model::ThinkingLevel::High);
-        stream_options.thinking_level = Some(
-            entry
-                .as_ref()
-                .map_or(requested_thinking, |entry| {
-                    entry.clamp_thinking_level(requested_thinking)
-                }),
-        );
+        stream_options.thinking_level = Some(entry.as_ref().map_or(requested_thinking, |entry| {
+            entry.clamp_thinking_level(requested_thinking)
+        }));
         // The normal provider hook can itself be the extension awaiting this
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
@@ -6681,13 +6679,17 @@ impl ExtensionCompactionModelState {
     }
 
     fn has_registered_header_auth(entry: &ModelEntry, provider: &dyn Provider) -> bool {
-        if crate::provider_metadata::canonical_provider_id(provider.name()) == Some("github-copilot") {
+        if crate::provider_metadata::canonical_provider_id(provider.name())
+            == Some("github-copilot")
+        {
             // Copilot reports openai-completions but requires its own GitHub
             // token exchange before it can send a completion request.
             return false;
         }
         let names: &[&str] = match provider.api() {
-            "openai-completions" | "openai-responses" | "openai-codex-responses"
+            "openai-completions"
+            | "openai-responses"
+            | "openai-codex-responses"
             | "google-vertex" => &["authorization"],
             "anthropic-messages" => &["authorization", "x-api-key"],
             "azure-openai" => &["authorization", "api-key"],
@@ -9460,7 +9462,10 @@ mod extensions_integration_tests {
         assert_eq!(options.headers["x-target-route"], "target-only");
         assert!(!options.headers.contains_key("authorization"));
         assert_eq!(options.max_tokens, Some(2048));
-        assert_eq!(options.thinking_level, Some(crate::model::ThinkingLevel::Off));
+        assert_eq!(
+            options.thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
         assert_eq!(original.api_key.as_deref(), Some("source-provider-key"));
         assert_eq!(current.name(), "capturing-provider");
     }
@@ -9480,10 +9485,8 @@ mod extensions_integration_tests {
                     let mut entry =
                         compaction_override_entry("compaction-header", "summary-model", true);
                     entry.model.api = api.to_string();
-                    let headers = std::collections::HashMap::from([(
-                        header.to_string(),
-                        value.to_string(),
-                    )]);
+                    let headers =
+                        std::collections::HashMap::from([(header.to_string(), value.to_string())]);
                     if use_compat {
                         entry.compat = Some(crate::models::CompatConfig {
                             custom_headers: Some(headers),
@@ -9563,7 +9566,10 @@ mod extensions_integration_tests {
             },
         );
         let entry = compaction_override_entry("github-copilot", "copilot-summary", true);
-        assert!(entry.api_key.is_none(), "catalog intentionally has no credential");
+        assert!(
+            entry.api_key.is_none(),
+            "catalog intentionally has no credential"
+        );
         let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
         registry.merge_entries(vec![entry]);
         let state = ExtensionCompactionModelState {
@@ -9582,7 +9588,10 @@ mod extensions_integration_tests {
             )
             .expect("factory receives auth resolved after the catalog was loaded");
         assert_eq!(provider.name(), "github-copilot");
-        assert_eq!(options.api_key.as_deref(), Some("fresh-target-github-token"));
+        assert_eq!(
+            options.api_key.as_deref(),
+            Some("fresh-target-github-token")
+        );
     }
 
     #[test]
@@ -13406,7 +13415,12 @@ mod abort_tests {
                     .iter()
                     .map(|result| result.tool_call_id.as_str())
                     .collect::<Vec<_>>(),
-                ["read-complete", "read-error", "still-running", "never-started"],
+                [
+                    "read-complete",
+                    "read-error",
+                    "still-running",
+                    "never-started"
+                ],
             );
             assert!(!results[0].is_error);
             assert!(results[0].content.iter().any(|block| {
@@ -19094,7 +19108,10 @@ fn is_complete_tool_call(tool_call: &ToolCall) -> bool {
 ///
 /// Otherwise retain #148's incomplete-only detection. Malformed peers still
 /// present in the snapshot are refused by `terminal_tool_batch_error`.
-fn is_truncated_before_tool_call(message: &AssistantMessage, streamed_tool_call_count: usize) -> bool {
+fn is_truncated_before_tool_call(
+    message: &AssistantMessage,
+    streamed_tool_call_count: usize,
+) -> bool {
     if message.stop_reason != StopReason::Length {
         return false;
     }
@@ -20321,11 +20338,13 @@ mod tests {
                 for error_envelope in [false, true] {
                     let mut message = assistant_message("Partial provider answer");
                     message.error_message = Some("original provider diagnostic".to_string());
-                    message.content.push(ContentBlock::ToolCall(batch_write_call(
-                        "call",
-                        "target.txt",
-                        "must not execute",
-                    )));
+                    message
+                        .content
+                        .push(ContentBlock::ToolCall(batch_write_call(
+                            "call",
+                            "target.txt",
+                            "must not execute",
+                        )));
                     let event = if error_envelope {
                         StreamEvent::Error {
                             reason,
@@ -20425,11 +20444,13 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let target = temp.path().join("target.txt");
             let mut message = assistant_message("The server tool is still working");
-            message.content.push(ContentBlock::ToolCall(batch_write_call(
-                "server-call",
-                "target.txt",
-                "must not execute",
-            )));
+            message
+                .content
+                .push(ContentBlock::ToolCall(batch_write_call(
+                    "server-call",
+                    "target.txt",
+                    "must not execute",
+                )));
             let original_content = serde_json::to_value(&message.content).unwrap();
             let provider = Arc::new(TerminalBatchProvider {
                 events: vec![StreamEvent::Done {
@@ -20446,7 +20467,10 @@ mod tests {
             let result = agent.run("Apply the edit", |_| {}).await.unwrap();
             assert_eq!(result.stop_reason, StopReason::Stop);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-            assert!(!target.exists(), "server tool pauses cannot execute locally");
+            assert!(
+                !target.exists(),
+                "server tool pauses cannot execute locally"
+            );
             assert!(
                 !agent
                     .messages()
@@ -20483,11 +20507,13 @@ mod tests {
                     category: Some("provider-policy".to_string()),
                     explanation: Some("original provider explanation".to_string()),
                 });
-                message.content.push(ContentBlock::ToolCall(batch_write_call(
-                    "refused-call",
-                    "target.txt",
-                    "must not execute",
-                )));
+                message
+                    .content
+                    .push(ContentBlock::ToolCall(batch_write_call(
+                        "refused-call",
+                        "target.txt",
+                        "must not execute",
+                    )));
                 let mut expected = message.clone();
                 expected.stop_reason = StopReason::Refusal;
                 let provider = Arc::new(TerminalBatchProvider {
@@ -22467,11 +22493,17 @@ mod tests {
         assert_eq!(projected[1]["content"][0], original_json[1]["content"][0]);
         assert_eq!(projected[1]["usage"], original_json[1]["usage"]);
         assert_eq!(projected[2]["toolCallId"], "read-image");
-        assert_eq!(projected[2]["content"][1], serde_json::to_value(media).unwrap());
+        assert_eq!(
+            projected[2]["content"][1],
+            serde_json::to_value(media).unwrap()
+        );
         assert_eq!(projected[2]["details"], original_json[2]["details"]);
         assert_eq!(projected[3], original_json[3]);
         drop(context);
-        assert_eq!(serde_json::to_value(agent.messages()).unwrap(), original_json);
+        assert_eq!(
+            serde_json::to_value(agent.messages()).unwrap(),
+            original_json
+        );
 
         agent.set_model_accepts_images(true);
         assert_eq!(
@@ -22487,7 +22519,9 @@ mod tests {
         let tool = Arc::new(ToolResultMessage {
             tool_call_id: "text-tool".to_string(),
             tool_name: "read".to_string(),
-            content: vec![ContentBlock::Text(TextContent::new("unchanged tool result"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "unchanged tool result",
+            ))],
             details: None,
             is_error: false,
             timestamp: 0,
@@ -22531,12 +22565,30 @@ mod tests {
             content: UserContent::Blocks(vec![sample_image_block()]),
             timestamp: 0,
         }));
-        assert!(agent.build_context().messages.iter().any(message_has_images));
+        assert!(
+            agent
+                .build_context()
+                .messages
+                .iter()
+                .any(message_has_images)
+        );
         agent.set_provider(Arc::new(SilentProvider));
-        assert!(!agent.build_context().messages.iter().any(message_has_images));
+        assert!(
+            !agent
+                .build_context()
+                .messages
+                .iter()
+                .any(message_has_images)
+        );
         assert!(agent.messages().iter().any(message_has_images));
         agent.set_model_accepts_images(true);
-        assert!(agent.build_context().messages.iter().any(message_has_images));
+        assert!(
+            agent
+                .build_context()
+                .messages
+                .iter()
+                .any(message_has_images)
+        );
     }
 
     #[test]
@@ -22589,7 +22641,12 @@ mod tests {
                     ResolvedCompactionSettings::default(),
                 );
                 session
-                    .enable_extensions(&[], temp_dir.path(), None, std::slice::from_ref(&entry_path))
+                    .enable_extensions(
+                        &[],
+                        temp_dir.path(),
+                        None,
+                        std::slice::from_ref(&entry_path),
+                    )
                     .await
                     .expect("enable context extension");
                 session
@@ -22607,8 +22664,7 @@ mod tests {
                 let projected = serde_json::to_value(messages).unwrap();
                 let injected = projected.as_array().unwrap().last().unwrap();
                 assert_eq!(
-                    injected["content"][0]["text"],
-                    "context hook reached provider",
+                    injected["content"][0]["text"], "context hook reached provider",
                     "the extension must actually rewrite the provider context",
                 );
                 if let Some(placeholder) = placeholder {

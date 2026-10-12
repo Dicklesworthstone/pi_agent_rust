@@ -353,10 +353,8 @@ fn sdk_rpc_request_yields_and_cancelled_exchange_revokes_controls() {
     );
     let control = client.control_handle();
     let request = Box::pin(client.request("get_state", serde_json::Map::new()));
-    match futures::executor::block_on(futures::future::select(
-        request,
-        futures::future::ready(()),
-    )) {
+    match futures::executor::block_on(futures::future::select(request, futures::future::ready(())))
+    {
         futures::future::Either::Right(((), pending)) => drop(pending),
         futures::future::Either::Left((result, _)) => {
             panic!("an unanswered request blocked its executor: {result:?}");
@@ -384,10 +382,8 @@ fn sdk_rpc_stalled_stdin_write_yields_and_can_be_cancelled() {
     let mut payload = serde_json::Map::new();
     payload.insert("message".into(), json!("x".repeat(8 * 1024 * 1024)));
     let request = Box::pin(client.request("prompt", payload));
-    match futures::executor::block_on(futures::future::select(
-        request,
-        futures::future::ready(()),
-    )) {
+    match futures::executor::block_on(futures::future::select(request, futures::future::ready(())))
+    {
         futures::future::Either::Right(((), pending)) => drop(pending),
         futures::future::Either::Left((result, _)) => {
             panic!("a full stdin pipe blocked its executor: {result:?}");
@@ -616,9 +612,8 @@ fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
         for explicit_shutdown in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let tail = if root_exits { "exit 0" } else { "wait" };
-            let script = format!(
-                "sleep 30 </dev/null &\nprintf '%s %s' \"$$\" \"$!\" > pids\n{tail}"
-            );
+            let script =
+                format!("sleep 30 </dev/null &\nprintf '%s %s' \"$$\" \"$!\" > pids\n{tail}");
             let mut client = rpc_pipe_fixture(&script, Some(directory.path().to_path_buf()));
             let control = client.control_handle();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

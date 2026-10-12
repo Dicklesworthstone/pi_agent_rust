@@ -225,11 +225,7 @@ impl SettingsSnapshot {
 }
 
 const fn on_off(value: bool) -> &'static str {
-    if value {
-        "on"
-    } else {
-        "off"
-    }
+    if value { "on" } else { "off" }
 }
 
 pub(super) struct SettingsController {
@@ -348,13 +344,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        AgentSessionHandle::from_session_with_listeners(session, Default::default())
-            .with_retry(Some(RetryPolicy {
+        AgentSessionHandle::from_session_with_listeners(session, Default::default()).with_retry(
+            Some(RetryPolicy {
                 max_retries: 7,
                 max_failovers_per_turn: 2,
                 base_delay_ms: 17,
                 max_delay_ms: 333,
-            }))
+            }),
+        )
     }
 
     #[test]
@@ -401,8 +398,9 @@ mod tests {
             handle.session().agent.queue_modes(),
             (QueueMode::All, QueueMode::All)
         );
-        let loaded: Config = serde_json::from_str(&std::fs::read_to_string(path).expect("saved file"))
-            .expect("valid saved config");
+        let loaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("saved file"))
+                .expect("valid saved config");
         assert!(loaded.retry_enabled());
         assert!(loaded.compaction_enabled());
         assert_eq!(loaded.steering_queue_mode(), QueueMode::All);
@@ -458,7 +456,10 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("saved settings"))
                 .expect("JSON");
-        assert_eq!(raw, serde_json::json!({ "images": { "auto_resize": false } }));
+        assert_eq!(
+            raw,
+            serde_json::json!({ "images": { "auto_resize": false } })
+        );
         let loaded: Config = serde_json::from_value(raw).expect("reload saved configuration");
         assert!(!loaded.image_auto_resize());
     }
@@ -585,7 +586,9 @@ mod tests {
             (SettingsKey::DoubleEscape, "fork"),
             (SettingsKey::AutocompleteRows, "15"),
         ] {
-            settings.apply(&mut handle, key, value).expect("save setting");
+            settings
+                .apply(&mut handle, key, value)
+                .expect("save setting");
         }
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("saved")).expect("JSON");

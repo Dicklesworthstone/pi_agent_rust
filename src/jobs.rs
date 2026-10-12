@@ -1908,7 +1908,8 @@ mod windows_job_pipe {
                 self.reactor.check()?;
                 match self.pipe.read(buffer) {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
                             return Err(error);
                         };
                         progress = state
@@ -3582,7 +3583,9 @@ mod tests {
         let mut pump = Some(std::thread::spawn(move || {
             pump_job_stream(reader, &pump_artifact, &pump_tail, &pump_sealed)
         }));
-        writer.write_all(&[b'b'; 128]).expect("output beyond artifact cap");
+        writer
+            .write_all(&[b'b'; 128])
+            .expect("output beyond artifact cap");
         writer.write_all(b"before-seal").expect("final output");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !tail.lock().expect("tail").text().ends_with("before-seal") {
@@ -3606,7 +3609,10 @@ mod tests {
         assert!(pump.is_none());
         assert_windows_pipe_writer_closed(&mut writer);
         assert_eq!(tail.lock().expect("tail").text(), tail_before);
-        assert_eq!(std::fs::read(&path).expect("settled artifact"), bytes_before);
+        assert_eq!(
+            std::fs::read(&path).expect("settled artifact"),
+            bytes_before
+        );
     }
 
     #[cfg(windows)]
@@ -3624,7 +3630,11 @@ mod tests {
             assert_windows_pipe_writer_closed(&mut writer);
             writers.push(writer);
         }
-        assert_eq!(writers.len(), 32, "writers stayed open across every retirement");
+        assert_eq!(
+            writers.len(),
+            32,
+            "writers stayed open across every retirement"
+        );
     }
 
     #[cfg(windows)]
@@ -3634,12 +3644,20 @@ mod tests {
             return;
         }
         let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&[b'o'; 32 * 1024]).expect("child stdout burst");
-        stdout.write_all(b"stdout-finished\n").expect("stdout marker");
+        stdout
+            .write_all(&[b'o'; 32 * 1024])
+            .expect("child stdout burst");
+        stdout
+            .write_all(b"stdout-finished\n")
+            .expect("stdout marker");
         stdout.flush().expect("flush stdout");
         let mut stderr = std::io::stderr().lock();
-        stderr.write_all(&[b'e'; 32 * 1024]).expect("child stderr burst");
-        stderr.write_all(b"stderr-finished\n").expect("stderr marker");
+        stderr
+            .write_all(&[b'e'; 32 * 1024])
+            .expect("child stderr burst");
+        stderr
+            .write_all(b"stderr-finished\n")
+            .expect("stderr marker");
         stderr.flush().expect("flush stderr");
     }
 
@@ -3649,7 +3667,11 @@ mod tests {
         let _guard = process_test_guard();
         let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
         command
-            .args(["--exact", "jobs::tests::windows_job_pipe_output_child", "--nocapture"])
+            .args([
+                "--exact",
+                "jobs::tests::windows_job_pipe_output_child",
+                "--nocapture",
+            ])
             .env("PI_JOBS_WINDOWS_PIPE_CHILD", "1")
             .stdin(std::process::Stdio::null());
         let (mut stdout, mut stderr) =
@@ -3695,13 +3717,22 @@ mod tests {
             }
             std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
         };
-        assert!(status.is_some_and(|status| status.success()), "child must exit successfully");
-        assert!(stdout_eof && stderr_eof, "both child streams must reach actual EOF");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "child must exit successfully"
+        );
+        assert!(
+            stdout_eof && stderr_eof,
+            "both child streams must reach actual EOF"
+        );
         let stdout_text = String::from_utf8(stdout_bytes).expect("stdout UTF-8");
         let stderr_text = String::from_utf8(stderr_bytes).expect("stderr UTF-8");
         assert!(stdout_text.contains(&format!("{}stdout-finished\n", "o".repeat(32 * 1024))));
         assert!(!stdout_text.contains("stderr-finished"));
-        assert_eq!(stderr_text, format!("{}stderr-finished\n", "e".repeat(32 * 1024)));
+        assert_eq!(
+            stderr_text,
+            format!("{}stderr-finished\n", "e".repeat(32 * 1024))
+        );
     }
 
     #[cfg(unix)]

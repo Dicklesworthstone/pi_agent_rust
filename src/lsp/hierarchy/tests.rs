@@ -589,7 +589,10 @@ fn selected_timeouts_bound_document_sync_while_another_request_owns_the_lane() {
                 .unwrap();
         });
         let log = frames(temp.path());
-        assert!(!log.iter().any(|frame| frame["method"] == "textDocument/didOpen"));
+        assert!(
+            !log.iter()
+                .any(|frame| frame["method"] == "textDocument/didOpen")
+        );
         assert_eq!(
             log.iter()
                 .filter(|frame| frame["method"] == "textDocument/prepareCallHierarchy")
@@ -597,7 +600,10 @@ fn selected_timeouts_bound_document_sync_while_another_request_owns_the_lane() {
             1,
             "only the deliberately held request may reach the server"
         );
-        assert!(!log.iter().any(|frame| frame["method"] == "textDocument/documentSymbol"));
+        assert!(
+            !log.iter()
+                .any(|frame| frame["method"] == "textDocument/documentSymbol")
+        );
     }
 }
 

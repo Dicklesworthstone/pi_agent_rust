@@ -554,8 +554,7 @@ impl ServerProcess {
                         .as_mut()
                         .ok_or_else(|| std::io::Error::other("server reaper lost its child"))?
                         .terminate_and_wait()
-                })
-            {
+                }) {
                 Ok(worker) => cleanup.reaper = Some(ProcessReaper { worker, child }),
                 Err(_) => {
                     // The OS can refuse another thread. Cleanup still owns
@@ -813,7 +812,9 @@ impl JsonRpcClient {
                     let _cleanup = cleanup;
                     reader_body();
                 })
-                .map_err(|err| Error::tool(flavor, format!("failed to start server reader: {err}")))?;
+                .map_err(|err| {
+                    Error::tool(flavor, format!("failed to start server reader: {err}"))
+                })?;
             lock(&client.workers).stdout = Some(worker);
         }
 
@@ -838,7 +839,9 @@ impl JsonRpcClient {
             let worker = std::thread::Builder::new()
                 .name("pi-lsp-stderr".to_string())
                 .spawn(pump_body)
-                .map_err(|err| Error::tool(flavor, format!("failed to start server stderr: {err}")))?;
+                .map_err(|err| {
+                    Error::tool(flavor, format!("failed to start server stderr: {err}"))
+                })?;
             lock(&client.workers).stderr = Some(worker);
         }
 
@@ -954,7 +957,9 @@ impl JsonRpcClient {
             pending.insert(id, tx);
             rx
         };
-        let write_result = writer.write_request(frame, id).and_then(|()| writer.flush());
+        let write_result = writer
+            .write_request(frame, id)
+            .and_then(|()| writer.flush());
         drop(writer);
         if let Err(err) = write_result {
             lock(&self.pending).remove(&id);
@@ -1475,7 +1480,9 @@ mod tests {
             .expect("route notification");
         }
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
-        let first = notification_rx.try_recv().expect("first queued notification");
+        let first = notification_rx
+            .try_recv()
+            .expect("first queued notification");
         assert_eq!(first.params["i"], 0);
         assert_eq!(first.dropped_before, 0);
         handle_message(
@@ -1488,7 +1495,9 @@ mod tests {
             &Mutex::new(None),
         )
         .expect("notification after capacity is released");
-        let older = notification_rx.try_recv().expect("older queued notification");
+        let older = notification_rx
+            .try_recv()
+            .expect("older queued notification");
         assert_eq!(older.params["i"], 1);
         assert_eq!(older.dropped_before, 0);
         let fresh = notification_rx.try_recv().expect("notification after loss");
@@ -1569,8 +1578,7 @@ mod tests {
         // The helper explicitly inherits stdin as well as stdout/stderr, so
         // killing only the shell cannot unblock any of the three pipe workers.
         let ending = if exit_root { "exit 0" } else { "wait" };
-        let script =
-            format!("sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n{ending}\n");
+        let script = format!("sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n{ending}\n");
         let client = JsonRpcClient::spawn("/bin/sh", &["-c".to_string(), script], &[], root)
             .expect("server tree");
         let (parent, helper) = fixture_pids(root);
@@ -1706,8 +1714,9 @@ mod tests {
             .expect("bounded queue admits the frame");
         // Neither process reads stdin; this frame is larger than pipe capacity.
         // Observe the real writer claiming it, rather than timing a scheduler.
-        assert!(wait_for_fixture(|| lock(&client.writer)
-            .has_in_flight_frame()));
+        assert!(wait_for_fixture(
+            || lock(&client.writer).has_in_flight_frame()
+        ));
         client.kill();
         assert!(matches!(
             response.try_recv(),
@@ -1735,7 +1744,9 @@ mod tests {
         )
         .expect("malformed server");
         let (parent, helper) = fixture_pids(root.path());
-        let (_, response) = client.request("test/pending", Value::Null).expect("request");
+        let (_, response) = client
+            .request("test/pending", Value::Null)
+            .expect("request");
         std::fs::write(root.path().join("release"), b"").expect("release bad frame");
         assert!(matches!(
             response.recv_timeout(Duration::from_secs(5)),
@@ -1755,9 +1766,8 @@ mod tests {
     #[test]
     fn fragmented_headers_and_bodies_survive_nonblocking_waits_without_replay() {
         let root = tempfile::tempdir().expect("tempdir");
-        let first = encode_frame(
-            &serde_json::json!({"jsonrpc":"2.0", "id":1, "result":"snowman ☃"}),
-        );
+        let first =
+            encode_frame(&serde_json::json!({"jsonrpc":"2.0", "id":1, "result":"snowman ☃"}));
         let second = encode_frame(&serde_json::json!({"jsonrpc":"2.0", "id":2, "result":"second"}));
         let body_start = find_subslice(&first, b"\r\n\r\n").expect("headers") + 4;
         std::fs::write(root.path().join("first"), &first[..10]).expect("first fragment");
@@ -1857,7 +1867,8 @@ mod tests {
                 if let Ok(raw) = i32::try_from(self.0)
                     && let Some(group) = rustix::process::Pid::from_raw(raw)
                 {
-                    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
                 }
             }
         }
@@ -1887,7 +1898,9 @@ mod tests {
             wait_for_fixture(|| workers_finished(&client)),
             "escaped descriptors pinned a worker"
         );
-        client.finish_cleanup().expect("workers join without pipe EOF");
+        client
+            .finish_cleanup()
+            .expect("workers join without pipe EOF");
         assert!(
             fixture_process_running(escaped),
             "fixture must keep its descriptors open throughout cleanup"

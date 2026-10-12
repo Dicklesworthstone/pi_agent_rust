@@ -428,9 +428,11 @@ fn read_latest_workdir_binding(conn: &SqliteConnection) -> Result<Option<Session
                 "PI_SESSION_WORKDIR_SOURCE_INVALID: custom entry is missing its type",
             ));
         }
-        if kind.custom_type.as_deref().is_some_and(|kind| {
-            kind.starts_with(crate::session_workdir::WORKDIR_BINDING_PREFIX)
-        }) {
+        if kind
+            .custom_type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with(crate::session_workdir::WORKDIR_BINDING_PREFIX))
+        {
             if kind.kind != "custom" {
                 return Err(Error::session(
                     "PI_SESSION_WORKDIR_BINDING_INVALID: workdir metadata is not a custom entry",
@@ -688,8 +690,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         }
 
         let binding = binding.flatten().into_iter().collect::<Vec<_>>();
-        if !binding.is_empty()
-            && crate::session_workdir::latest_workdir_binding(&binding).is_none()
+        if !binding.is_empty() && crate::session_workdir::latest_workdir_binding(&binding).is_none()
         {
             return Err(Error::session(
                 "PI_SESSION_WORKDIR_BINDING_INVALID: invalid cached workdir record",
@@ -1322,16 +1323,20 @@ mod tests {
         assert_eq!(meta.message_count, 1);
         assert!(meta.name.is_none());
         with_write_connection(&path, |conn| {
-            map_sqlite_result(conn.execute_raw(
-                "DELETE FROM pi_session_meta WHERE key='workdir_binding_json'",
-            ))
+            map_sqlite_result(
+                conn.execute_raw("DELETE FROM pi_session_meta WHERE key='workdir_binding_json'"),
+            )
         })
         .expect("emulate metadata written before workspace bindings were cached");
         let legacy_meta = futures::executor::block_on(load_session_meta(&path))
             .expect("legacy workspace scan must not hydrate attachment blobs");
         assert_eq!(
             legacy_meta.cwd,
-            dir.path().canonicalize().expect("canonical").display().to_string()
+            dir.path()
+                .canonicalize()
+                .expect("canonical")
+                .display()
+                .to_string()
         );
         assert_eq!(legacy_meta.header.cwd, header.cwd);
         assert_eq!(legacy_meta.message_count, 1);

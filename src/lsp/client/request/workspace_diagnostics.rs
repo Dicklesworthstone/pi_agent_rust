@@ -170,10 +170,14 @@ fn validate_streamed_reports(
         serde_json::to_writer(&mut byte_budget, &fragment)
             .map_err(|_| report_error("workspace report exceeds 8 MiB"))?;
         let Value::Object(mut object) = fragment else {
-            return Err(report_error("workspace fragment must contain an items array"));
+            return Err(report_error(
+                "workspace fragment must contain an items array",
+            ));
         };
         let Some(Value::Array(mut items)) = object.remove("items") else {
-            return Err(report_error("workspace fragment must contain an items array"));
+            return Err(report_error(
+                "workspace fragment must contain an items array",
+            ));
         };
         if combined.len().saturating_add(items.len()) > MAX_DOCUMENTS {
             return Err(report_error("workspace report has too many documents"));
@@ -501,8 +505,11 @@ mod tests {
         for bad in [Value::Null, json!({}), json!({"items":null}), good.clone()] {
             assert!(
                 validate_streamed_reports(
-                    json!({"items":[]}), vec![good.clone(), bad], &HashMap::new()
-                ).is_err()
+                    json!({"items":[]}),
+                    vec![good.clone(), bad],
+                    &HashMap::new()
+                )
+                .is_err()
             );
         }
     }
@@ -520,8 +527,11 @@ mod tests {
         a["items"] = json!(vec![a["items"][0].clone(); MAX_DIAGNOSTICS]);
         let b = report("untitled:b", "one too many");
         let error = validate_streamed_reports(
-            Value::Null, vec![json!({"items":[a]}), json!({"items":[b]})], &HashMap::new()
-        ).unwrap_err();
+            Value::Null,
+            vec![json!({"items":[a]}), json!({"items":[b]})],
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("too many diagnostics"));
     }
 }

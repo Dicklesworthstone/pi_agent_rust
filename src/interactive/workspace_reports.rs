@@ -614,7 +614,10 @@ mod tests {
                 ("slash command", memory(root.path(), args, Some(&settings))),
             ] {
                 let card = report.card.as_deref().expect("memory card");
-                assert!(card.contains("src/parser.rs"), "{source}: {args}: {report:?}");
+                assert!(
+                    card.contains("src/parser.rs"),
+                    "{source}: {args}: {report:?}"
+                );
                 assert!(
                     card.contains("[REDACTED_USER_PATTERN]"),
                     "{source}: {args}: {report:?}"

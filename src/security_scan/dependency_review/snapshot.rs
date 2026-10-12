@@ -183,7 +183,13 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 
 fn fingerprint(key: &Key, advisory: &str) -> String {
     let mut bytes = Vec::new();
-    for part in ["pi/dependency/v1", &key.ecosystem, &key.name, &key.version, advisory] {
+    for part in [
+        "pi/dependency/v1",
+        &key.ecosystem,
+        &key.name,
+        &key.version,
+        advisory,
+    ] {
         bytes.extend_from_slice(part.as_bytes());
         bytes.push(0);
     }
@@ -191,7 +197,10 @@ fn fingerprint(key: &Key, advisory: &str) -> String {
 }
 
 fn hex_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn date(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
@@ -202,10 +211,16 @@ fn date(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
 }
 
 fn lockfile_format(path: &str) -> Result<&'static str> {
-    if path.is_empty() || path.len() > 4096 || path.contains(['\\', ':'])
+    if path.is_empty()
+        || path.len() > 4096
+        || path.contains(['\\', ':'])
         || path.chars().any(char::is_control)
-        || Path::new(path).components().any(|part| !matches!(part, Component::Normal(_)))
-        || path.split('/').any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || Path::new(path)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
     {
         return Err(error("invalid lockfile identity in report"));
     }
@@ -228,10 +243,13 @@ impl Snapshot {
         if bytes.len() > super::MAX_REPORT_BYTES {
             return Err(error("dependency report exceeds 16 MiB"));
         }
-        let document: Document = serde_json::from_slice(bytes)
-            .map_err(|_| error("malformed native dependency SARIF; no parser contents are exposed"))?;
+        let document: Document = serde_json::from_slice(bytes).map_err(|_| {
+            error("malformed native dependency SARIF; no parser contents are exposed")
+        })?;
         if document.version != crate::security_scan::SARIF_VERSION || document.runs.len() != 1 {
-            return Err(error("expected exactly one native dependency-audit SARIF run"));
+            return Err(error(
+                "expected exactly one native dependency-audit SARIF run",
+            ));
         }
         let run = document.runs.into_iter().next().expect("one validated run");
         Self::from_run(run, digest(bytes))
@@ -239,69 +257,127 @@ impl Snapshot {
 
     fn from_run(run: Run, digest: String) -> Result<Self> {
         let props = run.properties;
-        if run.tool.driver.name != "pi dependency audit" || props.schema != AUDIT_SCHEMA
+        if run.tool.driver.name != "pi dependency audit"
+            || props.schema != AUDIT_SCHEMA
             || props.inventory.schema != crate::security_scan::dependencies::INVENTORY_SCHEMA
-            || props.inventory.scope != SCOPE || run.invocations.len() != 1
+            || props.inventory.scope != SCOPE
+            || run.invocations.len() != 1
         {
             return Err(error("not a supported native dependency audit"));
         }
         date(&props.observed_at)?;
         let count = props.inventory.packages.len();
         let complete = count > 0 && props.query_completion.iter().all(|complete| *complete);
-        let status = if count == 0 { "not_checked" } else if !complete { "incomplete" }
-            else if !props.metadata_complete { "complete_with_metadata_gaps" } else { "complete" };
-        if count > 10_000 || props.query_completion.len() != count
-            || props.query_complete != complete || props.status != status
-            || props.completed_queries != props.query_completion.iter().filter(|complete| **complete).count()
+        let status = if count == 0 {
+            "not_checked"
+        } else if !complete {
+            "incomplete"
+        } else if !props.metadata_complete {
+            "complete_with_metadata_gaps"
+        } else {
+            "complete"
+        };
+        if count > 10_000
+            || props.query_completion.len() != count
+            || props.query_complete != complete
+            || props.status != status
+            || props.completed_queries
+                != props
+                    .query_completion
+                    .iter()
+                    .filter(|complete| **complete)
+                    .count()
             || run.invocations[0].execution_successful != complete
-            || (props.metadata_complete && !complete) || run.results.len() > 2000
+            || (props.metadata_complete && !complete)
+            || run.results.len() > 2000
         {
-            return Err(error("contradictory or oversized dependency query-completion record"));
+            return Err(error(
+                "contradictory or oversized dependency query-completion record",
+            ));
         }
         let mut snapshot = Self {
-            digest, observed_at: props.observed_at, status: props.status,
-            query_complete: complete, metadata_complete: props.metadata_complete,
-            packages: BTreeMap::new(), findings: BTreeMap::new(),
+            digest,
+            observed_at: props.observed_at,
+            status: props.status,
+            query_complete: complete,
+            metadata_complete: props.metadata_complete,
+            packages: BTreeMap::new(),
+            findings: BTreeMap::new(),
             reviews: BTreeMap::new(),
-            lockfiles: BTreeMap::new(), locations: BTreeMap::new(), excluded: props.inventory.excluded,
+            lockfiles: BTreeMap::new(),
+            locations: BTreeMap::new(),
+            excluded: props.inventory.excluded,
         };
-        snapshot.admit_inventory(props.inventory.lockfiles, &props.inventory.packages, &props.query_completion)?;
+        snapshot.admit_inventory(
+            props.inventory.lockfiles,
+            &props.inventory.packages,
+            &props.query_completion,
+        )?;
         for result in run.results {
             let finding = result.properties.dependency;
             let key = finding.key();
             if !snapshot.packages.contains_key(&key)
-                || props.inventory.packages.get(finding.package_index).map(Package::key).as_ref() != Some(&key)
-                || finding.advisory_id.is_empty() || finding.advisory_id.len() > 128
+                || props
+                    .inventory
+                    .packages
+                    .get(finding.package_index)
+                    .map(Package::key)
+                    .as_ref()
+                    != Some(&key)
+                || finding.advisory_id.is_empty()
+                || finding.advisory_id.len() > 128
                 || matches!(finding.advisory_id.as_str(), "." | "..")
-                || !finding.advisory_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                || !finding
+                    .advisory_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
                 || result.rule_id != format!("osv/{}", finding.advisory_id)
                 || result.fingerprints.dependency != finding.fingerprint
                 || finding.fingerprint != fingerprint(&key, &finding.advisory_id)
                 || finding.metadata_available != finding.withdrawn.is_some()
                 || (snapshot.metadata_complete && !finding.metadata_available)
             {
-                return Err(error("dependency finding identity or metadata disagrees with its inventory"));
+                return Err(error(
+                    "dependency finding identity or metadata disagrees with its inventory",
+                ));
             }
             date(&finding.modified)?;
-            super::disposition::validate_record(result.properties.review.as_ref(), &finding,
-                result.suppressions.as_deref().unwrap_or(&[]), &snapshot.observed_at)?;
+            super::disposition::validate_record(
+                result.properties.review.as_ref(),
+                &finding,
+                result.suppressions.as_deref().unwrap_or(&[]),
+                &snapshot.observed_at,
+            )?;
             if let Some(record) = result.properties.review {
                 snapshot.reviews.insert(finding.fingerprint.clone(), record);
             }
-            if snapshot.findings.insert(finding.fingerprint.clone(), finding).is_some() {
+            if snapshot
+                .findings
+                .insert(finding.fingerprint.clone(), finding)
+                .is_some()
+            {
                 return Err(error("duplicate dependency finding identity"));
             }
         }
         Ok(snapshot)
     }
 
-    fn admit_inventory(&mut self, files: Vec<Lockfile>, packages: &[Package], completion: &[bool]) -> Result<()> {
+    fn admit_inventory(
+        &mut self,
+        files: Vec<Lockfile>,
+        packages: &[Package],
+        completion: &[bool],
+    ) -> Result<()> {
         if files.is_empty() || files.len() > 32 || self.excluded.len() > 20_000 {
             return Err(error("invalid dependency inventory size"));
         }
         for file in files {
-            if file.format != lockfile_format(&file.path)? || !hex_digest(&file.sha256)
-                || self.lockfiles.insert(file.path, (file.format, file.sha256)).is_some()
+            if file.format != lockfile_format(&file.path)?
+                || !hex_digest(&file.sha256)
+                || self
+                    .lockfiles
+                    .insert(file.path, (file.format, file.sha256))
+                    .is_some()
             {
                 return Err(error("duplicate or invalid lockfile identity"));
             }
@@ -309,11 +385,15 @@ impl Snapshot {
         let mut locations = self.excluded.len();
         for (package, complete) in packages.iter().zip(completion) {
             let key = package.key();
-            locations = locations.checked_add(package.locations.len()).ok_or_else(|| error("inventory limit"))?;
+            locations = locations
+                .checked_add(package.locations.len())
+                .ok_or_else(|| error("inventory limit"))?;
             if !matches!(key.ecosystem.as_str(), "crates.io" | "npm")
                 || !crate::security_scan::dependencies::valid_name(&key.ecosystem, &key.name)
-                || key.version.len() > 256 || semver::Version::parse(&key.version).is_err()
-                || locations > 20_000 || package.locations.is_empty()
+                || key.version.len() > 256
+                || semver::Version::parse(&key.version).is_err()
+                || locations > 20_000
+                || package.locations.is_empty()
                 || self.packages.insert(key.clone(), *complete).is_some()
             {
                 return Err(error("invalid or duplicate public package identity"));
@@ -322,7 +402,12 @@ impl Snapshot {
             for location in &package.locations {
                 if !location_valid(location, &self.lockfiles)
                     || !unique.insert(location.clone())
-                    || self.lockfiles[&location.lockfile].0 != if key.ecosystem == "npm" { "npm" } else { "cargo" }
+                    || self.lockfiles[&location.lockfile].0
+                        != if key.ecosystem == "npm" {
+                            "npm"
+                        } else {
+                            "cargo"
+                        }
                     || (key.ecosystem == "crates.io" && location.package_path.is_some())
                     || (key.ecosystem == "npm" && location.package_path.is_none())
                 {
@@ -332,9 +417,13 @@ impl Snapshot {
             self.locations.insert(key, unique);
         }
         for excluded in &self.excluded {
-            if !location_valid(&excluded.location, &self.lockfiles) || excluded.reason.is_empty()
+            if !location_valid(&excluded.location, &self.lockfiles)
+                || excluded.reason.is_empty()
                 || excluded.reason.len() > 128
-                || !excluded.reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                || !excluded
+                    .reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
             {
                 return Err(error("invalid dependency exclusion"));
             }
@@ -344,10 +433,18 @@ impl Snapshot {
     }
 
     pub fn check_pair(&self, current: &Self) -> Result<()> {
-        if self.lockfiles.iter().map(|(path, (format, _))| (path, format)).ne(
-            current.lockfiles.iter().map(|(path, (format, _))| (path, format)))
+        if self
+            .lockfiles
+            .iter()
+            .map(|(path, (format, _))| (path, format))
+            .ne(current
+                .lockfiles
+                .iter()
+                .map(|(path, (format, _))| (path, format)))
         {
-            return Err(error("selected lockfile scopes differ; audit the same paths before comparing"));
+            return Err(error(
+                "selected lockfile scopes differ; audit the same paths before comparing",
+            ));
         }
         if date(&self.observed_at)? > date(&current.observed_at)? {
             return Err(error("current audit predates baseline; swap the reports"));

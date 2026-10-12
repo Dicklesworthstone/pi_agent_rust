@@ -750,7 +750,10 @@ fn ambiguous_masked_tool_details_are_explicitly_omitted_without_losing_the_resul
             .contains("PI_SECRET_JSON_MASK_KEY_COLLISION")
     );
     assert!(!serde_json::to_string(&output).unwrap().contains(SECRET));
-    assert!(!output.is_error, "the completed operation remains successful");
+    assert!(
+        !output.is_error,
+        "the completed operation remains successful"
+    );
 }
 
 #[test]

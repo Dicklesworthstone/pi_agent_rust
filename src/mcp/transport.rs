@@ -1002,12 +1002,7 @@ impl McpStdioClient {
         self.enqueue(WriterCommand::Message(encode_stdio_message(&message)?))
     }
 
-    fn cancel_request(
-        &self,
-        id: u64,
-        dispatch: &RequestDispatch,
-        send_notification: bool,
-    ) {
+    fn cancel_request(&self, id: u64, dispatch: &RequestDispatch, send_notification: bool) {
         // Revoke before removing the waiter: the writer must not gain
         // permission to send an abandoned frame during cancellation cleanup.
         let cancel_dispatched = dispatch.cancel();
@@ -3644,11 +3639,11 @@ pub(crate) mod tests {
             .build()
             .expect("runtime");
         runtime
-            .block_on(fixture.transport.request(
-                "test/next",
-                Value::Null,
-                Duration::from_secs(10),
-            ))
+            .block_on(
+                fixture
+                    .transport
+                    .request("test/next", Value::Null, Duration::from_secs(10)),
+            )
             .expect("successor drains the earlier cancellation");
         let messages = fixture.finish();
         assert_eq!(messages.len(), 3, "{messages:?}");
@@ -3675,7 +3670,10 @@ pub(crate) mod tests {
                 .await
                 .expect_err("zero request budget");
             assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("before admission"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("before admission"),
+            );
             let error = owner
                 .with_current(fixture.transport.request(
                     "tools/call",

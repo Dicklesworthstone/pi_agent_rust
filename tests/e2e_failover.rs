@@ -329,8 +329,11 @@ fn e2e_print_and_rpc_keep_extension_prompt_through_retry_and_failover() {
         if mode == "rpc" {
             use std::io::Write as _;
             let mut stdin = child.stdin.take().expect("RPC stdin");
-            writeln!(stdin, r#"{{"type":"prompt","id":"prompt","message":"ping"}}"#)
-                .expect("write prompt");
+            writeln!(
+                stdin,
+                r#"{{"type":"prompt","id":"prompt","message":"ping"}}"#
+            )
+            .expect("write prompt");
         }
         let (stdout, stderr) = run_and_collect(child, 60);
         assert!(
@@ -342,7 +345,11 @@ fn e2e_print_and_rpc_keep_extension_prompt_through_retry_and_failover() {
             .into_iter()
             .filter(|request| request.path.ends_with("/chat/completions"))
             .collect::<Vec<_>>();
-        assert_eq!(requests.len(), 3, "{mode}: first attempt, retry and fallback");
+        assert_eq!(
+            requests.len(),
+            3,
+            "{mode}: first attempt, retry and fallback"
+        );
         assert_eq!(requests[0].path, "/primary/v1/chat/completions");
         assert_eq!(requests[1].path, "/primary/v1/chat/completions");
         assert_eq!(requests[2].path, "/backup/v1/chat/completions");

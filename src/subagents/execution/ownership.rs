@@ -493,7 +493,10 @@ mod tests {
                 };
                 assert!(drop_started, "the reaper thread must reach Drop");
                 assert!(!completed_while_locked);
-                assert!(alive_while_locked, "PID was freed before serialized retirement");
+                assert!(
+                    alive_while_locked,
+                    "PID was freed before serialized retirement"
+                );
                 assert_eq!(authority_while_locked, Some(pid));
                 assert_eq!(authority_after_drop, None);
                 assert_eq!(history.pid, Some(pid), "keep diagnostic process history");
@@ -534,7 +537,10 @@ mod tests {
                 drop(run);
                 let (authority, settled) = {
                     let hub = registry().lock().unwrap();
-                    (hub.control_pid(&entry.id), hub.get(&entry.id).unwrap().clone())
+                    (
+                        hub.control_pid(&entry.id),
+                        hub.get(&entry.id).unwrap().clone(),
+                    )
                 };
                 assert_eq!(authority, None);
                 assert_eq!(settled.pid, Some(pid));

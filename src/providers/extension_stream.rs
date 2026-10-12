@@ -560,8 +560,8 @@ mod preview_budget_tests {
     fn terminal_does_not_charge_completed_content_twice() {
         let text = "answer";
         let call = call();
-        let bytes = serde_json::to_vec(text).unwrap().len()
-            + serde_json::to_vec(&call).unwrap().len();
+        let bytes =
+            serde_json::to_vec(text).unwrap().len() + serde_json::to_vec(&call).unwrap().len();
         let mut decoder = decoder(bytes);
         push(&mut decoder, text_end(0, text)).unwrap();
         push(&mut decoder, tool_end(1, call.clone())).unwrap();
@@ -622,7 +622,10 @@ mod preview_budget_tests {
             // Distinct calls need distinct IDs. Equal-length identities keep
             // this test focused on the exact aggregate metadata-byte limit.
             call.id = format!("call-{index}");
-            assert_eq!(serde_json::to_vec(&(&call.id, &call.name)).unwrap().len(), bytes);
+            assert_eq!(
+                serde_json::to_vec(&(&call.id, &call.name)).unwrap().len(),
+                bytes
+            );
             let events = push(
                 &mut decoder,
                 AssistantMessageEvent::ToolCallStart {

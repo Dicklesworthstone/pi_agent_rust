@@ -1709,14 +1709,9 @@ fn events_compact_rejects_invalid_or_host_owned_options_before_dispatch() {
                 "request": {}, "options": { "thinkingLevel": "low" }
             }),
         ] {
-            let outcome = dispatch_hostcall_events(
-                "compact-invalid",
-                &manager,
-                &tools,
-                "compact",
-                payload,
-            )
-            .await;
+            let outcome =
+                dispatch_hostcall_events("compact-invalid", &manager, &tools, "compact", payload)
+                    .await;
             assert!(
                 matches!(outcome, HostcallOutcome::Error { ref code, .. } if code == "invalid_request")
             );

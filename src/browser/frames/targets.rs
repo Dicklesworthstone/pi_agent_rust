@@ -44,7 +44,10 @@ impl Targets {
 
     pub(crate) fn observe(&mut self, value: &Value, root: Option<&str>) -> Result<()> {
         let method = value["method"].as_str().unwrap_or_default();
-        if !matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget") {
+        if !matches!(
+            method,
+            "Target.attachedToTarget" | "Target.detachedFromTarget"
+        ) {
             return Ok(());
         }
         let params = &value["params"];
@@ -52,7 +55,9 @@ impl Targets {
             && root.is_some()
             && params["sessionId"].as_str() == root
         {
-            return Err(error("selected page target detached during browser operation"));
+            return Err(error(
+                "selected page target detached during browser operation",
+            ));
         }
         let Some(parent) = value["sessionId"].as_str() else {
             return Ok(());
@@ -123,9 +128,11 @@ impl Targets {
         let mut known = BTreeSet::from([root.to_owned()]);
         let mut ordered = Vec::with_capacity(self.links.len());
         while ordered.len() < self.links.len() {
-            let Some(link) = self.links.values().find(|link| {
-                known.contains(&link.parent) && !known.contains(&link.session)
-            }) else {
+            let Some(link) = self
+                .links
+                .values()
+                .find(|link| known.contains(&link.parent) && !known.contains(&link.session))
+            else {
                 return Err(error("iframe target graph is disconnected or cyclic"));
             };
             known.insert(link.session.clone());
@@ -135,7 +142,9 @@ impl Targets {
     }
 
     pub(super) fn preserves(&self, links: &[Link]) -> bool {
-        links.iter().all(|link| self.links.get(&link.session) == Some(link))
+        links
+            .iter()
+            .all(|link| self.links.get(&link.session) == Some(link))
     }
 }
 
@@ -193,7 +202,9 @@ mod tests {
     #[test]
     fn only_owned_iframe_attachments_admit_sessions() {
         let mut targets = Targets::default();
-        targets.observe(&attach("other-page", "foreign", "frame"), Some("page")).unwrap();
+        targets
+            .observe(&attach("other-page", "foreign", "frame"), Some("page"))
+            .unwrap();
         let mut worker = attach("page", "worker", "worker-target");
         worker["params"]["targetInfo"]["type"] = json!("worker");
         targets.observe(&worker, Some("page")).unwrap();
@@ -201,26 +212,45 @@ mod tests {
         browser_event.as_object_mut().unwrap().remove("sessionId");
         targets.observe(&browser_event, Some("page")).unwrap();
         assert!(targets.links.is_empty());
-        targets.observe(&attach("page", "child", "child-frame"), Some("page")).unwrap();
-        targets.observe(&attach("child", "nested", "nested-frame"), Some("page")).unwrap();
+        targets
+            .observe(&attach("page", "child", "child-frame"), Some("page"))
+            .unwrap();
+        targets
+            .observe(&attach("child", "nested", "nested-frame"), Some("page"))
+            .unwrap();
         assert!(targets.admits(Some("page"), "nested"));
         let links = targets.ordered("page").unwrap();
-        assert_eq!(links.iter().map(|link| link.session.as_str()).collect::<Vec<_>>(), ["child", "nested"]);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.session.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "nested"]
+        );
         assert!(targets.preserves(&links));
     }
 
     #[test]
     fn detach_retires_the_whole_subtree_and_reused_ids_are_new_incarnations() {
         let mut targets = Targets::default();
-        for event in [attach("page", "child", "frame"), attach("child", "nested", "nested-frame")] {
+        for event in [
+            attach("page", "child", "frame"),
+            attach("child", "nested", "nested-frame"),
+        ] {
             targets.observe(&event, Some("page")).unwrap();
         }
         let before = targets.ordered("page").unwrap();
-        targets.observe(&detach("page", "child"), Some("page")).unwrap();
+        targets
+            .observe(&detach("page", "child"), Some("page"))
+            .unwrap();
         assert!(targets.links.is_empty());
-        targets.observe(&attach("nested", "late", "late-frame"), Some("page")).unwrap();
+        targets
+            .observe(&attach("nested", "late", "late-frame"), Some("page"))
+            .unwrap();
         assert!(targets.links.is_empty());
-        targets.observe(&attach("page", "child", "frame"), Some("page")).unwrap();
+        targets
+            .observe(&attach("page", "child", "frame"), Some("page"))
+            .unwrap();
         assert!(!targets.preserves(&before[..1]));
         assert!(!targets.admits(Some("page"), "nested"));
     }
@@ -235,14 +265,20 @@ mod tests {
             detach("child", "child"),
         ] {
             let mut targets = Targets::default();
-            targets.observe(&attach("page", "child", "frame"), Some("page")).unwrap();
+            targets
+                .observe(&attach("page", "child", "frame"), Some("page"))
+                .unwrap();
             let generation = targets.generation();
             assert!(targets.observe(&conflict, Some("page")).is_err());
             assert_eq!(targets.generation(), generation);
             assert_eq!(targets.links.len(), 1);
         }
         let mut targets = Targets::default();
-        assert!(targets.observe(&detach("browser", "page"), Some("page")).is_err());
+        assert!(
+            targets
+                .observe(&detach("browser", "page"), Some("page"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -253,14 +289,29 @@ mod tests {
         let generation = targets.generation();
         targets.observe(&event, Some("page")).unwrap();
         assert_eq!(targets.generation(), generation);
-        for invalid in ["".to_owned(), "x".repeat(257), "PRIVATE-CANARY\n".to_owned()] {
-            let error = targets.observe(&attach("page", &invalid, "other"), Some("page")).unwrap_err();
+        for invalid in [
+            "".to_owned(),
+            "x".repeat(257),
+            "PRIVATE-CANARY\n".to_owned(),
+        ] {
+            let error = targets
+                .observe(&attach("page", &invalid, "other"), Some("page"))
+                .unwrap_err();
             assert!(!error.to_string().contains("PRIVATE-CANARY"));
         }
         for i in 1..MAX_FRAMES {
-            targets.observe(&attach("page", &format!("s-{i}"), &format!("f-{i}")), Some("page")).unwrap();
+            targets
+                .observe(
+                    &attach("page", &format!("s-{i}"), &format!("f-{i}")),
+                    Some("page"),
+                )
+                .unwrap();
         }
         assert_eq!(targets.links.len(), MAX_FRAMES);
-        assert!(targets.observe(&attach("page", "overflow", "overflow"), Some("page")).is_err());
+        assert!(
+            targets
+                .observe(&attach("page", "overflow", "overflow"), Some("page"))
+                .is_err()
+        );
     }
 }

@@ -3482,8 +3482,7 @@ mod tests {
         let path = root.join("attached.jsonl");
         let mut session = Session::in_memory();
         session.header.cwd = original.display().to_string();
-        crate::session_workdir::attach_session_workdir(&mut session, &replacement)
-            .expect("attach");
+        crate::session_workdir::attach_session_workdir(&mut session, &replacement).expect("attach");
         write_session_jsonl(&path, &session.header, &session.entries);
         let index = SessionIndex::for_sessions_root(&root);
         index.reindex_all().expect("seed complete scan");
@@ -3502,7 +3501,9 @@ mod tests {
                     .map_err(|err| Error::session(err.to_string()))?;
                 conn.execute_sync(
                     "UPDATE meta SET value=?1 WHERE key='last_sync_epoch_ms'",
-                    &[Value::from(before.last_modified_ms.saturating_add(1).to_string())],
+                    &[Value::from(
+                        before.last_modified_ms.saturating_add(1).to_string(),
+                    )],
                 )
                 .map_err(|err| Error::session(err.to_string()))?;
                 Ok(())
@@ -3513,15 +3514,18 @@ mod tests {
             .refresh_incremental()
             .expect("semantic migration refresh");
         assert_eq!(
-            refreshed.reused_files,
-            0,
+            refreshed.reused_files, 0,
             "old semantics cannot reuse matching stats"
         );
         assert_eq!(refreshed.refreshed_files, 1);
         let after = index.list_sessions(None).expect("migrated row").remove(0);
         assert_eq!(
             after.cwd,
-            replacement.canonicalize().expect("canonical").display().to_string()
+            replacement
+                .canonicalize()
+                .expect("canonical")
+                .display()
+                .to_string()
         );
         assert_eq!(after.size_bytes, before.size_bytes);
         assert_eq!(after.last_modified_ms, before.last_modified_ms);
@@ -3610,7 +3614,11 @@ mod tests {
         let meta = build_meta_from_file(&path).expect("valid attachment with unrelated fields");
         assert_eq!(
             meta.cwd,
-            replacement.canonicalize().expect("canonical").display().to_string()
+            replacement
+                .canonicalize()
+                .expect("canonical")
+                .display()
+                .to_string()
         );
     }
 
@@ -3636,7 +3644,11 @@ mod tests {
 
         let error = build_meta_from_jsonl(&path)
             .expect_err("malformed later row is not resumable metadata");
-        assert!(error.to_string().contains("PI_SESSION_WORKDIR_SOURCE_INVALID"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_WORKDIR_SOURCE_INVALID")
+        );
     }
 
     #[test]

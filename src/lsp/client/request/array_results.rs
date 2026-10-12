@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{
-    LspClient, RequestBudget, WARMUP_EMPTY_RESULT_WINDOW, WARMUP_RETRY_CADENCE,
-    is_empty_result, is_warmup_empty_retryable,
+    LspClient, RequestBudget, WARMUP_EMPTY_RESULT_WINDOW, WARMUP_RETRY_CADENCE, is_empty_result,
+    is_warmup_empty_retryable,
 };
 use crate::error::{Error, Result};
 
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn item_limit_is_cumulative_across_fragment_boundaries() {
-        assert!(assemble(Value::Null, vec![json!([1,2]), json!([3,4])], 3).is_err());
+        assert!(assemble(Value::Null, vec![json!([1, 2]), json!([3, 4])], 3).is_err());
         assert_eq!(
             assemble(Value::Null, vec![json!([]), json!([])], 0).unwrap(),
             json!([]),

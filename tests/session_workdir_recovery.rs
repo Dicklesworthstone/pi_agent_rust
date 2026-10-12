@@ -129,7 +129,10 @@ async fn sdk_resumes_attached_workspace(root: &Path, extension: &str, lazy: bool
     source.header.cwd = original.to_str().expect("UTF-8 original").to_owned();
     source.path = Some(path.clone());
     source.session_dir = Some(root.to_path_buf());
-    source.set_additional_roots(&[additional.clone(), root.join("missing-additional-workspace")]);
+    source.set_additional_roots(&[
+        additional.clone(),
+        root.join("missing-additional-workspace"),
+    ]);
     attach_session_workdir(&mut source, &replacement).expect("explicit attachment");
     if lazy {
         // The production lazy threshold is 10,000 entries. Put the binding
@@ -212,8 +215,15 @@ async fn sdk_resumes_attached_workspace(root: &Path, extension: &str, lazy: bool
         "continued in the attached workspace"
     );
     assert_eq!(
-        handle.workspace().expect("restored workspace").additional_roots(),
-        vec![additional.canonicalize().expect("canonical additional root")]
+        handle
+            .workspace()
+            .expect("restored workspace")
+            .additional_roots(),
+        vec![
+            additional
+                .canonicalize()
+                .expect("canonical additional root")
+        ]
     );
     let extra_output = additional.join("continued.txt");
     let write = tools
@@ -227,7 +237,10 @@ async fn sdk_resumes_attached_workspace(root: &Path, extension: &str, lazy: bool
         .await
         .expect("write in restored additional root");
     assert!(!write.is_error);
-    handle.remove_workspace_root(&additional).await.expect("revoke root");
+    handle
+        .remove_workspace_root(&additional)
+        .await
+        .expect("revoke root");
     assert!(
         tools
             .get("write")
@@ -317,7 +330,9 @@ fn explicit_reattachment_hydrates_the_latest_binding_outside_the_active_path() {
             .await
             .expect("saved attachment metadata");
         assert_eq!(
-            saved.resolve_runtime_cwd(None).expect("resolve reattachment"),
+            saved
+                .resolve_runtime_cwd(None)
+                .expect("resolve reattachment"),
             second.canonicalize().unwrap()
         );
     });
@@ -379,7 +394,10 @@ fn sdk_resume_rejects_other_or_missing_workspaces_before_project_startup() {
             error.to_string().contains("PI_SESSION_WORKDIR_UNAVAILABLE"),
             "{error}"
         );
-        assert_eq!(std::fs::read(&path).expect("source unchanged"), original_bytes);
+        assert_eq!(
+            std::fs::read(&path).expect("source unchanged"),
+            original_bytes
+        );
     });
 }
 
@@ -426,10 +444,17 @@ fn sdk_explicit_workspace_roots_survive_save_and_resume_without_a_handle() {
         let mut options = resumed_sdk_options(&path);
         options.working_directory = Some(primary.clone());
         options.workspace = Some(workspace);
-        let handle = create_agent_session(options).await.expect("new SDK session");
+        let handle = create_agent_session(options)
+            .await
+            .expect("new SDK session");
         {
             let cx = pi::agent_cx::AgentCx::for_request();
-            let mut stored = handle.session().session.lock(cx.cx()).await.expect("session lock");
+            let mut stored = handle
+                .session()
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
             stored.save().await.expect("save explicit workspace roots");
         }
         drop(handle);
@@ -438,8 +463,15 @@ fn sdk_explicit_workspace_roots_survive_save_and_resume_without_a_handle() {
             .await
             .expect("resume with only the saved path");
         assert_eq!(
-            resumed.workspace().expect("restored handle").additional_roots(),
-            vec![additional.canonicalize().expect("canonical additional root")]
+            resumed
+                .workspace()
+                .expect("restored handle")
+                .additional_roots(),
+            vec![
+                additional
+                    .canonicalize()
+                    .expect("canonical additional root")
+            ]
         );
         let tools = resumed.session().agent.shared_tools().snapshot();
         let read = tools

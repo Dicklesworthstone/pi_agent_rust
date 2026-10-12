@@ -754,12 +754,7 @@ impl Attempt {
         }
     }
 
-    fn defer(
-        self,
-        owner: AgentCx,
-        accepted: bool,
-        update: Option<&UpdateCallback>,
-    ) -> PendingRun {
+    fn defer(self, owner: AgentCx, accepted: bool, update: Option<&UpdateCallback>) -> PendingRun {
         if accepted
             && !self.result.is_error
             && matches!(self.result.status, SubagentStatus::Completed)
@@ -882,10 +877,7 @@ impl ChildProcessGuard {
         self.process_lease = Some(lease);
         self
     }
-    fn with_hub_channel(
-        mut self,
-        channel: Option<crate::agent_hub::ipc::ChildChannel>,
-    ) -> Self {
+    fn with_hub_channel(mut self, channel: Option<crate::agent_hub::ipc::ChildChannel>) -> Self {
         self.hub_channel = channel;
         self
     }

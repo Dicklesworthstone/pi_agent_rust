@@ -255,7 +255,10 @@ mod store_tests {
             .unwrap();
         assert!(!retained.is_error);
         let details = retained.details.unwrap();
-        assert_eq!(details["content"], "parser api_key=[REDACTED_GENERIC_SECRET]");
+        assert_eq!(
+            details["content"],
+            "parser api_key=[REDACTED_GENERIC_SECRET]"
+        );
         assert_eq!(details["tags"][0], "[REDACTED_USER_PATTERN]");
         assert_eq!(details["tags"][1], "parser");
         let id = details["id"].as_i64().unwrap();
@@ -285,7 +288,10 @@ mod store_tests {
             replacement.content,
             "parser connects via [REDACTED_DSN]db.example/app"
         );
-        assert_eq!(replacement.tags, vec!["[REDACTED_USER_PATTERN]".to_string()]);
+        assert_eq!(
+            replacement.tags,
+            vec!["[REDACTED_USER_PATTERN]".to_string()]
+        );
 
         // Read the real tables directly: screened read projections must not
         // disguise a write that already persisted a raw credential.
@@ -369,7 +375,10 @@ mod store_tests {
                 memories[0].content,
                 "legacy parser before\n[REDACTED_PRIVATE_KEY]\nuse the parser safely"
             );
-            assert_eq!(memories[0].tags, vec!["[REDACTED_USER_PATTERN]".to_string()]);
+            assert_eq!(
+                memories[0].tags,
+                vec!["[REDACTED_USER_PATTERN]".to_string()]
+            );
         }
         let model = reopened.mental_model().unwrap();
         assert!(model.contains("use the parser safely"));

@@ -1033,8 +1033,7 @@ impl RpcSubprocessOwner {
                         .as_mut()
                         .expect("RPC reaper owns its child")
                         .terminate_and_wait()
-                })
-            {
+                }) {
                 Ok(worker) => process.reaper = Some(RpcProcessReaper { worker, child }),
                 Err(_) => {
                     let mut child = child
@@ -1281,12 +1280,13 @@ impl RpcTransportClient {
             command.process_group(0);
         }
 
-        let child = crate::tools::spawn_command_with_job_discipline(&mut command).map_err(|err| {
-            Error::config(format!(
-                "Failed to spawn RPC subprocess {}: {err}",
-                options.binary_path.display()
-            ))
-        })?;
+        let child =
+            crate::tools::spawn_command_with_job_discipline(&mut command).map_err(|err| {
+                Error::config(format!(
+                    "Failed to spawn RPC subprocess {}: {err}",
+                    options.binary_path.display()
+                ))
+            })?;
         let mut child = crate::tools::ProcessGuard::new(
             child,
             crate::tools::ProcessCleanupMode::ProcessGroupTree,
@@ -1423,7 +1423,8 @@ impl RpcTransportClient {
         command_payload.extend(payload);
 
         let mut operation = RpcOperation::new(&self.owner)?;
-        self.write_json_line(&Value::Object(command_payload)).await?;
+        self.write_json_line(&Value::Object(command_payload))
+            .await?;
         let response = self.wait_for_response(&request_id, command).await?;
         let success = response
             .get("success")
@@ -1820,7 +1821,9 @@ impl RpcTransportClient {
                     .get("success")
                     .and_then(Value::as_bool)
                     .ok_or_else(|| {
-                        Error::api("RPC prompt acknowledgement did not include a boolean success flag")
+                        Error::api(
+                            "RPC prompt acknowledgement did not include a boolean success flag",
+                        )
                     })?;
                 if !success {
                     operation.finish();
@@ -2643,8 +2646,7 @@ impl AgentSessionHandle {
         let mut candidate = guard.clone();
         candidate.ensure_full_v2_hydration_before_save()?;
         let messages = candidate.to_messages_for_current_path();
-        let checkpoint =
-            crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
+        let checkpoint = crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
         self.install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
             .await?;
         Ok(checkpoint)
@@ -2676,12 +2678,13 @@ impl AgentSessionHandle {
             let snapshot = SessionEditSnapshot::capture(&guard)?;
             let mut candidate = guard.clone();
             candidate.ensure_full_v2_hydration_before_save()?;
-            let checkpoint = crate::checkpoint::find_checkpoint(&candidate, name).ok_or_else(|| {
-                Error::session(name.map_or_else(
-                    || String::from("No checkpoints yet — mark one with /checkpoint"),
-                    |name| format!("No checkpoint named '{name}'"),
-                ))
-            })?;
+            let checkpoint =
+                crate::checkpoint::find_checkpoint(&candidate, name).ok_or_else(|| {
+                    Error::session(name.map_or_else(
+                        || String::from("No checkpoints yet — mark one with /checkpoint"),
+                        |name| format!("No checkpoint named '{name}'"),
+                    ))
+                })?;
             let (messages, boundary) = checkpoint
                 .entry_id
                 .as_deref()
@@ -2724,10 +2727,7 @@ impl AgentSessionHandle {
             summary,
             tree_preserved: true,
         };
-        candidate.append_custom_entry(
-            "rewind".to_string(),
-            Some(serde_json::to_value(&outcome)?),
-        );
+        candidate.append_custom_entry("rewind".to_string(), Some(serde_json::to_value(&outcome)?));
         let _session_action_permit = session_actions.acquire(cx.cx()).await?;
         let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
             .await
@@ -2845,14 +2845,8 @@ impl AgentSessionHandle {
         let mut candidate = guard.clone();
         crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
             .map_err(|error| Error::session(error.to_string()))?;
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            true,
-            &admission,
-            "retry rewind",
-        )
-        .await?;
+        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
+            .await?;
         Ok(plan.content)
     }
 
@@ -2877,17 +2871,9 @@ impl AgentSessionHandle {
         let mut candidate = guard.clone();
         candidate.ensure_full_v2_hydration_before_save()?;
         let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
-            .ok_or_else(|| {
-                Error::session(format!("No user message {entry_id} on this branch"))
-            })?;
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            true,
-            &admission,
-            "branch rewind",
-        )
-        .await?;
+            .ok_or_else(|| Error::session(format!("No user message {entry_id} on this branch")))?;
+        self.install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
+            .await?;
         Ok(prepared)
     }
 
@@ -3033,10 +3019,7 @@ impl AgentSessionHandle {
             admission.block(reason.to_string());
             return Err(Error::session_persistence(reason));
         }
-        Ok(format!(
-            "Workspace root removed: {}",
-            canonical.display()
-        ))
+        Ok(format!("Workspace root removed: {}", canonical.display()))
     }
 
     /// Return all model messages for the current session path.
@@ -4104,7 +4087,8 @@ mod tests {
             &self,
             context: &ProviderContext<'_>,
             options: &StreamOptions,
-        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             {
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -4284,8 +4268,7 @@ mod tests {
             None,
             Some(&workspace),
         );
-        let mut store =
-            Session::create_with_dir_and_store(Some(root.join("sessions")), store_kind);
+        let mut store = Session::create_with_dir_and_store(Some(root.join("sessions")), store_kind);
         store.header.cwd = cwd.display().to_string();
         let session = AgentSession::new(
             Agent::new(provider, tools, AgentConfig::default()),
@@ -4493,7 +4476,11 @@ mod tests {
         let _cwd = CurrentDirGuard::new(&process_cwd);
         let path = root.path().join("resumed.jsonl");
         let mut source = Session::in_memory();
-        source.header.cwd = root.path().join("original-moved-away").display().to_string();
+        source.header.cwd = root
+            .path()
+            .join("original-moved-away")
+            .display()
+            .to_string();
         source.path = Some(path.clone());
         source.session_dir = Some(root.path().join("sessions"));
         crate::session_workdir::attach_session_workdir(&mut source, &attached).unwrap();
@@ -4611,7 +4598,12 @@ mod tests {
             let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
             let mut change = Box::pin(handle.add_workspace_root(&proposed));
             assert!(futures::poll!(change.as_mut()).is_pending());
-            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
             assert_eq!(
                 host_workspace.additional_roots(),
                 vec![previous.canonicalize().unwrap()]
@@ -4629,7 +4621,12 @@ mod tests {
             assert!(result.unwrap_err().is_session_persistence());
             assert!(host_workspace.additional_roots().is_empty());
             assert!(store.try_lock().unwrap().additional_roots().is_empty());
-            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
             handle.session.persist_session().await.unwrap();
             assert!(
                 Session::open(&path.display().to_string())
@@ -4661,7 +4658,12 @@ mod tests {
             let mut change = Box::pin(handle.remove_workspace_root(&extra));
             assert!(futures::poll!(change.as_mut()).is_pending());
             assert!(workspace.additional_roots().is_empty());
-            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
             assert!(
                 tools
                     .get("write")
@@ -4691,7 +4693,10 @@ mod tests {
                     .additional_roots()
                     .is_empty()
             );
-            assert_eq!(std::fs::read_to_string(&probe).unwrap(), "must remain untouched");
+            assert_eq!(
+                std::fs::read_to_string(&probe).unwrap(),
+                "must remain untouched"
+            );
         });
     }
 
@@ -4741,8 +4746,7 @@ mod tests {
         std::fs::create_dir(&other).expect("other workspace");
         std::fs::write(workspace.join("credential.txt"), "runtime-key\n")
             .expect("runtime credential");
-        std::fs::write(other.join("credential.txt"), "other-key\n")
-            .expect("other credential");
+        std::fs::write(other.join("credential.txt"), "other-key\n").expect("other credential");
         let auth_path = root.path().join("auth.json");
         let fresh_auth = || {
             let mut auth = AuthStorage::empty_at(auth_path.clone());
@@ -5298,9 +5302,12 @@ mod tests {
         let wrong = run_async(handle.rewind_to_checkpoint(Some("nope"))).unwrap_err();
         assert!(wrong.to_string().contains("No checkpoint named 'nope'"));
 
-        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-            requests: Arc::new(Mutex::new(Vec::new())),
-        }));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
         let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("rewind");
         assert_eq!(outcome.collapsed_messages, turn_len);
         assert!(
@@ -5344,9 +5351,12 @@ mod tests {
                     .expect("second turn");
             });
             let requests = Arc::new(Mutex::new(Vec::new()));
-            handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-                requests: Arc::clone(&requests),
-            }));
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindPrivacyProvider {
+                    requests: Arc::clone(&requests),
+                }));
             let store = handle.session_store();
             let (original_path, target_id) = {
                 let guard = store.try_lock().expect("session");
@@ -5359,7 +5369,10 @@ mod tests {
                             if matches!(
                                 entry.message,
                                 crate::session::SessionMessage::User { .. }
-                            ) => entry.base.id.clone(),
+                            ) =>
+                        {
+                            entry.base.id.clone()
+                        }
                         _ => None,
                     })
                     .expect("latest user entry");
@@ -5380,10 +5393,7 @@ mod tests {
                         .mark_checkpoint("must-not-appear", None)
                         .await
                         .map(|_| ()),
-                    "checkpoint" => handle
-                        .rewind_to_checkpoint(Some("kept"))
-                        .await
-                        .map(|_| ()),
+                    "checkpoint" => handle.rewind_to_checkpoint(Some("kept")).await.map(|_| ()),
                     "branch" => handle.rewind_to_user_message(&target_id).await.map(|_| ()),
                     _ => unreachable!(),
                 }
@@ -5463,11 +5473,10 @@ mod tests {
                     } else {
                         UserContent::Text("original first turn".to_string())
                     };
-                    let first_user =
-                        session.append_message(crate::session::SessionMessage::User {
-                            content,
-                            timestamp: Some(0),
-                        });
+                    let first_user = session.append_message(crate::session::SessionMessage::User {
+                        content,
+                        timestamp: Some(0),
+                    });
                     session.append_message(crate::session::SessionMessage::Assistant {
                         message: AssistantMessage {
                             content: vec![ContentBlock::Text(TextContent::new("original answer"))],
@@ -5499,10 +5508,8 @@ mod tests {
                             );
                         }
                         "native-retry" => {
-                            let prepared = handle
-                                .prepare_retry_content()
-                                .await
-                                .expect("native retry");
+                            let prepared =
+                                handle.prepare_retry_content().await.expect("native retry");
                             assert!(matches!(prepared, UserContent::Blocks(_)));
                         }
                         _ => unreachable!(),
@@ -5556,13 +5563,16 @@ mod tests {
                 .expect("turn");
         });
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        handle.session.agent.set_provider(Arc::new(FlakyThenOkProvider {
-            failures: usize::MAX,
-            calls: Arc::clone(&calls),
-            name: "test-provider".to_string(),
-            model: "test-model".to_string(),
-            input_tokens: 0,
-        }));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(FlakyThenOkProvider {
+                failures: usize::MAX,
+                calls: Arc::clone(&calls),
+                name: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                input_tokens: 0,
+            }));
         let store = handle.session_store();
         let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
         let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
@@ -5582,11 +5592,13 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before_file);
         assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
 
-        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-            requests: Arc::new(Mutex::new(Vec::new())),
-        }));
-        let outcome =
-            run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry summary");
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry summary");
         assert_eq!(outcome.collapsed_messages, 2);
         assert_eq!(handle.session.agent.messages().len(), 1);
     }
@@ -5633,10 +5645,10 @@ mod tests {
                 .iter()
                 .filter_map(|entry| match entry {
                     crate::session::SessionEntry::Message(entry)
-                        if matches!(
-                            entry.message,
-                            crate::session::SessionMessage::User { .. }
-                        ) => entry.base.id.clone(),
+                        if matches!(entry.message, crate::session::SessionMessage::User { .. }) =>
+                    {
+                        entry.base.id.clone()
+                    }
                     _ => None,
                 })
                 .nth(3)
@@ -5660,9 +5672,12 @@ mod tests {
             "compaction renumbers the checkpoint boundary"
         );
         let requests = Arc::new(Mutex::new(Vec::new()));
-        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-            requests: Arc::clone(&requests),
-        }));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
         let store = handle.session_store();
         let entries_before = store.try_lock().unwrap().entries.len();
         let outcome = run_async(handle.rewind_to_checkpoint(Some("before-experiment")))
@@ -5713,7 +5728,10 @@ mod tests {
                     .mark_checkpoint("outer", None)
                     .await
                     .expect("outer checkpoint");
-                handle.prompt("first span", |_| {}).await.expect("first turn");
+                handle
+                    .prompt("first span", |_| {})
+                    .await
+                    .expect("first turn");
                 handle
                     .mark_checkpoint("inner", None)
                     .await
@@ -5724,9 +5742,12 @@ mod tests {
                     .expect("second turn");
             });
             let requests = Arc::new(Mutex::new(Vec::new()));
-            handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-                requests: Arc::clone(&requests),
-            }));
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindPrivacyProvider {
+                    requests: Arc::clone(&requests),
+                }));
             let store = handle.session_store();
             run_async(async {
                 if compacted {
@@ -5741,7 +5762,10 @@ mod tests {
                                 if matches!(
                                     entry.message,
                                     crate::session::SessionMessage::User { .. }
-                                ) => entry.base.id.clone(),
+                                ) =>
+                            {
+                                entry.base.id.clone()
+                            }
                             _ => None,
                         })
                         .expect("last user entry");
@@ -5770,7 +5794,9 @@ mod tests {
             let error = run_async(handle.rewind_to_checkpoint(Some("inner")))
                 .expect_err("hidden checkpoint");
             assert!(
-                error.to_string().contains("no longer in the active context"),
+                error
+                    .to_string()
+                    .contains("no longer in the active context"),
                 "{error}"
             );
             assert_eq!(requests.lock().unwrap().len(), calls_before);
@@ -5804,19 +5830,25 @@ mod tests {
             let after_callback = Arc::new(Mutex::new(None));
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let actions = handle.session.session_action_admission_gate();
-            handle.session.agent.set_provider(Arc::new(RewindCallbackProvider {
-                delegate: RewindPrivacyProvider {
-                    requests: Arc::new(Mutex::new(Vec::new())),
-                },
-                store: Arc::clone(&store),
-                actions,
-                action,
-                after_callback: Arc::clone(&after_callback),
-                calls: Arc::clone(&calls),
-            }));
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindCallbackProvider {
+                    delegate: RewindPrivacyProvider {
+                        requests: Arc::new(Mutex::new(Vec::new())),
+                    },
+                    store: Arc::clone(&store),
+                    actions,
+                    action,
+                    after_callback: Arc::clone(&after_callback),
+                    calls: Arc::clone(&calls),
+                }));
             let error =
                 run_async(handle.rewind_to_checkpoint(Some("start"))).expect_err("stale summary");
-            assert!(error.to_string().contains("Session changed while"), "{error}");
+            assert!(
+                error.to_string().contains("Session changed while"),
+                "{error}"
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(
                 serde_json::to_value(handle.session.agent.messages()).unwrap(),
@@ -5853,16 +5885,19 @@ mod tests {
         let before_file = std::fs::read(&path).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let actions = handle.session.session_action_admission_gate();
-        handle.session.agent.set_provider(Arc::new(RewindCallbackProvider {
-            delegate: RewindPrivacyProvider {
-                requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            store: Arc::clone(&store),
-            actions,
-            action: RewindCallbackAction::Pending,
-            after_callback: Arc::new(Mutex::new(None)),
-            calls: Arc::clone(&calls),
-        }));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindCallbackProvider {
+                delegate: RewindPrivacyProvider {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                store: Arc::clone(&store),
+                actions,
+                action: RewindCallbackAction::Pending,
+                after_callback: Arc::new(Mutex::new(None)),
+                calls: Arc::clone(&calls),
+            }));
         run_async(async {
             let mut rewind = Box::pin(handle.rewind_to_checkpoint(Some("start")));
             assert!(futures::poll!(rewind.as_mut()).is_pending());
@@ -5882,9 +5917,12 @@ mod tests {
             SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
         );
         assert_eq!(std::fs::read(&path).unwrap(), before_file);
-        handle.session.agent.set_provider(Arc::new(RewindPrivacyProvider {
-            requests: Arc::new(Mutex::new(Vec::new())),
-        }));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
         let result =
             run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry after drop");
         assert_eq!(result.collapsed_messages, 2);
@@ -5944,9 +5982,7 @@ mod tests {
                 let stored = store.lock(cx.cx()).await.expect("session snapshot");
                 SessionEditSnapshot::capture(&stored).expect("snapshot")
             };
-            let outcome = handle
-                .rewind_to_checkpoint(Some("start"))
-                .await;
+            let outcome = handle.rewind_to_checkpoint(Some("start")).await;
             let stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original entries after context replacement.
             assert!(stored.entries.iter().any(
                 |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
@@ -5982,7 +6018,12 @@ mod tests {
             assert!(!request.contains("ACME-123456")); // ubs:ignore[rust.panic.assert-macros] -- User-defined pattern is applied.
             assert!(!request.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Bare reuse is protected by the live session vault.
             assert!(!request.contains("<pi-secret:000")); // ubs:ignore[rust.panic.assert-macros] -- Neither remembered nor newly allocated reversible IDs cross this fixture's provider boundary.
-            assert!(outcome.expect("rewind").summary.contains("privacy-aware rewind report")); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
+            assert!(
+                outcome
+                    .expect("rewind")
+                    .summary
+                    .contains("privacy-aware rewind report")
+            ); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
         }
     }
 

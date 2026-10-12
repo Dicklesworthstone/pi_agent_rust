@@ -4463,7 +4463,10 @@ impl PiFtuiModel {
             })
             .unzip();
         self.picker = Some(PickerOverlay::new(
-            format!("Settings · {}", sanitize(&snapshot.path.display().to_string())),
+            format!(
+                "Settings · {}",
+                sanitize(&snapshot.path.display().to_string())
+            ),
             items,
             values,
             PickerKind::Settings,
@@ -8277,13 +8280,9 @@ fn run_undo_command(
 }
 
 /// Handle `/usage` in the driver (bd-cv653.7.4): read-only quota table.
-async fn run_usage_command(
-    cwd: &std::path::Path,
-    refresh: bool,
-    agent_tx: &Sender<PiMsg>,
-) {
-    let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path())
-        .and_then(|mut auth| {
+async fn run_usage_command(cwd: &std::path::Path, refresh: bool, agent_tx: &Sender<PiMsg>) {
+    let auth =
+        crate::auth::AuthStorage::load(crate::config::Config::auth_path()).and_then(|mut auth| {
             auth.set_command_working_directory(cwd)?;
             Ok(auth)
         });
@@ -8824,10 +8823,10 @@ async fn prepare_driver_session_options(
             base.join(path)
         }
     };
-    let requested_cwd = options.working_directory.as_deref().map_or_else(
-        || process_cwd.clone(),
-        |path| resolve(path, &process_cwd),
-    );
+    let requested_cwd = options
+        .working_directory
+        .as_deref()
+        .map_or_else(|| process_cwd.clone(), |path| resolve(path, &process_cwd));
     // Locators belong to the caller's requested directory, even if their
     // saved transcript is attached to another workspace.
     options.session_path = options
@@ -9020,9 +9019,7 @@ pub fn run(
     let bash_cwd = driver_bash_cwd(&session_options);
     let workspace = session_options.workspace.clone();
     autocomplete.cwd.clone_from(&bash_cwd);
-    if !supplied_workspace
-        && let Some(source) = &mut autocomplete.resource_source
-    {
+    if !supplied_workspace && let Some(source) = &mut autocomplete.resource_source {
         source.package_manager = crate::package_manager::PackageManager::new(bash_cwd.clone())
             .with_project_trust(session_options.workspace_trusted);
     }
@@ -9070,7 +9067,8 @@ pub fn run(
     // Match the effective launch preferences, including caller overrides.
     settings_config.hide_thinking_block = Some(hide_thinking_block);
     settings_config.markdown.get_or_insert_default().spacing = Some(markdown_spacing);
-    settings_config.autocomplete_max_visible = u32::try_from(autocomplete.max_visible.clamp(1, 20)).ok();
+    settings_config.autocomplete_max_visible =
+        u32::try_from(autocomplete.max_visible.clamp(1, 20)).ok();
     settings_config.double_escape_action = Some(
         match double_escape_action {
             DoubleEscapeAction::Rewind => "rewind",
@@ -10098,7 +10096,10 @@ mod tests {
                 api_key: Some(String::from("ftui-workspace-fixture-key")),
                 session_path: Some(path.strip_prefix(&process_cwd).unwrap().to_path_buf()),
                 session_dir: Some(
-                    sessions_dir.strip_prefix(&process_cwd).unwrap().to_path_buf(),
+                    sessions_dir
+                        .strip_prefix(&process_cwd)
+                        .unwrap()
+                        .to_path_buf(),
                 ),
                 enabled_tools: Some(vec![String::from("read"), String::from("write")]),
                 ..crate::sdk::SessionOptions::default()
@@ -10109,7 +10110,10 @@ mod tests {
             let bound = cwd.canonicalize().expect("canonical workspace");
             assert_eq!(driver_bash_cwd(&prepared), bound);
             assert_eq!(prepared.session_path.as_deref(), Some(path.as_path()));
-            assert_eq!(prepared.session_dir.as_deref(), Some(sessions_dir.as_path()));
+            assert_eq!(
+                prepared.session_dir.as_deref(),
+                Some(sessions_dir.as_path())
+            );
             assert_eq!(
                 std::fs::read(&path).expect("source unchanged"),
                 original_bytes
@@ -10197,7 +10201,10 @@ mod tests {
                 "saved extra root"
             );
             assert_eq!(template.working_directory.as_deref(), Some(bound.as_path()));
-            assert_eq!(template.session_dir.as_deref(), Some(sessions_dir.as_path()));
+            assert_eq!(
+                template.session_dir.as_deref(),
+                Some(sessions_dir.as_path())
+            );
             let next = crate::sdk::create_agent_session(template)
                 .await
                 .expect("create replacement in the same workspace");
@@ -10261,7 +10268,10 @@ mod tests {
                 error.to_string().contains("PI_SESSION_WORKDIR_UNAVAILABLE"),
                 "{error}"
             );
-            assert_eq!(std::fs::read(&path).expect("unchanged source"), original_bytes);
+            assert_eq!(
+                std::fs::read(&path).expect("unchanged source"),
+                original_bytes
+            );
         });
     }
 
@@ -10284,7 +10294,10 @@ mod tests {
         assert_eq!(options.session_path.as_deref(), Some(path.as_path()));
         assert_eq!(options.session_dir, Some(root.path().join("new-sessions")));
         assert_eq!(driver_bash_cwd(&options), root.path());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a saved session");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "not a saved session"
+        );
     }
 
     #[test]
@@ -11213,7 +11226,10 @@ mod tests {
         sim.init();
         type_str(&mut sim, "unfinished draft");
         sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
-        assert_eq!(submit_rx.try_recv().expect("F2 request"), UiCommand::Settings);
+        assert_eq!(
+            submit_rx.try_recv().expect("F2 request"),
+            UiCommand::Settings
+        );
         assert!(sim.model().settings_pending);
         sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
             snapshot: settings_snapshot_fixture(),

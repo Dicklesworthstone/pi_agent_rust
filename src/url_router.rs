@@ -1095,7 +1095,9 @@ fn ssh_write_document_inner(
             stdin
                 .write_all(content.as_bytes())
                 .and_then(|()| stdin.flush())
-                .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}")))
+                .map_err(|e| {
+                    Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}"))
+                })
         });
     let output = child
         .wait_with_output()
@@ -1854,12 +1856,17 @@ mod tests {
         // More than the pipe capacity forces the remote staging reader to run.
         // Keeping stdin open holds it before the publication check, with no
         // timing assumptions or sleeps.
-        input.write_all(&vec![b'x'; 2 * 1024 * 1024]).expect("payload");
+        input
+            .write_all(&vec![b'x'; 2 * 1024 * 1024])
+            .expect("payload");
         std::fs::write(&target, b"external edit during upload\n").expect("remote change");
         drop(input);
         let output = child.wait_with_output().expect("remote output");
         assert_eq!(output.status.code(), Some(73), "{output:?}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"external edit during upload\n");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"external edit during upload\n"
+        );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 

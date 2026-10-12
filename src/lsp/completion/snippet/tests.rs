@@ -310,7 +310,10 @@ fn plain_items_reject_values_and_never_interpret_their_text() {
 fn named_values_mirror_exactly_and_never_evaluate_their_contents() {
     let literal = "${OTHER:ignored} $CLIPBOARD $(not_a_command) \\ 😀\nline";
     let expanded = expansion("$NAME / ${NAME} / ${1:$NAME}", &[("NAME", literal)]);
-    assert_eq!(expanded.item["insertText"], format!("{literal} / {literal} / {literal}"));
+    assert_eq!(
+        expanded.item["insertText"],
+        format!("{literal} / {literal} / {literal}")
+    );
     assert_eq!(expanded.variables, json!([{"name":"NAME","missing":false}]));
     expanded.require_values().unwrap();
 }
@@ -339,12 +342,21 @@ fn unknown_variables_are_required_fields_not_environment_or_clipboard_lookups() 
         let expanded = prepare(&raw, None).unwrap();
         assert_eq!(expanded.item["insertText"], name);
         assert_eq!(expanded.missing_variables, vec![name]);
-        assert!(expanded.require_values().unwrap_err().to_string().contains("VALUES_REQUIRED"));
+        assert!(
+            expanded
+                .require_values()
+                .unwrap_err()
+                .to_string()
+                .contains("VALUES_REQUIRED")
+        );
         let filled = prepare(&raw, Some(&values(&[(name, "")]))).unwrap();
         filled.require_values().unwrap();
         assert_eq!(filled.item["insertText"], "");
     }
-    assert_eq!(expansion("${CLIPBOARD:local default}", &[]).item["insertText"], "local default");
+    assert_eq!(
+        expansion("${CLIPBOARD:local default}", &[]).item["insertText"],
+        "local default"
+    );
 }
 
 #[test]
@@ -367,7 +379,10 @@ fn variable_overrides_suppress_nested_fields_without_consuming_extra_values() {
     let expanded = expansion(text, &[("OUTER", "whole")]);
     expanded.require_values().unwrap();
     assert!(expanded.fields.as_array().unwrap().is_empty());
-    assert_eq!(expanded.variables, json!([{"name":"OUTER","missing":false}]));
+    assert_eq!(
+        expanded.variables,
+        json!([{"name":"OUTER","missing":false}])
+    );
     for extra in [("INNER", "unused"), ("1", "unused")] {
         assert!(prepare(&item(text), Some(&values(&[("OUTER", "whole"), extra]))).is_err());
     }
@@ -384,21 +399,38 @@ fn variable_transforms_share_placeholder_semantics_without_mutating_mirrors() {
     expanded.require_values().unwrap();
     let missing = expansion("${NAME/(.*)/constant/}", &[]);
     assert_eq!(missing.item["insertText"], "constant");
-    assert!(missing.require_values().is_err(), "constant replacement must not hide an unresolved source");
+    assert!(
+        missing.require_values().is_err(),
+        "constant replacement must not hide an unresolved source"
+    );
     assert!(prepare(&item(text), Some(&values(&[("NAME", "😀.rs")]))).is_err());
 }
 
 #[test]
 fn variable_and_placeholder_admission_share_limits() {
-    let exact = (0..32).map(|id| format!("${id} $V{id} ")).collect::<String>();
+    let exact = (0..32)
+        .map(|id| format!("${id} $V{id} "))
+        .collect::<String>();
     assert!(prepare(&item(&exact), None).is_ok());
     assert!(prepare(&item(&format!("{exact}$EXTRA")), None).is_err());
-    assert!(prepare(&item(&format!("${}", "N".repeat(MAX_VARIABLE_NAME + 1))), None).is_err());
+    assert!(
+        prepare(
+            &item(&format!("${}", "N".repeat(MAX_VARIABLE_NAME + 1))),
+            None
+        )
+        .is_err()
+    );
     let transforms = "${V/x/y/}".repeat(transform::MAX_TRANSFORMS);
     assert!(prepare(&item(&transforms), Some(&values(&[("V", "x")]))).is_ok());
     assert!(prepare(&item(&format!("{transforms}${{1/x/y/}}")), None).is_err());
     let value = "x".repeat(16 * 1024);
-    assert!(prepare(&item("$NAME$NAME$NAME$NAME$NAME"), Some(&values(&[("NAME", &value)]))).is_err());
+    assert!(
+        prepare(
+            &item("$NAME$NAME$NAME$NAME$NAME"),
+            Some(&values(&[("NAME", &value)]))
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -407,10 +439,16 @@ fn variable_names_and_delimiters_are_validated_even_when_defaults_are_overridden
         validate_values(&values(&[(key, "value")])).unwrap();
     }
     for key in ["a.b", "a-b", "9name", "é", " name", "${NAME}"] {
-        assert!(validate_values(&values(&[(key, "value")])).is_err(), "{key}");
+        assert!(
+            validate_values(&values(&[(key, "value")])).is_err(),
+            "{key}"
+        );
     }
     for text in ["${NAME|a,b|}", "${NAME", "${NAME!}", "${1:${NAME!}}"] {
-        assert!(prepare(&item(text), Some(&values(&[("1", "override")]))).is_err(), "{text}");
+        assert!(
+            prepare(&item(text), Some(&values(&[("1", "override")]))).is_err(),
+            "{text}"
+        );
     }
     assert!(prepare(&item("$NAME"), Some(&values(&[("name", "wrong case")]))).is_err());
     assert!(prepare(&item("$1"), Some(&values(&[("NAME", "unknown")]))).is_err());
@@ -424,7 +462,13 @@ fn named_values_do_not_mutate_cached_defaults_or_expand_auto_imports() {
     let original = raw.clone();
     let expanded = prepare(&raw, Some(&values(&[("NAME", "chosen")]))).unwrap();
     assert_eq!(expanded.item["textEdit"]["newText"], "chosen");
-    assert_eq!(expanded.item["additionalTextEdits"], raw["additionalTextEdits"]);
+    assert_eq!(
+        expanded.item["additionalTextEdits"],
+        raw["additionalTextEdits"]
+    );
     assert_eq!(raw, original);
-    assert_eq!(prepare(&raw, None).unwrap().item["textEdit"]["newText"], "default");
+    assert_eq!(
+        prepare(&raw, None).unwrap().item["textEdit"]["newText"],
+        "default"
+    );
 }

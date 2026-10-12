@@ -1,16 +1,25 @@
 use super::*;
 
 pub(super) fn fixture(ecosystem: &str, versions: &[(&str, &[&str], bool)]) -> Value {
-    let path = if ecosystem == "npm" { "package-lock.json" } else { "Cargo.lock" };
+    let path = if ecosystem == "npm" {
+        "package-lock.json"
+    } else {
+        "Cargo.lock"
+    };
     let format = if ecosystem == "npm" { "npm" } else { "cargo" };
     let complete = !versions.is_empty() && versions.iter().all(|(_, _, complete)| *complete);
-    let packages: Vec<_> = versions.iter().enumerate().map(|(index, (version, _, _))| {
-        let mut location = json!({"lockfile":path});
-        if ecosystem == "npm" {
-            location["packagePath"] = json!(format!("node_modules/parent-{index}/node_modules/example"));
-        }
-        json!({"ecosystem":ecosystem,"name":"example","version":version,"locations":[location]})
-    }).collect();
+    let packages: Vec<_> = versions
+        .iter()
+        .enumerate()
+        .map(|(index, (version, _, _))| {
+            let mut location = json!({"lockfile":path});
+            if ecosystem == "npm" {
+                location["packagePath"] =
+                    json!(format!("node_modules/parent-{index}/node_modules/example"));
+            }
+            json!({"ecosystem":ecosystem,"name":"example","version":version,"locations":[location]})
+        })
+        .collect();
     let results: Vec<_> = versions.iter().enumerate().flat_map(|(index, (version, ids, _))| {
         ids.iter().map(move |id| {
             let fingerprint = snapshot::digest(format!("pi/dependency/v1\0{ecosystem}\0example\0{version}\0{id}\0").as_bytes());
@@ -41,7 +50,10 @@ fn parsed(value: &Value) -> Snapshot {
 }
 
 fn comparison(before: &Value, after: &Value) -> Value {
-    compare_snapshots(&parsed(before), &parsed(after), 0, 50).unwrap().details.unwrap()
+    compare_snapshots(&parsed(before), &parsed(after), 0, 50)
+        .unwrap()
+        .details
+        .unwrap()
 }
 
 #[test]
@@ -81,7 +93,10 @@ fn unfinished_queries_never_establish_absence_on_either_side() {
     }
     // A failed OTHER package does not erase a completed package's evidence.
     let partial = fixture("npm", &[("1.0.0", &[], true), ("2.0.0", &[], false)]);
-    assert_eq!(comparison(&hit, &partial)["counts"]["no_longer_observed"], 1);
+    assert_eq!(
+        comparison(&hit, &partial)["counts"]["no_longer_observed"],
+        1
+    );
 }
 
 #[test]
@@ -89,8 +104,10 @@ fn withdrawn_and_suppressed_matches_stay_visible_and_metadata_changes_are_separa
     let before = fixture("crates.io", &[("1.0.0", &["GHSA-match"], true)]);
     let mut after = before.clone();
     after["runs"][0]["results"][0]["properties"]["dependency"]["withdrawn"] = json!(true);
-    after["runs"][0]["results"][0]["properties"]["dependency"]["modified"] = json!("2026-01-02T00:00:00Z");
-    after["runs"][0]["results"][0]["suppressions"] = json!([{"kind":"external","status":"accepted","justification":"fixture"}]);
+    after["runs"][0]["results"][0]["properties"]["dependency"]["modified"] =
+        json!("2026-01-02T00:00:00Z");
+    after["runs"][0]["results"][0]["suppressions"] =
+        json!([{"kind":"external","status":"accepted","justification":"fixture"}]);
     let result = comparison(&before, &after);
     assert_eq!(result["counts"]["persistent"], 1);
     assert_eq!(result["findings"][0]["advisoryChanged"], true);
@@ -107,8 +124,10 @@ fn withdrawn_and_suppressed_matches_stay_visible_and_metadata_changes_are_separa
 fn different_lockfile_scopes_and_reverse_time_are_refused() {
     let before = fixture("crates.io", &[("1.0.0", &[], true)]);
     let mut after = before.clone();
-    after["runs"][0]["properties"]["inventory"]["lockfiles"][0]["path"] = json!("nested/Cargo.lock");
-    after["runs"][0]["properties"]["inventory"]["packages"][0]["locations"][0]["lockfile"] = json!("nested/Cargo.lock");
+    after["runs"][0]["properties"]["inventory"]["lockfiles"][0]["path"] =
+        json!("nested/Cargo.lock");
+    after["runs"][0]["properties"]["inventory"]["packages"][0]["locations"][0]["lockfile"] =
+        json!("nested/Cargo.lock");
     assert!(parsed(&before).check_pair(&parsed(&after)).is_err());
     after = before.clone();
     after["runs"][0]["properties"]["observedAt"] = json!("2025-01-02T00:00:00Z");
@@ -119,9 +138,13 @@ fn different_lockfile_scopes_and_reverse_time_are_refused() {
 fn report_identity_completion_and_duplicate_tampering_fail_without_payload_echoes() {
     let original = fixture("crates.io", &[("1.0.0", &["GHSA-match"], true)]);
     for pointer in [
-        "/version", "/runs/0/tool/driver/name", "/runs/0/properties/schema",
-        "/runs/0/properties/queryComplete", "/runs/0/properties/queryCompletion",
-        "/runs/0/properties/completedQueries", "/runs/0/invocations/0/executionSuccessful",
+        "/version",
+        "/runs/0/tool/driver/name",
+        "/runs/0/properties/schema",
+        "/runs/0/properties/queryComplete",
+        "/runs/0/properties/queryCompletion",
+        "/runs/0/properties/completedQueries",
+        "/runs/0/invocations/0/executionSuccessful",
         "/runs/0/properties/inventory/packages/0/version",
         "/runs/0/results/0/properties/dependency/packageIndex",
         "/runs/0/results/0/properties/dependency/advisoryId",
@@ -129,15 +152,24 @@ fn report_identity_completion_and_duplicate_tampering_fail_without_payload_echoe
     ] {
         let mut broken = original.clone();
         *broken.pointer_mut(pointer).unwrap() = json!("PRIVATE-CANARY");
-        let failure = Snapshot::parse(&serde_json::to_vec(&broken).unwrap()).err().expect("refused");
+        let failure = Snapshot::parse(&serde_json::to_vec(&broken).unwrap())
+            .err()
+            .expect("refused");
         assert!(!failure.to_string().contains("PRIVATE-CANARY"), "{pointer}");
     }
     let mut duplicate = original.clone();
     let finding = duplicate["runs"][0]["results"][0].clone();
-    duplicate["runs"][0]["results"].as_array_mut().unwrap().push(finding);
+    duplicate["runs"][0]["results"]
+        .as_array_mut()
+        .unwrap()
+        .push(finding);
     assert!(Snapshot::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
     let raw = serde_json::to_string(&original).unwrap();
-    let duplicate = raw.replacen("\"packageIndex\":0", "\"packageIndex\":1,\"packageIndex\":0", 1);
+    let duplicate = raw.replacen(
+        "\"packageIndex\":0",
+        "\"packageIndex\":1,\"packageIndex\":0",
+        1,
+    );
     assert_ne!(duplicate, raw);
     assert!(Snapshot::parse(duplicate.as_bytes()).is_err());
 }
@@ -146,7 +178,8 @@ fn report_identity_completion_and_duplicate_tampering_fail_without_payload_echoe
 fn locations_and_exclusions_change_without_churning_fingerprints() {
     let before = fixture("npm", &[("1.0.0", &["GHSA-match"], true)]);
     let mut after = before.clone();
-    after["runs"][0]["properties"]["inventory"]["packages"][0]["locations"][0]["packagePath"] = json!("node_modules/example");
+    after["runs"][0]["properties"]["inventory"]["packages"][0]["locations"][0]["packagePath"] =
+        json!("node_modules/example");
     after["runs"][0]["properties"]["inventory"]["excluded"] = json!([{
         "location":{"lockfile":"package-lock.json","packagePath":"node_modules/private"},"reason":"local_link"
     }]);
@@ -166,16 +199,34 @@ fn pages_cover_the_deterministic_full_union_and_bind_both_source_files() {
     let b = parsed(&after);
     let mut ids = Vec::new();
     for offset in 0..3 {
-        let output = compare_snapshots(&a, &b, offset, 1).unwrap().details.unwrap();
+        let output = compare_snapshots(&a, &b, offset, 1)
+            .unwrap()
+            .details
+            .unwrap();
         assert_eq!(output["total"], 3);
         assert_eq!(output["counts"]["no_longer_observed"], 2);
         assert_eq!(output["baseline"]["sha256"], a.digest);
         assert_eq!(output["current"]["sha256"], b.digest);
-        assert_eq!(output["nextOffset"], if offset == 2 { Value::Null } else { json!(offset+1) });
-        ids.push(output["findings"][0]["advisoryId"].as_str().unwrap().to_string());
+        assert_eq!(
+            output["nextOffset"],
+            if offset == 2 {
+                Value::Null
+            } else {
+                json!(offset + 1)
+            }
+        );
+        ids.push(
+            output["findings"][0]["advisoryId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
     }
     assert_eq!(ids, ["GHSA-a", "GHSA-b", "GHSA-c"]);
-    let end = compare_snapshots(&a, &b, usize::MAX, 50).unwrap().details.unwrap();
+    let end = compare_snapshots(&a, &b, usize::MAX, 50)
+        .unwrap()
+        .details
+        .unwrap();
     assert_eq!(end["findings"], json!([]));
     assert_eq!(end["nextOffset"], Value::Null);
 }
@@ -196,15 +247,32 @@ fn confined_reader_rejects_symlinks_directories_oversize_and_escape_paths() {
     let bytes = serde_json::to_vec(&fixture("crates.io", &[("1.0.0", &[], true)])).unwrap();
     std::fs::write(workspace.path().join("audit.sarif"), &bytes).unwrap();
     std::fs::write(other.path().join("private"), "PRIVATE-CANARY").unwrap();
-    std::os::unix::fs::symlink(other.path().join("private"), workspace.path().join("linked.sarif")).unwrap();
+    std::os::unix::fs::symlink(
+        other.path().join("private"),
+        workspace.path().join("linked.sarif"),
+    )
+    .unwrap();
     std::fs::create_dir(workspace.path().join("directory.sarif")).unwrap();
-    std::fs::File::create(workspace.path().join("large.sarif")).unwrap().set_len(MAX_REPORT_BYTES as u64 + 1).unwrap();
+    std::fs::File::create(workspace.path().join("large.sarif"))
+        .unwrap()
+        .set_len(MAX_REPORT_BYTES as u64 + 1)
+        .unwrap();
     let root = Root::open(workspace.path()).unwrap();
     assert_eq!(root.read("audit.sarif").unwrap(), bytes);
-    for name in ["linked.sarif", "directory.sarif", "large.sarif", "../audit.sarif", "/audit.sarif", "dir/audit.sarif"] {
+    for name in [
+        "linked.sarif",
+        "directory.sarif",
+        "large.sarif",
+        "../audit.sarif",
+        "/audit.sarif",
+        "dir/audit.sarif",
+    ] {
         assert!(root.read(name).is_err());
     }
-    assert_eq!(std::fs::read_to_string(other.path().join("private")).unwrap(), "PRIVATE-CANARY");
+    assert_eq!(
+        std::fs::read_to_string(other.path().join("private")).unwrap(),
+        "PRIVATE-CANARY"
+    );
 }
 
 #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]

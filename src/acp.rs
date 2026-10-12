@@ -221,10 +221,7 @@ impl AcpOutput {
         }
     }
 
-    fn send(
-        &self,
-        line: String,
-    ) -> std::result::Result<(), std::sync::mpsc::TrySendError<String>> {
+    fn send(&self, line: String) -> std::result::Result<(), std::sync::mpsc::TrySendError<String>> {
         self.admit(line, true)
     }
 
@@ -320,11 +317,9 @@ impl AcpOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.stopping || state.failure.is_some() {
-            return Err(
-                state
-                    .failure
-                    .unwrap_or("permission request client is shutting down"),
-            );
+            return Err(state
+                .failure
+                .unwrap_or("permission request client is shutting down"));
         }
         self.shared
             .pending_permissions
@@ -761,577 +756,601 @@ async fn run(
 
     // Capture dispatch errors so every exit path still tears down MCP state.
     let result: Result<()> = {
-    let dispatch = async {
-    while let Ok(line) = in_rx.recv(&cx).await {
-        // Buffered input can keep this future ready without returning to the
-        // outer failure race. Never dispatch another request after a lost frame.
-        if let Some(reason) = out_tx.failure_reason() {
-            return Err(Error::session(reason));
-        }
-        let raw_message: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(err) => {
-                let _ = out_tx.send(json_rpc_error(
-                    Value::Null,
-                    PARSE_ERROR,
-                    format!("Parse error: {err}"),
-                ));
-                continue;
-            }
-        };
-
-        if raw_message.get("method").is_none() {
-            let _ = route_permission_response(&raw_message, &pending_permissions, &cx);
-            continue;
-        }
-
-        // Parse the JSON-RPC request.
-        let request: JsonRpcRequest = match serde_json::from_value(raw_message) {
-            Ok(req) => req,
-            Err(err) => {
-                let _ = out_tx.send(json_rpc_error(
-                    Value::Null,
-                    INVALID_REQUEST,
-                    format!("Invalid request: {err}"),
-                ));
-                continue;
-            }
-        };
-
-        // Validate JSON-RPC version.
-        if request.jsonrpc != "2.0" {
-            if let Some(ref id) = request.id {
-                let _ = out_tx.send(json_rpc_error(
-                    id.clone(),
-                    INVALID_REQUEST,
-                    "Expected jsonrpc version 2.0",
-                ));
-            }
-            continue;
-        }
-
-        let id = request.id.clone().unwrap_or(Value::Null);
-
-        match request.method.as_str() {
-            "initialize" => {
-                let result = handle_initialize();
-                initialized.store(true, Ordering::SeqCst);
-                let _ = out_tx.send(json_rpc_ok(id, result));
-            }
-
-            // `initialized` is a notification the client sends after
-            // processing the `initialize` response. We accept it silently.
-            "initialized" => {}
-
-            // `shutdown` is the graceful shutdown request.
-            "shutdown" => {
-                let _ = out_tx.send(json_rpc_ok(id, json!(null)));
-            }
-
-            // `exit` notification tells us to terminate.
-            "exit" => {
-                break;
-            }
-
-            "session/new" => {
-                if !initialized.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_REQUEST,
-                        "Server not initialized. Call 'initialize' first.",
-                    ));
-                    continue;
+        let dispatch = async {
+            while let Ok(line) = in_rx.recv(&cx).await {
+                // Buffered input can keep this future ready without returning to the
+                // outer failure race. Never dispatch another request after a lost frame.
+                if let Some(reason) = out_tx.failure_reason() {
+                    return Err(Error::session(reason));
                 }
-
-                // Validate the entire definition list before constructing state.
-                // The constructor repeats this for non-dispatch callers/tests.
-                let validated = history::requested_cwd(&request.params)
-                    .map_err(|error| error.message)
-                    .and_then(|cwd| crate::mcp::config::parse_acp_servers(&request.params, &cwd).map(|_| ()));
-                if let Err(error) = validated {
-                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
-                    continue;
-                }
-                let permission_client = AcpPermissionClient {
-                    out_tx: out_tx.clone(),
-                    pending: Arc::clone(&pending_permissions),
-                    request_counter: Arc::clone(&permission_counter),
-                    timeout: acp_permission_timeout(),
-                    cx: cx.clone(),
-                };
-
-                match handle_session_new(&request.params, &options, Some(&permission_client)) {
-                    Ok((session_id, state)) => {
-                        let models: Vec<AcpModel> = state
-                            .available_models
-                            .iter()
-                            .map(|entry| AcpModel {
-                                id: entry.model.id.clone(),
-                                name: entry.model.name.clone(),
-                                provider: Some(entry.model.provider.clone()),
-                            })
-                            .collect();
-
-                        let modes = vec![
-                            AcpMode {
-                                slug: "agent".to_string(),
-                                name: "Agent".to_string(),
-                                description: "Full autonomous coding agent with tool access"
-                                    .to_string(),
-                            },
-                            AcpMode {
-                                slug: "chat".to_string(),
-                                name: "Chat".to_string(),
-                                description: "Conversational mode without tool execution"
-                                    .to_string(),
-                            },
-                        ];
-
-                        let config_options = config_options_for(&state);
-                        let mcp_state = state.mcp.clone();
-                        let state_arc = Arc::new(Mutex::new(state));
-                        {
-                            let mut guard = sessions.lock(&cx).await
-                                .map_err(|_| Error::session("Session registry is unavailable"))?;
-                            guard.insert(session_id.clone(), state_arc);
-                        }
-
-                        // `configOptions` is the ACP-standard surface (model +
-                        // thought_level selects); `models`/`modes` stay for
-                        // clients built against the earlier shape.
-                        let _ = out_tx.send(json_rpc_ok(
-                            id,
-                            json!({
-                                "sessionId": session_id,
-                                "configOptions": config_options,
-                                "models": models,
-                                "modes": modes,
-                            }),
-                        ));
-                        if let Some(mcp_state) = mcp_state {
-                            mcp::announce(&mcp_state, &session_id, &out_tx).await
-                                .map_err(Error::session)?;
-                        }
-                    }
+                let raw_message: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INTERNAL_ERROR,
-                            format!("Failed to create session: {err}"),
+                            Value::Null,
+                            PARSE_ERROR,
+                            format!("Parse error: {err}"),
                         ));
+                        continue;
                     }
-                }
-            }
-
-            "session/prompt" => {
-                if !initialized.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_REQUEST,
-                        "Server not initialized",
-                    ));
-                    continue;
-                }
-
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
-                    ));
-                    continue;
                 };
 
-                // Decode the complete ContentBlock[] before starting a turn.
-                // Images stay native image blocks, and embedded editor context
-                // retains its provenance without implicitly opening its URI.
-                let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
-                let Some(prompt_blocks) = prompt_blocks else {
-                    let _ = out_tx.send(json_rpc_error(
+                if raw_message.get("method").is_none() {
+                    let _ = route_permission_response(&raw_message, &pending_permissions, &cx);
+                    continue;
+                }
+
+                // Parse the JSON-RPC request.
+                let request: JsonRpcRequest = match serde_json::from_value(raw_message) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        let _ = out_tx.send(json_rpc_error(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            format!("Invalid request: {err}"),
+                        ));
+                        continue;
+                    }
+                };
+
+                // Validate JSON-RPC version.
+                if request.jsonrpc != "2.0" {
+                    if let Some(ref id) = request.id {
+                        let _ = out_tx.send(json_rpc_error(
+                            id.clone(),
+                            INVALID_REQUEST,
+                            "Expected jsonrpc version 2.0",
+                        ));
+                    }
+                    continue;
+                }
+
+                let id = request.id.clone().unwrap_or(Value::Null);
+
+                match request.method.as_str() {
+                    "initialize" => {
+                        let result = handle_initialize();
+                        initialized.store(true, Ordering::SeqCst);
+                        let _ = out_tx.send(json_rpc_ok(id, result));
+                    }
+
+                    // `initialized` is a notification the client sends after
+                    // processing the `initialize` response. We accept it silently.
+                    "initialized" => {}
+
+                    // `shutdown` is the graceful shutdown request.
+                    "shutdown" => {
+                        let _ = out_tx.send(json_rpc_ok(id, json!(null)));
+                    }
+
+                    // `exit` notification tells us to terminate.
+                    "exit" => {
+                        break;
+                    }
+
+                    "session/new" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_REQUEST,
+                                "Server not initialized. Call 'initialize' first.",
+                            ));
+                            continue;
+                        }
+
+                        // Validate the entire definition list before constructing state.
+                        // The constructor repeats this for non-dispatch callers/tests.
+                        let validated = history::requested_cwd(&request.params)
+                            .map_err(|error| error.message)
+                            .and_then(|cwd| {
+                                crate::mcp::config::parse_acp_servers(&request.params, &cwd)
+                                    .map(|_| ())
+                            });
+                        if let Err(error) = validated {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                            continue;
+                        }
+                        let permission_client = AcpPermissionClient {
+                            out_tx: out_tx.clone(),
+                            pending: Arc::clone(&pending_permissions),
+                            request_counter: Arc::clone(&permission_counter),
+                            timeout: acp_permission_timeout(),
+                            cx: cx.clone(),
+                        };
+
+                        match handle_session_new(
+                            &request.params,
+                            &options,
+                            Some(&permission_client),
+                        ) {
+                            Ok((session_id, state)) => {
+                                let models: Vec<AcpModel> = state
+                                    .available_models
+                                    .iter()
+                                    .map(|entry| AcpModel {
+                                        id: entry.model.id.clone(),
+                                        name: entry.model.name.clone(),
+                                        provider: Some(entry.model.provider.clone()),
+                                    })
+                                    .collect();
+
+                                let modes = vec![
+                                    AcpMode {
+                                        slug: "agent".to_string(),
+                                        name: "Agent".to_string(),
+                                        description:
+                                            "Full autonomous coding agent with tool access"
+                                                .to_string(),
+                                    },
+                                    AcpMode {
+                                        slug: "chat".to_string(),
+                                        name: "Chat".to_string(),
+                                        description: "Conversational mode without tool execution"
+                                            .to_string(),
+                                    },
+                                ];
+
+                                let config_options = config_options_for(&state);
+                                let mcp_state = state.mcp.clone();
+                                let state_arc = Arc::new(Mutex::new(state));
+                                {
+                                    let mut guard = sessions.lock(&cx).await.map_err(|_| {
+                                        Error::session("Session registry is unavailable")
+                                    })?;
+                                    guard.insert(session_id.clone(), state_arc);
+                                }
+
+                                // `configOptions` is the ACP-standard surface (model +
+                                // thought_level selects); `models`/`modes` stay for
+                                // clients built against the earlier shape.
+                                let _ = out_tx.send(json_rpc_ok(
+                                    id,
+                                    json!({
+                                        "sessionId": session_id,
+                                        "configOptions": config_options,
+                                        "models": models,
+                                        "modes": modes,
+                                    }),
+                                ));
+                                if let Some(mcp_state) = mcp_state {
+                                    mcp::announce(&mcp_state, &session_id, &out_tx)
+                                        .await
+                                        .map_err(Error::session)?;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    format!("Failed to create session: {err}"),
+                                ));
+                            }
+                        }
+                    }
+
+                    "session/prompt" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_REQUEST,
+                                "Server not initialized",
+                            ));
+                            continue;
+                        }
+
+                        let session_id = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+
+                        let Some(session_id) = session_id else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Missing required parameter: sessionId",
+                            ));
+                            continue;
+                        };
+
+                        // Decode the complete ContentBlock[] before starting a turn.
+                        // Images stay native image blocks, and embedded editor context
+                        // retains its provenance without implicitly opening its URI.
+                        let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
+                        let Some(prompt_blocks) = prompt_blocks else {
+                            let _ = out_tx.send(json_rpc_error(
                         id,
                         INVALID_PARAMS,
                         "Missing required parameter: prompt (expected array of ContentBlock)",
                     ));
-                    continue;
-                };
+                            continue;
+                        };
 
-                let mcp_command = match mcp::command_from_prompt(prompt_blocks) {
-                    Ok(command) => command,
-                    Err(error) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
-                        continue;
-                    }
-                };
-                let message_content = match content::extract_prompt_content(prompt_blocks) {
-                    Ok(content) => content,
-                    Err(err) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
-                        continue;
-                    }
-                };
+                        let mcp_command = match mcp::command_from_prompt(prompt_blocks) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                continue;
+                            }
+                        };
+                        let message_content = match content::extract_prompt_content(prompt_blocks) {
+                            Ok(content) => content,
+                            Err(err) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
+                                continue;
+                            }
+                        };
 
-                let session_state = {
-                    sessions
-                        .lock(&cx)
-                        .await
-                        .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
-                };
+                        let session_state = {
+                            sessions
+                                .lock(&cx)
+                                .await
+                                .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
+                        };
 
-                let Some(session_state) = session_state else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
-                    continue;
-                };
-
-                // Per spec, only one prompt turn may be active per session.
-                {
-                    let has_active = out_tx.prompt_is_active(&session_id);
-                    if has_active {
-                        let _ = out_tx.send(json_rpc_error(
-                            id,
-                            PROMPT_IN_PROGRESS,
-                            format!("Session {session_id} already has an active prompt"),
-                        ));
-                        continue;
-                    }
-                }
-
-                // Bump the counter so prompt-turn diagnostics stay unique even
-                // across the same session_id.
-                let _ = prompt_counter.fetch_add(1, Ordering::SeqCst);
-
-                let (abort_handle, abort_signal) = AbortHandle::new();
-                let mut prompt_guard = out_tx.begin_prompt(session_id.clone(), abort_handle)?;
-
-                // Per ACP, the server replies to session/prompt only after the
-                // turn completes — with a stopReason. Spawn the work and have
-                // the spawned task own the response (carrying the original `id`).
-                let out_tx_prompt = out_tx.clone();
-                let prompt_cx = cx.clone();
-                let prompt_session_id = session_id.clone();
-                let response_id = id.clone();
-
-                let spawned = options.runtime_handle.try_spawn(async move {
-                    prompt_guard.started = true;
-                    let stop_reason = run_prompt(
-                        session_state,
-                        message_content,
-                        mcp_command,
-                        abort_signal,
-                        out_tx_prompt.clone(),
-                        prompt_session_id.clone(),
-                        prompt_cx.clone(),
-                    )
-                    .await;
-
-                    prompt_guard.settled = true;
-
-                    let _ = out_tx_prompt.send(json_rpc_ok(
-                        response_id,
-                        json!({ "stopReason": stop_reason }),
-                    ));
-                    drop(prompt_guard);
-                });
-                if spawned.is_err() {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INTERNAL_ERROR,
-                        "Cannot start ACP prompt task",
-                    ));
-                }
-            }
-
-            // ACP defines session/cancel as a notification that aborts the
-            // current prompt turn for `sessionId`. We accept the request form
-            // too (some clients still send it as a request) and respond with
-            // an empty result so they don't error on a missing reply.
-            "session/cancel" => {
-                let session_id_opt = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id_opt else {
-                    if request.id.is_some() {
-                        let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INVALID_PARAMS,
-                            "Missing required parameter: sessionId",
-                        ));
-                    }
-                    continue;
-                };
-
-                out_tx.abort_prompt(&session_id);
-
-                if request.id.is_some() {
-                    let _ = out_tx.send(json_rpc_ok(id, json!({})));
-                }
-            }
-
-            "session/list" => {
-                if !initialized.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
-                    continue;
-                }
-                let response = match history::list(&request.params, &options, &sessions, &cx).await {
-                    Ok(result) => json_rpc_ok(id, result),
-                    Err(error) => json_rpc_error(id, error.code, error.message),
-                };
-                history::send_line(&out_tx, response)
-                    .await
-                    .map_err(|error| Error::session(error.message))?;
-            }
-
-            "session/load" | "session/resume" => {
-                if !initialized.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
-                    continue;
-                }
-                let session_id = match history::requested_session_id(&request.params) {
-                    Ok(session_id) => session_id,
-                    Err(error) => {
-                        let _ = out_tx.send(json_rpc_error(id, error.code, error.message));
-                        continue;
-                    }
-                };
-                // Check the reservation as well as agent_session: a spawned
-                // prompt may not yet have taken the agent out of its state.
-                let busy = out_tx.prompt_is_active(session_id);
-                if busy {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        PROMPT_IN_PROGRESS,
-                        "Cannot load or resume a session while a prompt is in progress",
-                    ));
-                    continue;
-                }
-                let permission_client = AcpPermissionClient {
-                    out_tx: out_tx.clone(),
-                    pending: Arc::clone(&pending_permissions),
-                    request_counter: Arc::clone(&permission_counter),
-                    timeout: acp_permission_timeout(),
-                    cx: cx.clone(),
-                };
-                let replay = request.method == "session/load";
-                let result = history::load(
-                    &request.params,
-                    &options,
-                    &permission_client,
-                    &sessions,
-                    &cx,
-                    &out_tx,
-                    replay,
-                )
-                .await;
-                // All replay notifications precede this response. Resume is
-                // intentionally history-free for clients that kept their view.
-                let response = match result {
-                    Ok(mut result) => {
-                        if !replay {
-                            result["resumed"] = json!(true);
-                        }
-                        json_rpc_ok(id, result)
-                    }
-                    Err(error) => json_rpc_error(id, error.code, error.message),
-                };
-                history::send_line(&out_tx, response)
-                    .await
-                    .map_err(|error| Error::session(error.message))?;
-            }
-
-            // Dynamic, per-session model switch (#105). Switches the live
-            // session's provider/model so clients can change models at runtime
-            // (e.g. to gpt-5.5) without restarting or editing static config.
-            "session/set_model" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
-                    ));
-                    continue;
-                };
-
-                let session_state = {
-                    sessions
-                        .lock(&cx)
-                        .await
-                        .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
-                };
-                let Some(session_state) = session_state else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
-                    continue;
-                };
-
-                match apply_set_model_request(&session_state, &request.params, &cx).await {
-                    Ok((provider, model)) => {
-                        let _ = out_tx.send(json_rpc_ok(
-                            id,
-                            json!({
-                                "sessionId": session_id,
-                                "model": { "provider": provider, "id": model },
-                            }),
-                        ));
-                    }
-                    Err(msg) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                    }
-                }
-            }
-
-            // Dynamic, per-session config option (#105). Currently applies the
-            // reasoning/thinking effort to the live session; unknown or
-            // restart-only options return a structured error (never a silent
-            // success). See the runtime-vs-restart contract above.
-            "session/set_config_option" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
-                    ));
-                    continue;
-                };
-
-                // ACP's `configId` names the option (`name`/`key` accepted
-                // too); the value lives under `value`.
-                let Some(name) = config_option_id(&request.params) else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: configId",
-                    ));
-                    continue;
-                };
-                let value = request.params.get("value").cloned().unwrap_or(Value::Null);
-
-                // `model` is the ACP model selector: same switch as
-                // session/set_model, with the value as `provider/id` or an id.
-                let model_request = if name.eq_ignore_ascii_case("model") {
-                    match value.as_str() {
-                        Some(model) => Some(json!({ "model": model })),
-                        None => {
+                        let Some(session_state) = session_state else {
                             let _ = out_tx.send(json_rpc_error(
+                                id,
+                                SESSION_NOT_FOUND,
+                                format!("Session not found: {session_id}"),
+                            ));
+                            continue;
+                        };
+
+                        // Per spec, only one prompt turn may be active per session.
+                        {
+                            let has_active = out_tx.prompt_is_active(&session_id);
+                            if has_active {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    PROMPT_IN_PROGRESS,
+                                    format!("Session {session_id} already has an active prompt"),
+                                ));
+                                continue;
+                            }
+                        }
+
+                        // Bump the counter so prompt-turn diagnostics stay unique even
+                        // across the same session_id.
+                        let _ = prompt_counter.fetch_add(1, Ordering::SeqCst);
+
+                        let (abort_handle, abort_signal) = AbortHandle::new();
+                        let mut prompt_guard =
+                            out_tx.begin_prompt(session_id.clone(), abort_handle)?;
+
+                        // Per ACP, the server replies to session/prompt only after the
+                        // turn completes — with a stopReason. Spawn the work and have
+                        // the spawned task own the response (carrying the original `id`).
+                        let out_tx_prompt = out_tx.clone();
+                        let prompt_cx = cx.clone();
+                        let prompt_session_id = session_id.clone();
+                        let response_id = id.clone();
+
+                        let spawned = options.runtime_handle.try_spawn(async move {
+                            prompt_guard.started = true;
+                            let stop_reason = run_prompt(
+                                session_state,
+                                message_content,
+                                mcp_command,
+                                abort_signal,
+                                out_tx_prompt.clone(),
+                                prompt_session_id.clone(),
+                                prompt_cx.clone(),
+                            )
+                            .await;
+
+                            prompt_guard.settled = true;
+
+                            let _ = out_tx_prompt.send(json_rpc_ok(
+                                response_id,
+                                json!({ "stopReason": stop_reason }),
+                            ));
+                            drop(prompt_guard);
+                        });
+                        if spawned.is_err() {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INTERNAL_ERROR,
+                                "Cannot start ACP prompt task",
+                            ));
+                        }
+                    }
+
+                    // ACP defines session/cancel as a notification that aborts the
+                    // current prompt turn for `sessionId`. We accept the request form
+                    // too (some clients still send it as a request) and respond with
+                    // an empty result so they don't error on a missing reply.
+                    "session/cancel" => {
+                        let session_id_opt = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+
+                        let Some(session_id) = session_id_opt else {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Missing required parameter: sessionId",
+                                ));
+                            }
+                            continue;
+                        };
+
+                        out_tx.abort_prompt(&session_id);
+
+                        if request.id.is_some() {
+                            let _ = out_tx.send(json_rpc_ok(id, json!({})));
+                        }
+                    }
+
+                    "session/list" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_REQUEST,
+                                "Server not initialized",
+                            ));
+                            continue;
+                        }
+                        let response =
+                            match history::list(&request.params, &options, &sessions, &cx).await {
+                                Ok(result) => json_rpc_ok(id, result),
+                                Err(error) => json_rpc_error(id, error.code, error.message),
+                            };
+                        history::send_line(&out_tx, response)
+                            .await
+                            .map_err(|error| Error::session(error.message))?;
+                    }
+
+                    "session/load" | "session/resume" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_REQUEST,
+                                "Server not initialized",
+                            ));
+                            continue;
+                        }
+                        let session_id = match history::requested_session_id(&request.params) {
+                            Ok(session_id) => session_id,
+                            Err(error) => {
+                                let _ = out_tx.send(json_rpc_error(id, error.code, error.message));
+                                continue;
+                            }
+                        };
+                        // Check the reservation as well as agent_session: a spawned
+                        // prompt may not yet have taken the agent out of its state.
+                        let busy = out_tx.prompt_is_active(session_id);
+                        if busy {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                PROMPT_IN_PROGRESS,
+                                "Cannot load or resume a session while a prompt is in progress",
+                            ));
+                            continue;
+                        }
+                        let permission_client = AcpPermissionClient {
+                            out_tx: out_tx.clone(),
+                            pending: Arc::clone(&pending_permissions),
+                            request_counter: Arc::clone(&permission_counter),
+                            timeout: acp_permission_timeout(),
+                            cx: cx.clone(),
+                        };
+                        let replay = request.method == "session/load";
+                        let result = history::load(
+                            &request.params,
+                            &options,
+                            &permission_client,
+                            &sessions,
+                            &cx,
+                            &out_tx,
+                            replay,
+                        )
+                        .await;
+                        // All replay notifications precede this response. Resume is
+                        // intentionally history-free for clients that kept their view.
+                        let response = match result {
+                            Ok(mut result) => {
+                                if !replay {
+                                    result["resumed"] = json!(true);
+                                }
+                                json_rpc_ok(id, result)
+                            }
+                            Err(error) => json_rpc_error(id, error.code, error.message),
+                        };
+                        history::send_line(&out_tx, response)
+                            .await
+                            .map_err(|error| Error::session(error.message))?;
+                    }
+
+                    // Dynamic, per-session model switch (#105). Switches the live
+                    // session's provider/model so clients can change models at runtime
+                    // (e.g. to gpt-5.5) without restarting or editing static config.
+                    "session/set_model" => {
+                        let session_id = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        let Some(session_id) = session_id else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Missing required parameter: sessionId",
+                            ));
+                            continue;
+                        };
+
+                        let session_state = {
+                            sessions
+                                .lock(&cx)
+                                .await
+                                .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
+                        };
+                        let Some(session_state) = session_state else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                SESSION_NOT_FOUND,
+                                format!("Session not found: {session_id}"),
+                            ));
+                            continue;
+                        };
+
+                        match apply_set_model_request(&session_state, &request.params, &cx).await {
+                            Ok((provider, model)) => {
+                                let _ = out_tx.send(json_rpc_ok(
+                                    id,
+                                    json!({
+                                        "sessionId": session_id,
+                                        "model": { "provider": provider, "id": model },
+                                    }),
+                                ));
+                            }
+                            Err(msg) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            }
+                        }
+                    }
+
+                    // Dynamic, per-session config option (#105). Currently applies the
+                    // reasoning/thinking effort to the live session; unknown or
+                    // restart-only options return a structured error (never a silent
+                    // success). See the runtime-vs-restart contract above.
+                    "session/set_config_option" => {
+                        let session_id = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        let Some(session_id) = session_id else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Missing required parameter: sessionId",
+                            ));
+                            continue;
+                        };
+
+                        // ACP's `configId` names the option (`name`/`key` accepted
+                        // too); the value lives under `value`.
+                        let Some(name) = config_option_id(&request.params) else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Missing required parameter: configId",
+                            ));
+                            continue;
+                        };
+                        let value = request.params.get("value").cloned().unwrap_or(Value::Null);
+
+                        // `model` is the ACP model selector: same switch as
+                        // session/set_model, with the value as `provider/id` or an id.
+                        let model_request = if name.eq_ignore_ascii_case("model") {
+                            match value.as_str() {
+                                Some(model) => Some(json!({ "model": model })),
+                                None => {
+                                    let _ = out_tx.send(json_rpc_error(
                                 id,
                                 INVALID_PARAMS,
                                 "Invalid value for config option 'model': expected a model id or provider/id string",
                             ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let option = if model_request.is_some() {
+                            None
+                        } else {
+                            match parse_config_option(name, &value) {
+                                Ok(option) => Some(option),
+                                Err(msg) => {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let session_state = {
+                            sessions
+                                .lock(&cx)
+                                .await
+                                .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
+                        };
+                        let Some(session_state) = session_state else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                SESSION_NOT_FOUND,
+                                format!("Session not found: {session_id}"),
+                            ));
                             continue;
+                        };
+
+                        let applied = match (model_request, option) {
+                            (Some(params), _) => {
+                                apply_set_model_request(&session_state, &params, &cx)
+                                    .await
+                                    .map(drop)
+                            }
+                            (None, Some(option)) => {
+                                apply_set_config_option(&session_state, option, &cx).await
+                            }
+                            (None, None) => Ok(()),
+                        };
+                        match applied {
+                            Ok(()) => {
+                                // ACP answers with the complete config state.
+                                let config_options = session_state
+                                    .lock(&cx)
+                                    .await
+                                    .ok()
+                                    .and_then(|guard| config_options_for(&guard));
+                                let _ = out_tx.send(json_rpc_ok(
+                                    id,
+                                    json!({
+                                        "configOptions": config_options,
+                                        "sessionId": session_id,
+                                        "name": name,
+                                        "applied": true,
+                                    }),
+                                ));
+                            }
+                            Err(msg) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            }
                         }
                     }
-                } else {
-                    None
-                };
-                let option = if model_request.is_some() {
-                    None
-                } else {
-                    match parse_config_option(name, &value) {
-                        Ok(option) => Some(option),
-                        Err(msg) => {
+
+                    // File I/O methods. Paths must be under a known session's cwd
+                    // to prevent arbitrary filesystem access.
+                    "read_text_file" => {
+                        let path_str = match request.params.get("path").and_then(Value::as_str) {
+                            Some(p) if !p.is_empty() => p,
+                            _ => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Missing or empty required parameter: path",
+                                ));
+                                continue;
+                            }
+                        };
+                        let session_id = request.params.get("sessionId").and_then(Value::as_str);
+
+                        if let Err(msg) =
+                            validate_file_path(path_str, session_id, &sessions, &cx).await
+                        {
                             let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
                             continue;
                         }
-                    }
-                };
 
-                let session_state = {
-                    sessions
-                        .lock(&cx)
-                        .await
-                        .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
-                };
-                let Some(session_state) = session_state else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
-                    continue;
-                };
-
-                let applied = match (model_request, option) {
-                    (Some(params), _) => {
-                        apply_set_model_request(&session_state, &params, &cx)
-                            .await
-                            .map(drop)
-                    }
-                    (None, Some(option)) => {
-                        apply_set_config_option(&session_state, option, &cx).await
-                    }
-                    (None, None) => Ok(()),
-                };
-                match applied {
-                    Ok(()) => {
-                        // ACP answers with the complete config state.
-                        let config_options = session_state.lock(&cx).await.ok().and_then(|guard| {
-                            config_options_for(&guard)
-                        });
-                        let _ = out_tx.send(json_rpc_ok(
-                            id,
-                            json!({
-                                "configOptions": config_options,
-                                "sessionId": session_id,
-                                "name": name,
-                                "applied": true,
-                            }),
-                        ));
-                    }
-                    Err(msg) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                    }
-                }
-            }
-
-            // File I/O methods. Paths must be under a known session's cwd
-            // to prevent arbitrary filesystem access.
-            "read_text_file" => {
-                let path_str = match request.params.get("path").and_then(Value::as_str) {
-                    Some(p) if !p.is_empty() => p,
-                    _ => {
-                        let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INVALID_PARAMS,
-                            "Missing or empty required parameter: path",
-                        ));
-                        continue;
-                    }
-                };
-                let session_id = request.params.get("sessionId").and_then(Value::as_str);
-
-                if let Err(msg) = validate_file_path(path_str, session_id, &sessions, &cx).await {
-                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                    continue;
-                }
-
-                let max_bytes = 10 * 1024 * 1024; // 10MB limit for ACP
-                match asupersync::fs::metadata(path_str).await {
-                    Ok(meta) if meta.len() > max_bytes => {
-                        let _ = out_tx.send(json_rpc_error(
+                        let max_bytes = 10 * 1024 * 1024; // 10MB limit for ACP
+                        match asupersync::fs::metadata(path_str).await {
+                            Ok(meta) if meta.len() > max_bytes => {
+                                let _ = out_tx.send(json_rpc_error(
                             id,
                             INTERNAL_ERROR,
                             format!(
@@ -1340,89 +1359,93 @@ async fn run(
                                 max_bytes
                             ),
                         ));
-                        continue;
-                    }
-                    _ => {}
-                }
+                                continue;
+                            }
+                            _ => {}
+                        }
 
-                match asupersync::fs::read(path_str).await {
-                    Ok(bytes) => {
-                        let contents = String::from_utf8_lossy(&bytes).into_owned();
-                        let _ = out_tx.send(json_rpc_ok(id, json!({ "contents": contents })));
+                        match asupersync::fs::read(path_str).await {
+                            Ok(bytes) => {
+                                let contents = String::from_utf8_lossy(&bytes).into_owned();
+                                let _ =
+                                    out_tx.send(json_rpc_ok(id, json!({ "contents": contents })));
+                            }
+                            Err(err) => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    format!("Failed to read file: {err}"),
+                                ));
+                            }
+                        }
                     }
-                    Err(err) => {
-                        let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INTERNAL_ERROR,
-                            format!("Failed to read file: {err}"),
-                        ));
-                    }
-                }
-            }
 
-            "write_text_file" => {
-                let path_str = match request.params.get("path").and_then(Value::as_str) {
-                    Some(p) if !p.is_empty() => p,
+                    "write_text_file" => {
+                        let path_str = match request.params.get("path").and_then(Value::as_str) {
+                            Some(p) if !p.is_empty() => p,
+                            _ => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Missing or empty required parameter: path",
+                                ));
+                                continue;
+                            }
+                        };
+                        let Some(contents) = request.params.get("contents").and_then(Value::as_str)
+                        else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Missing required parameter: contents",
+                            ));
+                            continue;
+                        };
+                        let session_id = request.params.get("sessionId").and_then(Value::as_str);
+
+                        if let Err(msg) =
+                            validate_file_path(path_str, session_id, &sessions, &cx).await
+                        {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            continue;
+                        }
+
+                        match asupersync::fs::write(path_str, contents.as_bytes()).await {
+                            Ok(()) => {
+                                let _ = out_tx.send(json_rpc_ok(id, json!({ "success": true })));
+                            }
+                            Err(err) => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    format!("Failed to write file: {err}"),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Unknown method.
                     _ => {
                         let _ = out_tx.send(json_rpc_error(
                             id,
-                            INVALID_PARAMS,
-                            "Missing or empty required parameter: path",
-                        ));
-                        continue;
-                    }
-                };
-                let Some(contents) = request.params.get("contents").and_then(Value::as_str) else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: contents",
-                    ));
-                    continue;
-                };
-                let session_id = request.params.get("sessionId").and_then(Value::as_str);
-
-                if let Err(msg) = validate_file_path(path_str, session_id, &sessions, &cx).await {
-                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                    continue;
-                }
-
-                match asupersync::fs::write(path_str, contents.as_bytes()).await {
-                    Ok(()) => {
-                        let _ = out_tx.send(json_rpc_ok(id, json!({ "success": true })));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(json_rpc_error(
-                            id,
-                            INTERNAL_ERROR,
-                            format!("Failed to write file: {err}"),
+                            METHOD_NOT_FOUND,
+                            format!("Method not found: {}", request.method),
                         ));
                     }
                 }
             }
-
-            // Unknown method.
-            _ => {
-                let _ = out_tx.send(json_rpc_error(
-                    id,
-                    METHOD_NOT_FOUND,
-                    format!("Method not found: {}", request.method),
-                ));
-            }
+            Ok(())
+        };
+        // A writer failure must wake even an idle dispatcher or one awaiting a
+        // management operation. Drop that operation before draining prompt owners.
+        let failure = out_tx.shared.failure.wait();
+        futures::pin_mut!(dispatch, failure);
+        match futures::future::select(failure, dispatch).await {
+            futures::future::Either::Left(_) => Err(Error::session(
+                out_tx.failure_reason().unwrap_or("ACP output failed"),
+            )),
+            futures::future::Either::Right((result, _)) => result,
         }
-    }
-    Ok(())
-    };
-    // A writer failure must wake even an idle dispatcher or one awaiting a
-    // management operation. Drop that operation before draining prompt owners.
-    let failure = out_tx.shared.failure.wait();
-    futures::pin_mut!(dispatch, failure);
-    match futures::future::select(failure, dispatch).await {
-        futures::future::Either::Left(_) => Err(Error::session(
-            out_tx.failure_reason().unwrap_or("ACP output failed"),
-        )),
-        futures::future::Either::Right((result, _)) => result,
-    }
     };
 
     let drained = out_tx.finish_prompts().await;
@@ -2547,11 +2570,7 @@ async fn run_prompt(
 /// outcome, including its save: stream terminals are deliberately not rendered
 /// by `build_acp_event_handler`, so `Error`/`MessageEnd`/`AgentEnd` events cannot
 /// duplicate this notice. MCP operator responses use their own completed path.
-async fn report_prompt_error(
-    out_tx: &AcpOutput,
-    session_id: &str,
-    error: &Error,
-) -> &'static str {
+async fn report_prompt_error(out_tx: &AcpOutput, session_id: &str, error: &Error) -> &'static str {
     if matches!(error, Error::Aborted) {
         return ACP_STOP_REASON_CANCELLED;
     }
@@ -3009,7 +3028,8 @@ mod tests {
     ) -> (T, Vec<String>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
         for index in 0..initial_frames {
-            tx.try_send(format!("held-{index}")).expect("preload output");
+            tx.try_send(format!("held-{index}"))
+                .expect("preload output");
         }
         let output = AcpOutput::new(tx);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -3069,7 +3089,10 @@ mod tests {
                 assert!(reply_rx.recv(&cx).await.is_err());
                 drop(first);
                 drop(second);
-                output.finish_prompts().await.expect("unstarted prompts drained");
+                output
+                    .finish_prompts()
+                    .await
+                    .expect("unstarted prompts drained");
             });
         });
         assert_eq!(frames, ["held-0"]);
@@ -3240,7 +3263,11 @@ mod tests {
                     .filter(|frame| {
                         frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
                     })
-                    .map(|frame| frame["params"]["update"]["content"]["text"].as_str().unwrap())
+                    .map(|frame| {
+                        frame["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap()
+                    })
                     .collect::<String>();
                 assert_eq!(text, "reply ".repeat(16));
                 assert_eq!(frames.last().unwrap()["id"], 7);
@@ -3281,7 +3308,12 @@ mod tests {
             let result = timeout(wall_now(), Duration::from_secs(1), dispatch)
                 .await
                 .expect("writer failure must wake idle dispatch");
-            assert!(result.unwrap_err().to_string().contains("test writer failed"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("test writer failed")
+            );
         });
     }
 
@@ -4263,7 +4295,10 @@ mod tests {
         );
         auth.set_command_working_directory(&host)
             .expect("scope host auth");
-        assert_eq!(auth.api_key(&provider_id).as_deref(), Some("host-credential"));
+        assert_eq!(
+            auth.api_key(&provider_id).as_deref(),
+            Some("host-credential")
+        );
         let mut entry = test_model_entry(&provider_id, "acp-credential-fixture");
         entry.model.api = "openai-completions".to_string();
         entry.model.base_url = "https://acp-credential.invalid/v1".to_string();

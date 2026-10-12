@@ -471,11 +471,12 @@ impl Provider for GeminiProvider {
         // Stage the final payload after extension rewrites. Session originals
         // stay inline and portable; remote file URIs are transport-only state.
         // Cloud Code Assist returned above; Vertex uses its separate provider.
-        let mut prepared = Box::pin(
-            self.files
-                .prepare(&self.client, &self.base_url, &upload_auth, &mut body),
-        )
-        .await?;
+        let mut prepared =
+            Box::pin(
+                self.files
+                    .prepare(&self.client, &self.base_url, &upload_auth, &mut body),
+            )
+            .await?;
         let response = loop {
             let request = self
                 .developer_request(&url, options, auth_value.as_deref())
@@ -2321,10 +2322,9 @@ mod tests {
             let context = Context::owned(None, messages, Vec::new());
             let original = serde_json::to_value(&context.messages).unwrap();
             let provider = GeminiProvider::new("gemini-3-pro");
-            let wire = serde_json::to_value(
-                provider.build_request(&context, &StreamOptions::default()),
-            )
-            .unwrap();
+            let wire =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
             let contents = wire["contents"].as_array().unwrap();
             assert_eq!(contents.len(), if with_media { 4 } else { 3 });
             assert_eq!(contents[1]["role"], "model");
@@ -2425,18 +2425,19 @@ mod tests {
             Vec::new(),
         );
         let provider = GeminiProvider::new("gemini-2.5-pro");
-        let wire = serde_json::to_value(
-            provider.build_request(&context, &StreamOptions::default()),
-        )
-        .unwrap();
+        let wire =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
         let contents = wire["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 8);
-        for (model_index, response_index, media_index, id, data) in [
-            (0, 1, 2, "call_a", "AQ=="),
-            (4, 5, 6, "call_b", "Ag=="),
-        ] {
+        for (model_index, response_index, media_index, id, data) in
+            [(0, 1, 2, "call_a", "AQ=="), (4, 5, 6, "call_b", "Ag==")]
+        {
             assert_eq!(contents[model_index]["role"], "model");
-            assert_eq!(contents[response_index]["parts"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                contents[response_index]["parts"].as_array().unwrap().len(),
+                1
+            );
             assert_eq!(
                 contents[response_index]["parts"][0]["functionResponse"]["response"]["result"],
                 "(see attached media)",
@@ -2446,9 +2447,15 @@ mod tests {
                 contents[media_index]["parts"][1]["text"],
                 format!("Media from read (tool call {id}):"),
             );
-            assert_eq!(contents[media_index]["parts"][2]["inline_data"]["data"], data);
+            assert_eq!(
+                contents[media_index]["parts"][2]["inline_data"]["data"],
+                data
+            );
         }
-        assert_eq!(contents[3]["parts"][0]["text"], "Keep the second result separate");
+        assert_eq!(
+            contents[3]["parts"][0]["text"],
+            "Keep the second result separate"
+        );
         assert_eq!(contents[7]["parts"].as_array().unwrap().len(), 1);
         assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "Aw==");
     }
@@ -3021,7 +3028,11 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for finish in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MODEL_ARMOR"] {
+        for finish in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "MODEL_ARMOR",
+        ] {
             for prior_call in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let marker = dir.path().join("must-not-be-written.txt");
@@ -3072,9 +3083,16 @@ mod tests {
                         }
                     }))
                     .unwrap();
-                assert_eq!(message.stop_reason, StopReason::Error, "{finish}/{prior_call}");
+                assert_eq!(
+                    message.stop_reason,
+                    StopReason::Error,
+                    "{finish}/{prior_call}"
+                );
                 assert!(
-                    message.error_message.as_deref().is_some_and(|error| error.contains(finish))
+                    message
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|error| error.contains(finish))
                 );
                 assert_eq!(executions.load(Ordering::SeqCst), 0);
                 assert!(

@@ -1716,7 +1716,12 @@ mod tests {
         let destination = BedrockProvider::new("m").with_provider_name("configured-bedrock");
         for (api, provider, model, same_origin) in [
             ("bedrock-converse-stream", "configured-bedrock", "m", true),
-            ("bedrock-converse-stream", "configured-bedrock", "other", false),
+            (
+                "bedrock-converse-stream",
+                "configured-bedrock",
+                "other",
+                false,
+            ),
             ("bedrock-converse-stream", "amazon-bedrock", "m", false),
             ("anthropic-messages", "configured-bedrock", "m", false),
             ("", "configured-bedrock", "m", false),
@@ -1810,7 +1815,10 @@ mod tests {
                     completed = true;
                 }
             }
-            assert!(completed, "foreign-history turn must reach a terminal response");
+            assert!(
+                completed,
+                "foreign-history turn must reach a terminal response"
+            );
         });
         let captured = captured_request
             .recv_timeout(FIXTURE_BUDGET)

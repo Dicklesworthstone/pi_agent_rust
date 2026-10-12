@@ -223,18 +223,31 @@ fn indexing_a_partial_v2_view_keeps_the_binding_outside_its_loaded_branch() {
         let selected_leaf = partial.leaf_id().map(str::to_owned);
 
         let index = SessionIndex::for_sessions_root(&sessions_root);
-        index.index_session(&partial).expect("repair index from lazy view");
+        index
+            .index_session(&partial)
+            .expect("repair index from lazy view");
         let listed = index.list_sessions(None).expect("all indexed metadata");
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].cwd,
-            replacement.canonicalize().expect("canonical").display().to_string()
+            replacement
+                .canonicalize()
+                .expect("canonical")
+                .display()
+                .to_string()
         );
         assert_eq!(listed[0].message_count, 2);
         assert_eq!(listed[0].id, source.header.id);
-        assert_eq!(partial.entries.len(), 1, "indexing must not hydrate live state");
+        assert_eq!(
+            partial.entries.len(),
+            1,
+            "indexing must not hydrate live state"
+        );
         assert_eq!(partial.leaf_id(), selected_leaf.as_deref());
-        assert_eq!(fs::read(&path).expect("source after indexing"), original_bytes);
+        assert_eq!(
+            fs::read(&path).expect("source after indexing"),
+            original_bytes
+        );
     });
 }
 
@@ -257,7 +270,10 @@ async fn malformed_saved_binding_is_not_discoverable(extension: &str) {
     session.save().await.expect("save valid binding");
     let index = SessionIndex::for_sessions_root(&sessions_root);
     assert_eq!(
-        index.list_sessions(None).expect("valid binding indexed").len(),
+        index
+            .list_sessions(None)
+            .expect("valid binding indexed")
+            .len(),
         1
     );
 
@@ -279,7 +295,9 @@ async fn malformed_saved_binding_is_not_discoverable(extension: &str) {
             .expect("old derived row evicted")
             .is_empty()
     );
-    index.reindex_all().expect("rebuild skips malformed binding");
+    index
+        .reindex_all()
+        .expect("rebuild skips malformed binding");
     assert!(
         index
             .list_sessions(None)

@@ -583,10 +583,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("workspace");
         let path = temp.path().join("source.rs");
         std::fs::write(&path, "fn main() {}\n").expect("source");
-        let Some(peer) = test_server::Fixture::connect(
-            temp.path(),
-            serde_json::json!({"textDocumentSync": 1}),
-        ) else {
+        let Some(peer) =
+            test_server::Fixture::connect(temp.path(), serde_json::json!({"textDocumentSync": 1}))
+        else {
             return;
         };
         let uri = peer.client.ensure_synced(&path, "rust").expect("document");
@@ -655,7 +654,10 @@ mod tests {
         );
         assert_eq!(
             peer.runtime
-                .block_on(peer.client.call("test/success", Value::Null, Duration::from_secs(5)))
+                .block_on(
+                    peer.client
+                        .call("test/success", Value::Null, Duration::from_secs(5))
+                )
                 .expect("unrelated requests remain usable"),
             serde_json::json!({"ok": true})
         );

@@ -752,7 +752,10 @@ async fn recover_files(
                 .and_then(|part| part.get_mut("fileData"))
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| files_error("staged media changed during recovery"))?;
-            part.insert("fileUri".to_string(), Value::String(replacement.uri.clone()));
+            part.insert(
+                "fileUri".to_string(),
+                Value::String(replacement.uri.clone()),
+            );
         }
         file.remote = replacement;
         changed = true;
@@ -1394,7 +1397,8 @@ mod tests {
                     write!(
                         wire,
                         "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        reply.status, reply.body.len()
+                        reply.status,
+                        reply.body.len()
                     )
                     .unwrap();
                     if !reply
@@ -1441,8 +1445,14 @@ mod tests {
             .with_compat(Some(CompatConfig {
                 custom_headers: Some(HashMap::from([
                     ("x-goog-api-key".to_string(), "compat-key".to_string()),
-                    ("authorization".to_string(), "Bearer compat-token".to_string()),
-                    ("x-goog-user-project".to_string(), "compat-project".to_string()),
+                    (
+                        "authorization".to_string(),
+                        "Bearer compat-token".to_string(),
+                    ),
+                    (
+                        "x-goog-user-project".to_string(),
+                        "compat-project".to_string(),
+                    ),
                 ])),
                 ..CompatConfig::default()
             }));
@@ -1458,9 +1468,18 @@ mod tests {
             api_key: Some("unused-fallback".to_string()),
             headers: HashMap::from([
                 ("X-Goog-Api-Key".to_string(), "request-key".to_string()),
-                ("Authorization".to_string(), "Bearer request-token".to_string()),
-                ("X-Goog-User-Project".to_string(), "request-project".to_string()),
-                ("X-Pi-Recovery-Marker".to_string(), "preserve-me".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "Bearer request-token".to_string(),
+                ),
+                (
+                    "X-Goog-User-Project".to_string(),
+                    "request-project".to_string(),
+                ),
+                (
+                    "X-Pi-Recovery-Marker".to_string(),
+                    "preserve-me".to_string(),
+                ),
             ]),
             ..StreamOptions::default()
         }
@@ -2297,18 +2316,30 @@ mod tests {
                     .uri,
                 concurrent.uri
             );
-            for part in body["contents"][0]["parts"].as_array().unwrap().iter().skip(1) {
+            for part in body["contents"][0]["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip(1)
+            {
                 assert_eq!(part["fileData"]["fileUri"], concurrent.uri);
                 assert_eq!(part["thoughtSignature"], "keep-this-field");
             }
         });
         let requests = server.finish();
-        assert_eq!(requests.len(), 4, "no upload after a concurrent replacement");
+        assert_eq!(
+            requests.len(),
+            4,
+            "no upload after a concurrent replacement"
+        );
         assert_eq!(requests[2].path, "/v1beta/files/old");
         assert_eq!(requests[3].path, "/v1beta/files/concurrent");
         for index in [2, 3] {
             assert_eq!(
-                requests[index].headers.get("x-goog-api-key").map(String::as_str),
+                requests[index]
+                    .headers
+                    .get("x-goog-api-key")
+                    .map(String::as_str),
                 Some("a")
             );
         }
@@ -2349,7 +2380,10 @@ mod tests {
         assert_eq!(requests[1].body, b"abc");
         assert_eq!(requests[4].body, requests[1].body);
         assert_eq!(
-            requests[3].headers.get("x-goog-api-key").map(String::as_str),
+            requests[3]
+                .headers
+                .get("x-goog-api-key")
+                .map(String::as_str),
             Some("a")
         );
         assert!(!requests[4].headers.contains_key("x-goog-api-key"));
@@ -2408,10 +2442,9 @@ mod tests {
                         .await
                         .unwrap();
                 if cancelled {
-                    prepared.owner.cancel_with(
-                        asupersync::types::CancelKind::User,
-                        Some("cancel recovery"),
-                    );
+                    prepared
+                        .owner
+                        .cancel_with(asupersync::types::CancelKind::User, Some("cancel recovery"));
                 } else {
                     prepared.deadline = owner_now(&prepared.owner);
                 }

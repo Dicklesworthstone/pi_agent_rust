@@ -115,7 +115,9 @@ impl TextPrefix {
             .ok_or_else(|| protocol("text or thinking content retracted an observed prefix"))?;
         let fingerprint: [u8; 32] = Sha256::digest(prefix.as_bytes()).into();
         if fingerprint != self.fingerprint {
-            return Err(protocol("text or thinking content changed an observed prefix"));
+            return Err(protocol(
+                "text or thinking content changed an observed prefix",
+            ));
         }
         Ok(())
     }
@@ -182,15 +184,17 @@ impl Ledger {
         let delta = match event {
             AssistantMessageEvent::TextDelta { delta, .. }
             | AssistantMessageEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
-            AssistantMessageEvent::TextEnd { .. }
-            | AssistantMessageEvent::ThinkingEnd { .. } => None,
+            AssistantMessageEvent::TextEnd { .. } | AssistantMessageEvent::ThinkingEnd { .. } => {
+                None
+            }
             // Indexed Start events deliver only the index, not their text.
             // They must not consume a prefix before the first actual delta.
             _ => return Ok(None),
         };
         let before_delta = if let Some(delta) = delta {
-            text.strip_suffix(delta)
-                .ok_or_else(|| protocol("text or thinking delta disagrees with its partial block"))?
+            text.strip_suffix(delta).ok_or_else(|| {
+                protocol("text or thinking delta disagrees with its partial block")
+            })?
         } else {
             text
         };
@@ -334,10 +338,7 @@ impl Ledger {
             }
             self.text_prefixes[index] = Some(prefix);
         }
-        self.entries[index] = Some(State {
-            kind,
-            fingerprint,
-        });
+        self.entries[index] = Some(State { kind, fingerprint });
         Ok(())
     }
 
@@ -967,7 +968,10 @@ mod tests {
         ledger
             .admit(&terminal(
                 StopReason::ToolUse,
-                vec![ContentBlock::ToolCall(call()), ContentBlock::ToolCall(other)],
+                vec![
+                    ContentBlock::ToolCall(call()),
+                    ContentBlock::ToolCall(other),
+                ],
             ))
             .unwrap();
     }
@@ -1201,7 +1205,9 @@ mod tests {
             assert!(ledger.entries.is_empty());
             assert!(ledger.text_prefixes.is_empty());
         }
-        ledger.admit(&block_event(Kind::Tool, Phase::Start)).unwrap();
+        ledger
+            .admit(&block_event(Kind::Tool, Phase::Start))
+            .unwrap();
         ledger
             .admit(&text_preview(Kind::Text, 1, Phase::End, "", "complete"))
             .unwrap();
@@ -1216,7 +1222,11 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(ledger.text_prefixes.len(), MAX_BLOCKS);
-        assert!(ledger.text_prefixes[..MAX_BLOCKS - 1].iter().all(Option::is_none));
+        assert!(
+            ledger.text_prefixes[..MAX_BLOCKS - 1]
+                .iter()
+                .all(Option::is_none)
+        );
         assert!(std::mem::size_of::<TextPrefix>() <= 40);
     }
 
@@ -1347,7 +1357,9 @@ mod tests {
             assert!(ledger.entries.is_empty());
             assert!(ledger.tool_identities.is_empty());
         }
-        ledger.admit(&block_event(Kind::Text, Phase::Start)).unwrap();
+        ledger
+            .admit(&block_event(Kind::Text, Phase::Start))
+            .unwrap();
         assert!(ledger.tool_identities.is_empty());
         let mut content = vec![text(""); MAX_BLOCKS];
         content[MAX_BLOCKS - 1] = ContentBlock::ToolCall(call());
@@ -1464,7 +1476,10 @@ mod tests {
             };
             let result = push(
                 &mut decoder,
-                terminal(StopReason::Stop, vec![block, text("unobserved final block")]),
+                terminal(
+                    StopReason::Stop,
+                    vec![block, text("unobserved final block")],
+                ),
             )
             .unwrap();
             assert!(matches!(&result[0], StreamEvent::Done { .. }));
@@ -1509,17 +1524,13 @@ mod tests {
     #[test]
     fn tool_fingerprints_ignore_object_order_but_bind_array_order_and_types() {
         let original = ContentBlock::ToolCall(ToolCall {
-            arguments: serde_json::from_str(
-                r#"{"z":1,"a":{"y":[{"b":2,"a":1},true],"x":"text"}}"#,
-            )
-            .unwrap(),
+            arguments: serde_json::from_str(r#"{"z":1,"a":{"y":[{"b":2,"a":1},true],"x":"text"}}"#)
+                .unwrap(),
             ..call()
         });
         let reordered = ContentBlock::ToolCall(ToolCall {
-            arguments: serde_json::from_str(
-                r#"{"a":{"x":"text","y":[{"a":1,"b":2},true]},"z":1}"#,
-            )
-            .unwrap(),
+            arguments: serde_json::from_str(r#"{"a":{"x":"text","y":[{"a":1,"b":2},true]},"z":1}"#)
+                .unwrap(),
             ..call()
         });
         assert_eq!(

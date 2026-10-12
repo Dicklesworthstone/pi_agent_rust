@@ -440,10 +440,9 @@ mod tests {
         .expect("save public SQLite session");
         run_on_sqlite_thread(|| {
             let conn = map_sqlite_result(SqliteConnection::open_read_only(path))?;
-            let rows = map_sqlite_result(conn.query_sync(
-                "SELECT json FROM pi_session_entries WHERE seq = 1",
-                &[],
-            ))?;
+            let rows = map_sqlite_result(
+                conn.query_sync("SELECT json FROM pi_session_entries WHERE seq = 1", &[]),
+            )?;
             let json = super::super::row_get_string(&rows[0], 0, "json")?;
             map_sqlite_result(conn.close())?;
             Ok(json)
@@ -458,7 +457,10 @@ mod tests {
                 "UPDATE pi_session_entries SET json = ?1 WHERE seq = 1",
                 &[SqliteValue::from(json.to_string())],
             ))?;
-            assert_eq!(changed, 1, "mutate the persisted entry used by load_session");
+            assert_eq!(
+                changed, 1,
+                "mutate the persisted entry used by load_session"
+            );
             map_sqlite_result(conn.close())
         })
         .expect("replace stored entry");

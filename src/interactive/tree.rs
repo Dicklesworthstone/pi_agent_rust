@@ -439,7 +439,8 @@ impl PiApp {
             new_session.header.model_id = Some(model_id);
             new_session.header.thinking_level = thinking_level;
             new_session.init_from_fork_plan(fork_plan);
-            if let Err(err) = crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)
+            if let Err(err) =
+                crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)
             {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,

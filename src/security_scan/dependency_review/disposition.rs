@@ -3,8 +3,8 @@
 //! is installed, and future audit queries never inherit a decision silently.
 
 use super::{
-    AgentCx, ContentBlock, MAX_REPORT_BYTES, Path, Result, Root, Snapshot, TextContent,
-    ToolOutput, Value, checkpoint, error, json, snapshot, validate_name,
+    AgentCx, ContentBlock, MAX_REPORT_BYTES, Path, Result, Root, Snapshot, TextContent, ToolOutput,
+    Value, checkpoint, error, json, snapshot, validate_name,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,16 +31,25 @@ pub(super) struct Record {
 }
 
 fn valid_hash(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_reason(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 2048
-        && !value.chars().any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    !value.trim().is_empty()
+        && value.len() <= 2048
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
 }
 
 fn owned(suppression: &Value) -> bool {
-    suppression.pointer("/properties/piDependencyReview").and_then(Value::as_str) == Some(SCHEMA)
+    suppression
+        .pointer("/properties/piDependencyReview")
+        .and_then(Value::as_str)
+        == Some(SCHEMA)
 }
 
 // Called during snapshot admission, including offline comparisons. Only our
@@ -57,8 +66,13 @@ pub(super) fn validate_record(
     }
     let own: Vec<_> = suppressions.iter().filter(|entry| owned(entry)).collect();
     let Some(record) = record else {
-        return if own.is_empty() { Ok(()) }
-            else { Err(error("dependency suppression has no matching review record")) };
+        return if own.is_empty() {
+            Ok(())
+        } else {
+            Err(error(
+                "dependency suppression has no matching review record",
+            ))
+        };
     };
     if record.reviewed_at.len() > 80 {
         return Err(error("invalid dependency review timestamp"));
@@ -67,20 +81,29 @@ pub(super) fn validate_record(
         .map_err(|_| error("invalid dependency review timestamp"))?;
     let observed = chrono::DateTime::parse_from_rfc3339(observed_at)
         .map_err(|_| error("invalid audit timestamp"))?;
-    if record.schema != SCHEMA || record.fingerprint != finding.fingerprint
-        || record.advisory_modified != finding.modified || !valid_reason(&record.reason)
-        || !valid_hash(&record.source_sha256) || reviewed < observed
+    if record.schema != SCHEMA
+        || record.fingerprint != finding.fingerprint
+        || record.advisory_modified != finding.modified
+        || !valid_reason(&record.reason)
+        || !valid_hash(&record.source_sha256)
+        || reviewed < observed
     {
-        return Err(error("dependency review is malformed or bound to another finding/revision"));
+        return Err(error(
+            "dependency review is malformed or bound to another finding/revision",
+        ));
     }
     if record.decision == Decision::Reopen {
         if !own.is_empty() {
             return Err(error("reopened dependency retains an owned suppression"));
         }
-    } else if own.len() != 1 || own[0]["kind"] != "external" || own[0]["status"] != "accepted"
+    } else if own.len() != 1
+        || own[0]["kind"] != "external"
+        || own[0]["status"] != "accepted"
         || own[0]["justification"].as_str() != Some(record.reason.as_str())
     {
-        return Err(error("dependency suppression disagrees with its review decision"));
+        return Err(error(
+            "dependency suppression disagrees with its review decision",
+        ));
     }
     Ok(())
 }
@@ -103,10 +126,14 @@ pub(in crate::security_scan) async fn execute(cwd: &Path, input: Value) -> Resul
         .map_err(|_| error("invalid disposition_dependencies arguments"))?;
     validate_name(&input.current)?;
     validate_name(&input.sarif_out)?;
-    if !valid_hash(&input.expected_sha256) || !valid_hash(&input.fingerprint)
-        || !valid_reason(&input.reason) || input.current == input.sarif_out
+    if !valid_hash(&input.expected_sha256)
+        || !valid_hash(&input.fingerprint)
+        || !valid_reason(&input.reason)
+        || input.current == input.sarif_out
     {
-        return Err(error("review requires exact SHA-256/fingerprint, a nonblank reason up to 2048 bytes, and a new output filename"));
+        return Err(error(
+            "review requires exact SHA-256/fingerprint, a nonblank reason up to 2048 bytes, and a new output filename",
+        ));
     }
     let owner = AgentCx::for_current_or_request();
     if !owner.capabilities().io {
@@ -152,11 +179,15 @@ pub(in crate::security_scan) async fn execute(cwd: &Path, input: Value) -> Resul
 }
 
 fn annotate(bytes: &[u8], snapshot: &Snapshot, input: &Input) -> Result<(Value, usize)> {
-    let finding = snapshot.findings.get(&input.fingerprint)
+    let finding = snapshot
+        .findings
+        .get(&input.fingerprint)
         .ok_or_else(|| error("fingerprint is absent from this dependency report"))?;
-    let mut document: Value = serde_json::from_slice(bytes)
-        .map_err(|_| error("malformed dependency report"))?;
-    let results = document.pointer_mut("/runs/0/results").and_then(Value::as_array_mut)
+    let mut document: Value =
+        serde_json::from_slice(bytes).map_err(|_| error("malformed dependency report"))?;
+    let results = document
+        .pointer_mut("/runs/0/results")
+        .and_then(Value::as_array_mut)
         .ok_or_else(|| error("missing dependency results"))?;
     // SARIF 2.1.0 section 3.27.23 requires suppression information to be
     // consistently null or non-null across a run. Once a decision is present,
@@ -167,25 +198,43 @@ fn annotate(bytes: &[u8], snapshot: &Snapshot, input: &Input) -> Result<(Value, 
             result["suppressions"] = json!([]);
         }
     }
-    let result = results.iter_mut().find(|entry| {
-        entry.pointer("/fingerprints/pi~1dependency~1v1").and_then(Value::as_str) == Some(input.fingerprint.as_str())
-    }).ok_or_else(|| error("missing dependency finding"))?;
+    let result = results
+        .iter_mut()
+        .find(|entry| {
+            entry
+                .pointer("/fingerprints/pi~1dependency~1v1")
+                .and_then(Value::as_str)
+                == Some(input.fingerprint.as_str())
+        })
+        .ok_or_else(|| error("missing dependency finding"))?;
     let record = Record {
-        schema: SCHEMA.into(), fingerprint: input.fingerprint.clone(), decision: input.decision,
-        reason: input.reason.clone(), reviewed_at: chrono::Utc::now().to_rfc3339(),
-        source_sha256: snapshot.digest.clone(), advisory_modified: finding.modified.clone(),
+        schema: SCHEMA.into(),
+        fingerprint: input.fingerprint.clone(),
+        decision: input.decision,
+        reason: input.reason.clone(),
+        reviewed_at: chrono::Utc::now().to_rfc3339(),
+        source_sha256: snapshot.digest.clone(),
+        advisory_modified: finding.modified.clone(),
     };
-    let mut suppressions: Vec<Value> = result.get("suppressions").and_then(Value::as_array)
-        .into_iter().flatten().filter(|entry| !owned(entry)).cloned().collect();
+    let mut suppressions: Vec<Value> = result
+        .get("suppressions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !owned(entry))
+        .cloned()
+        .collect();
     let foreign = suppressions.len();
     if input.decision != Decision::Reopen {
-        suppressions.push(json!({"kind":"external","status":"accepted","justification":record.reason,
-            "properties":{"piDependencyReview":SCHEMA}}));
+        suppressions.push(
+            json!({"kind":"external","status":"accepted","justification":record.reason,
+            "properties":{"piDependencyReview":SCHEMA}}),
+        );
     }
     validate_record(Some(&record), finding, &suppressions, &snapshot.observed_at)?;
     result["suppressions"] = json!(suppressions);
-    result["properties"]["piDependencyReview"] = serde_json::to_value(record)
-        .map_err(|_| error("cannot encode dependency decision"))?;
+    result["properties"]["piDependencyReview"] =
+        serde_json::to_value(record).map_err(|_| error("cannot encode dependency decision"))?;
     Ok((document, foreign))
 }
 
@@ -208,21 +257,38 @@ impl Root {
         use std::io::Write as _;
         validate_name(name)?;
         if bytes.len() > MAX_REPORT_BYTES || !owner.capabilities().io {
-            return Err(error("review publication exceeds its size or I/O capability"));
+            return Err(error(
+                "review publication exceeds its size or I/O capability",
+            ));
         }
         checkpoint(owner)?;
         let name_stage = format!(".pi-dependency-review-{}.tmp", uuid::Uuid::new_v4());
-        let fd = rustix::fs::openat(&self.0, name_stage.as_str(),
+        let fd = rustix::fs::openat(
+            &self.0,
+            name_stage.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_bits_truncate(0o600))
-            .map_err(|_| error("cannot create private dependency review staging file"))?;
-        let _stage = Stage { root: &self.0, name: name_stage.clone() };
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|_| error("cannot create private dependency review staging file"))?;
+        let _stage = Stage {
+            root: &self.0,
+            name: name_stage.clone(),
+        };
         let mut file = std::fs::File::from(fd);
-        file.write_all(bytes).and_then(|()| file.sync_all())
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
             .map_err(|_| error("dependency review write/sync failed; destination unchanged"))?;
         checkpoint(owner)?;
-        rustix::fs::linkat(&self.0, name_stage.as_str(), &self.0, name, AtFlags::empty())
-            .map_err(|_| error("dependency review output exists or cannot be published; no overwrite performed"))?;
+        rustix::fs::linkat(
+            &self.0,
+            name_stage.as_str(),
+            &self.0,
+            name,
+            AtFlags::empty(),
+        )
+        .map_err(|_| {
+            error("dependency review output exists or cannot be published; no overwrite performed")
+        })?;
         Ok(())
     }
 }
@@ -234,6 +300,8 @@ mod tests;
 impl Root {
     #[allow(clippy::unused_self)]
     fn publish(&self, _name: &str, _bytes: &[u8], _owner: &AgentCx) -> Result<()> {
-        Err(error("confined review publication requires supported Unix descriptor APIs"))
+        Err(error(
+            "confined review publication requires supported Unix descriptor APIs",
+        ))
     }
 }

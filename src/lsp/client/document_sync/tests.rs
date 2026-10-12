@@ -426,9 +426,11 @@ while True:
                 } else {
                     Duration::from_secs(5)
                 };
-                let mut syncing = Box::pin(owner.with_current(
-                    client.ensure_synced_with_timeout(&path, "plaintext", timeout),
-                ));
+                let mut syncing = Box::pin(owner.with_current(client.ensure_synced_with_timeout(
+                    &path,
+                    "plaintext",
+                    timeout,
+                )));
                 if mode == "timeout" {
                     assert!(
                         syncing
@@ -440,10 +442,7 @@ while True:
                 } else {
                     assert!(futures::poll!(syncing.as_mut()).is_pending());
                     if mode == "cancel" {
-                        owner.cancel_with(
-                            asupersync::types::CancelKind::User,
-                            Some("cancel sync"),
-                        );
+                        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel sync"));
                         assert!(
                             syncing
                                 .await
@@ -518,12 +517,7 @@ while True:
             let std::task::Poll::Ready(result) = futures::poll!(syncing.as_mut()) else {
                 panic!("an impossible batch must not wait for capacity");
             };
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("LSP_TRANSPORT_IO")
-            );
+            assert!(result.unwrap_err().to_string().contains("LSP_TRANSPORT_IO"));
         });
         assert!(client.is_alive());
         let current = client.document_snapshots()[&path];
@@ -557,7 +551,10 @@ while True:
         let error = client.ensure_synced(&path, "plaintext").unwrap_err();
         assert!(error.to_string().contains("LSP_TRANSPORT_BUSY"));
         assert_eq!(client.open_document_count(), MAX_OPEN_DOCUMENTS);
-        assert_eq!(client.document_snapshots()[&oldest].version, previous.version);
+        assert_eq!(
+            client.document_snapshots()[&oldest].version,
+            previous.version
+        );
         assert!(!client.document_snapshots().contains_key(&path));
         assert_eq!(paused.drain().len(), 1);
 

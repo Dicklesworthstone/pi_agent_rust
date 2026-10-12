@@ -626,10 +626,8 @@ impl HandoffGenerator {
                             && !call.id.trim().is_empty()
                         {
                             let observed = evidence.entry(&call.id).or_default();
-                            observed.ambiguous |= observed
-                                .call
-                                .replace((index, call.name.as_str()))
-                                .is_some();
+                            observed.ambiguous |=
+                                observed.call.replace((index, call.name.as_str())).is_some();
                         }
                     }
                 }
@@ -735,7 +733,10 @@ impl HandoffGenerator {
         let rest = rest.trim_start();
         let (complete, item) = if let Some(item) = rest.strip_prefix("[ ]") {
             (false, item)
-        } else if let Some(item) = rest.strip_prefix("[x]").or_else(|| rest.strip_prefix("[X]")) {
+        } else if let Some(item) = rest
+            .strip_prefix("[x]")
+            .or_else(|| rest.strip_prefix("[X]"))
+        {
             (true, item)
         } else {
             return None;
@@ -756,10 +757,7 @@ impl HandoffGenerator {
             if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
                 let width = trimmed.chars().take_while(|ch| *ch == marker).count();
                 if let Some((opening, minimum)) = fence {
-                    if marker == opening
-                        && width >= minimum
-                        && trimmed[width..].trim().is_empty()
-                    {
+                    if marker == opening && width >= minimum && trimmed[width..].trim().is_empty() {
                         fence = None;
                     }
                     return false;

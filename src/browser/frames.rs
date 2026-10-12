@@ -77,7 +77,13 @@ impl Tree {
         Ok(tree)
     }
 
-    fn visit(&mut self, node: &Value, parent: Option<&str>, depth: usize, session: &str) -> Result<()> {
+    fn visit(
+        &mut self,
+        node: &Value,
+        parent: Option<&str>,
+        depth: usize,
+        session: &str,
+    ) -> Result<()> {
         if depth > MAX_DEPTH || self.frames.len() >= MAX_FRAMES {
             return Err(error(
                 "browser frame tree exceeds its depth or frame-count limit",
@@ -155,7 +161,9 @@ impl Tree {
             .get(&parent)
             .is_none_or(|frame| frame.identity.session != link.parent)
         {
-            return Err(error("iframe root is not owned by its attached parent session"));
+            return Err(error(
+                "iframe root is not owned by its attached parent session",
+            ));
         }
         let depth = self.path(&parent)?.len();
         self.visit(root, Some(&parent), depth, &link.session)
@@ -271,8 +279,15 @@ impl Scope {
         if self.is_remote()
             && !matches!(
                 action,
-                "snapshot" | "ax_tree" | "evaluate" | "wait_for"
-                    | "click" | "scroll" | "fill" | "type" | "press"
+                "snapshot"
+                    | "ax_tree"
+                    | "evaluate"
+                    | "wait_for"
+                    | "click"
+                    | "scroll"
+                    | "fill"
+                    | "type"
+                    | "press"
             )
             && !forms::is_action(action)
         {
@@ -378,7 +393,8 @@ pub(super) fn validate(args: &Value) -> Result<()> {
             | "press"
             | "scroll"
             | "wait_for"
-    ) && !forms::is_action(action) {
+    ) && !forms::is_action(action)
+    {
         return Err(error(
             "frame selection is supported by inspection, evaluation and input actions only",
         ));
@@ -483,7 +499,12 @@ mod tests {
         assert!(scope.admit_action("select_option").is_ok());
         assert!(validate(&json!({"action":"select_option","tab":"work","frame":"child"})).is_ok());
         assert!(validate(&json!({"action":"select_option","frame":"child"})).is_err());
-        assert!(validate(&json!({"action":"select_option","tab":"work","frame":"child","dialog_response":{}})).is_err());
+        assert!(
+            validate(
+                &json!({"action":"select_option","tab":"work","frame":"child","dialog_response":{}})
+            )
+            .is_err()
+        );
     }
 
     fn scoped_remote_tree() -> (Tree, Targets) {
@@ -494,21 +515,32 @@ mod tests {
             ("remote-session", "nested-session", "remote-nested"),
             ("page", "sibling-session", "remote-sibling"),
         ] {
-            targets.observe(&json!({
-                "sessionId": parent, "method": "Target.attachedToTarget",
-                "params": {"sessionId": session, "waitingForDebugger": false,
-                    "targetInfo": {"targetId": target, "type": "iframe"}},
-            }), Some("page")).unwrap();
+            targets
+                .observe(
+                    &json!({
+                        "sessionId": parent, "method": "Target.attachedToTarget",
+                        "params": {"sessionId": session, "waitingForDebugger": false,
+                            "targetInfo": {"targetId": target, "type": "iframe"}},
+                    }),
+                    Some("page"),
+                )
+                .unwrap();
         }
         for (parent, session, target, frame_parent) in [
             ("page", "remote-session", "remote", "child"),
-            ("remote-session", "nested-session", "remote-nested", "remote"),
+            (
+                "remote-session",
+                "nested-session",
+                "remote-nested",
+                "remote",
+            ),
             ("page", "sibling-session", "remote-sibling", "main"),
         ] {
             tree.append_remote(
                 &remote_tree(target, frame_parent, "https://example.com/"),
                 &remote_link(parent, session, target),
-            ).unwrap();
+            )
+            .unwrap();
         }
         (tree, targets)
     }
@@ -519,19 +551,27 @@ mod tests {
         let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
         assert_eq!(scope.routes.len(), 2);
         for method in [
-            "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-            "DOM.resolveNode", "DOM.describeNode", "Accessibility.getFullAXTree",
+            "Runtime.evaluate",
+            "Runtime.callFunctionOn",
+            "Runtime.releaseObject",
+            "DOM.resolveNode",
+            "DOM.describeNode",
+            "Accessibility.getFullAXTree",
             "Page.createIsolatedWorld",
         ] {
             assert_eq!(scope.command_session(method).unwrap(), "nested-session");
         }
         for method in [
-            "Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Page.bringToFront",
+            "Input.insertText",
+            "Input.dispatchKeyEvent",
+            "Input.dispatchMouseEvent",
+            "Page.bringToFront",
         ] {
             assert_eq!(scope.command_session(method).unwrap(), "page");
         }
         for action in [
-            "snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press", "click", "scroll",
+            "snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press", "click",
+            "scroll",
         ] {
             assert!(scope.admit_action(action).is_ok());
         }
@@ -540,7 +580,10 @@ mod tests {
         }
         let local = Scope::pin(&tree, "child", &targets).unwrap();
         assert!(local.routes.is_empty());
-        assert_eq!(local.command_session("Input.dispatchMouseEvent").unwrap(), "page");
+        assert_eq!(
+            local.command_session("Input.dispatchMouseEvent").unwrap(),
+            "page"
+        );
         assert!(local.admit_action("click").is_ok());
         assert!(Scope::pin(&tree, "other-tab-frame", &targets).is_err());
     }
@@ -564,7 +607,11 @@ mod tests {
         }
         let (mut tree, targets) = scoped_remote_tree();
         let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
-        tree.frames.get_mut("remote-sibling").unwrap().identity.loader = "new-sibling".into();
+        tree.frames
+            .get_mut("remote-sibling")
+            .unwrap()
+            .identity
+            .loader = "new-sibling".into();
         assert!(scope.check_tree(&tree).is_ok());
         tree.frames.remove("remote");
         assert!(scope.check_tree(&tree).is_err());
@@ -575,22 +622,37 @@ mod tests {
         let (tree, mut targets) = scoped_remote_tree();
         let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
         assert!(targets.preserves(&scope.routes));
-        targets.observe(&json!({"sessionId":"page", "method":"Target.detachedFromTarget",
-            "params":{"sessionId":"sibling-session"}}), Some("page")).unwrap();
+        targets
+            .observe(
+                &json!({"sessionId":"page", "method":"Target.detachedFromTarget",
+            "params":{"sessionId":"sibling-session"}}),
+                Some("page"),
+            )
+            .unwrap();
         assert!(targets.preserves(&scope.routes));
-        targets.observe(&json!({"sessionId":"page", "method":"Target.detachedFromTarget",
-            "params":{"sessionId":"remote-session"}}), Some("page")).unwrap();
+        targets
+            .observe(
+                &json!({"sessionId":"page", "method":"Target.detachedFromTarget",
+            "params":{"sessionId":"remote-session"}}),
+                Some("page"),
+            )
+            .unwrap();
         assert!(!targets.preserves(&scope.routes));
         assert!(Scope::pin(&tree, "remote-nested", &targets).is_err());
     }
 
     fn remote_link(parent: &str, session: &str, target: &str) -> targets::Link {
         let mut targets = Targets::default();
-        targets.observe(&json!({
-            "sessionId": parent, "method": "Target.attachedToTarget",
-            "params": {"sessionId": session, "waitingForDebugger": false,
-                "targetInfo": {"targetId": target, "type": "iframe"}},
-        }), Some(parent)).unwrap();
+        targets
+            .observe(
+                &json!({
+                    "sessionId": parent, "method": "Target.attachedToTarget",
+                    "params": {"sessionId": session, "waitingForDebugger": false,
+                        "targetInfo": {"targetId": target, "type": "iframe"}},
+                }),
+                Some(parent),
+            )
+            .unwrap();
         targets.ordered(parent).unwrap().remove(0)
     }
 
@@ -611,10 +673,13 @@ mod tests {
         tree.append_remote(
             &remote_tree("remote-nested", "remote-local", "https://nested.example/"),
             &nested,
-        ).unwrap();
+        )
+        .unwrap();
         let path = tree.path("remote-nested").unwrap();
-        assert_eq!(path.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
-            ["main", "child", "remote", "remote-local", "remote-nested"]);
+        assert_eq!(
+            path.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            ["main", "child", "remote", "remote-local", "remote-nested"]
+        );
         assert_eq!(path[2].session, "remote-session");
         assert_eq!(path[3].session, "remote-session");
         assert_eq!(path[4].session, "nested-session");
@@ -649,7 +714,8 @@ mod tests {
         tree.append_remote(
             &remote_tree("remote", "child", "https://example.com/allowed"),
             &remote_link("page", "remote-session", "remote"),
-        ).unwrap();
+        )
+        .unwrap();
         let rules = vec!["example.com".to_owned()];
         let error = admit_path(&tree.path("remote").unwrap(), Some(&rules)).unwrap_err();
         assert!(!error.to_string().contains("PRIVATE-CANARY"));
@@ -658,14 +724,26 @@ mod tests {
 
     #[test]
     fn frame_count_budget_is_shared_across_process_trees() {
-        let mut tree = Tree::parse_in_session(&json!({"frameTree": node("main", "about:blank")}), "page").unwrap();
+        let mut tree =
+            Tree::parse_in_session(&json!({"frameTree": node("main", "about:blank")}), "page")
+                .unwrap();
         for i in 1..MAX_FRAMES {
             let id = format!("remote-{i}");
             let session = format!("session-{i}");
-            tree.append_remote(&remote_tree(&id, "main", "about:blank"), &remote_link("page", &session, &id)).unwrap();
+            tree.append_remote(
+                &remote_tree(&id, "main", "about:blank"),
+                &remote_link("page", &session, &id),
+            )
+            .unwrap();
         }
         assert_eq!(tree.frames.len(), MAX_FRAMES);
-        assert!(tree.append_remote(&remote_tree("overflow", "main", "about:blank"), &remote_link("page", "overflow", "overflow")).is_err());
+        assert!(
+            tree.append_remote(
+                &remote_tree("overflow", "main", "about:blank"),
+                &remote_link("page", "overflow", "overflow")
+            )
+            .is_err()
+        );
     }
 
     fn node(id: &str, url: &str) -> Value {

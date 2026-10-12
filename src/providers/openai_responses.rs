@@ -1579,10 +1579,16 @@ where
         Ok(())
     }
 
-    fn reject_tool_kind_change(&mut self, item_id: Option<&str>, output_index: Option<u32>) -> bool {
+    fn reject_tool_kind_change(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u32>,
+    ) -> bool {
         let collision = item_id.is_some_and(|id| self.tool_identities.items.contains_key(id))
             || output_index.is_some_and(|index| {
-                self.tool_identities.item_by_output_index.contains_key(&index)
+                self.tool_identities
+                    .item_by_output_index
+                    .contains_key(&index)
             });
         if collision {
             self.reject_tool_response(
@@ -3116,7 +3122,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("frame.png"),
-            base64::engine::general_purpose::STANDARD.decode(PNG).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(PNG)
+                .unwrap(),
         )
         .unwrap();
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
@@ -3137,7 +3145,8 @@ mod tests {
                     Some("[Image omitted: the active model does not support image input.]"),
                 ),
             ] {
-                let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+                let (base_url, rx) =
+                    spawn_test_server(200, "text/event-stream", &success_sse_body());
                 let provider = OpenAIResponsesProvider::new("gpt-test")
                     .with_codex_mode(codex_mode)
                     .with_base_url(base_url);
@@ -4125,37 +4134,87 @@ mod tests {
             ("changed name", vec![added.clone(), changed_name]),
             ("changed item", vec![added.clone(), changed_item.clone()]),
             ("completed call reused", vec![done.clone(), changed_item]),
-            ("output slot reused", vec![indexed_added.clone(), indexed_other]),
-            ("item moved at completion", vec![indexed_added.clone(), moved_done]),
-            ("item moved at arguments done", vec![indexed_added.clone(), moved_arguments]),
-            ("slot reused by orphan delta", vec![indexed_added, json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": "fc_other", "output_index": 0, "delta": "{}"
-            })]),
-            ("item became a message", vec![added.clone(), json!({
-                "type":"response.output_item.done", "item":{"type":"message", "id":"fc_identity"}
-            })]),
-            ("item became an unknown kind", vec![added.clone(), json!({
-                "type":"response.output_item.done", "item":{"id":"fc_identity"}
-            })]),
-            ("tool slot became reasoning", vec![json!({
-                "type":"response.output_item.added", "output_index":0, "item":added["item"]
-            }), json!({
-                "type":"response.output_item.done", "output_index":0,
-                "item":{"type":"reasoning", "id":"rs_other"}
-            })]),
-            ("non-function added reused a tool slot", vec![json!({
-                "type":"response.output_item.added", "output_index":0, "item":added["item"]
-            }), json!({
-                "type":"response.output_item.added", "output_index":0,
-                "item":{"type":"message", "id":"msg_other"}
-            })]),
+            (
+                "output slot reused",
+                vec![indexed_added.clone(), indexed_other],
+            ),
+            (
+                "item moved at completion",
+                vec![indexed_added.clone(), moved_done],
+            ),
+            (
+                "item moved at arguments done",
+                vec![indexed_added.clone(), moved_arguments],
+            ),
+            (
+                "slot reused by orphan delta",
+                vec![
+                    indexed_added,
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_other", "output_index": 0, "delta": "{}"
+                    }),
+                ],
+            ),
+            (
+                "item became a message",
+                vec![
+                    added.clone(),
+                    json!({
+                        "type":"response.output_item.done", "item":{"type":"message", "id":"fc_identity"}
+                    }),
+                ],
+            ),
+            (
+                "item became an unknown kind",
+                vec![
+                    added.clone(),
+                    json!({
+                        "type":"response.output_item.done", "item":{"id":"fc_identity"}
+                    }),
+                ],
+            ),
+            (
+                "tool slot became reasoning",
+                vec![
+                    json!({
+                        "type":"response.output_item.added", "output_index":0, "item":added["item"]
+                    }),
+                    json!({
+                        "type":"response.output_item.done", "output_index":0,
+                        "item":{"type":"reasoning", "id":"rs_other"}
+                    }),
+                ],
+            ),
+            (
+                "non-function added reused a tool slot",
+                vec![
+                    json!({
+                        "type":"response.output_item.added", "output_index":0, "item":added["item"]
+                    }),
+                    json!({
+                        "type":"response.output_item.added", "output_index":0,
+                        "item":{"type":"message", "id":"msg_other"}
+                    }),
+                ],
+            ),
             ("delta after item done", vec![done.clone(), delta.clone()]),
-            ("arguments after item done", vec![done, arguments_done.clone()]),
-            ("duplicate arguments done", vec![
-                added.clone(), arguments_done.clone(), arguments_done.clone()
-            ]),
-            ("delta after arguments done", vec![added, arguments_done, delta]),
+            (
+                "arguments after item done",
+                vec![done, arguments_done.clone()],
+            ),
+            (
+                "duplicate arguments done",
+                vec![
+                    added.clone(),
+                    arguments_done.clone(),
+                    arguments_done.clone(),
+                ],
+            ),
+            (
+                "delta after arguments done",
+                vec![added, arguments_done, delta],
+            ),
             ("empty item", vec![empty_item]),
             ("empty call", vec![empty_call]),
             ("empty name", vec![empty_name]),
@@ -4165,25 +4224,42 @@ mod tests {
     #[test]
     fn contradictory_tool_identities_end_the_response_once_without_rewriting_calls() {
         for (case, mut events) in conflicting_tool_identity_events("{}") {
-            events.push(tool_item_event("response.output_item.done", "after_failure", "write", "{}"));
+            events.push(tool_item_event(
+                "response.output_item.done",
+                "after_failure",
+                "write",
+                "{}",
+            ));
             events.push(completed_response_event());
             let out = collect_events(&events);
             assert_eq!(
-                out.iter().filter(|event| matches!(event, StreamEvent::Error { .. })).count(),
+                out.iter()
+                    .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                    .count(),
                 1,
                 "{case}"
             );
-            assert!(!out.iter().any(|event| matches!(event, StreamEvent::Done { .. })), "{case}");
-            assert!(!out.iter().any(|event| matches!(
-                event, StreamEvent::ToolCallStart { id, .. } if id == "call_after_failure"
-            )), "{case}");
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Done { .. })),
+                "{case}"
+            );
+            assert!(
+                !out.iter().any(|event| matches!(
+                    event, StreamEvent::ToolCallStart { id, .. } if id == "call_after_failure"
+                )),
+                "{case}"
+            );
             let Some(StreamEvent::Error { reason, error }) = out.last() else {
                 panic!("{case}: missing terminal error");
             };
             assert_eq!(*reason, StopReason::Error);
             assert_eq!(error.stop_reason, StopReason::Error);
             let detail = error.error_message.as_deref().unwrap();
-            assert!(detail.contains("Invalid OpenAI Responses tool identity"), "{case}");
+            assert!(
+                detail.contains("Invalid OpenAI Responses tool identity"),
+                "{case}"
+            );
             assert!(!detail.contains("private-rewritten"), "{case}");
             assert!(!detail.contains("fc_identity"), "{case}");
             assert!(!detail.contains("call_identity"), "{case}");
@@ -4194,7 +4270,10 @@ mod tests {
     fn parallel_tool_lifecycles_preserve_optional_fields_and_authoritative_snapshots() {
         let mut done_without_arguments =
             tool_item_event("response.output_item.done", "first", "write", "");
-        done_without_arguments["item"].as_object_mut().unwrap().remove("arguments");
+        done_without_arguments["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
         let events = [
             json!({"type":"response.function_call_arguments.delta", "item_id":"fc_first", "delta":"{\"old\":"}),
             tool_item_event("response.output_item.added", "second", "write", "{}"),
@@ -4206,14 +4285,25 @@ mod tests {
             completed_response_event(),
         ];
         let out = collect_events(&events);
-        assert!(!out.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
-        let Some(StreamEvent::Done { reason: StopReason::ToolUse, message }) = out.last() else {
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. }))
+        );
+        let Some(StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message,
+        }) = out.last()
+        else {
             panic!("valid parallel calls must complete");
         };
-        let calls = message.content.iter().filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => Some(call),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let calls = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].id, "call_second");
         assert_eq!(calls[1].id, "call_first");
@@ -4221,7 +4311,12 @@ mod tests {
         assert_eq!(calls[1].thought_signature.as_deref(), Some("fc_first"));
         assert_eq!(calls[2].id, "call_done_only");
         assert_eq!(calls[2].arguments, json!({}));
-        assert_eq!(out.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 3);
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            3
+        );
 
         for output_done in [false, true] {
             let mut events = vec![
@@ -4229,7 +4324,12 @@ mod tests {
                 json!({"type":"response.function_call_arguments.done", "item_id":"fc_snapshot", "arguments":"{\"final\":1}"}),
             ];
             if output_done {
-                events.push(tool_item_event("response.output_item.done", "snapshot", "write", r#"{"final":2}"#));
+                events.push(tool_item_event(
+                    "response.output_item.done",
+                    "snapshot",
+                    "write",
+                    r#"{"final":2}"#,
+                ));
             }
             events.push(completed_response_event());
             let out = collect_events(&events);
@@ -4238,7 +4338,10 @@ mod tests {
                 event, StreamEvent::ToolCallEnd { tool_call, .. }
                     if tool_call.arguments == json!({"final": expected})
             )));
-            assert!(!out.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. }))
+            );
         }
     }
 
@@ -4266,22 +4369,37 @@ mod tests {
             assert!(out.iter().any(|event| matches!(
                 event, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.arguments == expected
             )));
-            assert!(!out.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. }))
+            );
         }
     }
 
     #[test]
     fn tool_identity_limits_include_orphans_and_completed_items() {
         let mut events = (0..MAX_STREAMED_TOOL_ITEMS)
-            .map(|index| json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": format!("fc_{index}"), "delta": ""
-            }))
+            .map(|index| {
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": format!("fc_{index}"), "delta": ""
+                })
+            })
             .collect::<Vec<_>>();
         // Completing an orphan neither charges the same item twice nor frees
         // its identity for reuse before the actual end of the wire stream.
-        events.push(tool_item_event("response.output_item.added", "0", "write", "{}"));
-        events.push(tool_item_event("response.output_item.done", "0", "write", "{}"));
+        events.push(tool_item_event(
+            "response.output_item.added",
+            "0",
+            "write",
+            "{}",
+        ));
+        events.push(tool_item_event(
+            "response.output_item.done",
+            "0",
+            "write",
+            "{}",
+        ));
         events.push(json!({
             "type": "response.function_call_arguments.delta",
             "item_id": "fc_over_limit", "delta": ""
@@ -4291,7 +4409,13 @@ mod tests {
         let Some(StreamEvent::Error { error, .. }) = out.last() else {
             panic!("distinct orphan identities must be bounded");
         };
-        assert!(error.error_message.as_deref().unwrap().contains("count limit"));
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("count limit")
+        );
         assert!(out.iter().any(|event| matches!(
             event, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.id == "call_0"
         )));
@@ -4316,9 +4440,16 @@ mod tests {
             let Some(StreamEvent::Error { error, .. }) = out.last() else {
                 panic!("identity bytes must be bounded before retaining function fields");
             };
-            assert!(error.error_message.as_deref().unwrap().contains("byte limit"));
+            assert!(
+                error
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("byte limit")
+            );
             assert!(!out.iter().any(|event| matches!(
-                event, StreamEvent::ToolCallStart { .. } | StreamEvent::Done { .. }
+                event,
+                StreamEvent::ToolCallStart { .. } | StreamEvent::Done { .. }
             )));
         }
     }
@@ -4341,8 +4472,16 @@ mod tests {
                 panic!("provider failure must stay terminal");
             };
             assert_eq!(*reason, StopReason::Error);
-            assert_eq!(error.error_message.as_deref(), Some("original provider failure"));
-            assert_eq!(out.iter().filter(|event| matches!(event, StreamEvent::Error { .. })).count(), 1);
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some("original provider failure")
+            );
+            assert_eq!(
+                out.iter()
+                    .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                    .count(),
+                1
+            );
         }
     }
 
@@ -4356,18 +4495,25 @@ mod tests {
         let arguments = json!({"path":marker, "content":"must not execute"}).to_string();
         for (case, conflict) in conflicting_tool_identity_events(&arguments) {
             let mut events = vec![tool_item_event(
-                "response.output_item.done", "valid_peer", "write", &arguments,
+                "response.output_item.done",
+                "valid_peer",
+                "write",
+                &arguments,
             )];
             events.extend(conflict);
             events.push(completed_response_event());
-            let body = events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+            let body = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
             let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
             let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
             let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
                 crate::tools::WriteTool::new(dir.path()),
             )]);
             let mut agent = crate::agent::Agent::new(
-                Arc::new(provider), tools,
+                Arc::new(provider),
+                tools,
                 crate::agent::AgentConfig {
                     max_tool_iterations: 1,
                     stream_options: StreamOptions {
@@ -4380,16 +4526,31 @@ mod tests {
             let executions = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&executions);
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let message = runtime.block_on(agent.run("Apply both edits", move |event| {
-                if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                }
-            })).unwrap();
+            let message = runtime
+                .block_on(agent.run("Apply both edits", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
             assert_eq!(message.stop_reason, StopReason::Error, "{case}");
-            assert!(message.error_message.as_deref().unwrap().contains("Invalid OpenAI Responses tool identity"), "{case}");
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Invalid OpenAI Responses tool identity"),
+                "{case}"
+            );
             assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}");
             assert!(!marker.exists(), "{case}: a peer must not execute");
-            assert!(!agent.messages().iter().any(|message| matches!(message, Message::ToolResult(_))), "{case}");
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResult(_))),
+                "{case}"
+            );
         }
     }
 
@@ -4412,20 +4573,26 @@ mod tests {
                 tool_item_event("response.output_item.done", "first", "write", ""),
                 completed_response_event(),
             ];
-            let content_type = if codex { "application/x-ndjson" } else { "text/event-stream" };
+            let content_type = if codex {
+                "application/x-ndjson"
+            } else {
+                "text/event-stream"
+            };
             let body = if codex {
                 ndjson_body_from_events(&events)
             } else {
-                events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>()
+                events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>()
             };
             let follow_up = if codex {
                 ndjson_body_from_events(&[completed_response_event()])
             } else {
                 success_sse_body()
             };
-            let (base_url, requests) = spawn_test_server_with_bodies(
-                200, content_type, vec![body, follow_up],
-            );
+            let (base_url, requests) =
+                spawn_test_server_with_bodies(200, content_type, vec![body, follow_up]);
             let provider = OpenAIResponsesProvider::new("gpt-test")
                 .with_codex_mode(codex)
                 .with_base_url(base_url);
@@ -4433,11 +4600,16 @@ mod tests {
                 crate::tools::WriteTool::new(dir.path()),
             )]);
             let mut agent = crate::agent::Agent::new(
-                Arc::new(provider), tools,
+                Arc::new(provider),
+                tools,
                 crate::agent::AgentConfig {
                     max_tool_iterations: 1,
                     stream_options: StreamOptions {
-                        api_key: Some(if codex { build_test_jwt("acct-test") } else { "test-key".to_string() }),
+                        api_key: Some(if codex {
+                            build_test_jwt("acct-test")
+                        } else {
+                            "test-key".to_string()
+                        }),
                         ..Default::default()
                     },
                     ..crate::agent::AgentConfig::default()
@@ -4446,11 +4618,13 @@ mod tests {
             let executions = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&executions);
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let result = runtime.block_on(agent.run("Apply both edits", move |event| {
-                if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                }
-            })).unwrap();
+            let result = runtime
+                .block_on(agent.run("Apply both edits", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
             assert_eq!(result.stop_reason, StopReason::Stop);
             assert_eq!(executions.load(Ordering::SeqCst), 2);
             assert_eq!(std::fs::read_to_string(first).unwrap(), "one");
@@ -4458,7 +4632,10 @@ mod tests {
             requests.recv_timeout(Duration::from_secs(2)).unwrap();
             let follow_up = requests.recv_timeout(Duration::from_secs(2)).unwrap();
             let body: Value = serde_json::from_str(&follow_up.body).unwrap();
-            let mut result_ids = body["input"].as_array().unwrap().iter()
+            let mut result_ids = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
                 .filter(|item| item["type"] == "function_call_output")
                 .map(|item| item["call_id"].as_str().unwrap())
                 .collect::<Vec<_>>();
@@ -4519,7 +4696,10 @@ mod tests {
                         Ok(_) => {}
                     }
                 }
-                assert!(saw_error, "{event_type}: expected the known-item parse error");
+                assert!(
+                    saw_error,
+                    "{event_type}: expected the known-item parse error"
+                );
                 assert!(
                     stream.next().await.is_none(),
                     "{event_type}: resumed after error"
@@ -4616,12 +4796,20 @@ mod tests {
             assert_eq!(calls[0].arguments, expected);
             assert!(matches!(
                 out.last(),
-                Some(StreamEvent::Done { reason: StopReason::ToolUse, .. })
+                Some(StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    ..
+                })
             ));
         }
 
         let out = collect_events(&[
-            tool_item_event("response.output_item.added", "snapshot", "echo", "{\"text\":"),
+            tool_item_event(
+                "response.output_item.added",
+                "snapshot",
+                "echo",
+                "{\"text\":",
+            ),
             tool_item_event(
                 "response.output_item.done",
                 "snapshot",
@@ -4635,7 +4823,10 @@ mod tests {
             StreamEvent::ToolCallEnd { tool_call, .. }
                 if tool_call.arguments == json!({"text": "complete final snapshot"})
         )));
-        assert!(!out.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -4760,8 +4951,16 @@ mod tests {
             .unwrap();
         assert_eq!(message.stop_reason, StopReason::Error);
         assert_eq!(executions.load(Ordering::SeqCst), 0);
-        assert!(!marker.exists(), "valid sibling of a malformed batch must not run");
-        assert!(!agent.messages().iter().any(|message| matches!(message, Message::ToolResult(_))));
+        assert!(
+            !marker.exists(),
+            "valid sibling of a malformed batch must not run"
+        );
+        assert!(
+            !agent
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult(_)))
+        );
     }
 
     #[test]

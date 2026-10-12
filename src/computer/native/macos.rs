@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const HELPER: &str = concat!(include_str!("macos_input.swift"), "\n", include_str!("macos.swift"));
+const HELPER: &str = concat!(
+    include_str!("macos_input.swift"),
+    "\n",
+    include_str!("macos.swift")
+);
 const OWNED_INPUT_ACTIONS: &[&str] = &["mouse_click", "mouse_drag", "key_type", "key_press"];
 const SCREENSHOT_REPLY_LIMIT: usize = IMAGE_LIMIT.div_ceil(3) * 4 + 8192;
 const ACTIONS: &[&str] = &[
@@ -46,26 +50,52 @@ fn protocol() -> crate::error::Error {
 // are exposed, never an NSError, subprocess stderr, or server-provided code.
 fn failure(code: &str) -> crate::error::Error {
     error(match code {
-        "screen_permission" => "macOS Screen Recording permission is required; grant it to the hosting terminal/application in System Settings and restart the host",
-        "accessibility_permission" => "macOS Accessibility permission is required; grant it to the hosting terminal/application in System Settings and restart the host",
-        "accessibility_failed" => "the macOS application did not provide the requested accessibility data",
-        "ambiguous_window" => "the macOS window could not be uniquely matched by PID, title and geometry; refresh the window list instead of guessing",
-        "focus_unconfirmed" => "macOS window activation did not confirm the requested focus; focus may already have changed",
-        "target_not_focused" => "the requested macOS window is not focused; use focus_window explicitly before input",
+        "screen_permission" => {
+            "macOS Screen Recording permission is required; grant it to the hosting terminal/application in System Settings and restart the host"
+        }
+        "accessibility_permission" => {
+            "macOS Accessibility permission is required; grant it to the hosting terminal/application in System Settings and restart the host"
+        }
+        "accessibility_failed" => {
+            "the macOS application did not provide the requested accessibility data"
+        }
+        "ambiguous_window" => {
+            "the macOS window could not be uniquely matched by PID, title and geometry; refresh the window list instead of guessing"
+        }
+        "focus_unconfirmed" => {
+            "macOS window activation did not confirm the requested focus; focus may already have changed"
+        }
+        "target_not_focused" => {
+            "the requested macOS window is not focused; use focus_window explicitly before input"
+        }
         "pointer_outside_displays" => "the requested point is outside the active macOS displays",
-        "pointer_unconfirmed" => "the macOS pointer did not reach the requested position; effects may already have occurred",
+        "pointer_unconfirmed" => {
+            "the macOS pointer did not reach the requested position; effects may already have occurred"
+        }
         "input_failed" => "macOS could not create the requested input event",
-        "input_cancelled" => "macOS input stopped because its owner or deadline ended; releases were attempted and effects may already have occurred",
+        "input_cancelled" => {
+            "macOS input stopped because its owner or deadline ended; releases were attempted and effects may already have occurred"
+        }
         "input_channel" => "macOS input could not establish its owner channel",
-        "input_conflict" => "macOS input refused while a required key/button, modifier, Caps Lock or Fn state conflicts; release physical inputs before retrying",
-        "unsupported_key" => "macOS key_press accepts ANSI-US letters/digits, named navigation keys and F1..F20 with Ctrl/Alt/Shift/Cmd; use key_type for literal Unicode text",
-        "os_version" => "the macOS computer backend requires macOS 14 or newer and Xcode Command Line Tools with a compatible macOS SDK",
+        "input_conflict" => {
+            "macOS input refused while a required key/button, modifier, Caps Lock or Fn state conflicts; release physical inputs before retrying"
+        }
+        "unsupported_key" => {
+            "macOS key_press accepts ANSI-US letters/digits, named navigation keys and F1..F20 with Ctrl/Alt/Shift/Cmd; use key_type for literal Unicode text"
+        }
+        "os_version" => {
+            "the macOS computer backend requires macOS 14 or newer and Xcode Command Line Tools with a compatible macOS SDK"
+        }
         "display_unavailable" => "the requested macOS display is unavailable; list displays again",
         "window_unavailable" => "the requested macOS window is unavailable; list windows again",
         "clipboard_not_text" => "the macOS clipboard has no readable text representation",
         "clipboard_changed" => "the macOS clipboard changed while being read; retry the read",
-        "clipboard_failed" => "the macOS clipboard write was not verified; its previous contents may already have been cleared",
-        "capture_failed" => "macOS screen capture failed; check Screen Recording permission and the selected display/window",
+        "clipboard_failed" => {
+            "the macOS clipboard write was not verified; its previous contents may already have been cleared"
+        }
+        "capture_failed" => {
+            "macOS screen capture failed; check Screen Recording permission and the selected display/window"
+        }
         "output_limit" => "the macOS desktop result exceeds its output or image budget",
         "invalid_geometry" => "macOS returned invalid desktop geometry",
         "unsupported_action" => "this action is not available in the macOS desktop backend",
@@ -94,7 +124,10 @@ fn decode_reply(bytes: &[u8], action: &str) -> Result<Value> {
     let reply: Reply = serde_json::from_slice(bytes).map_err(|_| protocol())?;
     match reply {
         Reply::Error { code } => Err(failure(&code)),
-        Reply::Ok { action: actual, data } if actual == action && data.is_object() => Ok(data),
+        Reply::Ok {
+            action: actual,
+            data,
+        } if actual == action && data.is_object() => Ok(data),
         Reply::Ok { .. } => Err(protocol()),
     }
 }
@@ -108,14 +141,18 @@ fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
 }
 
 fn positive_id(value: &Value) -> Result<u64> {
-    value.as_u64().filter(|id| *id > 0 && *id <= u64::from(u32::MAX)).ok_or_else(protocol)
+    value
+        .as_u64()
+        .filter(|id| *id > 0 && *id <= u64::from(u32::MAX))
+        .ok_or_else(protocol)
 }
 
 fn geometry(value: &Value) -> Result<()> {
     for field in ["x", "y", "width", "height"] {
         let number = value[field].as_f64().ok_or_else(protocol)?;
         let extent = matches!(field, "width" | "height");
-        if !number.is_finite() || number.abs() > 1_000_000.0
+        if !number.is_finite()
+            || number.abs() > 1_000_000.0
             || (extent && (number <= 0.0 || number > 100_000.0))
         {
             return Err(protocol());
@@ -126,9 +163,11 @@ fn geometry(value: &Value) -> Result<()> {
 
 fn label(value: &Value) -> Result<()> {
     let value = value.as_str().ok_or_else(protocol)?;
-    if value.chars().count() > 512 || value.chars().any(|ch| {
-        ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    }) {
+    if value.chars().count() > 512
+        || value.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
         return Err(protocol());
     }
     Ok(())
@@ -136,7 +175,14 @@ fn label(value: &Value) -> Result<()> {
 
 fn catalog(data: &Value, displays: bool) -> Result<()> {
     let field = if displays { "displays" } else { "windows" };
-    fields(data, if displays { &["displays"] } else { &["windows", "scope", "order"] })?;
+    fields(
+        data,
+        if displays {
+            &["displays"]
+        } else {
+            &["windows", "scope", "order"]
+        },
+    )?;
     let entries = data[field].as_array().ok_or_else(protocol)?;
     if entries.len() > if displays { 64 } else { 256 } || (displays && entries.is_empty()) {
         return Err(protocol());
@@ -148,18 +194,48 @@ fn catalog(data: &Value, displays: bool) -> Result<()> {
             return Err(protocol());
         }
         if displays {
-            fields(entry, &["id", "name", "x", "y", "width", "height", "is_primary",
-                "scale_factor", "pixel_width", "pixel_height"])?;
+            fields(
+                entry,
+                &[
+                    "id",
+                    "name",
+                    "x",
+                    "y",
+                    "width",
+                    "height",
+                    "is_primary",
+                    "scale_factor",
+                    "pixel_width",
+                    "pixel_height",
+                ],
+            )?;
             label(&entry["name"])?;
             positive_id(&entry["pixel_width"])?;
             positive_id(&entry["pixel_height"])?;
             let scale = entry["scale_factor"].as_f64().ok_or_else(protocol)?;
-            if !entry["is_primary"].is_boolean() || !scale.is_finite() || scale <= 0.0 || scale > 16.0 {
+            if !entry["is_primary"].is_boolean()
+                || !scale.is_finite()
+                || scale <= 0.0
+                || scale > 16.0
+            {
                 return Err(protocol());
             }
         } else {
-            fields(entry, &["id", "pid", "title", "app_name", "x", "y", "width", "height",
-                "frontmost_application", "is_on_screen"])?;
+            fields(
+                entry,
+                &[
+                    "id",
+                    "pid",
+                    "title",
+                    "app_name",
+                    "x",
+                    "y",
+                    "width",
+                    "height",
+                    "frontmost_application",
+                    "is_on_screen",
+                ],
+            )?;
             positive_id(&entry["pid"])?;
             label(&entry["title"])?;
             label(&entry["app_name"])?;
@@ -168,7 +244,9 @@ fn catalog(data: &Value, displays: bool) -> Result<()> {
             }
         }
     }
-    if !displays && (data["scope"] != "on_screen_normal_windows" || data["order"] != "front_to_back") {
+    if !displays
+        && (data["scope"] != "on_screen_normal_windows" || data["order"] != "front_to_back")
+    {
         return Err(protocol());
     }
     Ok(())
@@ -185,7 +263,9 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         "clipboard_read" => {
             fields(data, &["text", "char_count"])?;
             let text = data["text"].as_str().ok_or_else(protocol)?;
-            if text.len() > 64 * 1024 || data["char_count"].as_u64() != Some(text.chars().count() as u64) {
+            if text.len() > 64 * 1024
+                || data["char_count"].as_u64() != Some(text.chars().count() as u64)
+            {
                 return Err(protocol());
             }
             Ok(())
@@ -193,7 +273,9 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         "clipboard_write" => {
             fields(data, &["written", "char_count"])?;
             let text = args["text"].as_str().ok_or_else(protocol)?;
-            if data["written"] != true || data["char_count"].as_u64() != Some(text.chars().count() as u64) {
+            if data["written"] != true
+                || data["char_count"].as_u64() != Some(text.chars().count() as u64)
+            {
                 return Err(protocol());
             }
             Ok(())
@@ -203,7 +285,8 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
 }
 
 fn input_confirmation(args: &Value, data: &Value) -> Result<()> {
-    if data["dispatched"] != true || data["released"] != true
+    if data["dispatched"] != true
+        || data["released"] != true
         || data["application_effect"] != "not_verified"
         || data.get("window_id") != args.get("window_id")
     {
@@ -216,8 +299,21 @@ fn input_confirmation(args: &Value, data: &Value) -> Result<()> {
 }
 
 fn keyboard_result(action: &str, args: &Value, data: &Value) -> Result<()> {
-    let field = if action == "key_type" { "char_count" } else { "key" };
-    fields(data, &["dispatched", "released", "application_effect", "window_id", field])?;
+    let field = if action == "key_type" {
+        "char_count"
+    } else {
+        "key"
+    };
+    fields(
+        data,
+        &[
+            "dispatched",
+            "released",
+            "application_effect",
+            "window_id",
+            field,
+        ],
+    )?;
     input_confirmation(args, data)?;
     if action == "key_type" {
         let text = args["text"].as_str().ok_or_else(protocol)?;
@@ -232,7 +328,17 @@ fn keyboard_result(action: &str, args: &Value, data: &Value) -> Result<()> {
 }
 
 fn input_result(args: &Value, data: &Value) -> Result<()> {
-    fields(data, &["dispatched", "released", "button", "position", "application_effect", "window_id"])?;
+    fields(
+        data,
+        &[
+            "dispatched",
+            "released",
+            "button",
+            "position",
+            "application_effect",
+            "window_id",
+        ],
+    )?;
     fields(&data["position"], &["x", "y"])?;
     input_confirmation(args, data)?;
     if data["button"].as_str() != Some(args["button"].as_str().unwrap_or("left")) {
@@ -240,9 +346,13 @@ fn input_result(args: &Value, data: &Value) -> Result<()> {
     }
     for axis in ["x", "y"] {
         let actual = data["position"][axis].as_f64().ok_or_else(protocol)?;
-        if !actual.is_finite() || actual.abs() > 1_000_000.0
-            || args.get(axis).is_some_and(|expected| expected.as_f64()
-                .is_none_or(|expected| !expected.is_finite() || (actual - expected).abs() > 0.5))
+        if !actual.is_finite()
+            || actual.abs() > 1_000_000.0
+            || args.get(axis).is_some_and(|expected| {
+                expected
+                    .as_f64()
+                    .is_none_or(|expected| !expected.is_finite() || (actual - expected).abs() > 0.5)
+            })
         {
             return Err(protocol());
         }
@@ -275,7 +385,10 @@ fn targeting_result(action: &str, args: &Value, data: &Value) -> Result<()> {
             }
         }
         "scroll" => {
-            fields(data, &["dispatched", "direction", "amount", "application_effect"])?;
+            fields(
+                data,
+                &["dispatched", "direction", "amount", "application_effect"],
+            )?;
             if data["dispatched"] != true
                 || data["direction"].as_str() != Some(args["direction"].as_str().unwrap_or("down"))
                 || data["amount"].as_u64() != Some(args["amount"].as_u64().unwrap_or(3))
@@ -297,7 +410,18 @@ fn admit_tree(node: &Value, depth: usize, nodes: &mut usize, text_bytes: &mut us
         return Err(protocol());
     }
     *nodes += 1;
-    fields(node, &["role", "title", "enabled", "focused", "bounds", "children", "value_redacted"])?;
+    fields(
+        node,
+        &[
+            "role",
+            "title",
+            "enabled",
+            "focused",
+            "bounds",
+            "children",
+            "value_redacted",
+        ],
+    )?;
     label(&node["role"])?;
     let children = node["children"].as_array().ok_or_else(protocol)?;
     if children.len() > 128 {
@@ -312,8 +436,10 @@ fn admit_tree(node: &Value, depth: usize, nodes: &mut usize, text_bytes: &mut us
     for field in ["role", "title"] {
         if let Some(value) = node.get(field) {
             label(value)?;
-            *text_bytes = (*text_bytes).checked_add(value.as_str().ok_or_else(protocol)?.len())
-                .filter(|bytes| *bytes <= 64 * 1024).ok_or_else(protocol)?;
+            *text_bytes = (*text_bytes)
+                .checked_add(value.as_str().ok_or_else(protocol)?.len())
+                .filter(|bytes| *bytes <= 64 * 1024)
+                .ok_or_else(protocol)?;
         }
     }
     for field in ["enabled", "focused"] {
@@ -332,9 +458,20 @@ fn admit_tree(node: &Value, depth: usize, nodes: &mut usize, text_bytes: &mut us
 }
 
 fn accessibility_result(args: &Value, data: &Value) -> Result<()> {
-    fields(data, &["pid", "window_id", "tree", "truncated", "node_count", "scope"])?;
+    fields(
+        data,
+        &[
+            "pid",
+            "window_id",
+            "tree",
+            "truncated",
+            "node_count",
+            "scope",
+        ],
+    )?;
     positive_id(&data["pid"])?;
-    if data.get("window_id") != args.get("window_id") || !data["truncated"].is_boolean()
+    if data.get("window_id") != args.get("window_id")
+        || !data["truncated"].is_boolean()
         || data["scope"] != "requested_or_focused_window"
     {
         return Err(protocol());
@@ -362,25 +499,40 @@ pub(super) async fn execute(
     if !ACTIONS.contains(&action) {
         return Err(failure("unsupported_action"));
     }
-    let target = (action == "screenshot").then(|| destination(cwd, args)).transpose()?;
+    let target = (action == "screenshot")
+        .then(|| destination(cwd, args))
+        .transpose()?;
     let input = request_bytes(args)?;
     let mut helpers = helpers.clone();
-    helpers.entry("swift".into()).or_insert_with(|| "/usr/bin/swift".into());
+    helpers
+        .entry("swift".into())
+        .or_insert_with(|| "/usr/bin/swift".into());
     let bytes = if OWNED_INPUT_ACTIONS.contains(&action) {
-        process::input::run(owner, &helpers,
+        process::input::run(
+            owner,
+            &helpers,
             &process::strings(&["-swift-version", "5", "-e", HELPER]),
-            &input).await?
-    } else { process::run(
-        owner,
-        // Neither a workspace executable nor a workspace Swift module may
-        // shadow the system helper. SDK overrides remain trusted host policy.
-        Path::new("/"),
-        &helpers,
-        "swift",
-        &process::strings(&["-swift-version", "5", "-e", HELPER]),
-        &input,
-        if target.is_some() { SCREENSHOT_REPLY_LIMIT } else { process::TEXT_LIMIT },
-    ).await? };
+            &input,
+        )
+        .await?
+    } else {
+        process::run(
+            owner,
+            // Neither a workspace executable nor a workspace Swift module may
+            // shadow the system helper. SDK overrides remain trusted host policy.
+            Path::new("/"),
+            &helpers,
+            "swift",
+            &process::strings(&["-swift-version", "5", "-e", HELPER]),
+            &input,
+            if target.is_some() {
+                SCREENSHOT_REPLY_LIMIT
+            } else {
+                process::TEXT_LIMIT
+            },
+        )
+        .await?
+    };
     check_owner(owner)?;
     let mut data = decode_reply(&bytes, action)?;
     if let Some(target) = target {
@@ -400,13 +552,29 @@ fn screenshot_output(
     args: &Value,
     mut data: Value,
 ) -> Result<ToolOutput> {
-    fields(&data, &["png", "bounds", "display_id", "window_id", "pixel_width", "pixel_height"])?;
-    let encoded = data.as_object_mut().ok_or_else(protocol)?.remove("png").ok_or_else(protocol)?;
+    fields(
+        &data,
+        &[
+            "png",
+            "bounds",
+            "display_id",
+            "window_id",
+            "pixel_width",
+            "pixel_height",
+        ],
+    )?;
+    let encoded = data
+        .as_object_mut()
+        .ok_or_else(protocol)?
+        .remove("png")
+        .ok_or_else(protocol)?;
     let encoded = encoded.as_str().ok_or_else(protocol)?;
     if encoded.len() > IMAGE_LIMIT.div_ceil(3) * 4 {
         return Err(failure("output_limit"));
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| protocol())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| protocol())?;
     let bounds = &data["bounds"];
     fields(bounds, &["x", "y", "width", "height"])?;
     geometry(bounds)?;
@@ -416,11 +584,19 @@ fn screenshot_output(
         ("display_id", "window_id")
     };
     positive_id(&data[selected])?;
-    if data.get(other).is_some() || args.get(selected).is_some_and(|expected| data.get(selected) != Some(expected)) {
+    if data.get(other).is_some()
+        || args
+            .get(selected)
+            .is_some_and(|expected| data.get(selected) != Some(expected))
+    {
         return Err(protocol());
     }
     let dimension = |range: std::ops::Range<usize>| -> Result<u32> {
-        let raw = bytes.get(range).ok_or_else(protocol)?.try_into().map_err(|_| protocol())?;
+        let raw = bytes
+            .get(range)
+            .ok_or_else(protocol)?
+            .try_into()
+            .map_err(|_| protocol())?;
         Ok(u32::from_be_bytes(raw))
     };
     let width = dimension(16..20)?;
@@ -443,9 +619,12 @@ fn screenshot_output(
     if let Some(details) = result.details.as_mut() {
         details["desktop"] = data.clone();
     }
-    result.content.insert(1, crate::model::ContentBlock::Text(
-        crate::model::TextContent::new(format!("macOS screenshot mapping (desktop points to PNG pixels): {data}")),
-    ));
+    result.content.insert(
+        1,
+        crate::model::ContentBlock::Text(crate::model::TextContent::new(format!(
+            "macOS screenshot mapping (desktop points to PNG pixels): {data}"
+        ))),
+    );
     Ok(result)
 }
 
@@ -473,7 +652,9 @@ mod tests {
             br#"{"status":"error","code":"screen_permission"}"#,
             b"PRIVATE-CANARY",
         ] {
-            let failure = decode_reply(bytes, "list_displays").unwrap_err().to_string();
+            let failure = decode_reply(bytes, "list_displays")
+                .unwrap_err()
+                .to_string();
             assert!(!failure.contains("PRIVATE-CANARY"));
         }
     }
@@ -490,7 +671,10 @@ mod tests {
         let args = json!({"action":"screenshot","display_id":73,"output_path":"capture.png"});
         let target = destination(dir.path(), &args).unwrap();
         let result = screenshot_output(&target, &args, screenshot_data()).unwrap();
-        assert_eq!(std::fs::read(target.path()).unwrap(), super::super::super::mock::PNG);
+        assert_eq!(
+            std::fs::read(target.path()).unwrap(),
+            super::super::super::mock::PNG
+        );
         let details = result.details.unwrap();
         assert_eq!(details["desktop"]["bounds"]["x"], -100.0);
         assert_eq!(details["desktop"]["pixels_per_point_x"], 1.0);
@@ -523,9 +707,13 @@ mod tests {
 
     #[test]
     fn native_display_ids_use_the_full_u32_range() {
-        assert!(super::super::validate(&json!({"action":"screenshot","display_id":u32::MAX})).is_ok());
+        assert!(
+            super::super::validate(&json!({"action":"screenshot","display_id":u32::MAX})).is_ok()
+        );
         for id in [0, u64::MAX] {
-            assert!(super::super::validate(&json!({"action":"screenshot","display_id":id})).is_err());
+            assert!(
+                super::super::validate(&json!({"action":"screenshot","display_id":id})).is_err()
+            );
         }
     }
 
@@ -535,10 +723,21 @@ mod tests {
             "height":800,"pixel_width":2560,"pixel_height":1600,"scale_factor":2,"is_primary":true});
         assert!(catalog(&json!({"displays":[display.clone()]}), true).is_ok());
         assert!(catalog(&json!({"displays":[display.clone(),display.clone()]}), true).is_err());
-        for field in ["id", "name", "x", "width", "pixel_width", "scale_factor", "is_primary"] {
+        for field in [
+            "id",
+            "name",
+            "x",
+            "width",
+            "pixel_width",
+            "scale_factor",
+            "is_primary",
+        ] {
             let mut invalid = display.clone();
             invalid[field] = Value::Null;
-            assert!(catalog(&json!({"displays":[invalid]}), true).is_err(), "{field}");
+            assert!(
+                catalog(&json!({"displays":[invalid]}), true).is_err(),
+                "{field}"
+            );
         }
         assert!(catalog(&json!({"displays":[]}), true).is_err());
     }
@@ -546,23 +745,56 @@ mod tests {
     #[test]
     fn clipboard_replies_bind_exact_text_counts_and_write_confirmation() {
         let args = json!({"action":"clipboard_write","text":"a🦀"});
-        assert!(admit_result("clipboard_write", &args, &json!({"written":true,"char_count":2})).is_ok());
-        for data in [json!({"written":false,"char_count":2}), json!({"written":true,"char_count":5})] {
+        assert!(
+            admit_result(
+                "clipboard_write",
+                &args,
+                &json!({"written":true,"char_count":2})
+            )
+            .is_ok()
+        );
+        for data in [
+            json!({"written":false,"char_count":2}),
+            json!({"written":true,"char_count":5}),
+        ] {
             assert!(admit_result("clipboard_write", &args, &data).is_err());
         }
         let text = "a\n🦀\u{202e}";
-        assert!(admit_result("clipboard_read", &json!({}), &json!({"text":text,"char_count":4})).is_ok());
-        assert!(admit_result("clipboard_read", &json!({}), &json!({"text":text,"char_count":3})).is_err());
+        assert!(
+            admit_result(
+                "clipboard_read",
+                &json!({}),
+                &json!({"text":text,"char_count":4})
+            )
+            .is_ok()
+        );
+        assert!(
+            admit_result(
+                "clipboard_read",
+                &json!({}),
+                &json!({"text":text,"char_count":3})
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn failed_helpers_never_publish_or_fall_back_to_fixture_results() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"action":"screenshot","output_path":"capture.png"});
         let helpers = BTreeMap::from([("swift".to_string(), PathBuf::from("/bin/false"))]);
         let failure = runtime.block_on(async {
-            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &args).await.unwrap_err()
+            execute(
+                &AgentCx::for_current_or_request(),
+                dir.path(),
+                &helpers,
+                &args,
+            )
+            .await
+            .unwrap_err()
         });
         assert!(failure.to_string().contains("desktop helper swift failed"));
         assert!(!dir.path().join("capture.png").exists());
@@ -603,7 +835,8 @@ mod tests {
             } else {
                 json!("PRIVATE-CANARY")
             };
-            let error = accessibility_result(&json!({"window_id":73}), &tree_result(invalid, 1)).unwrap_err();
+            let error = accessibility_result(&json!({"window_id":73}), &tree_result(invalid, 1))
+                .unwrap_err();
             assert!(!error.to_string().contains("PRIVATE-CANARY"));
         }
         let value = json!({"role":"AXTextField","value":"PRIVATE-CANARY","children":[]});
@@ -615,7 +848,9 @@ mod tests {
         let leaf = json!({"role":"AXButton","children":[]});
         let args = json!({"window_id":73});
         assert!(accessibility_result(&args, &tree_result(leaf.clone(), 2)).is_err());
-        assert!(accessibility_result(&json!({"window_id":74}), &tree_result(leaf.clone(), 1)).is_err());
+        assert!(
+            accessibility_result(&json!({"window_id":74}), &tree_result(leaf.clone(), 1)).is_err()
+        );
         let wide = json!({"role":"AXWindow","children":vec![leaf.clone();129]});
         assert!(accessibility_result(&args, &tree_result(wide, 130)).is_err());
         let mut deep = leaf.clone();
@@ -634,24 +869,29 @@ mod tests {
     fn accessibility_labels_cannot_exceed_the_aggregate_text_budget() {
         let leaf = json!({"role":"AXStaticText","title":"x".repeat(512),"children":[]});
         let tree = json!({"role":"AXWindow","children":vec![leaf;128]});
-        assert!(accessibility_result(&json!({"window_id":73}), &tree_result(tree,129)).is_err());
+        assert!(accessibility_result(&json!({"window_id":73}), &tree_result(tree, 129)).is_err());
     }
 
     #[test]
     fn new_targeting_operations_keep_the_existing_host_approval_boundary() {
         use crate::tools::Tool;
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let tool = crate::computer::ComputerTool::new(dir.path()).with_mock(false);
-        for args in [json!({"action":"focus_window","window_id":73}),
+        for args in [
+            json!({"action":"focus_window","window_id":73}),
             json!({"action":"mouse_move","x":-12,"y":300}),
             json!({"action":"scroll","direction":"down"}),
             json!({"action":"mouse_click","button":"right"}),
             json!({"action":"mouse_drag","x":-12,"y":300}),
             json!({"action":"key_type","text":"PRIVATE-CANARY"}),
-            json!({"action":"key_press","key":"Cmd+Shift+C"})]
-        {
-            let failure = runtime.block_on(tool.execute("desktop-consent", args, None)).unwrap_err();
+            json!({"action":"key_press","key":"Cmd+Shift+C"}),
+        ] {
+            let failure = runtime
+                .block_on(tool.execute("desktop-consent", args, None))
+                .unwrap_err();
             assert!(failure.to_string().contains("requires host approval"));
         }
     }
@@ -662,10 +902,20 @@ mod tests {
         let receipt = json!({"dispatched":true,"released":true,"window_id":73,"button":"right",
             "position":{"x":-12.0,"y":300.0},"application_effect":"not_verified"});
         assert!(admit_result("mouse_drag", &args, &receipt).is_ok());
-        for field in ["dispatched", "released", "window_id", "button", "position", "application_effect"] {
+        for field in [
+            "dispatched",
+            "released",
+            "window_id",
+            "button",
+            "position",
+            "application_effect",
+        ] {
             let mut invalid = receipt.clone();
             invalid[field] = Value::Null;
-            assert!(admit_result("mouse_drag", &args, &invalid).is_err(), "{field}");
+            assert!(
+                admit_result("mouse_drag", &args, &invalid).is_err(),
+                "{field}"
+            );
         }
         let mut wrong = receipt.clone();
         wrong["position"]["x"] = json!(12);
@@ -684,26 +934,49 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("swift-fixture");
-        std::fs::write(&helper, concat!(
-            "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
-            "IFS= read -r frame || exit 8\n",
-            "printf '%s' '{\"status\":\"ok\",\"action\":\"mouse_click\",\"data\":{",
-            "\"dispatched\":true,\"released\":true,\"button\":\"right\",",
-            "\"position\":{\"x\":-12,\"y\":300},\"application_effect\":\"not_verified\"}}'\n",
-        )).unwrap();
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
+                "IFS= read -r frame || exit 8\n",
+                "printf '%s' '{\"status\":\"ok\",\"action\":\"mouse_click\",\"data\":{",
+                "\"dispatched\":true,\"released\":true,\"button\":\"right\",",
+                "\"position\":{\"x\":-12,\"y\":300},\"application_effect\":\"not_verified\"}}'\n",
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let helpers = BTreeMap::from([("swift".to_string(), helper)]);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let args = json!({"action":"mouse_click","x":-12,"y":300,"button":"right"});
         let output = runtime.block_on(async {
-            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &args).await.unwrap()
+            execute(
+                &AgentCx::for_current_or_request(),
+                dir.path(),
+                &helpers,
+                &args,
+            )
+            .await
+            .unwrap()
         });
         assert!(!output.is_error);
         assert_eq!(output.details.unwrap()["backend"], "macos");
         let wrong = json!({"action":"mouse_drag","x":-12,"y":300,"button":"right"});
-        assert!(runtime.block_on(async {
-            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &wrong).await
-        }).is_err());
+        assert!(
+            runtime
+                .block_on(async {
+                    execute(
+                        &AgentCx::for_current_or_request(),
+                        dir.path(),
+                        &helpers,
+                        &wrong,
+                    )
+                    .await
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -713,10 +986,19 @@ mod tests {
         let receipt = json!({"dispatched":true,"released":true,"char_count":5,
             "window_id":73,"application_effect":"not_verified"});
         assert!(admit_result("key_type", &args, &receipt).is_ok());
-        for field in ["dispatched", "released", "char_count", "window_id", "application_effect"] {
+        for field in [
+            "dispatched",
+            "released",
+            "char_count",
+            "window_id",
+            "application_effect",
+        ] {
             let mut invalid = receipt.clone();
             invalid[field] = Value::Null;
-            assert!(admit_result("key_type", &args, &invalid).is_err(), "{field}");
+            assert!(
+                admit_result("key_type", &args, &invalid).is_err(),
+                "{field}"
+            );
         }
         for count in [4, text.len(), text.encode_utf16().count()] {
             let mut invalid = receipt.clone();
@@ -725,7 +1007,9 @@ mod tests {
         }
         let mut leaked = receipt;
         leaked["text"] = json!("PRIVATE-CANARY");
-        let failure = admit_result("key_type", &args, &leaked).unwrap_err().to_string();
+        let failure = admit_result("key_type", &args, &leaked)
+            .unwrap_err()
+            .to_string();
         assert!(!failure.contains("PRIVATE-CANARY"));
         let key = json!({"dispatched":true,"released":true,"key":"Cmd+Shift+C",
             "application_effect":"not_verified"});
@@ -743,29 +1027,52 @@ mod tests {
         let helper = dir.path().join("keyboard-fixture");
         // A real subprocess records the exact stdin frame to its own sibling
         // file and responds without EOF. It never runs Swift or posts OS input.
-        std::fs::write(&helper, concat!(
-            "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
-            "IFS= read -r frame || exit 8\n",
-            "printf '%s\\n' \"$frame\" >> \"$0.requests\"\n",
-            "cat \"$0.reply\"\n",
-        )).unwrap();
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
+                "IFS= read -r frame || exit 8\n",
+                "printf '%s\\n' \"$frame\" >> \"$0.requests\"\n",
+                "cat \"$0.reply\"\n",
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let helpers = BTreeMap::from([("swift".to_string(), helper.clone())]);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let requests = dir.path().join("keyboard-fixture.requests");
         let reply = dir.path().join("keyboard-fixture.reply");
         let text = "🦀\n$(literal-not-a-command)";
         for (args, data) in [
-            (json!({"action":"key_type","text":text}), json!({"char_count":text.chars().count()})),
-            (json!({"action":"key_press","key":"Ctrl+Shift+C"}), json!({"key":"Ctrl+Shift+C"})),
+            (
+                json!({"action":"key_type","text":text}),
+                json!({"char_count":text.chars().count()}),
+            ),
+            (
+                json!({"action":"key_press","key":"Ctrl+Shift+C"}),
+                json!({"key":"Ctrl+Shift+C"}),
+            ),
         ] {
             let mut data = data;
             data["dispatched"] = json!(true);
             data["released"] = json!(true);
             data["application_effect"] = json!("not_verified");
-            std::fs::write(&reply, json!({"status":"ok","action":args["action"],"data":data}).to_string()).unwrap();
+            std::fs::write(
+                &reply,
+                json!({"status":"ok","action":args["action"],"data":data}).to_string(),
+            )
+            .unwrap();
             let output = runtime.block_on(async {
-                execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &args).await.unwrap()
+                execute(
+                    &AgentCx::for_current_or_request(),
+                    dir.path(),
+                    &helpers,
+                    &args,
+                )
+                .await
+                .unwrap()
             });
             assert!(!output.is_error);
             assert!(output.details.unwrap().get("text").is_none());
@@ -775,22 +1082,40 @@ mod tests {
         }
         std::fs::write(&reply, br#"{"status":"error","code":"input_cancelled"}"#).unwrap();
         let failure = runtime.block_on(async {
-            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers,
-                &json!({"action":"key_type","text":"PRIVATE-CANARY"})).await.unwrap_err()
+            execute(
+                &AgentCx::for_current_or_request(),
+                dir.path(),
+                &helpers,
+                &json!({"action":"key_type","text":"PRIVATE-CANARY"}),
+            )
+            .await
+            .unwrap_err()
         });
         assert!(!failure.to_string().contains("PRIVATE-CANARY"));
-        assert_eq!(std::fs::read_to_string(&requests).unwrap().lines().count(), 3);
+        assert_eq!(
+            std::fs::read_to_string(&requests).unwrap().lines().count(),
+            3
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn native_dispatch_reaches_macos_without_an_x11_display() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let helpers = BTreeMap::from([("swift".to_string(), PathBuf::from("/bin/false"))]);
         let failure = runtime.block_on(async {
-            super::super::execute(&AgentCx::for_current_or_request(), dir.path(), &helpers,
-                &mut super::super::State::default(), &json!({"action":"list_displays"})).await.unwrap_err()
+            super::super::execute(
+                &AgentCx::for_current_or_request(),
+                dir.path(),
+                &helpers,
+                &mut super::super::State::default(),
+                &json!({"action":"list_displays"}),
+            )
+            .await
+            .unwrap_err()
         });
         assert!(failure.to_string().contains("desktop helper swift failed"));
     }

@@ -2173,7 +2173,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["assistant", "tool", "tool", "tool", "tool", "user"]
         );
-        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"].iter().enumerate() {
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
             assert_eq!(messages[index + 1]["tool_call_id"], *id);
         }
@@ -2216,7 +2219,16 @@ mod tests {
                 .iter()
                 .map(|m| m["role"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["user", "assistant", "tool", "user", "assistant", "tool", "user", "user"]
+            [
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "user"
+            ]
         );
         for (message_index, part_index, expected) in [
             (0, 0, "data:image/png;base64,AQ=="),
@@ -2268,7 +2280,10 @@ mod tests {
             ["assistant", "tool", "tool", "tool"]
         );
         assert_eq!(messages[1]["content"], "plain result");
-        assert_eq!(messages[2]["content"], "[media omitted: clip.mp4, video/mp4, 3 B]");
+        assert_eq!(
+            messages[2]["content"],
+            "[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
         assert_eq!(messages[3]["content"], "");
         assert!(!wire.to_string().contains("AAAA"));
     }

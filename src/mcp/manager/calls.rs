@@ -575,7 +575,9 @@ impl McpManager {
                         } else {
                             "MCP_REQUEST_NOT_SENT"
                         },
-                        format!("tools/call was withdrawn before dispatch; the call was not sent: {error}"),
+                        format!(
+                            "tools/call was withdrawn before dispatch; the call was not sent: {error}"
+                        ),
                     ));
                 }
                 return Err(error);
@@ -791,11 +793,8 @@ mod tests {
             let runtime = runtime();
             let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
             runtime.block_on(async {
-                let mut first = Box::pin(transport.request(
-                    "test/first",
-                    Value::Null,
-                    Duration::from_secs(10),
-                ));
+                let mut first =
+                    Box::pin(transport.request("test/first", Value::Null, Duration::from_secs(10)));
                 assert!(futures::poll!(first.as_mut()).is_pending());
                 peer.wait_for_writer();
                 let arguments = json!({"marker":"withdrawn"});
@@ -850,16 +849,16 @@ mod tests {
                     *McpManager::lock(&entry.health),
                     ServerHealth::Ready { tools: 1 }
                 ));
-                let mut next = Box::pin(manager.call_tool(
-                    "exec",
-                    "execute",
-                    json!({"marker":"kept"}),
-                ));
+                let mut next =
+                    Box::pin(manager.call_tool("exec", "execute", json!({"marker":"kept"})));
                 assert!(futures::poll!(next.as_mut()).is_pending());
                 peer.release();
                 let (first, next) = futures::join!(first, next);
                 assert_eq!(first.expect("sibling completes"), "test/first");
-                assert_eq!(next.expect("subsequent tool uses same server"), "tools/call");
+                assert_eq!(
+                    next.expect("subsequent tool uses same server"),
+                    "tools/call"
+                );
                 assert!(is_current(&entry, &transport));
                 assert_eq!(McpManager::lock(&entry.restarts).count, 0);
             });

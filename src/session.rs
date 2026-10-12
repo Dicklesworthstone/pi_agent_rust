@@ -1745,11 +1745,7 @@ fn append_jsonl_entries_blocking(
         // failures leave both the caller and authoritative JSONL unchanged.
         let mut entries = Vec::with_capacity(stored_entries.len() + entries_appended.len());
         for stored in stored_entries {
-            let reusable_entry = stored
-                .base()
-                .id
-                .as_ref()
-                .and_then(|id| reusable.get(id));
+            let reusable_entry = stored.base().id.as_ref().and_then(|id| reusable.get(id));
             if let Some(known) = reusable_entry
                 && known.fingerprint == stored.native_fingerprint(path)?
             {
@@ -5715,8 +5711,7 @@ impl Session {
             let SessionEntry::Custom(custom) = entry else {
                 return None;
             };
-            (custom.custom_type == crate::session_workdir::WORKDIR_BINDING_TYPE)
-                .then_some(custom)
+            (custom.custom_type == crate::session_workdir::WORKDIR_BINDING_TYPE).then_some(custom)
         });
         let inherited_workdir_binding = inherited_workdir_binding
             .filter(|binding| {
@@ -14811,10 +14806,7 @@ mod tests {
         drop(file);
 
         let err = load_session_meta_jsonl(&session_path).expect_err("invalid utf8 should error");
-        assert!(
-            err.to_string().contains("Read session entry line"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("Read session entry line"), "{err}");
     }
 
     #[cfg(feature = "sqlite-sessions")]

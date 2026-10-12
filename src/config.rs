@@ -2473,7 +2473,10 @@ mod tests {
         let merged = Config::merge(global, project);
         let inherited = merged.http.as_ref().expect("merged HTTP settings");
         assert_eq!(inherited.proxy_loopback, Some(true));
-        assert_eq!(inherited.proxy.as_deref(), Some("http://proxy.example:8080"));
+        assert_eq!(
+            inherited.proxy.as_deref(),
+            Some("http://proxy.example:8080")
+        );
         assert_eq!(
             inherited.https_proxy.as_deref(),
             Some("http://secure.example:8443")
@@ -2496,7 +2499,11 @@ mod tests {
         assert!(warnings.is_empty());
         assert!(resolved.endpoint_for(false, "127.0.0.1", 11434).is_none());
         assert!(resolved.endpoint_for(true, "localhost", 443).is_none());
-        assert!(resolved.endpoint_for(true, "internal.example", 443).is_none());
+        assert!(
+            resolved
+                .endpoint_for(true, "internal.example", 443)
+                .is_none()
+        );
         assert_eq!(
             resolved
                 .endpoint_for(true, "remote.example", 443)

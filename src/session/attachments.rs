@@ -554,7 +554,9 @@ impl StoredEntry {
             let _ = remaining.next();
         }
         if remaining.next().is_some() {
-            return Err(blob_error("attachment reference is outside native metadata"));
+            return Err(blob_error(
+                "attachment reference is outside native metadata",
+            ));
         }
         writer.write_all(&json.as_bytes()[cursor..])?;
         Ok(writer.digest.finalize().into())
@@ -621,7 +623,9 @@ fn hydrate_reference_entry(
         return Ok(entry);
     }
     let SessionEntry::Message(message) = &mut entry else {
-        return Err(blob_error("attachment reference is outside a native message"));
+        return Err(blob_error(
+            "attachment reference is outside a native message",
+        ));
     };
     let blocks = match &mut message.message {
         SessionMessage::User {
@@ -632,14 +636,22 @@ fn hydrate_reference_entry(
             content: blocks, ..
         } => blocks,
         SessionMessage::Assistant { message } => &mut message.content,
-        _ => return Err(blob_error("attachment reference is outside native content blocks")),
+        _ => {
+            return Err(blob_error(
+                "attachment reference is outside native content blocks",
+            ));
+        }
     };
     let directory = BlobDirectory::open(source, false)?;
     for (index, reference) in &references.0 {
         let data = match blocks.get_mut(*index) {
             Some(ContentBlock::Image(image)) => &mut image.data,
             Some(ContentBlock::Media(media)) => &mut media.data,
-            _ => return Err(blob_error("attachment reference is outside a native data slot")),
+            _ => {
+                return Err(blob_error(
+                    "attachment reference is outside a native data slot",
+                ));
+            }
         };
         let bytes = directory.read(reference)?;
         *data = reference.encoding.encode(&bytes);
@@ -960,8 +972,8 @@ mod tests {
         session.append_message(message(vec![image(STANDARD.encode(&bytes))]));
         save(&mut session);
         let wire = wire_entries(&path);
-        let reference = BlobRef::parse(&wire[0]["message"]["content"][0]["data"])
-            .expect("stored reference");
+        let reference =
+            BlobRef::parse(&wire[0]["message"]["content"][0]["data"]).expect("stored reference");
         let blob_directory = BlobDirectory::open(&path, false).expect("open blob directory");
         let mut offset = 0usize;
         let mut chunks = 0usize;
@@ -1085,7 +1097,9 @@ mod tests {
                     expected
                 );
                 assert_eq!(
-                    stored.native_fingerprint(&path).expect("streaming fingerprint"),
+                    stored
+                        .native_fingerprint(&path)
+                        .expect("streaming fingerprint"),
                     expected
                 );
                 assert_eq!(
@@ -1161,7 +1175,10 @@ mod tests {
         )
         .expect("append without materializing existing media");
         assert!(matches!(receipt.entries[0], JsonlPersistedEntry::Reuse(0)));
-        assert!(matches!(receipt.entries[1], JsonlPersistedEntry::Hydrated(_)));
+        assert!(matches!(
+            receipt.entries[1],
+            JsonlPersistedEntry::Hydrated(_)
+        ));
         assert!(matches!(receipt.entries[4], JsonlPersistedEntry::Reuse(1)));
         assert_eq!(serde_json::to_value(&local.entries).unwrap(), local_before);
         assert!(fs::read(&path).unwrap().starts_with(&committed_before));
@@ -1214,7 +1231,8 @@ mod tests {
         assert_eq!(blobs(&path).len(), 1);
         assert_eq!(
             serde_json::to_value(&session.entries).unwrap(),
-            serde_json::to_value(open(&path).expect("reopen authoritative history").entries).unwrap()
+            serde_json::to_value(open(&path).expect("reopen authoritative history").entries)
+                .unwrap()
         );
     }
 
@@ -1241,7 +1259,10 @@ mod tests {
         )
         .expect("writer reaches disk before its owner accepts the receipt");
         drop(receipt);
-        assert_eq!(serde_json::to_value(&session.entries).unwrap(), local_before);
+        assert_eq!(
+            serde_json::to_value(&session.entries).unwrap(),
+            local_before
+        );
         assert_eq!(
             session
                 .persisted_entry_count
@@ -1261,7 +1282,11 @@ mod tests {
             &reusable,
         )
         .expect_err("same ID with different bytes must reject replay");
-        assert!(error.to_string().contains("conflicting persisted and in-memory payloads"));
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting persisted and in-memory payloads")
+        );
         assert_eq!(fs::read(&path).unwrap(), committed);
         save(&mut session);
         assert_eq!(session.entries.len(), 2);
@@ -1270,7 +1295,10 @@ mod tests {
             committed,
             "identical replay appends no bytes"
         );
-        assert_eq!(serde_json::to_value(&session.entries).unwrap(), local_before);
+        assert_eq!(
+            serde_json::to_value(&session.entries).unwrap(),
+            local_before
+        );
     }
 
     #[test]
@@ -1293,7 +1321,10 @@ mod tests {
             );
         });
         assert_eq!(fs::read(&path).unwrap(), committed);
-        assert_eq!(serde_json::to_value(&session.entries).unwrap(), local_before);
+        assert_eq!(
+            serde_json::to_value(&session.entries).unwrap(),
+            local_before
+        );
         assert_eq!(
             session
                 .persisted_entry_count
@@ -1542,7 +1573,9 @@ mod tests {
             .expect("stored projection retains opaque Value semantics");
         assert_eq!(stored.payload().unwrap()["message"]["details"]["key"], 2);
         assert_eq!(
-            stored.native_fingerprint(&path).expect("opaque JSON fingerprint"),
+            stored
+                .native_fingerprint(&path)
+                .expect("opaque JSON fingerprint"),
             native_entry_fingerprint(&decoded).expect("native opaque JSON fingerprint")
         );
     }
@@ -1883,10 +1916,8 @@ mod tests {
         object.remove("id");
         object.remove("parentId");
         let native = decode_entry(Some(&path), &legacy.to_string()).expect("hydrate legacy row");
-        let reserved_id = crate::session::generate_loaded_entry_id(
-            &native,
-            &std::collections::HashSet::new(),
-        );
+        let reserved_id =
+            crate::session::generate_loaded_entry_id(&native, &std::collections::HashSet::new());
         let mut reserved = legacy.clone();
         reserved["id"] = Value::String(reserved_id.clone());
         reserved["message"]["content"] =
@@ -2019,11 +2050,9 @@ mod tests {
                 .map(Value::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            let error = crate::session::read_jsonl_entries_for_v2(
-                &mut std::io::Cursor::new(source),
-                &path,
-            )
-            .expect_err("compact references cannot weaken strict graph validation");
+            let error =
+                crate::session::read_jsonl_entries_for_v2(&mut std::io::Cursor::new(source), &path)
+                    .expect_err("compact references cannot weaken strict graph validation");
             assert!(error.to_string().contains(detail), "{error}");
         }
     }

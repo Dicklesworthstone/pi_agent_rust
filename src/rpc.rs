@@ -198,8 +198,7 @@ async fn run_rpc_turn<F, Fut>(
     retry_abort: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
     turn: F,
-)
-where
+) where
     F: FnOnce(AgentCx) -> Fut,
     Fut: Future<Output = ()>,
 {
@@ -217,12 +216,18 @@ where
                 capabilities.spawn,
                 CapSet::<false, true, true, true, true>::MASK,
             ),
-            (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
+            (
+                capabilities.time,
+                CapSet::<true, false, true, true, true>::MASK,
+            ),
             (
                 capabilities.entropy,
                 CapSet::<true, true, false, true, true>::MASK,
             ),
-            (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
+            (
+                capabilities.io,
+                CapSet::<true, true, true, false, true>::MASK,
+            ),
             (
                 capabilities.remote,
                 CapSet::<true, true, true, true, false>::MASK,
@@ -4647,11 +4652,9 @@ pub async fn run(
                     }
                 }
 
-                let loaded = crate::session_workdir::open_session_for_runtime(
-                    &resolved_path,
-                    &runtime_cwd,
-                )
-                .await;
+                let loaded =
+                    crate::session_workdir::open_session_for_runtime(&resolved_path, &runtime_cwd)
+                        .await;
                 match loaded {
                     Ok(mut new_session) => {
                         let session_transition = match acquire_rpc_session_transition(
@@ -6495,7 +6498,9 @@ async fn run_prompt_with_retry(
         }));
     }
     terminal_guard.disarm();
-    let _ = out_tx.send(event(&output.terminal_value(&terminal_messages, Value::Null)));
+    let _ = out_tx.send(event(
+        &output.terminal_value(&terminal_messages, Value::Null),
+    ));
 
     if stopped_at_time_cap {
         // Compaction may make another provider call; a capped request ends at
@@ -12101,7 +12106,10 @@ mod retry_tests {
                     finished_turn.store(true, Ordering::SeqCst);
                 },
             ));
-            entry.recv(AgentCx::for_request().cx()).await.expect("entry");
+            entry
+                .recv(AgentCx::for_request().cx())
+                .await
+                .expect("entry");
             client.set_cancel_requested(true);
             asupersync::time::timeout(wall_now(), Duration::from_secs(5), task)
                 .await
@@ -12253,7 +12261,8 @@ mod retry_tests {
                                             abort_tx
                                                 .send(
                                                     &abort_cx,
-                                                    r#"{"id":"2","type":"abort_retry"}"#.to_string(),
+                                                    r#"{"id":"2","type":"abort_retry"}"#
+                                                        .to_string(),
                                                 )
                                                 .await
                                                 .expect("send abort_retry command");
@@ -12841,8 +12850,7 @@ mod retry_tests {
             in_tx
                 .send(
                     &asupersync::Cx::for_testing(),
-                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id})
-                        .to_string(),
+                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id}).to_string(),
                 )
                 .await
                 .expect("send fork");
@@ -12916,8 +12924,7 @@ mod retry_tests {
             in_tx
                 .send(
                     &asupersync::Cx::for_testing(),
-                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id})
-                        .to_string(),
+                    json!({"id": "fork", "type": "fork", "entryId": fixture.target_id}).to_string(),
                 )
                 .await
                 .expect("send fork");
@@ -17045,9 +17052,8 @@ mod tests {
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
             let out_rx = Arc::new(Mutex::new(out_rx));
-            let server = handle.spawn(async move {
-                Box::pin(run(agent_session, options, in_rx, out_tx)).await
-            });
+            let server = handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
             let request = json!({
                 "id": "switch",
                 "type": "switch_session",
@@ -17069,7 +17075,10 @@ mod tests {
                 assert_eq!(stored.header.id, source_id);
                 assert!(stored.entries.is_empty());
             }
-            assert_eq!(std::fs::read(&target_path).expect("unchanged target"), original_bytes);
+            assert_eq!(
+                std::fs::read(&target_path).expect("unchanged target"),
+                original_bytes
+            );
 
             crate::session_workdir::attach_session_workdir(&mut target, &workspace)
                 .expect("explicitly attach target");
@@ -20267,7 +20276,9 @@ export default function init(pi) {
             assert!(chunk.eof, "fixture must fit in one retrieval chunk");
             assert_eq!(reference["$piBlob"], chunk.digest);
             assert_eq!(reference["sizeBytes"], chunk.size_bytes);
-            let bytes = STANDARD.decode(&chunk.data).expect("decode attachment chunk");
+            let bytes = STANDARD
+                .decode(&chunk.data)
+                .expect("decode attachment chunk");
             let encoded = if reference["encoding"] == "base64NoPad" {
                 STANDARD_NO_PAD.encode(bytes)
             } else {
@@ -20411,7 +20422,10 @@ export default function init(pi) {
                 "every fixture event must actually externalize its payload"
             );
             rpc_restore_compact_attachments(&mut projected, &compact.attachments);
-            assert_eq!(projected, expected, "only media data may change on the wire");
+            assert_eq!(
+                projected, expected,
+                "only media data may change on the wire"
+            );
             assert_eq!(
                 serde_json::to_value(&event).expect("untouched native event"),
                 untouched,
@@ -20429,9 +20443,9 @@ export default function init(pi) {
             model: "fixture-model".to_string(),
             ..AssistantMessage::default()
         };
-        partial
-            .content
-            .push(ContentBlock::Text(TextContent::new("long snapshot ".repeat(8192))));
+        partial.content.push(ContentBlock::Text(TextContent::new(
+            "long snapshot ".repeat(8192),
+        )));
         let partial = Arc::new(partial);
         let output = RpcOutput::default();
         output.set_compact(true);
@@ -20462,7 +20476,10 @@ export default function init(pi) {
                 assistant_message_event: update,
             };
             let line = output.event_line(&event);
-            assert!(line.len() < 1024, "delta frame copied its cumulative snapshot");
+            assert!(
+                line.len() < 1024,
+                "delta frame copied its cumulative snapshot"
+            );
             let value = parse_response(&line);
             assert!(value.get("message").is_none());
             assert!(value["assistantMessageEvent"].get("partial").is_none());
@@ -20613,8 +20630,7 @@ export default function init(pi) {
                     .cloned()
                     .expect("fork source entry");
 
-                let mut target =
-                    Session::create_with_dir(Some(temp.path().join("sessions")));
+                let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
                 target.header.provider = Some("anthropic".to_string());
                 target.header.model_id = Some("test-model".to_string());
                 target.header.thinking_level = Some("off".to_string());
@@ -20807,13 +20823,9 @@ export default function init(pi) {
                     )
                     .await;
                     assert_ok(&response, "set_output_mode");
-                    let readable = send_recv(
-                        &in_tx,
-                        &out_rx,
-                        &read.to_string(),
-                        "read after mode change",
-                    )
-                    .await;
+                    let readable =
+                        send_recv(&in_tx, &out_rx, &read.to_string(), "read after mode change")
+                            .await;
                     assert_ok(&readable, "get_attachment");
                 }
 
@@ -20822,22 +20834,12 @@ export default function init(pi) {
                     "sessionPath": target_path,
                     "entryId": entry_id,
                 });
-                let cancelled = send_recv(
-                    &in_tx,
-                    &out_rx,
-                    &transition.to_string(),
-                    "veto transition",
-                )
-                .await;
+                let cancelled =
+                    send_recv(&in_tx, &out_rx, &transition.to_string(), "veto transition").await;
                 assert_ok(&cancelled, command);
                 assert_eq!(cancelled["data"]["cancelled"], true);
-                let readable = send_recv(
-                    &in_tx,
-                    &out_rx,
-                    &read.to_string(),
-                    "read after veto",
-                )
-                .await;
+                let readable =
+                    send_recv(&in_tx, &out_rx, &read.to_string(), "read after veto").await;
                 assert_ok(&readable, "get_attachment");
                 {
                     let cx = AgentCx::for_request();
@@ -21057,7 +21059,10 @@ export default function init(pi) {
                 let line = recv_line(&out_rx, "compact native completion")
                     .await
                     .expect("terminal event");
-                assert!(line.len() < 16_384, "compact completion must not echo media");
+                assert!(
+                    line.len() < 16_384,
+                    "compact completion must not echo media"
+                );
                 let value = parse_response(&line);
                 if value["type"] == "message_update" {
                     assert!(value.get("message").is_none());
@@ -21083,7 +21088,10 @@ export default function init(pi) {
             );
             {
                 let cx = AgentCx::for_request();
-                let stored = inner_session.lock(&cx).await.expect("stored native messages");
+                let stored = inner_session
+                    .lock(&cx)
+                    .await
+                    .expect("stored native messages");
                 let stored_user = stored
                     .entries_for_current_path()
                     .into_iter()

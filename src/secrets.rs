@@ -733,7 +733,10 @@ mod tests {
 
                 let mut vault = SecretVault::default();
                 let (protected, audit) = obfuscate(&input, &mut vault, &[]);
-                assert_eq!(protected, format!("{prefix}<pi-secret:000001>{escape}after"));
+                assert_eq!(
+                    protected,
+                    format!("{prefix}<pi-secret:000001>{escape}after")
+                );
                 assert_eq!(audit.detections, 1);
                 assert_eq!(vault.restore(&protected), input);
                 let error = gate_outbound(&input, SecretsMode::Block, &[]).unwrap_err();

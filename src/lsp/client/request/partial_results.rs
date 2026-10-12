@@ -148,7 +148,11 @@ impl<'a> PartialOwner<'a> {
         // turning a rejected stream into an empty successful collection.
         let active = {
             let mut inbox = LspClient::lock(&self.client.partial_results);
-            if inbox.active.as_ref().is_none_or(|active| active.token != self.token) {
+            if inbox
+                .active
+                .as_ref()
+                .is_none_or(|active| active.token != self.token)
+            {
                 return Err(partial_error("partial result ownership was retired"));
             }
             inbox
@@ -238,8 +242,7 @@ impl LspClient {
                     let retry = is_retryable_request_error(method, &error);
                     drop(partials);
                     drop(lane);
-                    if !retry
-                        || budget.remaining().map_err(Error::from)? < WARMUP_RETRY_CADENCE * 2
+                    if !retry || budget.remaining().map_err(Error::from)? < WARMUP_RETRY_CADENCE * 2
                     {
                         return Err(Error::from(error));
                     }
@@ -309,10 +312,16 @@ mod tests {
         }
         assert!(active.failure.is_none());
         active.accept(json!({"token":"owned","value":{"items":[]}}));
-        assert_eq!(active.failure, Some("partial result has too many fragments"));
+        assert_eq!(
+            active.failure,
+            Some("partial result has too many fragments")
+        );
         assert!(active.values.is_empty());
         let mut active = collection(100);
         active.accept(json!({"token":"owned"}));
-        assert_eq!(active.failure, Some("matching progress notification has no value"));
+        assert_eq!(
+            active.failure,
+            Some("matching progress notification has no value")
+        );
     }
 }

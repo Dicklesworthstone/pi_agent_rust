@@ -373,19 +373,17 @@ impl SubagentTool {
                 self.run_one(&agents, task, None, on_update, deadline, parent_model)
                     .await,
             ]),
-            RequestMode::Parallel(tasks) => {
-                Ok(ChildRunner::new(
-                    self.cwd.clone(),
-                    self.global_dir.clone(),
-                    self.child_binary.clone(),
-                    self.role_model_spec.clone(),
-                    crate::agent_hub::ChildKind::Subagent,
-                    deadline,
-                )
-                .with_parent_model(parent_model)
-                .run_parallel(&agents, tasks, concurrency, on_update)
-                .await)
-            }
+            RequestMode::Parallel(tasks) => Ok(ChildRunner::new(
+                self.cwd.clone(),
+                self.global_dir.clone(),
+                self.child_binary.clone(),
+                self.role_model_spec.clone(),
+                crate::agent_hub::ChildKind::Subagent,
+                deadline,
+            )
+            .with_parent_model(parent_model)
+            .run_parallel(&agents, tasks, concurrency, on_update)
+            .await),
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
                 let mut results = Vec::with_capacity(tasks.len());

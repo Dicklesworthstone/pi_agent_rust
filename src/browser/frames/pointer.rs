@@ -139,11 +139,10 @@ impl Projection {
             point.x = number(&values[index * 2])?;
             point.y = number(&values[index * 2 + 1])?;
         }
-        let cross = |a: Point, b: Point, c: Point| {
-            (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
-        };
-        let turns = [0, 1, 2, 3]
-            .map(|i| cross(points[i], points[(i + 1) % 4], points[(i + 2) % 4]));
+        let cross =
+            |a: Point, b: Point, c: Point| (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        let turns =
+            [0, 1, 2, 3].map(|i| cross(points[i], points[(i + 1) % 4], points[(i + 2) % 4]));
         if !turns.iter().all(|n| *n > EPSILON) && !turns.iter().all(|n| *n < -EPSILON) {
             return Err(error(
                 "iframe content quad is degenerate, folded or concave",
@@ -326,8 +325,8 @@ pub(in crate::browser) async fn project(
                 json!({"backendNodeId":backend}),
             )
             .await?;
-        point = Projection::new(&model["model"]["content"])?
-            .map(point, viewports[&link.session])?;
+        point =
+            Projection::new(&model["model"]["content"])?.map(point, viewports[&link.session])?;
         for (document_x, document_y) in viewports[&link.parent].hit_grid(point)? {
             let hit = cdp
                 .frame_command(
@@ -384,7 +383,9 @@ mod tests {
         let mut viewport = view(420.0, 300.0);
         viewport.visible_width = 405.0;
         assert_point(
-            projection.map(Point { x: 105.0, y: 120.0 }, viewport).unwrap(),
+            projection
+                .map(Point { x: 105.0, y: 120.0 }, viewport)
+                .unwrap(),
             332.0,
             257.0,
         );
@@ -411,7 +412,9 @@ mod tests {
         assert_point(reflected.map(point, viewport).unwrap(), 150.0, 25.0);
         let perspective = Projection::new(&json!([0, 0, 200, 0, 150, 100, 50, 100])).unwrap();
         assert_point(
-            perspective.map(Point { x: 100.0, y: 50.0 }, viewport).unwrap(),
+            perspective
+                .map(Point { x: 100.0, y: 50.0 }, viewport)
+                .unwrap(),
             100.0,
             200.0 / 3.0,
         );
@@ -427,7 +430,10 @@ mod tests {
             json!([0, 0, 0, 0, 0, 0, 0, 0]),
             json!([0, 0, 100, 0, 20, 20, 0, 100]),
         ] {
-            let error = Projection::new(&quad).err().expect("invalid quad").to_string();
+            let error = Projection::new(&quad)
+                .err()
+                .expect("invalid quad")
+                .to_string();
             assert!(!error.contains("PRIVATE-CANARY"));
         }
     }
@@ -437,7 +443,10 @@ mod tests {
         let mut viewport = view(600.0, 450.0);
         viewport.scroll_x = -20.0;
         viewport.scroll_y = 800.0;
-        let point = Point { x: 105.25, y: 120.75 };
+        let point = Point {
+            x: 105.25,
+            y: 120.75,
+        };
         assert_eq!(
             viewport.hit_grid(point).unwrap(),
             [(85, 920), (85, 921), (86, 920), (86, 921)],
@@ -448,7 +457,14 @@ mod tests {
             [(85, 920)],
         );
         assert!(viewport.hit_grid(Point { x: 600.0, y: 0.0 }).is_err());
-        assert!(viewport.hit_grid(Point { x: f64::NAN, y: 0.0 }).is_err());
+        assert!(
+            viewport
+                .hit_grid(Point {
+                    x: f64::NAN,
+                    y: 0.0
+                })
+                .is_err()
+        );
     }
 
     #[test]

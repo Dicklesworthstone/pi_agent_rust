@@ -19455,7 +19455,10 @@ async fn dispatch_hostcall_events_ref(
             if !payload.is_object()
                 || payload.as_object().is_some_and(|fields| {
                     fields.keys().any(|key| {
-                        !matches!(key.as_str(), "preparation" | "options" | "strategy" | "request")
+                        !matches!(
+                            key.as_str(),
+                            "preparation" | "options" | "strategy" | "request"
+                        )
                     })
                 })
             {
@@ -19510,7 +19513,10 @@ async fn dispatch_hostcall_events_ref(
             // of silently getting the wrong compaction kind.
             match payload.get("strategy") {
                 None | Some(Value::Null) => {
-                    if payload.get("request").is_some_and(|request| !request.is_null()) {
+                    if payload
+                        .get("request")
+                        .is_some_and(|request| !request.is_null())
+                    {
                         return HostcallOutcome::Error {
                             code: "invalid_request".to_string(),
                             message: "compact: request requires a native strategy".to_string(),

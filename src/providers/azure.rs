@@ -1985,7 +1985,10 @@ mod tests {
         let parts = user_json["content"].as_array().expect("parts array");
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["text"], "Images from test_tool (tool call call_123):");
+        assert_eq!(
+            parts[1]["text"],
+            "Images from test_tool (tool call call_123):"
+        );
         assert_eq!(parts[2]["type"], "image_url");
         assert!(
             parts[2]["image_url"]["url"]
@@ -2029,7 +2032,10 @@ mod tests {
         let parts = user_json["content"].as_array().expect("parts array");
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["text"], "Images from test_tool (tool call call_123):");
+        assert_eq!(
+            parts[1]["text"],
+            "Images from test_tool (tool call call_123):"
+        );
         assert_eq!(parts[2]["type"], "image_url");
     }
 
@@ -2078,7 +2084,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["assistant", "tool", "tool", "tool", "tool", "user"]
         );
-        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"].iter().enumerate() {
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
             assert_eq!(messages[index + 1]["tool_call_id"], *id);
         }
@@ -2122,7 +2131,16 @@ mod tests {
                 .iter()
                 .map(|m| m["role"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["user", "assistant", "tool", "user", "assistant", "tool", "user", "user"]
+            [
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "user"
+            ]
         );
         for (message_index, part_index, expected) in [
             (0, 0, "data:image/png;base64,AQ=="),

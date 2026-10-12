@@ -260,7 +260,12 @@ fn lazy_fork_can_target_an_omitted_branch_without_duplicating_its_latest_binding
             "the latest binding is already in the copied ancestry"
         );
         assert!(fork.to_messages_for_current_path().is_empty());
-        assert!(fixture.source.get_entry(&fixture.omitted_target_id).is_none());
+        assert!(
+            fixture
+                .source
+                .get_entry(&fixture.omitted_target_id)
+                .is_none()
+        );
     });
 }
 

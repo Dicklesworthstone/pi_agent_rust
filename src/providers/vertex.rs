@@ -622,14 +622,16 @@ mod tests {
         })];
         for (index, id) in calls.iter().enumerate() {
             let content = if index == 0 {
-                vec![crate::model::ContentBlock::Image(crate::model::ImageContent {
-                    data: "AQ==".to_string(),
-                    mime_type: "image/png".to_string(),
-                })]
+                vec![crate::model::ContentBlock::Image(
+                    crate::model::ImageContent {
+                        data: "AQ==".to_string(),
+                        mime_type: "image/png".to_string(),
+                    },
+                )]
             } else {
-                vec![crate::model::ContentBlock::Text(crate::model::TextContent::new(
-                    "text result",
-                ))]
+                vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("text result"),
+                )]
             };
             messages.push(Message::tool_result(crate::model::ToolResultMessage {
                 tool_call_id: (*id).to_string(),
@@ -660,7 +662,10 @@ mod tests {
             ]),
         );
         assert_eq!(contents[2]["role"], "user");
-        assert_eq!(contents[2]["parts"][1]["text"], "Media from read (tool call call_a):");
+        assert_eq!(
+            contents[2]["parts"][1]["text"],
+            "Media from read (tool call call_a):"
+        );
         assert_eq!(contents[2]["parts"][2]["inline_data"]["data"], "AQ==");
     }
 

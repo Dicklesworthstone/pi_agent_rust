@@ -10,9 +10,7 @@
 //! session; `inspect_saved_session_workdir` also supports lazily loaded stores.
 
 mod persisted;
-pub use persisted::{
-    SavedSessionWorkdir, inspect_saved_session_workdir, open_session_for_runtime,
-};
+pub use persisted::{SavedSessionWorkdir, inspect_saved_session_workdir, open_session_for_runtime};
 
 use std::io;
 use std::path::{Path, PathBuf};

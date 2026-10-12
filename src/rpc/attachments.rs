@@ -331,10 +331,7 @@ pub(super) struct ContentBlocks<'a> {
 }
 
 impl<'a> ContentBlocks<'a> {
-    pub(super) const fn new(
-        blocks: &'a [ContentBlock],
-        catalog: &'a AttachmentCatalog,
-    ) -> Self {
+    pub(super) const fn new(blocks: &'a [ContentBlock], catalog: &'a AttachmentCatalog) -> Self {
         Self { blocks, catalog }
     }
 }
@@ -435,10 +432,7 @@ pub(super) struct AssistantMessageProjection<'a> {
 }
 
 impl<'a> AssistantMessageProjection<'a> {
-    pub(super) fn new(
-        message: &'a AssistantMessage,
-        catalog: &'a AttachmentCatalog,
-    ) -> Self {
+    pub(super) fn new(message: &'a AssistantMessage, catalog: &'a AttachmentCatalog) -> Self {
         Self {
             content: ContentBlocks::new(&message.content, catalog),
             api: &message.api,
@@ -481,10 +475,7 @@ pub(super) struct ModelMessageProjection<'a> {
 }
 
 impl<'a> ModelMessageProjection<'a> {
-    pub(super) const fn new(
-        message: &'a Message,
-        catalog: &'a AttachmentCatalog,
-    ) -> Self {
+    pub(super) const fn new(message: &'a Message, catalog: &'a AttachmentCatalog) -> Self {
         Self { message, catalog }
     }
 }
@@ -531,10 +522,7 @@ pub(super) struct SessionMessageProjection<'a> {
 }
 
 impl<'a> SessionMessageProjection<'a> {
-    pub(super) const fn new(
-        message: &'a SessionMessage,
-        catalog: &'a AttachmentCatalog,
-    ) -> Self {
+    pub(super) const fn new(message: &'a SessionMessage, catalog: &'a AttachmentCatalog) -> Self {
         Self { message, catalog }
     }
 }
@@ -593,7 +581,11 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    fn small_catalog(blob_bytes: usize, retained_bytes: usize, entries: usize) -> AttachmentCatalog {
+    fn small_catalog(
+        blob_bytes: usize,
+        retained_bytes: usize,
+        entries: usize,
+    ) -> AttachmentCatalog {
         AttachmentCatalog::with_limits(CatalogLimits {
             blob_bytes,
             retained_bytes,
@@ -686,13 +678,8 @@ mod tests {
         let projected_blocks = projected["content"].as_array_mut().unwrap();
         assert_eq!(projected_blocks.len(), original_blocks.len());
         let mut references = 0;
-        for (projected_block, original_block) in
-            projected_blocks.iter_mut().zip(original_blocks)
-        {
-            if matches!(
-                original_block["type"].as_str(),
-                Some("image" | "media")
-            ) {
+        for (projected_block, original_block) in projected_blocks.iter_mut().zip(original_blocks) {
+            if matches!(original_block["type"].as_str(), Some("image" | "media")) {
                 let reference = &projected_block["data"];
                 let attachment_id = reference["attachmentId"].as_str().unwrap();
                 let chunk = catalog.read(attachment_id, 0, MAX_CHUNK_BYTES).unwrap();
@@ -861,12 +848,7 @@ mod tests {
         let encoded_key = Sha256::digest(b"YWJj").into();
         catalog.clear();
         assert_eq!(
-            catalog.retain(
-                generation,
-                encoded_key,
-                Encoding::Standard,
-                b"abc".to_vec()
-            ),
+            catalog.retain(generation, encoded_key, Encoding::Standard, b"abc".to_vec()),
             None
         );
         let state = catalog.state.lock().unwrap();

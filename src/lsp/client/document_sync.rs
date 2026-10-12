@@ -280,10 +280,7 @@ impl LspClient {
         uri: &str,
         size: usize,
     ) -> Result<Vec<String>> {
-        let mut candidates: Vec<_> = docs
-            .iter()
-            .filter(|(key, _)| key.as_str() != uri)
-            .collect();
+        let mut candidates: Vec<_> = docs.iter().filter(|(key, _)| key.as_str() != uri).collect();
         candidates.sort_by(|(left_uri, left), (right_uri, right)| {
             (left.version, left_uri).cmp(&(right.version, right_uri))
         });

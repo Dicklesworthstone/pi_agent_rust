@@ -4463,11 +4463,9 @@ impl SessionStoreV2 {
     ) -> Result<()> {
         self.validate_integrity()?;
         for frame in self.read_all_entries()? {
-            let entry = crate::session::attachments::decode_stored_entry(
-                jsonl_source,
-                frame.payload.get(),
-            )
-            .map_err(|error| frame_payload_error(&frame, error))?;
+            let entry =
+                crate::session::attachments::decode_stored_entry(jsonl_source, frame.payload.get())
+                    .map_err(|error| frame_payload_error(&frame, error))?;
             validate_frame_entry_metadata(&frame, entry.base(), entry.entry_type())?;
         }
         Ok(())
@@ -4698,9 +4696,7 @@ fn validate_frame_entry_metadata(
     if base.parent_id != frame.parent_entry_id {
         return Err(Error::session(format!(
             "frame parent_entry_id mismatch for entry {}: frame={:?} entry={:?}",
-            frame.entry_id,
-            frame.parent_entry_id,
-            base.parent_id
+            frame.entry_id, frame.parent_entry_id, base.parent_id
         )));
     }
     if !frame.entry_type.eq(payload_entry_type) {

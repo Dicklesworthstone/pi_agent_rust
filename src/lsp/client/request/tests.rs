@@ -67,7 +67,11 @@ fn admission_backpressure_waits_and_posts_a_command_only_once() {
         .iter()
         .filter(|frame| frame["method"] == "workspace/executeCommand")
         .collect();
-    assert_eq!(commands.len(), 1, "queue admission must not replay a command");
+    assert_eq!(
+        commands.len(),
+        1,
+        "queue admission must not replay a command"
+    );
     assert_eq!(commands[0]["params"]["command"], "run-once");
     assert!(peer.client.is_alive());
 }
@@ -82,11 +86,10 @@ fn admission_backpressure_spends_the_original_deadline_without_dispatch() {
     let started = std::time::Instant::now();
     let error = peer
         .runtime
-        .block_on(peer.client.call(
-            "test/must-not-run",
-            Value::Null,
-            Duration::from_millis(30),
-        ))
+        .block_on(
+            peer.client
+                .call("test/must-not-run", Value::Null, Duration::from_millis(30)),
+        )
         .unwrap_err();
     assert!(matches!(error, LspCallError::Timeout { timeout_ms: 30 }));
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -174,10 +177,12 @@ fn dropping_an_admission_wait_releases_the_lane_without_cancelling_other_work() 
             .iter()
             .any(|frame| frame["method"] == "test/must-not-run")
     );
-    assert!(frames
-        .iter()
-        .filter(|frame| frame["method"] == "$/cancelRequest")
-        .all(|frame| frame["params"]["id"] == json!(pending[0])));
+    assert!(
+        frames
+            .iter()
+            .filter(|frame| frame["method"] == "$/cancelRequest")
+            .all(|frame| frame["params"]["id"] == json!(pending[0]))
+    );
     assert!(peer.client.is_alive());
 }
 

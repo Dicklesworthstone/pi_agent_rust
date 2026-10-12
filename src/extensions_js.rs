@@ -26365,7 +26365,12 @@ mod tests {
             assert_eq!(
                 probe["errors"],
                 json!([
-                    "TypeError", "TypeError", "TypeError", "TypeError", "TypeError", "TypeError"
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError"
                 ])
             );
         });
@@ -34451,10 +34456,13 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     disk_cache_dir: None,
                     ..PiJsRuntimeConfig::default()
                 };
-                let runtime =
-                    PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
-                        .await
-                        .expect("create Windows-path runtime");
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows-path runtime");
                 runtime
                     .eval(
                         r"
@@ -34486,7 +34494,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     .expect("eval Windows default path workflow");
                 drain_until_idle(&runtime, &clock).await;
                 let actual = get_global_json(&runtime, "windowsPathDefaults").await;
-                let saved_drive = if deny_env { r"D:\next" } else { r"D:\saved\next" };
+                let saved_drive = if deny_env {
+                    r"D:\next"
+                } else {
+                    r"D:\saved\next"
+                };
                 assert_eq!(
                     actual,
                     serde_json::json!({
@@ -34518,7 +34530,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         // runtime seals its native hooks; this fixture leaves production
         // authorization untouched and performs no host filesystem I/O.
         let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
-        let state = Rc::new(RefCell::new(PiJsModuleState::new().with_disk_cache_dir(None)));
+        let state = Rc::new(RefCell::new(
+            PiJsModuleState::new().with_disk_cache_dir(None),
+        ));
         runtime.set_loader(
             PiJsResolver {
                 state: Rc::clone(&state),
@@ -34729,10 +34743,13 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     disk_cache_dir: None,
                     ..PiJsRuntimeConfig::default()
                 };
-                let runtime =
-                    PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
-                        .await
-                        .expect("create Windows filesystem runtime");
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows filesystem runtime");
                 let fixture = format!("pijs-roots-{}", uuid::Uuid::new_v4().simple());
                 runtime
                     .context

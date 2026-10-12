@@ -144,9 +144,12 @@ async fn call(
             "parent messaging requires I/O and timer authority",
         ));
     }
-    owner
-        .checkpoint()
-        .map_err(|_| ipc_error("CANCELLED", "parent messaging was cancelled before dispatch"))?;
+    owner.checkpoint().map_err(|_| {
+        ipc_error(
+            "CANCELLED",
+            "parent messaging was cancelled before dispatch",
+        )
+    })?;
     let mut frame = serde_json::to_vec(&WireRequest {
         version: VERSION,
         token,
@@ -159,12 +162,18 @@ async fn call(
     let now = owner
         .timer_driver()
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    let inherited = owner.budget().deadline.map_or(EXCHANGE_TIMEOUT, |deadline| {
-        Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-    });
+    let inherited = owner
+        .budget()
+        .deadline
+        .map_or(EXCHANGE_TIMEOUT, |deadline| {
+            Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+        });
     let timeout = EXCHANGE_TIMEOUT.min(inherited);
     if timeout.is_zero() {
-        return Err(ipc_error("TIMEOUT", "parent messaging deadline has expired"));
+        return Err(ipc_error(
+            "TIMEOUT",
+            "parent messaging deadline has expired",
+        ));
     }
     let exchange = async {
         match select(
@@ -234,12 +243,18 @@ async fn exchange(address: SocketAddr, frame: Vec<u8>) -> Result<Reply> {
             ));
         }
         if response.len().saturating_add(count) > MAX_RESPONSE_BYTES {
-            return Err(ipc_error("LIMIT", "parent messaging response exceeds 256 KiB"));
+            return Err(ipc_error(
+                "LIMIT",
+                "parent messaging response exceeds 256 KiB",
+            ));
         }
         response.extend_from_slice(&chunk[..count]);
         if let Some(end) = response.iter().position(|byte| *byte == b'\n') {
             if end + 1 != response.len() {
-                return Err(ipc_error("PROTOCOL", "parent returned trailing response data"));
+                return Err(ipc_error(
+                    "PROTOCOL",
+                    "parent returned trailing response data",
+                ));
             }
             let response: WireResponse = serde_json::from_slice(&response[..end])
                 .map_err(|_| ipc_error("PROTOCOL", "parent returned an invalid response"))?;
@@ -270,11 +285,7 @@ impl ChildChannel {
             .checkpoint()
             .map_err(|_| ipc_error("CANCELLED", "parent messaging owner is cancelled"))?;
         let capabilities = owner.capabilities();
-        if !capabilities.io
-            || !capabilities.time
-            || !capabilities.entropy
-            || remaining.is_zero()
-        {
+        if !capabilities.io || !capabilities.time || !capabilities.entropy || remaining.is_zero() {
             return Err(ipc_error(
                 "PERMISSION",
                 "parent messaging requires live I/O, timer and entropy authority",
@@ -309,10 +320,7 @@ impl ChildChannel {
         })
     }
 
-    pub(crate) fn configure_child(
-        command: &mut std::process::Command,
-        channel: Option<&Self>,
-    ) {
+    pub(crate) fn configure_child(command: &mut std::process::Command, channel: Option<&Self>) {
         // An explicit tool allowlist without hub needs no new channel and
         // must never borrow this process's identity in its own parent hub.
         command.env_remove(ADDRESS_ENV).env_remove(TOKEN_ENV);
@@ -422,7 +430,9 @@ impl Connection {
                             }
                             let request = serde_json::from_slice::<WireRequest>(&self.input[..end]);
                             let response = match request {
-                                Ok(request) => dispatch_authenticated(sender, token, request, owner),
+                                Ok(request) => {
+                                    dispatch_authenticated(sender, token, request, owner)
+                                }
                                 Err(_) => Err(ipc_error("PROTOCOL", "invalid request frame")),
                             };
                             self.set_response(match response {
@@ -572,7 +582,6 @@ fn dispatch(hub: &mut AgentHubRegistry, sender: &str, request: Request) -> Resul
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,7 +642,10 @@ mod tests {
             let mut chunk = [0_u8; 4096];
             match client.read(&mut chunk) {
                 Ok(0) => {
-                    assert!(response.ends_with(b"\n"), "reply closed before its boundary");
+                    assert!(
+                        response.ends_with(b"\n"),
+                        "reply closed before its boundary"
+                    );
                     return response;
                 }
                 Ok(count) => {
@@ -704,16 +716,12 @@ mod tests {
         assert!(!error.contains(&wrong_token));
 
         let oversized = vec![b'x'; MAX_REQUEST_BYTES + 1];
-        assert!(
-            refusal(&round_trip(&mut channel, &oversized)).contains("PI_HUB_IPC_LIMIT")
-        );
+        assert!(refusal(&round_trip(&mut channel, &oversized)).contains("PI_HUB_IPC_LIMIT"));
 
         let mut spoofed = request(Action::Roster);
         spoofed.claimed_from = Some("parent".to_string());
         let spoofed = wire(&token, spoofed);
-        assert!(
-            refusal(&round_trip(&mut channel, &spoofed)).contains("PI_HUB_IPC_SENDER")
-        );
+        assert!(refusal(&round_trip(&mut channel, &spoofed)).contains("PI_HUB_IPC_SENDER"));
 
         let valid = wire(&token, request(Action::Roster));
         let error = refusal(&round_trip(&mut channel, &valid));
@@ -728,8 +736,8 @@ mod tests {
     #[test]
     fn partial_frames_and_disconnects_do_not_become_requests() {
         let (_owner, mut channel) = channel();
-        let mut client = TcpStream::connect_timeout(&channel.address, Duration::from_secs(1))
-            .expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&channel.address, Duration::from_secs(1)).expect("connect");
         let mut frame = wire(&channel.token, request(Action::Roster));
         frame.pop();
         client.write_all(&frame).expect("write incomplete frame");
@@ -747,7 +755,10 @@ mod tests {
         drop(client);
         while !channel.connections.is_empty() {
             channel.poll();
-            assert!(Instant::now() < deadline, "disconnected client was retained");
+            assert!(
+                Instant::now() < deadline,
+                "disconnected client was retained"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -769,9 +780,7 @@ mod tests {
         assert!(channel.connections.is_empty());
         assert!(channel.listener.is_none());
         assert!(channel.token.is_empty());
-        assert!(
-            TcpStream::connect_timeout(&channel.address, Duration::from_millis(100)).is_err()
-        );
+        assert!(TcpStream::connect_timeout(&channel.address, Duration::from_millis(100)).is_err());
         drop(clients);
     }
 
@@ -782,16 +791,12 @@ mod tests {
         channel.deadline = Instant::now();
         channel.poll();
         assert!(channel.listener.is_none());
-        assert!(
-            TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err()
-        );
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
 
         let (_owner, owned) = self::channel();
         let address = owned.address;
         drop(owned);
-        assert!(
-            TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err()
-        );
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
     }
 
     #[test]
@@ -824,7 +829,9 @@ mod tests {
         let mut hub = AgentHubRegistry::default();
         hub.set_dir_for_tests(temp.path().to_path_buf());
         let sender = hub.register("sender", "send message").expect("sender");
-        let peer = hub.register("receiver", "receive message").expect("receiver");
+        let peer = hub
+            .register("receiver", "receive message")
+            .expect("receiver");
         hub.mark_running(&sender.id, 10);
         hub.mark_running(&peer.id, 20);
         let mut send = request(Action::Send);

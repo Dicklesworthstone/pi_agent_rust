@@ -584,8 +584,14 @@ impl Cdp {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        if !self.frame_targets.admits(self.session_id.as_deref(), session) {
-            return Err(Error::tool("browser", "frame session is no longer attached"));
+        if !self
+            .frame_targets
+            .admits(self.session_id.as_deref(), session)
+        {
+            return Err(Error::tool(
+                "browser",
+                "frame session is no longer attached",
+            ));
         }
         owner
             .checkpoint()
@@ -595,12 +601,19 @@ impl Cdp {
             .await?;
         for _ in 0..MAX_EVENTS {
             let response = self.receive(owner).await?;
-            if !self.frame_targets.admits(self.session_id.as_deref(), session) {
-                return Err(Error::tool("browser", "frame detached during browser operation"));
+            if !self
+                .frame_targets
+                .admits(self.session_id.as_deref(), session)
+            {
+                return Err(Error::tool(
+                    "browser",
+                    "frame detached during browser operation",
+                ));
             }
             if response["method"] == "Page.javascriptDialogOpening"
                 && response["sessionId"].as_str().is_some_and(|session| {
-                    self.frame_targets.admits(self.session_id.as_deref(), session)
+                    self.frame_targets
+                        .admits(self.session_id.as_deref(), session)
                 })
             {
                 return Err(Error::tool(
@@ -1064,8 +1077,14 @@ impl Session {
                     .await
             }
             action if interaction::forms::is_action(action) => {
-                interaction::forms::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
-                    .await
+                interaction::forms::execute(
+                    owner,
+                    cdp,
+                    &tab,
+                    self.references.get(&reference_key),
+                    args,
+                )
+                .await
             }
             "upload" => {
                 self.uploads
@@ -1137,7 +1156,11 @@ mod tests {
             frame_command_result(&response, 7, "child").unwrap(),
             Some(json!({"value": 42}))
         );
-        assert!(frame_command_result(&response, 8, "child").unwrap().is_none());
+        assert!(
+            frame_command_result(&response, 8, "child")
+                .unwrap()
+                .is_none()
+        );
         assert!(frame_command_result(&response, 7, "page").is_err());
         for invalid in [
             json!({"id": 7, "result": {}}),

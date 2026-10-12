@@ -467,12 +467,18 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
     for (key, value) in values.into_iter().flatten() {
         if let Ok(id) = key.parse::<u32>() {
             if !parser.ids.contains(&id) {
-                return Err(tool_err("LSP_USAGE", "snippetValues contains an unknown placeholder index"));
+                return Err(tool_err(
+                    "LSP_USAGE",
+                    "snippetValues contains an unknown placeholder index",
+                ));
             }
             numbered.insert(id, value.as_str());
         } else {
             if !parser.variables.contains(key) {
-                return Err(tool_err("LSP_USAGE", "snippetValues contains an unknown variable name"));
+                return Err(tool_err(
+                    "LSP_USAGE",
+                    "snippetValues contains an unknown variable name",
+                ));
             }
             named.insert(key.as_str(), value.as_str());
         }

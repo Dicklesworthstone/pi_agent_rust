@@ -484,7 +484,9 @@ impl AgentHubRegistry {
             sent_ms: now_ms(),
         };
         if body.trim().is_empty() {
-            return Err(Error::validation("hub: parent message requires non-empty text"));
+            return Err(Error::validation(
+                "hub: parent message requires non-empty text",
+            ));
         }
         if body.len() > MAX_STEER_FRAME_BYTES
             || serde_json::to_vec(&message)?.len().saturating_add(1) > MAX_STEER_FRAME_BYTES
@@ -509,7 +511,9 @@ impl AgentHubRegistry {
         }
         let cursor = cursor.unwrap_or(0);
         let queue = self.bus.get(id);
-        let oldest_cursor = queue.and_then(VecDeque::front).map_or(0, |message| message.seq);
+        let oldest_cursor = queue
+            .and_then(VecDeque::front)
+            .map_or(0, |message| message.seq);
         let mut messages = Vec::new();
         let mut bytes = 0_usize;
         let mut next_cursor = cursor;

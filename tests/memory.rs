@@ -592,12 +592,9 @@ fn cass_recall_preserves_exact_session_values_and_excludes_them_from_project_his
         assert!(details.get("memories").is_none());
         assert!(serde_json::to_string(details).unwrap().contains(exact));
     }
-    let project = block_on_with_io_only(cass.execute(
-        "project-search",
-        json!({"query":"handoff"}),
-        None,
-    ))
-    .unwrap();
+    let project =
+        block_on_with_io_only(cass.execute("project-search", json!({"query":"handoff"}), None))
+            .unwrap();
     assert!(!project.is_error);
     assert_eq!(project.details.as_ref().unwrap()["memories"], json!([]));
     assert!(
@@ -628,7 +625,11 @@ fn cass_recall_preserves_exact_session_values_and_excludes_them_from_project_his
         None,
     ))
     .unwrap_err();
-    assert!(injected.to_string().contains("PI_SHARED_MEMORY_INVALID_INPUT"));
+    assert!(
+        injected
+            .to_string()
+            .contains("PI_SHARED_MEMORY_INVALID_INPUT")
+    );
     finish_case(&harness, case);
 }
 

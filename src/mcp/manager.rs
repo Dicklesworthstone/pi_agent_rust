@@ -1789,10 +1789,16 @@ mod acp_literal_tests {
     fn credential_commands_read_from_the_server_workspace_without_changing_process_cwd() {
         let project = tempfile::tempdir().expect("project");
         let other = tempfile::tempdir().expect("other project");
-        std::fs::write(project.path().join("credential.txt"), "selected-workspace-token")
-            .expect("project credential fixture");
-        std::fs::write(other.path().join("credential.txt"), "different-workspace-token")
-            .expect("other credential fixture");
+        std::fs::write(
+            project.path().join("credential.txt"),
+            "selected-workspace-token",
+        )
+        .expect("project credential fixture");
+        std::fs::write(
+            other.path().join("credential.txt"),
+            "different-workspace-token",
+        )
+        .expect("other credential fixture");
         let process_cwd = std::env::current_dir().expect("process cwd");
         let entries = vec![("TOKEN".to_string(), "$CMD:cat credential.txt".to_string())];
         for validate in [

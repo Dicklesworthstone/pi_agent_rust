@@ -750,9 +750,8 @@ fn saved_workspace_auth_reload_survives_auxiliary_requests() {
         let _ = child.wait();
     }
     let trace = std::fs::read_to_string(&log_path).expect("read child diagnostics");
-    let status = result.unwrap_or_else(|reason| {
-        panic!("Bedrock auth regression failed: {reason}\n{trace}")
-    });
+    let status =
+        result.unwrap_or_else(|reason| panic!("Bedrock auth regression failed: {reason}\n{trace}"));
     assert!(
         status.success() && trace.contains("BEDROCK_WORKSPACE_AUTH_RELOAD_COMPLETE"),
         "Bedrock auth regression failed: {status}\n{trace}",
@@ -778,8 +777,11 @@ fn check_saved_workspace_auth_reload(root: &std::path::Path) {
     ] {
         std::fs::write(directory.join("credential-first.txt"), "initial-token\n")
             .expect("initial command credential");
-        std::fs::write(directory.join("credential-rotated.txt"), format!("{token}\n"))
-            .expect("rotated command credential");
+        std::fs::write(
+            directory.join("credential-rotated.txt"),
+            format!("{token}\n"),
+        )
+        .expect("rotated command credential");
     }
 
     let session_path = root.join("saved-session.jsonl");
@@ -787,11 +789,16 @@ fn check_saved_workspace_auth_reload(root: &std::path::Path) {
     header.cwd = saved_workspace.display().to_string();
     std::fs::write(
         &session_path,
-        format!("{}\n", serde_json::to_string(&header).expect("session header")),
+        format!(
+            "{}\n",
+            serde_json::to_string(&header).expect("session header")
+        ),
     )
     .expect("saved session");
-    let saved = run(pi::session_workdir::inspect_saved_session_workdir(&session_path))
-        .expect("inspect saved workspace");
+    let saved = run(pi::session_workdir::inspect_saved_session_workdir(
+        &session_path,
+    ))
+    .expect("inspect saved workspace");
     let runtime_cwd = saved.resolve_runtime_cwd(None).expect("saved runtime cwd");
     assert_eq!(runtime_cwd, saved_workspace);
     assert_eq!(std::env::current_dir().unwrap(), invocation);
@@ -817,8 +824,8 @@ fn check_saved_workspace_auth_reload(root: &std::path::Path) {
     );
     auth.save().expect("initial selected auth");
     let server = Server::new(200, EVENT_STREAM, complete_text());
-    let mut entry = pi::models::ad_hoc_model_entry("amazon-bedrock", "model-a")
-        .expect("Bedrock model entry");
+    let mut entry =
+        pi::models::ad_hoc_model_entry("amazon-bedrock", "model-a").expect("Bedrock model entry");
     entry.model.base_url.clone_from(&server.base);
     entry.model.cost.input = 1.0;
     let provider = pi::providers::create_provider_with_auth(&entry, None, Some(&auth))
@@ -848,7 +855,9 @@ fn check_saved_workspace_auth_reload(root: &std::path::Path) {
             token: "wrong-relative-auth-file".to_string(),
         },
     );
-    conflicting_auth.save().expect("conflicting relative auth file");
+    conflicting_auth
+        .save()
+        .expect("conflicting relative auth file");
     std::env::set_current_dir(&later_workspace).expect("change isolated child cwd");
 
     // The bound provider must also work for a summary whose operation options

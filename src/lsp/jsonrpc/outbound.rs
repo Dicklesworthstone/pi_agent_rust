@@ -234,8 +234,7 @@ impl QueuedWriter {
 
     #[cfg(test)]
     pub(super) fn has_in_flight_frame(&self) -> bool {
-        lock(&self.queue.state).frames.is_empty()
-            && self.budget.used.load(Ordering::Acquire) != 0
+        lock(&self.queue.state).frames.is_empty() && self.budget.used.load(Ordering::Acquire) != 0
     }
 
     pub(super) fn write_request(&self, bytes: &[u8], id: u64) -> io::Result<()> {
@@ -521,7 +520,9 @@ mod tests {
                 if byte_limit { 3 } else { 1 },
                 if byte_limit { bytes - 1 } else { 4096 },
             );
-            let (_, response) = client.request("test/held", serde_json::Value::Null).unwrap();
+            let (_, response) = client
+                .request("test/held", serde_json::Value::Null)
+                .unwrap();
             let mut batch = super::super::JsonRpcClient::prepare_notifications(vec![
                 ("textDocument/didChange", serde_json::json!({})),
                 ("textDocument/didSave", serde_json::json!({})),
@@ -756,7 +757,10 @@ mod tests {
         assert_eq!(decoded["method"], "workspace/executeCommand");
         assert_eq!(decoded["params"]["command"], "run-once");
         assert_eq!(decoded["id"], serde_json::json!(command_id));
-        assert!(receiver.try_recv().is_err(), "accepted work cannot be retried");
+        assert!(
+            receiver.try_recv().is_err(),
+            "accepted work cannot be retried"
+        );
         assert!(client.is_alive());
     }
 
@@ -780,7 +784,10 @@ mod tests {
         assert_eq!(lock(&client.pending).len(), 1);
         assert!(lock(&client.pending).contains_key(&first_id));
         assert_eq!(
-            receiver.try_recv().expect("earlier request preserved").request_id,
+            receiver
+                .try_recv()
+                .expect("earlier request preserved")
+                .request_id,
             Some(first_id)
         );
         assert!(receiver.try_recv().is_err());
@@ -812,8 +819,14 @@ mod tests {
             Err(TransportError::Io(reason)) if reason.contains("exceeds the writer byte budget")
         ));
         assert!(client.is_alive());
-        assert_eq!(lock(&client.pending).len(), super::super::MAX_PENDING_REQUESTS);
-        assert!(receiver.try_recv().is_err(), "rejected work was never posted");
+        assert_eq!(
+            lock(&client.pending).len(),
+            super::super::MAX_PENDING_REQUESTS
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejected work was never posted"
+        );
     }
 
     #[cfg(unix)]

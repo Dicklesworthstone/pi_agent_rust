@@ -290,7 +290,10 @@ impl MemoryStore {
     /// Memory's irreversible privacy floor also applies when conversation
     /// obfuscation is off; exact shared-session values are unaffected.
     #[must_use]
-    pub fn with_secrets_settings(mut self, settings: Option<&crate::secrets::SecretsSettings>) -> Self {
+    pub fn with_secrets_settings(
+        mut self,
+        settings: Option<&crate::secrets::SecretsSettings>,
+    ) -> Self {
         self.secret_patterns = settings
             .and_then(|settings| settings.extra_patterns.as_deref())
             .map(crate::secrets::compile_extra_patterns)
@@ -518,12 +521,14 @@ impl MemoryStore {
         let limit = limit.unwrap_or(DEFAULT_RECALL_LIMIT).min(100);
         let query = query.to_string();
         self.with_conn(move |conn| {
-            FtsRecencyRanker.recall(conn, &query, limit).map(|memories| {
-                memories
-                    .into_iter()
-                    .map(|memory| self.screen_memory(memory))
-                    .collect()
-            })
+            FtsRecencyRanker
+                .recall(conn, &query, limit)
+                .map(|memories| {
+                    memories
+                        .into_iter()
+                        .map(|memory| self.screen_memory(memory))
+                        .collect()
+                })
         })
     }
 
@@ -947,7 +952,10 @@ impl Tool for RecallTool {
 
     fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
         if matches!(shared::session_requested(input), Ok(true))
-            || input.get("includeHistory").and_then(serde_json::Value::as_bool) == Some(false)
+            || input
+                .get("includeHistory")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
         {
             ToolEffects::read()
         } else {
@@ -982,7 +990,10 @@ impl Tool for RecallTool {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| Error::Aborted)?;
         if !owner.capabilities().io {
-            return Err(Error::tool("recall", "Project recall requires I/O capability"));
+            return Err(Error::tool(
+                "recall",
+                "Project recall requires I/O capability",
+            ));
         }
         let memories = self.store.recall(&input.query, input.limit)?;
         let shown_query = self.store.screen_text(&input.query);
@@ -1217,7 +1228,10 @@ mod tests {
             panic!("recall must return readable evidence");
         };
         assert!(text.text.contains(&format!("[{}] (fact)", memory.id)));
-        assert!(text.text.contains("[cass:1] codex — /archive/session.jsonl:42"));
+        assert!(
+            text.text
+                .contains("[cass:1] codex — /archive/session.jsonl:42")
+        );
         assert!(text.text.contains("Earlier parser evidence"));
         assert_eq!(store.list(10).unwrap().len(), 1);
         assert_eq!(store.recall("Earlier", None).unwrap().len(), 0);
