@@ -3571,7 +3571,7 @@ impl Agent {
                 );
 
                 let assistant_message = match assistant_result {
-                    Ok(msg) => self.maybe_repair_dialect_tool_calls(msg),
+                    Ok(msg) => msg,
                     Err(err) => {
                         let err_string = err.to_string();
                         let steering_to_add = self.drain_steering_messages().await;
@@ -3689,7 +3689,10 @@ impl Agent {
                 // A paused Anthropic server-tool turn must be resubmitted
                 // verbatim. Its content can contain tool-use blocks, but those
                 // are not a request to execute our local tool registry.
-                let execute_local_tools = !pause_turn && !tool_calls.is_empty();
+                let execute_local_tools = matches!(
+                    assistant_arc.stop_reason,
+                    StopReason::Stop | StopReason::ToolUse | StopReason::Length
+                ) && !tool_calls.is_empty();
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
                     pause_turn_continuations = pause_turn_continuations.saturating_add(1);
@@ -4311,10 +4314,10 @@ impl Agent {
         // uniformly for every provider.
         let mut tool_call_raw_args: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
-        // #148: whether this streaming response ever began assembling a tool
-        // call. Needed to tell "cut off mid tool call" apart from "cut off in
-        // the middle of plain prose", which is an ordinary `Length` stop.
-        let mut tool_call_started = false;
+        // #148: count distinct streamed calls, including any unfinished call
+        // later omitted from the terminal snapshot. Repeated updates at one
+        // content index still describe one call.
+        let mut streamed_tool_call_indices = std::collections::HashSet::new();
 
         'stream: loop {
             if checkpoint_cx.checkpoint().is_err()
@@ -4755,7 +4758,7 @@ impl Agent {
                     id,
                     name,
                 } => {
-                    tool_call_started = true;
+                    streamed_tool_call_indices.insert(content_index);
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -4805,7 +4808,7 @@ impl Agent {
                     delta,
                     ..
                 } => {
-                    tool_call_started = true;
+                    streamed_tool_call_indices.insert(content_index);
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -4869,7 +4872,7 @@ impl Agent {
                     tool_call,
                     ..
                 } => {
-                    tool_call_started = true;
+                    streamed_tool_call_indices.insert(content_index);
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -4912,21 +4915,50 @@ impl Agent {
                         });
                     }
                 }
-                StreamEvent::Done { mut message, .. } => {
-                    // #148: a turn cut short by the provider's token limit while a
-                    // tool call was still being assembled must not finalize as an
-                    // ordinary stop. The half-built call is unusable, so the run
-                    // loop would see no executable tool call and quietly end the
-                    // turn. Re-stamping it as `Error` routes it through the
-                    // existing error handling, which surfaces `error_message` to
-                    // the caller via `AgentEnd`.
-                    if is_truncated_before_tool_call(&message, tool_call_started) {
+                StreamEvent::Done {
+                    reason,
+                    mut message,
+                } => {
+                    // Failures, refusals, and server-tool pauses must win over
+                    // a stale success reason in the final message snapshot.
+                    let terminal_override = match reason {
+                        StopReason::Error | StopReason::Aborted | StopReason::Refusal => !matches!(
+                            message.stop_reason,
+                            StopReason::Error | StopReason::Aborted
+                        ),
+                        StopReason::PauseTurn => matches!(
+                            message.stop_reason,
+                            StopReason::Stop | StopReason::ToolUse | StopReason::Length
+                        ),
+                        StopReason::Length => matches!(
+                            message.stop_reason,
+                            StopReason::Stop | StopReason::ToolUse
+                        ),
+                        _ => false,
+                    };
+                    if terminal_override {
+                        message.stop_reason = reason;
+                    }
+                    // #148: a token-limited snapshot may omit an unfinished
+                    // call even while completed peers remain. Report the
+                    // truncation before any peer executes, through the existing
+                    // Error/AgentEnd path.
+                    if is_truncated_before_tool_call(&message, streamed_tool_call_indices.len()) {
                         message.stop_reason = StopReason::Error;
                         message.error_message = Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
                     }
                     return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
                 }
-                StreamEvent::Error { error, .. } => {
+                StreamEvent::Error { reason, mut error } => {
+                    // Custom providers can leave the partial snapshot stamped
+                    // Stop/ToolUse. An Error envelope never authorizes tools.
+                    if !matches!(error.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        error.stop_reason = if reason == StopReason::Aborted {
+                            StopReason::Aborted
+                        } else {
+                            StopReason::Error
+                        };
+                    }
                     return Ok(self.finalize_assistant_message(error, &on_event, added_partial));
                 }
             }
@@ -4948,7 +4980,8 @@ impl Agent {
             // the connection without a terminal event; the resulting error
             // should name the truncated tool call rather than the generic
             // missing-`Done` condition.
-            let truncated_tool_call = is_truncated_before_tool_call(&final_msg, tool_call_started);
+            let truncated_tool_call =
+                is_truncated_before_tool_call(&final_msg, streamed_tool_call_indices.len());
             final_msg.stop_reason = StopReason::Error;
             final_msg.error_message = Some(if truncated_tool_call {
                 TRUNCATED_TOOL_CALL_ERROR.to_string()
@@ -5021,6 +5054,14 @@ impl Agent {
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
     ) -> AssistantMessage {
+        // Repair before the execution check and terminal publication so the
+        // persisted message, MessageEnd, and local executor see one batch.
+        message = self.maybe_repair_dialect_tool_calls(message);
+        if let Some(error) = terminal_tool_batch_error(&message) {
+            message.stop_reason = StopReason::Error;
+            // Preserve the provider's original diagnostic if it supplied one.
+            message.error_message.get_or_insert(error);
+        }
         // gh #221: price the finished turn from the catalog rates. Transports
         // only fill token counts (plus OpenRouter's billed total); without
         // this every `usage.cost` stayed 0.0 on every provider.
@@ -18897,6 +18938,43 @@ fn filter_image_blocks(blocks: &mut Vec<ContentBlock>, placeholder: &str) -> usi
 const TRUNCATED_TOOL_CALL_ERROR: &str = "Model output truncated before tool call completed (provider stop reason: length); \
      the incomplete tool call was not executed";
 
+/// Validate every call before any peer can reach approval, hooks, or execution.
+/// Streaming ToolCallEnd events are content updates, not execution authority.
+fn terminal_tool_batch_error(message: &AssistantMessage) -> Option<String> {
+    if matches!(
+        message.stop_reason,
+        StopReason::Error | StopReason::Aborted | StopReason::PauseTurn | StopReason::Refusal
+    ) {
+        // Failed or refused turns cannot execute. Paused turns must retain
+        // their signed provider payload verbatim for continuation.
+        return None;
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for (index, block) in message.content.iter().enumerate() {
+        let ContentBlock::ToolCall(call) = block else {
+            continue;
+        };
+        let detail = if call.id.trim().is_empty() {
+            "tool call ID must not be blank"
+        } else if !ids.insert(call.id.as_str()) {
+            "tool call IDs must be unique within the response"
+        } else if call.name.trim().is_empty() {
+            "tool name must not be blank"
+        } else if !call.arguments.is_object() {
+            "tool arguments must be a JSON object"
+        } else {
+            continue;
+        };
+        // IDs, names, and arguments come from the provider and may contain
+        // secrets. The diagnostic identifies only the field and block index.
+        return Some(format!(
+            "PI_TOOL_CALL_PROTOCOL: invalid tool call at content index {index}: {detail}; local tool batch withheld"
+        ));
+    }
+    None
+}
+
 /// Whether a tool call survived streaming intact enough to execute.
 ///
 /// Two ways a truncated call fails this: an empty `name` (the placeholder
@@ -18911,33 +18989,31 @@ fn is_complete_tool_call(tool_call: &ToolCall) -> bool {
     !tool_call.name.trim().is_empty() && !tool_call.arguments.is_null()
 }
 
-/// Whether `message` represents a response the provider truncated at its token
-/// limit before any tool call finished (#148).
+/// Whether the provider's token limit left an incomplete or missing tool batch.
 ///
-/// `tool_call_started` says a `ToolCall{Start,Delta,End}` event arrived on this
-/// stream; without it, a `Length` stop in the middle of plain prose (no tool
-/// call involved) would be misreported as a failure. It also covers the case
-/// where truncation drops the half-built call from the final message entirely,
-/// leaving nothing in `content` to inspect.
+/// Count distinct indices from `ToolCall{Start,Delta,End}` events so repeated
+/// updates do not invent extra calls. A terminal snapshot can omit an unfinished
+/// call; even if a peer completed, executing it would apply only part of the
+/// batch. Done-only providers have no streamed indices and remain supported.
 ///
-/// Returns `false` when at least one usable tool call survived — that turn still
-/// has work the run loop can execute, so it keeps its provider stop reason.
-fn is_truncated_before_tool_call(message: &AssistantMessage, tool_call_started: bool) -> bool {
+/// Otherwise retain #148's incomplete-only detection. Malformed peers still
+/// present in the snapshot are refused by `terminal_tool_batch_error`.
+fn is_truncated_before_tool_call(message: &AssistantMessage, streamed_tool_call_count: usize) -> bool {
     if message.stop_reason != StopReason::Length {
         return false;
     }
 
-    let mut saw_incomplete = false;
+    let mut final_tool_call_count = 0;
+    let mut has_complete_tool_call = false;
     for block in &message.content {
         if let ContentBlock::ToolCall(tool_call) = block {
-            if is_complete_tool_call(tool_call) {
-                return false;
-            }
-            saw_incomplete = true;
+            final_tool_call_count += 1;
+            has_complete_tool_call |= is_complete_tool_call(tool_call);
         }
     }
 
-    tool_call_started || saw_incomplete
+    final_tool_call_count < streamed_tool_call_count
+        || (!has_complete_tool_call && (streamed_tool_call_count > 0 || final_tool_call_count > 0))
 }
 
 /// Extract tool calls from content blocks.
@@ -19804,6 +19880,579 @@ mod tests {
                 ["prev".to_string(), "hello".to_string()]
             );
         });
+    }
+
+    /// Feed terminal protocol cases through the real Agent loop, then stop so
+    /// a pre-check regression fails on observable tool effects instead of looping.
+    struct TerminalBatchProvider {
+        events: Vec<StreamEvent>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TerminalBatchProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            let events = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.events.clone()
+            } else {
+                vec![StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: assistant_message("finished"),
+                }]
+            };
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn batch_write_call(id: &str, path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "write".to_string(),
+            arguments: json!({"path": path, "content": content}),
+            thought_signature: Some("provider-call-signature".to_string()),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invalid_terminal_tool_peer_withholds_the_whole_batch_before_approval() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target.txt");
+            let valid = batch_write_call("valid-call", "target.txt", "changed");
+            let mut invalid = Vec::new();
+            for id in ["", " \t", "valid-call"] {
+                invalid.push(ToolCall {
+                    id: id.to_string(),
+                    ..valid.clone()
+                });
+            }
+            for name in ["", " \n"] {
+                invalid.push(ToolCall {
+                    id: "invalid-peer".to_string(),
+                    name: name.to_string(),
+                    ..valid.clone()
+                });
+            }
+            for arguments in [
+                Value::Null,
+                json!(true),
+                json!(42),
+                json!("private-argument"),
+                json!([]),
+            ] {
+                invalid.push(ToolCall {
+                    id: "invalid-peer".to_string(),
+                    arguments,
+                    ..valid.clone()
+                });
+            }
+
+            for bad in invalid {
+                for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::Length] {
+                    std::fs::write(&target, "original").unwrap();
+                    let mut message = assistant_message("Retain the partial explanation");
+                    message.stop_reason = reason;
+                    message.usage.input = 17;
+                    message.usage.output = 5;
+                    message.usage.total_tokens = 22;
+                    message.content.extend([
+                        ContentBlock::ToolCall(valid.clone()),
+                        ContentBlock::ToolCall(bad.clone()),
+                    ]);
+                    let original_content = serde_json::to_value(&message.content).unwrap();
+                    let provider = Arc::new(TerminalBatchProvider {
+                        events: vec![
+                            StreamEvent::Start {
+                                partial: assistant_message(""),
+                            },
+                            StreamEvent::ToolCallEnd {
+                                content_index: 1,
+                                tool_call: valid.clone(),
+                            },
+                            StreamEvent::Done { reason, message },
+                        ],
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let observed = Arc::clone(&approvals);
+                    let mut agent = Agent::new(
+                        provider.clone(),
+                        ToolRegistry::new(&["write"], temp.path(), None),
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |_| {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                Box::pin(async { ToolApprovalDecision::Allow })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let captured = Arc::clone(&events);
+                    let result = agent
+                        .run("Apply the edits", move |event| {
+                            captured.lock().unwrap().push(event);
+                        })
+                        .await
+                        .unwrap();
+
+                    assert_eq!(result.stop_reason, StopReason::Error, "{reason:?}/{bad:?}");
+                    let error = result.error_message.as_deref().unwrap();
+                    assert!(error.contains("PI_TOOL_CALL_PROTOCOL"));
+                    assert!(!error.contains("private-argument"));
+                    assert_eq!(
+                        serde_json::to_value(&result.content).unwrap(),
+                        original_content
+                    );
+                    assert_eq!(
+                        (
+                            result.usage.input,
+                            result.usage.output,
+                            result.usage.total_tokens
+                        ),
+                        (17, 5, 22)
+                    );
+                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+                    assert!(
+                        !agent
+                            .messages()
+                            .iter()
+                            .any(|m| matches!(m, Message::ToolResult(_)))
+                    );
+                    let events = events.lock().unwrap();
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
+                    );
+                    let ended = events
+                        .iter()
+                        .find_map(|event| match event {
+                            AgentEvent::MessageEnd {
+                                message: Message::Assistant(message),
+                            } => Some(message),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(ended).unwrap(),
+                        serde_json::to_value(&result).unwrap()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn valid_parallel_tool_batch_executes_with_stop_tool_use_and_length() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::Length] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut message = assistant_message("Apply both edits");
+                message.stop_reason = reason;
+                message.content.extend([
+                    ContentBlock::ToolCall(batch_write_call("first", "first.txt", "one")),
+                    ContentBlock::ToolCall(batch_write_call("second", "second.txt", "two")),
+                ]);
+                let original = serde_json::to_value(&message).unwrap();
+                let provider = Arc::new(TerminalBatchProvider {
+                    events: vec![StreamEvent::Done { reason, message }],
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let mut agent = Agent::new(
+                    provider.clone(),
+                    ToolRegistry::new(&["write"], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                let result = agent.run("Apply the edits", |_| {}).await.unwrap();
+                assert_eq!(result.stop_reason, StopReason::Stop);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+                    "one"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("second.txt")).unwrap(),
+                    "two"
+                );
+                let Message::Assistant(stored) = &agent.messages()[1] else {
+                    panic!("validated assistant batch stays in history");
+                };
+                assert_eq!(serde_json::to_value(stored).unwrap(), original);
+                let results: Vec<_> = agent
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::ToolResult(result) => {
+                            Some((result.tool_call_id.as_str(), result.is_error))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(results, [("first", false), ("second", false)]);
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn length_tool_batch_withholds_completed_peer_when_another_call_disappears() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for omit_started_peer in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let target = temp.path().join("target.txt");
+                std::fs::write(&target, "original").unwrap();
+                let completed = batch_write_call("complete", "target.txt", "changed");
+                let mut message = assistant_message("Apply the edits");
+                message.stop_reason = StopReason::Length;
+                message
+                    .content
+                    .push(ContentBlock::ToolCall(completed.clone()));
+                let mut events = vec![StreamEvent::Start {
+                    partial: assistant_message(""),
+                }];
+                // Start, delta, and repeated end updates at the same index
+                // represent one call, not four separate batch members.
+                events.extend([
+                    StreamEvent::ToolCallStart {
+                        content_index: 1,
+                        id: completed.id.clone(),
+                        name: completed.name.clone(),
+                    },
+                    StreamEvent::ToolCallDelta {
+                        content_index: 1,
+                        delta: serde_json::to_string(&completed.arguments).unwrap(),
+                    },
+                    StreamEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: completed.clone(),
+                    },
+                    StreamEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: completed,
+                    },
+                ]);
+                if omit_started_peer {
+                    events.extend([
+                        StreamEvent::ToolCallStart {
+                            content_index: 2,
+                            id: "unfinished".to_string(),
+                            name: "write".to_string(),
+                        },
+                        StreamEvent::ToolCallDelta {
+                            content_index: 2,
+                            delta: "{\"path\":\"other.txt\",\"content\":\"".to_string(),
+                        },
+                    ]);
+                }
+                events.push(StreamEvent::Done {
+                    reason: StopReason::Length,
+                    message,
+                });
+                let provider = Arc::new(TerminalBatchProvider {
+                    events,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = Arc::clone(&approvals);
+                let mut agent = Agent::new(
+                    provider.clone(),
+                    ToolRegistry::new(&["write"], temp.path(), None),
+                    AgentConfig {
+                        tool_approval: Some(Arc::new(move |_| {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async { ToolApprovalDecision::Allow })
+                        })),
+                        ..AgentConfig::default()
+                    },
+                );
+                let result = agent.run("Apply the edits", |_| {}).await.unwrap();
+                if omit_started_peer {
+                    assert_eq!(result.stop_reason, StopReason::Error);
+                    assert_eq!(
+                        result.error_message.as_deref(),
+                        Some(TRUNCATED_TOOL_CALL_ERROR)
+                    );
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+                    assert!(
+                        !agent
+                            .messages()
+                            .iter()
+                            .any(|m| matches!(m, Message::ToolResult(_)))
+                    );
+                } else {
+                    assert_eq!(result.stop_reason, StopReason::Stop);
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(approvals.load(Ordering::SeqCst), 1);
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed");
+                }
+                assert!(!temp.path().join("other.txt").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_failure_envelopes_never_execute_stale_success_snapshots() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target.txt");
+            for reason in [StopReason::Error, StopReason::Aborted] {
+                for error_envelope in [false, true] {
+                    let mut message = assistant_message("Partial provider answer");
+                    message.error_message = Some("original provider diagnostic".to_string());
+                    message.content.push(ContentBlock::ToolCall(batch_write_call(
+                        "call",
+                        "target.txt",
+                        "must not execute",
+                    )));
+                    let event = if error_envelope {
+                        StreamEvent::Error {
+                            reason,
+                            error: message,
+                        }
+                    } else {
+                        StreamEvent::Done { reason, message }
+                    };
+                    let provider = Arc::new(TerminalBatchProvider {
+                        events: vec![event],
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    let mut agent = Agent::new(
+                        provider,
+                        ToolRegistry::new(&["write"], temp.path(), None),
+                        AgentConfig::default(),
+                    );
+                    let result = agent.run("Apply the edit", |_| {}).await.unwrap();
+                    assert_eq!(result.stop_reason, reason);
+                    assert_eq!(
+                        result.error_message.as_deref(),
+                        Some("original provider diagnostic")
+                    );
+                    assert!(!target.exists(), "a terminal failure cannot create a file");
+                    assert!(
+                        !agent
+                            .messages()
+                            .iter()
+                            .any(|m| matches!(m, Message::ToolResult(_)))
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_length_envelope_rejects_a_dropped_incomplete_call() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for snapshot_reason in [StopReason::Stop, StopReason::ToolUse] {
+                let mut message = assistant_message("Retain the partial explanation");
+                message.stop_reason = snapshot_reason;
+                message.usage.input = 9;
+                message.usage.output = 2;
+                message.usage.total_tokens = 11;
+                let original_content = serde_json::to_value(&message.content).unwrap();
+                let provider = Arc::new(TerminalBatchProvider {
+                    events: vec![
+                        StreamEvent::Start {
+                            partial: assistant_message(""),
+                        },
+                        StreamEvent::ToolCallStart {
+                            content_index: 1,
+                            id: "partial-call".to_string(),
+                            name: "write".to_string(),
+                        },
+                        StreamEvent::ToolCallDelta {
+                            content_index: 1,
+                            delta: "{\"path\":\"target.txt\",\"content\":\"".to_string(),
+                        },
+                        // The provider omits the unfinished call from its
+                        // snapshot while the envelope still reports Length.
+                        StreamEvent::Done {
+                            reason: StopReason::Length,
+                            message,
+                        },
+                    ],
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let mut agent = Agent::new(
+                    provider.clone(),
+                    ToolRegistry::new(&["write"], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                let result = agent.run("Apply the edit", |_| {}).await.unwrap();
+                assert_eq!(result.stop_reason, StopReason::Error);
+                assert_eq!(
+                    result.error_message.as_deref(),
+                    Some(TRUNCATED_TOOL_CALL_ERROR)
+                );
+                assert_eq!(
+                    serde_json::to_value(&result.content).unwrap(),
+                    original_content
+                );
+                assert_eq!(result.usage.total_tokens, 11);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert!(!temp.path().join("target.txt").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_pause_envelope_continues_signed_calls_without_local_execution() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target.txt");
+            let mut message = assistant_message("The server tool is still working");
+            message.content.push(ContentBlock::ToolCall(batch_write_call(
+                "server-call",
+                "target.txt",
+                "must not execute",
+            )));
+            let original_content = serde_json::to_value(&message.content).unwrap();
+            let provider = Arc::new(TerminalBatchProvider {
+                events: vec![StreamEvent::Done {
+                    reason: StopReason::PauseTurn,
+                    message,
+                }],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&["write"], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let result = agent.run("Apply the edit", |_| {}).await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert!(!target.exists(), "server tool pauses cannot execute locally");
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| matches!(m, Message::ToolResult(_)))
+            );
+            let Message::Assistant(stored) = &agent.messages()[1] else {
+                panic!("paused assistant stays in history for continuation");
+            };
+            assert_eq!(stored.stop_reason, StopReason::PauseTurn);
+            assert_eq!(
+                serde_json::to_value(&stored.content).unwrap(),
+                original_content
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_refusal_preserves_provider_details_without_local_execution() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target.txt");
+            for (snapshot_reason, reason) in [
+                (StopReason::Refusal, StopReason::Refusal),
+                (StopReason::Stop, StopReason::Refusal),
+                (StopReason::Refusal, StopReason::Stop),
+                (StopReason::Refusal, StopReason::PauseTurn),
+            ] {
+                let mut message = assistant_message("Provider declined the request");
+                message.stop_reason = snapshot_reason;
+                message.stop_details = Some(crate::model::StopDetails {
+                    kind: "refusal".to_string(),
+                    category: Some("provider-policy".to_string()),
+                    explanation: Some("original provider explanation".to_string()),
+                });
+                message.content.push(ContentBlock::ToolCall(batch_write_call(
+                    "refused-call",
+                    "target.txt",
+                    "must not execute",
+                )));
+                let mut expected = message.clone();
+                expected.stop_reason = StopReason::Refusal;
+                let provider = Arc::new(TerminalBatchProvider {
+                    events: vec![StreamEvent::Done { reason, message }],
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let mut agent = Agent::new(
+                    provider.clone(),
+                    ToolRegistry::new(&["write"], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                let result = agent.run("Apply the edit", |_| {}).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&result).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert!(!target.exists(), "refused requests cannot execute locally");
+                assert!(
+                    !agent
+                        .messages()
+                        .iter()
+                        .any(|m| matches!(m, Message::ToolResult(_)))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_validation_preserves_failed_aborted_and_signed_pause_payloads() {
+        for reason in [
+            StopReason::Error,
+            StopReason::Aborted,
+            StopReason::PauseTurn,
+            StopReason::Refusal,
+        ] {
+            let mut message = assistant_message("provider explanation");
+            message.stop_reason = reason;
+            message.error_message = Some("original diagnostic".to_string());
+            message.content.extend([
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "signed reasoning".to_string(),
+                    thinking_signature: Some("opaque-signature".to_string()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: String::new(),
+                    name: String::new(),
+                    arguments: Value::Null,
+                    thought_signature: Some("opaque-call".to_string()),
+                }),
+            ]);
+            let original = serde_json::to_value(&message).unwrap();
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let on_event: AgentEventHandler = Arc::new(|_| {});
+            let result = agent.finalize_assistant_message(message, &on_event, false);
+            assert_eq!(serde_json::to_value(result).unwrap(), original);
+        }
     }
 
     /// #148: first turn is cut off by the token cap while a tool call is still
