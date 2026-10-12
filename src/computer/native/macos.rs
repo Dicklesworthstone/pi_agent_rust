@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const HELPER: &str = include_str!("macos.swift");
+const HELPER: &str = concat!(include_str!("macos_input.swift"), "\n", include_str!("macos.swift"));
+const OWNED_INPUT_ACTIONS: &[&str] = &["mouse_click", "mouse_drag"];
 const SCREENSHOT_REPLY_LIMIT: usize = IMAGE_LIMIT.div_ceil(3) * 4 + 8192;
 const ACTIONS: &[&str] = &[
     "list_displays",
@@ -23,6 +24,8 @@ const ACTIONS: &[&str] = &[
     "ax_tree",
     "focus_window",
     "mouse_move",
+    "mouse_click",
+    "mouse_drag",
     "scroll",
 ];
 
@@ -50,6 +53,9 @@ fn failure(code: &str) -> crate::error::Error {
         "pointer_outside_displays" => "the requested point is outside the active macOS displays",
         "pointer_unconfirmed" => "the macOS pointer did not reach the requested position; effects may already have occurred",
         "input_failed" => "macOS could not create the requested input event",
+        "input_cancelled" => "macOS input stopped because its owner or deadline ended; releases were attempted and effects may already have occurred",
+        "input_channel" => "macOS input could not establish its owner channel",
+        "input_conflict" => "macOS input refused while its button or a modifier is already held; release physical inputs before retrying",
         "os_version" => "the macOS computer backend requires macOS 14 or newer and Xcode Command Line Tools with a compatible macOS SDK",
         "display_unavailable" => "the requested macOS display is unavailable; list displays again",
         "window_unavailable" => "the requested macOS window is unavailable; list windows again",
@@ -170,6 +176,7 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         "list_displays" => catalog(data, true),
         "list_windows" => catalog(data, false),
         "ax_tree" => accessibility_result(args, data),
+        "mouse_click" | "mouse_drag" => input_result(args, data),
         "focus_window" | "mouse_move" | "scroll" => targeting_result(action, args, data),
         "clipboard_read" => {
             fields(data, &["text", "char_count"])?;
@@ -189,6 +196,28 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         }
         _ => Err(failure("unsupported_action")),
     }
+}
+
+fn input_result(args: &Value, data: &Value) -> Result<()> {
+    fields(data, &["dispatched", "released", "button", "position", "application_effect", "window_id"])?;
+    fields(&data["position"], &["x", "y"])?;
+    if data["dispatched"] != true || data["released"] != true
+        || data["application_effect"] != "not_verified"
+        || data.get("window_id") != args.get("window_id")
+        || data["button"].as_str() != Some(args["button"].as_str().unwrap_or("left"))
+    {
+        return Err(protocol());
+    }
+    for axis in ["x", "y"] {
+        let actual = data["position"][axis].as_f64().ok_or_else(protocol)?;
+        if !actual.is_finite() || actual.abs() > 1_000_000.0
+            || args.get(axis).is_some_and(|expected| expected.as_f64()
+                .is_none_or(|expected| !expected.is_finite() || (actual - expected).abs() > 0.5))
+        {
+            return Err(protocol());
+        }
+    }
+    Ok(())
 }
 
 fn targeting_result(action: &str, args: &Value, data: &Value) -> Result<()> {
@@ -307,7 +336,11 @@ pub(super) async fn execute(
     let input = request_bytes(args)?;
     let mut helpers = helpers.clone();
     helpers.entry("swift".into()).or_insert_with(|| "/usr/bin/swift".into());
-    let bytes = process::run(
+    let bytes = if OWNED_INPUT_ACTIONS.contains(&action) {
+        process::input::run(owner, &helpers,
+            &process::strings(&["-swift-version", "5", "-e", HELPER]),
+            &input).await?
+    } else { process::run(
         owner,
         // Neither a workspace executable nor a workspace Swift module may
         // shadow the system helper. SDK overrides remain trusted host policy.
@@ -317,7 +350,7 @@ pub(super) async fn execute(
         &process::strings(&["-swift-version", "5", "-e", HELPER]),
         &input,
         if target.is_some() { SCREENSHOT_REPLY_LIMIT } else { process::TEXT_LIMIT },
-    ).await?;
+    ).await? };
     check_owner(owner)?;
     let mut data = decode_reply(&bytes, action)?;
     if let Some(target) = target {
@@ -582,11 +615,63 @@ mod tests {
         let tool = crate::computer::ComputerTool::new(dir.path()).with_mock(false);
         for args in [json!({"action":"focus_window","window_id":73}),
             json!({"action":"mouse_move","x":-12,"y":300}),
-            json!({"action":"scroll","direction":"down"})]
+            json!({"action":"scroll","direction":"down"}),
+            json!({"action":"mouse_click","button":"right"}),
+            json!({"action":"mouse_drag","x":-12,"y":300})]
         {
             let failure = runtime.block_on(tool.execute("desktop-consent", args, None)).unwrap_err();
             assert!(failure.to_string().contains("requires host approval"));
         }
+    }
+
+    #[test]
+    fn mouse_input_receipts_bind_release_target_button_and_position() {
+        let args = json!({"action":"mouse_drag","window_id":73,"x":-12,"y":300,"button":"right"});
+        let receipt = json!({"dispatched":true,"released":true,"window_id":73,"button":"right",
+            "position":{"x":-12.0,"y":300.0},"application_effect":"not_verified"});
+        assert!(admit_result("mouse_drag", &args, &receipt).is_ok());
+        for field in ["dispatched", "released", "window_id", "button", "position", "application_effect"] {
+            let mut invalid = receipt.clone();
+            invalid[field] = Value::Null;
+            assert!(admit_result("mouse_drag", &args, &invalid).is_err(), "{field}");
+        }
+        let mut wrong = receipt.clone();
+        wrong["position"]["x"] = json!(12);
+        assert!(admit_result("mouse_drag", &args, &wrong).is_err());
+        wrong = receipt.clone();
+        wrong["window_id"] = json!(74);
+        assert!(admit_result("mouse_drag", &args, &wrong).is_err());
+        wrong = receipt;
+        wrong["private"] = json!("PRIVATE-CANARY");
+        let failure = admit_result("mouse_drag", &args, &wrong).unwrap_err();
+        assert!(!failure.to_string().contains("PRIVATE-CANARY"));
+    }
+
+    #[test]
+    fn mouse_input_reaches_the_owned_transport_and_validates_its_reply() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("swift-fixture");
+        std::fs::write(&helper, concat!(
+            "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
+            "IFS= read -r frame || exit 8\n",
+            "printf '%s' '{\"status\":\"ok\",\"action\":\"mouse_click\",\"data\":{",
+            "\"dispatched\":true,\"released\":true,\"button\":\"right\",",
+            "\"position\":{\"x\":-12,\"y\":300},\"application_effect\":\"not_verified\"}}'\n",
+        )).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helpers = BTreeMap::from([("swift".to_string(), helper)]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let args = json!({"action":"mouse_click","x":-12,"y":300,"button":"right"});
+        let output = runtime.block_on(async {
+            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &args).await.unwrap()
+        });
+        assert!(!output.is_error);
+        assert_eq!(output.details.unwrap()["backend"], "macos");
+        let wrong = json!({"action":"mouse_drag","x":-12,"y":300,"button":"right"});
+        assert!(runtime.block_on(async {
+            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &wrong).await
+        }).is_err());
     }
 
     #[cfg(target_os = "macos")]

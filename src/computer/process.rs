@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, ExitStatus, Stdio};
 use std::time::Duration;
 
+pub(super) mod input;
+
 pub(super) const TEXT_LIMIT: usize = 256 * 1024;
 
 pub(super) struct Running {
@@ -52,6 +54,7 @@ fn spawn(
         .args(args)
         .current_dir(cwd)
         .env_remove("XDOTOOL_DEBUG")
+        .env_remove("PI_COMPUTER_OWNED_INPUT")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

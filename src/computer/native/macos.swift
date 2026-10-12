@@ -19,6 +19,7 @@ struct Request: Decodable {
     let display_id: UInt32?
     let window_id: UInt32?
     let text: String?
+    let button: String?
     let x: Int32?
     let y: Int32?
     let direction: String?
@@ -484,7 +485,8 @@ func perform(_ request: Request) throws {
 #endif
 
 do {
-    let bytes = FileHandle.standardInput.readData(ofLength: 128 * 1024 + 1)
+    let bytes = ownedInputInvocation ? try readOwnedInputFrame()
+        : FileHandle.standardInput.readData(ofLength: 128 * 1024 + 1)
     guard bytes.count <= 128 * 1024 else { throw DesktopFailure("invalid_request") }
     let request = try JSONDecoder().decode(Request.self, from: bytes)
     guard request.display_id == nil || request.window_id == nil else {
@@ -492,6 +494,12 @@ do {
     }
     #if os(macOS)
     guard #available(macOS 14.0, *) else { throw DesktopFailure("os_version") }
+    if ownedInputInvocation {
+        guard ownedInputActions.contains(request.action) else { throw DesktopFailure("unsupported_action") }
+        // The transaction returns only after normal/deferred input releases.
+        let result = try performOwnedInput(request)
+        succeed(request, result)
+    }
     try perform(request)
     // Only capture is asynchronous. Rust owns its deadline and subprocess.
     RunLoop.main.run()
