@@ -129,12 +129,24 @@ impl LspTool {
     }
 
     async fn synced(&self, path: &Path) -> Result<(String, Arc<ServerEntry>)> {
+        self.synced_with_timeout(path, self.registry.request_timeout())
+            .await
+    }
+
+    async fn synced_with_timeout(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<(String, Arc<ServerEntry>)> {
         let entry = self.client_for(path).await?;
         let spec = self.registry.spec_for_file(path).ok_or_else(|| {
             tool_err("LSP_NO_SERVER", format!("no server for {}", path.display()))
         })?;
         let language_id = Self::language_id_for(path, spec);
-        let uri = entry.client.ensure_synced(path, &language_id)?;
+        let uri = entry
+            .client
+            .ensure_synced_with_timeout(path, &language_id, timeout)
+            .await?;
         Ok((uri, entry))
     }
 
@@ -241,7 +253,9 @@ impl LspTool {
             return Ok(text_output(payload.to_string(), payload));
         }
         let path = resolve_tool_path(file, &self.cwd);
-        let (uri, entry) = self.synced(&path).await?;
+        let (uri, entry) = self
+            .synced_with_timeout(&path, self.request_timeout(input))
+            .await?;
         let wait = input
             .timeout
             .filter(|secs| *secs > 0)
@@ -266,7 +280,9 @@ impl LspTool {
         match (input.file.as_deref(), input.query.as_deref()) {
             (Some(file), _) => {
                 let path = resolve_tool_path(file, &self.cwd);
-                let (uri, entry) = self.synced(&path).await?;
+                let (uri, entry) = self
+                    .synced_with_timeout(&path, self.request_timeout(input))
+                    .await?;
                 let result = entry
                     .client
                     .call(

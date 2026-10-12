@@ -543,7 +543,24 @@ impl LspTool {
                 .as_deref()
                 .ok_or_else(|| tool_err("LSP_USAGE", "hierarchy query requires symbol"))?;
             let path = resolve_tool_path(file, &self.cwd).canonicalize()?;
-            let (uri, entry) = self.synced(&path).await?;
+            let now = budget
+                .owner
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let remaining = budget.remaining()?;
+            let (uri, entry) = asupersync::time::timeout(
+                now,
+                remaining,
+                self.synced_with_timeout(&path, remaining),
+            )
+            .await
+            .map_err(|_| {
+                tool_err(
+                    "LSP_TIMEOUT",
+                    "hierarchy server startup or synchronization exceeded the request budget",
+                )
+            })??;
             direction.capability(&entry.client.capabilities().raw)?;
             let text = entry.client.synchronized_text(&uri).ok_or_else(expired)?;
             let position = Self::resolve_position_in(&path, &text, input.line, symbol)?;

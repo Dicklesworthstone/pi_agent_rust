@@ -536,6 +536,72 @@ fn preparation_and_expansion_share_one_deadline() {
 }
 
 #[test]
+fn selected_timeouts_bound_document_sync_while_another_request_owns_the_lane() {
+    for action in ["symbols", "outgoing_calls"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), "hang_prepare") else {
+            return;
+        };
+        assert!(tool.registry.request_timeout() > Duration::from_secs(3));
+        runtime.block_on(async {
+            let path = temp.path().join("source.graphfixture");
+            let entry = tool.client_for(&path).await.unwrap();
+            let mut held = Box::pin(entry.client.call(
+                "textDocument/prepareCallHierarchy",
+                json!({}),
+                Duration::from_secs(30),
+            ));
+            let owner = AgentCx::for_current_or_request();
+            let start = Instant::now();
+            loop {
+                assert!(futures::poll!(held.as_mut()).is_pending());
+                if temp.path().join("held").exists() {
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(10));
+                owner.time().sleep(Duration::from_millis(10)).await;
+            }
+            let now = owner
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let error = asupersync::time::timeout(
+                now,
+                Duration::from_secs(3),
+                tool.execute(
+                    "short-sync-budget",
+                    json!({"action":action,"file":"source.graphfixture","symbol":"root","timeout":1}),
+                    None,
+                ),
+            )
+            .await
+            .expect("the selected one-second timeout must bound synchronization admission")
+            .unwrap_err();
+            assert!(error.to_string().contains("LSP_TIMEOUT"));
+            assert!(entry.client.document_snapshots().is_empty());
+            assert!(entry.client.is_alive());
+            assert!(lock(&tool.hierarchies.entries).is_empty());
+            drop(held);
+            entry
+                .client
+                .call("test/barrier", Value::Null, Duration::from_secs(5))
+                .await
+                .unwrap();
+        });
+        let log = frames(temp.path());
+        assert!(!log.iter().any(|frame| frame["method"] == "textDocument/didOpen"));
+        assert_eq!(
+            log.iter()
+                .filter(|frame| frame["method"] == "textDocument/prepareCallHierarchy")
+                .count(),
+            1,
+            "only the deliberately held request may reach the server"
+        );
+        assert!(!log.iter().any(|frame| frame["method"] == "textDocument/documentSymbol"));
+    }
+}
+
+#[test]
 fn dropping_each_request_stage_cancels_it_without_leaking_handles() {
     for mode in ["hang_prepare", "hang_calls"] {
         let temp = tempfile::tempdir().unwrap();

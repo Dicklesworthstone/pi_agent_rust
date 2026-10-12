@@ -197,6 +197,7 @@ fn source_admission_rejects_large_files_and_directories() {
 #[cfg(unix)]
 mod protocol {
     use super::*;
+    use crate::agent_cx::AgentCx;
     use std::time::Duration;
 
     // Real Content-Length framing over a subprocess; no transport mock. The
@@ -275,6 +276,302 @@ while True:
         let path = root.join("source.txt");
         std::fs::write(&path, text).unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn rejected_change_and_save_preserve_the_entire_previous_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(
+            temp.path(),
+            json!({"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}}),
+            &rt,
+        );
+        let path = source(temp.path(), "before");
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        let previous = client.document_snapshots()[&path];
+        frames(&client, &rt);
+        client.accept_diagnostics(&json!({
+            "uri":uri,"version":previous.version,"diagnostics":[{"message":"previous report"}]
+        }));
+        client.quiescent.store(true, Ordering::SeqCst);
+        let paused = client.rpc.pause_outbound_for_test(2, 4096);
+        let (_, pending) = client.rpc.request("test/held", Value::Null).unwrap();
+        std::fs::write(&path, "after").unwrap();
+
+        let error = client.ensure_synced(&path, "plaintext").unwrap_err();
+        assert!(error.to_string().contains("LSP_TRANSPORT_BUSY"));
+        let retained = client.document_snapshots()[&path];
+        assert_eq!(retained.version, previous.version);
+        assert_eq!(retained.hash, previous.hash);
+        assert_eq!(
+            client.diagnostics_snapshot()[&uri][0]["message"],
+            "previous report"
+        );
+        assert!(client.quiescent.load(Ordering::SeqCst));
+        assert!(client.is_alive());
+        assert!(matches!(
+            pending.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let rejected = paused.drain();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["method"], "test/held");
+
+        client.ensure_synced(&path, "plaintext").unwrap();
+        let admitted = paused.drain();
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0]["method"], "textDocument/didChange");
+        assert_eq!(admitted[0]["params"]["contentChanges"][0]["text"], "after");
+        assert_eq!(admitted[1]["method"], "textDocument/didSave");
+        assert_eq!(admitted[1]["params"]["text"], "after");
+        let current = client.document_snapshots()[&path];
+        assert!(current.version > previous.version);
+        assert_eq!(current.hash, content_hash("after"));
+        assert!(!client.diagnostics_snapshot().contains_key(&uri));
+        assert!(!client.quiescent.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_waiting_incremental_sync_rechecks_source_and_baseline_before_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(
+            temp.path(),
+            json!({"textDocumentSync":{"openClose":true,"change":2,"save":{"includeText":true}}}),
+            &rt,
+        );
+        let path = source(temp.path(), "before😀");
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        frames(&client, &rt);
+        let paused = client.rpc.pause_outbound_for_test(3, 4096);
+        client.rpc.request("test/held-a", Value::Null).unwrap();
+        client.rpc.request("test/held-b", Value::Null).unwrap();
+        std::fs::write(&path, "waiting😀").unwrap();
+
+        rt.block_on(async {
+            let mut syncing = Box::pin(client.ensure_synced_with_timeout(
+                &path,
+                "plaintext",
+                Duration::from_secs(5),
+            ));
+            assert!(futures::poll!(syncing.as_mut()).is_pending());
+            assert!(
+                client.open_docs.try_lock().is_ok(),
+                "capacity waits release document locks"
+            );
+            assert_eq!(
+                paused.drain().len(),
+                2,
+                "only the held requests were admitted"
+            );
+
+            // A second caller advances the server's baseline while the first
+            // caller is suspended; the disk then changes once more.
+            std::fs::write(&path, "middle☃").unwrap();
+            client.ensure_synced(&path, "plaintext").unwrap();
+            let intermediate = paused.drain();
+            assert_eq!(intermediate.len(), 2);
+            assert_eq!(
+                replay_change("before😀", &intermediate[0]["params"]["contentChanges"][0]),
+                "middle☃"
+            );
+            let version = client.document_snapshots()[&path].version;
+            std::fs::write(&path, "newest😀\r\nline").unwrap();
+            assert_eq!(syncing.await.unwrap(), uri);
+            client.rpc.request("test/after-sync", Value::Null).unwrap();
+
+            let admitted = paused.drain();
+            assert_eq!(admitted.len(), 3);
+            assert_eq!(admitted[0]["method"], "textDocument/didChange");
+            assert_eq!(
+                replay_change("middle☃", &admitted[0]["params"]["contentChanges"][0]),
+                "newest😀\r\nline"
+            );
+            assert_eq!(admitted[1]["method"], "textDocument/didSave");
+            assert_eq!(admitted[1]["params"]["text"], "newest😀\r\nline");
+            assert_eq!(admitted[2]["method"], "test/after-sync");
+            assert!(client.document_snapshots()[&path].version > version);
+            client.ensure_synced(&path, "plaintext").unwrap();
+            assert!(
+                paused.drain().is_empty(),
+                "successful synchronization is not repeated"
+            );
+        });
+        assert!(client.is_alive());
+    }
+
+    #[test]
+    fn unadmitted_sync_timeout_cancellation_and_drop_do_not_change_either_endpoint() {
+        for mode in ["timeout", "cancel", "drop"] {
+            let temp = tempfile::tempdir().unwrap();
+            let rt = runtime();
+            let client = connect(
+                temp.path(),
+                json!({"textDocumentSync":{"openClose":true,"change":1,"save":true}}),
+                &rt,
+            );
+            let path = source(temp.path(), "before");
+            client.ensure_synced(&path, "plaintext").unwrap();
+            let previous = client.document_snapshots()[&path];
+            frames(&client, &rt);
+            let paused = client.rpc.pause_outbound_for_test(2, 4096);
+            let (_, pending) = client.rpc.request("test/held", Value::Null).unwrap();
+            std::fs::write(&path, "after").unwrap();
+            let owner = AgentCx::for_request();
+
+            rt.block_on(async {
+                let timeout = if mode == "timeout" {
+                    Duration::from_millis(30)
+                } else {
+                    Duration::from_secs(5)
+                };
+                let mut syncing = Box::pin(owner.with_current(
+                    client.ensure_synced_with_timeout(&path, "plaintext", timeout),
+                ));
+                if mode == "timeout" {
+                    assert!(
+                        syncing
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("LSP_TIMEOUT")
+                    );
+                } else {
+                    assert!(futures::poll!(syncing.as_mut()).is_pending());
+                    if mode == "cancel" {
+                        owner.cancel_with(
+                            asupersync::types::CancelKind::User,
+                            Some("cancel sync"),
+                        );
+                        assert!(
+                            syncing
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("LSP_CANCELLED")
+                        );
+                    } else {
+                        drop(syncing);
+                    }
+                }
+            });
+            assert!(client.open_docs.try_lock().is_ok());
+            rt.block_on(async {
+                let budget = RequestBudget::new(Duration::from_secs(1));
+                drop(budget.acquire(&client.request_lane).await.unwrap());
+            });
+            let current = client.document_snapshots()[&path];
+            assert_eq!(current.version, previous.version);
+            assert_eq!(current.hash, previous.hash);
+            assert!(client.is_alive());
+            assert!(matches!(
+                pending.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let admitted = paused.drain();
+            assert_eq!(
+                admitted.len(),
+                1,
+                "{mode} must not admit any document or cancel frame"
+            );
+            assert_eq!(admitted[0]["method"], "test/held");
+        }
+    }
+
+    #[test]
+    fn an_oversized_combined_update_is_rejected_without_waiting_or_retiring_the_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(
+            temp.path(),
+            json!({"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}}),
+            &rt,
+        );
+        let path = source(temp.path(), "before");
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        let previous = client.document_snapshots()[&path];
+        frames(&client, &rt);
+        let text = "after".repeat(50);
+        let change = crate::lsp::jsonrpc::encode_frame(&json!({
+            "jsonrpc":"2.0","method":"textDocument/didChange","params":{
+                "textDocument":{"uri":uri,"version":previous.version + 1},
+                "contentChanges":[{"text":text}]
+            }
+        }));
+        let save = crate::lsp::jsonrpc::encode_frame(&json!({
+            "jsonrpc":"2.0","method":"textDocument/didSave","params":{
+                "textDocument":{"uri":uri},"text":text
+            }
+        }));
+        let limit = change.len() + save.len() - 1;
+        assert!(change.len() <= limit && save.len() <= limit);
+        let paused = client.rpc.pause_outbound_for_test(3, limit);
+        client.rpc.request("test/held", Value::Null).unwrap();
+        std::fs::write(&path, text).unwrap();
+        rt.block_on(async {
+            let mut syncing = Box::pin(client.ensure_synced_with_timeout(
+                &path,
+                "plaintext",
+                Duration::from_secs(5),
+            ));
+            let std::task::Poll::Ready(result) = futures::poll!(syncing.as_mut()) else {
+                panic!("an impossible batch must not wait for capacity");
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LSP_TRANSPORT_IO")
+            );
+        });
+        assert!(client.is_alive());
+        let current = client.document_snapshots()[&path];
+        assert_eq!(current.version, previous.version);
+        assert_eq!(current.hash, previous.hash);
+        let admitted = paused.drain();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["method"], "test/held");
+    }
+
+    #[test]
+    fn cache_eviction_and_open_are_admitted_as_one_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(temp.path(), json!({"textDocumentSync":1}), &rt);
+        let oldest = source(temp.path(), "oldest");
+        let oldest_uri = client.ensure_synced(&oldest, "plaintext").unwrap();
+        for index in 1..MAX_OPEN_DOCUMENTS {
+            let path = temp.path().join(format!("source-{index}.txt"));
+            std::fs::write(&path, "source").unwrap();
+            client.ensure_synced(&path, "plaintext").unwrap();
+        }
+        frames(&client, &rt);
+        let previous = client.document_snapshots()[&oldest];
+        let path = temp.path().join("new.txt");
+        std::fs::write(&path, "new").unwrap();
+        let path = path.canonicalize().unwrap();
+        let paused = client.rpc.pause_outbound_for_test(2, 4096);
+        client.rpc.request("test/held", Value::Null).unwrap();
+
+        let error = client.ensure_synced(&path, "plaintext").unwrap_err();
+        assert!(error.to_string().contains("LSP_TRANSPORT_BUSY"));
+        assert_eq!(client.open_document_count(), MAX_OPEN_DOCUMENTS);
+        assert_eq!(client.document_snapshots()[&oldest].version, previous.version);
+        assert!(!client.document_snapshots().contains_key(&path));
+        assert_eq!(paused.drain().len(), 1);
+
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        let admitted = paused.drain();
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0]["method"], "textDocument/didClose");
+        assert_eq!(admitted[0]["params"]["textDocument"]["uri"], oldest_uri);
+        assert_eq!(admitted[1]["method"], "textDocument/didOpen");
+        assert_eq!(admitted[1]["params"]["textDocument"]["uri"], uri);
+        assert_eq!(client.open_document_count(), MAX_OPEN_DOCUMENTS);
+        assert!(!client.document_snapshots().contains_key(&oldest));
+        assert!(client.document_snapshots().contains_key(&path));
+        assert!(client.is_alive());
     }
 
     #[test]

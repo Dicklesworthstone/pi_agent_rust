@@ -59,7 +59,7 @@ pub enum TransportError {
     Closed(String),
     /// Local I/O failure writing to or reading from the server.
     Io(String),
-    /// No request was admitted because bounded transport capacity is in use.
+    /// No work was admitted because bounded transport capacity is in use.
     /// Callers may wait within their original deadline before trying again.
     Backpressure(String),
 }
@@ -151,6 +151,12 @@ type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, Tr
 pub(super) struct PreparedRequest {
     id: u64,
     frame: Option<Vec<u8>>,
+}
+
+/// An all-or-none group of document notifications. Retain the encoded bytes
+/// across capacity waits and make a successful admission impossible to repeat.
+pub(super) struct PreparedNotifications {
+    frames: Option<Vec<Vec<u8>>>,
 }
 
 /// Hook for server→client requests (e.g. `workspace/applyEdit`). Returning
@@ -852,6 +858,15 @@ impl JsonRpcClient {
         self.alive.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(super) fn pause_outbound_for_test(
+        &self,
+        capacity: usize,
+        bytes: usize,
+    ) -> outbound::PausedOutbound<'_> {
+        outbound::PausedOutbound::new(self, capacity, bytes)
+    }
+
     /// Queue a request and return its completion receiver and request id.
     /// Only the dedicated pump writes the blocking pipe. An abandoned request
     /// is skipped if it is still queued; an in-flight write may already have
@@ -960,6 +975,56 @@ impl JsonRpcClient {
         }
         request.frame = None;
         Ok((id, rx))
+    }
+
+    pub(super) fn prepare_notifications(
+        notifications: Vec<(&str, Value)>,
+    ) -> PreparedNotifications {
+        PreparedNotifications {
+            frames: Some(
+                notifications
+                    .into_iter()
+                    .map(|(method, params)| {
+                        encode_frame(&serde_json::json!({
+                            "jsonrpc": "2.0", "method": method, "params": params
+                        }))
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Admit a complete document update without publishing a partial prefix.
+    /// Backpressure and permanent size rejection leave the connection and
+    /// retained batch intact. Other failures retire an indeterminate transport.
+    pub(super) fn try_admit_notifications(
+        &self,
+        batch: &mut PreparedNotifications,
+    ) -> std::result::Result<(), TransportError> {
+        let frames = batch.frames.as_mut().ok_or_else(|| {
+            TransportError::Io("notification batch was already admitted".to_string())
+        })?;
+        let write_result = {
+            let mut writer = lock(&self.writer);
+            writer
+                .write_notification_batch(frames)
+                .and_then(|()| writer.flush())
+        };
+        if let Err(error) = write_result {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(TransportError::Backpressure(format!(
+                    "notification queue failed: {error}"
+                )));
+            }
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                self.kill();
+            }
+            return Err(TransportError::Io(format!(
+                "notification queue failed: {error}"
+            )));
+        }
+        batch.frames = None;
+        Ok(())
     }
 
     /// Queue a notification (no response expected), without blocking on stdin.

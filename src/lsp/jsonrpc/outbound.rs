@@ -242,6 +242,70 @@ impl QueuedWriter {
         self.enqueue(bytes, Some(id)).map(|_| ())
     }
 
+    /// Admit a document transaction in one queue operation. Refusal leaves
+    /// every frame with its caller; acceptance transfers every frame in order.
+    /// Each frame retains its own byte reservation until the pump writes it.
+    pub(super) fn write_notification_batch(&self, frames: &mut Vec<Vec<u8>>) -> io::Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        let bytes = frames.iter().try_fold(0_usize, |total, frame| {
+            total.checked_add(frame.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "notification batch size overflow",
+                )
+            })
+        })?;
+        self.validate_frame_size(bytes)?;
+        let mut state = lock(&self.queue.state);
+        if state.receiver_closed || state.writer_closed {
+            return Err(closed());
+        }
+        // A batch larger than the entire queue can never become admissible.
+        // Distinguish that from temporary pressure before checking occupancy.
+        if frames.len() > state.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "notification batch exceeds the writer frame capacity",
+            ));
+        }
+        if state.frames.len() > state.capacity - frames.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "server writer frame queue full",
+            ));
+        }
+        self.budget
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= self.budget.limit)
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "server writer byte budget exhausted",
+                )
+            })?;
+        // No fallible admission remains. The pump cannot claim a prefix
+        // until the complete transaction is present in the queue.
+        for bytes in frames.drain(..) {
+            let reservation = Reservation {
+                budget: Arc::clone(&self.budget),
+                bytes: bytes.len(),
+            };
+            state.frames.push_back(Frame {
+                bytes,
+                request_id: None,
+                _reservation: Some(reservation),
+            });
+        }
+        drop(state);
+        self.queue.ready.notify_one();
+        Ok(())
+    }
+
     pub(super) fn validate_frame_size(&self, bytes: usize) -> io::Result<()> {
         if bytes > self.budget.limit {
             return Err(io::Error::new(
@@ -350,6 +414,49 @@ impl Write for QueuedWriter {
     }
 }
 
+/// Exercise the real bounded queue with a deliberately paused consumer, while
+/// keeping a connected fixture's original pipe owner alive for restoration.
+#[cfg(test)]
+pub(in crate::lsp) struct PausedOutbound<'a> {
+    client: &'a super::JsonRpcClient,
+    receiver: FrameReceiver,
+    original: Option<QueuedWriter>,
+}
+
+#[cfg(test)]
+impl<'a> PausedOutbound<'a> {
+    pub(super) fn new(client: &'a super::JsonRpcClient, capacity: usize, bytes: usize) -> Self {
+        let (writer, receiver) = QueuedWriter::channel(Arc::clone(&client.alive), capacity, bytes);
+        let original = std::mem::replace(&mut *lock(&client.writer), writer);
+        Self {
+            client,
+            receiver,
+            original: Some(original),
+        }
+    }
+
+    pub(in crate::lsp) fn drain(&self) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = self.receiver.try_recv() {
+            frames.push(
+                super::read_frame(&mut std::io::BufReader::new(frame.bytes.as_slice()))
+                    .expect("complete queued frame")
+                    .expect("queued message"),
+            );
+        }
+        frames
+    }
+}
+
+#[cfg(test)]
+impl Drop for PausedOutbound<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            *lock(&self.client.writer) = original;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +466,117 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::time::Duration;
+
+    #[test]
+    fn notification_batch_refusal_reserves_neither_a_prefix_nor_capacity() {
+        for byte_pressure in [false, true] {
+            let alive = Arc::new(AtomicBool::new(true));
+            let (writer, receiver) = QueuedWriter::channel(
+                alive,
+                if byte_pressure { 3 } else { 2 },
+                if byte_pressure { 12 } else { 64 },
+            );
+            writer.enqueue(b"held", Some(7)).unwrap();
+            let mut frames = vec![b"first".to_vec(), b"second".to_vec()];
+            assert_eq!(
+                writer
+                    .write_notification_batch(&mut frames)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(frames, [b"first".to_vec(), b"second".to_vec()]);
+            assert_eq!(writer.budget.used.load(Ordering::Acquire), 4);
+            let held = receiver.try_recv().unwrap();
+            assert_eq!(held.request_id, Some(7));
+            assert!(receiver.try_recv().is_err(), "no batch prefix was accepted");
+            drop(held);
+
+            writer.write_notification_batch(&mut frames).unwrap();
+            assert!(frames.is_empty());
+            assert_eq!(writer.budget.used.load(Ordering::Acquire), 11);
+            assert_eq!(receiver.try_recv().unwrap().bytes, b"first");
+            assert_eq!(writer.budget.used.load(Ordering::Acquire), 6);
+            assert_eq!(receiver.try_recv().unwrap().bytes, b"second");
+            assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_batches_reject_permanent_limits_without_retiring_pending_work() {
+        for byte_limit in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let client = super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).unwrap();
+            let first = serde_json::json!({
+                "jsonrpc":"2.0", "method":"textDocument/didChange", "params":{}
+            });
+            let second = serde_json::json!({
+                "jsonrpc":"2.0", "method":"textDocument/didSave", "params":{}
+            });
+            let bytes = super::super::encode_frame(&first).len()
+                + super::super::encode_frame(&second).len();
+            let paused = PausedOutbound::new(
+                &client,
+                if byte_limit { 3 } else { 1 },
+                if byte_limit { bytes - 1 } else { 4096 },
+            );
+            let (_, response) = client.request("test/held", serde_json::Value::Null).unwrap();
+            let mut batch = super::super::JsonRpcClient::prepare_notifications(vec![
+                ("textDocument/didChange", serde_json::json!({})),
+                ("textDocument/didSave", serde_json::json!({})),
+            ]);
+            assert!(matches!(
+                client.try_admit_notifications(&mut batch),
+                Err(TransportError::Io(_))
+            ));
+            assert!(client.is_alive());
+            assert_eq!(lock(&client.pending).len(), 1);
+            assert!(matches!(
+                response.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let admitted = paused.drain();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0]["method"], "test/held");
+            assert!(matches!(
+                client.try_admit_notifications(&mut batch),
+                Err(TransportError::Io(_))
+            ));
+            assert!(paused.drain().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_notification_batches_cannot_be_posted_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let client = super::super::JsonRpcClient::spawn("cat", &[], &[], root.path()).unwrap();
+        let paused = PausedOutbound::new(&client, 2, 4096);
+        let mut batch = super::super::JsonRpcClient::prepare_notifications(vec![
+            (
+                "textDocument/didClose",
+                serde_json::json!({"textDocument":{"uri":"file:///source"}}),
+            ),
+            (
+                "textDocument/didOpen",
+                serde_json::json!({"textDocument":{
+                    "uri":"file:///source","languageId":"rust","version":1,"text":"source"
+                }}),
+            ),
+        ]);
+        client.try_admit_notifications(&mut batch).unwrap();
+        let admitted = paused.drain();
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0]["method"], "textDocument/didClose");
+        assert_eq!(admitted[1]["method"], "textDocument/didOpen");
+        assert!(matches!(
+            client.try_admit_notifications(&mut batch),
+            Err(TransportError::Io(reason)) if reason.contains("already admitted")
+        ));
+        assert!(client.is_alive());
+        assert!(paused.drain().is_empty());
+    }
 
     #[test]
     fn reader_retires_all_pending_work_when_a_server_reply_cannot_be_admitted() {

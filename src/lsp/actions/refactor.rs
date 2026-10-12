@@ -403,7 +403,9 @@ impl LspTool {
         }
         let old_path = requested.canonicalize()?;
         let hash = file_hash(&old_path)?;
-        let (old_uri, entry) = self.synced(&old_path).await?;
+        let (old_uri, entry) = self
+            .synced_with_timeout(&old_path, self.request_timeout(input))
+            .await?;
         let snapshot = RefactorSnapshot::capture(&entry, &old_path, hash)?;
         // Use a canonical base without creating parents. Scope validation
         // rejects traversal and symlink components, including dangling targets.
