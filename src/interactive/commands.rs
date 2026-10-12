@@ -4209,7 +4209,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         };
         let path = self.cwd.join(".pi/mcp.json");
         let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
-            value["mcpServers"][&name] = entry_value;
+            crate::mcp::config::insert_project_server(&mut value, &name, entry_value)?;
             crate::mcp::config::write_project_config(&path, &value)
         });
         match result {
@@ -4240,9 +4240,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let name = (*name).to_string();
         let path = self.cwd.join(".pi/mcp.json");
         let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
-            if let Some(servers) = value["mcpServers"].as_object_mut()
-                && servers.remove(&name).is_none()
-            {
+            if !crate::mcp::config::remove_project_server(&mut value, &name) {
                 return Err(crate::error::Error::tool(
                     "mcp",
                     format!("[MCP_UNKNOWN_SERVER] {name:?} is not in {}", path.display()),
@@ -4269,6 +4267,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     /// `/mcp trust|deny|test <name>` — async via the runtime, reporting back
     /// as a system message; newly available tools mount into the live agent.
+    #[allow(clippy::option_if_let_else)]
     fn mcp_handle_action(
         &mut self,
         manager: &std::sync::Arc<crate::mcp::McpManager>,

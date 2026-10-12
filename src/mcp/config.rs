@@ -1063,6 +1063,58 @@ pub fn read_project_config(path: &Path) -> Result<Value, crate::error::Error> {
     }
 }
 
+/// Insert or replace `name` in a project config's `mcpServers` object.
+///
+/// A missing or `null` `mcpServers` member (and a `null` document) starts
+/// empty, as before.
+///
+/// # Errors
+///
+/// Refuses a config whose top level or whose `mcpServers` member is some
+/// other non-object value. Indexing such a [`Value`] by key panics, and
+/// replacing it would discard what the user wrote.
+pub fn insert_project_server(
+    config: &mut Value,
+    name: &str,
+    entry: Value,
+) -> Result<(), crate::error::Error> {
+    let not_an_object = |what: &str| {
+        crate::error::Error::tool(
+            "mcp",
+            format!("[MCP_CONFIG_INVALID] {what} must be a JSON object"),
+        )
+    };
+    if config.is_null() {
+        *config = Value::Object(serde_json::Map::new());
+    }
+    let servers = config
+        .as_object_mut()
+        .ok_or_else(|| not_an_object("the project MCP config"))?
+        .entry("mcpServers")
+        .or_insert(Value::Null);
+    if servers.is_null() {
+        *servers = Value::Object(serde_json::Map::new());
+    }
+    servers
+        .as_object_mut()
+        .ok_or_else(|| not_an_object("`mcpServers`"))?
+        .insert(name.to_string(), entry);
+    Ok(())
+}
+
+/// Remove `name` from a project config's `mcpServers` object.
+///
+/// Returns whether an entry was removed. A config whose top level or whose
+/// `mcpServers` member is not an object has no such server and is left
+/// untouched: it is never indexed, because indexing a non-object [`Value`]
+/// by key panics.
+pub fn remove_project_server(config: &mut Value, name: &str) -> bool {
+    config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(name).is_some())
+}
+
 /// Write the project config back (pretty JSON, parent dirs created).
 ///
 /// # Errors
@@ -1856,6 +1908,52 @@ mod tests {
         assert!(
             !path.exists(),
             "rejected output must not create the config file"
+        );
+    }
+
+    #[test]
+    fn project_server_edits_never_index_a_non_object_config() {
+        use serde_json::json;
+
+        // `/mcp add` and `/mcp remove` used to index these by key, which
+        // panics for every shape below except a bare `null`.
+        for config in [
+            json!([]),
+            json!("text"),
+            json!(7),
+            json!({"mcpServers": []}),
+            json!({"mcpServers": "text"}),
+        ] {
+            let mut removed = config.clone();
+            assert!(!remove_project_server(&mut removed, "docs"), "{config}");
+            assert_eq!(removed, config, "a refused removal must not edit");
+
+            let mut added = config.clone();
+            let error = insert_project_server(&mut added, "docs", json!({"command": "x"}))
+                .expect_err("a non-object config is refused");
+            assert!(error.to_string().contains("MCP_CONFIG_INVALID"), "{error}");
+            assert_eq!(added, config, "a refused insertion must not edit");
+        }
+
+        for config in [json!(null), json!({}), json!({"mcpServers": null})] {
+            let mut removed = config.clone();
+            assert!(!remove_project_server(&mut removed, "docs"), "{config}");
+            assert_eq!(removed, config, "an unknown server must not edit");
+
+            let mut added = config;
+            insert_project_server(&mut added, "docs", json!({"command": "x"}))
+                .expect("an empty config accepts a server");
+            assert_eq!(added, json!({"mcpServers": {"docs": {"command": "x"}}}));
+        }
+
+        let mut config = json!({"mcpServers": {"docs": {"command": "x"}, "db": {}}, "other": 1});
+        insert_project_server(&mut config, "docs", json!({"url": "https://example.test"}))
+            .expect("replace");
+        assert!(remove_project_server(&mut config, "db"));
+        assert!(!remove_project_server(&mut config, "db"));
+        assert_eq!(
+            config,
+            json!({"mcpServers": {"docs": {"url": "https://example.test"}}, "other": 1})
         );
     }
 }
