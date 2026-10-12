@@ -247,7 +247,7 @@ thiserror = "2"
 # Terminal output (rich_rust for beautiful TUI).
 # rich_rust is shared by non-TUI code paths (plain styled stdout/markdown
 # rendering in src/tui.rs and elsewhere), so it stays unconditional.
-rich_rust = { version = "0.2.2", features = ["markdown"] }
+rich_rust = { version = "0.2.3", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
@@ -316,7 +316,12 @@ crossbeam-queue = "0.3"
 # writer fix (GH#404 — pi uses the fts5 feature), the GH#402 checkpoint
 # backfill watermark (super-linear autocommit cost with schema size), and
 # PRAGMA wal_checkpoint cumulative-nBackfill stock parity.
-fsqlite = { version = "0.3.14", default-features = false, features = ["native", "fts5"] }
+# MOVED 0.3.14 (locked 0.3.18) -> 0.4.10 on 2026-10-12: pi's use of the API
+# (Connection, Row, SqliteValue, FrankenError) compiles unchanged. 0.4 is
+# built on asupersync 0.5, the version pi itself uses, so the second copy of
+# asupersync (0.4.11) and its franken-kernel/decision/evidence 0.4.11
+# companions leave the dependency graph.
+fsqlite = { version = "0.4.10", default-features = false, features = ["native", "fts5"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
