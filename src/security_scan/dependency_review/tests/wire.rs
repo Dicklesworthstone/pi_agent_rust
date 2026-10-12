@@ -116,6 +116,26 @@ fn public_comparison_consumes_real_audit_exports_without_requerying_osv() {
     assert_eq!(outage.details.unwrap()["counts"]["unknown"], 1);
     assert_eq!(std::fs::read(dir.path().join("before.sarif")).unwrap(), unchanged);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+
+    // The server is still gone: triage is a report transformation, not a
+    // fresh lookup, and comparison must keep the dispositioned match visible.
+    let review = runtime.block_on(tool.execute("triage", json!({
+        "op":"disposition_dependencies","current":"before.sarif",
+        "expectedSha256":details["baseline"]["sha256"],
+        "fingerprint":details["findings"][0]["fingerprint"],
+        "decision":"false_positive","reason":"Requires separate applicability analysis",
+        "sarifOut":"reviewed.sarif"
+    }), None)).unwrap();
+    assert!(!review.is_error);
+    assert_eq!(review.details.unwrap()["advisoryMatches"], 1);
+    let reviewed = runtime.block_on(tool.execute("compare-triage", json!({
+        "op":"compare_dependencies","baseline":"before.sarif","current":"reviewed.sarif"
+    }), None)).unwrap().details.unwrap();
+    assert_eq!(reviewed["counts"]["persistent"], 1);
+    assert_eq!(reviewed["findings"][0]["currentDecision"], "false_positive");
+    assert_eq!(reviewed["findings"][0]["baselineDecision"], Value::Null);
+    assert_eq!(std::fs::read(dir.path().join("before.sarif")).unwrap(), unchanged);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 5);
 }
 
 #[test]

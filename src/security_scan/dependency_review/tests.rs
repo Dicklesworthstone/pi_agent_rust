@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture(ecosystem: &str, versions: &[(&str, &[&str], bool)]) -> Value {
+pub(super) fn fixture(ecosystem: &str, versions: &[(&str, &[&str], bool)]) -> Value {
     let path = if ecosystem == "npm" { "package-lock.json" } else { "Cargo.lock" };
     let format = if ecosystem == "npm" { "npm" } else { "cargo" };
     let complete = !versions.is_empty() && versions.iter().all(|(_, _, complete)| *complete);

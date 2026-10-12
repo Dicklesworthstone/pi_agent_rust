@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+mod disposition;
 mod snapshot;
+pub(super) use disposition::execute as apply_disposition;
 use snapshot::{Match, Snapshot};
 
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
@@ -120,6 +122,8 @@ fn compare_snapshots(before: &Snapshot, after: &Snapshot, offset: usize, limit: 
         json!({"ecosystem":finding.ecosystem,"name":finding.name,"version":finding.version,
             "advisoryId":finding.advisory_id,"fingerprint":finding.fingerprint,
             "state":state,"reason":reason,"baseline":observation(*old),"current":observation(*new),
+            "baselineDecision":before.reviews.get(&finding.fingerprint).map(|record|record.decision),
+            "currentDecision":after.reviews.get(&finding.fingerprint).map(|record|record.decision),
             "locationsChanged":old.is_some() && new.is_some() && before.locations_changed(after, &finding.key()),
             "advisoryChanged":old.zip(*new).is_some_and(|(a,b)| a.modified != b.modified
                 || a.withdrawn != b.withdrawn || a.metadata_available != b.metadata_available)})

@@ -104,6 +104,8 @@ struct Fingerprints {
 #[derive(Deserialize)]
 struct FindingProperties {
     dependency: Match,
+    #[serde(rename = "piDependencyReview")]
+    review: Option<super::disposition::Record>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +114,8 @@ struct Finding {
     rule_id: String,
     fingerprints: Fingerprints,
     properties: FindingProperties,
+    #[serde(default)]
+    suppressions: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +165,7 @@ pub(super) struct Snapshot {
     pub metadata_complete: bool,
     pub packages: BTreeMap<Key, bool>,
     pub findings: BTreeMap<String, Match>,
+    pub reviews: BTreeMap<String, super::disposition::Record>,
     lockfiles: BTreeMap<String, (String, String)>,
     locations: BTreeMap<Key, BTreeSet<Location>>,
     excluded: Vec<Excluded>,
@@ -257,6 +262,7 @@ impl Snapshot {
             digest, observed_at: props.observed_at, status: props.status,
             query_complete: complete, metadata_complete: props.metadata_complete,
             packages: BTreeMap::new(), findings: BTreeMap::new(),
+            reviews: BTreeMap::new(),
             lockfiles: BTreeMap::new(), locations: BTreeMap::new(), excluded: props.inventory.excluded,
         };
         snapshot.admit_inventory(props.inventory.lockfiles, &props.inventory.packages, &props.query_completion)?;
@@ -277,6 +283,11 @@ impl Snapshot {
                 return Err(error("dependency finding identity or metadata disagrees with its inventory"));
             }
             date(&finding.modified)?;
+            super::disposition::validate_record(result.properties.review.as_ref(), &finding,
+                result.suppressions.as_deref().unwrap_or(&[]), &snapshot.observed_at)?;
+            if let Some(record) = result.properties.review {
+                snapshot.reviews.insert(finding.fingerprint.clone(), record);
+            }
             if snapshot.findings.insert(finding.fingerprint.clone(), finding).is_some() {
                 return Err(error("duplicate dependency finding identity"));
             }
@@ -361,6 +372,7 @@ impl Snapshot {
             "queryComplete":self.query_complete,"metadataComplete":self.metadata_complete,
             "lockfiles":self.lockfiles.len(),"eligiblePackages":self.packages.len(),
             "completedQueries":self.packages.values().filter(|complete| **complete).count(),
-            "advisoryMatches":self.findings.len(),"excludedEntries":self.excluded.len()})
+            "advisoryMatches":self.findings.len(),"excludedEntries":self.excluded.len(),
+            "reviewedFindings":self.reviews.len()})
     }
 }
