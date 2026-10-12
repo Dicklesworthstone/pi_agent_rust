@@ -8,10 +8,13 @@
 //! Successful terminal messages must also preserve every observed block type
 //! and every completed block payload. A terminal is not permission to replace
 //! a tool call after its completed preview has already been displayed.
+//! Tool IDs and names are bound at their first nonempty indexed preview, not
+//! just at the end: arguments may accumulate, but a preview cannot change the
+//! identity of the operation that stream consumers have already observed.
 
 use super::{MAX_BLOCKS, limit, protocol};
 use crate::error::Result;
-use crate::model::{AssistantMessageEvent, ContentBlock};
+use crate::model::{AssistantMessageEvent, ContentBlock, ToolCall};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
@@ -49,15 +52,62 @@ struct State {
     fingerprint: Option<[u8; 32]>,
 }
 
+// Keep identity commitments separate from completed-payload commitments. An
+// unfinished tool may legitimately gain arguments, a signature, or an ID/name
+// that was initially absent. Once a nonblank ID/name is observed, it may not
+// change or disappear. Retain no copies of untrusted identity strings.
+#[derive(Clone, Copy, Default)]
+struct ToolIdentity {
+    id: Option<[u8; 32]>,
+    name: Option<[u8; 32]>,
+}
+
+impl ToolIdentity {
+    fn observe(self, call: &ToolCall) -> Result<Self> {
+        let observed = Self {
+            id: identity_fingerprint(&call.id),
+            name: identity_fingerprint(&call.name),
+        };
+        if self.id.is_some() && self.id != observed.id {
+            return Err(protocol(
+                "tool-call ID changed after its first nonempty preview",
+            ));
+        }
+        if self.name.is_some() && self.name != observed.name {
+            return Err(protocol(
+                "tool name changed after its first nonempty preview",
+            ));
+        }
+        Ok(observed)
+    }
+}
+
+fn identity_fingerprint(value: &str) -> Option<[u8; 32]> {
+    // Whitespace-only identities cannot identify a completed tool call. Do
+    // not normalize nonblank values: whitespace and case remain significant.
+    (!value.trim().is_empty()).then(|| Sha256::digest(value.as_bytes()).into())
+}
+
 pub(super) struct Ledger {
     entries: Vec<Option<State>>,
+    tool_identities: Vec<Option<ToolIdentity>>,
 }
 
 impl Ledger {
     pub(super) const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            tool_identities: Vec::new(),
         }
+    }
+
+    fn observe_tool(&self, index: usize, call: &ToolCall) -> Result<ToolIdentity> {
+        self.tool_identities
+            .get(index)
+            .copied()
+            .flatten()
+            .unwrap_or_default()
+            .observe(call)
     }
 
     #[allow(clippy::too_many_lines)] // one match over the block lifecycle events
@@ -166,6 +216,11 @@ impl Ledger {
                 ));
             }
         }
+        let tool_identity = if let ContentBlock::ToolCall(call) = block {
+            Some(self.observe_tool(index, call)?)
+        } else {
+            None
+        };
         let fingerprint = if phase == Phase::End {
             Some(block_fingerprint(block)?)
         } else {
@@ -173,6 +228,12 @@ impl Ledger {
         };
         if self.entries.len() <= index {
             self.entries.resize(index + 1, None);
+        }
+        if let Some(identity) = tool_identity {
+            if self.tool_identities.len() <= index {
+                self.tool_identities.resize(index + 1, None);
+            }
+            self.tool_identities[index] = Some(identity);
         }
         self.entries[index] = Some(State {
             kind,
@@ -194,6 +255,9 @@ impl Ledger {
                 .ok_or_else(|| protocol("terminal message omitted an observed content block"))?;
             if !state.kind.matches(block) {
                 return Err(protocol("terminal message changed an observed block type"));
+            }
+            if let ContentBlock::ToolCall(call) = block {
+                self.observe_tool(index, call)?;
             }
             if let Some(expected) = state.fingerprint
                 && block_fingerprint(block)? != expected
@@ -664,6 +728,184 @@ mod tests {
                     terminal(reason, vec![ContentBlock::ToolCall(supplied)]),
                 );
             }
+        }
+    }
+
+    fn tool_preview(phase: Phase, tool_call: ToolCall) -> AssistantMessageEvent {
+        let partial = message(vec![ContentBlock::ToolCall(tool_call.clone())]);
+        match phase {
+            Phase::Start => AssistantMessageEvent::ToolCallStart {
+                content_index: 0,
+                partial,
+            },
+            Phase::Delta => AssistantMessageEvent::ToolCallDelta {
+                content_index: 0,
+                delta: "{}".into(),
+                partial,
+            },
+            Phase::End => AssistantMessageEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call,
+                partial,
+            },
+        }
+    }
+
+    #[test]
+    fn open_tool_previews_cannot_change_or_erase_observed_identity() {
+        for first in [Phase::Start, Phase::Delta] {
+            for next in [Phase::Delta, Phase::End] {
+                for field in ["id", "name"] {
+                    for value in ["PRIVATE-CANARY", "", "  "] {
+                        let mut decoder = decoder();
+                        push(&mut decoder, tool_preview(first, call())).unwrap();
+                        let mut changed = call();
+                        if field == "id" {
+                            changed.id = value.into();
+                        } else {
+                            changed.name = value.into();
+                        }
+                        reject(&mut decoder, tool_preview(next, changed));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_terminals_bind_identity_even_without_tool_end_events() {
+        for first in [Phase::Start, Phase::Delta] {
+            for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::PauseTurn] {
+                for field in ["id", "name"] {
+                    let mut decoder = decoder();
+                    push(&mut decoder, tool_preview(first, call())).unwrap();
+                    let mut changed = call();
+                    if field == "id" {
+                        changed.id = "PRIVATE-CANARY".into();
+                    } else {
+                        changed.name = "PRIVATE-CANARY".into();
+                    }
+                    reject(
+                        &mut decoder,
+                        terminal(reason, vec![ContentBlock::ToolCall(changed)]),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_tool_identity_can_arrive_incrementally_while_arguments_grow() {
+        let mut decoder = decoder();
+        let mut supplied = ToolCall {
+            id: String::new(),
+            name: "  ".into(),
+            arguments: json!({}),
+            thought_signature: None,
+        };
+        push(&mut decoder, tool_preview(Phase::Start, supplied.clone())).unwrap();
+        supplied.id = call().id;
+        push(&mut decoder, tool_preview(Phase::Delta, supplied.clone())).unwrap();
+        supplied.name = call().name;
+        supplied.arguments = json!({"path": "output.txt"});
+        push(&mut decoder, tool_preview(Phase::Delta, supplied)).unwrap();
+        push(&mut decoder, tool_preview(Phase::End, call())).unwrap();
+        let output = push(
+            &mut decoder,
+            terminal(StopReason::Stop, vec![ContentBlock::ToolCall(call())]),
+        )
+        .unwrap();
+        assert!(matches!(
+            &output[0],
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn filling_one_identity_field_does_not_allow_replacing_the_other() {
+        for missing_id in [false, true] {
+            let mut decoder = decoder();
+            let mut initial = call();
+            if missing_id {
+                initial.id.clear();
+            } else {
+                initial.name.clear();
+            }
+            push(&mut decoder, tool_preview(Phase::Start, initial)).unwrap();
+            let mut changed = call();
+            if missing_id {
+                changed.name = "PRIVATE-CANARY".into();
+            } else {
+                changed.id = "PRIVATE-CANARY".into();
+            }
+            reject(&mut decoder, tool_preview(Phase::Delta, changed));
+        }
+    }
+
+    #[test]
+    fn tool_identity_tracking_is_bounded_and_only_allocated_for_tools() {
+        let mut ledger = Ledger::new();
+        for content_index in [MAX_BLOCKS, usize::MAX] {
+            assert!(
+                ledger
+                    .admit(&AssistantMessageEvent::ToolCallStart {
+                        content_index,
+                        partial: message(vec![ContentBlock::ToolCall(call())]),
+                    })
+                    .is_err()
+            );
+            assert!(ledger.entries.is_empty());
+            assert!(ledger.tool_identities.is_empty());
+        }
+        ledger.admit(&block_event(Kind::Text, Phase::Start)).unwrap();
+        assert!(ledger.tool_identities.is_empty());
+        let mut content = vec![text(""); MAX_BLOCKS];
+        content[MAX_BLOCKS - 1] = ContentBlock::ToolCall(call());
+        ledger
+            .admit(&AssistantMessageEvent::ToolCallStart {
+                content_index: MAX_BLOCKS - 1,
+                partial: message(content),
+            })
+            .unwrap();
+        assert_eq!(ledger.tool_identities.len(), MAX_BLOCKS);
+        assert!(
+            ledger.tool_identities[..MAX_BLOCKS - 1]
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(std::mem::size_of::<ToolIdentity>() <= 72);
+    }
+
+    #[test]
+    fn identity_matching_preserves_exact_spelling_and_cancellation() {
+        for (id, name) in [
+            ("CALL-1", "write"),
+            ("call-1", "Write"),
+            ("call-1 ", "write"),
+        ] {
+            let mut decoder = decoder();
+            push(&mut decoder, tool_preview(Phase::Start, call())).unwrap();
+            reject(
+                &mut decoder,
+                tool_preview(
+                    Phase::Delta,
+                    ToolCall {
+                        id: id.into(),
+                        name: name.into(),
+                        ..call()
+                    },
+                ),
+            );
+        }
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            let mut decoder = decoder();
+            push(&mut decoder, tool_preview(Phase::Start, call())).unwrap();
+            let output = push(&mut decoder, terminal(reason, vec![])).unwrap();
+            assert!(matches!(&output[0], StreamEvent::Error { .. }));
+            assert!(decoder.finished());
         }
     }
 
