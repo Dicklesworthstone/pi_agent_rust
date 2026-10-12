@@ -1,8 +1,8 @@
 //! Frame-local DOM lookup and verified page-viewport input coordinates.
 //!
-//! The CDP connection stays attached to the page target. Same-process frame
-//! nodes are resolved in their isolated world; input still uses native page
-//! events. Never reuse frame-local getBoundingClientRect coordinates for them.
+//! Nodes are resolved in their isolated world; input uses native page events.
+//! Remote renderer candidates are projected through every embedding boundary.
+//! Never reuse frame-local getBoundingClientRect coordinates for page input.
 
 use super::{Cdp, document, element_call};
 use crate::agent_cx::AgentCx;
@@ -305,7 +305,7 @@ async fn contains_hit(owner: &AgentCx, cdp: &mut Cdp, target: u64, hit: u64) -> 
 /// Select a page-viewport point and verify Chromium's hit test there belongs
 /// to this frame and this element (or its composed descendant). Ancestor
 /// overlays, sibling frames and browser coordinate inconsistencies fail closed.
-pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Result<(i32, i32)> {
+pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Result<(f64, f64)> {
     let doc = document(owner, cdp).await?;
     // Retain native element visibility, enabled/inert and local occlusion checks.
     element_call(owner, cdp, id, "point", json!({})).await?;
@@ -356,7 +356,7 @@ pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Resu
             if document(owner, cdp).await? != doc {
                 return Err(error("selected frame navigated before input dispatch"));
             }
-            return Ok((x, y));
+            return crate::browser::frames::project_pointer(owner, cdp, &doc.frame, x, y).await;
         }
     }
     Err(error(
@@ -443,9 +443,18 @@ mod tests {
 
     #[test]
     fn hit_tests_preserve_signed_and_fractional_scroll_offsets() {
-        assert_eq!(hit_test_point(&json!({"pageX": -400, "pageY": 20}), 100, 50).unwrap(), (-300, 70));
-        assert_eq!(hit_test_point(&json!({"pageX": 0.75, "pageY": 1.25}), 100, 50).unwrap(), (101, 51));
-        assert_eq!(hit_test_point(&json!({"pageX": 0, "pageY": 0}), 100, 50).unwrap(), (100, 50));
+        assert_eq!(
+            hit_test_point(&json!({"pageX": -400, "pageY": 20}), 100, 50).unwrap(),
+            (-300, 70),
+        );
+        assert_eq!(
+            hit_test_point(&json!({"pageX": 0.75, "pageY": 1.25}), 100, 50).unwrap(),
+            (101, 51),
+        );
+        assert_eq!(
+            hit_test_point(&json!({"pageX": 0, "pageY": 0}), 100, 50).unwrap(),
+            (100, 50),
+        );
     }
 
     #[test]

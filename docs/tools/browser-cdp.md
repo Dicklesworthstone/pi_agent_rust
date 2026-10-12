@@ -161,24 +161,23 @@ Use an actual returned frame ID in place of `FRAME_ID` below:
 {"action":"snapshot","tab":"work","frame":"FRAME_ID"}
 {"action":"fill","tab":"work","frame":"FRAME_ID","selector":"#email","text":"person@example.com"}
 {"action":"press","tab":"work","frame":"FRAME_ID","selector":"#email","key":"End"}
+{"action":"click","tab":"work","frame":"FRAME_ID","selector":"@e12"}
+{"action":"scroll","tab":"work","frame":"FRAME_ID","selector":".results","delta_y":400}
 {"action":"wait_for","tab":"work","frame":"FRAME_ID","selector":".result","timeout_ms":10000}
 {"action":"evaluate","tab":"work","frame":"FRAME_ID","script":"({title: document.title, count: document.forms.length})"}
 ```
 
 An explicit `tab` is required whenever `frame` is supplied. The frame option is
 per-call: it is never a persistent switch that could silently redirect a later
-operation. Same-process frames support `snapshot`, `ax_tree`, `evaluate`,
-`click`, `type`, `fill`, `press`, `scroll` and `wait_for`. Nested out-of-process
-frames support `snapshot`, `ax_tree`, `evaluate`, `type`, `fill`, `press` and
-`wait_for`. Their `click` and `scroll` actions currently fail explicitly: remote
-renderer coordinates must not be dispatched as if they were page coordinates.
+operation. Both same-process and nested out-of-process frames support `snapshot`,
+`ax_tree`, `evaluate`, `click`, `type`, `fill`, `press`, `scroll` and `wait_for`.
 Scoped keypress and wheel actions require an explicit selector instead of using
-ambient focus or the main viewport. Keyboard/text actions bring the selected page
-to the front, focus the requested control in its renderer and check focus before
-native input dispatch to the page.
+ambient focus or the main viewport. Native input actions bring the selected page
+to the front. Keyboard/text actions focus the requested control in its renderer
+and check focus before native input dispatch to the page.
 
 CSS lookup runs in the selected frame's isolated world. Runtime, DOM and
-accessibility commands use that frame's owning renderer session; keyboard input
+accessibility commands use that frame's owning renderer session; native input
 uses the page session. Responses must match both the request ID and renderer
 session. Snapshot references must be used with the same tab and frame; inspecting
 the parent or another frame does not overwrite them. The registry retains at most
@@ -189,12 +188,26 @@ rebinding to replacement nodes. Snapshot details include `frame_id` and
 For same-process clicks and wheel input, Pi obtains Chromium's content quads in
 page-viewport coordinates, clips them to the viewport, and verifies the actual
 hit-test node belongs to the selected frame and target element or its composed
-descendants. An overlay in an ancestor document therefore blocks the operation
-even when the frame's own local hit test sees an unobstructed element. Frame-local
-DOM rectangle coordinates are never blindly reused as page coordinates. Geometry
-and candidate counts are bounded, and no mouse event is dispatched when checks
-fail. This native page-coordinate projection is not yet implemented across remote
-renderer boundaries.
+descendants. The DOM hit-test lookup includes the renderer's document scroll
+offset; the native mouse/wheel coordinates remain in the viewport.
+
+For an out-of-process frame, the same leaf check produces a renderer-local
+candidate. Pi projects that candidate through each embedding iframe's **content
+quad**, using the child's full viewport dimensions, including scrollbar space.
+Border boxes, padding offsets, and client-width-only scaling are not substituted
+for this mapping. A projective transform handles nondegenerate convex quads,
+including CSS scaling, rotation, reflection and perspective. Each parent renderer
+must then hit the exact embedding iframe in its expected parent document at the
+projected point. Fractional projections check the enclosing integer hit-test grid
+and retain fractional coordinates for actual native input.
+
+An overlay in an ancestor document therefore blocks the operation even when the
+frame's own local hit test sees an unobstructed element. Frame-local DOM rectangle
+coordinates are never blindly reused as page coordinates. Geometry, frame and
+candidate counts are bounded; malformed, degenerate, folded, occluded or
+out-of-viewport projections fail without pointer dispatch. A pinch-zoomed or
+visually offset viewport is explicitly unsupported for cross-process pointer
+input, rather than approximated. Failure never falls back to JavaScript clicks.
 
 Each scoped operation pins the selected frame and its ancestors' IDs, loader IDs,
 URLs and renderer sessions before entering an isolated world. Related renderer
@@ -334,7 +347,38 @@ Mock mode requires `with_mock(true)` or `PI_BROWSER_MOCK=1`;
 full-page capture and PDF operations deliberately reject mock mode rather than
 inventing successful process, input or transfer results.
 
-### Cross-process frame increment validation status
+### Cross-process pointer increment validation status
+
+This increment adds twelve Rust test functions: three scrolled hit-test
+regressions, six geometry/viewport unit tests, two additional public-tool
+HTTP/WebSocket protocol tests, and the explicitly ignored real-Chromium scenario
+in `tests/browser_remote_pointer.rs`. The earlier pointer-refusal fixture is now
+a positive projection test: it requires two renderer boundaries, distinct border
+and content quads, scrolled leaf/parent documents and the actual page-input route.
+Negative controls cover ancestor occlusion, malformed geometry, navigation during
+projection, zoomed viewports and a partial-pixel overlay. The live Rust scenario
+requires a genuinely out-of-process sandboxed srcdoc frame, stable element
+references, trusted click/wheel events, CSS transforms, scroll offsets and
+ancestor-overlay refusal; it never treats missing Chromium as a passing test.
+
+The Rust tests were authored but **not executed** here. The required
+`dsr quality --tool pi_agent_rust` command returned `dsr: command not found`
+(exit 127); Rust compilation, rustfmt, Clippy and DSR remain unverified.
+
+A separate CPython CDP probe against Chromium 144.0.7559.96 exercised an offline
+sandboxed srcdoc frame in a separate renderer. It observed six trusted native
+clicks and five trusted wheel events across untransformed, scaled, rotated,
+perspective-transformed and independently scrolled parent/child cases. A parent
+overlay was detected even though the child's own hit test still found the button.
+It also reproduced the scrolled-hit-test defect: with child scrollY=800, the
+viewport point (105,120) found no DOM node, while document point (105,920) found
+the intended button. This validates the protocol/geometry assumptions, **not**
+the compiled Rust implementation or multi-remote-renderer execution. The standalone
+root-container probe used `--no-sandbox` and `--site-per-process`; production
+launch flags were not changed. No release, quality-gate or Bead-closure claim is
+made from that probe.
+
+### Earlier cross-process frame increment validation status
 
 The cross-process increment adds 18 regression test functions across frame
 discovery, session/ancestry admission, response correlation and a real loopback
@@ -345,9 +389,10 @@ wrong-session conditions. It validates the Rust adapter's intended transport
 behavior, not Chromium's renderer, hit testing or actual native input.
 
 These tests were authored but **not executed** in the implementation environment.
-`dsr quality --tool pi_agent_rust` remains unavailable (exit 127). No Rust compile,
+`dsr quality --tool pi_agent_rust` was unavailable (exit 127). No Rust compile,
 formatting, Clippy, test pass, live cross-process Chromium run or DSR gate result
-is claimed. Cross-process native pointer projection is still incomplete.
+was claimed for that earlier increment. Pointer projection was implemented in
+the subsequent increment above.
 
 ### Earlier same-process frame increment validation status
 

@@ -325,7 +325,7 @@ pub(super) async fn execute(
 ) -> Result<ToolOutput> {
     let action = required(args, "action")?;
     let scoped = cdp.frame_selected();
-    if scoped && matches!(action, "press" | "type" | "fill") {
+    if scoped && matches!(action, "press" | "type" | "fill" | "click" | "scroll") {
         cdp.command(owner, "Page.bringToFront", json!({})).await?;
     }
     if action == "press" {
@@ -425,8 +425,7 @@ pub(super) async fn execute(
     match action {
         "click" => {
             let (x, y) = if scoped {
-                let (x, y) = frame_input::click_point(owner, cdp, id).await?;
-                (f64::from(x), f64::from(y))
+                frame_input::click_point(owner, cdp, id).await?
             } else {
                 let point = element_call(owner, cdp, id, "point", json!({})).await?;
                 let x = point["x"]

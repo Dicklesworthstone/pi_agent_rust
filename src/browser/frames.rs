@@ -13,6 +13,8 @@ use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+mod pointer;
+pub(super) use pointer::project as project_pointer;
 mod targets;
 pub(super) use targets::Targets;
 #[cfg(test)]
@@ -262,26 +264,25 @@ impl Scope {
             .is_some_and(|(root, selected)| root.session != selected.session)
     }
 
-    /// Pointer geometry from a remote renderer is not a page-viewport point.
-    /// Do not dispatch a plausible but misplaced native click or wheel event.
-    /// Inspection, evaluation and focused keyboard input need no conversion.
+    /// Pointer actions use project_pointer before dispatch. File transfer,
+    /// navigation, exports and dialogs still have no frame-scoped contract.
     pub(super) fn admit_action(&self, action: &str) -> Result<()> {
-        if self.is_remote() && matches!(action, "click" | "scroll") {
-            return Err(error(
-                "cross-process frame pointer input requires page-coordinate projection; click and scroll are not supported for this frame",
-            ));
+        if self.is_remote()
+            && !matches!(
+                action,
+                "snapshot" | "ax_tree" | "evaluate" | "wait_for"
+                    | "click" | "scroll" | "fill" | "type" | "press"
+            )
+        {
+            return Err(error("action is not supported in a cross-process frame"));
         }
         Ok(())
     }
 
     pub(super) fn command_session(&self, method: &str) -> Result<&str> {
-        if self.is_remote() && method == "Input.dispatchMouseEvent" {
-            return Err(error(
-                "cross-process frame pointer coordinates are not admitted",
-            ));
-        }
-        // Input belongs to the focused page, not the renderer's default
-        // widget. The caller verifies focus in the selected isolated world.
+        // Native input belongs to the page. Pointer callers first project
+        // their renderer-local candidate and verify every embedding boundary;
+        // keyboard callers verify focus in the selected isolated world.
         if method.starts_with("Input.") || method == "Page.bringToFront" {
             self.ancestry
                 .first()
@@ -512,14 +513,17 @@ mod tests {
         ] {
             assert_eq!(scope.command_session(method).unwrap(), "nested-session");
         }
-        for method in ["Input.insertText", "Input.dispatchKeyEvent", "Page.bringToFront"] {
+        for method in [
+            "Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Page.bringToFront",
+        ] {
             assert_eq!(scope.command_session(method).unwrap(), "page");
         }
-        assert!(scope.command_session("Input.dispatchMouseEvent").is_err());
-        for action in ["snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press"] {
+        for action in [
+            "snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press", "click", "scroll",
+        ] {
             assert!(scope.admit_action(action).is_ok());
         }
-        for action in ["click", "scroll"] {
+        for action in ["upload", "download", "goto", "handle_dialog"] {
             assert!(scope.admit_action(action).is_err());
         }
         let local = Scope::pin(&tree, "child", &targets).unwrap();
