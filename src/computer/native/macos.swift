@@ -5,6 +5,7 @@ import Foundation
 #if os(macOS)
 import AppKit
 import CoreGraphics
+import ApplicationServices
 import ScreenCaptureKit
 #endif
 
@@ -132,6 +133,255 @@ func windowList() throws -> [[String: Any]] {
     }
 }
 
+func requireAccessibility() throws {
+    guard AXIsProcessTrusted() else { throw DesktopFailure("accessibility_permission") }
+    guard AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.15) == .success else {
+        throw DesktopFailure("accessibility_failed")
+    }
+}
+
+func attribute(_ element: AXUIElement, _ name: String) throws -> CFTypeRef? {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+    switch status {
+    case .success: return value
+    case .attributeUnsupported, .noValue: return nil
+    default: throw DesktopFailure("accessibility_failed")
+    }
+}
+
+func elementAttribute(_ element: AXUIElement, _ name: String) throws -> AXUIElement {
+    guard let value = try attribute(element, name), CFGetTypeID(value) == AXUIElementGetTypeID() else {
+        throw DesktopFailure("accessibility_failed")
+    }
+    return value as! AXUIElement // Type checked above; no private AX API.
+}
+
+func accessibilityBounds(_ element: AXUIElement) throws -> CGRect? {
+    guard let position = try attribute(element, kAXPositionAttribute),
+          let size = try attribute(element, kAXSizeAttribute),
+          CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else {
+        return nil
+    }
+    var origin = CGPoint.zero
+    var extent = CGSize.zero
+    let p = position as! AXValue
+    let s = size as! AXValue
+    guard AXValueGetType(p) == .cgPoint, AXValueGetType(s) == .cgSize,
+          AXValueGetValue(p, .cgPoint, &origin), AXValueGetValue(s, .cgSize, &extent) else { return nil }
+    return CGRect(origin: origin, size: extent)
+}
+
+func children(_ element: AXUIElement, _ name: String, maximum: Int) throws -> ([AXUIElement], Bool) {
+    var count = 0
+    let status = AXUIElementGetAttributeValueCount(element, name as CFString, &count)
+    if status == .attributeUnsupported || status == .noValue { return ([], false) }
+    guard status == .success, count >= 0 else { throw DesktopFailure("accessibility_failed") }
+    let admitted = min(count, maximum)
+    if admitted == 0 { return ([], count > 0) }
+    var values: CFArray?
+    guard AXUIElementCopyAttributeValues(element, name as CFString, 0, admitted, &values) == .success,
+          let array = values as? [AnyObject], array.count <= admitted else {
+        throw DesktopFailure("accessibility_failed")
+    }
+    let elements = try array.map { value -> AXUIElement in
+        guard CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            throw DesktopFailure("accessibility_failed")
+        }
+        return value as! AXUIElement
+    }
+    return (elements, count > elements.count)
+}
+
+func focusedWindow() throws -> (pid_t, AXUIElement) {
+    guard let application = NSWorkspace.shared.frontmostApplication else {
+        throw DesktopFailure("window_unavailable")
+    }
+    let root = AXUIElementCreateApplication(application.processIdentifier)
+    return (application.processIdentifier, try elementAttribute(root, kAXFocusedWindowAttribute))
+}
+
+func sameBounds(_ a: CGRect, _ b: CGRect) -> Bool {
+    abs(a.origin.x - b.origin.x) <= 0.5 && abs(a.origin.y - b.origin.y) <= 0.5
+        && abs(a.width - b.width) <= 0.5 && abs(a.height - b.height) <= 0.5
+}
+
+func resolveWindow(_ id: UInt32) throws -> (pid_t, AXUIElement) {
+    try requireScreenAccess()
+    guard let raw = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]],
+          raw.count == 1, let record = raw.first,
+          (record[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id,
+          let pid = (record[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid > 0,
+          let title = record[kCGWindowName as String] as? String else {
+        throw DesktopFailure("window_unavailable")
+    }
+    let bounds = try windowBounds(record)
+    let root = AXUIElementCreateApplication(pid)
+    let (windows, incomplete) = try children(root, kAXWindowsAttribute, maximum: 256)
+    guard !incomplete else { throw DesktopFailure("ambiguous_window") }
+    var matches: [AXUIElement] = []
+    for window in windows {
+        guard let candidate = try accessibilityBounds(window), sameBounds(bounds, candidate),
+              (try attribute(window, kAXTitleAttribute) as? String ?? "") == title else { continue }
+        matches.append(window)
+    }
+    // No public CGWindowID -> AXUIElement conversion exists. Correlate PID,
+    // exact unsanitized title and geometry; never guess or use a private API.
+    guard matches.count == 1 else { throw DesktopFailure("ambiguous_window") }
+    return (pid, matches[0])
+}
+
+func focusWindow(_ request: Request) throws -> Never {
+    try requireAccessibility()
+    guard let id = request.window_id else { throw DesktopFailure("invalid_request") }
+    let (pid, window) = try resolveWindow(id)
+    guard let application = NSRunningApplication(processIdentifier: pid),
+          application.activate(options: []),
+          AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success else {
+        throw DesktopFailure("focus_unconfirmed")
+    }
+    let until = ProcessInfo.processInfo.systemUptime + 2
+    while ProcessInfo.processInfo.systemUptime < until {
+        if let (actualPID, actualWindow) = try? focusedWindow(), actualPID == pid, CFEqual(actualWindow, window) {
+            let (confirmedPID, confirmedWindow) = try resolveWindow(id)
+            guard confirmedPID == pid, CFEqual(confirmedWindow, window) else {
+                throw DesktopFailure("focus_unconfirmed")
+            }
+            succeed(request, ["window_id": id, "pid": pid, "focused": true])
+        }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+    throw DesktopFailure("focus_unconfirmed")
+}
+
+struct TreeReader {
+    var remaining = 256
+    var textBytes = 64 * 1024
+    var truncated = false
+    var visited: [AXUIElement] = []
+    let deadline = ProcessInfo.processInfo.systemUptime + 8
+
+    mutating func label(_ value: String) -> String {
+        let cap = min(512, textBytes / 4)
+        let limited = boundedLabel(value, limit: cap)
+        if value.unicodeScalars.prefix(cap + 1).count > cap { truncated = true }
+        textBytes -= limited.utf8.count
+        return limited
+    }
+
+    mutating func read(_ element: AXUIElement, depth: Int = 0) throws -> [String: Any]? {
+        guard remaining > 0, depth <= 12, ProcessInfo.processInfo.systemUptime < deadline,
+              !visited.contains(where: { CFEqual($0, element) }) else {
+            truncated = true
+            return nil
+        }
+        remaining -= 1
+        visited.append(element)
+        guard let role = try attribute(element, kAXRoleAttribute) as? String else {
+            throw DesktopFailure("accessibility_failed")
+        }
+        let subrole = try attribute(element, kAXSubroleAttribute) as? String ?? ""
+        var node: [String: Any] = ["role": label(role)]
+        if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
+            // Do not even query names or children of secure fields. Value/Text
+            // interfaces are never queried for any node, secure or otherwise.
+            node["value_redacted"] = true
+            node["children"] = [[String: Any]]()
+            return node
+        }
+        if let title = try attribute(element, kAXTitleAttribute) as? String { node["title"] = label(title) }
+        if let enabled = try attribute(element, kAXEnabledAttribute) as? Bool { node["enabled"] = enabled }
+        if let focused = try attribute(element, kAXFocusedAttribute) as? Bool { node["focused"] = focused }
+        if let bounds = try accessibilityBounds(element), bounds.width > 0, bounds.height > 0 {
+            node["bounds"] = try geometry(bounds)
+        }
+        let (items, omitted) = try children(element, kAXChildrenAttribute, maximum: min(128, remaining))
+        truncated = truncated || omitted
+        var nodes: [[String: Any]] = []
+        for item in items {
+            if let child = try read(item, depth: depth + 1) { nodes.append(child) }
+        }
+        node["children"] = nodes
+        return node
+    }
+}
+
+func accessibilityTree(_ request: Request) throws -> Never {
+    try requireAccessibility()
+    let target: (pid_t, AXUIElement)
+    if let id = request.window_id { target = try resolveWindow(id) }
+    else { target = try focusedWindow() }
+    var reader = TreeReader()
+    guard let tree = try reader.read(target.1) else { throw DesktopFailure("accessibility_failed") }
+    var data: [String: Any] = ["pid": target.0, "tree": tree, "truncated": reader.truncated,
+                               "node_count": 256 - reader.remaining,
+                               "scope": "requested_or_focused_window"]
+    if let id = request.window_id { data["window_id"] = id }
+    succeed(request, data)
+}
+
+func requireFocusedTarget(_ request: Request) throws {
+    if let id = request.window_id {
+        let (pid, window) = try resolveWindow(id)
+        let (actualPID, actualWindow) = try focusedWindow()
+        guard pid == actualPID, CFEqual(window, actualWindow) else {
+            throw DesktopFailure("target_not_focused")
+        }
+    }
+}
+
+func movePointer(_ request: Request) throws -> Never {
+    try requireAccessibility()
+    guard let x = request.x, let y = request.y else { throw DesktopFailure("invalid_request") }
+    let point = CGPoint(x: Int(x), y: Int(y))
+    let visible = try displayList().contains { display in
+        guard let left = display["x"] as? Double, let top = display["y"] as? Double,
+              let width = display["width"] as? Double, let height = display["height"] as? Double else { return false }
+        return CGRect(x: left, y: top, width: width, height: height).contains(point)
+    }
+    guard visible else { throw DesktopFailure("pointer_outside_displays") }
+    try requireFocusedTarget(request)
+    guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                              mouseCursorPosition: point, mouseButton: .left) else {
+        throw DesktopFailure("input_failed")
+    }
+    event.post(tap: .cghidEventTap)
+    let until = ProcessInfo.processInfo.systemUptime + 0.5
+    while ProcessInfo.processInfo.systemUptime < until {
+        if let actual = CGEvent(source: nil)?.location,
+           abs(actual.x - point.x) <= 0.5, abs(actual.y - point.y) <= 0.5 {
+            succeed(request, ["position": ["x": Double(actual.x), "y": Double(actual.y)],
+                              "dispatched": true])
+        }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    throw DesktopFailure("pointer_unconfirmed")
+}
+
+func scroll(_ request: Request) throws -> Never {
+    try requireAccessibility()
+    let amount = request.amount ?? 3
+    guard (1...100).contains(amount) else { throw DesktopFailure("invalid_request") }
+    let direction = request.direction ?? "down"
+    let vertical: Int32
+    let horizontal: Int32
+    switch direction {
+    case "up": (vertical, horizontal) = (amount, 0)
+    case "down": (vertical, horizontal) = (-amount, 0)
+    case "left": (vertical, horizontal) = (0, amount)
+    case "right": (vertical, horizontal) = (0, -amount)
+    default: throw DesktopFailure("invalid_request")
+    }
+    try requireFocusedTarget(request)
+    guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2,
+                              wheel1: vertical, wheel2: horizontal, wheel3: 0) else {
+        throw DesktopFailure("input_failed")
+    }
+    event.post(tap: .cghidEventTap)
+    succeed(request, ["dispatched": true, "direction": direction, "amount": amount,
+                      "application_effect": "not_verified"])
+}
+
 @available(macOS 14.0, *)
 func screenshot(_ request: Request) throws {
     try requireScreenAccess()
@@ -199,6 +449,14 @@ func perform(_ request: Request) throws {
                           "order": "front_to_back"])
     case "screenshot":
         try screenshot(request)
+    case "ax_tree":
+        try accessibilityTree(request)
+    case "focus_window":
+        try focusWindow(request)
+    case "mouse_move":
+        try movePointer(request)
+    case "scroll":
+        try scroll(request)
     case "clipboard_read":
         let board = NSPasteboard.general
         let generation = board.changeCount

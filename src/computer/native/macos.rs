@@ -20,6 +20,10 @@ const ACTIONS: &[&str] = &[
     "screenshot",
     "clipboard_read",
     "clipboard_write",
+    "ax_tree",
+    "focus_window",
+    "mouse_move",
+    "scroll",
 ];
 
 #[derive(Deserialize)]
@@ -38,6 +42,14 @@ fn protocol() -> crate::error::Error {
 fn failure(code: &str) -> crate::error::Error {
     error(match code {
         "screen_permission" => "macOS Screen Recording permission is required; grant it to the hosting terminal/application in System Settings and restart the host",
+        "accessibility_permission" => "macOS Accessibility permission is required; grant it to the hosting terminal/application in System Settings and restart the host",
+        "accessibility_failed" => "the macOS application did not provide the requested accessibility data",
+        "ambiguous_window" => "the macOS window could not be uniquely matched by PID, title and geometry; refresh the window list instead of guessing",
+        "focus_unconfirmed" => "macOS window activation did not confirm the requested focus; focus may already have changed",
+        "target_not_focused" => "the requested macOS window is not focused; use focus_window explicitly before input",
+        "pointer_outside_displays" => "the requested point is outside the active macOS displays",
+        "pointer_unconfirmed" => "the macOS pointer did not reach the requested position; effects may already have occurred",
+        "input_failed" => "macOS could not create the requested input event",
         "os_version" => "the macOS computer backend requires macOS 14 or newer and Xcode Command Line Tools with a compatible macOS SDK",
         "display_unavailable" => "the requested macOS display is unavailable; list displays again",
         "window_unavailable" => "the requested macOS window is unavailable; list windows again",
@@ -157,6 +169,8 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
     match action {
         "list_displays" => catalog(data, true),
         "list_windows" => catalog(data, false),
+        "ax_tree" => accessibility_result(args, data),
+        "focus_window" | "mouse_move" | "scroll" => targeting_result(action, args, data),
         "clipboard_read" => {
             fields(data, &["text", "char_count"])?;
             let text = data["text"].as_str().ok_or_else(protocol)?;
@@ -175,6 +189,106 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         }
         _ => Err(failure("unsupported_action")),
     }
+}
+
+fn targeting_result(action: &str, args: &Value, data: &Value) -> Result<()> {
+    match action {
+        "focus_window" => {
+            fields(data, &["focused", "window_id", "pid"])?;
+            positive_id(&data["window_id"])?;
+            positive_id(&data["pid"])?;
+            if data["focused"] != true || data.get("window_id") != args.get("window_id") {
+                return Err(protocol());
+            }
+        }
+        "mouse_move" => {
+            fields(data, &["dispatched", "position"])?;
+            fields(&data["position"], &["x", "y"])?;
+            if data["dispatched"] != true {
+                return Err(protocol());
+            }
+            for axis in ["x", "y"] {
+                let actual = data["position"][axis].as_f64().ok_or_else(protocol)?;
+                let expected = args[axis].as_f64().ok_or_else(protocol)?;
+                if !actual.is_finite() || !expected.is_finite() || (actual - expected).abs() > 0.5 {
+                    return Err(protocol());
+                }
+            }
+        }
+        "scroll" => {
+            fields(data, &["dispatched", "direction", "amount", "application_effect"])?;
+            if data["dispatched"] != true
+                || data["direction"].as_str() != Some(args["direction"].as_str().unwrap_or("down"))
+                || data["amount"].as_u64() != Some(args["amount"].as_u64().unwrap_or(3))
+                || data["application_effect"] != "not_verified"
+            {
+                return Err(protocol());
+            }
+        }
+        _ => return Err(failure("unsupported_action")),
+    }
+    Ok(())
+}
+
+// Independently validate the helper's tree before exposing application data.
+// There is no Value/Text interface in this protocol. A redacted field may not
+// smuggle a title, geometry or descendants alongside its redaction marker.
+fn admit_tree(node: &Value, depth: usize, nodes: &mut usize, text_bytes: &mut usize) -> Result<()> {
+    if depth > 12 || *nodes >= 256 {
+        return Err(protocol());
+    }
+    *nodes += 1;
+    fields(node, &["role", "title", "enabled", "focused", "bounds", "children", "value_redacted"])?;
+    label(&node["role"])?;
+    let children = node["children"].as_array().ok_or_else(protocol)?;
+    if children.len() > 128 {
+        return Err(protocol());
+    }
+    if node.get("value_redacted").is_some() || node["role"] == "AXSecureTextField" {
+        fields(node, &["role", "value_redacted", "children"])?;
+        if node["value_redacted"] != true || !children.is_empty() {
+            return Err(protocol());
+        }
+    }
+    for field in ["role", "title"] {
+        if let Some(value) = node.get(field) {
+            label(value)?;
+            *text_bytes = (*text_bytes).checked_add(value.as_str().ok_or_else(protocol)?.len())
+                .filter(|bytes| *bytes <= 64 * 1024).ok_or_else(protocol)?;
+        }
+    }
+    for field in ["enabled", "focused"] {
+        if node.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(protocol());
+        }
+    }
+    if let Some(bounds) = node.get("bounds") {
+        fields(bounds, &["x", "y", "width", "height"])?;
+        geometry(bounds)?;
+    }
+    for child in children {
+        admit_tree(child, depth + 1, nodes, text_bytes)?;
+    }
+    Ok(())
+}
+
+fn accessibility_result(args: &Value, data: &Value) -> Result<()> {
+    fields(data, &["pid", "window_id", "tree", "truncated", "node_count", "scope"])?;
+    positive_id(&data["pid"])?;
+    if data.get("window_id") != args.get("window_id") || !data["truncated"].is_boolean()
+        || data["scope"] != "requested_or_focused_window"
+    {
+        return Err(protocol());
+    }
+    if let Some(id) = data.get("window_id") {
+        positive_id(id)?;
+    }
+    let mut nodes = 0;
+    admit_tree(&data["tree"], 0, &mut nodes, &mut 0)?;
+    if data["node_count"].as_u64() != Some(nodes as u64) {
+        return Err(protocol());
+    }
+    Ok(())
 }
 
 pub(super) async fn execute(
@@ -389,6 +503,90 @@ mod tests {
         });
         assert!(failure.to_string().contains("desktop helper swift failed"));
         assert!(!dir.path().join("capture.png").exists());
+    }
+
+    #[test]
+    fn focus_pointer_and_scroll_confirmations_bind_the_requested_operation() {
+        let focus = json!({"focused":true,"window_id":73,"pid":123});
+        let args = json!({"window_id":73});
+        assert!(admit_result("focus_window", &args, &focus).is_ok());
+        assert!(admit_result("focus_window", &json!({"window_id":74}), &focus).is_err());
+        let point = json!({"dispatched":true,"position":{"x":-12.0,"y":300.25}});
+        assert!(admit_result("mouse_move", &json!({"x":-12,"y":300}), &point).is_ok());
+        assert!(admit_result("mouse_move", &json!({"x":12,"y":300}), &point).is_err());
+        let scroll = json!({"dispatched":true,"direction":"down","amount":3,"application_effect":"not_verified"});
+        assert!(admit_result("scroll", &json!({}), &scroll).is_ok());
+        assert!(admit_result("scroll", &json!({"direction":"up"}), &scroll).is_err());
+        assert!(admit_result("scroll", &json!({"amount":4}), &scroll).is_err());
+        let mut unverified = focus;
+        unverified["focused"] = json!(false);
+        assert!(admit_result("focus_window", &args, &unverified).is_err());
+    }
+
+    fn tree_result(tree: Value, count: usize) -> Value {
+        json!({"pid":123,"window_id":73,"tree":tree,"truncated":false,
+            "node_count":count,"scope":"requested_or_focused_window"})
+    }
+
+    #[test]
+    fn accessibility_tree_keeps_structure_but_never_accepts_secure_field_payloads() {
+        let secure = json!({"role":"AXTextField","value_redacted":true,"children":[]});
+        let tree = json!({"role":"AXWindow","title":"Window","children":[secure.clone()]});
+        assert!(accessibility_result(&json!({"window_id":73}), &tree_result(tree, 2)).is_ok());
+        for field in ["title", "value", "bounds", "children"] {
+            let mut invalid = secure.clone();
+            invalid[field] = if field == "children" {
+                json!([{"role":"AXStaticText","title":"PRIVATE-CANARY","children":[]}])
+            } else {
+                json!("PRIVATE-CANARY")
+            };
+            let error = accessibility_result(&json!({"window_id":73}), &tree_result(invalid, 1)).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+        }
+        let value = json!({"role":"AXTextField","value":"PRIVATE-CANARY","children":[]});
+        assert!(accessibility_result(&json!({"window_id":73}), &tree_result(value, 1)).is_err());
+    }
+
+    #[test]
+    fn accessibility_shape_counts_depth_and_identity_are_independently_bounded() {
+        let leaf = json!({"role":"AXButton","children":[]});
+        let args = json!({"window_id":73});
+        assert!(accessibility_result(&args, &tree_result(leaf.clone(), 2)).is_err());
+        assert!(accessibility_result(&json!({"window_id":74}), &tree_result(leaf.clone(), 1)).is_err());
+        let wide = json!({"role":"AXWindow","children":vec![leaf.clone();129]});
+        assert!(accessibility_result(&args, &tree_result(wide, 130)).is_err());
+        let mut deep = leaf.clone();
+        for _ in 0..12 {
+            deep = json!({"role":"AXGroup","children":[deep]});
+        }
+        assert!(accessibility_result(&args, &tree_result(deep.clone(), 13)).is_ok());
+        deep = json!({"role":"AXGroup","children":[deep]});
+        assert!(accessibility_result(&args, &tree_result(deep, 14)).is_err());
+        let branch = json!({"role":"AXGroup","children":vec![leaf;127]});
+        let oversized = json!({"role":"AXWindow","children":[branch.clone(),branch]});
+        assert!(accessibility_result(&args, &tree_result(oversized, 257)).is_err());
+    }
+
+    #[test]
+    fn accessibility_labels_cannot_exceed_the_aggregate_text_budget() {
+        let leaf = json!({"role":"AXStaticText","title":"x".repeat(512),"children":[]});
+        let tree = json!({"role":"AXWindow","children":vec![leaf;128]});
+        assert!(accessibility_result(&json!({"window_id":73}), &tree_result(tree,129)).is_err());
+    }
+
+    #[test]
+    fn new_targeting_operations_keep_the_existing_host_approval_boundary() {
+        use crate::tools::Tool;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::computer::ComputerTool::new(dir.path()).with_mock(false);
+        for args in [json!({"action":"focus_window","window_id":73}),
+            json!({"action":"mouse_move","x":-12,"y":300}),
+            json!({"action":"scroll","direction":"down"})]
+        {
+            let failure = runtime.block_on(tool.execute("desktop-consent", args, None)).unwrap_err();
+            assert!(failure.to_string().contains("requires host approval"));
+        }
     }
 
     #[cfg(target_os = "macos")]

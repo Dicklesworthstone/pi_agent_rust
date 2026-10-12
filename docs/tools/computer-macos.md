@@ -48,8 +48,8 @@ Captures within the inline-image budget also return a native image block.
 Screenshot metadata includes desktop-point bounds and independently derived
 `pixels_per_point_x` and `pixels_per_point_y`. To map a screenshot pixel back to
 the desktop, divide by the corresponding ratio and add the bounds' origin.
-Origins can be negative on multi-monitor desktops. The shared tool schema's
-legacy pixel wording describes X11; macOS coordinates are desktop points.
+Origins can be negative on multi-monitor desktops. The shared tool schema
+distinguishes X11 pixels from macOS desktop points.
 Retina and mixed-scale mappings still require live verification.
 
 `clipboard_read` returns exact UTF-8 text, bounded to 64 KiB, and rejects a
@@ -58,8 +58,35 @@ clipboard change observed during the read. `clipboard_write` accepts at most
 written text through a read-back. A failed or cancelled write may already have
 cleared/replaced the previous clipboard; rollback is not promised.
 
-Accessibility inspection, focus, pointer and keyboard actions are not yet
-implemented in this increment. Unsupported actions fail before helper spawn.
+`ax_tree` inspects the requested window, or the focused window when no ID is
+provided. It requires Accessibility permission. Explicit window targeting also
+requires Screen Recording permission: the helper correlates the native window
+ID with AX using PID, exact unsanitized title and desktop-point geometry. Missing
+or ambiguous matches fail rather than selecting a different window. This is
+correlation, not an authenticated OS identity boundary.
+
+Trees are bounded to 256 nodes, depth 12, 128 children per node, 64 KiB of labels
+and an eight-second traversal budget. A 150 ms accessibility messaging timeout
+limits individual API calls. Cycles and exhausted budgets set `truncated`.
+Unavailable/stale accessibility data fails explicitly. Value/Text interfaces
+are never queried; secure text fields omit titles, geometry and descendants as
+well. Other application titles/labels can still contain private data. Rust
+checks the tree schema, counts, depth, label budget and redacted-node shape
+before returning it to the model.
+
+`focus_window` activates and raises one correlated window, confirms the exact
+focused AX object, then re-resolves its native ID before reporting success.
+`mouse_move` uses desktop points, admits negative multi-monitor origins, rejects
+points outside active displays, and observes the actual pointer position after
+posting the event. `scroll` posts a line-based wheel event with the requested
+direction and amount; it reports dispatch, not an inferred application effect.
+All three retain the existing host approval requirement. When a `window_id` is
+supplied for pointer movement or scrolling, that window must already be focused.
+Focus can race; coordinates and wheel events are not confined to that window.
+
+`mouse_click`, `mouse_drag`, `key_type` and `key_press` remain unsupported and
+fail before helper spawn. They need cancellation-safe key/button release
+handling; this backend does not silently substitute unguarded input.
 
 ## Ownership and verification
 
@@ -72,10 +99,14 @@ limit. Cancellation drops the owned process; already accepted OS effects are
 not transactional.
 
 Source validation in this implementation environment: the helper parsed with
-Swift's macOS-target frontend and executed its explicit non-macOS rejection
-path on Linux. These are not a macOS SDK typecheck or native desktop tests.
+Swift's macOS-target frontend. Seven actual helper protocol checks passed on
+Linux: valid requests reject the unsupported platform, while malformed JSON,
+wrong-type/overflow IDs, conflicting capture targets and oversized input fail
+with fixed diagnostics without echoing private request data. These are not a
+macOS SDK typecheck or native desktop tests.
 Rust regression tests cover protocol admission, catalogs, clipboard replies,
-PNG identity/dimensions, no-overwrite publication, helper failure and the macOS
-dispatch seam. They have not run: `dsr quality --tool pi_agent_rust` returned
+PNG identity/dimensions, no-overwrite publication, helper failure, the macOS
+dispatch seam, target confirmation, accessibility privacy/budgets and public
+tool approval. They have not run: `dsr quality --tool pi_agent_rust` returned
 `dsr: command not found` (exit 127), and no Rust toolchain is installed here.
 Full DSR quality and actual macOS permission/desktop tests remain required.
