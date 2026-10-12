@@ -5787,6 +5787,7 @@ dependencies = [
  "loom",
  "md-5 0.11.0",
  "memchr",
+ "mio",
  "pbkdf2",
  "pdf-extract",
  "portable-pty",

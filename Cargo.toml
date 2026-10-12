@@ -464,6 +464,8 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 # crate unsafe-free while encapsulating the Win32 FFI.
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
+# Nonblocking job-pipe readers; one process-wide reactor owns IOCP completions.
+mio = { version = "1.2.4", features = ["os-ext"] }
 # `GetFileInformationByHandle` without `unsafe`: std's own accessors for the
 # volume serial number and file index are behind the unstable
 # `windows_by_handle` feature, which this crate cannot use because it also has

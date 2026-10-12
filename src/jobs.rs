@@ -142,7 +142,7 @@ const MIN_RETAINED_ARTIFACT_FILES: usize = 8;
 /// from blocking terminal publication forever.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Unix job pipes are nonblocking so a sealed pump observes cancellation
+/// Job pipes are nonblocking on Unix and Windows so a sealed pump observes cancellation
 /// within this interval even when an escaped process retains the write end.
 const OUTPUT_PUMP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -1518,8 +1518,9 @@ pub fn spawn_background(
     cmd.arg("-c")
         .arg(&shell_command)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    #[cfg(not(windows))]
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::tools::isolate_command_process_group(&mut cmd);
 
@@ -1556,6 +1557,17 @@ pub fn spawn_background(
     let settled_notify = Arc::new(Notify::new());
     let cancel_deadline = Arc::new(CancelDeadline::new());
 
+    // Reserve the job slot before allocating either pipe. Windows children
+    // receive synchronous writers while their parent readers use overlapped
+    // I/O; using std's anonymous pipes would leave their reads uncancellable.
+    #[cfg(windows)]
+    let (stdout, stderr) = windows_job_pipe::configure(&mut cmd).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to prepare job output pipes: {err}{cleanup_failure_context}"),
+        )
+    })?;
+
     let started_at = Instant::now();
     let started_at_ms = now_ms();
     // Owner shutdown marks the registry before waiting for this lifecycle
@@ -1571,24 +1583,31 @@ pub fn spawn_background(
             format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
         )
     })?;
+    // Command retains caller-supplied Stdio handles after spawn. Close those
+    // parent copies immediately so only the child owns the pipe writers.
+    drop(cmd);
     let pid = child.id();
     let mut child = BackgroundChild::new(child);
+    #[cfg(not(windows))]
     let stdout = child
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", format!("Missing stdout{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
     let stderr = child
         .child
         .as_mut()
         .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", format!("Missing stderr{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
     prepare_job_stream(&stdout).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to prepare job stdout: {err}{cleanup_failure_context}"),
         )
     })?;
+    #[cfg(not(windows))]
     prepare_job_stream(&stderr).map_err(|err| {
         Error::tool(
             "bash",
@@ -1596,9 +1615,8 @@ pub fn spawn_background(
         )
     })?;
 
-    // Pump threads: dedicated OS threads for the same reason as the
-    // foreground path (unbounded blocking reads must not starve the
-    // runtime's blocking pool).
+    // Dedicated threads isolate artifact filesystem I/O from the runtime's
+    // blocking pool. Pipe reads themselves are nonblocking on Unix/Windows.
     let stdout_tail = Arc::clone(&tail);
     let stdout_artifact = Arc::clone(&artifact);
     let stdout_sealed = Arc::clone(&output_sealed);
@@ -1753,6 +1771,194 @@ pub fn spawn_background(
     Ok(JobSnapshot::from_source_best_effort(&snapshot_source))
 }
 
+#[cfg(windows)]
+mod windows_job_pipe {
+    use mio::windows::NamedPipe;
+    use mio::{Events, Interest, Poll, Registry, Token};
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const REACTOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const REACTOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Mio retains an Arc for every submitted read until Poll consumes its
+    /// completion, including cancellation. A per-job Poll cannot safely retire
+    /// on a deadline: its last callback may arrive afterward. This one reactor
+    /// lives until process exit and never owns job writers, pumps, or artifacts.
+    struct Reactor {
+        registry: Registry,
+        state: Arc<ReactorState>,
+    }
+
+    struct ReactorState {
+        failed: AtomicBool,
+        progress: Mutex<()>,
+        ready: Condvar,
+    }
+
+    impl ReactorState {
+        fn notify(&self) {
+            let _progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.ready.notify_all();
+        }
+    }
+
+    struct ReactorExit(Arc<ReactorState>);
+
+    impl Drop for ReactorExit {
+        fn drop(&mut self) {
+            self.0.failed.store(true, Ordering::Release);
+            self.0.notify();
+        }
+    }
+
+    impl Reactor {
+        fn start() -> io::Result<Self> {
+            let mut poll = Poll::new()?;
+            let registry = poll.registry().try_clone()?;
+            let state = Arc::new(ReactorState {
+                failed: AtomicBool::new(false),
+                progress: Mutex::new(()),
+                ready: Condvar::new(),
+            });
+            let worker_state = Arc::clone(&state);
+            let _worker = std::thread::Builder::new()
+                .name("pi-job-pipe-reactor".to_string())
+                .spawn(move || {
+                    let _exit = ReactorExit(Arc::clone(&worker_state));
+                    let mut events = Events::with_capacity(128);
+                    loop {
+                        // Poll runs the IOCP callbacks that release cancelled
+                        // I/O. Wake the bounded set of readers together after
+                        // callbacks finish; each consumes its own Mio buffer.
+                        match poll.poll(&mut events, Some(REACTOR_POLL_INTERVAL)) {
+                            Ok(()) => {
+                                if !events.is_empty() {
+                                    worker_state.notify();
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                if !worker_state.failed.swap(true, Ordering::AcqRel) {
+                                    tracing::error!(
+                                        event = "pi.jobs.pipe_reactor_failed",
+                                        error = %error,
+                                        "Windows job pipe reactor failed; refusing new jobs"
+                                    );
+                                }
+                                worker_state.notify();
+                                // Do not drop Poll with outstanding cancelled
+                                // reads. Keep trying to reclaim their callbacks
+                                // even though admission stays permanently shut.
+                                std::thread::sleep(REACTOR_RETRY_INTERVAL);
+                            }
+                        }
+                    }
+                })?;
+            Ok(Self { registry, state })
+        }
+
+        fn check(&self) -> io::Result<()> {
+            if self.state.failed.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "PI_JOBS_PIPE_REACTOR: Windows job output reactor is unavailable",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn reactor() -> io::Result<&'static Reactor> {
+        static REACTOR: OnceLock<Result<Reactor, String>> = OnceLock::new();
+        match REACTOR.get_or_init(|| Reactor::start().map_err(|error| error.to_string())) {
+            Ok(reactor) => {
+                reactor.check()?;
+                Ok(reactor)
+            }
+            Err(error) => Err(io::Error::other(format!(
+                "PI_JOBS_PIPE_REACTOR: failed to start Windows job output reactor: {error}"
+            ))),
+        }
+    }
+
+    pub(super) struct Reader {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Read for Reader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let deadline = Instant::now() + super::OUTPUT_PUMP_POLL_INTERVAL;
+            let state = &self.reactor.state;
+            // Lock before checking the pipe, then atomically unlock to wait.
+            // A completion between read and wait cannot lose its notification.
+            // Poll releases Mio's internal locks before acquiring this mutex.
+            let mut progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                self.reactor.check()?;
+                match self.pipe.read(buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                            return Err(error);
+                        };
+                        progress = state
+                            .ready
+                            .wait_timeout(progress, remaining)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            // Suppress new readiness notifications before NamedPipe's Drop
+            // cancels its pending read. The shared Poll remains alive to reap
+            // the completion-held Arc and close the actual server handle.
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+        }
+    }
+
+    pub(super) fn pair() -> io::Result<(Reader, File)> {
+        let reactor = reactor()?;
+        let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
+        let mut pipe = NamedPipe::new(&name)?;
+        // The client must stay synchronous for child stdout/stderr. Opening it
+        // first establishes the connection, so connect below takes the immediate
+        // ERROR_PIPE_CONNECTED path instead of owning a pending connect whose
+        // callback could submit a fresh read after the server has been dropped.
+        let writer = OpenOptions::new().write(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::READABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Reader { pipe, reactor }, writer))
+    }
+
+    pub(super) fn configure(command: &mut Command) -> io::Result<(Reader, Reader)> {
+        let (stdout, stdout_writer) = pair()?;
+        let (stderr, stderr_writer) = pair()?;
+        command
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer));
+        Ok((stdout, stderr))
+    }
+}
+
 #[cfg(unix)]
 fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(reader)?;
@@ -1763,7 +1969,7 @@ fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
 }
 
 // Mirrors the Unix arm's fallible signature, which really can fail.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn prepare_job_stream<R>(_reader: &R) -> std::io::Result<()> {
     Ok(())
@@ -1800,10 +2006,19 @@ fn pump_job_stream<R: Read>(
         if output_sealed.load(Ordering::Acquire) {
             return Ok(());
         }
+        #[cfg(windows)]
+        let read_started = Instant::now();
         match reader.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(windows)]
+                // Windows waits for readiness inside Read. Do not add another
+                // full idle delay after that bounded wait has already elapsed.
+                std::thread::sleep(
+                    OUTPUT_PUMP_POLL_INTERVAL.saturating_sub(read_started.elapsed()),
+                );
+                #[cfg(not(windows))]
                 std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
             }
             Err(err) => return Err(err),
@@ -3285,6 +3500,208 @@ mod tests {
             "sealing must stop and join the reader even while the writer remains open"
         );
         assert!(pump.is_none());
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_bytes(reader: &mut windows_job_pipe::Reader, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = vec![0; expected.len()];
+        let mut count = 0;
+        while count < received.len() && Instant::now() < deadline {
+            match reader.read(&mut received[count..]) {
+                Ok(0) => panic!("an open writer must not produce EOF"),
+                Ok(bytes) => count += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read Windows job pipe: {error}"),
+            }
+        }
+        assert_eq!(&received[..count], expected);
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_writer_closed(writer: &mut std::fs::File) {
+        // Every probe fits in the pipe's 64 KiB buffer even if a cancelled
+        // read leaked its completion-owned Arc. Only server-handle retirement
+        // makes this retained client observe a broken pipe.
+        for _ in 0..64 {
+            match writer.write(b"x") {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return,
+                Ok(1) => std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL),
+                result => panic!("unexpected pipe retirement probe: {result:?}"),
+            }
+        }
+        panic!("cancelled reader retained its Windows server handle");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_distinguishes_idle_data_and_eof() {
+        let _guard = process_test_guard();
+        let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle pipe").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"first").expect("first output");
+        assert_windows_pipe_bytes(&mut reader, b"first");
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle gap").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"second").expect("second output");
+        assert_windows_pipe_bytes(&mut reader, b"second");
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "closed writer must produce EOF");
+                }
+                result => panic!("unexpected result after writer closed: {result:?}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sealed_pipe_pump_joins_and_closes_server_with_writer_held() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(reader, &pump_artifact, &pump_tail, &pump_sealed)
+        }));
+        writer.write_all(&[b'b'; 128]).expect("output beyond artifact cap");
+        writer.write_all(b"before-seal").expect("final output");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tail.lock().expect("tail").text().ends_with("before-seal") {
+            assert!(Instant::now() < deadline, "pump must consume output");
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        }
+        assert!(
+            !pump.as_ref().expect("live pump").is_finished(),
+            "an open writer must leave an unsealed pump pending"
+        );
+        let tail_before = tail.lock().expect("tail").text();
+        let bytes_before = std::fs::read(&path).expect("artifact bytes");
+        assert_eq!(bytes_before.len(), 64);
+        assert!(artifact.lock().expect("artifact").truncated);
+
+        sealed.store(true, Ordering::Release);
+        assert!(
+            finish_pump(&mut pump, Instant::now() + OUTPUT_DRAIN_GRACE),
+            "sealing must join the pump while its writer remains open"
+        );
+        assert!(pump.is_none());
+        assert_windows_pipe_writer_closed(&mut writer);
+        assert_eq!(tail.lock().expect("tail").text(), tail_before);
+        assert_eq!(std::fs::read(&path).expect("settled artifact"), bytes_before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_repeated_pipe_cancellation_retires_handles_with_writers_held() {
+        let _guard = process_test_guard();
+        let mut writers = Vec::new();
+        for _ in 0..32 {
+            let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+            assert_eq!(
+                reader.read(&mut [0]).expect_err("pending read").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(reader);
+            assert_windows_pipe_writer_closed(&mut writer);
+            writers.push(writer);
+        }
+        assert_eq!(writers.len(), 32, "writers stayed open across every retirement");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_output_child() {
+        if std::env::var_os("PI_JOBS_WINDOWS_PIPE_CHILD").is_none() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&[b'o'; 32 * 1024]).expect("child stdout burst");
+        stdout.write_all(b"stdout-finished\n").expect("stdout marker");
+        stdout.flush().expect("flush stdout");
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(&[b'e'; 32 * 1024]).expect("child stderr burst");
+        stderr.write_all(b"stderr-finished\n").expect("stderr marker");
+        stderr.flush().expect("flush stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_configured_child_pipes_drain_both_streams_to_eof() {
+        let _guard = process_test_guard();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args(["--exact", "jobs::tests::windows_job_pipe_output_child", "--nocapture"])
+            .env("PI_JOBS_WINDOWS_PIPE_CHILD", "1")
+            .stdin(std::process::Stdio::null());
+        let (mut stdout, mut stderr) =
+            windows_job_pipe::configure(&mut command).expect("configure child output");
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .expect("spawn child with Windows Job discipline");
+        // Command retains the parent writer copies for reuse. Match the
+        // production handoff so EOF proves that these copies were disposed.
+        drop(command);
+        let pid = child.id();
+        let mut child = BackgroundChild::new(child);
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut buffer = [0; 8192];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(stdout_eof && stderr_eof) && Instant::now() < deadline {
+            for (reader, bytes, eof) in [
+                (&mut stdout, &mut stdout_bytes, &mut stdout_eof),
+                (&mut stderr, &mut stderr_bytes, &mut stderr_eof),
+            ] {
+                if *eof {
+                    continue;
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => *eof = true,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("read configured child output: {error}"),
+                }
+            }
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("reap output child") {
+                crate::tools::terminate_reaped_child_discipline(pid);
+                child.disarm();
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill_and_wait();
+                break None;
+            }
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        };
+        assert!(status.is_some_and(|status| status.success()), "child must exit successfully");
+        assert!(stdout_eof && stderr_eof, "both child streams must reach actual EOF");
+        let stdout_text = String::from_utf8(stdout_bytes).expect("stdout UTF-8");
+        let stderr_text = String::from_utf8(stderr_bytes).expect("stderr UTF-8");
+        assert!(stdout_text.contains(&format!("{}stdout-finished\n", "o".repeat(32 * 1024))));
+        assert!(!stdout_text.contains("stderr-finished"));
+        assert_eq!(stderr_text, format!("{}stderr-finished\n", "e".repeat(32 * 1024)));
     }
 
     #[cfg(unix)]
