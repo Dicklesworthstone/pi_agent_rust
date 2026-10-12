@@ -680,26 +680,70 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     // Keep only failure state here: retaining a sender would keep our own
     // receiver alive forever when the dispatcher and prompt tasks finish.
     let writer_failure = Arc::clone(&out_tx.shared);
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let stdout = io::stdout();
         let mut writer = io::BufWriter::new(stdout.lock());
-        for line in out_rx {
-            if writer.write_all(line.as_bytes()).is_err() {
-                writer_failure.fail("ACP stdout write failed");
-                break;
-            }
-            if writer.write_all(b"\n").is_err() {
-                writer_failure.fail("ACP stdout write failed");
-                break;
-            }
-            if writer.flush().is_err() {
-                writer_failure.fail("ACP stdout flush failed");
-                break;
-            }
+        let result = write_acp_output(out_rx, &mut writer);
+        if let Err(reason) = result {
+            writer_failure.fail(reason);
         }
+        let _ = writer_done_tx.send(result);
     });
 
-    run(options, in_rx, out_tx).await
+    let result = run(options, in_rx, out_tx).await;
+    // Prompt settlement can leave final frames queued. The process must keep
+    // running until stdout flushes them, or report that delivery is incomplete.
+    // A blocked OS write cannot be joined safely on an async worker.
+    finish_acp_output(result, writer_done_rx, Duration::from_secs(30)).await
+}
+
+/// This blocking loop runs only on the dedicated stdout thread. Successful
+/// completion means every queued frame, including the final response, flushed.
+fn write_acp_output(
+    receiver: std::sync::mpsc::Receiver<String>,
+    writer: &mut impl Write,
+) -> std::result::Result<(), &'static str> {
+    for line in receiver {
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|_| "ACP stdout write failed")?;
+        writer
+            .write_all(b"\n")
+            .map_err(|_| "ACP stdout write failed")?;
+        writer.flush().map_err(|_| "ACP stdout flush failed")?;
+    }
+    writer.flush().map_err(|_| "ACP stdout flush failed")
+}
+
+async fn finish_acp_output(
+    result: Result<()>,
+    completed: std::sync::mpsc::Receiver<std::result::Result<(), &'static str>>,
+    deadline: Duration,
+) -> Result<()> {
+    let drain = async move {
+        loop {
+            match completed.try_recv() {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(reason)) => return Err(Error::session(reason)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::session(
+                        "ACP stdout writer stopped before delivery completed",
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    sleep(wall_now(), Duration::from_millis(5)).await;
+                }
+            }
+        }
+    };
+    let delivered = match timeout(wall_now(), deadline, Box::pin(drain)).await {
+        Ok(delivered) => delivered,
+        Err(_) => Err(Error::session(
+            "ACP stdout delivery timed out; output is incomplete",
+        )),
+    };
+    result.and(delivered)
 }
 
 /// Core ACP event loop.
@@ -3276,6 +3320,172 @@ mod tests {
         drop(output);
         reader.join().expect("draining reader");
         assert!(failure.state.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn stdio_completion_waits_for_real_file_flush_and_preserves_prior_error() {
+        struct PausedFile {
+            file: std::fs::File,
+            entered: Option<std::sync::mpsc::SyncSender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Write for PausedFile {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.file.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).map_err(io::Error::other)?;
+                    self.release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(io::Error::other)?;
+                }
+                self.file.flush()
+            }
+        }
+
+        for prior_error in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("editor-output.jsonl");
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            let update = json_rpc_notification(
+                "session/update",
+                json!({
+                    "sessionId": "editor-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "completed work" },
+                    },
+                }),
+            );
+            let terminal = json_rpc_ok(json!(7), json!({ "stopReason": "end_turn" }));
+            let expected = format!("{update}\n{terminal}\n");
+            tx.send(update).unwrap();
+            tx.send(terminal).unwrap();
+            drop(tx);
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let file = PausedFile {
+                file: std::fs::File::create(&path).unwrap(),
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            let writer = std::thread::spawn(move || {
+                let mut buffered = io::BufWriter::new(file);
+                let result = write_acp_output(rx, &mut buffered);
+                let _ = done_tx.send(result);
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer reached the controlled flush");
+
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let result = if prior_error {
+                    Err(Error::session("original prompt persistence failure"))
+                } else {
+                    Ok(())
+                };
+                let finished = finish_acp_output(result, done_rx, Duration::from_secs(2));
+                futures::pin_mut!(finished);
+                futures::future::poll_fn(|cx| {
+                    assert!(
+                        std::future::Future::poll(finished.as_mut(), cx).is_pending(),
+                        "stdio completion must wait while its final response is still queued"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                release_tx.send(()).unwrap();
+                let result = finished.await;
+                if prior_error {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("original prompt persistence failure")
+                    );
+                } else {
+                    result.expect("all queued output flushed");
+                }
+            });
+            writer.join().expect("stdout worker");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn stdio_completion_reports_real_write_failure_and_missing_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("read-only-output.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(json_rpc_ok(json!(1), json!({ "stopReason": "end_turn" })))
+            .unwrap();
+        drop(tx);
+        let written = write_acp_output(rx, &mut read_only);
+        assert_eq!(written, Err("ACP stdout write failed"));
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            done_tx.send(written).unwrap();
+            drop(done_tx);
+            let error = finish_acp_output(Ok(()), done_rx, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ACP stdout write failed"));
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            drop(done_tx);
+            let error = finish_acp_output(Ok(()), done_rx, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stdout writer stopped before delivery completed")
+            );
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            done_tx.send(Err("ACP stdout flush failed")).unwrap();
+            let error = finish_acp_output(
+                Err(Error::session("original prompt persistence failure")),
+                done_rx,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("original prompt persistence failure")
+            );
+        });
+    }
+
+    #[test]
+    fn stdio_completion_bounds_a_writer_that_never_finishes() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let error = finish_acp_output(Ok(()), done_rx, Duration::from_millis(10))
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stdout delivery timed out; output is incomplete")
+            );
+            // Keep the sender alive until after the deadline: this models an
+            // OS write that remains blocked, not an already-disconnected writer.
+            drop(done_tx);
+        });
     }
 
     #[test]
