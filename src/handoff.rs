@@ -733,13 +733,11 @@ impl HandoffGenerator {
         let rest = rest.trim_start();
         let (complete, item) = if let Some(item) = rest.strip_prefix("[ ]") {
             (false, item)
-        } else if let Some(item) = rest
-            .strip_prefix("[x]")
-            .or_else(|| rest.strip_prefix("[X]"))
-        {
-            (true, item)
         } else {
-            return None;
+            let item = rest
+                .strip_prefix("[x]")
+                .or_else(|| rest.strip_prefix("[X]"))?;
+            (true, item)
         };
         if !item.is_empty() && !item.starts_with(char::is_whitespace) {
             return None;

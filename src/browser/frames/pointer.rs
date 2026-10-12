@@ -259,7 +259,8 @@ async fn viewport(
 /// This is a geometry projection, not a second frame authorization. The active
 /// CDP scope is checked before and after the inventory and every original
 /// ancestor/renderer must still match. No pointer is dispatched here.
-#[allow(clippy::too_many_lines)]
+// `Link` has no `id` field: a link's `target` is the frame id it is matched against.
+#[allow(clippy::too_many_lines, clippy::suspicious_operation_groupings)]
 pub(in crate::browser) async fn project(
     owner: &AgentCx,
     cdp: &mut Cdp,

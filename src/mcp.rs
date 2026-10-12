@@ -591,9 +591,11 @@ pub async fn connect_trusted_and_mount_tools(
 }
 
 /// Bind this manager even when its catalog is empty, then publish the current
-/// admitted catalog. Only this exact manager's wrappers may be removed or
-/// replaced; in-flight calls keep their previous immutable registry snapshot.
-/// Returns the number of added, replaced, or removed wrappers.
+/// admitted catalog.
+///
+/// Only this exact manager's wrappers may be removed or replaced; in-flight
+/// calls keep their previous immutable registry snapshot. Returns the number
+/// of added, replaced, or removed wrappers.
 pub fn reconcile_tools(
     manager: &std::sync::Arc<McpManager>,
     registry: &crate::tools::SharedToolRegistry,

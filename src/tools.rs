@@ -6308,6 +6308,10 @@ impl SharedToolRegistry {
             .clone()
     }
 
+    // The write guard spans the whole read-modify-write and the version bump:
+    // releasing it after the swap would let a reader pair the new snapshot
+    // with the old version.
+    #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn reconcile_mcp_tools(
         &self,
         manager: &Arc<crate::mcp::McpManager>,
@@ -9175,7 +9179,7 @@ impl HubTool {
                 (text, details)
             }
             Reply::Sent { message } => {
-                let text = format!("Message queued for {} (seq {}).", message.to, message.seq,);
+                let text = format!("Message queued for {} (seq {}).", message.to, message.seq);
                 (text, serde_json::json!(message))
             }
             Reply::Inbox {

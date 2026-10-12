@@ -26,6 +26,8 @@ struct CatalogTransport {
 
 #[async_trait]
 impl McpTransport for CatalogTransport {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_in_scrutinee)]
     async fn request(&self, method: &str, params: Value, _timeout: Duration) -> Result<Value> {
         match method {
             "initialize" => Ok(json!({})),
@@ -166,6 +168,8 @@ fn agent(provider: &Arc<CatalogProvider>) -> Agent {
 }
 
 #[test]
+// The guard is dropped explicitly before the next await; clippy cannot see that.
+#[allow(clippy::await_holding_lock)]
 fn live_agent_reconciles_refreshed_schemas_and_removed_tools_before_provider_dispatch() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (manager, _, state) = fixture(

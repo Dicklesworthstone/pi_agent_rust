@@ -715,6 +715,7 @@ fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult
     !result.is_error
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PendingRun {
     Settled(SubagentResult),
     AwaitingWriteback {

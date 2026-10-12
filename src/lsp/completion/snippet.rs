@@ -422,6 +422,7 @@ impl Expanded {
 /// Convert only the primary snippet insertion. Auto-import TextEdits are plain
 /// text and must not be interpreted as snippets. Cache and resolve keep the
 /// original server representation; preview choices never alter a later apply.
+#[allow(clippy::too_many_lines)]
 pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded> {
     if let Some(values) = values {
         validate_values(values)?;

@@ -398,6 +398,9 @@ impl LspClient {
         })
     }
 
+    // The diagnostics guard is taken under `open_docs` so that dropping
+    // evicted or re-synced URIs from the cache is atomic with the insert.
+    #[allow(clippy::significant_drop_tightening)]
     fn try_ensure_synced(
         &self,
         path: &Path,
@@ -520,6 +523,9 @@ impl LspClient {
         Self::lock(&self.diagnostics).clear();
     }
 
+    // `open_docs` stays locked from the version check to the insert, so a
+    // notification cannot pass the check and then publish stale diagnostics.
+    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn accept_diagnostics(&self, params: &Value) {
         let (Some(uri), Some(diagnostics)) = (
             params.get("uri").and_then(Value::as_str),

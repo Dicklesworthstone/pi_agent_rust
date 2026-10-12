@@ -70,7 +70,7 @@ impl InputChild {
         Ok(owned)
     }
 
-    fn stop_group(&mut self) {
+    fn stop_group(&self) {
         if let Ok(pid) = i32::try_from(self.child.id())
             && let Some(group) = rustix::process::Pid::from_raw(pid)
         {
@@ -141,7 +141,7 @@ pub(in crate::computer) async fn run(
     frame.push(b'\n');
     let program = helpers
         .get("swift")
-        .map_or(Path::new("/usr/bin/swift"), PathBuf::as_path);
+        .map_or_else(|| Path::new("/usr/bin/swift"), PathBuf::as_path);
     let mut owned = InputChild::spawn(owner, program, args)?;
     let mut written = 0;
     let mut bytes = Vec::new();

@@ -51,7 +51,7 @@ fn secret_json_depth(depth: usize) -> Result<()> {
 /// pairs directly into a map would silently discard one of the arguments.
 /// Refuse that ambiguity rather than execute a different call. The borrowed
 /// input and session vault remain unchanged on every outcome.
-pub(crate) fn restore_inbound_json(
+pub fn restore_inbound_json(
     value: &serde_json::Value,
     vault: &SecretVault,
 ) -> Result<serde_json::Value> {
@@ -71,7 +71,7 @@ pub(crate) fn restore_inbound_json(
 /// credential merely to retain its type. Key collisions and excessive depth
 /// refuse the projection; callers must omit the affected output on failure,
 /// never fall back to the original unscreened value. No new secrets are learned.
-pub(crate) fn mask_known_json(
+pub fn mask_known_json(
     value: &serde_json::Value,
     vault: &SecretVault,
 ) -> Result<serde_json::Value> {
@@ -399,7 +399,7 @@ pub fn transform_outbound_json(
 /// strings and keys are still screened, and block mode still refuses secrets.
 /// This exception must never apply to user input, tool results, tool schemas or
 /// assistant history sent to another origin.
-pub(crate) fn transform_assistant_replay_json(
+pub fn transform_assistant_replay_json(
     value: &serde_json::Value,
     vault: &mut SecretVault,
     mode: SecretsMode,
@@ -650,7 +650,7 @@ mod structured_outbound_tests {
         let nested_secret = "literal <pi-secret:000001>";
         let nested_placeholder = vault.placeholder_for(nested_secret, "user");
         let input = json!({
-            "nested": [{placeholder.clone(): placeholder.clone()}],
+            "nested": [{placeholder.clone(): placeholder}],
             "literal": nested_placeholder,
             "ordinary": [17, true, false, null],
             "unknown": "<pi-secret:ffffff>",
@@ -731,7 +731,7 @@ mod structured_outbound_tests {
         let input = json!({
             "nested": {
                 KEY: {"credential": KEY},
-                placeholder.clone(): "a different member",
+                placeholder: "a different member",
             },
         });
         let original = input.clone();

@@ -1628,6 +1628,7 @@ impl ExtensionHostActions for MockHostActions {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn events_compact_preserves_public_model_and_summary_options() {
     asupersync::test_utils::run_test(|| async {
         let manager = ExtensionManager::new();

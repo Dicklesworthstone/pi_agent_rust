@@ -6810,7 +6810,7 @@ async fn try_failover_to_next_chain_entry(
         return Ok(false);
     };
     state.failover_lifecycle_id = Some(lifecycle_id);
-    state.failover_source = committed.source.clone();
+    state.failover_source.clone_from(&committed.source);
     state.failover_chain_position = Some(outcome.next_position);
 
     state.failover_primary = Some(primary_model.clone());
@@ -8571,6 +8571,7 @@ mod retry_tests {
     }
 
     #[test]
+    #[allow(clippy::await_holding_lock)]
     fn rpc_auto_retry_retries_then_succeeds_with_native_media() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
             .blocking_threads(1, 8)
@@ -8872,12 +8873,12 @@ mod retry_tests {
                         } else {
                             Vec::new()
                         };
-                        let events = run_rpc_prompt_scope_fixture(
+                        let events = Box::pin(run_rpc_prompt_scope_fixture(
                             Arc::clone(&session),
                             runtime_handle.clone(),
                             root.path().join("auth.json"),
                             attachments,
-                        )
+                        ))
                         .await;
                         assert_eq!(events.last().expect("terminal")["type"], "agent_end");
                         assert!(events.last().expect("terminal")["error"].is_null());
@@ -8906,12 +8907,12 @@ mod retry_tests {
                             assert_eq!(hook_count, 1, "recovery must not replay start hooks");
                             guard.extensions.take()
                         };
-                        let events = run_rpc_prompt_scope_fixture(
+                        let events = Box::pin(run_rpc_prompt_scope_fixture(
                             Arc::clone(&session),
                             runtime_handle.clone(),
                             root.path().join("auth.json"),
                             Vec::new(),
-                        )
+                        ))
                         .await;
                         assert_eq!(events.last().expect("terminal")["type"], "agent_end");
                         assert!(events.last().expect("terminal")["error"].is_null());
@@ -10217,6 +10218,7 @@ mod retry_tests {
     }
 
     #[test]
+    #[allow(clippy::used_underscore_items)]
     fn rpc_reconciliation_preserves_unchanged_timers_and_uses_each_branch_record() {
         let primary = rpc_recovery_entry("primary");
         let fallback = rpc_recovery_entry("fallback");
@@ -20302,6 +20304,7 @@ export default function init(pi) {
         }
     }
 
+    #[allow(clippy::cast_sign_loss)]
     fn rpc_compact_fixture_content() -> Vec<ContentBlock> {
         use base64::Engine as _;
         use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
@@ -20602,6 +20605,7 @@ export default function init(pi) {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn rpc_compact_history_attachment_lifetimes_follow_committed_transitions() {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
@@ -23935,11 +23939,13 @@ export default function init(pi) {
 
     #[test]
     fn parse_prompt_media_enforces_decoded_size_and_count_limits() {
-        let mut config = Config::default();
-        config.media = Some(crate::media_tools::MediaSettings {
-            max_bytes: Some(1),
-            ..Default::default()
-        });
+        let mut config = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(1),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
         for data in ["YQ==", "YQ"] {
             let value = json!([{"type": "media", "data": data, "mimeType": "audio/wav"}]);
             assert_eq!(parse_prompt_media(Some(&value), &config).unwrap().len(), 1);
@@ -24045,13 +24051,15 @@ export default function init(pi) {
 
     #[test]
     fn rpc_native_content_applies_media_limits_and_total_block_limit() {
-        let mut config = Config::default();
-        config.media = Some(crate::media_tools::MediaSettings {
-            max_bytes: Some(1),
-            ..Default::default()
-        });
+        let config = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(1),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
         let valid = json!({"type": "media", "data": "YQ==", "mimeType": "audio/wav"});
-        assert!(parse_prompt_attachments(&json!({"content": [valid.clone()]}), &config).is_ok());
+        assert!(parse_prompt_attachments(&json!({"content": [valid]}), &config).is_ok());
         assert!(
             parse_prompt_attachments(
                 &json!({"content": [

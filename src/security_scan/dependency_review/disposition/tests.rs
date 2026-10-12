@@ -100,7 +100,7 @@ fn reopen_removes_only_owned_suppression_and_does_not_change_future_audits() {
     let mut original = fixture("crates.io", &[("1.0.0", &["GHSA-a"], true)]);
     let foreign =
         json!({"kind":"external","status":"accepted","justification":"Independent disposition"});
-    original["runs"][0]["results"][0]["suppressions"] = json!([foreign.clone()]);
+    original["runs"][0]["results"][0]["suppressions"] = json!([foreign]);
     let accepted = review(&original, Decision::AcceptedRisk);
     let changed = review(&accepted, Decision::FalsePositive);
     assert_eq!(

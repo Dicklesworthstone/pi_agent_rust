@@ -27,7 +27,6 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-#[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;

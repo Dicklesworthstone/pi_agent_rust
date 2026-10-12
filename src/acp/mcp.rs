@@ -136,6 +136,8 @@ pub(super) fn prepare(
     }))
 }
 
+// Exclusive access is part of the call contract; callers live in sibling modules.
+#[allow(clippy::needless_pass_by_ref_mut)]
 pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     let shared = agent.agent.shared_tools();
     shared.bind_mcp_manager(&state.manager);
@@ -333,6 +335,8 @@ async fn refresh_catalogs(state: &SessionMcp) {
         .complete(acknowledged, Instant::now());
 }
 
+// The Ok/Err arms read clearer as a match than as map_or_else closures.
+#[allow(clippy::option_if_let_else)]
 async fn execute(state: &SessionMcp, command: Command) -> String {
     match command {
         Command::List => status(state),
@@ -342,8 +346,10 @@ async fn execute(state: &SessionMcp, command: Command) -> String {
         }
         Command::Inspect(name) => state.descriptions.iter()
             .find(|(candidate, _)| candidate == &name)
-            .map(|(_, text)| text.clone())
-            .unwrap_or_else(|| "Unknown MCP server; use /mcp list".to_string()),
+            .map_or_else(
+                || "Unknown MCP server; use /mcp list".to_string(),
+                |(_, text)| text.clone(),
+            ),
         Command::Trust(name) => match state.manager.trust(&name).await {
             Ok(tools) => format!("Trusted and connected MCP server {name}: {} tools", tools.len()),
             Err(_) => "MCP trust/connect did not complete. Any trust decision already persisted remains in effect; inspect the editor configuration, then use /mcp list or /mcp deny NAME.".to_string(),
@@ -484,10 +490,14 @@ mod tests {
         let ready = [row("acknowledged", "ready (1 tools)")];
         assert!(refresh.due(&ready, now));
         refresh.complete(acknowledged_servers(&ready), now);
-        assert!(!refresh.due(
-            &ready,
-            now + CATALOG_REFRESH_INTERVAL - Duration::from_millis(1)
-        ));
+        assert!(
+            !refresh.due(
+                &ready,
+                (now + CATALOG_REFRESH_INTERVAL)
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("instant just before the refresh deadline")
+            )
+        );
         assert!(refresh.due(&ready, now + CATALOG_REFRESH_INTERVAL));
 
         let pending = [row("pending", "not started")];
@@ -511,10 +521,14 @@ mod tests {
         for health in ["not started", "unhealthy (retry 1/3): unavailable"] {
             let rows = [row("acknowledged", health)];
             refresh.complete(acknowledged_servers(&rows), now);
-            assert!(!refresh.due(
-                &rows,
-                now + CATALOG_RETRY_INTERVAL - Duration::from_millis(1)
-            ));
+            assert!(
+                !refresh.due(
+                    &rows,
+                    (now + CATALOG_RETRY_INTERVAL)
+                        .checked_sub(Duration::from_millis(1))
+                        .expect("instant just before the retry deadline")
+                )
+            );
             assert!(refresh.due(&rows, now + CATALOG_RETRY_INTERVAL));
         }
         let failed = [row("acknowledged", "failed: exhausted 3 retries")];

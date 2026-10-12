@@ -186,6 +186,7 @@ impl SettingsKey {
 /// Effective settings acknowledged by the driver. No credentials or complete
 /// configuration document cross the UI event channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SettingsSnapshot {
     pub path: PathBuf,
     pub auto_retry: bool,
@@ -238,7 +239,7 @@ pub(super) struct SettingsController {
 
 impl SettingsController {
     pub(super) fn new(config: Config, path: PathBuf, handle: &AgentSessionHandle) -> Self {
-        let retry_policy = handle.retry_policy().unwrap_or(RetryPolicy {
+        let retry_policy = handle.retry_policy().unwrap_or_else(|| RetryPolicy {
             max_retries: config.retry_max_retries(),
             max_failovers_per_turn: config.max_failovers_per_turn(),
             base_delay_ms: config.retry_base_delay_ms(),
@@ -344,14 +345,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        AgentSessionHandle::from_session_with_listeners(session, Default::default()).with_retry(
-            Some(RetryPolicy {
-                max_retries: 7,
-                max_failovers_per_turn: 2,
-                base_delay_ms: 17,
-                max_delay_ms: 333,
-            }),
+        AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
         )
+        .with_retry(Some(RetryPolicy {
+            max_retries: 7,
+            max_failovers_per_turn: 2,
+            base_delay_ms: 17,
+            max_delay_ms: 333,
+        }))
     }
 
     #[test]

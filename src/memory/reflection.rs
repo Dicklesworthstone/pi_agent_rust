@@ -175,6 +175,7 @@ impl ReflectTool {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     async fn execute_reflection(
         &self,
         input: serde_json::Value,

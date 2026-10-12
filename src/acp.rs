@@ -711,6 +711,7 @@ fn write_acp_output(
     writer.flush().map_err(|_| "ACP stdout flush failed")
 }
 
+#[allow(clippy::option_if_let_else)]
 async fn finish_acp_output(
     result: Result<()>,
     completed: std::sync::mpsc::Receiver<std::result::Result<(), &'static str>>,
@@ -1248,16 +1249,15 @@ async fn run(
                         // `model` is the ACP model selector: same switch as
                         // session/set_model, with the value as `provider/id` or an id.
                         let model_request = if name.eq_ignore_ascii_case("model") {
-                            match value.as_str() {
-                                Some(model) => Some(json!({ "model": model })),
-                                None => {
-                                    let _ = out_tx.send(json_rpc_error(
-                                id,
-                                INVALID_PARAMS,
-                                "Invalid value for config option 'model': expected a model id or provider/id string",
-                            ));
-                                    continue;
-                                }
+                            if let Some(model) = value.as_str() {
+                                Some(json!({ "model": model }))
+                            } else {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Invalid value for config option 'model': expected a model id or provider/id string",
+                                ));
+                                continue;
                             }
                         } else {
                             None
@@ -2181,7 +2181,7 @@ impl AcpRecoveryUpdates {
                 max_attempts,
                 delay_ms,
                 ..
-            } => self.notice(format!(
+            } => self.notice(&format!(
                 "Retrying provider request (attempt {attempt}/{max_attempts}, in {delay_ms} ms)."
             )),
             AgentEvent::FailoverStart {
@@ -2191,7 +2191,7 @@ impl AcpRecoveryUpdates {
                 to_model,
                 ..
             } => {
-                self.notice(format!(
+                self.notice(&format!(
                     "Provider fallback: {from_provider}/{from_model} → {to_provider}/{to_model}."
                 ));
                 self.committed_model(to_provider, to_model);
@@ -2202,14 +2202,14 @@ impl AcpRecoveryUpdates {
                 model,
                 restored_primary: true,
             } => {
-                self.notice(format!("Restored primary provider: {provider}/{model}."));
+                self.notice(&format!("Restored primary provider: {provider}/{model}."));
                 self.committed_model(provider, model);
             }
             _ => {}
         }
     }
 
-    fn notice(&self, text: String) {
+    fn notice(&self, text: &str) {
         let _ = self.out.send(json_rpc_notification(
             "session/update",
             json!({
@@ -2244,19 +2244,19 @@ impl AcpRecoveryUpdates {
                 .unwrap_or_else(|| "off".to_string());
             session_config_options((provider, model), &thinking, &self.available_models)
         };
-        self.configuration(configuration);
+        self.configuration(&configuration);
     }
 
-    fn configuration(&self, configuration: Value) {
+    fn configuration(&self, configuration: &Value) {
         {
             let mut previous = self
                 .last_configuration
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *previous == configuration {
+            if *previous == *configuration {
                 return;
             }
-            previous.clone_from(&configuration);
+            previous.clone_from(configuration);
         }
         let _ = self.out.send(json_rpc_notification(
             "session/update",
@@ -2271,7 +2271,7 @@ impl AcpRecoveryUpdates {
     }
 
     fn finish(&self, handle: &AgentSessionHandle) {
-        self.configuration(config_options_for_handle(handle, &self.available_models));
+        self.configuration(&config_options_for_handle(handle, &self.available_models));
     }
 }
 

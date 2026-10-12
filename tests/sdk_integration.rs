@@ -342,29 +342,32 @@ fn sdk_run_limit_reaches_the_live_agent_and_persists_its_terminal_turn() {
                 scripted: Arc::clone(&provider),
             });
             handle.session_mut().agent.set_provider(scripted_transport);
-            let events = handle
-                .prompt("Run with the configured time budget")
+            let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            let prompt_events = Arc::clone(&events);
+            handle
+                .prompt("Run with the configured time budget", move |event| {
+                    let type_name = match &event {
+                        AgentEvent::AgentEnd { .. } => "agent_end",
+                        AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
+                        _ => return,
+                    };
+                    prompt_events.lock().expect("lock").push(type_name);
+                })
                 .await
                 .expect("successful terminal turn");
+            let events = events.lock().expect("lock").clone();
             assert_eq!(handle.model(), expected_model);
             assert_eq!(
                 provider.call_count.load(Ordering::SeqCst),
                 usize::from(!capped)
             );
             assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["type"] == "agent_end")
-                    .count(),
+                events.iter().filter(|event| **event == "agent_end").count(),
                 1,
                 "exactly one terminal event for {label}"
             );
             // ubs:ignore rust.panic.assert-macros -- Regression assertion: a terminal time cap must not enter provider retry.
-            assert!(
-                events
-                    .iter()
-                    .all(|event| event["type"] != "auto_retry_start")
-            );
+            assert!(events.iter().all(|event| *event != "auto_retry_start"));
             let path = handle
                 .with_session(|session| session.path.clone())
                 .await

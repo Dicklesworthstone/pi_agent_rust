@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, StopReason, StreamEvent};
 
 mod request;
-pub(crate) use request::with_timeout_and_abort;
+pub use request::with_timeout_and_abort;
 pub use request::{RequestStop, with_timeout};
 
 /// Auxiliary calls request only a few hundred tokens. Bound host-side output
@@ -83,7 +83,7 @@ pub fn redact_inputs(parts: &[&str], privacy: &AuxiliaryPrivacy) -> Result<Vec<S
 
 /// Preserve discoveries from the live conversation without sharing its
 /// mutable vault or exporting reversible IDs to a secondary model.
-pub(crate) fn redact_inputs_with_vault(
+pub fn redact_inputs_with_vault(
     parts: &[&str],
     privacy: &AuxiliaryPrivacy,
     known_secrets: &crate::secrets::SecretVault,
@@ -119,7 +119,7 @@ pub(crate) fn redact_inputs_with_vault(
 /// Keeping JSON structure preserves assignment context and anchored patterns.
 /// The supplied vault must be a private projection snapshot. Successful scans
 /// retain discoveries for subsequent projections without changing a live Agent.
-pub(crate) fn redact_json_with_vault(
+pub fn redact_json_with_vault(
     value: &serde_json::Value,
     privacy: &AuxiliaryPrivacy,
     known_secrets: &mut crate::secrets::SecretVault,

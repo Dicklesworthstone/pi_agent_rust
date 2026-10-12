@@ -391,6 +391,7 @@ fn resolve_no_proxy_raw(
 
 /// Recognize loopback without DNS: resolving arbitrary hosts here would leak
 /// SOCKS5h destination queries and change the user's remote routing policy.
+#[allow(clippy::option_if_let_else)]
 fn is_loopback_host(host: &str) -> bool {
     if host
         .strip_suffix('.')

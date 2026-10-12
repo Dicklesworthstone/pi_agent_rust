@@ -111,15 +111,15 @@ mod tests {
 
     #[async_trait]
     impl Provider for PendingProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ownership-fixture"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "ownership-fixture"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "ownership-fixture"
         }
 
@@ -345,15 +345,15 @@ mod tests {
 
     #[async_trait]
     impl Provider for WriteThenPending {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ownership-fixture"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "ownership-fixture"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "ownership-fixture"
         }
 

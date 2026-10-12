@@ -726,7 +726,7 @@ where
         })
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         // A failed generation cannot be made executable by a later STOP or
         // function-call chunk. Usage metadata is still collected by the
@@ -3024,6 +3024,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn rejected_gemini_tool_batches_never_execute_a_write() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};

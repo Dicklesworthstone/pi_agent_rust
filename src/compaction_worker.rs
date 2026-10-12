@@ -683,6 +683,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn background_compaction_preserves_header_auth_and_operation_options() {
         run_async(|runtime_handle| async move {
             let observed = Arc::new(std::sync::Mutex::new(Vec::new()));

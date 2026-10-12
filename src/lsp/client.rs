@@ -354,6 +354,9 @@ impl LspClient {
             .map(|document| std::sync::Arc::clone(&document.text))
     }
 
+    // The generation guard covers the whole drain-and-apply, so a concurrent
+    // poller cannot publish an older batch after a newer one was applied.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn poll_notifications(&self) {
         // Hold one owner across drain and apply: concurrent callers must not
         // publish an earlier batch after a newer one has already been applied.
@@ -733,7 +736,7 @@ mod tests {
             let (id, response) = peer.client.rpc.request("test/frames", Value::Null).unwrap();
             let observed =
                 crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
-                    peer.client.rpc.cancel_request(id)
+                    peer.client.rpc.cancel_request(id);
                 })
                 .await
                 .expect("peer observation arrived")

@@ -683,6 +683,7 @@ impl MemoryStore {
 // ---------------------------------------------------------------------------
 
 /// Replace any detected credential in `content` with a placeholder.
+///
 /// Project facts never store detected secrets; shared session values are exact.
 /// No raw-value map or restorable session placeholder is retained.
 #[must_use]

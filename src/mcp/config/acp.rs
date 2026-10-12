@@ -71,7 +71,8 @@ impl Write for SizeLimit {
 /// `None` means the client omitted the field, while `Some([])` explicitly
 /// selects no servers. That distinction matters when reattaching a live
 /// session: an omitted field must not disconnect its existing tools.
-pub(crate) fn parse_acp_servers(
+#[allow(clippy::too_many_lines)] // Keep every wire-shape refusal in one ordered pass.
+pub fn parse_acp_servers(
     params: &Value,
     cwd: &Path,
 ) -> Result<Option<Vec<ConfiguredServer>>, String> {
@@ -202,7 +203,7 @@ mod tests {
         std::env::current_exe().unwrap().display().to_string()
     }
 
-    fn parse(servers: Value) -> Result<Vec<ConfiguredServer>, String> {
+    fn parse(servers: &Value) -> Result<Vec<ConfiguredServer>, String> {
         parse_acp_servers(&json!({"mcpServers": servers}), Path::new("/workspace"))
             .map(|value| value.expect("field supplied"))
     }
@@ -214,15 +215,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(parse(json!([])).unwrap().is_empty());
+        assert!(parse(&json!([])).unwrap().is_empty());
         for invalid in [Value::Null, json!({}), json!(false)] {
-            assert!(parse(invalid).is_err());
+            assert!(parse(&invalid).is_err());
         }
     }
 
     #[test]
     fn decodes_stdio_and_http_without_resolving_literal_values() {
-        let servers = parse(json!([
+        let servers = parse(&json!([
             {"name":"stdio","command":command(),"args":["--flag","a b"],
              "env":[{"name":"TOKEN","value":"$CMD:must-not-run"}]},
             {"type":"http","name":"remote","url":"https://example.invalid/mcp",
@@ -256,7 +257,7 @@ mod tests {
             json!([{"name":"one","command":command(),"headers":[]}]),
             json!([{"name":"one","command":"relative-command"}]),
         ] {
-            assert!(parse(servers).is_err());
+            assert!(parse(&servers).is_err());
         }
     }
 
@@ -268,7 +269,7 @@ mod tests {
             json!([{"name":"Authorization","value":"a\r\nb"}]),
         ] {
             assert!(
-                parse(json!([{"type":"http","name":"remote",
+                parse(&json!([{"type":"http","name":"remote",
                 "url":"https://example.invalid/mcp","headers":headers}]))
                 .is_err()
             );
@@ -278,23 +279,23 @@ mod tests {
             "https://user:secret@example.invalid",
             "https://example.invalid/#x",
         ] {
-            let error = parse(json!([{"type":"http","name":"remote","url":url}])).unwrap_err();
+            let error = parse(&json!([{"type":"http","name":"remote","url":url}])).unwrap_err();
             assert!(!error.contains("secret"));
         }
         assert!(
-            parse(json!([{"name":"one","command":command(),"env":[
+            parse(&json!([{"name":"one","command":command(),"env":[
             {"name":"PATH","value":"a"},{"name":"Path","value":"b"}]}]))
             .is_err()
         );
-        assert!(parse(json!([{"name":"bad\nname","command":"x"}])).is_err());
+        assert!(parse(&json!([{"name":"bad\nname","command":"x"}])).is_err());
     }
 
     #[test]
     fn bounds_count_and_total_input_before_cloning() {
         let repeated = vec![json!({"name":"one","command":"x"}); MAX_ACP_MCP_SERVERS + 1];
-        assert!(parse(json!(repeated)).unwrap_err().contains("at most"));
+        assert!(parse(&json!(repeated)).unwrap_err().contains("at most"));
         assert!(
-            parse(json!([{"name":"one","command":"x",
+            parse(&json!([{"name":"one","command":"x",
             "args":["x".repeat(MAX_MCP_CONFIG_BYTES)]}]))
             .unwrap_err()
             .contains("byte")

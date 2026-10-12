@@ -132,6 +132,8 @@ impl ServiceControl {
         self.stop_requested.store(true, Ordering::Release);
     }
 
+    // Waiters are notified while the completion lock is still held, as written.
+    #[allow(clippy::significant_drop_tightening)]
     fn finish(&self, snapshot: ServiceSnapshot) {
         let mut completion = self
             .completion
@@ -143,6 +145,9 @@ impl ServiceControl {
         self.completed.notify_all();
     }
 
+    // The guard is consumed by the condvar wait and handed back; the lint has
+    // no narrower scope to offer.
+    #[allow(clippy::significant_drop_tightening)]
     fn wait_until(&self, name: &str, deadline: Instant) -> Result<ServiceSnapshot> {
         let completion = self
             .completion
@@ -216,6 +221,9 @@ impl ServiceRequest {
         Ok(())
     }
 
+    // The startup slot stays locked across the cancellation check and the
+    // write, so `cancel()` cannot slip between them.
+    #[allow(clippy::significant_drop_tightening)]
     fn own_startup(&self, name: &str, control: &Arc<ServiceControl>) -> Result<()> {
         let mut startup = self
             .startup
@@ -1281,6 +1289,9 @@ fn write_service_artifact<W: Write>(artifact: &mut W, capture: &mut LogCapture, 
     capture.truncated = capture.dropped_bytes != 0;
 }
 
+// The ring is locked while a chunk is pushed and its capture counters are
+// copied, so readers never see bytes without the matching counts.
+#[allow(clippy::significant_drop_tightening)]
 fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: &Mutex<Ring>) {
     let mut capture = LogCapture {
         drain_state: LogDrainState::Streaming,
@@ -1708,6 +1719,9 @@ pub fn describe(name: &str) -> Result<ServiceSnapshot> {
 
 /// Kill every non-detached service (session exit). Called once from the
 /// main shutdown chokepoint next to `jobs::kill_all`.
+// The registry lock covers both marking the victims and persisting that
+// state, so the detached-state file never records a half-applied stop.
+#[allow(clippy::significant_drop_tightening)]
 pub fn kill_session_services() {
     let deadline = Instant::now() + SETTLEMENT_BUDGET;
     let controls = {
@@ -1985,6 +1999,7 @@ mod tests {
 
     /// Exercise the real pump's short-write and failure paths without an
     /// unreliable host-level disk exhaustion dependency.
+    #[allow(clippy::struct_excessive_bools)]
     struct FailingArtifact {
         bytes: Vec<u8>,
         remaining: usize,
@@ -2031,6 +2046,7 @@ mod tests {
     #[test]
     fn artifact_write_failures_report_actual_prefix_and_keep_draining() {
         let input = b"first line\nready after write failure\nlast line";
+        let ready_log = regex::Regex::new("(?m)^ready after write failure$").expect("regex");
         for fail_with_zero in [false, true] {
             let mut artifact = FailingArtifact {
                 bytes: Vec::new(),
@@ -2048,9 +2064,7 @@ mod tests {
                 terminal_error: false,
             };
             let mut output = Ring::new(8);
-            output.watch_readiness(Some(
-                regex::Regex::new("(?m)^ready after write failure$").expect("regex"),
-            ));
+            output.watch_readiness(Some(ready_log.clone()));
             let ring = Mutex::new(output);
             pump_service_stream(reader, &mut artifact, &ring);
             assert_eq!(artifact.bytes, &input[..7]);

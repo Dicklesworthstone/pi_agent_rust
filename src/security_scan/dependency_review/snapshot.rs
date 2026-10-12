@@ -255,6 +255,7 @@ impl Snapshot {
         Self::from_run(run, digest(bytes))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_run(run: Run, digest: String) -> Result<Self> {
         let props = run.properties;
         if run.tool.driver.name != "pi dependency audit"

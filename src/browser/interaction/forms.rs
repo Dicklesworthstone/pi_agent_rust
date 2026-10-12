@@ -33,11 +33,11 @@ pub(in crate::browser) fn validate(args: &Value) -> Result<()> {
     let action = args["action"].as_str().unwrap_or_default();
     if !is_action(action)
         || object.keys().any(|key| {
-            !matches!(
+            !(matches!(
                 key.as_str(),
                 "action" | "tab" | "frame" | "selector" | "timeout_ms"
-            ) && !(action == "select_option" && key == "options")
-                && !(action == "set_checked" && key == "checked")
+            ) || action == "select_option" && key == "options"
+                || action == "set_checked" && key == "checked")
         })
         || args["selector"]
             .as_str()
@@ -171,13 +171,6 @@ fn matches_request(args: &Value, state: &Selection) -> bool {
 
 fn helper_value(response: &Value) -> Result<Value> {
     if let Some(exception) = response.get("exceptionDetails") {
-        // Echo only exact codes from our helper, never arbitrary page exception
-        // text, option labels, source snippets or entered credentials.
-        let first = exception["exception"]["description"]
-            .as_str()
-            .and_then(|text| text.lines().next())
-            .unwrap_or_default();
-        let code = first.strip_prefix("Error: ").unwrap_or(first);
         const CODES: &[&str] = &[
             "BROWSER_FORM_STALE_ELEMENT",
             "BROWSER_FORM_DISABLED",
@@ -200,6 +193,13 @@ fn helper_value(response: &Value) -> Result<Value> {
             "BROWSER_FORM_SELECTION_NOT_RETAINED",
             "BROWSER_FORM_NOT_CHECKABLE",
         ];
+        // Echo only exact codes from our helper, never arbitrary page exception
+        // text, option labels, source snippets or entered credentials.
+        let first = exception["exception"]["description"]
+            .as_str()
+            .and_then(|text| text.lines().next())
+            .unwrap_or_default();
+        let code = first.strip_prefix("Error: ").unwrap_or(first);
         let code = CODES
             .iter()
             .copied()
@@ -494,6 +494,7 @@ async fn set_checked(
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn args(options: Value) -> Value {
         json!({"action":"select_option","selector":"#choice","options":options})
     }

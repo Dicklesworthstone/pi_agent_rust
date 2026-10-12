@@ -97,9 +97,10 @@ fn ipc_error(code: &str, message: &str) -> Error {
     Error::tool("hub", format!("PI_HUB_IPC_{code}: {message}"))
 }
 
-/// Any inherited channel marker activates the restricted child route. Partial
-/// or invalid configuration must fail closed instead of reading an empty local
-/// registry or accidentally invoking local process-control operations.
+/// Any inherited channel marker activates the restricted child route.
+///
+/// Partial or invalid configuration must fail closed instead of reading an empty
+/// local registry or accidentally invoking local process-control operations.
 #[must_use]
 pub fn inherited_channel_present() -> bool {
     std::env::var_os(ADDRESS_ENV).is_some() || std::env::var_os(TOKEN_ENV).is_some()
@@ -121,9 +122,10 @@ fn inherited_endpoint() -> Result<Option<(SocketAddr, String)>> {
     Ok(Some((address, token)))
 }
 
-/// Submit exactly one request, without automatic retries. If an acknowledged
-/// write is interrupted, the recipient inbox is the delivery record; retrying
-/// an uncertain send can otherwise deliver the same message twice.
+/// Submit exactly one request, without automatic retries.
+///
+/// If an acknowledged write is interrupted, the recipient inbox is the delivery
+/// record; retrying an uncertain send can otherwise deliver the same message twice.
 pub async fn call_from_env(request: Request) -> Result<Option<Reply>> {
     let Some((address, token)) = inherited_endpoint()? else {
         return Ok(None);
@@ -385,8 +387,8 @@ impl Connection {
         }
     }
 
-    fn set_response(&mut self, response: WireResponse) {
-        let encoded = serde_json::to_vec(&response)
+    fn set_response(&mut self, response: &WireResponse) {
+        let encoded = serde_json::to_vec(response)
             .ok()
             .filter(|bytes| bytes.len() < MAX_RESPONSE_BYTES)
             .unwrap_or_else(|| {
@@ -400,9 +402,10 @@ impl Connection {
     }
 
     fn refuse(&mut self, code: &str, message: &str) {
-        self.set_response(WireResponse::Error(ipc_error(code, message).to_string()));
+        self.set_response(&WireResponse::Error(ipc_error(code, message).to_string()));
     }
 
+    #[allow(clippy::option_if_let_else)]
     fn poll(&mut self, sender: &str, token: &str, owner: &AgentCx, deadline: Instant) -> bool {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
             return false;
@@ -435,7 +438,7 @@ impl Connection {
                                 }
                                 Err(_) => Err(ipc_error("PROTOCOL", "invalid request frame")),
                             };
-                            self.set_response(match response {
+                            self.set_response(&match response {
                                 Ok(reply) => WireResponse::Ok(reply),
                                 Err(error) => WireResponse::Error(error.to_string()),
                             });
@@ -519,6 +522,7 @@ fn dispatch_authenticated(
     dispatch(&mut hub, sender, request.request)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn dispatch(hub: &mut AgentHubRegistry, sender: &str, request: Request) -> Result<Reply> {
     if hub.control_pid(sender).is_none()
         || hub
@@ -837,17 +841,18 @@ mod tests {
         let mut send = request(Action::Send);
         send.name = Some(peer.id.clone());
         send.text = Some("first native message".to_string());
-        let first = match dispatch(&mut hub, &sender.id, send).expect("send peer") {
-            Reply::Sent { message } => message,
-            _ => panic!("expected sent reply"),
+        let Reply::Sent { message: first } =
+            dispatch(&mut hub, &sender.id, send).expect("send peer")
+        else {
+            panic!("expected sent reply")
         };
         assert_eq!(first.from, sender.id);
         assert_eq!(first.to, peer.id);
         let mut inbox = request(Action::Inbox);
         inbox.name = Some("self".to_string());
-        let messages = match dispatch(&mut hub, &peer.id, inbox).expect("own inbox") {
-            Reply::Inbox { messages, .. } => messages,
-            _ => panic!("expected inbox"),
+        let Reply::Inbox { messages, .. } = dispatch(&mut hub, &peer.id, inbox).expect("own inbox")
+        else {
+            panic!("expected inbox")
         };
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].body, "first native message");
@@ -860,9 +865,9 @@ mod tests {
         let mut report = request(Action::Send);
         report.name = Some("parent".to_string());
         report.text = Some("child report".to_string());
-        let message = match dispatch(&mut hub, &sender.id, report).expect("parent send") {
-            Reply::Sent { message } => message,
-            _ => panic!("expected sent reply"),
+        let Reply::Sent { message } = dispatch(&mut hub, &sender.id, report).expect("parent send")
+        else {
+            panic!("expected sent reply")
         };
         assert!(message.seq > first.seq);
         assert_eq!(hub.inbox("parent")[0].from, sender.id);

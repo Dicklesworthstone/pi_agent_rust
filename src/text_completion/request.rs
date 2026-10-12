@@ -52,7 +52,7 @@ where
 /// Inline requests initiated by an agent turn also observe its explicit abort
 /// signal. Interactive cancellation uses that signal without cancelling the
 /// executor context, which must remain alive to persist and finish the turn.
-pub(crate) async fn with_timeout_and_abort<F>(
+pub async fn with_timeout_and_abort<F>(
     timeout: Duration,
     abort: Option<&crate::agent::AbortSignal>,
     future: F,

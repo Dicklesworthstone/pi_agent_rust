@@ -303,6 +303,7 @@ fn preparation_screens_individual_complete_fields_before_excerpting() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn preparation_retains_live_vault_discoveries_without_exporting_reversible_ids() {
     run_async(async {
         let provider =
@@ -495,6 +496,7 @@ fn entry(provider: &str, url: &str, key: Option<&str>) -> ModelEntry {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn resolved_credentials_and_headers_reach_the_role_without_cross_destination_override() {
     run_async(async {
         let dir = tempfile::tempdir().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated fixture storage is required.
@@ -606,6 +608,7 @@ fn agent_session(provider: Arc<dyn Provider>, session: Session, save: bool) -> A
     )
 }
 
+#[allow(clippy::future_not_send)]
 async fn persist_exchange(agent_session: &mut AgentSession, messages: Vec<Message>) {
     let cx = crate::agent_cx::AgentCx::for_request();
     let mut session = agent_session.session.lock(cx.cx()).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup requires the session lock.

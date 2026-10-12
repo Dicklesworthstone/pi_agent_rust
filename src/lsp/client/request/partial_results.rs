@@ -124,6 +124,8 @@ impl<'a> PartialOwner<'a> {
         })
     }
 
+    // Token ownership and any recorded failure are read under one inbox lock.
+    #[allow(clippy::significant_drop_tightening)]
     fn check(&self) -> Result<()> {
         // Any queue loss may have been one of our fragments. A subsequent
         // successful response cannot prove the missing part was harmless.

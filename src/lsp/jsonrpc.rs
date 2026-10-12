@@ -492,7 +492,7 @@ struct ProcessReaper {
 }
 
 impl ServerProcess {
-    fn new(child: ProcessGuard) -> Self {
+    const fn new(child: ProcessGuard) -> Self {
         Self {
             cleanup: Mutex::new(ProcessCleanup {
                 child: Some(child),
@@ -501,6 +501,9 @@ impl ServerProcess {
         }
     }
 
+    // The cleanup guard keeps `close` from retiring the child while its
+    // pipes are being taken.
+    #[allow(clippy::significant_drop_tightening)]
     fn take_pipes(
         &self,
     ) -> std::io::Result<(
@@ -531,6 +534,7 @@ impl ServerProcess {
         Ok((stdin, stdout, stderr))
     }
 
+    #[allow(clippy::option_if_let_else)]
     fn child_exited(&self) -> bool {
         let mut cleanup = lock(&self.cleanup);
         match cleanup.child.as_mut() {
@@ -547,25 +551,25 @@ impl ServerProcess {
         if let Some(child) = cleanup.child.take() {
             let child = Arc::new(Mutex::new(Some(child)));
             let worker_child = Arc::clone(&child);
-            match std::thread::Builder::new()
+            if let Ok(worker) = std::thread::Builder::new()
                 .name("pi-lsp-reaper".to_string())
                 .spawn(move || {
                     lock(&worker_child)
                         .as_mut()
                         .ok_or_else(|| std::io::Error::other("server reaper lost its child"))?
                         .terminate_and_wait()
-                }) {
-                Ok(worker) => cleanup.reaper = Some(ProcessReaper { worker, child }),
-                Err(_) => {
-                    // The OS can refuse another thread. Cleanup still owns
-                    // the child and must not silently drop its reap obligation.
-                    let mut child = lock(&child)
-                        .take()
-                        .ok_or_else(|| std::io::Error::other("server cleanup lost its child"))?;
-                    if let Err(error) = child.terminate_and_wait() {
-                        cleanup.child = Some(child);
-                        return Err(error);
-                    }
+                })
+            {
+                cleanup.reaper = Some(ProcessReaper { worker, child });
+            } else {
+                // The OS can refuse another thread. Cleanup still owns
+                // the child and must not silently drop its reap obligation.
+                let mut child = lock(&child)
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("server cleanup lost its child"))?;
+                if let Err(error) = child.terminate_and_wait() {
+                    cleanup.child = Some(child);
+                    return Err(error);
                 }
             }
         }
@@ -722,6 +726,7 @@ impl JsonRpcClient {
     /// # Errors
     ///
     /// Same spawn failures as [`Self::spawn`].
+    #[allow(clippy::too_many_lines)]
     pub fn spawn_with_policy(
         command: &str,
         args: &[String],

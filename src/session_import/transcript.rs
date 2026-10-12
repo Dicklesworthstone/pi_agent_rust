@@ -98,7 +98,7 @@ fn has_calls(message: &AssistantMessage) -> bool {
 /// A matching output ID cannot turn an interrupted/failed model response into
 /// a completed call. Failed tool *executions* are different: their is_error
 /// results still complete a successfully authored call and remain replayable.
-fn assistant_allows_tool_replay(message: &AssistantMessage) -> bool {
+const fn assistant_allows_tool_replay(message: &AssistantMessage) -> bool {
     matches!(message.stop_reason, StopReason::Stop | StopReason::ToolUse)
         && message.error_message.is_none()
 }

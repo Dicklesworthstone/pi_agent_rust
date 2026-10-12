@@ -532,6 +532,7 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
         AGENT_EVENTS_SUB_ID
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(&self, sender: SubscriptionSender<PiFtuiMsg>, stop: StopSignal) {
         let Some(rx) = self.rx.lock().ok().and_then(|mut slot| slot.take()) else {
             // Already consumed (or poisoned): nothing to drain. The runtime
@@ -2225,7 +2226,8 @@ impl PiFtuiModel {
         self.file_ref_cwd.clone_from(&launch.cwd);
         self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
-        self.extension_commands = launch.catalog.extension_commands.clone();
+        self.extension_commands
+            .clone_from(&launch.catalog.extension_commands);
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
         self.autocomplete.close();
@@ -3086,7 +3088,8 @@ impl PiFtuiModel {
                 // list once the driver's session (and its extension
                 // runtime) exists. Any open popup was computed against the
                 // old list; drop it, the next keystroke recomputes.
-                self.extension_commands = catalog.extension_commands.clone();
+                self.extension_commands
+                    .clone_from(&catalog.extension_commands);
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
@@ -3194,17 +3197,16 @@ impl PiFtuiModel {
             } if self
                 .displayed_session_id
                 .as_deref()
-                .is_none_or(|shown| shown == owner_session_id) =>
+                .is_none_or(|shown| shown == owner_session_id)
+                && !text.is_empty() =>
             {
-                if !text.is_empty() {
-                    let draft = self.input.text();
-                    let restored = if draft.is_empty() {
-                        text
-                    } else {
-                        format!("{text}\n\n{draft}")
-                    };
-                    self.input.set_text(&restored);
-                }
+                let draft = self.input.text();
+                let restored = if draft.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{draft}")
+                };
+                self.input.set_text(&restored);
             }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -4435,10 +4437,10 @@ impl PiFtuiModel {
     }
 
     fn send_settings_command(&mut self, command: UiCommand) {
-        if !self
+        if self
             .submit_tx
             .as_ref()
-            .is_some_and(|tx| tx.send(command).is_ok())
+            .is_none_or(|tx| tx.send(command).is_err())
         {
             self.settings_pending = false;
             self.busy = None;
@@ -6253,7 +6255,7 @@ const BTW_UNAVAILABLE: &str =
 /// Only bounded, protected text crosses into the background provider task.
 /// The answer is display-only and never enters the session.
 async fn run_btw_command(
-    handle: &mut crate::sdk::AgentSessionHandle,
+    handle: &crate::sdk::AgentSessionHandle,
     client: Option<&Arc<crate::btw::BtwClient>>,
     question: String,
     owner_session_id: String,
@@ -6543,6 +6545,7 @@ async fn run_prompt_turn(
 
 /// One controlled turn; returns the text of inputs it never claimed and
 /// whether completion requires a pause before those inputs may run.
+#[allow(clippy::option_if_let_else)]
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -7026,7 +7029,7 @@ async fn run_extension_command(
 /// Handle the default FTUI's MCP control surface against the manager owned by
 /// this exact SDK session (bd-vjfol).
 async fn run_mcp_command(
-    handle: &mut crate::sdk::AgentSessionHandle,
+    handle: &crate::sdk::AgentSessionHandle,
     subcommand: &str,
     name: Option<&str>,
     agent_tx: &Sender<PiMsg>,
@@ -9303,11 +9306,10 @@ pub fn run(
                             run_undo_command(&handle, count, force, redo, &agent_tx);
                         }
                         Ok(UiCommand::Usage { refresh }) => {
-                            run_usage_command(&cwd, refresh, &agent_tx).await;
+                            run_usage_command(&bash_cwd, refresh, &agent_tx).await;
                         }
                         Ok(UiCommand::Mcp { subcommand, name }) => {
-                            run_mcp_command(&mut handle, &subcommand, name.as_deref(), &agent_tx)
-                                .await;
+                            run_mcp_command(&handle, &subcommand, name.as_deref(), &agent_tx).await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             // A prompt template runs as a turn, unless an
@@ -9521,7 +9523,7 @@ pub fn run(
                             owner_session_id,
                         }) => {
                             run_btw_command(
-                                &mut handle,
+                                &handle,
                                 driver_btw_client.as_ref(),
                                 question,
                                 owner_session_id,
@@ -12708,6 +12710,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn drain_loop_bridges_agent_channel_until_disconnect() {
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, msg_rx) = mpsc::channel::<PiFtuiMsg>();
@@ -12726,6 +12729,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn drain_loop_honors_stop_predicate() {
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, _msg_rx) = mpsc::channel::<PiFtuiMsg>();
@@ -12736,6 +12740,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn drain_loop_stops_consuming_when_the_runtime_sender_fails() {
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, msg_rx) = mpsc::channel::<PiFtuiMsg>();
@@ -15453,6 +15458,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn side_question_driver_rejects_stale_owners_and_screens_remembered_credentials() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -15477,7 +15483,7 @@ mod tests {
                 false,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
-            let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            let handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
                 session,
                 crate::sdk::EventListeners::default(),
             );
@@ -15491,7 +15497,7 @@ mod tests {
             );
             let (agent_tx, agent_rx) = mpsc::channel();
             run_btw_command(
-                &mut handle,
+                &handle,
                 Some(&blocked_client),
                 String::from("a clean but stale question"),
                 String::from("replaced-session"),
@@ -15501,7 +15507,7 @@ mod tests {
             .await;
             assert!(agent_rx.try_recv().is_err());
             run_btw_command(
-                &mut handle,
+                &handle,
                 Some(&blocked_client),
                 format!("Does {known} still work?"),
                 owner_session_id.clone(),
@@ -15521,7 +15527,7 @@ mod tests {
             // in the current transcript.
             let redacting_client = Arc::new(crate::btw::BtwClient::new(provider.clone(), None));
             run_btw_command(
-                &mut handle,
+                &handle,
                 Some(&redacting_client),
                 format!("Does {known} still work?"),
                 owner_session_id.clone(),
@@ -17031,6 +17037,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn capped_turn_returns_pending_input_and_reports_only_a_durable_pause() {
         use crate::agent::AgentEvent;
         use crate::model::{ContentBlock, Message, UserContent};
@@ -17211,7 +17218,7 @@ mod tests {
                                 if text == "initial capped prompt")
                     ))
                 );
-                let expected_markers = if fail_save { 0 } else { 1 };
+                let expected_markers = usize::from(!fail_save);
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     messages
@@ -17404,6 +17411,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn typed_prompt_scans_prose_without_file_names_bodies_or_template_bytes() {
         use crate::model::{ThinkingLevel, UserContent};
         let dir = tempfile::tempdir().unwrap();
@@ -17457,6 +17465,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn initial_native_prompt_keeps_prepared_bytes_order_and_authored_authority_once() {
         use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
         use base64::Engine as _;
@@ -17597,6 +17606,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn retry_driver_preserves_interleaved_native_blocks_and_plain_text() {
         use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent, UserContent};
         let blocks = vec![

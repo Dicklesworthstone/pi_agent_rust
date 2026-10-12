@@ -109,7 +109,7 @@ fn validate_reports(raw: Value, open_docs: &HashMap<String, OpenDoc>) -> Result<
             ));
         }
         if let Some(id) = report.get("resultId")
-            && !id.as_str().is_some_and(|id| id.len() <= MAX_ID_BYTES)
+            && id.as_str().is_none_or(|id| id.len() > MAX_ID_BYTES)
         {
             return Err(report_error("resultId must be a bounded string"));
         }
@@ -207,6 +207,9 @@ impl LspClient {
     /// Refuses unsupported servers, malformed/oversized/incremental responses,
     /// version mismatches, local document changes, cancellation, notification
     /// loss and timeout. Failed attempts discard all of their fragments.
+    // `options` borrows from the capabilities guard, which the enclosing
+    // block already releases before the first await.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn workspace_diagnostics(&self, timeout: Duration) -> Result<Vec<Value>> {
         let budget = RequestBudget::new(timeout);
         budget.remaining().map_err(Error::from)?;

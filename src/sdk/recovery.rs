@@ -1205,6 +1205,7 @@ mod persistence_fence_tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn terminal_observers_see_the_fence_before_the_logical_turn_ends() {
         let admission = ProviderAdmissionGate::default();
         let observed = admission.clone();

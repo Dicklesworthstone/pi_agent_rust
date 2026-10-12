@@ -823,6 +823,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn clearing_shared_catalog_expires_ids_even_when_bytes_return() {
         let catalog = AttachmentCatalog::default();
         let old = catalog.register("YWJj").unwrap();

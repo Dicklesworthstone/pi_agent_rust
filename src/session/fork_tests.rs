@@ -7,9 +7,9 @@ use crate::session_workdir::{
 };
 use serde_json::json;
 
-pub(crate) const WORKSPACE_CONTEXT: &str = "FORK_WORKSPACE_CONTEXT: continue in this project.";
+pub const WORKSPACE_CONTEXT: &str = "FORK_WORKSPACE_CONTEXT: continue in this project.";
 
-pub(crate) struct WorkspaceFixture {
+pub struct WorkspaceFixture {
     pub source: Session,
     pub target_id: String,
     pub root_target_id: String,
@@ -84,7 +84,7 @@ fn assistant(text: &str) -> SessionMessage {
 /// The active conversation contains an older attachment, while the latest
 /// binding and another user message live on an omitted branch. Large fixtures
 /// exercise the real automatic V2 threshold without changing process globals.
-pub(crate) async fn workspace_fixture(root: &Path, lazy: bool) -> WorkspaceFixture {
+pub async fn workspace_fixture(root: &Path, lazy: bool) -> WorkspaceFixture {
     let root = root.canonicalize().expect("canonical fixture root");
     let original_cwd = root.join("moved-original-workspace");
     let previous_cwd = root.join("previous-workspace");

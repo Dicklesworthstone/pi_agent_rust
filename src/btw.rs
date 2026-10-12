@@ -858,6 +858,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn anchored_patterns_apply_to_source_text_before_display_labels() {
         asupersync::test_utils::run_test(|| async {
             for mode in ["obfuscate", "block"] {

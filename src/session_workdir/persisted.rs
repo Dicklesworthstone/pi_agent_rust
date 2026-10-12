@@ -68,6 +68,7 @@ impl SavedSessionWorkdir {
     /// constructing tools. An explicit runtime directory is a consistency
     /// assertion, not permission to replace the session's attachment.
     /// Neither this method nor discovery changes the process cwd.
+    #[allow(clippy::unnecessary_debug_formatting)]
     pub fn resolve_runtime_cwd(&self, requested: Option<&Path>) -> Result<PathBuf> {
         let expected = super::WorkdirHealth::inspect(&self.workdir.bound_cwd)
             .into_directory(&self.workdir.bound_cwd)?;
@@ -92,6 +93,7 @@ impl SavedSessionWorkdir {
 }
 
 /// Open a saved session for an existing runtime without changing its workspace.
+///
 /// Discover session-wide metadata before native loading, then verify that the
 /// loaded transcript still belongs to that observation before installation.
 pub async fn open_session_for_runtime(path: &Path, runtime_cwd: &Path) -> Result<Session> {
@@ -297,10 +299,12 @@ impl Drop for CancelRead {
 }
 
 /// Inspect a saved session without starting a model, extension, or tool and
-/// without saving, repairing, or moving it. JSONL discovery scans bounded lines
-/// on a worker and ignores V2 hydration settings and media sidecars. SQLite
-/// uses its native full-session reader, including its existing integrity and
-/// read-only access rules; that optional backend may hydrate attachments.
+/// without saving, repairing, or moving it.
+///
+/// JSONL discovery scans bounded lines on a worker and ignores V2 hydration
+/// settings and media sidecars. SQLite uses its native full-session reader,
+/// including its existing integrity and read-only access rules; that optional
+/// backend may hydrate attachments.
 ///
 /// This does not authorize execution or replace transcript validation. Open
 /// the original store normally, then call [`SavedSessionWorkdir::check_loaded_session`]

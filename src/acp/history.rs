@@ -412,7 +412,7 @@ async fn replay_blocks(
 async fn replay_message(message: &Message, id: &str, out: &AcpOutput) -> HistoryResult<()> {
     match message {
         Message::User(message) => {
-            replay_user_content(&message.content, "user_message_chunk", id, out).await?
+            replay_user_content(&message.content, "user_message_chunk", id, out).await?;
         }
         Message::Assistant(message) => {
             for block in &message.content {
@@ -434,7 +434,7 @@ async fn replay_message(message: &Message, id: &str, out: &AcpOutput) -> History
                     }
                     _ => {
                         replay_blocks(std::slice::from_ref(block), "agent_message_chunk", id, out)
-                            .await?
+                            .await?;
                     }
                 }
             }
@@ -604,7 +604,7 @@ pub(super) async fn list(
     let root = options
         .session_dir
         .as_deref()
-        .map(|root| root.canonicalize())
+        .map(Path::canonicalize)
         .transpose();
     let root = match root {
         Ok(root) => root,

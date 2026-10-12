@@ -306,7 +306,7 @@ fn explicit_reattachment_hydrates_the_latest_binding_outside_the_active_path() {
             content: UserContent::Text("selected branch".to_string()),
             timestamp: 1,
         }));
-        let selected_leaf = source.leaf_id.clone();
+        let selected_leaf = source.leaf_id().map(str::to_owned);
         source.save().await.expect("save source");
         pi::session::create_v2_sidecar_from_jsonl(&path).expect("V2 sidecar");
         let mut partial = Session::open(path.to_str().expect("UTF-8 path"))

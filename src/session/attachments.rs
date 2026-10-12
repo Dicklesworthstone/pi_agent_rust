@@ -31,12 +31,12 @@ fn blob_error(reason: impl std::fmt::Display) -> Error {
     Error::session(format!("{ERROR_PREFIX} {reason}"))
 }
 
-pub(crate) fn is_attachment_error(error: &Error) -> bool {
+pub fn is_attachment_error(error: &Error) -> bool {
     matches!(error, Error::Session(message) if message.starts_with(ERROR_PREFIX))
 }
 
 /// Append to the entire filename: `session.jsonl` owns `session.jsonl.blobs`.
-pub(crate) fn sidecar_path(session_path: &Path) -> PathBuf {
+pub fn sidecar_path(session_path: &Path) -> PathBuf {
     let mut path = session_path.as_os_str().to_os_string();
     path.push(".blobs");
     PathBuf::from(path)
@@ -461,7 +461,7 @@ impl ReferencePlan {
 /// referenced data slots are empty there and cannot escape into a Session.
 /// Consumers can obtain graph metadata or the complete stored payload only.
 #[derive(Debug)]
-pub(crate) struct StoredEntry {
+pub struct StoredEntry {
     entry: SessionEntry,
     references: ReferencePlan,
 }
@@ -532,7 +532,7 @@ impl StoredEntry {
             }
             // Include the opening quote. Base64 uses only JSON-safe ASCII, so
             // streaming its bytes is identical to serde's string encoding.
-            writer.write_all(&json.as_bytes()[cursor..start + 1])?;
+            writer.write_all(&json.as_bytes()[cursor..=start])?;
             {
                 let engine = match reference.encoding {
                     Encoding::Standard => &STANDARD,
@@ -662,7 +662,7 @@ fn hydrate_reference_entry(
 /// Validate the native schema and every referenced blob without retaining
 /// attachment bytes. Only migration/integrity consumers use this projection;
 /// ordinary Session loading continues through the fully hydrating decoder.
-pub(crate) fn decode_stored_entry(source: Option<&Path>, json: &str) -> Result<StoredEntry> {
+pub fn decode_stored_entry(source: Option<&Path>, json: &str) -> Result<StoredEntry> {
     let original_error = match serde_json::from_str::<SessionEntry>(json) {
         Ok(entry) => {
             return Ok(StoredEntry {
@@ -689,7 +689,7 @@ pub(crate) fn decode_stored_entry(source: Option<&Path>, json: &str) -> Result<S
     Ok(StoredEntry { entry, references })
 }
 
-pub(crate) fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionEntry> {
+pub fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionEntry> {
     decode_entry_with_references(source, json).map(|(entry, _)| entry)
 }
 
@@ -698,7 +698,7 @@ pub(crate) fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionE
 /// hydrating a `Value`, which otherwise collapses duplicate member names.
 /// Opaque tool arguments and custom data retain their usual JSON semantics.
 #[cfg(feature = "sqlite-sessions")]
-pub(crate) fn validate_native_attachment_references(json: &str) -> Result<()> {
+pub fn validate_native_attachment_references(json: &str) -> Result<()> {
     let spans = native_reference_spans(json)?;
     if !spans.is_empty() {
         validate_reference_entry_shape(json, &spans)?;
@@ -955,6 +955,7 @@ mod tests {
         fs::write(path, bytes).expect("write wire fixture");
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn assert_attachment_error(error: Error, detail: &str) {
         assert!(
             is_attachment_error(&error),
@@ -1622,8 +1623,7 @@ mod tests {
             );
             assert_attachment_error(
                 crate::session::create_v2_sidecar_from_jsonl(&path)
-                    .err()
-                    .expect("migration must reject damaged bytes"),
+                    .expect_err("migration must reject damaged bytes"),
                 ERROR_PREFIX,
             );
             session.append_message(text_message("must not overwrite damaged source"));
@@ -1676,7 +1676,7 @@ mod tests {
         let huge = json!({
             "type":"message", "timestamp":"2026-01-01T00:00:00Z",
             "message":{"role":"user", "content":[
-                {"type":"image", "mimeType":"image/png", "data":reference.clone()},
+                {"type":"image", "mimeType":"image/png", "data":reference},
                 {"type":"image", "mimeType":"image/png", "data":reference}
             ]}
         });

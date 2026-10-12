@@ -54,13 +54,13 @@ async fn notifications(peer: &Fixture, frames: Vec<Value>) {
     peer_call(peer, "test/notifications", json!({"notifications":frames})).await;
 }
 
-fn progress(request: &Value, value: Value) -> Value {
+fn progress(request: &Value, value: &Value) -> Value {
     json!({"jsonrpc":"2.0","method":"$/progress","params":{
         "token":request["params"]["partialResultToken"],"value":value
     }})
 }
 
-fn completion(request: &Value, result: Value) -> Value {
+fn completion(request: &Value, result: &Value) -> Value {
     json!({"jsonrpc":"2.0","id":request["id"],"result":result})
 }
 
@@ -93,7 +93,7 @@ fn snapshot_polling_preserves_fragments_until_the_real_terminal_response() {
         let request = &requests[0];
         let expected = report("untitled:from-progress");
         notifications(&peer, vec![
-            progress(request, json!({"items":[expected]})),
+            progress(request, &json!({"items":[expected]})),
             json!({"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"quiescent":true}}),
         ]).await;
         assert!(peer.client.diagnostics_snapshot().is_empty());
@@ -104,7 +104,7 @@ fn snapshot_polling_preserves_fragments_until_the_real_terminal_response() {
             "a snapshot reader routes rather than steals the fragment"
         );
         assert!(futures::poll!(pending.as_mut()).is_pending(), "progress is not completion");
-        notifications(&peer, vec![completion(request, Value::Null)]).await;
+        notifications(&peer, vec![completion(request, &Value::Null)]).await;
         assert_eq!(pending.await.unwrap(), vec![expected]);
         assert!(peer.client.diagnostics_snapshot().is_empty());
         assert_retired(&peer);
@@ -133,9 +133,9 @@ fn actual_queue_loss_refuses_an_already_buffered_success_and_allows_a_fresh_call
         ];
         flood.push(progress(
             request,
-            json!({"items":[report("untitled:lost-error")]}),
+            &json!({"items":[report("untitled:lost-error")]}),
         ));
-        flood.push(completion(request, json!({"items":[]})));
+        flood.push(completion(request, &json!({"items":[]})));
         notifications(&peer, flood).await;
         assert!(peer.client.dropped_notifications() > 0);
         let error = pending.await.unwrap_err();
@@ -169,7 +169,7 @@ fn dropping_a_written_partial_request_cancels_once_and_isolates_late_fragments()
         let old = requests[0].clone();
         notifications(
             &peer,
-            vec![progress(&old, json!({"items":[report("untitled:old")]}))],
+            vec![progress(&old, &json!({"items":[report("untitled:old")]}))],
         )
         .await;
         peer.client.poll_notifications();
@@ -189,10 +189,10 @@ fn dropping_a_written_partial_request_cancels_once_and_isolates_late_fragments()
         notifications(
             &peer,
             vec![
-                progress(&old, json!({"items":[report("untitled:late-old")]})),
-                completion(&old, json!({"items":[]})),
-                progress(new, json!({"items":[expected]})),
-                completion(new, Value::Null),
+                progress(&old, &json!({"items":[report("untitled:late-old")]})),
+                completion(&old, &json!({"items":[]})),
+                progress(new, &json!({"items":[expected]})),
+                completion(new, &Value::Null),
             ],
         )
         .await;
@@ -234,7 +234,7 @@ fn server_retrigger_discards_the_previous_attempt_and_uses_a_new_token() {
         notifications(
             &peer,
             vec![
-                progress(&old, json!({"items":[report("untitled:failed-attempt")]})),
+                progress(&old, &json!({"items":[report("untitled:failed-attempt")]})),
                 json!({"jsonrpc":"2.0","id":old["id"],"error":{
                     "code":-32802,"message":"retry diagnostics","data":{"retriggerRequest":true}
                 }}),
@@ -267,10 +267,10 @@ fn server_retrigger_discards_the_previous_attempt_and_uses_a_new_token() {
                 vec![
                     progress(
                         &old,
-                        json!({"items":[report("untitled:late-failed-attempt")]}),
+                        &json!({"items":[report("untitled:late-failed-attempt")]}),
                     ),
-                    progress(&new, json!({"items":[expected]})),
-                    completion(&new, json!({"items":[]})),
+                    progress(&new, &json!({"items":[expected]})),
+                    completion(&new, &json!({"items":[]})),
                 ],
             )
             .await;
@@ -299,7 +299,7 @@ fn owner_cancellation_after_progress_retires_the_collection_without_delivery() {
             &peer,
             vec![progress(
                 &requests[0],
-                json!({"items":[report("untitled:cancelled")]}),
+                &json!({"items":[report("untitled:cancelled")]}),
             )],
         )
         .await;
@@ -344,8 +344,8 @@ fn terminal_response_cannot_exceed_the_fragments_remaining_byte_budget() {
         notifications(
             &peer,
             vec![
-                progress(&requests[0], fragment),
-                completion(&requests[0], Value::Null),
+                progress(&requests[0], &fragment),
+                completion(&requests[0], &Value::Null),
             ],
         )
         .await;

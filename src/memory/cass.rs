@@ -58,7 +58,7 @@ type Screener<'a> = &'a (dyn Fn(&str) -> String + Send + Sync);
 /// Completion and degradation are separate from an empty, completed search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CassStatus {
+pub enum CassStatus {
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     Completed,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -73,7 +73,7 @@ pub(crate) enum CassStatus {
 /// Fixed diagnostic codes never contain a query, stdout, stderr, or OS error.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CassSearch {
+pub struct CassSearch {
     pub status: CassStatus,
     pub hits: Vec<CassHit>,
     pub diagnostic: Option<&'static str>,
@@ -94,7 +94,7 @@ impl CassSearch {
 /// A screened archive excerpt with its source/line citation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CassHit {
+pub struct CassHit {
     pub source_path: String,
     pub line_number: Option<u64>,
     pub agent: String,
@@ -107,7 +107,7 @@ pub(crate) struct CassHit {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CassProvenance {
+pub struct CassProvenance {
     pub source: &'static str,
     pub mode: &'static str,
     pub read_only: bool,
@@ -120,7 +120,7 @@ pub(crate) struct CassProvenance {
 /// caller free to return its local bank results; cancellation is distinguished
 /// so a cancelled tool does not report successful partial recall.
 #[cfg_attr(not(unix), allow(clippy::unused_async))]
-pub(crate) async fn search(
+pub async fn search(
     owner: &AgentCx,
     project_root: &Path,
     query: &str,

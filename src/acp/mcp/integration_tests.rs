@@ -373,6 +373,7 @@ fn live_state(
     (id, state, mcp)
 }
 
+#[allow(clippy::future_not_send)]
 async fn read_permission(
     rx: &std::sync::mpsc::Receiver<String>,
     out: &mut Vec<Value>,

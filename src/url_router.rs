@@ -1957,6 +1957,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn remote_edit_reads_include_one_overflow_byte_without_transferring_whole_file() {
         let root = tempfile::tempdir().expect("fixture");
         let target = root.path().join("large file's data");

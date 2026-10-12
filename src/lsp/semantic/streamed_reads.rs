@@ -62,7 +62,7 @@ impl Peer {
         })
     }
 
-    fn run(&self, action: &str, extra: Value) -> Result<ToolOutput> {
+    fn run(&self, action: &str, extra: &Value) -> Result<ToolOutput> {
         let mut input = json!({"action":action,"file":"anchor.pistream","timeout":5});
         if action == "symbols" {
             input["query"] = json!("a");
@@ -87,7 +87,7 @@ impl Peer {
     }
 
     fn assert_reusable(&self) {
-        let output = self.run("hover", json!({})).unwrap();
+        let output = self.run("hover", &json!({})).unwrap();
         assert!(!output.is_error);
         assert_eq!(payload(output)["hover"], "still usable");
         assert!(!self.root.path().join("metadata-target.rs").exists());
@@ -101,7 +101,7 @@ fn workspace_symbols_merge_streams_before_lazy_resolution() {
         let Some(peer) = Peer::new(mode) else {
             return;
         };
-        let output = peer.run("symbols", json!({"resolve":true})).unwrap();
+        let output = peer.run("symbols", &json!({"resolve":true})).unwrap();
         assert!(!output.is_error);
         let details = payload(output);
         assert_eq!(details["count"], 2);
@@ -138,7 +138,7 @@ fn every_array_navigation_action_uses_streams_and_preserves_location_links() {
             let Some(peer) = Peer::new(mode) else {
                 return;
             };
-            let details = payload(peer.run(action, json!({})).unwrap());
+            let details = payload(peer.run(action, &json!({})).unwrap());
             assert_eq!(details["total"], 2);
             assert_eq!(details["count"], 2);
             assert_eq!(details["responseComplete"], true);
@@ -167,7 +167,7 @@ fn nonstreamed_single_locations_and_null_results_remain_supported() {
         let Some(peer) = Peer::new("single") else {
             return;
         };
-        let details = payload(peer.run(action, json!({})).unwrap());
+        let details = payload(peer.run(action, &json!({})).unwrap());
         assert_eq!(details["total"], 1);
         assert_eq!(details["count"], 1);
         peer.assert_reusable();
@@ -176,7 +176,7 @@ fn nonstreamed_single_locations_and_null_results_remain_supported() {
         let Some(peer) = Peer::new("legacy-null") else {
             return;
         };
-        let details = payload(peer.run(action, json!({})).unwrap());
+        let details = payload(peer.run(action, &json!({})).unwrap());
         assert_eq!(details["total"], 0);
         assert_eq!(details["count"], 0);
         peer.assert_reusable();
@@ -189,14 +189,14 @@ fn display_limits_do_not_limit_validation_or_hide_stream_totals() {
         let Some(peer) = Peer::new("stream") else {
             return;
         };
-        let details = payload(peer.run(action, json!({"limit":1})).unwrap());
+        let details = payload(peer.run(action, &json!({"limit":1})).unwrap());
         assert_eq!(details["total"], 2);
         assert_eq!(details["count"], 1);
         assert_eq!(details["truncated"], true);
         let Some(peer) = Peer::new("bad-tail") else {
             return;
         };
-        assert!(peer.run(action, json!({"limit":1})).is_err());
+        assert!(peer.run(action, &json!({"limit":1})).is_err());
         assert!(peer.frames("workspaceSymbol/resolve").is_empty());
         peer.assert_reusable();
     }
@@ -215,7 +215,7 @@ fn failed_ambiguous_and_oversized_streams_cannot_become_partial_success() {
             let Some(peer) = Peer::new(mode) else {
                 return;
             };
-            let error = peer.run(action, json!({"limit":1})).unwrap_err();
+            let error = peer.run(action, &json!({"limit":1})).unwrap_err();
             assert!(error.to_string().contains(marker), "{mode}: {error}");
             assert!(peer.frames("workspaceSymbol/resolve").is_empty());
             peer.assert_reusable();
@@ -228,7 +228,7 @@ fn empty_navigation_streams_keep_the_existing_warmup_retry_policy() {
     let Some(peer) = Peer::new("warmup") else {
         return;
     };
-    let details = payload(peer.run("references", json!({})).unwrap());
+    let details = payload(peer.run("references", &json!({})).unwrap());
     assert_eq!(details["total"], 2);
     let frames = peer.frames("textDocument/references");
     assert_eq!(frames.len(), 2);
@@ -241,7 +241,7 @@ fn empty_navigation_streams_keep_the_existing_warmup_retry_policy() {
     let Some(peer) = Peer::new("warmup") else {
         return;
     };
-    let details = payload(peer.run("symbols", json!({})).unwrap());
+    let details = payload(peer.run("symbols", &json!({})).unwrap());
     assert_eq!(details["total"], 0);
     assert_eq!(peer.frames("workspace/symbol").len(), 1);
 }
@@ -251,7 +251,7 @@ fn server_retry_discards_old_fragments_and_uses_a_fresh_token() {
     let Some(peer) = Peer::new("retry") else {
         return;
     };
-    let details = payload(peer.run("references", json!({})).unwrap());
+    let details = payload(peer.run("references", &json!({})).unwrap());
     assert_eq!(details["total"], 2);
     let text = details.to_string();
     assert!(!text.contains("discarded-attempt"));
@@ -270,7 +270,7 @@ fn progress_without_completion_times_out_and_releases_the_client_lane() {
     let Some(peer) = Peer::new("stall") else {
         return;
     };
-    let error = peer.run("references", json!({"timeout":1})).unwrap_err();
+    let error = peer.run("references", &json!({"timeout":1})).unwrap_err();
     assert!(error.to_string().contains("LSP_TIMEOUT"), "{error}");
     peer.assert_reusable();
     let requests = peer.frames("textDocument/references");
@@ -286,7 +286,7 @@ fn streamed_results_do_not_bypass_the_source_drift_fence() {
         let Some(peer) = Peer::new("source-change") else {
             return;
         };
-        let error = peer.run(action, json!({})).unwrap_err();
+        let error = peer.run(action, &json!({})).unwrap_err();
         assert!(error.to_string().contains("LSP_SEMANTIC_STALE"), "{error}");
         assert!(peer.frames("workspaceSymbol/resolve").is_empty());
         peer.assert_reusable();

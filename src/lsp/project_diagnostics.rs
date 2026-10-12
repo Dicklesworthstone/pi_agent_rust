@@ -443,9 +443,9 @@ while True:
             assert_eq!(details["responseComplete"], true);
             assert_eq!(details["totalDocuments"], if empty { 0 } else { 2 });
             assert_eq!(details["totalDiagnostics"], if empty { 0 } else { 2 });
-            assert_eq!(details["errorCount"], if empty { 0 } else { 1 });
-            assert_eq!(details["warningCount"], if empty { 0 } else { 1 });
-            assert_eq!(details["returnedDocuments"], if empty { 0 } else { 1 });
+            assert_eq!(details["errorCount"], i32::from(!empty));
+            assert_eq!(details["warningCount"], i32::from(!empty));
+            assert_eq!(details["returnedDocuments"], i32::from(!empty));
             assert_eq!(details["truncated"], !empty);
             assert_eq!(details["complete"], empty);
             assert!(!temp.path().join("never-opened.piproject").exists());

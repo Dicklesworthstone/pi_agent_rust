@@ -22,6 +22,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+/// Input cap of the tool-free auxiliary requests (`/btw`, advisor, titles).
+/// Compaction is deliberately not bounded by it; the re-export lets the
+/// integration suite prove that against the real constant.
+#[doc(hidden)]
+pub use crate::text_completion::MAX_INPUT_BYTES as AUXILIARY_MAX_INPUT_BYTES;
+
 /// Approximate characters per token for English text with GPT-family tokenizers.
 /// Intentionally conservative (overestimates tokens) to avoid exceeding context windows.
 /// Set to 3 to safely account for code/symbol-heavy content which is denser than prose.
@@ -226,6 +232,7 @@ const MAX_COMPACTION_PRIVACY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMPACTION_PRIVACY_FIELDS: usize = 262_144;
 
 /// Launch-time privacy policy and remembered credentials for a summarizer.
+///
 /// The vault is a private snapshot; screening never changes the live Agent.
 /// SecretVault's Debug implementation reports only its entry count.
 #[derive(Clone, Debug, Default)]
@@ -504,7 +511,7 @@ impl<'a> SummaryFields<'a> {
         thinking: bool,
         separator: &str,
     ) -> Result<()> {
-        fn text_of(block: &ContentBlock, thinking: bool) -> Option<&str> {
+        const fn text_of(block: &ContentBlock, thinking: bool) -> Option<&str> {
             match block {
                 ContentBlock::Text(text) if !thinking => Some(text.text.as_str()),
                 ContentBlock::Thinking(text) if thinking => Some(text.thinking.as_str()),

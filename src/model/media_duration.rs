@@ -296,6 +296,7 @@ fn flac_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
     duration_from_units(samples, rate)
 }
 
+#[allow(clippy::useless_let_if_seq)]
 fn mp3_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
     let mut offset = 0_usize;
     if reader.read::<3>(0)? == *b"ID3" {
@@ -766,6 +767,7 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut bytes = u32::try_from(body.len() + 8)
             .unwrap()
@@ -803,10 +805,7 @@ mod tests {
                     assert_eq!(reader.read::<1>(offset), Some([bytes[offset]]));
                     if offset + 64 <= len {
                         assert_eq!(
-                            reader
-                                .read::<64>(offset)
-                                .as_ref()
-                                .map(|value| value.as_slice()),
+                            reader.read::<64>(offset).as_ref().map(<[u8; 64]>::as_slice),
                             Some(&bytes[offset..offset + 64])
                         );
                     }
@@ -905,7 +904,8 @@ mod tests {
     fn flac_duration_uses_streaminfo_samples_and_rejects_unknown_length() {
         let mut bytes = b"fLaC\x80\x00\x00\x22".to_vec();
         bytes.resize(42, 0);
-        let packed = (48_000_u64 << 44) | (15_u64 << 36) | 2_880_000;
+        // 0x002b_f200 is 2_880_000 samples: sixty seconds at 48 kHz.
+        let packed = (48_000_u64 << 44) | (15_u64 << 36) | 0x002b_f200;
         bytes[18..26].copy_from_slice(&packed.to_be_bytes());
         assert_eq!(
             inspect(&encode(&bytes), "audio/flac"),

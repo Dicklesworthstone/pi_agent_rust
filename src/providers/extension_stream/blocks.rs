@@ -30,7 +30,7 @@ enum Kind {
 }
 
 impl Kind {
-    fn matches(self, block: &ContentBlock) -> bool {
+    const fn matches(self, block: &ContentBlock) -> bool {
         matches!(
             (self, block),
             (Self::Text, ContentBlock::Text(_))
@@ -405,7 +405,7 @@ impl Serialize for CanonicalValue<'_> {
             }
             serde_json::Value::Object(items) => {
                 let mut entries: Vec<_> = items.iter().collect();
-                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                entries.sort_unstable_by_key(|(left, _)| *left);
                 serializer.collect_map(
                     entries
                         .into_iter()
@@ -1198,7 +1198,7 @@ mod tests {
         for content_index in [MAX_BLOCKS, usize::MAX] {
             let event = AssistantMessageEvent::TextDelta {
                 content_index,
-                delta: "".into(),
+                delta: String::new(),
                 partial: message(vec![text("")]),
             };
             assert!(ledger.admit(&event).is_err());

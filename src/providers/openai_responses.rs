@@ -886,6 +886,7 @@ enum ToolItemEvent {
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct ToolItemIdentity {
     output_index: Option<u32>,
     function: Option<(String, String)>,
@@ -4094,6 +4095,7 @@ mod tests {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn conflicting_tool_identity_events(arguments: &str) -> Vec<(&'static str, Vec<Value>)> {
         let added = tool_item_event("response.output_item.added", "identity", "write", arguments);
         let done = tool_item_event("response.output_item.done", "identity", "write", arguments);
@@ -4486,6 +4488,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn contradictory_streamed_identities_never_execute_a_valid_sibling() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4555,6 +4558,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn valid_parallel_response_calls_execute_once_and_replay_matching_results() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4645,6 +4649,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn fatal_tool_payload_parse_error_cannot_resume_after_repoll() {
         for event_type in ["response.output_item.added", "response.output_item.done"] {
             let events = [
@@ -4850,6 +4855,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn invalid_tool_completion_is_terminal_on_sse_and_ndjson_transports() {
         let events = [
             tool_item_event("response.output_item.done", "bad", "write", "null"),
@@ -4902,6 +4908,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn malformed_parallel_tool_batch_never_executes_the_valid_sibling() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};

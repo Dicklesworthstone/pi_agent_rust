@@ -110,6 +110,7 @@ fn subagent_launch_model_precedence_keeps_resolved_parent_ids_exact() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn request_model_snapshot_survives_queue_chain_retry_and_revival() {
     for mode in ["tasks", "chain"] {
         let body = format!(
@@ -815,6 +816,11 @@ fn pending_parallel_fixture() -> PendingParallelFixture {
 /// Notify only after a completed child has freed the sole execution slot and
 /// its successor begins. The public kill operation must see history without
 /// any remaining authority to signal the old PID or revive pending writeback.
+// Registry guard scope is deliberate.
+#[allow(
+    clippy::significant_drop_tightening,
+    clippy::significant_drop_in_scrutinee
+)]
 fn pending_writeback_callback(
     fixture: &PendingParallelFixture,
     sender: futures::channel::oneshot::Sender<String>,
@@ -844,6 +850,7 @@ fn pending_writeback_callback(
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn hub_kill_rejects_reaped_pending_writeback_without_cancelling_its_sibling() {
     let fixture = pending_parallel_fixture();
     let (sender, receiver) = futures::channel::oneshot::channel();
@@ -856,9 +863,10 @@ fn hub_kill_rejects_reaped_pending_writeback_without_cancelling_its_sibling() {
             fixture.request.clone(),
             Some(pending_writeback_callback(&fixture, sender)),
         ));
-        let (ready_id, pending) = match futures::future::select(run, receiver).await {
-            futures::future::Either::Right((Ok(id), pending)) => (id, pending),
-            _ => panic!("a completed child must wait for the second child"),
+        let futures::future::Either::Right((Ok(ready_id), pending)) =
+            futures::future::select(run, receiver).await
+        else {
+            panic!("a completed child must wait for the second child")
         };
         let killed = crate::tools::HubTool::new(&fixture.tool.cwd)
             .execute(
@@ -910,9 +918,10 @@ fn parent_cancellation_rejects_already_completed_parallel_writeback() {
             fixture.request.clone(),
             Some(pending_writeback_callback(&fixture, sender)),
         ));
-        let pending = match futures::future::select(run, receiver).await {
-            futures::future::Either::Right((Ok(_), pending)) => pending,
-            _ => panic!("a completed child must wait for the second child"),
+        let futures::future::Either::Right((Ok(_), pending)) =
+            futures::future::select(run, receiver).await
+        else {
+            panic!("a completed child must wait for the second child")
         };
         owner.cancel_with(
             asupersync::types::CancelKind::User,
@@ -934,6 +943,7 @@ fn parent_cancellation_rejects_already_completed_parallel_writeback() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn dropping_parallel_execution_preserves_completed_work_and_cancels_its_lease() {
     let fixture = pending_parallel_fixture();
     let (sender, receiver) = futures::channel::oneshot::channel();
@@ -1293,6 +1303,7 @@ fn revived_id(output: &ToolOutput) -> &str {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_children()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let script = format!(
@@ -1389,6 +1400,7 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn hub_revival_refuses_synthetic_registration_without_spending_a_child_entry() {
     let name = format!("synthetic-{}", uuid::Uuid::new_v4());
     let source = {
@@ -1418,6 +1430,7 @@ fn hub_revival_refuses_synthetic_registration_without_spending_a_child_entry() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn hub_revival_checks_current_authority_before_starting_a_replacement()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_directory, tool) = fixture(&emit(&[ended("complete", "stop")]));
@@ -1453,6 +1466,7 @@ fn hub_revival_checks_current_authority_before_starting_a_replacement()
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn failed_hub_revival_spawn_settles_its_single_registered_replacement()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_directory, tool) = fixture(&emit(&[ended("complete", "stop")]));
@@ -1481,6 +1495,8 @@ fn failed_hub_revival_spawn_settles_its_single_registered_replacement()
 }
 
 #[test]
+// Registry guard scope is deliberate; the real-child lifecycle stays in one test.
+#[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
 fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let script = format!(
@@ -1515,9 +1531,10 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
                 }
             })),
         ));
-        let (pid, pending) = match futures::future::select(future, receiver).await {
-            futures::future::Either::Right((Ok(pid), pending)) => (pid, pending),
-            _ => panic!("revival must launch before it can be cancelled"), // ubs:ignore: real-process progress oracle
+        let futures::future::Either::Right((Ok(pid), pending)) =
+            futures::future::select(future, receiver).await
+        else {
+            panic!("revival must launch before it can be cancelled"); // ubs:ignore: real-process progress oracle
         };
         let replacement = crate::agent_hub::registry()
             .lock()
@@ -1603,6 +1620,7 @@ fn active_and_killed_revival_owners_block_replacement_until_drop_reaps_the_child
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)] // Registry guard scope is deliberate.
 fn hub_revival_keeps_schema_isolation_and_authored_task_across_corrective_retry()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let script = format!(

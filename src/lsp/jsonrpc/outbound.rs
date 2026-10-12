@@ -1253,6 +1253,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::used_underscore_binding)]
     fn queued_abandoned_requests_and_cancels_do_not_reach_the_pipe() {
         let root = tempfile::tempdir().expect("tempdir");
         let PausedTransport {
@@ -1304,6 +1305,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::used_underscore_binding)]
     fn cancelling_a_claimed_write_precedes_queued_traffic_without_waiting_for_the_pipe() {
         let root = tempfile::tempdir().expect("tempdir");
         let PausedTransport {

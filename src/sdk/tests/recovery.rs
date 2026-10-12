@@ -125,10 +125,10 @@ fn install_system_prompt_hook(handle: &mut AgentSessionHandle, prompt: Option<&s
             })
         },
     );
-    install_native_event_hooks(handle, serde_json::json!({"before_agent_start": output}));
+    install_native_event_hooks(handle, &serde_json::json!({"before_agent_start": output}));
 }
 
-fn install_native_event_hooks(handle: &mut AgentSessionHandle, responses: Value) {
+fn install_native_event_hooks(handle: &mut AgentSessionHandle, responses: &Value) {
     let manager = crate::extensions::ExtensionManager::new();
     let temp = tempdir().unwrap();
     let entry = temp.path().join("turn-system-prompt.native.json");
@@ -251,10 +251,10 @@ fn saving_native_content_handle(
     (handle, calls, observations)
 }
 
-fn install_native_content_hooks(handle: &mut AgentSessionHandle, input: Value) {
+fn install_native_content_hooks(handle: &mut AgentSessionHandle, input: &Value) {
     install_native_event_hooks(
         handle,
-        serde_json::json!({
+        &serde_json::json!({
             "input": input,
             "before_agent_start": {
                 "systemPrompt": "native-content-hook",
@@ -320,7 +320,7 @@ fn native_content_retries_preserve_order_and_persist_one_user_message() {
         .session
         .agent
         .set_system_prompt(Some("ordinary-system".to_string()));
-    install_native_content_hooks(&mut handle, serde_json::json!({"action":"continue"}));
+    install_native_content_hooks(&mut handle, &serde_json::json!({"action":"continue"}));
     let content = native_content_fixture();
 
     let result = run_async(handle.prompt_with_content(content.clone(), |_| {})).unwrap();
@@ -416,7 +416,7 @@ fn native_input_hooks_replace_add_and_remove_text_and_images_without_losing_medi
     for (case, response, expected) in cases {
         let dir = tempdir().unwrap();
         let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 1);
-        install_native_content_hooks(&mut handle, response);
+        install_native_content_hooks(&mut handle, &response);
 
         let result = run_async(handle.prompt_with_content(original.clone(), |_| {}))
             .unwrap_or_else(|error| panic!("{case}: {error}"));
@@ -445,7 +445,7 @@ fn media_only_prompts_accept_hooks_that_add_text_and_images_without_existing_slo
             serde_json::json!({
                 "action":"transform",
                 "text":"describe these clips",
-                "images":[image.clone()],
+                "images":[image],
             }),
             vec![
                 ContentBlock::Text(TextContent::new("describe these clips")),
@@ -458,7 +458,7 @@ fn media_only_prompts_accept_hooks_that_add_text_and_images_without_existing_slo
     for (response, expected) in cases {
         let dir = tempdir().unwrap();
         let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
-        install_native_content_hooks(&mut handle, response);
+        install_native_content_hooks(&mut handle, &response);
         let result = run_async(handle.prompt_with_content(media.clone(), |_| {})).unwrap();
         assert_eq!(result.stop_reason, StopReason::Stop);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -499,7 +499,7 @@ fn invalid_native_content_refuses_before_provider_calls_or_session_persistence()
         // input hook could otherwise replace the visible text/images.
         install_native_content_hooks(
             &mut handle,
-            serde_json::json!({"action":"transform", "text":"replacement", "images":[]}),
+            &serde_json::json!({"action":"transform", "text":"replacement", "images":[]}),
         );
         let error = run_async(handle.prompt_with_content(content, |_| {})).unwrap_err();
         assert!(error.to_string().contains("PI_INPUT_CONTENT"), "{error}");
@@ -522,7 +522,7 @@ fn input_hooks_cannot_turn_a_native_prompt_into_an_empty_persisted_turn() {
     let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 0);
     install_native_content_hooks(
         &mut handle,
-        serde_json::json!({"action":"transform", "text":"", "images":[]}),
+        &serde_json::json!({"action":"transform", "text":"", "images":[]}),
     );
 
     let error = run_async(handle.prompt_with_content(content, |_| {})).unwrap_err();
@@ -543,7 +543,7 @@ fn native_content_explicit_abort_prevents_admission_and_retry_reentry() {
     for pre_aborted in [true, false] {
         let dir = tempdir().unwrap();
         let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 1);
-        install_native_content_hooks(&mut handle, serde_json::json!({"action":"continue"}));
+        install_native_content_hooks(&mut handle, &serde_json::json!({"action":"continue"}));
         let content = native_content_fixture();
         let (abort, signal) = AbortHandle::new();
         if pre_aborted {
@@ -2287,7 +2287,7 @@ fn unchanged_failover_provenance_keeps_its_running_monotonic_cooldown() {
     // restarts the interval and can prevent restoration indefinitely.
     provenance.cooldown_deadline = None;
     provenance.cooldown_secs = Some(300);
-    install_reconciliation_provenance(&mut handle, provenance.clone());
+    install_reconciliation_provenance(&mut handle, provenance);
     handle.failover_state = {
         let store = handle.session_store();
         let session = store.try_lock().unwrap();

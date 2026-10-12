@@ -117,6 +117,7 @@ impl WorkspaceHandle {
     /// Publish an already validated canonical root set without resolving paths
     /// again after persistence. A host may hold another mutable clone, so an
     /// SDK transaction must not overwrite root changes made while it saved.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn replace_additional_roots_if_unchanged(
         &mut self,
         expected: &[PathBuf],

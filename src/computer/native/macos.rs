@@ -143,7 +143,7 @@ fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
 fn positive_id(value: &Value) -> Result<u64> {
     value
         .as_u64()
-        .filter(|id| *id > 0 && *id <= u64::from(u32::MAX))
+        .filter(|id| *id > 0 && u32::try_from(*id).is_ok())
         .ok_or_else(protocol)
 }
 
@@ -721,8 +721,8 @@ mod tests {
     fn display_catalog_preserves_negative_points_and_rejects_ambiguous_ids() {
         let display = json!({"id":73,"name":"Retina","x":-1280,"y":0,"width":1280,
             "height":800,"pixel_width":2560,"pixel_height":1600,"scale_factor":2,"is_primary":true});
-        assert!(catalog(&json!({"displays":[display.clone()]}), true).is_ok());
-        assert!(catalog(&json!({"displays":[display.clone(),display.clone()]}), true).is_err());
+        assert!(catalog(&json!({"displays":[display]}), true).is_ok());
+        assert!(catalog(&json!({"displays":[display,display]}), true).is_err());
         for field in [
             "id",
             "name",
@@ -818,6 +818,7 @@ mod tests {
         assert!(admit_result("focus_window", &args, &unverified).is_err());
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn tree_result(tree: Value, count: usize) -> Value {
         json!({"pid":123,"window_id":73,"tree":tree,"truncated":false,
             "node_count":count,"scope":"requested_or_focused_window"})
@@ -826,7 +827,7 @@ mod tests {
     #[test]
     fn accessibility_tree_keeps_structure_but_never_accepts_secure_field_payloads() {
         let secure = json!({"role":"AXTextField","value_redacted":true,"children":[]});
-        let tree = json!({"role":"AXWindow","title":"Window","children":[secure.clone()]});
+        let tree = json!({"role":"AXWindow","title":"Window","children":[secure]});
         assert!(accessibility_result(&json!({"window_id":73}), &tree_result(tree, 2)).is_ok());
         for field in ["title", "value", "bounds", "children"] {
             let mut invalid = secure.clone();
@@ -1038,7 +1039,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let helpers = BTreeMap::from([("swift".to_string(), helper.clone())]);
+        let helpers = BTreeMap::from([("swift".to_string(), helper)]);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();

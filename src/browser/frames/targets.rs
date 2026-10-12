@@ -20,7 +20,7 @@ pub(super) struct Link {
 }
 
 #[derive(Default)]
-pub(crate) struct Targets {
+pub struct Targets {
     links: BTreeMap<String, Link>,
     generation: u64,
 }
@@ -290,7 +290,7 @@ mod tests {
         targets.observe(&event, Some("page")).unwrap();
         assert_eq!(targets.generation(), generation);
         for invalid in [
-            "".to_owned(),
+            String::new(),
             "x".repeat(257),
             "PRIVATE-CANARY\n".to_owned(),
         ] {

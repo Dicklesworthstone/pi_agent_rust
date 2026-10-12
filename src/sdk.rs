@@ -1023,7 +1023,7 @@ impl RpcSubprocessOwner {
             // shutdown still owns and joins this exact reap obligation.
             let child = Arc::new(Mutex::new(Some(child)));
             let reaper_child = Arc::clone(&child);
-            match std::thread::Builder::new()
+            if let Ok(worker) = std::thread::Builder::new()
                 .name("pi-sdk-rpc-reaper".to_string())
                 .spawn(move || {
                     let mut child = reaper_child
@@ -1033,18 +1033,18 @@ impl RpcSubprocessOwner {
                         .as_mut()
                         .expect("RPC reaper owns its child")
                         .terminate_and_wait()
-                }) {
-                Ok(worker) => process.reaper = Some(RpcProcessReaper { worker, child }),
-                Err(_) => {
-                    let mut child = child
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                        .expect("failed RPC reaper spawn retains its child");
-                    if let Err(error) = child.terminate_and_wait() {
-                        process.child = Some(child);
-                        return Err(Error::Io(Box::new(error)));
-                    }
+                })
+            {
+                process.reaper = Some(RpcProcessReaper { worker, child });
+            } else {
+                let mut child = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("failed RPC reaper spawn retains its child");
+                if let Err(error) = child.terminate_and_wait() {
+                    process.child = Some(child);
+                    return Err(Error::Io(Box::new(error)));
                 }
             }
         }
@@ -1097,7 +1097,7 @@ impl RpcOperation {
         })
     }
 
-    fn finish(&mut self) {
+    const fn finish(&mut self) {
         self.finished = true;
     }
 }
@@ -1898,6 +1898,9 @@ impl RpcTransportClient {
         next_rpc_request_id(&self.next_request_id)
     }
 
+    // The writer guard spans the "still open" check and the enqueue, so
+    // `RpcSubprocessOwner::close` cannot take the sender between them.
+    #[allow(clippy::significant_drop_tightening)]
     async fn write_json_line(&self, payload: &Value) -> Result<()> {
         self.owner.ensure_open()?;
         let encoded = encode_rpc_json_line(payload)?;
@@ -2358,6 +2361,7 @@ impl AgentSessionHandle {
     /// Start acknowledged MCP servers and mount their cached tools into this
     /// exact Agent. Session replacement calls this only after the previous
     /// handle has been dropped, preventing overlapping singleton transports.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn activate_mcp(&mut self) {
         let Some(manager) = self.mcp_manager.clone() else {
             return;
@@ -5618,6 +5622,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn checkpoint_rewind_uses_compacted_boundary_and_reopens_identically() {
         let dir = tempdir().expect("tempdir");
         let mut handle = saving_handle(dir.path());
@@ -5928,6 +5933,7 @@ mod tests {
         assert_eq!(result.collapsed_messages, 2);
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn assert_rewind_privacy(mode: &str) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(RewindPrivacyProvider {
@@ -8072,6 +8078,7 @@ export default function init(pi) {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn disabled_builtins_survive_extension_mount_and_plan_checkpoint_restore() {
         run_async(async {
             let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated fixture storage is required.
@@ -8181,7 +8188,7 @@ export default function init(pi) {
                 } else {
                     disabled.enter_plan_mode(&owner).await
                 };
-                let error = result.err().expect("disabled planning must be rejected"); // ubs:ignore[rust.ownership.unwrap-expect] -- Both public controls must reject disabled built-ins.
+                let error = result.expect_err("disabled planning must be rejected"); // ubs:ignore[rust.ownership.unwrap-expect] -- Both public controls must reject disabled built-ins.
                 assert!(error.to_string().contains("[PLAN_TOOLS_DISABLED]")); // ubs:ignore[rust.panic.assert-macros] -- Rejection must identify the explicit tool policy.
                 assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- A rejected control cannot activate planning.
                 assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- A rejected restore cannot install the saved proposal.

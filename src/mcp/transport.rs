@@ -101,9 +101,11 @@ const STDIO_CANCEL_GRACE: Duration = Duration::from_millis(20);
 type StdioOutcome = std::result::Result<Value, McpStdioError>;
 type StdioPending = Mutex<HashMap<u64, StdSyncSender<StdioOutcome>>>;
 
-/// A single request's permission to reach the server. Queue admission is not
-/// dispatch: the writer and manager race for this lease before the first pipe
-/// write, so abandoned queued work cannot gain remote effects afterward.
+/// A single request's permission to reach the server.
+///
+/// Queue admission is not dispatch: the writer and manager race for this lease
+/// before the first pipe write, so abandoned queued work cannot gain remote
+/// effects afterward.
 ///
 /// Transports overriding [`McpTransport::request_with_dispatch`] must claim
 /// this lease before sending any request bytes and send nothing if it fails.
@@ -3375,7 +3377,7 @@ pub(crate) mod tests {
     /// correlated replies through the production router. The idle child gives
     /// the unmodified transport an owned process to retire on abandonment.
     #[cfg(unix)]
-    pub(crate) struct HeldStdioTransport {
+    pub struct HeldStdioTransport {
         pub(crate) transport: std::sync::Arc<StdioTransport>,
         entered: StdReceiver<()>,
         resume: StdSyncSender<()>,

@@ -66,6 +66,7 @@ impl WorkdirHealth {
         }
     }
 
+    #[allow(clippy::unnecessary_debug_formatting)]
     fn into_directory(self, path: &Path) -> Result<PathBuf> {
         match self {
             Self::Available { canonical_path } => Ok(canonical_path),
@@ -154,6 +155,7 @@ pub fn require_session_workdir(session: &Session) -> Result<PathBuf> {
 
 /// Guard a runtime which has already selected its workspace. Never change cwd
 /// after configuration or trust decisions have been constructed.
+#[allow(clippy::unnecessary_debug_formatting)]
 pub fn check_session_workdir(session: &Session, runtime_cwd: &Path) -> Result<()> {
     let expected = require_session_workdir(session)?;
     let actual = WorkdirHealth::inspect(runtime_cwd).into_directory(runtime_cwd)?;

@@ -2099,7 +2099,7 @@ impl Agent {
 
     /// Credential rules shared with project-memory command projections.
     #[must_use]
-    pub(crate) fn secrets_settings(&self) -> Option<&crate::secrets::SecretsSettings> {
+    pub(crate) const fn secrets_settings(&self) -> Option<&crate::secrets::SecretsSettings> {
         self.config.secrets.as_ref()
     }
 
@@ -6250,7 +6250,7 @@ struct SessionInputSourceGuard<'a> {
 }
 
 impl<'a> SessionInputSourceGuard<'a> {
-    fn new(session: &'a mut AgentSession, source: InputSource) -> Self {
+    const fn new(session: &'a mut AgentSession, source: InputSource) -> Self {
         let previous_source = std::mem::replace(&mut session.input_source, source);
         Self {
             session,
@@ -9226,6 +9226,7 @@ mod extensions_integration_tests {
     /// preparation is rejected with a validation error, never a fabricated
     /// summary.
     #[test]
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn agent_host_actions_compact_session_bridges_native_compaction() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -9737,6 +9738,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn native_compaction_host_screens_configured_patterns_and_fresh_live_vault() {
         asupersync::test_utils::run_test(|| async {
             for mode in ["obfuscate", "block"] {
@@ -9868,6 +9870,7 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn native_compaction_screens_returned_windows_and_refuses_fragmented_text() {
         asupersync::test_utils::run_test(|| async {
             for mode in ["obfuscate", "block"] {
@@ -13301,7 +13304,7 @@ mod abort_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn abort_preserves_completed_batch_results_in_persisted_history() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -20044,7 +20047,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn invalid_terminal_tool_peer_withholds_the_whole_batch_before_approval() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
@@ -21937,7 +21940,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn semantic_context_continuation_preserves_bundle_across_provider_shapes_without_duplicate_entries()
      {
         let runtime = RuntimeBuilder::current_thread()
@@ -22592,6 +22595,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn context_hook_images_obey_the_final_provider_image_policy() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -22629,8 +22633,8 @@ mod tests {
                     Arc::new(provider),
                     ToolRegistry::from_tools(Vec::new()),
                     AgentConfig {
-                        block_images,
                         model_accepts_images,
+                        block_images,
                         ..AgentConfig::default()
                     },
                 );

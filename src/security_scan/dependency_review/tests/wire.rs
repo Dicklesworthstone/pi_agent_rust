@@ -80,6 +80,7 @@ fn peer(responses: Vec<(u16, Value)>) -> (String, std::thread::JoinHandle<Vec<(S
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn public_comparison_consumes_real_audit_exports_without_requerying_osv() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

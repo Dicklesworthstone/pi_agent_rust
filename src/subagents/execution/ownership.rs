@@ -443,6 +443,7 @@ mod tests {
         }
 
         #[test]
+        #[allow(clippy::significant_drop_tightening)]
         fn dropping_a_process_guard_serializes_reaping_with_pid_retirement() {
             for operator_killed in [false, true] {
                 let mut command = std::process::Command::new("sh");
@@ -537,10 +538,7 @@ mod tests {
                 drop(run);
                 let (authority, settled) = {
                     let hub = registry().lock().unwrap();
-                    (
-                        hub.control_pid(&entry.id),
-                        hub.get(&entry.id).unwrap().clone(),
-                    )
+                    (hub.control_pid(&entry.id), hub.get(&entry.id).unwrap())
                 };
                 assert_eq!(authority, None);
                 assert_eq!(settled.pid, Some(pid));

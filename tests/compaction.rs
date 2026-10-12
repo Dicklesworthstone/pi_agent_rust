@@ -1060,6 +1060,22 @@ fn privacy_preparation() -> CompactionPreparation {
     }
 }
 
+/// File operations that record `path` as read.
+///
+/// `FileOperations` has no public mutator, so build it the way an extension
+/// does: through the preparation's JSON form. Only `file_ops` is taken from
+/// the round trip, leaving every other field of the caller's preparation
+/// exactly as the test wrote it.
+fn read_file_ops(path: &str) -> pi::compaction::FileOperations {
+    let mut value = pi::compaction::compaction_preparation_to_value(&privacy_preparation());
+    value["fileOps"]["read"] = json!([path]);
+    let file_ops = pi::compaction::compaction_preparation_from_value(&value)
+        .expect("a preparation with one read file parses")
+        .file_ops;
+    assert_eq!(file_ops.read_files().collect::<Vec<_>>(), vec![path]);
+    file_ops
+}
+
 #[test]
 fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
     run_async(async {
@@ -1093,7 +1109,7 @@ fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
                         vec![user_text(format!("ACME-123456{}", "x".repeat(4096)))];
                 }
                 _ => {
-                    prep.file_ops.read.insert("ACME-123456".to_string());
+                    prep.file_ops = read_file_ops("ACME-123456");
                 }
             }
             let error = compact(
@@ -1160,7 +1176,7 @@ fn compaction_obfuscates_complete_fields_and_remembered_values_across_both_reque
             StopReason::ToolUse,
         )];
         prep.previous_summary = Some("ACME-123456".to_string());
-        prep.file_ops.read.insert("ACME-123456".to_string());
+        prep.file_ops = read_file_ops("ACME-123456");
         let original = pi::compaction::compaction_preparation_to_value(&prep);
         let result = compact(
             prep.clone(),
@@ -1332,7 +1348,7 @@ fn compaction_fallback_screens_assembled_echoes_and_appended_file_lists() {
             Usage::default(),
             StopReason::ToolUse,
         )];
-        prep.file_ops.read.insert(secret.to_string());
+        prep.file_ops = read_file_ops(secret);
         let privacy = CompactionPrivacy::default();
         let result = compact(
             prep.clone(),
@@ -1365,7 +1381,7 @@ fn local_compaction_omits_unprojectable_content_without_appending_raw_file_lists
     for shake in [false, true] {
         let mut prep = privacy_preparation();
         prep.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
-        prep.file_ops.read.insert("ACME-123456".to_string());
+        prep.file_ops = read_file_ops("ACME-123456");
         prep.messages_to_summarize = vec![assistant_message(
             vec![ContentBlock::ToolCall(ToolCall {
                 id: "unchanged-call".to_string(),
@@ -1407,7 +1423,7 @@ fn compaction_accepts_large_context_and_refuses_aggregate_scan_overflow() {
         )
         .await
         .expect("normal large compaction exceeds the small auxiliary budget");
-        assert!(provider.prompts()[0].len() > pi::text_completion::MAX_INPUT_BYTES);
+        assert!(provider.prompts()[0].len() > pi::compaction::AUXILIARY_MAX_INPUT_BYTES);
 
         let refused = Arc::new(ScriptedProvider::new(["must not dispatch"]));
         let mut prep = privacy_preparation();

@@ -277,6 +277,7 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage], retry_attempts: Option<(u3
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBatcher) {
     match event {
         AgentEvent::MessageStart {
@@ -441,7 +442,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             // here and distinguish them from a turn that may drain more work.
             if error.is_none()
                 && let Some(last) = last_assistant_message(messages)
-                && let Some(message) = crate::agent::time_cap_marker(&last)
+                && let Some(message) = crate::agent::time_cap_marker(last)
             {
                 done = match done {
                     PiMsg::AgentDone { usage, .. } => PiMsg::AgentTimeCap {
@@ -2982,6 +2983,14 @@ After approving access in the browser, press Enter in Pi to complete login."
         None
     }
 
+    // The UI batcher stays locked across each event so its messages reach the
+    // UI in event order; the terminal slot has no other owner once the turn
+    // has returned.
+    #[allow(
+        clippy::significant_drop_in_scrutinee,
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines
+    )]
     fn spawn_recoverable_turn(
         &mut self,
         input: Option<UserContent>,
@@ -3162,7 +3171,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         if !display_owned.trim().is_empty() {
             self.messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: display_owned.clone(),
+                content: display_owned,
                 thinking: None,
                 collapsed: false,
             });
@@ -3753,7 +3762,7 @@ mod stream_delta_batcher_tests {
                 resources,
                 resource_cli,
                 Path::new(".").to_path_buf(),
-                current.clone(),
+                current,
                 Vec::new(),
                 available_models,
                 None,
@@ -4113,6 +4122,7 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn classic_time_cap_is_saved_once_and_pauses_queued_startup_input() {
         let temp = tempfile::TempDir::new().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated durable fixture storage is required.
         let calls = Arc::new(AtomicUsize::new(0));

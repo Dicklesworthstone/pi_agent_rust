@@ -486,6 +486,7 @@ impl SecretVault {
         out
     }
 
+    #[allow(clippy::option_if_let_else)]
     fn mask_json_document(
         &self,
         text: &str,
