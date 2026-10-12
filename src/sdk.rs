@@ -2913,29 +2913,57 @@ impl AgentSessionHandle {
 
     /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
     /// workspace root on the shared handle and persist the canonical set
-    /// into the session header. Returns a user-facing status line.
+    /// into the session header. Relative paths use the saved primary workspace,
+    /// including an explicit workdir attachment. New access is published only
+    /// after persistence succeeds; an interrupted save fences provider re-entry.
     pub async fn add_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
-        let canonical = crate::workspace::validate_new_root(dir.as_ref())?;
+        let dir = dir.as_ref();
+        if dir.as_os_str().is_empty() {
+            return Err(Error::validation(
+                "cannot add an empty path as a workspace root",
+            ));
+        }
         let mut workspace = self
             .workspace
             .clone()
             .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
-        let already = workspace
-            .snapshot_or(Path::new("."))
-            .contains_canonical(&canonical);
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(self.session_store(), cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let cwd = crate::session_workdir::require_session_workdir(&candidate)?;
+        let snapshot = workspace.snapshot_or(&cwd);
+        crate::session_workdir::check_session_workdir(&candidate, snapshot.primary())?;
+        let canonical = crate::workspace::validate_new_root(&resolve_path_for_cwd(dir, &cwd))?;
+        let previous_roots = snapshot.additional();
+        let mut roots = previous_roots.to_vec();
+        let already = snapshot.contains_canonical(&canonical);
         if !already {
-            workspace.add_root(&canonical);
+            roots.push(canonical.clone());
         }
-        let roots = workspace.additional_roots();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.set_additional_roots(&roots);
+        candidate.set_additional_roots(&roots);
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            false,
+            &admission,
+            "workspace root grant",
+        )
+        .await?;
+        if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots) {
+            // The candidate reached disk, but another host changed live access.
+            // Preserve that authority and require deliberate reconciliation.
+            guard.set_additional_roots(&workspace.additional_roots());
+            let reason = "Workspace roots changed while a root grant was being saved; \
+                          live access was not overwritten";
+            admission.block(reason.to_string());
+            return Err(Error::session_persistence(reason));
         }
         let display = canonical.display().to_string();
         Ok(if already {
@@ -2947,30 +2975,67 @@ impl AgentSessionHandle {
 
     /// `/remove-dir` driver (bd-cv653.3.12): revoke an additional root on
     /// the shared handle (immediate for every tool holding a clone) and
-    /// persist. Returns a user-facing status line.
+    /// persist before reporting success. Relative paths use the saved primary
+    /// workspace. A failed or interrupted save keeps access revoked in memory
+    /// and fences provider re-entry until the session is recovered.
     pub async fn remove_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let dir = dir.as_ref();
+        if dir.as_os_str().is_empty() {
+            return Err(Error::validation(
+                "cannot remove an empty workspace root path",
+            ));
+        }
         let mut workspace = self
             .workspace
             .clone()
             .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
-        let removed = workspace.remove_root(dir.as_ref());
-        if !removed {
-            return Ok(format!("Not a workspace root: {}", dir.as_ref().display()));
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(self.session_store(), cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let cwd = crate::session_workdir::require_session_workdir(&candidate)?;
+        let snapshot = workspace.snapshot_or(&cwd);
+        crate::session_workdir::check_session_workdir(&candidate, snapshot.primary())?;
+        let canonical = crate::extensions::safe_canonicalize(&resolve_path_for_cwd(dir, &cwd));
+        let previous_roots = snapshot.additional();
+        let mut roots = previous_roots.to_vec();
+        roots.retain(|root| root != &canonical);
+        if roots.len() == previous_roots.len() {
+            return Ok(format!("Not a workspace root: {}", canonical.display()));
         }
-        let roots = workspace.additional_roots();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.set_additional_roots(&roots);
+        if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots.clone()) {
+            return Err(Error::session(
+                "Workspace roots changed while preparing a root removal; retry the removal",
+            ));
+        }
+        // Revocation is conservative: a failed or dropped save must never
+        // restore access, including through a later flush of the live Session.
+        guard.set_additional_roots(&roots);
+        candidate.set_additional_roots(&roots);
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            false,
+            &admission,
+            "workspace root removal",
+        )
+        .await?;
+        if !workspace.replace_additional_roots_if_unchanged(&roots, roots.clone()) {
+            guard.set_additional_roots(&workspace.additional_roots());
+            let reason = "Workspace roots changed while a root removal was being saved; \
+                          live access was not overwritten";
+            admission.block(reason.to_string());
+            return Err(Error::session_persistence(reason));
         }
         Ok(format!(
             "Workspace root removed: {}",
-            dir.as_ref().display()
+            canonical.display()
         ))
     }
 
@@ -4196,6 +4261,438 @@ mod tests {
             crate::compaction::ResolvedCompactionSettings::default(),
         );
         AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+    }
+
+    fn workspace_handle_with_store(
+        root: &Path,
+        store_kind: crate::session::SessionStoreKind,
+    ) -> AgentSessionHandle {
+        let cwd = root.join("primary");
+        std::fs::create_dir(&cwd).expect("primary workspace");
+        let workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        });
+        let tools = ToolRegistry::with_mutation_recorder(
+            &["read", "write"],
+            &cwd,
+            None,
+            None,
+            Some(&workspace),
+        );
+        let mut store =
+            Session::create_with_dir_and_store(Some(root.join("sessions")), store_kind);
+        store.header.cwd = cwd.display().to_string();
+        let session = AgentSession::new(
+            Agent::new(provider, tools, AgentConfig::default()),
+            Arc::new(AsyncMutex::new(store)),
+            true,
+            ResolvedCompactionSettings::default(),
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        handle.workspace = Some(workspace);
+        handle
+    }
+
+    #[test]
+    fn workspace_root_changes_reopen_durably_and_revoke_existing_tool_handles() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            let root = tempdir().unwrap();
+            let mut handle = workspace_handle_with_store(root.path(), store_kind);
+            let extra = root.path().join("additional");
+            std::fs::create_dir(&extra).unwrap();
+            let canonical = extra.canonicalize().unwrap();
+            let probe = extra.join("probe.txt");
+            std::fs::write(&probe, "before grant").unwrap();
+            let tools = handle.session.agent.shared_tools().snapshot();
+            let write = tools.get("write").unwrap();
+            run_async(async {
+                assert!(
+                    write
+                        .execute(
+                            "before-grant",
+                            serde_json::json!({"path": probe, "content": "denied"}),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+                handle.add_workspace_root(&extra).await.unwrap();
+                let path = handle
+                    .session_store()
+                    .try_lock()
+                    .unwrap()
+                    .path
+                    .clone()
+                    .unwrap();
+                let reopened = Session::open(&path.display().to_string()).await.unwrap();
+                assert_eq!(reopened.additional_roots(), vec![canonical.clone()]);
+                let output = write
+                    .execute(
+                        "after-grant",
+                        serde_json::json!({"path": probe, "content": "allowed"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!output.is_error);
+
+                let nested = extra.join("nested");
+                std::fs::create_dir(&nested).unwrap();
+                assert!(
+                    handle
+                        .add_workspace_root(&nested)
+                        .await
+                        .unwrap()
+                        .starts_with("Already")
+                );
+                assert_eq!(
+                    Session::open(&path.display().to_string())
+                        .await
+                        .unwrap()
+                        .additional_roots(),
+                    vec![canonical]
+                );
+                handle.remove_workspace_root(&extra).await.unwrap();
+                assert!(
+                    Session::open(&path.display().to_string())
+                        .await
+                        .unwrap()
+                        .additional_roots()
+                        .is_empty()
+                );
+                assert!(handle.workspace().unwrap().additional_roots().is_empty());
+                assert!(
+                    write
+                        .execute(
+                            "after-revocation",
+                            serde_json::json!({"path": probe, "content": "must stay denied"}),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(std::fs::read_to_string(&probe).unwrap(), "allowed");
+            });
+        }
+    }
+
+    #[test]
+    fn workspace_root_save_failures_do_not_grant_access_or_undo_revocation() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            for remove in [false, true] {
+                let root = tempdir().unwrap();
+                let mut handle = workspace_handle_with_store(root.path(), store_kind);
+                let extra = root.path().join("additional");
+                std::fs::create_dir(&extra).unwrap();
+                let probe = extra.join("probe.txt");
+                std::fs::write(&probe, "must remain untouched").unwrap();
+                let tools = handle.session.agent.shared_tools().snapshot();
+                run_async(async {
+                    handle
+                        .mark_checkpoint("before root change", None)
+                        .await
+                        .unwrap();
+                    if remove {
+                        handle.add_workspace_root(&extra).await.unwrap();
+                    }
+                    let store = handle.session_store();
+                    let original_path = store.try_lock().unwrap().path.clone().unwrap();
+                    let original_bytes = std::fs::read(&original_path).unwrap();
+                    let blocked_path = root
+                        .path()
+                        .join("directory-not-session")
+                        .with_extension(original_path.extension().unwrap());
+                    std::fs::create_dir(&blocked_path).unwrap();
+                    store.try_lock().unwrap().path = Some(blocked_path);
+                    let result = if remove {
+                        handle.remove_workspace_root(&extra).await
+                    } else {
+                        handle.add_workspace_root(&extra).await
+                    };
+                    assert!(result.unwrap_err().is_session_persistence());
+                    assert!(handle.workspace().unwrap().additional_roots().is_empty());
+                    assert!(store.try_lock().unwrap().additional_roots().is_empty());
+                    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+                    assert!(
+                        tools
+                            .get("write")
+                            .unwrap()
+                            .execute(
+                                "failed-root-change",
+                                serde_json::json!({"path": probe, "content": "denied"}),
+                                None,
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&probe).unwrap(),
+                        "must remain untouched"
+                    );
+                    store.try_lock().unwrap().path = Some(original_path.clone());
+                    assert!(
+                        handle
+                            .prompt("must remain fenced", |_| {})
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    assert!(
+                        handle
+                            .add_workspace_root(&extra)
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    // A later explicit flush must not revive a removed root.
+                    handle.session.persist_session().await.unwrap();
+                    assert!(
+                        Session::open(&original_path.display().to_string())
+                            .await
+                            .unwrap()
+                            .additional_roots()
+                            .is_empty()
+                    );
+                    assert!(
+                        handle
+                            .session
+                            .ensure_provider_reentry_allowed()
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_root_paths_use_a_resumed_workdir_attachment() {
+        let _lock = current_dir_lock();
+        let root = tempdir().unwrap();
+        let process_cwd = root.path().join("process/workspace");
+        let attached = root.path().join("attached/workspace");
+        let extra = root.path().join("attached/additional");
+        let decoy = root.path().join("process/additional");
+        for dir in [&process_cwd, &attached, &extra, &decoy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _cwd = CurrentDirGuard::new(&process_cwd);
+        let path = root.path().join("resumed.jsonl");
+        let mut source = Session::in_memory();
+        source.header.cwd = root.path().join("original-moved-away").display().to_string();
+        source.path = Some(path.clone());
+        source.session_dir = Some(root.path().join("sessions"));
+        crate::session_workdir::attach_session_workdir(&mut source, &attached).unwrap();
+        run_async(async {
+            source.save().await.unwrap();
+            let mut handle = create_agent_session(SessionOptions {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-4o".to_string()),
+                api_key: Some("dummy-key".to_string()),
+                session_path: Some(path.clone()),
+                session_dir: Some(root.path().join("sessions")),
+                no_session: false,
+                no_context_files: true,
+                enabled_tools: Some(vec!["read".to_string(), "write".to_string()]),
+                workspace: Some(crate::workspace::WorkspaceHandle::single(&attached)),
+                ..SessionOptions::default()
+            })
+            .await
+            .unwrap();
+            handle.add_workspace_root("../additional").await.unwrap();
+            let expected = vec![extra.canonicalize().unwrap()];
+            assert_eq!(handle.workspace().unwrap().additional_roots(), expected);
+            assert_eq!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots(),
+                expected
+            );
+            assert!(!handle.workspace().unwrap().is_within(&decoy));
+            handle.remove_workspace_root("../additional").await.unwrap();
+            let reopened = Session::open(&path.display().to_string()).await.unwrap();
+            assert!(reopened.additional_roots().is_empty());
+            assert_eq!(
+                crate::session_workdir::require_session_workdir(&reopened).unwrap(),
+                attached.canonicalize().unwrap()
+            );
+            assert_eq!(reopened.header.cwd, source.header.cwd);
+        });
+    }
+
+    #[test]
+    fn waiting_workspace_root_changes_cancel_without_mutation_or_quarantine() {
+        for remove in [false, true] {
+            let root = tempdir().unwrap();
+            let mut handle =
+                workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+            let extra = root.path().join("additional");
+            std::fs::create_dir(&extra).unwrap();
+            run_async(async {
+                handle
+                    .mark_checkpoint("before root change", None)
+                    .await
+                    .unwrap();
+                if remove {
+                    handle.add_workspace_root(&extra).await.unwrap();
+                }
+                let store = handle.session_store();
+                let workspace = handle.workspace().unwrap();
+                let before_roots = workspace.additional_roots();
+                let before_session =
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                let admission = handle.session.provider_admission_gate();
+                let actions = handle.session.session_action_admission_gate();
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_permit = admission.acquire(cx.cx()).await.unwrap();
+                let mut change = Box::pin(async {
+                    if remove {
+                        handle.remove_workspace_root(&extra).await
+                    } else {
+                        handle.add_workspace_root(&extra).await
+                    }
+                });
+                assert!(futures::poll!(change.as_mut()).is_pending());
+                let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(action_permit)) =
+                    futures::poll!(callback_action.as_mut())
+                else {
+                    panic!("a waiting root change must not hold Session-action authority");
+                };
+                assert_eq!(workspace.additional_roots(), before_roots);
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap()
+                        == before_session
+                );
+                drop(change);
+                drop(action_permit);
+                drop(provider_permit);
+                admission.ensure_allowed().unwrap();
+                if remove {
+                    handle.remove_workspace_root(&extra).await.unwrap();
+                } else {
+                    handle.add_workspace_root(&extra).await.unwrap();
+                }
+                admission.ensure_allowed().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn workspace_root_grant_stays_private_and_preserves_host_edits_during_save() {
+        let root = tempdir().unwrap();
+        let mut handle =
+            workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+        let previous = root.path().join("previous");
+        let proposed = root.path().join("proposed");
+        std::fs::create_dir(&previous).unwrap();
+        std::fs::create_dir(&proposed).unwrap();
+        run_async(async {
+            handle.add_workspace_root(&previous).await.unwrap();
+            let store = handle.session_store();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let admission = handle.session.provider_admission_gate();
+            let mut host_workspace = handle.workspace().unwrap();
+            let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+            let mut change = Box::pin(handle.add_workspace_root(&proposed));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            assert_eq!(
+                host_workspace.additional_roots(),
+                vec![previous.canonicalize().unwrap()]
+            );
+            assert!(!host_workspace.is_within(&proposed));
+            assert!(host_workspace.remove_root(&previous));
+            drop(disk_lock);
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(10),
+                change,
+            )
+            .await
+            .expect("root save must finish after releasing the persistence lock");
+            assert!(result.unwrap_err().is_session_persistence());
+            assert!(host_workspace.additional_roots().is_empty());
+            assert!(store.try_lock().unwrap().additional_roots().is_empty());
+            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            handle.session.persist_session().await.unwrap();
+            assert!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn workspace_root_removal_revokes_existing_tools_before_save_completes() {
+        let root = tempdir().unwrap();
+        let mut handle =
+            workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+        let extra = root.path().join("additional");
+        std::fs::create_dir(&extra).unwrap();
+        let probe = extra.join("probe.txt");
+        std::fs::write(&probe, "must remain untouched").unwrap();
+        let tools = handle.session.agent.shared_tools().snapshot();
+        run_async(async {
+            handle.add_workspace_root(&extra).await.unwrap();
+            let store = handle.session_store();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let workspace = handle.workspace().unwrap();
+            let admission = handle.session.provider_admission_gate();
+            let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+            let mut change = Box::pin(handle.remove_workspace_root(&extra));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            assert!(workspace.additional_roots().is_empty());
+            assert!(admission.ensure_allowed().unwrap_err().is_session_persistence());
+            assert!(
+                tools
+                    .get("write")
+                    .unwrap()
+                    .execute(
+                        "revoked-before-save",
+                        serde_json::json!({"path": probe, "content": "denied"}),
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            drop(disk_lock);
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(10),
+                change,
+            )
+            .await
+            .expect("root removal must finish after releasing the persistence lock")
+            .unwrap();
+            admission.ensure_allowed().unwrap();
+            assert!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read_to_string(&probe).unwrap(), "must remain untouched");
+        });
     }
 
     fn flaky_handle_as(
