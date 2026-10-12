@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 
 mod targets;
 pub(super) use targets::Targets;
+#[cfg(test)]
+mod tests_transport;
 
 const MAX_FRAMES: usize = 256;
 const MAX_DEPTH: usize = 32;
@@ -54,6 +56,7 @@ struct Tree {
 }
 
 impl Tree {
+    #[cfg(test)]
     fn parse(response: &Value) -> Result<Self> {
         Self::parse_in_session(response, "")
     }
@@ -135,7 +138,8 @@ impl Tree {
     /// root has an external parentId, which must belong to its owning parent
     /// session before that subtree may join this page's frame inventory.
     fn append_remote(&mut self, response: &Value, link: &targets::Link) -> Result<()> {
-        let root = response.get("frameTree")
+        let root = response
+            .get("frameTree")
             .filter(|value| value.is_object())
             .ok_or_else(|| error("iframe session returned no frame tree"))?;
         let frame = &root["frame"];
@@ -143,7 +147,11 @@ impl Tree {
             return Err(error("iframe target does not match its root frame"));
         }
         let parent = identifier(frame, "parentId", false)?;
-        if self.frames.get(&parent).is_none_or(|frame| frame.identity.session != link.parent) {
+        if self
+            .frames
+            .get(&parent)
+            .is_none_or(|frame| frame.identity.session != link.parent)
+        {
             return Err(error("iframe root is not owned by its attached parent session"));
         }
         let depth = self.path(&parent)?.len();
@@ -173,16 +181,22 @@ async fn inventory(owner: &AgentCx, cdp: &mut Cdp) -> Result<Tree> {
     let root = cdp.page_session_id()?.to_owned();
     let links = targets::discover(owner, cdp).await?;
     let generation = cdp.frame_targets.generation();
-    let response = cdp.frame_command(owner, &root, "Page.getFrameTree", json!({})).await?;
+    let response = cdp
+        .frame_command(owner, &root, "Page.getFrameTree", json!({}))
+        .await?;
     let mut tree = Tree::parse_in_session(&response, &root)?;
     for link in &links {
-        let response = cdp.frame_command(owner, &link.session, "Page.getFrameTree", json!({})).await?;
+        let response = cdp
+            .frame_command(owner, &link.session, "Page.getFrameTree", json!({}))
+            .await?;
         tree.append_remote(&response, link)?;
     }
     // Never return a silently incomplete snapshot when a process swap or
     // newly attached subtree races the collection of its component trees.
     if cdp.frame_targets.generation() != generation {
-        return Err(error("iframe targets changed during discovery; use list_frames again"));
+        return Err(error(
+            "iframe targets changed during discovery; use list_frames again",
+        ));
     }
     Ok(tree)
 }
@@ -200,22 +214,123 @@ fn admit_path(path: &[Identity], allowlist: Option<&[String]>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub(super) struct Scope {
     ancestry: Vec<Identity>,
     context: u64,
+    routes: Vec<targets::Link>,
 }
 
 impl Scope {
+    fn pin(tree: &Tree, id: &str, targets: &Targets) -> Result<Self> {
+        let ancestry = tree.path(id)?;
+        let root = ancestry
+            .first()
+            .ok_or_else(|| error("frame selection has no page"))?;
+        let routes: Vec<_> = targets
+            .ordered(&root.session)?
+            .into_iter()
+            .filter(|link| ancestry.iter().any(|frame| frame.session == link.session))
+            .collect();
+        if ancestry.iter().any(|frame| {
+            frame.session != root.session
+                && !routes.iter().any(|link| link.session == frame.session)
+        }) {
+            return Err(error("selected frame has no owned renderer session"));
+        }
+        Ok(Self {
+            ancestry,
+            context: 0,
+            routes,
+        })
+    }
+
     pub(super) const fn context_id(&self) -> u64 {
         self.context
     }
 
-    pub(super) fn check(&self, response: &Value) -> Result<Value> {
-        let selected = self
-            .ancestry
+    fn selected(&self) -> Result<&Identity> {
+        self.ancestry
             .last()
-            .ok_or_else(|| error("frame selection has no document"))?;
-        let current = Tree::parse(response)?.path(&selected.id)?;
+            .ok_or_else(|| error("frame selection has no document"))
+    }
+
+    pub(super) fn is_remote(&self) -> bool {
+        self.ancestry
+            .first()
+            .zip(self.ancestry.last())
+            .is_some_and(|(root, selected)| root.session != selected.session)
+    }
+
+    /// Pointer geometry from a remote renderer is not a page-viewport point.
+    /// Do not dispatch a plausible but misplaced native click or wheel event.
+    /// Inspection, evaluation and focused keyboard input need no conversion.
+    pub(super) fn admit_action(&self, action: &str) -> Result<()> {
+        if self.is_remote() && matches!(action, "click" | "scroll") {
+            return Err(error(
+                "cross-process frame pointer input requires page-coordinate projection; click and scroll are not supported for this frame",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn command_session(&self, method: &str) -> Result<&str> {
+        if self.is_remote() && method == "Input.dispatchMouseEvent" {
+            return Err(error(
+                "cross-process frame pointer coordinates are not admitted",
+            ));
+        }
+        // Input belongs to the focused page, not the renderer's default
+        // widget. The caller verifies focus in the selected isolated world.
+        if method.starts_with("Input.") || method == "Page.bringToFront" {
+            self.ancestry
+                .first()
+                .map(|root| root.session.as_str())
+                .ok_or_else(|| error("frame selection has no page"))
+        } else {
+            Ok(&self.selected()?.session)
+        }
+    }
+
+    pub(super) fn check_targets(&self, cdp: &Cdp) -> Result<()> {
+        if self.ancestry.first().map(|root| root.session.as_str()) != Some(cdp.page_session_id()?)
+            || !cdp.frame_targets.preserves(&self.routes)
+        {
+            return Err(error(
+                "selected frame renderer detached or changed; take a new snapshot",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rebuild just this document's process ancestry, not unrelated iframe
+    /// targets. A sibling's reload cannot invalidate the selection, but every
+    /// selected renderer incarnation, parent, loader and URL remains pinned.
+    pub(super) async fn check_current(&self, owner: &AgentCx, cdp: &mut Cdp) -> Result<Value> {
+        self.check_targets(cdp)?;
+        let root = cdp.page_session_id()?.to_owned();
+        let response = cdp
+            .frame_command(owner, &root, "Page.getFrameTree", json!({}))
+            .await?;
+        let mut tree = Tree::parse_in_session(&response, &root)?;
+        for link in &self.routes {
+            let response = cdp
+                .frame_command(owner, &link.session, "Page.getFrameTree", json!({}))
+                .await?;
+            tree.append_remote(&response, link)?;
+        }
+        self.check_targets(cdp)?;
+        self.check_tree(&tree)
+    }
+
+    #[cfg(test)]
+    pub(super) fn check(&self, response: &Value) -> Result<Value> {
+        self.check_tree(&Tree::parse(response)?)
+    }
+
+    fn check_tree(&self, tree: &Tree) -> Result<Value> {
+        let selected = self.selected()?;
+        let current = tree.path(&selected.id)?;
         if current != self.ancestry {
             return Err(error(
                 "selected frame or ancestor navigated; list frames and take a new snapshot before retrying",
@@ -287,24 +402,26 @@ pub(super) async fn select(
     id: &str,
     allowlist: Option<&[String]>,
 ) -> Result<Scope> {
-    let response = cdp.command(owner, "Page.getFrameTree", json!({})).await?;
-    let ancestry = Tree::parse(&response)?.path(id)?;
-    admit_path(&ancestry, allowlist)?;
+    let tree = inventory(owner, cdp).await?;
+    let mut scope = Scope::pin(&tree, id, &cdp.frame_targets)?;
+    admit_path(&scope.ancestry, allowlist)?;
+    scope.check_current(owner, cdp).await?;
+    let session = scope.selected()?.session.clone();
     let world = cdp
-        .command(
+        .frame_command(
             owner,
+            &session,
             "Page.createIsolatedWorld",
             json!({"frameId": id, "worldName": "pi-browser-tools"}),
         )
         .await?;
-    let context = world["executionContextId"]
+    scope.context = world["executionContextId"]
         .as_u64()
         .filter(|id| *id > 0)
         .ok_or_else(|| error("selected frame has no isolated execution context"))?;
-    let scope = Scope { ancestry, context };
     // Creating the world can race a navigation. Do not authorize the new
     // document merely because Chromium reused a frame ID.
-    scope.check(&cdp.command(owner, "Page.getFrameTree", json!({})).await?)?;
+    scope.check_current(owner, cdp).await?;
     Ok(scope)
 }
 
@@ -355,6 +472,101 @@ pub(super) async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scoped_remote_tree() -> (Tree, Targets) {
+        let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
+        let mut targets = Targets::default();
+        for (parent, session, target) in [
+            ("page", "remote-session", "remote"),
+            ("remote-session", "nested-session", "remote-nested"),
+            ("page", "sibling-session", "remote-sibling"),
+        ] {
+            targets.observe(&json!({
+                "sessionId": parent, "method": "Target.attachedToTarget",
+                "params": {"sessionId": session, "waitingForDebugger": false,
+                    "targetInfo": {"targetId": target, "type": "iframe"}},
+            }), Some("page")).unwrap();
+        }
+        for (parent, session, target, frame_parent) in [
+            ("page", "remote-session", "remote", "child"),
+            ("remote-session", "nested-session", "remote-nested", "remote"),
+            ("page", "sibling-session", "remote-sibling", "main"),
+        ] {
+            tree.append_remote(
+                &remote_tree(target, frame_parent, "https://example.com/"),
+                &remote_link(parent, session, target),
+            ).unwrap();
+        }
+        (tree, targets)
+    }
+
+    #[test]
+    fn selection_routes_dom_and_worlds_to_the_owner_but_keys_to_the_page() {
+        let (tree, targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        assert_eq!(scope.routes.len(), 2);
+        for method in [
+            "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+            "DOM.resolveNode", "DOM.describeNode", "Accessibility.getFullAXTree",
+            "Page.createIsolatedWorld",
+        ] {
+            assert_eq!(scope.command_session(method).unwrap(), "nested-session");
+        }
+        for method in ["Input.insertText", "Input.dispatchKeyEvent", "Page.bringToFront"] {
+            assert_eq!(scope.command_session(method).unwrap(), "page");
+        }
+        assert!(scope.command_session("Input.dispatchMouseEvent").is_err());
+        for action in ["snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press"] {
+            assert!(scope.admit_action(action).is_ok());
+        }
+        for action in ["click", "scroll"] {
+            assert!(scope.admit_action(action).is_err());
+        }
+        let local = Scope::pin(&tree, "child", &targets).unwrap();
+        assert!(local.routes.is_empty());
+        assert_eq!(local.command_session("Input.dispatchMouseEvent").unwrap(), "page");
+        assert!(local.admit_action("click").is_ok());
+        assert!(Scope::pin(&tree, "other-tab-frame", &targets).is_err());
+    }
+
+    #[test]
+    fn selected_process_and_every_ancestor_document_are_pinned() {
+        for frame_id in ["main", "child", "remote", "remote-nested"] {
+            for field in ["loader", "url", "session", "parent"] {
+                let (mut tree, targets) = scoped_remote_tree();
+                let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+                assert!(scope.check_tree(&tree).is_ok());
+                let identity = &mut tree.frames.get_mut(frame_id).unwrap().identity;
+                match field {
+                    "loader" => identity.loader = "new-loader".into(),
+                    "url" => identity.url = "https://example.com/new".into(),
+                    "session" => identity.session = "replacement-process".into(),
+                    _ => identity.parent = Some("foreign-parent".into()),
+                }
+                assert!(scope.check_tree(&tree).is_err(), "{frame_id} {field}");
+            }
+        }
+        let (mut tree, targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        tree.frames.get_mut("remote-sibling").unwrap().identity.loader = "new-sibling".into();
+        assert!(scope.check_tree(&tree).is_ok());
+        tree.frames.remove("remote");
+        assert!(scope.check_tree(&tree).is_err());
+    }
+
+    #[test]
+    fn selection_requires_owned_routes_and_ignores_unrelated_detach() {
+        let (tree, mut targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        assert!(targets.preserves(&scope.routes));
+        targets.observe(&json!({"sessionId":"page", "method":"Target.detachedFromTarget",
+            "params":{"sessionId":"sibling-session"}}), Some("page")).unwrap();
+        assert!(targets.preserves(&scope.routes));
+        targets.observe(&json!({"sessionId":"page", "method":"Target.detachedFromTarget",
+            "params":{"sessionId":"remote-session"}}), Some("page")).unwrap();
+        assert!(!targets.preserves(&scope.routes));
+        assert!(Scope::pin(&tree, "remote-nested", &targets).is_err());
+    }
 
     fn remote_link(parent: &str, session: &str, target: &str) -> targets::Link {
         let mut targets = Targets::default();
@@ -520,6 +732,7 @@ mod tests {
         let scope = Scope {
             ancestry: Tree::parse(&source).unwrap().path("nested").unwrap(),
             context: 7,
+            routes: Vec::new(),
         };
         assert_eq!(scope.check(&source).unwrap()["id"], "nested");
         for pointer in [

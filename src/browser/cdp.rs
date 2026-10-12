@@ -540,6 +540,16 @@ impl Cdp {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        if let Some(scope) = self.frame_scope.clone() {
+            // Bypass this routing entrypoint while checking the ancestry:
+            // check_current uses explicit session commands, so validation
+            // cannot recurse through command() or fall back to the page.
+            scope.check_current(owner, self).await?;
+            let session = scope.command_session(method)?;
+            let response = self.frame_command(owner, session, method, params).await?;
+            scope.check_targets(self)?;
+            return Ok(response);
+        }
         self.call(owner, method, params, true).await
     }
 
@@ -634,16 +644,14 @@ impl Cdp {
     /// Resolve only the pinned frame, or the main document when no frame was
     /// requested. Never substitute the root after a detach or navigation.
     pub(super) async fn frame_document(&mut self, owner: &AgentCx) -> Result<Value> {
+        if let Some(scope) = self.frame_scope.clone() {
+            return scope.check_current(owner, self).await;
+        }
         let tree = self.command(owner, "Page.getFrameTree", json!({})).await?;
-        self.frame_scope.as_ref().map_or_else(
-            || {
-                tree["frameTree"]
-                    .get("frame")
-                    .cloned()
-                    .ok_or_else(|| Error::tool("browser", "page has no main-frame document"))
-            },
-            |scope| scope.check(&tree),
-        )
+        tree["frameTree"]
+            .get("frame")
+            .cloned()
+            .ok_or_else(|| Error::tool("browser", "page has no main-frame document"))
     }
 
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
@@ -1003,7 +1011,9 @@ impl Session {
         }
         let frame = args.get("frame").and_then(Value::as_str);
         if let Some(frame) = frame {
-            cdp.frame_scope = Some(frames::select(owner, cdp, frame, allowlist).await?);
+            let scope = frames::select(owner, cdp, frame, allowlist).await?;
+            scope.admit_action(action)?;
+            cdp.frame_scope = Some(scope);
         }
         let reference_key = (target.clone(), frame.unwrap_or_default().to_owned());
         if let Some(expected) = dialog::Expected::from_args(args, allowlist)? {

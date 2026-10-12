@@ -107,7 +107,7 @@ impl BrowserTool {
     }
 
     /// Select managed launch from trusted host code, overriding the environment.
-    /// Stop an already-running browser before changing connection configuration.
+    /// Stop an already-running browser before changing its connection configuration.
     #[must_use]
     pub fn with_launch_options(mut self, options: BrowserLaunchOptions) -> Self {
         self.launch_options = Some(options);
@@ -179,7 +179,7 @@ impl Tool for BrowserTool {
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
                 "frame": {"type": "string", "maxLength": 256,
-                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll or wait_for to that frame for this call only. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Out-of-process frames and frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
+                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll or wait_for to that frame for this call only. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Nested out-of-process frames support inspection, evaluate, wait_for and focused type/fill/press; their click/scroll are not supported until native page-coordinate projection is available. Frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate; frame-scoped evaluation uses an isolated DOM world, not the page's JavaScript globals"},
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1. Frame references require the same tab and frame; frame-scoped press/scroll require a selector."},

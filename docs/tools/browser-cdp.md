@@ -137,17 +137,23 @@ structured CDP arguments rather than interpolated executable source.
 ## Inspect and operate an embedded frame
 
 First obtain the frame ID from the selected tab. Frame IDs are browser-generated,
-not CSS selectors, element references, frame names or target IDs.
+not CSS selectors, element references or frame names. Use the returned ID rather
+than trying to select a browser-wide iframe target directly.
 
 ```json
 {"action":"list_frames","tab":"work"}
 ```
 
 The result contains `frames`, with each entry's `frame_id`, `parent_id`,
-`is_main`, `allowed`, `url` and `name`. Names and URLs are omitted for frames
-blocked by the URL policy. Discovery does not itself enter a frame or change
-future calls' document scope. The returned tree is limited to 256 frames and
-32 nesting levels; an oversized or malformed tree fails explicitly.
+`is_main`, `out_of_process`, `allowed`, `url` and `name`. Names and URLs are omitted
+for frames blocked by the URL policy. Discovery recursively auto-attaches only
+iframe targets related to the selected page, without pausing them for a debugger.
+It merges the local frame trees of those renderers through validated parent-frame
+and parent-session links; another tab or a worker cannot join the inventory.
+Discovery does not itself enter an isolated DOM world or change future calls'
+document scope. The combined tree is limited to 256 frames and 32 nesting levels,
+with a separate bound on attachment work; malformed or changing trees fail
+explicitly rather than returning a silently incomplete inventory.
 
 Use an actual returned frame ID in place of `FRAME_ID` below:
 
@@ -155,50 +161,58 @@ Use an actual returned frame ID in place of `FRAME_ID` below:
 {"action":"snapshot","tab":"work","frame":"FRAME_ID"}
 {"action":"fill","tab":"work","frame":"FRAME_ID","selector":"#email","text":"person@example.com"}
 {"action":"press","tab":"work","frame":"FRAME_ID","selector":"#email","key":"End"}
-{"action":"click","tab":"work","frame":"FRAME_ID","selector":"@e12"}
 {"action":"wait_for","tab":"work","frame":"FRAME_ID","selector":".result","timeout_ms":10000}
-{"action":"scroll","tab":"work","frame":"FRAME_ID","selector":".results","delta_y":400}
 {"action":"evaluate","tab":"work","frame":"FRAME_ID","script":"({title: document.title, count: document.forms.length})"}
 ```
 
 An explicit `tab` is required whenever `frame` is supplied. The frame option is
 per-call: it is never a persistent switch that could silently redirect a later
-operation. Supported scoped actions are `snapshot`, `ax_tree`, `evaluate`,
-`click`, `type`, `fill`, `press`, `scroll` and `wait_for`. Scoped keypress and
-wheel actions also require an explicit selector, instead of using ambient focus
-or the main viewport. Keyboard/text actions bring the selected page to the front,
-focus the requested control and check focus before native input dispatch.
+operation. Same-process frames support `snapshot`, `ax_tree`, `evaluate`,
+`click`, `type`, `fill`, `press`, `scroll` and `wait_for`. Nested out-of-process
+frames support `snapshot`, `ax_tree`, `evaluate`, `type`, `fill`, `press` and
+`wait_for`. Their `click` and `scroll` actions currently fail explicitly: remote
+renderer coordinates must not be dispatched as if they were page coordinates.
+Scoped keypress and wheel actions require an explicit selector instead of using
+ambient focus or the main viewport. Keyboard/text actions bring the selected page
+to the front, focus the requested control in its renderer and check focus before
+native input dispatch to the page.
 
-CSS lookup runs in the selected frame's isolated world. Snapshot references must
-be used with the same tab and frame; inspecting the parent or another frame does
-not overwrite them. The registry retains at most 256 document buckets. Evicted,
-detached and navigated references fail rather than rebinding to replacement
-nodes. Snapshot details include `frame_id` and `reference_scope`.
+CSS lookup runs in the selected frame's isolated world. Runtime, DOM and
+accessibility commands use that frame's owning renderer session; keyboard input
+uses the page session. Responses must match both the request ID and renderer
+session. Snapshot references must be used with the same tab and frame; inspecting
+the parent or another frame does not overwrite them. The registry retains at most
+256 document buckets. Evicted, detached and navigated references fail rather than
+rebinding to replacement nodes. Snapshot details include `frame_id` and
+`reference_scope`.
 
-For clicks and wheel input, Pi obtains Chromium's content quads in page-viewport
-coordinates, clips them to the viewport, and verifies the actual hit-test node
-belongs to the selected frame and target element or its composed descendants.
-An overlay in an ancestor document therefore blocks the operation even when the
-frame's own local hit test sees an unobstructed element. Frame-local DOM rectangle
-coordinates are never blindly reused as page coordinates. Geometry and candidate
-counts are bounded, and no mouse event is dispatched when checks fail.
+For same-process clicks and wheel input, Pi obtains Chromium's content quads in
+page-viewport coordinates, clips them to the viewport, and verifies the actual
+hit-test node belongs to the selected frame and target element or its composed
+descendants. An overlay in an ancestor document therefore blocks the operation
+even when the frame's own local hit test sees an unobstructed element. Frame-local
+DOM rectangle coordinates are never blindly reused as page coordinates. Geometry
+and candidate counts are bounded, and no mouse event is dispatched when checks
+fail. This native page-coordinate projection is not yet implemented across remote
+renderer boundaries.
 
-Each scoped operation pins the selected frame and its ancestors' IDs, loader IDs
-and URLs before entering an isolated world. Every ancestor must pass the URL
-policy; nested `about:blank` and `about:srcdoc` cannot bypass a blocked ancestor.
-Navigation, reparenting or detach detected during the operation is an error,
-not permission to enter the new document. These checks are not an atomic browser
-transaction: page scripts can run between protocol commands, and cancellation
-or failure cannot roll back effects already dispatched.
+Each scoped operation pins the selected frame and its ancestors' IDs, loader IDs,
+URLs and renderer sessions before entering an isolated world. Related renderer
+attachments carry incarnation identities, so a detach/re-attach cannot reuse an
+old selection merely by repeating an opaque session ID. Every ancestor must pass
+the URL policy; nested `about:blank` and `about:srcdoc` cannot bypass a blocked
+ancestor. Navigation, reparenting or detach detected during the operation is an
+error, not permission to enter the new document. Unrelated sibling reloads do not
+invalidate an otherwise unchanged selected ancestry. These checks are not an
+atomic browser transaction: page scripts can run between protocol commands, and
+cancellation or failure cannot roll back effects already dispatched. The
+operation's socket owns all its renderer attachments and drops them on exit.
 
-**Current scope:** same-process frames reachable through the attached page's CDP
-session. Out-of-process iframe attachment/routing is not implemented. Chromium
-errors when a frame cannot be entered are propagated without a main-frame
-fallback. Frame-scoped evaluation has DOM access in an isolated world, not access
-to the page's JavaScript global variables. Frame options on uploads, downloads,
-exports, navigation, tab/lifecycle actions or dialog responses are rejected
-before connection or launch. Those existing operations remain main-document or
-tab-level operations.
+Frame-scoped evaluation has DOM access in an isolated world, not access to the
+page's JavaScript global variables. Frame options on uploads, downloads, exports,
+navigation, tab/lifecycle actions or dialog responses are rejected before
+connection or launch. Those existing operations remain main-document or tab-level
+operations. Chromium errors never authorize a fallback to the main frame.
 
 ## Select real files for upload
 
@@ -320,9 +334,24 @@ Mock mode requires `with_mock(true)` or `PI_BROWSER_MOCK=1`;
 full-page capture and PDF operations deliberately reject mock mode rather than
 inventing successful process, input or transfer results.
 
-### Frame increment validation status
+### Cross-process frame increment validation status
 
-The frame increment adds 16 Rust test functions: frame-tree/policy/document
+The cross-process increment adds 18 regression test functions across frame
+discovery, session/ancestry admission, response correlation and a real loopback
+HTTP/WebSocket protocol peer. The peer drives the public browser tool for nested
+frame listing, evaluation, snapshots, form filling, focused keypresses and waits;
+it also injects navigation, detach, foreign-target, blocked-ancestor and
+wrong-session conditions. It validates the Rust adapter's intended transport
+behavior, not Chromium's renderer, hit testing or actual native input.
+
+These tests were authored but **not executed** in the implementation environment.
+`dsr quality --tool pi_agent_rust` remains unavailable (exit 127). No Rust compile,
+formatting, Clippy, test pass, live cross-process Chromium run or DSR gate result
+is claimed. Cross-process native pointer projection is still incomplete.
+
+### Earlier same-process frame increment validation status
+
+The earlier frame increment adds 16 Rust test functions: frame-tree/policy/document
 identity tests, geometry and handle-admission tests, public preflight checks,
 and one ignored real-Chromium integration scenario in `tests/browser_frames.rs`.
 That live scenario exercises iframe fill/type/keypress, actual native clicks,
