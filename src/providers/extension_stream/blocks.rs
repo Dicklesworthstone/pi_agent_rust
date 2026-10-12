@@ -11,6 +11,9 @@
 //! Tool IDs and names are bound at their first nonempty indexed preview, not
 //! just at the end: arguments may accumulate, but a preview cannot change the
 //! identity of the operation that stream consumers have already observed.
+//! Nonblank IDs cannot identify two different preview indices. Text/thinking
+//! deltas must agree with their snapshots, and later snapshots and successful
+//! terminals may extend, but never rewrite, an already observed text prefix.
 
 use super::{MAX_BLOCKS, limit, protocol};
 use crate::error::Result;
@@ -88,9 +91,48 @@ fn identity_fingerprint(value: &str) -> Option<[u8; 32]> {
     (!value.trim().is_empty()).then(|| Sha256::digest(value.as_bytes()).into())
 }
 
+// Retain only a length and a commitment to a delta's cumulative snapshot.
+// Signatures may arrive later; completed-block fingerprints bind those at End.
+#[derive(Clone, Copy)]
+struct TextPrefix {
+    bytes: usize,
+    fingerprint: [u8; 32],
+}
+
+impl TextPrefix {
+    fn new(text: &str) -> Self {
+        Self {
+            bytes: text.len(),
+            fingerprint: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+
+    fn check(self, text: &str) -> Result<()> {
+        // get() also rejects a replacement that puts the old byte boundary
+        // inside a new Unicode character, rather than panicking on a slice.
+        let prefix = text
+            .get(..self.bytes)
+            .ok_or_else(|| protocol("text or thinking content retracted an observed prefix"))?;
+        let fingerprint: [u8; 32] = Sha256::digest(prefix.as_bytes()).into();
+        if fingerprint != self.fingerprint {
+            return Err(protocol("text or thinking content changed an observed prefix"));
+        }
+        Ok(())
+    }
+}
+
+fn text_payload(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::Text(text) => Some(&text.text),
+        ContentBlock::Thinking(thinking) => Some(&thinking.thinking),
+        _ => None,
+    }
+}
+
 pub(super) struct Ledger {
     entries: Vec<Option<State>>,
     tool_identities: Vec<Option<ToolIdentity>>,
+    text_prefixes: Vec<Option<TextPrefix>>,
 }
 
 impl Ledger {
@@ -98,16 +140,66 @@ impl Ledger {
         Self {
             entries: Vec::new(),
             tool_identities: Vec::new(),
+            text_prefixes: Vec::new(),
         }
     }
 
     fn observe_tool(&self, index: usize, call: &ToolCall) -> Result<ToolIdentity> {
-        self.tool_identities
+        let previous = self
+            .tool_identities
             .get(index)
             .copied()
             .flatten()
-            .unwrap_or_default()
-            .observe(call)
+            .unwrap_or_default();
+        let observed = previous.observe(call)?;
+        // Scan only when an ID first becomes bound, not on every arguments
+        // delta. There can be at most MAX_BLOCKS such bindings per stream;
+        // reuse their fixed-size commitments instead of storing another map.
+        if previous.id.is_none()
+            && let Some(id) = observed.id
+            && self
+                .tool_identities
+                .iter()
+                .flatten()
+                .any(|identity| identity.id == Some(id))
+        {
+            return Err(protocol(
+                "tool-call ID is already assigned to another content index",
+            ));
+        }
+        Ok(observed)
+    }
+
+    fn observe_text(
+        &self,
+        index: usize,
+        event: &AssistantMessageEvent,
+        block: &ContentBlock,
+    ) -> Result<Option<TextPrefix>> {
+        let Some(text) = text_payload(block) else {
+            return Ok(None);
+        };
+        let delta = match event {
+            AssistantMessageEvent::TextDelta { delta, .. }
+            | AssistantMessageEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+            AssistantMessageEvent::TextEnd { .. }
+            | AssistantMessageEvent::ThinkingEnd { .. } => None,
+            // Indexed Start events deliver only the index, not their text.
+            // They must not consume a prefix before the first actual delta.
+            _ => return Ok(None),
+        };
+        let before_delta = if let Some(delta) = delta {
+            text.strip_suffix(delta)
+                .ok_or_else(|| protocol("text or thinking delta disagrees with its partial block"))?
+        } else {
+            text
+        };
+        if let Some(Some(previous)) = self.text_prefixes.get(index) {
+            // A sparse stream can skip intervening updates, but the new
+            // delta cannot replay/overlap text that was already observed.
+            previous.check(before_delta)?;
+        }
+        Ok(delta.map(|_| TextPrefix::new(text)))
     }
 
     #[allow(clippy::too_many_lines)] // one match over the block lifecycle events
@@ -221,6 +313,7 @@ impl Ledger {
         } else {
             None
         };
+        let text_prefix = self.observe_text(index, event, block)?;
         let fingerprint = if phase == Phase::End {
             Some(block_fingerprint(block)?)
         } else {
@@ -234,6 +327,12 @@ impl Ledger {
                 self.tool_identities.resize(index + 1, None);
             }
             self.tool_identities[index] = Some(identity);
+        }
+        if let Some(prefix) = text_prefix {
+            if self.text_prefixes.len() <= index {
+                self.text_prefixes.resize(index + 1, None);
+            }
+            self.text_prefixes[index] = Some(prefix);
         }
         self.entries[index] = Some(State {
             kind,
@@ -258,6 +357,11 @@ impl Ledger {
             }
             if let ContentBlock::ToolCall(call) = block {
                 self.observe_tool(index, call)?;
+            }
+            if let Some(text) = text_payload(block)
+                && let Some(Some(prefix)) = self.text_prefixes.get(index)
+            {
+                prefix.check(text)?;
             }
             if let Some(expected) = state.fingerprint
                 && block_fingerprint(block)? != expected
@@ -732,22 +836,405 @@ mod tests {
     }
 
     fn tool_preview(phase: Phase, tool_call: ToolCall) -> AssistantMessageEvent {
-        let partial = message(vec![ContentBlock::ToolCall(tool_call.clone())]);
+        indexed_tool_preview(0, phase, tool_call)
+    }
+
+    fn indexed_tool_preview(
+        content_index: usize,
+        phase: Phase,
+        tool_call: ToolCall,
+    ) -> AssistantMessageEvent {
+        let mut content = vec![text(""); content_index];
+        content.push(ContentBlock::ToolCall(tool_call.clone()));
+        let partial = message(content);
         match phase {
             Phase::Start => AssistantMessageEvent::ToolCallStart {
-                content_index: 0,
+                content_index,
                 partial,
             },
             Phase::Delta => AssistantMessageEvent::ToolCallDelta {
-                content_index: 0,
+                content_index,
                 delta: "{}".into(),
                 partial,
             },
             Phase::End => AssistantMessageEvent::ToolCallEnd {
-                content_index: 0,
+                content_index,
                 tool_call,
                 partial,
             },
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_ids_are_rejected_before_any_second_preview_is_forwarded() {
+        for (first_index, next_index) in [(0, 2), (2, 0)] {
+            for first in [Phase::Start, Phase::Delta, Phase::End] {
+                for next in [Phase::Start, Phase::Delta, Phase::End] {
+                    let mut decoder = decoder();
+                    let mut supplied = call();
+                    supplied.id = "PRIVATE-CANARY".into();
+                    push(
+                        &mut decoder,
+                        indexed_tool_preview(first_index, first, supplied.clone()),
+                    )
+                    .unwrap();
+                    supplied.arguments = json!({"path": "other.txt"});
+                    reject(
+                        &mut decoder,
+                        indexed_tool_preview(next_index, next, supplied),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_tool_ids_cannot_collide_when_they_become_known() {
+        for next in [Phase::Delta, Phase::End] {
+            let mut decoder = decoder();
+            let mut unknown = call();
+            unknown.id.clear();
+            for index in 0..2 {
+                push(
+                    &mut decoder,
+                    indexed_tool_preview(index, Phase::Start, unknown.clone()),
+                )
+                .unwrap();
+            }
+            push(&mut decoder, tool_preview(Phase::Delta, call())).unwrap();
+            reject(&mut decoder, indexed_tool_preview(1, next, call()));
+        }
+    }
+
+    #[test]
+    fn distinct_ids_allow_same_tool_name_and_repeated_interleaved_argument_updates() {
+        let calls = [
+            call(),
+            ToolCall {
+                id: "call-2".into(),
+                ..call()
+            },
+        ];
+        let mut decoder = decoder();
+        for phase in [Phase::Start, Phase::Delta, Phase::Delta, Phase::End] {
+            for index in [1, 0] {
+                assert_eq!(
+                    push(
+                        &mut decoder,
+                        indexed_tool_preview(index, phase, calls[index].clone()),
+                    )
+                    .unwrap()
+                    .len(),
+                    1
+                );
+            }
+        }
+        let output = push(
+            &mut decoder,
+            terminal(
+                StopReason::Stop,
+                calls.into_iter().map(ContentBlock::ToolCall).collect(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            &output[0],
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                message,
+            } if message.content.len() == 2
+        ));
+    }
+
+    #[test]
+    fn rejected_duplicate_does_not_claim_an_index_or_mutate_the_existing_call() {
+        let mut ledger = Ledger::new();
+        ledger.admit(&tool_preview(Phase::Start, call())).unwrap();
+        assert!(
+            ledger
+                .admit(&indexed_tool_preview(1, Phase::End, call()))
+                .is_err()
+        );
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.tool_identities.len(), 1);
+        let other = ToolCall {
+            id: "call-2".into(),
+            ..call()
+        };
+        ledger
+            .admit(&indexed_tool_preview(1, Phase::End, other.clone()))
+            .unwrap();
+        ledger
+            .admit(&terminal(
+                StopReason::ToolUse,
+                vec![ContentBlock::ToolCall(call()), ContentBlock::ToolCall(other)],
+            ))
+            .unwrap();
+    }
+
+    fn text_preview(
+        kind: Kind,
+        content_index: usize,
+        phase: Phase,
+        delta: &str,
+        content: &str,
+    ) -> AssistantMessageEvent {
+        use AssistantMessageEvent as E;
+        let mut blocks = vec![text(""); content_index];
+        blocks.push(match kind {
+            Kind::Text => text(content),
+            Kind::Thinking => thinking(content),
+            Kind::Tool => panic!("expected text or thinking"),
+        });
+        let partial = message(blocks);
+        match (kind, phase) {
+            (Kind::Text, Phase::Start) => E::TextStart {
+                content_index,
+                partial,
+            },
+            (Kind::Text, Phase::Delta) => E::TextDelta {
+                content_index,
+                delta: delta.into(),
+                partial,
+            },
+            (Kind::Text, Phase::End) => E::TextEnd {
+                content_index,
+                content: content.into(),
+                partial,
+            },
+            (Kind::Thinking, Phase::Start) => E::ThinkingStart {
+                content_index,
+                partial,
+            },
+            (Kind::Thinking, Phase::Delta) => E::ThinkingDelta {
+                content_index,
+                delta: delta.into(),
+                partial,
+            },
+            (Kind::Thinking, Phase::End) => E::ThinkingEnd {
+                content_index,
+                content: content.into(),
+                partial,
+            },
+            (Kind::Tool, _) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn text_and_thinking_deltas_must_match_their_same_event_snapshots() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            for (delta, content) in [("PRIVATE-CANARY", "real"), ("long", "x"), ("x", "xy")] {
+                reject(
+                    &mut decoder(),
+                    text_preview(kind, 0, Phase::Delta, delta, content),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn later_deltas_cannot_rewrite_retract_overlap_or_replay_observed_text() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            for (delta, content) in [
+                (" suffix", "PRIVATE-CANARY suffix"),
+                ("", "pre"),
+                ("prefix", "prefix"),
+                ("fix", "prefix"),
+                ("", "different"),
+            ] {
+                let mut decoder = decoder();
+                push(
+                    &mut decoder,
+                    text_preview(kind, 0, Phase::Delta, "prefix", "prefix"),
+                )
+                .unwrap();
+                reject(
+                    &mut decoder,
+                    text_preview(kind, 0, Phase::Delta, delta, content),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ends_and_successful_terminals_cannot_replace_open_text_prefixes() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            for replacement in ["", "pre", "PRIVATE-CANARY"] {
+                let mut stream_decoder = decoder();
+                push(
+                    &mut stream_decoder,
+                    text_preview(kind, 0, Phase::Delta, "prefix", "prefix"),
+                )
+                .unwrap();
+                reject(
+                    &mut stream_decoder,
+                    text_preview(kind, 0, Phase::End, "", replacement),
+                );
+                for reason in [
+                    StopReason::Stop,
+                    StopReason::Length,
+                    StopReason::Refusal,
+                    StopReason::PauseTurn,
+                ] {
+                    let mut decoder = decoder();
+                    push(
+                        &mut decoder,
+                        text_preview(kind, 0, Phase::Delta, "prefix", "prefix"),
+                    )
+                    .unwrap();
+                    let block = if kind == Kind::Text {
+                        text(replacement)
+                    } else {
+                        thinking(replacement)
+                    };
+                    reject(&mut decoder, terminal(reason, vec![block]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_unicode_updates_and_optional_end_events_can_extend_open_prefixes() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            for emit_end in [false, true] {
+                let mut decoder = decoder();
+                for (delta, content) in [
+                    ("🦀", "unseen 🦀"),
+                    (" world", "unseen 🦀 middle world"),
+                    ("", "unseen 🦀 middle world"),
+                ] {
+                    assert_eq!(
+                        push(
+                            &mut decoder,
+                            text_preview(kind, 0, Phase::Delta, delta, content),
+                        )
+                        .unwrap()
+                        .len(),
+                        1
+                    );
+                }
+                let complete = "unseen 🦀 middle world!";
+                if emit_end {
+                    push(
+                        &mut decoder,
+                        text_preview(kind, 0, Phase::End, "", complete),
+                    )
+                    .unwrap();
+                }
+                let block = if kind == Kind::Text {
+                    text(complete)
+                } else {
+                    thinking(complete)
+                };
+                let output = push(&mut decoder, terminal(StopReason::Stop, vec![block])).unwrap();
+                assert!(matches!(
+                    &output[0],
+                    StreamEvent::Done { message, .. }
+                        if text_payload(&message.content[0]) == Some(complete)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_starts_do_not_consume_text_and_interleaved_prefixes_are_independent() {
+        let mut decoder = decoder();
+        for (kind, index, content) in [(Kind::Text, 0, "answer"), (Kind::Thinking, 1, "reason")] {
+            push(
+                &mut decoder,
+                text_preview(kind, index, Phase::Start, "", content),
+            )
+            .unwrap();
+            push(
+                &mut decoder,
+                text_preview(kind, index, Phase::Delta, content, content),
+            )
+            .unwrap();
+        }
+        for (kind, index, content) in [(Kind::Thinking, 1, "reason!"), (Kind::Text, 0, "answer!")] {
+            push(
+                &mut decoder,
+                text_preview(kind, index, Phase::Delta, "!", content),
+            )
+            .unwrap();
+        }
+        let output = push(
+            &mut decoder,
+            terminal(StopReason::Stop, vec![text("answer!"), thinking("reason!")]),
+        )
+        .unwrap();
+        assert!(matches!(&output[0], StreamEvent::Done { .. }));
+    }
+
+    #[test]
+    fn unicode_boundary_rewrites_and_rejected_deltas_do_not_mutate_prefix_state() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            let mut ledger = Ledger::new();
+            ledger
+                .admit(&text_preview(kind, 0, Phase::Delta, "a", "a"))
+                .unwrap();
+            // The previous one-byte boundary lies inside the new 'é'.
+            assert!(
+                ledger
+                    .admit(&text_preview(kind, 0, Phase::Delta, "!", "é!"))
+                    .is_err()
+            );
+            ledger
+                .admit(&text_preview(kind, 0, Phase::Delta, "🦀", "a🦀"))
+                .unwrap();
+            ledger
+                .admit(&text_preview(kind, 0, Phase::End, "", "a🦀"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn text_prefix_tracking_is_bounded_and_not_allocated_for_end_only_previews() {
+        let mut ledger = Ledger::new();
+        for content_index in [MAX_BLOCKS, usize::MAX] {
+            let event = AssistantMessageEvent::TextDelta {
+                content_index,
+                delta: "".into(),
+                partial: message(vec![text("")]),
+            };
+            assert!(ledger.admit(&event).is_err());
+            assert!(ledger.entries.is_empty());
+            assert!(ledger.text_prefixes.is_empty());
+        }
+        ledger.admit(&block_event(Kind::Tool, Phase::Start)).unwrap();
+        ledger
+            .admit(&text_preview(Kind::Text, 1, Phase::End, "", "complete"))
+            .unwrap();
+        assert!(ledger.text_prefixes.is_empty());
+        ledger
+            .admit(&text_preview(
+                Kind::Thinking,
+                MAX_BLOCKS - 1,
+                Phase::Delta,
+                "🦀",
+                "🦀",
+            ))
+            .unwrap();
+        assert_eq!(ledger.text_prefixes.len(), MAX_BLOCKS);
+        assert!(ledger.text_prefixes[..MAX_BLOCKS - 1].iter().all(Option::is_none));
+        assert!(std::mem::size_of::<TextPrefix>() <= 40);
+    }
+
+    #[test]
+    fn failure_and_cancellation_can_discard_open_text_without_fabricating_success() {
+        for kind in [Kind::Text, Kind::Thinking] {
+            for reason in [StopReason::Error, StopReason::Aborted] {
+                let mut decoder = decoder();
+                push(
+                    &mut decoder,
+                    text_preview(kind, 0, Phase::Delta, "prefix", "prefix"),
+                )
+                .unwrap();
+                let output = push(&mut decoder, terminal(reason, vec![])).unwrap();
+                assert!(matches!(&output[0], StreamEvent::Error { .. }));
+                assert!(decoder.finished());
+                assert!(decoder.finish().unwrap().is_empty());
+            }
         }
     }
 

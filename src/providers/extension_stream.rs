@@ -615,10 +615,14 @@ mod preview_budget_tests {
 
     #[test]
     fn individually_valid_tool_starts_cannot_accumulate_unbounded_metadata() {
-        let call = call();
+        let mut call = call();
         let bytes = serde_json::to_vec(&(&call.id, &call.name)).unwrap().len();
         let mut decoder = decoder(3 * bytes);
         for index in 0..3 {
+            // Distinct calls need distinct IDs. Equal-length identities keep
+            // this test focused on the exact aggregate metadata-byte limit.
+            call.id = format!("call-{index}");
+            assert_eq!(serde_json::to_vec(&(&call.id, &call.name)).unwrap().len(), bytes);
             let events = push(
                 &mut decoder,
                 AssistantMessageEvent::ToolCallStart {
@@ -630,6 +634,7 @@ mod preview_budget_tests {
             assert_eq!(events.len(), 1);
         }
         assert_eq!(decoder.preview_bytes_remaining, 0);
+        call.id = "call-3".into();
         reject_limit(
             &mut decoder,
             AssistantMessageEvent::ToolCallStart {
