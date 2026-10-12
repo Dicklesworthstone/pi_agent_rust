@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+pub(super) mod forms;
 mod frame_input;
 pub(super) mod upload;
 

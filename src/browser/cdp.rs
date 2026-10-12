@@ -138,6 +138,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
                 ));
             }
         }
+        action if interaction::forms::is_action(action) => interaction::forms::validate(args)?,
         "upload" => {
             interaction::upload::validate(args)?;
         }
@@ -1060,6 +1061,10 @@ impl Session {
             }
             "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
                 interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
+                    .await
+            }
+            action if interaction::forms::is_action(action) => {
+                interaction::forms::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
                     .await
             }
             "upload" => {

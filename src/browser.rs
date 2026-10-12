@@ -107,7 +107,7 @@ impl BrowserTool {
     }
 
     /// Select managed launch from trusted host code, overriding the environment.
-    /// Stop an already-running browser before changing connection configuration.
+    /// Stop an already-running browser before changing its connection configuration.
     #[must_use]
     pub fn with_launch_options(mut self, options: BrowserLaunchOptions) -> Self {
         self.launch_options = Some(options);
@@ -158,10 +158,10 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
-         frame discovery and frame-scoped inspection/input, workspace file uploads, JavaScript dialogs, \
-         screenshots and PDF export. start launches or attaches; status never launches; stop only \
-         stops a Pi-owned browser. Failures are errors, never simulated successes. Selecting \
-         upload files exposes them to page scripts."
+         structured option selection, frame discovery and frame-scoped inspection/input, \
+         workspace file uploads, JavaScript dialogs, screenshots and PDF export. start launches \
+         or attaches; status never launches; stop only stops a Pi-owned browser. Failures are \
+         errors, never simulated successes. Selecting upload files exposes them to page scripts."
     }
 
     fn parameters(&self) -> Value {
@@ -173,18 +173,31 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "list_frames", "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
-                             "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf",
+                             "scroll", "wait_for", "select_option", "upload", "download", "screenshot", "print_pdf",
                              "handle_dialog"],
                     "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
                 "frame": {"type": "string", "maxLength": 256,
-                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll or wait_for to that frame for this call only, including nested out-of-process frames. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Cross-process click/scroll project through embedding content quads and verify ancestor hit tests before native page input; occluded, invalid or pinch-zoomed geometry is rejected. Frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
+                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll, wait_for or select_option to that frame for this call only, including nested out-of-process frames. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Cross-process click/scroll project through embedding content quads and verify ancestor hit tests before native page input; occluded, invalid or pinch-zoomed geometry is rejected. Frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate; frame-scoped evaluation uses an isolated DOM world, not the page's JavaScript globals"},
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1. Frame references require the same tab and frame; frame-scoped press/scroll require a selector."},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
+                "options": {
+                    "type": "array", "maxItems": 100,
+                    "description": "select_option: required full selection for an ordinary HTML select. Each item specifies exactly one literal value, exact DOM label, or zero-based index. Missing, ambiguous, duplicate and disabled options fail before mutation. [] clears; multiple entries require a multiple select. At most 64 KiB of selector text. Uses DOM selectedness setters and input/change events, not trusted native mouse selection; verifies retained results on the same node.",
+                    "items": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "value": {"type":"string"},
+                            "label": {"type":"string"},
+                            "index": {"type":"integer", "minimum":0, "maximum":4095}
+                        },
+                        "oneOf": [{"required":["value"]}, {"required":["label"]}, {"required":["index"]}]
+                    }
+                },
                 "accept": {"type": "boolean", "description": "handle_dialog: required explicit choice; true accepts, false dismisses the selected tab's current JavaScript dialog. Requires an explicit tab; never replays the triggering action."},
                 "prompt_text": {"type": "string", "description": "handle_dialog: exact prompt answer, at most 64 KiB. Only with accept=true; omit to send no promptText override."},
                 "dialog_response": {
@@ -239,13 +252,14 @@ impl Tool for BrowserTool {
                     | "download"
                     | "print_pdf"
                     | "handle_dialog"
-            ) || args.get("frame").is_some()
+            ) || interaction::forms::is_action(action)
+                || args.get("frame").is_some()
                 || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()
             {
                 return Err(Error::tool(
                     "browser",
-                    "browser lifecycle, frames, file uploads, dialogs and page exports require the native backend",
+                    "browser lifecycle, frames, structured forms, file uploads, dialogs and page exports require the native backend",
                 ));
             }
             return self

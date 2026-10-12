@@ -6,6 +6,7 @@
 //! operation instead of falling back to the top-level document.
 
 use super::cdp::Cdp;
+use super::interaction::forms;
 use super::{output, policy, required};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -273,6 +274,7 @@ impl Scope {
                 "snapshot" | "ax_tree" | "evaluate" | "wait_for"
                     | "click" | "scroll" | "fill" | "type" | "press"
             )
+            && !forms::is_action(action)
         {
             return Err(error("action is not supported in a cross-process frame"));
         }
@@ -376,7 +378,7 @@ pub(super) fn validate(args: &Value) -> Result<()> {
             | "press"
             | "scroll"
             | "wait_for"
-    ) {
+    ) && !forms::is_action(action) {
         return Err(error(
             "frame selection is supported by inspection, evaluation and input actions only",
         ));
@@ -473,6 +475,16 @@ pub(super) async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_forms_keep_explicit_tab_and_owned_renderer_requirements() {
+        let (tree, targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        assert!(scope.admit_action("select_option").is_ok());
+        assert!(validate(&json!({"action":"select_option","tab":"work","frame":"child"})).is_ok());
+        assert!(validate(&json!({"action":"select_option","frame":"child"})).is_err());
+        assert!(validate(&json!({"action":"select_option","tab":"work","frame":"child","dialog_response":{}})).is_err());
+    }
 
     fn scoped_remote_tree() -> (Tree, Targets) {
         let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
