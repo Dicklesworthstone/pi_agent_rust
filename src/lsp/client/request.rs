@@ -20,6 +20,7 @@ use super::{
 };
 use crate::agent_cx::AgentCx;
 
+mod array_results;
 mod partial_results;
 mod workspace_diagnostics;
 pub(super) use partial_results::PartialResults;

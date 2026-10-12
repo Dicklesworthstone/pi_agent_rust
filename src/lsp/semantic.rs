@@ -20,6 +20,9 @@ mod navigation;
 mod signatures;
 mod symbols;
 
+#[cfg(test)]
+mod streamed_reads;
+
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 

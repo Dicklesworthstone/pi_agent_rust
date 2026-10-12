@@ -351,11 +351,25 @@ impl LspTool {
             }
         }
         source.verify(&budget)?;
-        let raw = source
-            .entry
-            .client
-            .call(method, params, budget.remaining()?)
-            .await?;
+        let raw = if action == "hover" {
+            source
+                .entry
+                .client
+                .call(method, params, budget.remaining()?)
+                .await?
+        } else {
+            source
+                .entry
+                .client
+                .call_with_array_partial_results(
+                    method,
+                    params,
+                    budget.remaining()?,
+                    MAX_RESPONSE_BYTES,
+                    MAX_SERVER_LOCATIONS,
+                )
+                .await?
+        };
         source.verify(&budget)?;
         let payload = json!({
             "action":action,"file":display_path(&source.path,&self.cwd),

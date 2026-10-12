@@ -204,10 +204,12 @@ impl LspTool {
         let raw = source
             .entry
             .client
-            .call(
+            .call_with_array_partial_results(
                 "workspace/symbol",
                 json!({"query":query}),
                 budget.remaining()?,
+                MAX_RESPONSE_BYTES,
+                MAX_SERVER_ITEMS,
             )
             .await?;
         source.verify(&budget)?;
