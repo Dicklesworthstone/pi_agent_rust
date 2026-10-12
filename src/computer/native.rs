@@ -1,4 +1,4 @@
-//! Validated desktop requests and native X11/AT-SPI operations. Other backends
+//! Validated desktop requests and native X11/AT-SPI and macOS operations. Other backends
 //! fail explicitly; selecting a backend never selects canned results.
 
 #[cfg(unix)]
@@ -22,9 +22,11 @@ use std::time::Duration;
 mod accessibility;
 #[cfg(unix)]
 mod input;
+#[cfg(unix)]
+mod macos;
 
 pub(super) const HELPERS: &[&str] = &[
-    "xrandr", "wmctrl", "xprop", "scrot", "xdotool", "xclip", "python3",
+    "xrandr", "wmctrl", "xprop", "scrot", "xdotool", "xclip", "python3", "swift",
 ];
 pub(super) const IMAGE_LIMIT: usize = 20 * 1024 * 1024;
 
@@ -101,7 +103,9 @@ pub(super) fn validate(args: &Value) -> Result<Duration> {
         return Err(error(format!("{action} requires both x and y coordinates")));
     }
     number(args, "window_id", 1, i64::from(u32::MAX))?;
-    number(args, "display_id", 1, 64)?;
+    // macOS uses full-width CoreGraphics IDs, not XRandR list indices.
+    // Each backend still admits at most 64 enumerated displays.
+    number(args, "display_id", 1, i64::from(u32::MAX))?;
     if action == "focus_window" && args.get("window_id").is_none() {
         return Err(error("focus_window requires window_id"));
     }
@@ -234,6 +238,9 @@ pub(super) async fn execute(
     args: &Value,
 ) -> Result<ToolOutput> {
     check_owner(owner)?;
+    if cfg!(target_os = "macos") {
+        return macos::execute(owner, cwd, helpers, args).await;
+    }
     if let Some(clipboard) = state.clipboard.as_mut()
         && !matches!(clipboard.poll(4096), Ok(None))
     {
