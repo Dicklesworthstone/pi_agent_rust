@@ -12,10 +12,11 @@ nodes or a one-pixel screenshot.
 
 Native operations are available through **Linux X11** and the
 [macOS backend](computer-macos.md). macOS requires macOS 14 or newer and Xcode
-Command Line Tools; it implements display/window discovery, screenshots,
-clipboard access, accessibility trees, focus, pointer movement and scrolling.
-Its keyboard, click and drag operations remain unsupported. See that backend's
-guide for permissions, desktop-point coordinates and validation limitations.
+Command Line Tools; its source path implements display/window discovery,
+screenshots, clipboard access, accessibility trees, focus, mouse movement,
+clicks, dragging, scrolling, Unicode typing and key chords. See that backend's
+guide for permissions, desktop-point coordinates, input-release limitations and
+validation status. Live macOS behavior remains unverified.
 Windows and native Wayland adapters are not implemented.
 
 The Linux-specific details below describe **X11**. It requires the

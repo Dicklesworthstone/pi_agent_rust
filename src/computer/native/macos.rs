@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const HELPER: &str = concat!(include_str!("macos_input.swift"), "\n", include_str!("macos.swift"));
-const OWNED_INPUT_ACTIONS: &[&str] = &["mouse_click", "mouse_drag"];
+const OWNED_INPUT_ACTIONS: &[&str] = &["mouse_click", "mouse_drag", "key_type", "key_press"];
 const SCREENSHOT_REPLY_LIMIT: usize = IMAGE_LIMIT.div_ceil(3) * 4 + 8192;
 const ACTIONS: &[&str] = &[
     "list_displays",
@@ -26,6 +26,8 @@ const ACTIONS: &[&str] = &[
     "mouse_move",
     "mouse_click",
     "mouse_drag",
+    "key_type",
+    "key_press",
     "scroll",
 ];
 
@@ -55,7 +57,8 @@ fn failure(code: &str) -> crate::error::Error {
         "input_failed" => "macOS could not create the requested input event",
         "input_cancelled" => "macOS input stopped because its owner or deadline ended; releases were attempted and effects may already have occurred",
         "input_channel" => "macOS input could not establish its owner channel",
-        "input_conflict" => "macOS input refused while its button or a modifier is already held; release physical inputs before retrying",
+        "input_conflict" => "macOS input refused while a required key/button, modifier, Caps Lock or Fn state conflicts; release physical inputs before retrying",
+        "unsupported_key" => "macOS key_press accepts ANSI-US letters/digits, named navigation keys and F1..F20 with Ctrl/Alt/Shift/Cmd; use key_type for literal Unicode text",
         "os_version" => "the macOS computer backend requires macOS 14 or newer and Xcode Command Line Tools with a compatible macOS SDK",
         "display_unavailable" => "the requested macOS display is unavailable; list displays again",
         "window_unavailable" => "the requested macOS window is unavailable; list windows again",
@@ -177,6 +180,7 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
         "list_windows" => catalog(data, false),
         "ax_tree" => accessibility_result(args, data),
         "mouse_click" | "mouse_drag" => input_result(args, data),
+        "key_type" | "key_press" => keyboard_result(action, args, data),
         "focus_window" | "mouse_move" | "scroll" => targeting_result(action, args, data),
         "clipboard_read" => {
             fields(data, &["text", "char_count"])?;
@@ -198,14 +202,40 @@ fn admit_result(action: &str, args: &Value, data: &Value) -> Result<()> {
     }
 }
 
-fn input_result(args: &Value, data: &Value) -> Result<()> {
-    fields(data, &["dispatched", "released", "button", "position", "application_effect", "window_id"])?;
-    fields(&data["position"], &["x", "y"])?;
+fn input_confirmation(args: &Value, data: &Value) -> Result<()> {
     if data["dispatched"] != true || data["released"] != true
         || data["application_effect"] != "not_verified"
         || data.get("window_id") != args.get("window_id")
-        || data["button"].as_str() != Some(args["button"].as_str().unwrap_or("left"))
     {
+        return Err(protocol());
+    }
+    if let Some(id) = data.get("window_id") {
+        positive_id(id)?;
+    }
+    Ok(())
+}
+
+fn keyboard_result(action: &str, args: &Value, data: &Value) -> Result<()> {
+    let field = if action == "key_type" { "char_count" } else { "key" };
+    fields(data, &["dispatched", "released", "application_effect", "window_id", field])?;
+    input_confirmation(args, data)?;
+    if action == "key_type" {
+        let text = args["text"].as_str().ok_or_else(protocol)?;
+        let count = u64::try_from(text.chars().count()).map_err(|_| protocol())?;
+        if data["char_count"].as_u64() != Some(count) {
+            return Err(protocol());
+        }
+    } else if data["key"].as_str().is_none() || data.get("key") != args.get("key") {
+        return Err(protocol());
+    }
+    Ok(())
+}
+
+fn input_result(args: &Value, data: &Value) -> Result<()> {
+    fields(data, &["dispatched", "released", "button", "position", "application_effect", "window_id"])?;
+    fields(&data["position"], &["x", "y"])?;
+    input_confirmation(args, data)?;
+    if data["button"].as_str() != Some(args["button"].as_str().unwrap_or("left")) {
         return Err(protocol());
     }
     for axis in ["x", "y"] {
@@ -617,7 +647,9 @@ mod tests {
             json!({"action":"mouse_move","x":-12,"y":300}),
             json!({"action":"scroll","direction":"down"}),
             json!({"action":"mouse_click","button":"right"}),
-            json!({"action":"mouse_drag","x":-12,"y":300})]
+            json!({"action":"mouse_drag","x":-12,"y":300}),
+            json!({"action":"key_type","text":"PRIVATE-CANARY"}),
+            json!({"action":"key_press","key":"Cmd+Shift+C"})]
         {
             let failure = runtime.block_on(tool.execute("desktop-consent", args, None)).unwrap_err();
             assert!(failure.to_string().contains("requires host approval"));
@@ -672,6 +704,82 @@ mod tests {
         assert!(runtime.block_on(async {
             execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &wrong).await
         }).is_err());
+    }
+
+    #[test]
+    fn keyboard_receipts_require_complete_release_and_exact_input_identity() {
+        let text = "a\u{0301}🦀\n\t";
+        let args = json!({"action":"key_type","text":text,"window_id":73});
+        let receipt = json!({"dispatched":true,"released":true,"char_count":5,
+            "window_id":73,"application_effect":"not_verified"});
+        assert!(admit_result("key_type", &args, &receipt).is_ok());
+        for field in ["dispatched", "released", "char_count", "window_id", "application_effect"] {
+            let mut invalid = receipt.clone();
+            invalid[field] = Value::Null;
+            assert!(admit_result("key_type", &args, &invalid).is_err(), "{field}");
+        }
+        for count in [4, text.len(), text.encode_utf16().count()] {
+            let mut invalid = receipt.clone();
+            invalid["char_count"] = json!(count);
+            assert!(admit_result("key_type", &args, &invalid).is_err());
+        }
+        let mut leaked = receipt;
+        leaked["text"] = json!("PRIVATE-CANARY");
+        let failure = admit_result("key_type", &args, &leaked).unwrap_err().to_string();
+        assert!(!failure.contains("PRIVATE-CANARY"));
+        let key = json!({"dispatched":true,"released":true,"key":"Cmd+Shift+C",
+            "application_effect":"not_verified"});
+        assert!(admit_result("key_press", &json!({"key":"Cmd+Shift+C"}), &key).is_ok());
+        assert!(admit_result("key_press", &json!({"key":"Cmd+C"}), &key).is_err());
+        let empty = json!({"dispatched":true,"released":true,"char_count":0,
+            "application_effect":"not_verified"});
+        assert!(admit_result("key_type", &json!({"text":""}), &empty).is_ok());
+    }
+
+    #[test]
+    fn typing_and_chords_use_owned_transport_and_do_not_repeat_failed_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("keyboard-fixture");
+        // A real subprocess records the exact stdin frame to its own sibling
+        // file and responds without EOF. It never runs Swift or posts OS input.
+        std::fs::write(&helper, concat!(
+            "#!/bin/sh\n[ \"$PI_COMPUTER_OWNED_INPUT\" = 1 ] || exit 7\n",
+            "IFS= read -r frame || exit 8\n",
+            "printf '%s\\n' \"$frame\" >> \"$0.requests\"\n",
+            "cat \"$0.reply\"\n",
+        )).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helpers = BTreeMap::from([("swift".to_string(), helper.clone())]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let requests = dir.path().join("keyboard-fixture.requests");
+        let reply = dir.path().join("keyboard-fixture.reply");
+        let text = "🦀\n$(literal-not-a-command)";
+        for (args, data) in [
+            (json!({"action":"key_type","text":text}), json!({"char_count":text.chars().count()})),
+            (json!({"action":"key_press","key":"Ctrl+Shift+C"}), json!({"key":"Ctrl+Shift+C"})),
+        ] {
+            let mut data = data;
+            data["dispatched"] = json!(true);
+            data["released"] = json!(true);
+            data["application_effect"] = json!("not_verified");
+            std::fs::write(&reply, json!({"status":"ok","action":args["action"],"data":data}).to_string()).unwrap();
+            let output = runtime.block_on(async {
+                execute(&AgentCx::for_current_or_request(), dir.path(), &helpers, &args).await.unwrap()
+            });
+            assert!(!output.is_error);
+            assert!(output.details.unwrap().get("text").is_none());
+            let recorded = std::fs::read_to_string(&requests).unwrap();
+            let actual: Value = serde_json::from_str(recorded.lines().last().unwrap()).unwrap();
+            assert_eq!(actual, args);
+        }
+        std::fs::write(&reply, br#"{"status":"error","code":"input_cancelled"}"#).unwrap();
+        let failure = runtime.block_on(async {
+            execute(&AgentCx::for_current_or_request(), dir.path(), &helpers,
+                &json!({"action":"key_type","text":"PRIVATE-CANARY"})).await.unwrap_err()
+        });
+        assert!(!failure.to_string().contains("PRIVATE-CANARY"));
+        assert_eq!(std::fs::read_to_string(&requests).unwrap().lines().count(), 3);
     }
 
     #[cfg(target_os = "macos")]

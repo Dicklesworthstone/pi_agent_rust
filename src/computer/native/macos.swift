@@ -20,6 +20,7 @@ struct Request: Decodable {
     let window_id: UInt32?
     let text: String?
     let button: String?
+    let key: String?
     let x: Int32?
     let y: Int32?
     let direction: String?

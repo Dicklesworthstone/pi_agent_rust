@@ -8,7 +8,7 @@ use super::{error, native};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};

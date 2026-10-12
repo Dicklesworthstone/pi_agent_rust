@@ -13,10 +13,11 @@ An SDK host may override `swift` with an absolute trusted helper path through
 `ComputerTool::with_helper_path`.
 
 Enable `--tools ...,computer` or `computer.enableComputer: true`.
-`computer.requireApproval` remains true by default. Clipboard writes use the
-same host approval picker as other desktop mutations; a missing/dismissed
-picker denies them. Model arguments cannot grant permission. Observation can
-expose private desktop data: use a desktop the session is authorized to inspect.
+`computer.requireApproval` remains true by default. Clipboard writes and input
+use the same host approval picker as other desktop mutations; a missing or
+dismissed picker denies them. Model arguments cannot grant permission.
+Observation can expose private desktop data: use a desktop the session is
+authorized to inspect.
 
 Screen Recording permission is required for window listing and screenshots.
 Grant permission through normal macOS controls to the hosting application or
@@ -84,29 +85,112 @@ All three retain the existing host approval requirement. When a `window_id` is
 supplied for pointer movement or scrolling, that window must already be focused.
 Focus can race; coordinates and wheel events are not confined to that window.
 
-`mouse_click`, `mouse_drag`, `key_type` and `key_press` remain unsupported and
-fail before helper spawn. They need cancellation-safe key/button release
-handling; this backend does not silently substitute unguarded input.
+## Clicks, dragging, typing and shortcuts
+
+All four input actions require host approval by default and macOS Accessibility
+permission. They use an owned, bounded input channel, not an unguarded helper.
+
+```json
+{"action":"mouse_click","x":400,"y":240,"button":"left"}
+{"action":"mouse_drag","x":600,"y":300,"button":"left"}
+{"action":"key_type","text":"Literal Unicode: café 🦀"}
+{"action":"key_press","key":"Cmd+Shift+C"}
+```
+
+`mouse_click` supports left, right and middle buttons. Coordinates are optional;
+with neither it clicks at the current pointer. `mouse_drag` starts at the current
+pointer and requires an endpoint. It emits 24 interpolated drag movements before
+releasing the button. Every sampled path point must lie on an active display;
+points in gaps between monitors are rejected before any press. Results include
+the observed final pointer position and the selected button, not a claim that
+the application accepted the click or drop.
+
+`key_type` emits literal Unicode through Quartz keyboard events, with one
+complete UTF-16 scalar per press/release pair. Combining characters, joiners and
+surrogate pairs retain their order. Newline and Tab dispatch Return and Tab;
+other control characters and NUL are rejected. Input is limited to 4,096 Unicode
+scalars, and empty text emits no events. It never uses the clipboard, shell
+interpolation, or an accessibility value setter. Results report `char_count`,
+not a copy of the typed text. Application frameworks may interpret keyboard
+events themselves instead of honoring their Unicode payloads; successful
+dispatch is not verified text insertion.
+
+`key_press` accepts one ANSI-US physical letter/digit, a named navigation key,
+or F1 through F20, plus Ctrl, Alt, Shift and Cmd/Super modifiers. Control is an
+alias for Ctrl; Command/Meta/Super are aliases for Cmd. Bare `C` adds Shift;
+`Ctrl+C` means Ctrl plus the unshifted C key, and `Ctrl+Shift+C` is explicit.
+Modifier presses precede the primary key, and releases run in reverse order.
+Backspace maps to the backward Delete key, Delete to Forward Delete, and Insert
+to the Mac Help key. F21 through F24 and arbitrary key commands are not supported.
+Shortcuts use Carbon's physical ANSI-US key positions; use `key_type` rather
+than relying on a shortcut key's label for text in another keyboard layout.
+
+Existing held input is not silently cleared: mouse transactions reject a held
+target button or active shortcut modifier; keyboard transactions reject held
+required keys and active shortcut modifiers, Caps Lock or Fn state. Avoid
+concurrent human input. An optional `window_id` is correlated once and must
+remain the focused AX window at every event checkpoint. The helper checks its
+input lease again after potentially blocking focus queries. This is a focus
+precondition, not a security boundary or spatial confinement; a focus change
+between the check and event can still affect another application.
 
 ## Ownership and verification
 
-Request data travels as JSON through anonymous-file stdin, never interpolated
-Swift or shell source. The helper runs outside the workspace with bounded
-stdout and discarded stderr. Capability checks run before spawn and after the
-helper finishes. The existing tool deadline includes approval, lock waiting,
-Swift startup and OS work. Each finite helper also has the shared 30-second
-limit. Cancellation drops the owned process; already accepted OS effects are
-not transactional.
+Finite inspection/clipboard requests travel as JSON through anonymous-file
+stdin. Click/drag/keyboard requests travel as exactly one JSON line (32 KiB
+maximum) on a nonblocking pipe; Rust keeps the writer open as the input lease.
+The fixed helper source and trusted executable selection are separate from
+request data. No text is interpolated into Swift, shell source or argv.
 
-Source validation in this implementation environment: the helper parsed with
-Swift's macOS-target frontend. Seven actual helper protocol checks passed on
-Linux: valid requests reject the unsupported platform, while malformed JSON,
-wrong-type/overflow IDs, conflicting capture targets and oversized input fail
-with fixed diagnostics without echoing private request data. These are not a
-macOS SDK typecheck or native desktop tests.
+The input helper is the sole event emitter. It checks for lease EOF, a second
+command or deadline expiration between events; failures unwind through releases
+for only the inputs it holds. Normal and emergency release events are allocated
+before each transaction's first press. Typing builds two native events per
+scalar transaction rather than retaining thousands of native events. Normal
+success is reported only after release dispatch; `released: true` is a dispatch
+receipt, not independent observation of the OS key/button state. The application
+outcome is always `application_effect: "not_verified"`. Rust checks receipt
+fields, requested target and exact text count/chord or button/position before
+returning success. Failed input is never automatically repeated.
+
+On cancellation or future drop, Rust closes the input lease first and allows
+up to 500 ms of cooperative cleanup before killing the process group and reaping
+the helper. It does not spawn a new cleanup process after cancellation and has
+no detached stdin/stdout pump threads. The grace is not a guarantee: a crashed
+helper, abrupt host termination, stalled OS call or an uncooperative helper can
+leave input effects behind. Releases cannot undo already accepted text, clicks
+or application actions. Cleanup/reaping is synchronous and not hard real-time.
+
+The helper runs outside the workspace with bounded stdout and discarded
+stderr. Capability checks run before spawn and after completion. The existing
+tool deadline includes approval, lock waiting, Swift startup and OS work; each
+helper has a 30-second bound, and input emission also has a 20-second budget.
+
+Validation in this implementation environment: the combined helper parsed with
+Swift's macOS-target frontend. The portable production mouse/keyboard planners
+and lifecycle engine passed 1,313 assertions, including every modifier subset,
+cancellation at every event boundary, a sink failing after a press, reverse
+release order, literal Unicode round-trips and input bounds. These are recording
+sink tests, not native desktop tests. The actual combined helper passed eight
+Linux framing/protocol checks, including replying while its input lease remains
+open, invalid field types, incomplete frames, excess data and private-data-safe
+errors. Linux execution checks the explicit unsupported-platform response, not
+macOS APIs.
+
+The portable fixture can be run without requesting desktop access:
+
+```sh
+probe_dir=$(mktemp -d)
+cat src/computer/native/macos_input.swift \
+    src/computer/native/macos/input_tests.swift > "$probe_dir/input.swift"
+swift -swift-version 5 -D PI_INPUT_TESTS "$probe_dir/input.swift"
+```
+
 Rust regression tests cover protocol admission, catalogs, clipboard replies,
 PNG identity/dimensions, no-overwrite publication, helper failure, the macOS
-dispatch seam, target confirmation, accessibility privacy/budgets and public
-tool approval. They have not run: `dsr quality --tool pi_agent_rust` returned
-`dsr: command not found` (exit 127), and no Rust toolchain is installed here.
-Full DSR quality and actual macOS permission/desktop tests remain required.
+dispatch seam, target confirmation, accessibility privacy/budgets, public tool
+approval, input pipe ownership and receipt validation. They have not run:
+`dsr quality --tool pi_agent_rust` returned `dsr: command not found` (exit 127),
+and no Rust toolchain is installed here. Full DSR quality, macOS SDK typechecking
+and live permission/input/desktop tests remain required. Neither the portable
+Swift fixture nor its Linux protocol probes constitute a DSR quality pass.
