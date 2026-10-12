@@ -11,14 +11,13 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::{
     ACP_STOP_REASON_CANCELLED, ACP_STOP_REASON_END_TURN, ACP_STOP_REASON_ERROR, AbortSignal,
-    AcpSessionsMap, AgentCx, AgentSession, history, json_rpc_notification,
+    AcpOutput, AcpSessionsMap, AgentCx, AgentSession, history, json_rpc_notification,
 };
 use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager, ServerInfo};
 
@@ -231,7 +230,7 @@ fn status(state: &SessionMcp) -> String {
 pub(super) async fn announce(
     state: &Arc<SessionMcp>,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> Result<(), String> {
     history::send_line(out, commands_notification(id))
         .await
@@ -289,7 +288,7 @@ pub(super) fn command_from_prompt(blocks: &[Value]) -> Result<Option<Command>, S
     Ok(Some(command))
 }
 
-async fn emit_text(out: &SyncSender<String>, id: &str, text: &str) -> Result<(), String> {
+async fn emit_text(out: &AcpOutput, id: &str, text: &str) -> Result<(), String> {
     history::send_line(out, json_rpc_notification("session/update", json!({
         "sessionId": id,
         "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } },
@@ -369,7 +368,7 @@ pub(super) async fn before_prompt(
     command: Option<Command>,
     signal: &AbortSignal,
     cx: &AgentCx,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
     id: &str,
 ) -> Option<&'static str> {
     if signal.is_aborted() || cx.is_cancel_requested() {
@@ -709,6 +708,7 @@ mod tests {
                     available_models: Vec::new(),
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
+                let out = AcpOutput::new(out);
                 let run = |command| {
                     let (_, signal) = super::super::AbortHandle::new();
                     super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(

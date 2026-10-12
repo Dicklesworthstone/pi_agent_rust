@@ -591,6 +591,7 @@ mod tests {
         use crate::agent::AgentEvent;
 
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let tx = super::super::AcpOutput::new(tx);
         let handler = super::super::build_acp_event_handler(tx, "editor-session".to_string());
         handler(AgentEvent::ToolExecutionUpdate {
             tool_call_id: "capture-1".to_string(),
@@ -623,6 +624,7 @@ mod tests {
     #[test]
     fn failed_tool_keeps_its_error_status_and_visual_evidence() {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let tx = super::super::AcpOutput::new(tx);
         let handler = super::super::build_acp_event_handler(tx, "editor-session".to_string());
         let mut result = screenshot_output();
         result.is_error = true;

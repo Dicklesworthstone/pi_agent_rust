@@ -54,7 +54,7 @@ use crate::tools::ToolRegistry;
 use asupersync::channel::oneshot;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
-use asupersync::time::{timeout, wall_now};
+use asupersync::time::{sleep, timeout, wall_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -157,6 +157,259 @@ fn json_rpc_notification(method: &str, params: Value) -> String {
 
 type AcpSessionsMap = Arc<Mutex<HashMap<String, Arc<Mutex<AcpSessionState>>>>>;
 type PendingPermissionMap = Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>;
+
+/// Synchronous agent callbacks cannot wait for the editor to drain stdout.
+/// Preserve the bounded FIFO, but turn saturation into a terminal transport
+/// failure instead of parking an async worker inside SyncSender::send.
+/// Once any frame is lost, no later response may claim a successful delivery.
+#[derive(Clone)]
+struct AcpOutput {
+    sender: std::sync::mpsc::SyncSender<String>,
+    shared: Arc<AcpOutputShared>,
+}
+
+struct AcpOutputShared {
+    state: StdMutex<AcpOutputState>,
+    failed: AbortHandle,
+    failure: AbortSignal,
+    pending_permissions: PendingPermissionMap,
+}
+
+#[derive(Default)]
+struct AcpOutputState {
+    failure: Option<&'static str>,
+    stopping: bool,
+    prompts: HashMap<String, AbortHandle>,
+}
+
+impl AcpOutputShared {
+    fn record_failure(&self, state: &mut AcpOutputState, reason: &'static str) {
+        state.failure.get_or_insert(reason);
+        state.stopping = true;
+        for handle in state.prompts.values() {
+            // Use the native abort lane. Cancelling the runtime context can
+            // prevent the task from running its persistence/owner cleanup.
+            handle.abort();
+        }
+        self.pending_permissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.failed.abort();
+    }
+
+    fn fail(&self, reason: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_failure(&mut state, reason);
+    }
+}
+
+impl AcpOutput {
+    fn new(sender: std::sync::mpsc::SyncSender<String>) -> Self {
+        let (failed, failure) = AbortHandle::new();
+        Self {
+            sender,
+            shared: Arc::new(AcpOutputShared {
+                state: StdMutex::new(AcpOutputState::default()),
+                failed,
+                failure,
+                pending_permissions: Arc::new(StdMutex::new(HashMap::new())),
+            }),
+        }
+    }
+
+    fn send(
+        &self,
+        line: String,
+    ) -> std::result::Result<(), std::sync::mpsc::TrySendError<String>> {
+        self.admit(line, true)
+    }
+
+    /// Async replay can retain the unsent frame and wait for bounded
+    /// backpressure. Synchronous callbacks instead call send and fail closed
+    /// on overflow; they must never silently skip a delta or tool result.
+    fn try_send(
+        &self,
+        line: String,
+    ) -> std::result::Result<(), std::sync::mpsc::TrySendError<String>> {
+        self.admit(line, false)
+    }
+
+    fn admit(
+        &self,
+        line: String,
+        fail_when_full: bool,
+    ) -> std::result::Result<(), std::sync::mpsc::TrySendError<String>> {
+        use std::sync::mpsc::TrySendError;
+
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.failure.is_some() {
+            return Err(TrySendError::Disconnected(line));
+        }
+        let result = self.sender.try_send(line);
+        match &result {
+            Err(TrySendError::Full(_)) if fail_when_full => self.shared.record_failure(
+                &mut state,
+                "ACP output queue is full; cannot deliver all updates",
+            ),
+            Err(TrySendError::Disconnected(_)) => self
+                .shared
+                .record_failure(&mut state, "ACP output client disconnected"),
+            _ => {}
+        }
+        result
+    }
+
+    fn failure_reason(&self) -> Option<&'static str> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure
+    }
+
+    fn prompt_is_active(&self, session_id: &str) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts
+            .contains_key(session_id)
+    }
+
+    fn begin_prompt(&self, session_id: String, abort: AbortHandle) -> Result<AcpPromptGuard> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopping || state.failure.is_some() {
+            abort.abort();
+            return Err(Error::session("ACP output is closed to new prompts"));
+        }
+        if state.prompts.contains_key(&session_id) {
+            return Err(Error::session("ACP session already has an active prompt"));
+        }
+        state.prompts.insert(session_id.clone(), abort);
+        Ok(AcpPromptGuard {
+            shared: Arc::clone(&self.shared),
+            session_id,
+            started: false,
+            settled: false,
+        })
+    }
+
+    /// Serialize approval admission with EOF/failure cleanup. A permission
+    /// inserted after finish_prompts clears the registry would have no editor
+    /// left to answer it.
+    fn register_permission(
+        &self,
+        key: String,
+        sender: oneshot::Sender<Value>,
+    ) -> std::result::Result<(), &'static str> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopping || state.failure.is_some() {
+            return Err(
+                state
+                    .failure
+                    .unwrap_or("permission request client is shutting down"),
+            );
+        }
+        self.shared
+            .pending_permissions
+            .lock()
+            .map_err(|_| "permission request registry unavailable")?
+            .insert(key, sender);
+        Ok(())
+    }
+
+    fn abort_prompt(&self, session_id: &str) {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = state.prompts.get(session_id) {
+            handle.abort();
+        }
+    }
+
+    /// Stop admission, signal every turn, and wait for their owners to return.
+    /// Dropping an output clone is not proof that a session was persisted.
+    async fn finish_prompts(&self) -> Result<()> {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stopping = true;
+            for handle in state.prompts.values() {
+                handle.abort();
+            }
+        }
+        self.shared
+            .pending_permissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let drain = async {
+            loop {
+                if self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prompts
+                    .is_empty()
+                {
+                    return;
+                }
+                sleep(wall_now(), Duration::from_millis(5)).await;
+            }
+        };
+        timeout(wall_now(), Duration::from_secs(30), Box::pin(drain))
+            .await
+            .map_err(|_| Error::session("ACP prompt cleanup timed out; persistence is incomplete"))
+    }
+}
+
+/// Acquired before spawn so queued, not-yet-polled turns are also cancelled.
+/// Retirement follows the durable prompt result and owner restoration.
+struct AcpPromptGuard {
+    shared: Arc<AcpOutputShared>,
+    session_id: String,
+    started: bool,
+    settled: bool,
+}
+
+impl Drop for AcpPromptGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prompts.remove(&self.session_id);
+        if self.started && !self.settled {
+            self.shared.record_failure(
+                &mut state,
+                "ACP prompt task ended before session cleanup completed",
+            );
+        }
+    }
+}
 
 const ACP_PERMISSION_ALLOW_ONCE: &str = "allow-once";
 const ACP_PERMISSION_REJECT_ONCE: &str = "reject-once";
@@ -306,7 +559,7 @@ pub struct AcpOptions {
 
 #[derive(Clone)]
 struct AcpPermissionClient {
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    out_tx: AcpOutput,
     pending: PendingPermissionMap,
     request_counter: Arc<AtomicU64>,
     timeout: Duration,
@@ -348,10 +601,11 @@ impl AcpPermissionClient {
         let request_key = json_rpc_id_key(&request_id);
         let (reply_tx, mut reply_rx) = oneshot::channel();
 
-        if let Ok(mut guard) = self.pending.lock() {
-            guard.insert(request_key.clone(), reply_tx);
-        } else {
-            return ToolApprovalDecision::deny("permission request registry unavailable");
+        if let Err(reason) = self
+            .out_tx
+            .register_permission(request_key.clone(), reply_tx)
+        {
+            return ToolApprovalDecision::deny(reason);
         }
         let _pending_guard = PendingPermissionGuard {
             pending: Arc::clone(&self.pending),
@@ -360,7 +614,11 @@ impl AcpPermissionClient {
 
         let request_line = json_rpc_permission_request(&request_id, session_id, &request);
         if self.out_tx.send(request_line).is_err() {
-            return ToolApprovalDecision::deny("permission request client disconnected");
+            return ToolApprovalDecision::deny(
+                self.out_tx
+                    .failure_reason()
+                    .unwrap_or("permission request client disconnected"),
+            );
         }
 
         let response = timeout(
@@ -385,6 +643,7 @@ impl AcpPermissionClient {
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(256);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+    let out_tx = AcpOutput::new(out_tx);
 
     // Stdin reader thread.
     std::thread::spawn(move || {
@@ -418,17 +677,23 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     });
 
     // Stdout writer thread.
+    // Keep only failure state here: retaining a sender would keep our own
+    // receiver alive forever when the dispatcher and prompt tasks finish.
+    let writer_failure = Arc::clone(&out_tx.shared);
     std::thread::spawn(move || {
         let stdout = io::stdout();
         let mut writer = io::BufWriter::new(stdout.lock());
         for line in out_rx {
             if writer.write_all(line.as_bytes()).is_err() {
+                writer_failure.fail("ACP stdout write failed");
                 break;
             }
             if writer.write_all(b"\n").is_err() {
+                writer_failure.fail("ACP stdout write failed");
                 break;
             }
             if writer.flush().is_err() {
+                writer_failure.fail("ACP stdout flush failed");
                 break;
             }
         }
@@ -441,20 +706,24 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
 async fn run(
     options: AcpOptions,
     mut in_rx: asupersync::channel::mpsc::Receiver<String>,
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    out_tx: AcpOutput,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     let sessions: AcpSessionsMap = Arc::new(Mutex::new(HashMap::new()));
     let prompt_counter = Arc::new(AtomicU64::new(0));
     let permission_counter = Arc::new(AtomicU64::new(0));
-    let pending_permissions: PendingPermissionMap = Arc::new(StdMutex::new(HashMap::new()));
-    let active_prompts: Arc<Mutex<HashMap<String, AbortHandle>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending_permissions = Arc::clone(&out_tx.shared.pending_permissions);
     let initialized = Arc::new(AtomicBool::new(false));
 
     // Capture dispatch errors so every exit path still tears down MCP state.
-    let result: Result<()> = async {
+    let result: Result<()> = {
+    let dispatch = async {
     while let Ok(line) = in_rx.recv(&cx).await {
+        // Buffered input can keep this future ready without returning to the
+        // outer failure race. Never dispatch another request after a lost frame.
+        if let Some(reason) = out_tx.failure_reason() {
+            return Err(Error::session(reason));
+        }
         let raw_message: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(err) => {
@@ -681,10 +950,7 @@ async fn run(
 
                 // Per spec, only one prompt turn may be active per session.
                 {
-                    let has_active = active_prompts
-                        .lock(&cx)
-                        .await
-                        .is_ok_and(|guard| guard.contains_key(&session_id));
+                    let has_active = out_tx.prompt_is_active(&session_id);
                     if has_active {
                         let _ = out_tx.send(json_rpc_error(
                             id,
@@ -700,22 +966,18 @@ async fn run(
                 let _ = prompt_counter.fetch_add(1, Ordering::SeqCst);
 
                 let (abort_handle, abort_signal) = AbortHandle::new();
-                {
-                    let mut guard = active_prompts.lock(&cx).await
-                        .map_err(|_| Error::session("Active prompt registry is unavailable"))?;
-                    guard.insert(session_id.clone(), abort_handle);
-                }
+                let mut prompt_guard = out_tx.begin_prompt(session_id.clone(), abort_handle)?;
 
                 // Per ACP, the server replies to session/prompt only after the
                 // turn completes — with a stopReason. Spawn the work and have
                 // the spawned task own the response (carrying the original `id`).
                 let out_tx_prompt = out_tx.clone();
-                let active_prompts_cleanup = Arc::clone(&active_prompts);
                 let prompt_cx = cx.clone();
                 let prompt_session_id = session_id.clone();
                 let response_id = id.clone();
 
-                options.runtime_handle.spawn(async move {
+                let spawned = options.runtime_handle.try_spawn(async move {
+                    prompt_guard.started = true;
                     let stop_reason = run_prompt(
                         session_state,
                         message_content,
@@ -727,15 +989,21 @@ async fn run(
                     )
                     .await;
 
-                    if let Ok(mut guard) = active_prompts_cleanup.lock(&prompt_cx).await {
-                        guard.remove(&prompt_session_id);
-                    }
+                    prompt_guard.settled = true;
 
                     let _ = out_tx_prompt.send(json_rpc_ok(
                         response_id,
                         json!({ "stopReason": stop_reason }),
                     ));
+                    drop(prompt_guard);
                 });
+                if spawned.is_err() {
+                    let _ = out_tx.send(json_rpc_error(
+                        id,
+                        INTERNAL_ERROR,
+                        "Cannot start ACP prompt task",
+                    ));
+                }
             }
 
             // ACP defines session/cancel as a notification that aborts the
@@ -760,11 +1028,7 @@ async fn run(
                     continue;
                 };
 
-                if let Ok(guard) = active_prompts.lock(&cx).await
-                    && let Some(handle) = guard.get(&session_id)
-                {
-                    handle.abort();
-                }
+                out_tx.abort_prompt(&session_id);
 
                 if request.id.is_some() {
                     let _ = out_tx.send(json_rpc_ok(id, json!({})));
@@ -799,11 +1063,7 @@ async fn run(
                 };
                 // Check the reservation as well as agent_session: a spawned
                 // prompt may not yet have taken the agent out of its state.
-                let busy = active_prompts
-                    .lock(&cx)
-                    .await
-                    .map_err(|error| Error::session(format!("Active prompt registry unavailable: {error}")))?
-                    .contains_key(session_id);
+                let busy = out_tx.prompt_is_active(session_id);
                 if busy {
                     let _ = out_tx.send(json_rpc_error(
                         id,
@@ -1108,18 +1368,25 @@ async fn run(
         }
     }
     Ok(())
-    }.await;
+    };
+    // A writer failure must wake even an idle dispatcher or one awaiting a
+    // management operation. Drop that operation before draining prompt owners.
+    let failure = out_tx.shared.failure.wait();
+    futures::pin_mut!(dispatch, failure);
+    match futures::future::select(failure, dispatch).await {
+        futures::future::Either::Left(_) => Err(Error::session(
+            out_tx.failure_reason().unwrap_or("ACP output failed"),
+        )),
+        futures::future::Either::Right((result, _)) => result,
+    }
+    };
 
-    let cleanup = AgentCx::for_request();
-    if let Ok(guard) = active_prompts.lock(&cleanup).await {
-        for abort in guard.values() {
-            abort.abort();
-        }
-    }
-    if let Ok(mut pending) = pending_permissions.lock() {
-        pending.clear();
-    }
+    let drained = out_tx.finish_prompts().await;
     mcp::shutdown(&sessions).await;
+    drained?;
+    if let Some(reason) = out_tx.failure_reason() {
+        return Err(Error::session(reason));
+    }
     result
 }
 
@@ -1816,7 +2083,7 @@ fn config_options_for_handle(
 /// with bounded status text and the standard complete config-option update.
 /// Provider error bodies stay out of these notices, just as on final errors.
 struct AcpRecoveryUpdates {
-    out: std::sync::mpsc::SyncSender<String>,
+    out: AcpOutput,
     session_id: String,
     session: Arc<Mutex<Session>>,
     available_models: Vec<ModelEntry>,
@@ -1827,7 +2094,7 @@ impl AcpRecoveryUpdates {
     fn new(
         handle: &AgentSessionHandle,
         available_models: Vec<ModelEntry>,
-        out: &std::sync::mpsc::SyncSender<String>,
+        out: &AcpOutput,
         session_id: &str,
     ) -> Arc<Self> {
         let configuration = config_options_for_handle(handle, &available_models);
@@ -2134,7 +2401,7 @@ async fn run_prompt(
     message: Vec<ContentBlock>,
     mcp_command: Option<mcp::Command>,
     abort_signal: AbortSignal,
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    out_tx: AcpOutput,
     session_id: String,
     cx: AgentCx,
 ) -> &'static str {
@@ -2222,8 +2489,11 @@ async fn run_prompt(
     // Cancellation ends provider work, not the obligation to return its owner
     // to the editor session. Cleanup must not use a cancelled request context.
     let cleanup_cx = AgentCx::for_request();
-    if let Ok(mut guard) = session_state.lock(&cleanup_cx).await {
-        guard.agent_session = Some(agent_session);
+    match session_state.lock(&cleanup_cx).await {
+        Ok(mut guard) => guard.agent_session = Some(agent_session),
+        Err(_) => out_tx
+            .shared
+            .fail("ACP could not restore its session owner after the prompt"),
     }
 
     stop_reason
@@ -2234,7 +2504,7 @@ async fn run_prompt(
 /// by `build_acp_event_handler`, so `Error`/`MessageEnd`/`AgentEnd` events cannot
 /// duplicate this notice. MCP operator responses use their own completed path.
 async fn report_prompt_error(
-    out_tx: &std::sync::mpsc::SyncSender<String>,
+    out_tx: &AcpOutput,
     session_id: &str,
     error: &Error,
 ) -> &'static str {
@@ -2345,7 +2615,7 @@ fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> 
 ///   "params": { "sessionId": ..., "update": { "sessionUpdate": <kind>, ... } } }
 /// ```
 fn build_acp_event_handler(
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    out_tx: AcpOutput,
     session_id: String,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     move |event: AgentEvent| {
@@ -2490,6 +2760,7 @@ mod tests {
         StreamError,
         Aborted,
         StreamAborted,
+        ToolThenBurst,
     }
 
     struct PromptTestProvider {
@@ -2522,7 +2793,7 @@ mod tests {
             _options: &StreamOptions,
         ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
         {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some((stored, path)) = &self.save_fault {
                 stored.try_lock().expect("prompt already persisted").path = Some(path.clone());
             }
@@ -2541,7 +2812,34 @@ mod tests {
             };
             let mut message = partial.clone();
             let mut events = vec![Ok(StreamEvent::Start { partial })];
-            if matches!(self.outcome, PromptTestOutcome::Complete) {
+            if matches!(self.outcome, PromptTestOutcome::ToolThenBurst) && call_number == 0 {
+                message.content = vec![
+                    serde_json::from_value(json!({
+                        "type": "toolCall",
+                        "id": "clock-before-burst",
+                        "name": "current_time",
+                        "arguments": {},
+                    }))
+                    .expect("tool call fixture"),
+                ];
+                message.stop_reason = StopReason::ToolUse;
+                events.push(Ok(StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message,
+                }));
+            } else if matches!(self.outcome, PromptTestOutcome::ToolThenBurst) {
+                message.content = vec![ContentBlock::Text(TextContent::new("reply ".repeat(16)))];
+                for _ in 0..16 {
+                    events.push(Ok(StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "reply ".to_string(),
+                    }));
+                }
+                events.push(Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }));
+            } else if matches!(self.outcome, PromptTestOutcome::Complete) {
                 message.content = vec![ContentBlock::Text(TextContent::new("Provider reply"))];
                 events.push(Ok(StreamEvent::TextDelta {
                     content_index: 0,
@@ -2590,9 +2888,14 @@ mod tests {
             calls: AtomicUsize::new(0),
             save_fault: fail_after_provider.then(|| (Arc::clone(&stored), root.to_path_buf())),
         });
+        let tools: &[&str] = if matches!(outcome, PromptTestOutcome::ToolThenBurst) {
+            &["current_time"]
+        } else {
+            &[]
+        };
         let agent = crate::agent::Agent::new(
             Arc::clone(&provider) as Arc<dyn crate::provider::Provider>,
-            ToolRegistry::new(&[], root, None),
+            ToolRegistry::new(tools, root, None),
             crate::agent::AgentConfig::default(),
         );
         let session = AgentSession::new(
@@ -2621,6 +2924,7 @@ mod tests {
         signal: AbortSignal,
     ) -> (&'static str, Vec<Value>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let tx = AcpOutput::new(tx);
         let reason = run_prompt(
             state,
             vec![ContentBlock::Text(TextContent::new("editor prompt"))],
@@ -2648,6 +2952,330 @@ mod tests {
         update["params"]["update"]["content"]["text"]
             .as_str()
             .expect("text notice")
+    }
+
+    /// Keep the receiver open and unread while the producer runs. The outer
+    /// deadline also catches a regression back to blocking SyncSender::send:
+    /// dropping the receiver then releases that worker instead of hanging the
+    /// entire test process.
+    fn with_non_draining_output<T: Send + 'static>(
+        capacity: usize,
+        initial_frames: usize,
+        work: impl FnOnce(AcpOutput) -> T + Send + 'static,
+    ) -> (T, Vec<String>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        for index in 0..initial_frames {
+            tx.try_send(format!("held-{index}")).expect("preload output");
+        }
+        let output = AcpOutput::new(tx);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = work(output);
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        let frames = rx.try_iter().collect();
+        drop(rx);
+        if result.is_err() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(1));
+            if worker.is_finished() {
+                worker.join().expect("ACP output worker panicked");
+            }
+            panic!("ACP producer did not finish with an open, non-draining receiver");
+        }
+        worker.join().expect("ACP output worker panicked");
+        (result.expect("output worker completed"), frames)
+    }
+
+    #[test]
+    fn output_overflow_aborts_registered_prompts_and_releases_permissions() {
+        let ((), frames) = with_non_draining_output(1, 1, |output| {
+            let (first_abort, first_signal) = AbortHandle::new();
+            let first = output
+                .begin_prompt("first".into(), first_abort)
+                .expect("first prompt");
+            let (second_abort, second_signal) = AbortHandle::new();
+            let second = output
+                .begin_prompt("second".into(), second_abort)
+                .expect("second prompt");
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            output
+                .shared
+                .pending_permissions
+                .lock()
+                .unwrap()
+                .insert("approval".into(), reply_tx);
+
+            assert!(matches!(
+                output.send("overflow".into()),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ));
+            assert!(first_signal.is_aborted());
+            assert!(second_signal.is_aborted());
+            assert!(output.shared.failure.is_aborted());
+            assert!(output.shared.pending_permissions.lock().unwrap().is_empty());
+            assert!(output.send("false-success".into()).is_err());
+            let (rejected_abort, rejected_signal) = AbortHandle::new();
+            assert!(output.begin_prompt("later".into(), rejected_abort).is_err());
+            assert!(rejected_signal.is_aborted());
+
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let cx = AgentCx::for_current_or_request();
+                assert!(reply_rx.recv(&cx).await.is_err());
+                drop(first);
+                drop(second);
+                output.finish_prompts().await.expect("unstarted prompts drained");
+            });
+        });
+        assert_eq!(frames, ["held-0"]);
+    }
+
+    #[test]
+    fn output_drain_waits_for_settlement_and_detects_abandoned_turns() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(tx);
+            let (abort, signal) = AbortHandle::new();
+            let unstarted = output.begin_prompt("unstarted".into(), abort).unwrap();
+            drop(unstarted);
+            assert!(output.failure_reason().is_none());
+            assert!(!signal.is_aborted());
+
+            let (abort, signal) = AbortHandle::new();
+            let mut guard = output.begin_prompt("running".into(), abort).unwrap();
+            guard.started = true;
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            output
+                .register_permission("before-shutdown".into(), reply_tx)
+                .expect("permission admitted before shutdown");
+            let drain = output.finish_prompts();
+            futures::pin_mut!(drain);
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(signal.is_aborted());
+            assert!(output.prompt_is_active("running"));
+            let cx = AgentCx::for_current_or_request();
+            assert!(reply_rx.recv(&cx).await.is_err());
+            let client = AcpPermissionClient {
+                out_tx: output.clone(),
+                pending: Arc::clone(&output.shared.pending_permissions),
+                request_counter: Arc::new(AtomicU64::new(0)),
+                timeout: Duration::from_secs(60),
+                cx,
+            };
+            let decision = timeout(
+                wall_now(),
+                Duration::from_secs(1),
+                Box::pin(client.request_permission(
+                    "running",
+                    ToolApprovalRequest {
+                        tool_call_id: "after-shutdown".into(),
+                        tool_name: "current_time".into(),
+                        arguments: json!({}),
+                    },
+                )),
+            )
+            .await
+            .expect("shutdown rejects permission without awaiting the editor");
+            assert!(matches!(
+                decision,
+                ToolApprovalDecision::Deny { reason } if reason.contains("shutting down")
+            ));
+            assert!(client.pending.lock().unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+            guard.settled = true;
+            drop(guard);
+            drain.await.expect("settled prompt drained");
+            assert!(output.failure_reason().is_none());
+
+            let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(tx);
+            let (abort, _) = AbortHandle::new();
+            let mut abandoned = output.begin_prompt("abandoned".into(), abort).unwrap();
+            abandoned.started = true;
+            drop(abandoned);
+            assert_eq!(
+                output.failure_reason(),
+                Some("ACP prompt task ended before session cleanup completed")
+            );
+            assert!(output.send("false-success".into()).is_err());
+        });
+    }
+
+    #[test]
+    fn native_prompt_overflow_restores_owner_and_persists_completed_tool_work() {
+        for (capacity, overflow) in [(8, true), (64, false)] {
+            let ((), frames) = with_non_draining_output(capacity, 0, move |output| {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let root = tempfile::tempdir().unwrap();
+                    let (state, provider, stored) =
+                        prompt_test_state(root.path(), PromptTestOutcome::ToolThenBurst, false)
+                            .await;
+                    let (abort, signal) = AbortHandle::new();
+                    let mut guard = output
+                        .begin_prompt("editor-session".into(), abort)
+                        .expect("register native prompt");
+                    guard.started = true;
+                    let reason = run_prompt(
+                        Arc::clone(&state),
+                        vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+                        None,
+                        signal.clone(),
+                        output.clone(),
+                        "editor-session".into(),
+                        AgentCx::for_current_or_request(),
+                    )
+                    .await;
+                    guard.settled = true;
+
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(
+                        reason,
+                        if overflow {
+                            ACP_STOP_REASON_CANCELLED
+                        } else {
+                            ACP_STOP_REASON_END_TURN
+                        }
+                    );
+                    assert_eq!(signal.is_aborted(), overflow);
+                    assert_eq!(output.failure_reason().is_some(), overflow);
+                    assert!(state.try_lock().unwrap().agent_session.is_some());
+
+                    let path = stored.try_lock().unwrap().path.clone().unwrap();
+                    let reopened = Session::open(path.to_str().unwrap())
+                        .await
+                        .expect("reopen completed native work");
+                    let messages = reopened.to_messages_for_current_path();
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .filter(|message| matches!(message, crate::model::Message::User(_)))
+                            .count(),
+                        1,
+                        "accepted input remains in the saved conversation"
+                    );
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .filter(|message| matches!(
+                                message,
+                                crate::model::Message::ToolResult(result)
+                                    if result.tool_call_id == "clock-before-burst" && !result.is_error
+                            ))
+                            .count(),
+                        1,
+                        "the real tool result must survive output cancellation exactly once"
+                    );
+
+                    let terminal = json_rpc_ok(json!(7), json!({"stopReason": reason}));
+                    assert_eq!(output.send(terminal).is_err(), overflow);
+                    drop(guard);
+                    output.finish_prompts().await.expect("native owner returned");
+                });
+            });
+            let frames = frames
+                .iter()
+                .map(|line| serde_json::from_str::<Value>(line).expect("ACP frame"))
+                .collect::<Vec<_>>();
+            assert!(frames.iter().any(|frame| {
+                frame["params"]["update"]["toolCallId"] == "clock-before-burst"
+                    && frame["params"]["update"]["status"] == "completed"
+            }));
+            if overflow {
+                assert_eq!(frames.len(), capacity);
+                assert!(frames.iter().all(|frame| frame.get("id").is_none()));
+            } else {
+                let text = frames
+                    .iter()
+                    .filter(|frame| {
+                        frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    })
+                    .map(|frame| frame["params"]["update"]["content"]["text"].as_str().unwrap())
+                    .collect::<String>();
+                assert_eq!(text, "reply ".repeat(16));
+                assert_eq!(frames.last().unwrap()["id"], 7);
+                assert_eq!(frames.last().unwrap()["result"]["stopReason"], "end_turn");
+            }
+        }
+    }
+
+    #[test]
+    fn output_failure_wakes_dispatcher_without_another_input_line() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let auth = AuthStorage::load(root.path().join("auth.json")).unwrap();
+            let options = AcpOptions {
+                config: Config::default(),
+                launch: AcpLaunchOptions::default(),
+                available_models: Vec::new(),
+                model_registry: ModelRegistry::load(&auth, None),
+                auth,
+                oauth_refresh_failures: Vec::new(),
+                runtime_handle: handle,
+                session_dir: Some(root.path().into()),
+                skills_prompt: None,
+            };
+            let (_in_tx, in_rx) = asupersync::channel::mpsc::channel(8);
+            let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(tx);
+            let dispatch = run(options, in_rx, output.clone());
+            futures::pin_mut!(dispatch);
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(dispatch.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            output.shared.fail("test writer failed");
+            let result = timeout(wall_now(), Duration::from_secs(1), dispatch)
+                .await
+                .expect("writer failure must wake idle dispatch");
+            assert!(result.unwrap_err().to_string().contains("test writer failed"));
+        });
+    }
+
+    #[test]
+    fn healthy_concurrent_output_preserves_burst_order_and_channel_eof() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        let output = AcpOutput::new(tx);
+        let failure = Arc::clone(&output.shared);
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            for burst in 0..4 {
+                for index in 0..512 {
+                    assert_eq!(
+                        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                        format!("{burst}:{index}")
+                    );
+                }
+                ack_tx.send(()).unwrap();
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "terminal-response"
+            );
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_secs(2)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ));
+        });
+        for burst in 0..4 {
+            for index in 0..512 {
+                output.send(format!("{burst}:{index}")).unwrap();
+            }
+            ack_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        output.send("terminal-response".into()).unwrap();
+        drop(output);
+        reader.join().expect("draining reader");
+        assert!(failure.state.lock().unwrap().failure.is_none());
     }
 
     #[test]
@@ -3263,7 +3891,8 @@ mod tests {
 
         runtime.block_on(async {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(8);
-            let pending = Arc::new(StdMutex::new(HashMap::new()));
+            let out_tx = AcpOutput::new(out_tx);
+            let pending = Arc::clone(&out_tx.shared.pending_permissions);
             let cx = AgentCx::for_testing();
             let client = AcpPermissionClient {
                 out_tx,
@@ -3327,7 +3956,8 @@ mod tests {
 
         runtime.block_on(async {
             let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(8);
-            let pending = Arc::new(StdMutex::new(HashMap::new()));
+            let out_tx = AcpOutput::new(out_tx);
+            let pending = Arc::clone(&out_tx.shared.pending_permissions);
             let client = AcpPermissionClient {
                 out_tx,
                 pending: Arc::clone(&pending),
@@ -3364,8 +3994,9 @@ mod tests {
 
         runtime.block_on(async {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+            let out_tx = AcpOutput::new(out_tx);
             drop(out_rx);
-            let pending = Arc::new(StdMutex::new(HashMap::new()));
+            let pending = Arc::clone(&out_tx.shared.pending_permissions);
             let client = AcpPermissionClient {
                 out_tx,
                 pending: Arc::clone(&pending),

@@ -287,6 +287,7 @@ async fn prompt(
     signal: AbortSignal,
 ) -> (&'static str, Vec<Value>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(128);
+    let tx = AcpOutput::new(tx);
     let reason = run_prompt(
         Arc::clone(state),
         content,
@@ -692,9 +693,10 @@ fn launch_iteration_limit_stops_before_executing_the_next_provider_tool_call() {
         options.launch = AcpLaunchOptions::from_cli(&cli);
         let cx = AgentCx::for_current_or_request();
         let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel::<String>(8);
+        let permission_tx = AcpOutput::new(permission_tx);
         let permission_client = AcpPermissionClient {
+            pending: Arc::clone(&permission_tx.shared.pending_permissions),
             out_tx: permission_tx,
-            pending: Arc::new(StdMutex::new(HashMap::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
             timeout: Duration::from_secs(5),
             cx: cx.clone(),

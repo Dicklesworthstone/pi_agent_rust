@@ -222,10 +222,10 @@ fn text(value: &str) -> Vec<ContentBlock> {
     vec![ContentBlock::Text(TextContent::new(value))]
 }
 
-fn permission_client(out: &SyncSender<String>, cx: &AgentCx) -> AcpPermissionClient {
+fn permission_client(out: &AcpOutput, cx: &AgentCx) -> AcpPermissionClient {
     AcpPermissionClient {
         out_tx: out.clone(),
-        pending: Arc::new(StdMutex::new(HashMap::new())),
+        pending: Arc::clone(&out.shared.pending_permissions),
         request_counter: Arc::new(AtomicU64::new(0)),
         timeout: Duration::from_secs(2),
         cx: cx.clone(),
@@ -414,6 +414,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
         runtime.block_on(bounded(async {
             let cx = AgentCx::for_current_or_request();
             let (tx, rx) = std::sync::mpsc::sync_channel(128);
+            let tx = AcpOutput::new(tx);
             let client = permission_client(&tx, &cx);
             let (id, state, mcp) = live_state(
                 temp.path(),
@@ -523,6 +524,7 @@ fn cancelling_mcp_setup_restores_the_agent_and_busy_session_shutdown_reaches_the
     runtime.block_on(bounded(async {
         let cx = AgentCx::for_current_or_request();
         let (tx, _rx) = std::sync::mpsc::sync_channel(32);
+        let tx = AcpOutput::new(tx);
         let client = permission_client(&tx, &cx);
         let (id, state, mcp) = live_state(
             temp.path(),
@@ -606,6 +608,7 @@ fn new_and_restored_sessions_accept_mcp_definitions_without_connecting_or_replay
         let options = options(root.path(), handle);
         let cx = AgentCx::for_current_or_request();
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let tx = AcpOutput::new(tx);
         let client = permission_client(&tx, &cx);
         let params = json!({"cwd":cwd,"mcpServers":server.config()});
         let (_, new) = crate::acp::handle_session_new(&params, &options, Some(&client)).unwrap();
@@ -697,6 +700,7 @@ fn dispatcher_rejects_invalid_mcp_definition_before_creating_a_session() {
         let options = options(root.path(), handle);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel(8);
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+        let out_tx = AcpOutput::new(out_tx);
         for request in [
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{

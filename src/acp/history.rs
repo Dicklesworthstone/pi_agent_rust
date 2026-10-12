@@ -6,7 +6,7 @@
 //! branches, and does not grant authority to historic tool calls.
 
 use super::{
-    AcpOptions, AcpPermissionClient, AcpSessionsMap, AgentCx, INTERNAL_ERROR, INVALID_PARAMS,
+    AcpOptions, AcpOutput, AcpPermissionClient, AcpSessionsMap, AgentCx, INTERNAL_ERROR, INVALID_PARAMS,
     PROMPT_IN_PROGRESS, SESSION_NOT_FOUND, build_acp_session, classify_tool_kind,
     config_options_for, content, json_rpc_notification,
 };
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -190,7 +190,7 @@ pub(super) async fn load(
     permission_client: &AcpPermissionClient,
     sessions: &AcpSessionsMap,
     cx: &AgentCx,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
     replay: bool,
 ) -> HistoryResult<Value> {
     let id = requested_session_id(params)?;
@@ -278,7 +278,7 @@ pub(super) async fn load(
 /// Bounded backpressure without blocking an async worker on SyncSender::send.
 /// The stdout writer owns I/O. A disconnected or stalled client never receives
 /// a successful load response claiming that an incomplete replay was complete.
-pub(super) async fn send_line(out: &SyncSender<String>, mut line: String) -> HistoryResult<()> {
+pub(super) async fn send_line(out: &AcpOutput, mut line: String) -> HistoryResult<()> {
     let send = async {
         loop {
             match out.try_send(line) {
@@ -295,10 +295,13 @@ pub(super) async fn send_line(out: &SyncSender<String>, mut line: String) -> His
     };
     timeout(wall_now(), Duration::from_secs(30), Box::pin(send))
         .await
-        .map_err(|_| HistoryError::internal("ACP client stalled during history delivery"))?
+        .map_err(|_| {
+            out.shared.fail("ACP client stalled during history delivery");
+            HistoryError::internal("ACP client stalled during history delivery")
+        })?
 }
 
-async fn send_update(out: &SyncSender<String>, id: &str, update: Value) -> HistoryResult<()> {
+async fn send_update(out: &AcpOutput, id: &str, update: Value) -> HistoryResult<()> {
     send_line(
         out,
         json_rpc_notification(
@@ -315,7 +318,7 @@ async fn send_update(out: &SyncSender<String>, id: &str, update: Value) -> Histo
 async fn replay_session(
     session: &Session,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> HistoryResult<()> {
     for entry in session.entries_for_current_path() {
         match entry {
@@ -367,7 +370,7 @@ async fn replay_text(
     kind: &str,
     text: &str,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> HistoryResult<()> {
     send_update(
         out,
@@ -381,7 +384,7 @@ async fn replay_user_content(
     content: &UserContent,
     kind: &str,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> HistoryResult<()> {
     match content {
         UserContent::Text(text) => replay_text(kind, text, id, out).await,
@@ -393,7 +396,7 @@ async fn replay_blocks(
     blocks: &[ContentBlock],
     kind: &str,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> HistoryResult<()> {
     for block in blocks {
         // Use exactly the same media conversion as live tool results. Strip
@@ -417,7 +420,7 @@ async fn replay_blocks(
 async fn replay_message(
     message: &Message,
     id: &str,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
 ) -> HistoryResult<()> {
     match message {
         Message::User(message) => {
@@ -732,7 +735,6 @@ mod tests {
     use crate::session::SessionStoreKind;
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicU64;
 
     fn user(text: &str) -> Message {
@@ -1031,6 +1033,7 @@ mod tests {
             let options = test_options(root.path(), handle);
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            let out_tx = AcpOutput::new(out_tx);
             for request in [
                 json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1 } }),
                 json!({ "jsonrpc": "2.0", "id": 2, "method": "session/list", "params": { "cwd": cwd } }),
@@ -1231,6 +1234,7 @@ mod tests {
             std::fs::write(&path, &raw).unwrap();
             let restored = Session::open(path.to_str().unwrap()).await.unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel(32);
+            let tx = AcpOutput::new(tx);
             replay_session(&restored, &restored.header.id, &tx)
                 .await
                 .unwrap();
@@ -1252,6 +1256,7 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let tx = AcpOutput::new(tx);
             let call: Message = serde_json::from_value(json!({
                 "role": "assistant", "api": "test", "provider": "test", "model": "test",
                 "usage": Usage::default(), "stopReason": "toolUse", "timestamp": 1,
@@ -1288,6 +1293,7 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            let tx = AcpOutput::new(tx);
             for display in [false, true] {
                 let message = Message::Custom(crate::model::CustomMessage {
                     custom_type: "extension-state".into(),
@@ -1327,6 +1333,7 @@ mod tests {
             let before = std::fs::read(path).unwrap();
             let restored = Session::open(path.to_str().unwrap()).await.unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            let tx = AcpOutput::new(tx);
             replay_session(&restored, &restored.header.id, &tx)
                 .await
                 .unwrap();
@@ -1356,6 +1363,7 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let tx = AcpOutput::new(tx);
             tx.try_send("earlier".to_string()).unwrap();
             let reader = async {
                 sleep(wall_now(), Duration::from_millis(10)).await;
@@ -1404,9 +1412,10 @@ mod tests {
             let sessions = Arc::new(Mutex::new(HashMap::new()));
             let cx = AgentCx::for_testing();
             let (tx, rx) = std::sync::mpsc::sync_channel(32);
+            let tx = AcpOutput::new(tx);
             let client = AcpPermissionClient {
                 out_tx: tx.clone(),
-                pending: Arc::new(StdMutex::new(HashMap::new())),
+                pending: Arc::clone(&tx.shared.pending_permissions),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 timeout: Duration::from_secs(1),
                 cx: cx.clone(),
