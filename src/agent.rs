@@ -1584,16 +1584,10 @@ impl AbortSignal {
     }
 
     pub async fn wait(&self) {
-        if self.is_aborted() {
-            return;
-        }
-
-        loop {
-            self.inner.notify.notified().await;
-            if self.is_aborted() {
-                return;
-            }
-        }
+        // Broadcast notifications are edge-triggered. Sample their generation
+        // before checking the latched flag, so an abort between that check and
+        // waiter registration cannot strand provider or tool cancellation.
+        self.inner.notify.wait_until(|| self.is_aborted()).await;
     }
 }
 
@@ -12264,6 +12258,108 @@ mod abort_tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context as TaskContext, Poll};
+
+    #[derive(Default)]
+    struct AbortWakeCounter(AtomicUsize);
+
+    impl std::task::Wake for AbortWakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn abort_signal_is_latched_before_waiter_subscription() {
+        let (handle, signal) = AbortHandle::new();
+        let mut created_before_abort = Box::pin(signal.wait());
+        let waker = futures::task::noop_waker();
+        let mut task = TaskContext::from_waker(&waker);
+
+        handle.abort();
+        assert!(std::future::Future::poll(created_before_abort.as_mut(), &mut task).is_ready());
+
+        // Broadcasts do not retain permits for future subscribers. The latched
+        // predicate must still complete a newly created waiter without a
+        // second abort or any provider/tool progress to wake it.
+        let late_signal = signal.clone();
+        let mut created_after_abort = Box::pin(late_signal.wait());
+        assert!(std::future::Future::poll(created_after_abort.as_mut(), &mut task).is_ready());
+    }
+
+    #[test]
+    fn abort_signal_wakes_every_waiter_after_a_nonterminal_notification() {
+        let (handle, signal) = AbortHandle::new();
+        let cloned_signal = signal.clone();
+        let mut first = Box::pin(signal.wait());
+        let mut second = Box::pin(cloned_signal.wait());
+        let first_wakes = Arc::new(AbortWakeCounter::default());
+        let second_wakes = Arc::new(AbortWakeCounter::default());
+        let first_waker = std::task::Waker::from(Arc::clone(&first_wakes));
+        let second_waker = std::task::Waker::from(Arc::clone(&second_wakes));
+        let mut first_task = TaskContext::from_waker(&first_waker);
+        let mut second_task = TaskContext::from_waker(&second_waker);
+        assert!(std::future::Future::poll(first.as_mut(), &mut first_task).is_pending());
+        assert!(std::future::Future::poll(second.as_mut(), &mut second_task).is_pending());
+
+        signal.inner.notify.notify_waiters();
+        assert_eq!(first_wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(second_wakes.0.load(Ordering::SeqCst), 1);
+        assert!(!signal.is_aborted());
+        assert!(std::future::Future::poll(first.as_mut(), &mut first_task).is_pending());
+        assert!(std::future::Future::poll(second.as_mut(), &mut second_task).is_pending());
+
+        // Removing one subscriber must not consume another subscriber's abort.
+        drop(first);
+        let mut replacement = Box::pin(signal.wait());
+        assert!(std::future::Future::poll(replacement.as_mut(), &mut first_task).is_pending());
+        handle.abort();
+        assert_eq!(first_wakes.0.load(Ordering::SeqCst), 2);
+        assert_eq!(second_wakes.0.load(Ordering::SeqCst), 2);
+        assert!(std::future::Future::poll(replacement.as_mut(), &mut first_task).is_ready());
+        assert!(std::future::Future::poll(second.as_mut(), &mut second_task).is_ready());
+        handle.abort();
+        assert_eq!(first_wakes.0.load(Ordering::SeqCst), 2);
+        assert_eq!(second_wakes.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn abort_signal_registration_racing_another_thread_never_stays_pending() {
+        const ATTEMPTS: usize = 256;
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<AbortHandle>(1);
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let worker_rendezvous = Arc::clone(&rendezvous);
+        let worker = std::thread::spawn(move || {
+            for _ in 0..ATTEMPTS {
+                let handle = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("next independent abort signal");
+                worker_rendezvous.wait();
+                handle.abort();
+                worker_rendezvous.wait();
+            }
+        });
+        let waker = futures::task::noop_waker();
+        let mut task = TaskContext::from_waker(&waker);
+        for _ in 0..ATTEMPTS {
+            let (handle, signal) = AbortHandle::new();
+            let mut waiting = Box::pin(signal.wait());
+            sender.send(handle).expect("abort worker remains alive");
+            rendezvous.wait();
+            let first = std::future::Future::poll(waiting.as_mut(), &mut task);
+            rendezvous.wait();
+            assert!(signal.is_aborted());
+            // Do not repoll a future that already completed. Otherwise, the
+            // first poll raced the abort and must retain that notification.
+            if first.is_pending() {
+                assert!(std::future::Future::poll(waiting.as_mut(), &mut task).is_ready());
+            }
+        }
+        worker.join().expect("abort worker completed");
+    }
 
     struct StartThenPending {
         start: Option<StreamEvent>,
