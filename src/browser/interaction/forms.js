@@ -18,6 +18,14 @@ function piBrowserForm(action, request) {
     }
   };
   mutable();
+  if (action === "form_checked") {
+    if (!(this instanceof HTMLInputElement) || !["checkbox", "radio"].includes(this.type)) {
+      fail("NOT_CHECKABLE");
+    }
+    // Read only. Checkedness changes are performed by one native mouse click
+    // in Rust, never a JavaScript click() or a checked-property assignment.
+    return { kind: this.type, checked: this.checked, indeterminate: this.indeterminate };
+  }
   if (!(this instanceof HTMLSelectElement)) fail("NOT_SELECT");
   if (action !== "form_select" && action !== "form_selection") fail("UNKNOWN_ACTION");
 

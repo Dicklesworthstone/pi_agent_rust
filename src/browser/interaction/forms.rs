@@ -21,7 +21,7 @@ fn error(message: &'static str) -> Error {
 }
 
 pub(in crate::browser) fn is_action(action: &str) -> bool {
-    matches!(action, "select_option")
+    matches!(action, "select_option" | "set_checked")
 }
 
 /// Run before connection/launch. Unknown fields are refused, not silently
@@ -30,15 +30,22 @@ pub(in crate::browser) fn validate(args: &Value) -> Result<()> {
     let object = args
         .as_object()
         .ok_or_else(|| error("BROWSER_FORM_INVALID: expected an object"))?;
-    if args["action"] != "select_option"
+    let action = args["action"].as_str().unwrap_or_default();
+    if !is_action(action)
         || object.keys().any(|key| {
-            !matches!(key.as_str(), "action" | "tab" | "frame" | "selector" | "options" | "timeout_ms")
+            !matches!(key.as_str(), "action" | "tab" | "frame" | "selector" | "timeout_ms")
+                && !(action == "select_option" && key == "options")
+                && !(action == "set_checked" && key == "checked")
         })
         || args["selector"]
             .as_str()
             .is_none_or(|value| value.is_empty() || value.len() > MAX_TEXT_BYTES)
     {
-        return Err(error("BROWSER_FORM_INVALID: select_option requires a selector and only its documented fields"));
+        return Err(error("BROWSER_FORM_INVALID: form actions require a selector and only their documented fields"));
+    }
+    if action == "set_checked" {
+        return args["checked"].as_bool().map(|_| ())
+            .ok_or_else(|| error("BROWSER_FORM_INVALID: set_checked requires an explicit checked boolean"));
     }
     let options = args["options"]
         .as_array()
@@ -134,7 +141,7 @@ fn helper_value(response: &Value) -> Result<Value> {
             "BROWSER_FORM_NOT_MULTIPLE", "BROWSER_FORM_INVALID_OPTION",
             "BROWSER_FORM_OPTION_NOT_FOUND", "BROWSER_FORM_AMBIGUOUS_OPTION",
             "BROWSER_FORM_DUPLICATE_OPTION", "BROWSER_FORM_DISABLED_OPTION",
-            "BROWSER_FORM_SELECTION_NOT_RETAINED",
+            "BROWSER_FORM_SELECTION_NOT_RETAINED", "BROWSER_FORM_NOT_CHECKABLE",
         ];
         let code = CODES.iter().copied().find(|allowed| *allowed == code)
             .unwrap_or("BROWSER_FORM_OPERATION_FAILED");
@@ -200,6 +207,18 @@ pub(in crate::browser) async fn execute(
     let selector = args["selector"].as_str().ok_or_else(|| error("BROWSER_FORM_INVALID: missing selector"))?;
     let id = resolve(owner, cdp, selector, refs).await?
         .ok_or_else(|| error("BROWSER_FORM_OPTION_NOT_FOUND: selector did not match a control"))?;
+    if args["action"] == "set_checked" {
+        let wanted = args["checked"].as_bool()
+            .ok_or_else(|| error("BROWSER_FORM_INVALID: missing checked boolean"))?;
+        let (state, changed) = set_checked(owner, cdp, &expected, id, wanted).await?;
+        return Ok(super::super::output(
+            format!("Control in tab {tab} is {}{}", if state.checked { "checked" } else { "unchecked" },
+                if changed { "" } else { " (already in the requested state)" }),
+            json!({"action":"set_checked", "tab":tab, "selector":selector,
+                "changed":changed, "checked":state.checked, "kind":state.kind,
+                "backend":"cdp", "input_method":"native-pointer"}),
+        ));
+    }
     let changed = invoke(owner, cdp, &expected, id, "form_select", args["options"].clone()).await?;
     let (selected, changed) = selection(changed)?;
     let changed = changed.ok_or_else(|| error("BROWSER_FORM_PROTOCOL: missing changed flag"))?;
@@ -220,6 +239,99 @@ pub(in crate::browser) async fn execute(
             "changed":changed, "multiple":selected.multiple, "selected":selected.selected,
             "backend":"cdp", "input_method":"dom-selection"}),
     ))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CheckKind {
+    Checkbox,
+    Radio,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CheckState {
+    kind: CheckKind,
+    checked: bool,
+    indeterminate: bool,
+}
+
+impl CheckState {
+    fn needs_click(&self, wanted: bool) -> Result<bool> {
+        if self.indeterminate {
+            return Err(error("BROWSER_FORM_INDETERMINATE: mixed controls require an explicit page workflow"));
+        }
+        if self.checked == wanted {
+            return Ok(false);
+        }
+        if self.kind == CheckKind::Radio && !wanted {
+            return Err(error("BROWSER_FORM_RADIO_UNCHECK_UNSUPPORTED: select another radio in the group"));
+        }
+        Ok(true)
+    }
+
+    fn verify(&self, previous: &Self, wanted: bool) -> Result<()> {
+        if self.kind != previous.kind || self.indeterminate || self.checked != wanted {
+            return Err(error("BROWSER_FORM_CHECKED_NOT_RETAINED: control changed or rejected the input; no click was retried"));
+        }
+        Ok(())
+    }
+}
+
+async fn checked_state(
+    owner: &AgentCx, cdp: &mut Cdp, expected: &Document, id: u64,
+) -> Result<CheckState> {
+    let value = invoke(owner, cdp, expected, id, "form_checked", Value::Null).await?;
+    serde_json::from_value(value)
+        .map_err(|_| error("BROWSER_FORM_PROTOCOL: invalid checked state"))
+}
+
+async fn set_checked(
+    owner: &AgentCx, cdp: &mut Cdp, expected: &Document, id: u64, wanted: bool,
+) -> Result<(CheckState, bool)> {
+    let initial = checked_state(owner, cdp, expected, id).await?;
+    if !initial.needs_click(wanted)? {
+        return Ok((initial, false));
+    }
+    cdp.command(owner, "Page.bringToFront", json!({})).await?;
+    cdp.command(owner, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId":id})).await?;
+    let (x, y) = if cdp.frame_selected() {
+        // Includes native viewport hit testing and remote-frame projection.
+        super::frame_input::click_point(owner, cdp, id).await?
+    } else {
+        let point = super::element_call(owner, cdp, id, "point", json!({})).await?;
+        let coordinate = |key: &str| {
+            point[key].as_f64().filter(|value| value.is_finite() && (0.0..=1_000_000.0).contains(value))
+                .ok_or_else(|| error("BROWSER_FORM_PROTOCOL: control has no bounded clickable point"))
+        };
+        (coordinate("x")?, coordinate("y")?)
+    };
+    // Scrolling, focusing or geometry lookup can run page code. Do not blindly
+    // toggle the new state, and never re-resolve a selector into another node.
+    let ready = checked_state(owner, cdp, expected, id).await?;
+    if ready.kind != initial.kind {
+        return Err(error("BROWSER_FORM_CONTROL_CHANGED: control type changed before input"));
+    }
+    if !ready.needs_click(wanted)? {
+        return Ok((ready, false));
+    }
+    let page_session = cdp.page_session_id()?.to_owned();
+    check_document(owner, cdp, expected).await?;
+    owner.checkpoint().map_err(|_| error("browser form operation cancelled"))?;
+    let pressed = cdp.command(owner, "Input.dispatchMouseEvent", json!({
+        "type":"mousePressed", "x":x, "y":y, "button":"left", "buttons":1, "clickCount":1,
+    })).await;
+    // Release once even when a press acknowledgement fails. It is cleanup on
+    // the original page session, not another click or a substitute document.
+    // The same cancellation/deadline still applies, so cleanup is best effort.
+    let released = cdp.frame_command(owner, &page_session, "Input.dispatchMouseEvent", json!({
+        "type":"mouseReleased", "x":x, "y":y, "button":"left", "buttons":0, "clickCount":1,
+    })).await;
+    pressed?;
+    released?;
+    let confirmed = checked_state(owner, cdp, expected, id).await?;
+    confirmed.verify(&initial, wanted)?;
+    Ok((confirmed, true))
 }
 
 #[cfg(test)]
@@ -292,5 +404,58 @@ mod tests {
         assert!(!error.contains("PRIVATE-CANARY"));
         assert!(error.contains("BROWSER_FORM_OPERATION_FAILED"));
         assert!(helper_value(&json!({"result":{"value":true}})).is_err());
+    }
+
+    #[test]
+    fn checked_actions_require_booleans_and_refuse_selection_or_dialog_fields() {
+        for value in [json!(true), json!(false)] {
+            assert!(validate(&json!({"action":"set_checked","selector":"#c","checked":value})).is_ok());
+        }
+        for value in [Value::Null, json!(0), json!("false"), json!([])] {
+            assert!(validate(&json!({"action":"set_checked","selector":"#c","checked":value})).is_err());
+        }
+        for field in ["options", "text", "dialog_response", "accept"] {
+            let mut args = json!({"action":"set_checked","selector":"#c","checked":true});
+            args[field] = json!([]);
+            assert!(validate(&args).is_err());
+        }
+        assert!(is_action("set_checked"));
+    }
+
+    #[test]
+    fn checked_state_admission_rejects_coercion_and_unknown_control_types() {
+        for value in [json!({}), json!({"kind":"switch","checked":true,"indeterminate":false}),
+            json!({"kind":"checkbox","checked":"true","indeterminate":false}),
+            json!({"kind":"checkbox","checked":true,"indeterminate":false,"value":"PRIVATE"})] {
+            assert!(serde_json::from_value::<CheckState>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_transitions_are_idempotent_and_do_not_invent_radio_uncheck() {
+        for kind in [CheckKind::Checkbox, CheckKind::Radio] {
+            for checked in [false, true] {
+                let state = CheckState { kind, checked, indeterminate: false };
+                assert!(!state.needs_click(checked).unwrap());
+                if kind == CheckKind::Radio && checked {
+                    assert!(state.needs_click(false).is_err());
+                } else {
+                    assert!(state.needs_click(!checked).unwrap());
+                }
+                let mixed = CheckState { indeterminate: true, ..state };
+                assert!(mixed.needs_click(false).is_err());
+                assert!(mixed.needs_click(true).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn checked_postcondition_rejects_reverted_mixed_and_retyped_controls() {
+        let before = CheckState { kind: CheckKind::Checkbox, checked: false, indeterminate: false };
+        let good = CheckState { checked: true, ..before };
+        assert!(good.verify(&before, true).is_ok());
+        assert!(before.verify(&before, true).is_err());
+        assert!(CheckState { kind: CheckKind::Radio, ..good }.verify(&before, true).is_err());
+        assert!(CheckState { indeterminate: true, ..good }.verify(&before, true).is_err());
     }
 }
