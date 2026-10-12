@@ -1012,6 +1012,7 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn unsigned_numeric_tool_arguments_survive_same_origin_continuations() {
     use pi::model::{ContentBlock, Message, StopReason, TextContent, ToolResultMessage};
 
@@ -1428,6 +1429,7 @@ fn signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() {
     use pi::model::{ContentBlock, Message, StopReason, TextContent, ThinkingContent};
 
@@ -1530,6 +1532,7 @@ fn attachment_message(
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn media_names_are_discovered_before_earlier_fields_are_screened() {
     use pi::model::{ContentBlock, MediaContent, Message, TextContent, UserContent};
 
@@ -1663,6 +1666,7 @@ fn remembered_and_configured_media_names_are_protected_at_provider_entry() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn secret_mime_types_refuse_without_changing_transport_or_learning_other_fields() {
     use pi::model::{ContentBlock, ImageContent, MediaContent, TextContent};
 

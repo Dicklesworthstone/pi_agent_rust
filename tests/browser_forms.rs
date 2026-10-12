@@ -324,8 +324,8 @@ mod wire {
         Some(serde_json::from_slice(&data).unwrap())
     }
 
-    fn send(socket: &mut TcpStream, value: Value) {
-        let data = serde_json::to_vec(&value).unwrap();
+    fn send(socket: &mut TcpStream, value: &Value) {
+        let data = serde_json::to_vec(value).unwrap();
         let mut frame = vec![0x81];
         if data.len() < 126 {
             frame.push(u8::try_from(data.len()).unwrap());
@@ -337,6 +337,7 @@ mod wire {
         socket.write_all(&frame).unwrap();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn serve(socket: &mut TcpStream, fault: Fault, mut checked: bool) -> Seen {
         let mut seen = Seen::default();
         for _ in 0..512 {
@@ -355,7 +356,7 @@ mod wire {
                     json!({"targetInfos":[{"targetId":"target","type":"page","url":"about:blank"}]})
                 }
                 "Target.attachToTarget" => json!({"sessionId":"page"}),
-                "Target.setAutoAttach" => json!({}),
+                "Target.setAutoAttach" | "Page.bringToFront" => json!({}),
                 "Page.getFrameTree" => {
                     json!({"frameTree":{"frame":{"id":"main","url":"about:blank",
                     "loaderId":if fault==Fault::Navigate && seen.mutations>0 {"new"} else {"loader"}}}})
@@ -413,7 +414,6 @@ mod wire {
                         json!({"result":{"type":"object","value":value}})
                     }
                 }
-                "Page.bringToFront" => json!({}),
                 "DOM.scrollIntoViewIfNeeded" => {
                     assert_eq!(params["backendNodeId"], 42);
                     if fault == Fault::AlreadyAfterScroll {
@@ -445,7 +445,7 @@ mod wire {
             if let Some(session) = request.get("sessionId") {
                 reply["sessionId"] = session.clone();
             }
-            send(socket, reply);
+            send(socket, &reply);
         }
         panic!("form peer command budget exceeded")
     }

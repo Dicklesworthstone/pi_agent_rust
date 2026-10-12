@@ -1437,7 +1437,7 @@ fn advisor_options(
     }
 }
 
-fn cli_uses_runtime_session(cli: &cli::Cli) -> bool {
+const fn cli_uses_runtime_session(cli: &cli::Cli) -> bool {
     cli.command.is_none()
         && cli.fetch_models.is_none()
         && cli.export.is_none()
@@ -1462,6 +1462,7 @@ fn invocation_path(path: &Path, invocation_cwd: &Path) -> PathBuf {
     }
 }
 
+#[allow(clippy::unnecessary_debug_formatting)]
 fn cli_path_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
@@ -1471,7 +1472,7 @@ fn cli_path_string(path: &Path) -> Result<String> {
 /// Select the original store before project trust, configuration or tools.
 /// Session locators are anchored to the invocation directory; runtime paths
 /// are resolved later, against the saved workspace. No process cwd is changed.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::unnecessary_debug_formatting)]
 async fn resolve_cli_session_workdir(
     cli: &mut cli::Cli,
     invocation_cwd: &Path,
@@ -1552,7 +1553,11 @@ async fn resolve_cli_session_workdir(
     Ok(Some(saved))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::future_not_send,
+    clippy::unnecessary_debug_formatting
+)]
 async fn run(
     mut cli: cli::Cli,
     extension_flags: Vec<cli::ExtensionCliFlag>,
@@ -2109,7 +2114,7 @@ async fn run(
             // enables the read tool, as on the terminal stacks.
             skills_prompt: Some(resources.format_skills_for_prompt()),
         };
-        return run_acp_mode(acp_options).await;
+        return Box::pin(run_acp_mode(acp_options)).await;
     }
 
     if let Some(export_path) = cli.export.clone() {
@@ -2200,7 +2205,7 @@ async fn run(
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let mut session =
+    let session =
         startup_session.ok_or_else(|| anyhow::anyhow!("Runtime session was not initialized"))?;
 
     let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
@@ -10230,7 +10235,7 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
 async fn run_interactive_mode(
     session: AgentSession,
     initial: Option<InitialMessage>,
@@ -11703,7 +11708,7 @@ mod tests {
         // Model registration adds an allowed, credentialed extension row.
         // Resolve its actual scope/selection before validating the destination.
         config.disabled_providers = Some(vec![bootstrap.model_entry.model.provider.clone()]);
-        let mut registered = bootstrap.model_entry.clone();
+        let mut registered = bootstrap.model_entry;
         registered.model.provider = "startup-oauth-extension".to_string();
         registered.model.id = "scoped".to_string();
         registered.model.name = "Scoped extension".to_string();

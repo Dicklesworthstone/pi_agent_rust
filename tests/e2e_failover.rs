@@ -264,7 +264,7 @@ fn e2e_failover_429_walks_chain_and_completes() {
 fn e2e_print_and_rpc_keep_extension_prompt_through_retry_and_failover() {
     const TURN_PROMPT: &str = "Keep the approved per-turn instructions on every provider attempt.";
     for mode in ["print", "rpc"] {
-        let harness = TestHarness::new(&format!("e2e_{mode}_recovery_prompt"));
+        let harness = TestHarness::new(format!("e2e_{mode}_recovery_prompt"));
         let server = harness.start_mock_http_server();
         server.add_route(
             "POST",

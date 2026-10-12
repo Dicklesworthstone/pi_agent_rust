@@ -160,7 +160,7 @@ fn chunk(stream: &mut TcpStream, bytes: &[u8]) {
     stream.write_all(b"\r\n").expect("chunk end");
 }
 
-fn event(stream: &mut TcpStream, value: Value, finish: Option<&str>) {
+fn event(stream: &mut TcpStream, value: &Value, finish: Option<&str>) {
     let data = format!(
         "data: {}\n\n",
         json!({
@@ -184,8 +184,8 @@ fn event(stream: &mut TcpStream, value: Value, finish: Option<&str>) {
 }
 
 fn finish(stream: &mut TcpStream, answer: &str) {
-    event(stream, json!({"content": answer}), None);
-    event(stream, json!({}), Some("stop"));
+    event(stream, &json!({"content": answer}), None);
+    event(stream, &json!({}), Some("stop"));
     chunk(stream, b"data: [DONE]\n\n");
     stream
         .write_all(b"0\r\n\r\n")
@@ -201,14 +201,14 @@ fn peer(listener: &TcpListener, ack: &mpsc::Receiver<usize>, abort: bool) {
         "reason carefully"
     ));
     begin_response(&mut first);
-    event(&mut first, json!({"role": "assistant"}), None);
+    event(&mut first, &json!({"role": "assistant"}), None);
     for index in 0..DELTAS {
         let value = if abort {
             json!({"reasoning": delta(index)})
         } else {
             json!({"reasoning_content": delta(index)})
         };
-        event(&mut first, value, None);
+        event(&mut first, &value, None);
         if (index + 1) % BATCH == 0 {
             phase(&format!(
                 "wire delta={index} sent; awaiting presented tail and editor"
@@ -302,7 +302,7 @@ struct Input {
     pending: VecDeque<Event>,
 }
 
-fn key(code: KeyCode) -> Event {
+const fn key(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code))
 }
 
@@ -676,7 +676,7 @@ fn run_ui(mode: Mode, path: &Path, url: &str, ack: mpsc::SyncSender<usize>) {
     driver.join().expect("SDK driver completed");
 }
 
-pub(super) fn run(abort: bool) {
+pub fn run(abort: bool) {
     let directory = tempfile::tempdir().expect("real session directory");
     let path = directory.path().join("reasoning.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").expect("local SSE peer");

@@ -256,13 +256,13 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
             "api":"openai-completions",
             "baseUrl":format!("{}/selected/v1", server.base_url()),
             "apiKey":"test-key",
-            "models":[{"id":model_id,"contextWindow":128000}]
+            "models":[{"id":model_id,"contextWindow":128_000}]
         },
         "e2econfigured":{
             "api":"openai-completions",
             "baseUrl":format!("{}/configured/v1", server.base_url()),
             "apiKey":"test-key",
-            "models":[{"id":"configured-model","contextWindow":128000}]
+            "models":[{"id":"configured-model","contextWindow":128_000}]
         }
     }});
     std::fs::write(agent_dir.join("models.json"), models.to_string())
@@ -373,7 +373,7 @@ fn e2e_unpinned_subagent_inherits_cli_model_instead_of_configured_defaults() {
 }
 
 #[cfg(unix)]
-fn hub_tool_call_sse(id: &str, tool: &str, arguments: serde_json::Value) -> String {
+fn hub_tool_call_sse(id: &str, tool: &str, arguments: &serde_json::Value) -> String {
     let call = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{
         "index":0,"id":id,"type":"function",
         "function":{"name":tool,"arguments":arguments.to_string()}
@@ -417,7 +417,7 @@ fn e2e_native_children_exchange_hub_messages_through_the_parent() {
     let harness = TestHarness::new("e2e_native_children_exchange_hub_messages_through_the_parent");
     let server = harness.start_mock_http_server();
     let call =
-        |id: &str, tool: &str, arguments| sse_response(hub_tool_call_sse(id, tool, arguments));
+        |id: &str, tool: &str, arguments| sse_response(hub_tool_call_sse(id, tool, &arguments));
     server.add_route_queue(
         "POST",
         "/parent/v1/chat/completions",
@@ -549,7 +549,7 @@ fn e2e_native_children_exchange_hub_messages_through_the_parent() {
                 "api":"openai-completions",
                 "baseUrl":format!("{}/{name}/v1", server.base_url()),
                 "apiKey":"test-key",
-                "models":[{"id":format!("{name}-model"),"contextWindow":128000}]
+                "models":[{"id":format!("{name}-model"),"contextWindow":128_000}]
             }),
         );
     }

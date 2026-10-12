@@ -3,6 +3,11 @@
 //! These tests exercise the real `AgentSession` + `Session` persistence path
 //! using deterministic in-process provider streams.
 
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 mod common;
 
 use asupersync::runtime::RuntimeBuilder;

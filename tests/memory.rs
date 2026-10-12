@@ -538,7 +538,7 @@ fn cass_registry_preserves_local_operations_when_history_has_no_process_authorit
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn cass_recall_preserves_exact_session_values_and_excludes_them_from_project_history() {
     let case = "cass_recall_preserves_exact_session_values_and_excludes_them_from_project_history";
     let harness = TestHarness::new(case);
@@ -833,6 +833,7 @@ impl pi::provider::Provider for ReflectionDriver {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn direct_and_xdev_reflection_use_the_current_agents_vault_and_patterns() {
     const OPAQUE: &str = "opaqueLiveSessionCredential12345";
     let harness = TestHarness::new("reflect_live_agent_privacy");

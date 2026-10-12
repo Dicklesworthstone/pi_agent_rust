@@ -133,7 +133,7 @@ fn word_char_progress() {
     assert!(rows.iter().all(|row| row.width() <= 3));
 }
 
-fn key(code: KeyCode, modifiers: Modifiers) -> PiFtuiMsg {
+const fn key(code: KeyCode, modifiers: Modifiers) -> PiFtuiMsg {
     PiFtuiMsg::Term(Event::Key(KeyEvent {
         code,
         modifiers,
@@ -207,9 +207,7 @@ fn persist_and_reopen(thinking: &str) -> Session {
         "timestamp": 1
     }))
     .expect("assistant message fixture");
-    session.append_message(SessionMessage::Assistant {
-        message: assistant.into(),
-    });
+    session.append_message(SessionMessage::Assistant { message: assistant });
     phase("persist completed thinking: before save");
     run_async(session.save()).expect("save completed session");
     let expected = serde_json::to_value(&session.entries).expect("original entries");
@@ -224,6 +222,7 @@ fn persist_and_reopen(thinking: &str) -> Session {
     reopened
 }
 
+#[allow(clippy::too_many_lines)]
 fn stream_resume_abort() {
     let (_agent_tx, agent_rx) = mpsc::channel();
     let mut model = PiFtuiModel::new(agent_rx).with_thinking_visible(true);
@@ -301,7 +300,7 @@ fn stream_resume_abort() {
     send(
         &mut resumed,
         PiMsg::ConversationReset {
-            session_id: reopened.header.id.clone(),
+            session_id: reopened.header.id,
             messages: vec![ConversationMessage {
                 role: MessageRole::Assistant,
                 content: "ANSWER_DONE".to_string(),

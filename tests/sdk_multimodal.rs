@@ -385,6 +385,7 @@ fn terminal_reasons(events: &[StreamEvent]) -> Vec<StopReason> {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
     for explicit_abort in [false, true] {
         let root = tempfile::tempdir().expect("tempdir");
@@ -609,6 +610,7 @@ fn sdk_mml_img_transport_supports_image_only_prompts() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn sdk_mml_native_transport_retries_preserve_order_and_one_durable_prompt() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![503, 200]);
@@ -795,6 +797,7 @@ fn sdk_mml_img_provider_image_blocking_still_applies() {
     assert!(!encoded.contains("image_url"));
 }
 
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 fn assert_turn_save_failure_fences_every_entrypoint(with_images: bool, retry: bool) {
     let root = tempfile::tempdir().expect("tempdir");
     // Keep an extra response available so an illegal later provider call is
@@ -1128,6 +1131,7 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
     }
 
     #[test]
+    #[allow(clippy::manual_assert_eq)]
     fn ordinary_media_echoes_fit_response_and_pre_ack_bounds() {
         use base64::Engine as _;
 

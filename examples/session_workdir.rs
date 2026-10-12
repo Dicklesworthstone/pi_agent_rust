@@ -128,6 +128,7 @@ async fn load_session(path: &Path) -> PiResult<(PathBuf, Session)> {
     Ok((path, session))
 }
 
+#[allow(clippy::unnecessary_debug_formatting)]
 async fn prepare(command: RecoveryCommand) -> PiResult<Prepared> {
     match command {
         RecoveryCommand::Inspect { session } => {
