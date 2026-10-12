@@ -1772,12 +1772,23 @@ enum OpenAIResponsesInputItem {
         #[serde(rename = "type")]
         r#type: &'static str,
         call_id: String,
-        output: String,
+        output: OpenAIResponsesFunctionOutput,
     },
     /// Raw provider item replayed verbatim (currently: `reasoning` items with
     /// their `encrypted_content`, captured on parse into
     /// `ThinkingContent::thinking_signature`).
     RawItem(serde_json::Value),
+}
+
+/// Responses and Codex accept the same text/image content parts in function
+/// outputs as in user input. Keep ordinary tool output as a string; an image
+/// requires the structured form so its bytes stay attached to its call ID.
+/// <https://developers.openai.com/api/docs/guides/function-calling#formatting-results>
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OpenAIResponsesFunctionOutput {
+    Text(String),
+    Content(Vec<OpenAIResponsesUserContentPart>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1951,26 +1962,57 @@ fn build_openai_responses_input(
                 flush_pending(&mut pending_text, &mut input);
             }
             Message::ToolResult(result) => {
-                let mut out = String::new();
-                for (i, block) in result.content.iter().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    if let ContentBlock::Text(t) = block {
-                        out.push_str(&t.text);
-                    }
-                }
                 let (call_id, _) = split_responses_tool_call_id(&result.tool_call_id);
                 input.push(OpenAIResponsesInputItem::FunctionCallOutput {
                     r#type: "function_call_output",
                     call_id: call_id.to_string(),
-                    output: out,
+                    output: convert_tool_result_output(&result.content),
                 });
             }
         }
     }
 
     input
+}
+
+fn convert_tool_result_output(content: &[ContentBlock]) -> OpenAIResponsesFunctionOutput {
+    if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+    {
+        let parts = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(OpenAIResponsesUserContentPart::InputText {
+                    text: text.text.clone(),
+                }),
+                ContentBlock::Image(image) => Some(OpenAIResponsesUserContentPart::InputImage {
+                    image_url: format!("data:{};base64,{}", image.mime_type, image.data),
+                }),
+                ContentBlock::Media(media) => Some(OpenAIResponsesUserContentPart::InputText {
+                    text: media.placeholder(),
+                }),
+                _ => None,
+            })
+            .collect();
+        return OpenAIResponsesFunctionOutput::Content(parts);
+    }
+
+    // Preserve the existing text-only wire representation, including empty
+    // blocks and their separators. Audio/video get the same explicit omission
+    // explanation as user attachments instead of silently disappearing.
+    let mut output = String::new();
+    for (index, block) in content.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        match block {
+            ContentBlock::Text(text) => output.push_str(&text.text),
+            ContentBlock::Media(media) => output.push_str(&media.placeholder()),
+            _ => {}
+        }
+    }
+    OpenAIResponsesFunctionOutput::Text(output)
 }
 
 /// Maximum item-id length OpenAI accepts on replayed input items.
@@ -2629,6 +2671,234 @@ mod tests {
             is_error: false,
             timestamp: 0,
         }))
+    }
+
+    fn multimodal_tool_result(id: &str, content: Vec<ContentBlock>, is_error: bool) -> Message {
+        Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error,
+            timestamp: 0,
+        })
+    }
+
+    fn tool_image(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(crate::model::ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    #[test]
+    fn tool_output_images_keep_order_error_content_and_parallel_call_ids() {
+        let calls = ["call_first|fc_first", "call_second"]
+            .into_iter()
+            .map(|id| {
+                ContentBlock::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                })
+            })
+            .collect();
+        let context = Context::owned(
+            None,
+            vec![
+                assistant_message_with_blocks(calls),
+                multimodal_tool_result(
+                    "call_first|fc_first",
+                    vec![tool_image("Zmlyc3Q=", "image/png")],
+                    false,
+                ),
+                multimodal_tool_result(
+                    "call_second",
+                    vec![
+                        ContentBlock::Text(TextContent::new("Capture partly failed")),
+                        tool_image("c2Vjb25k", "image/jpeg"),
+                        ContentBlock::Media(crate::model::MediaContent {
+                            data: "YWJj".to_string(),
+                            mime_type: "video/mp4".to_string(),
+                            name: Some("clip.mp4".to_string()),
+                        }),
+                        ContentBlock::Text(TextContent::new("Inspect the remaining frame")),
+                        tool_image("dGhpcmQ=", "image/webp"),
+                    ],
+                    true,
+                ),
+            ],
+            Vec::new(),
+        );
+        let original = serde_json::to_value(&context.messages).unwrap();
+
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(codex_mode);
+            let request = provider.build_request(&context, &StreamOptions::default());
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                value["input"],
+                json!([
+                    {"type":"function_call", "id":"fc_first", "call_id":"call_first", "name":"read", "arguments":"{}"},
+                    {"type":"function_call", "call_id":"call_second", "name":"read", "arguments":"{}"},
+                    {"type":"function_call_output", "call_id":"call_first", "output":[
+                        {"type":"input_image", "image_url":"data:image/png;base64,Zmlyc3Q="}
+                    ]},
+                    {"type":"function_call_output", "call_id":"call_second", "output":[
+                        {"type":"input_text", "text":"Capture partly failed"},
+                        {"type":"input_image", "image_url":"data:image/jpeg;base64,c2Vjb25k"},
+                        {"type":"input_text", "text":"[media omitted: clip.mp4, video/mp4, 3 B]"},
+                        {"type":"input_text", "text":"Inspect the remaining frame"},
+                        {"type":"input_image", "image_url":"data:image/webp;base64,dGhpcmQ="}
+                    ]}
+                ]),
+                "codex_mode={codex_mode}",
+            );
+        }
+        assert_eq!(serde_json::to_value(&context.messages).unwrap(), original);
+        assert!(matches!(&context.messages[2], Message::ToolResult(result) if result.is_error));
+    }
+
+    #[test]
+    fn tool_output_text_stays_a_string_and_media_has_an_omission_explanation() {
+        let context = Context::owned(
+            None,
+            vec![
+                multimodal_tool_result("empty", Vec::new(), false),
+                multimodal_tool_result(
+                    "text",
+                    vec![
+                        ContentBlock::Text(TextContent::new("first\n")),
+                        ContentBlock::Text(TextContent::new("")),
+                        ContentBlock::Text(TextContent::new("last")),
+                    ],
+                    true,
+                ),
+                multimodal_tool_result(
+                    "media",
+                    vec![ContentBlock::Media(crate::model::MediaContent {
+                        data: "YWJj".to_string(),
+                        mime_type: "audio/wav".to_string(),
+                        name: None,
+                    })],
+                    false,
+                ),
+            ],
+            Vec::new(),
+        );
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(codex_mode);
+            let request = provider.build_request(&context, &StreamOptions::default());
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                value["input"],
+                json!([
+                    {"type":"function_call_output", "call_id":"empty", "output":""},
+                    {"type":"function_call_output", "call_id":"text", "output":"first\n\n\nlast"},
+                    {"type":"function_call_output", "call_id":"media", "output":"[media omitted: unnamed, audio/wav, 3 B]"}
+                ]),
+                "codex_mode={codex_mode}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_image_read_reaches_responses_and_codex_under_agent_image_policy() {
+        use crate::tools::Tool as _;
+        use std::sync::Arc;
+
+        // A real PNG goes through the native read tool before its persisted
+        // result is replayed through Agent and the HTTP request converter.
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("frame.png"),
+            base64::engine::general_purpose::STANDARD.decode(PNG).unwrap(),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let read = crate::tools::ReadTool::with_settings(dir.path(), false, false);
+        let output = runtime
+            .block_on(read.execute("call_image", json!({"path":"frame.png"}), None))
+            .unwrap();
+        assert!(!output.is_error);
+        let original_content = serde_json::to_value(&output.content).unwrap();
+
+        for codex_mode in [false, true] {
+            for (block_images, model_accepts_images, omission) in [
+                (false, true, None),
+                (true, true, Some("Image reading is disabled.")),
+                (
+                    false,
+                    false,
+                    Some("[Image omitted: the active model does not support image input.]"),
+                ),
+            ] {
+                let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+                let provider = OpenAIResponsesProvider::new("gpt-test")
+                    .with_codex_mode(codex_mode)
+                    .with_base_url(base_url);
+                let mut agent = crate::agent::Agent::new(
+                    Arc::new(provider),
+                    crate::tools::ToolRegistry::from_tools(Vec::new()),
+                    crate::agent::AgentConfig {
+                        block_images,
+                        model_accepts_images,
+                        stream_options: StreamOptions {
+                            api_key: Some(build_test_jwt("acct_images")),
+                            ..Default::default()
+                        },
+                        ..crate::agent::AgentConfig::default()
+                    },
+                );
+                agent.replace_messages(vec![
+                    assistant_message_with_blocks(vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call_image".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path":"frame.png"}),
+                        thought_signature: None,
+                    })]),
+                    multimodal_tool_result("call_image", output.content.clone(), false),
+                ]);
+                let message = runtime
+                    .block_on(agent.run("Describe the frame", |_| {}))
+                    .unwrap();
+                assert_eq!(message.stop_reason, StopReason::Stop);
+                let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let body: Value = serde_json::from_str(&captured.body).unwrap();
+                let result = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == "function_call_output")
+                    .expect("original tool output remains attributed");
+                assert_eq!(result["call_id"], "call_image");
+                if let Some(omission) = omission {
+                    assert!(result["output"].as_str().unwrap().contains(omission));
+                    assert!(
+                        !captured.body.contains(PNG),
+                        "filtered image bytes cannot be sent",
+                    );
+                } else {
+                    assert_eq!(
+                        result["output"],
+                        json!([
+                            {"type":"input_text", "text":"Read image file [image/png]"},
+                            {"type":"input_image", "image_url":format!("data:image/png;base64,{PNG}")}
+                        ]),
+                    );
+                }
+                let Message::ToolResult(stored) = &agent.messages()[1] else {
+                    panic!("native tool result must remain in history");
+                };
+                assert_eq!(
+                    serde_json::to_value(&stored.content).unwrap(),
+                    original_content,
+                );
+            }
+        }
     }
 
     fn raw_reasoning_item() -> Value {
