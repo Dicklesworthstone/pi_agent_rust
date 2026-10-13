@@ -77,6 +77,57 @@ against a hostile concurrent writer or a security boundary for arbitrary code.
 a shell. `%pip`, `%bun`, JS file loading, and automatic dependency installation
 are not implemented by this Python command.
 
+## Async JavaScript cells
+
+JavaScript retains ordinary script-level `let`, `const`, function declarations,
+and globals. Top-level `await` uses QuickJS's async grammar; declarations made
+inside that mode are not persistent, so use `globalThis` for values to retain.
+Grammar selection happens before execution: runtime `SyntaxError` exceptions,
+including failed `JSON.parse` calls, never re-execute the cell's earlier work.
+
+```json
+{"kernel":"js","code":"await sleep(10); globalThis.text = await tool.call('read', {path:'README.md'}); console.log(text.slice(0,200))"}
+```
+
+`tool.call(name, args)` returns a promise for the same content string returned
+by the existing synchronous helpers. It accepts object arguments. Host policy
+still permits only `read`, `grep`, `find`, and `ls`; rejected calls reject an
+`Error` that can be caught with `try`/`catch` or `.catch()`. `Promise.all` can
+compose calls, but the asynchronous bridge dispatches them one at a time and
+the host still executes them serially. `tool.read(path)` and the other positional
+synchronous helpers keep their existing return types.
+
+`sleep(milliseconds)`, `setTimeout(callback, milliseconds, ...args)`,
+`clearTimeout(id)`, `setInterval`, and `clearInterval` are available. Timers run
+while the cell waits for its returned promise, with promise microtasks before
+timer callbacks. Timer callbacks must be functions; strings are never evaluated.
+Negative delays clamp to zero; non-finite delays and values above 2147483647 ms
+are rejected. Intervals have a minimum delay of one millisecond.
+
+**Await the work to keep it alive.** Outstanding timers and undispatched async
+calls are discarded when a cell returns or fails. They are not retained tasks,
+and their promises cannot be resumed in a later cell. An already dispatched
+host read may finish; discarding a cell does not undo admitted host work.
+There is no timer thread, background execution between cells, network API,
+module loader, or expanded filesystem authority added by these helpers.
+
+The reactor admits at most 128 pending operations, 4096 operation creations,
+and 65536 delivered events per cell. Tool arguments are limited to 256 KiB each
+and 1 MiB across queued async calls. Limits fail explicitly rather than dropping
+part of a request. Callbacks execute without holding the native registry borrow.
+
+A JavaScript timeout now discards the realm and reports `EVAL_STATE_RESET`;
+the next cell starts with fresh variables. This deliberately replaces the old
+state-preserved timeout behavior: abandoned promise continuations must not run
+under the next cell's deadline. Ordinary errors with no leftover microtasks
+preserve completed mutations. Legacy synchronous bridge waits now obey the cell
+deadline too, and dropping the kernel revokes its worker. These are cooperative
+boundaries, not hard real-time guarantees or rollback of completed work.
+
+Kernel regressions live under `src/eval/js_kernel/`; `tests/eval_async_js.rs`
+exercises these helpers through the actual Rust `EvalTool`. JavaScript-bootstrap
+probes under Node do not establish QuickJS, Rust-host, or DSR acceptance.
+
 ## Scope and validation
 
 These additions target the persistent-async and file-backed-cell capabilities
