@@ -1,10 +1,78 @@
 # Persistent eval kernels
 
 The `eval` tool runs one cell at a time in a retained Python or QuickJS kernel.
-Pi's input fields are `code`, `kernel` (`python` or `js`, default `python`), and
-`timeout_secs` (default 30, clamped to 1–600). These are Pi's native fields, not
+Pi's input fields are `code`, `kernel` (`python` or `js`, default `python`),
+`reset` (boolean, default false), and `timeout_secs` (default 30, clamped to
+1–600). These are Pi's native fields, not
 OMP's `language`/`timeout` wire format. Python requires a usable interpreter;
 `PI_EVAL_PYTHON` selects it instead of `python3`.
+
+## Exclusive execution and reset
+
+Calls on one `EvalTool` instance execute exclusively, including direct SDK calls
+and calls selecting different languages. Waiting is asynchronous and does not
+consume the active cell budget; simultaneous callers have no FIFO guarantee.
+Separate instances retain independent state and admission. Dropping a waiting
+future executes nothing. Dropping an active future discards its checked-out
+kernel through the existing cleanup path; it does not roll back completed work.
+
+Use `reset: true` to retire only the selected language before executing its code:
+
+```json
+{"kernel":"js","reset":true,"code":""}
+```
+
+An empty cell performs reset without additional user code. The other language
+is untouched. Requests are validated before reset, so invalid language names,
+non-boolean reset values or malformed fields cannot silently discard state.
+Successful reset requests report `EVAL_STATE_RESET`, `details.reset: true`, and
+a new cell sequence starting at one. Backend errors after reset still disclose
+the state loss. Ordinary results include `details.reset: false`.
+
+## Python rich displays
+
+Python's `display(value, *, mime=None)` captures an explicit output snapshot.
+Strings default to `text/plain`; other supported JSON values default to
+`application/json`. Choose `text/markdown` or `image/png` explicitly:
+
+```python
+display({"answer": 42, "observations": [True, None]})
+display("## Result\nThe calculation completed.", mime="text/markdown")
+
+# Plotting libraries are optional. After saving a figure to an io.BytesIO:
+display(png_buffer.getvalue(), mime="image/png")
+```
+
+PNG inputs are bytes/bytearray or canonical standard base64, never paths or
+URLs. The helper does not read files, fetch images, inspect notebook MIME hooks,
+or install plotting packages. JSON accepts built-in dictionaries with string
+keys, lists/tuples, strings, booleans, null, finite floats, and integers fitting
+signed/unsigned 64-bit storage. Convert larger integers to strings explicitly.
+Custom objects and serializers are not invoked; convert them deliberately.
+
+Display snapshots are returned in call order as native content blocks. JSON also
+appears without text parsing in `details.jsonOutputs`; `details.displays` records
+MIME types, encoded byte counts and PNG dimensions without duplicating base64.
+Captured stdout/stderr precede the displays, and the final expression or error
+follows them. This is final-cell output, not live streaming or a combined
+stdout/display timestamp log. A display preceding an ordinary exception remains
+available, but the tool result is still an error. A timeout/crash may lose the
+unreturned cell's captures. The final expression's existing `repr()` is unchanged.
+
+Each cell admits at most 32 displays, 2 MiB per serialized MIME frame, and 4 MiB
+across frames. JSON values are limited to depth 32 and 65,536 nodes. PNG envelope
+checks require header/end markers, dimensions at most 16,384 per axis and at
+most 16,777,216 pixels; neither helper nor host decompresses or certifies the
+raster. These are display limits, not bounds on arbitrary eval memory or stdout.
+Limits reject the offending display explicitly; they never silently truncate.
+The Rust host independently validates the complete collection before publishing
+any of it or returning the kernel to its reusable slot.
+
+Only the active cell's thread/context may display. A retained task from a prior
+cell keeps that prior sink, which closes at its boundary; late display attempts
+raise `EVAL_DISPLAY_CLOSED` rather than polluting another result. Awaiting a child
+task within its originating cell works. This does not turn retained tasks into
+managed background jobs. JavaScript rich displays are not provided by this API.
 
 ## Async Python cells
 
@@ -132,8 +200,9 @@ probes under Node do not establish QuickJS, Rust-host, or DSR acceptance.
 
 These additions target the persistent-async and file-backed-cell capabilities
 in OMP v18.10.4's `docs/tools/eval.md`; they do not claim complete OMP eval parity.
-Structured rich displays, tracked auto-backgrounding, general session-tool and
-subagent bridges, and the Bun runtime remain separate work.
+JavaScript rich displays, tracked auto-backgrounding, general session-tool and
+subagent bridges, and the Bun runtime remain separate work. Python rich-output
+coverage is in `tests/eval_display.rs` and `src/eval/display.rs`.
 
 Regression coverage is in `tests/eval.rs`, through the actual Rust `EvalTool`.
 Use the repository's authoritative `dsr quality --tool pi_agent_rust` workflow.

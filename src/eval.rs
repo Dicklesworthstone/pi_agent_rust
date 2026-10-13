@@ -17,6 +17,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod display;
 mod js_kernel;
 mod lifecycle;
 
@@ -424,6 +425,11 @@ impl EvalTool {
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
 
+        // Validate all rich output before making the kernel reusable. A
+        // malformed protocol result discards this connection, not just its
+        // bad frame, and cannot partially publish a successful tool result.
+        let output = format_cell_response(&final_line, restarted, cells_run)?;
+
         // Return the kernel to the slot for the next cell.
         {
             let mut slot = self
@@ -433,7 +439,7 @@ impl EvalTool {
             *slot = Some(kernel);
         }
 
-        format_cell_response(&final_line, restarted, cells_run)
+        Ok(output)
     }
 
     /// Execute one whitelisted bridge call through the SAME tool
@@ -451,58 +457,7 @@ impl EvalTool {
 
 /// Turn a kernel protocol response line into the tool output contract.
 fn format_cell_response(line: &str, restarted: bool, cells_run: u64) -> Result<ToolOutput> {
-    let response: Value = serde_json::from_str(line)
-        .map_err(|err| Error::tool("eval", format!("EVAL_PROTOCOL: {err}")))?;
-    let ok = response.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let stdout = response.get("stdout").and_then(Value::as_str).unwrap_or("");
-    let stderr = response.get("stderr").and_then(Value::as_str).unwrap_or("");
-    let mut text = String::new();
-    if restarted && cells_run == 1 {
-        text.push_str("(kernel started)\n");
-    }
-    if !stdout.is_empty() {
-        text.push_str(stdout);
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-    }
-    if !stderr.is_empty() {
-        text.push_str(stderr);
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-    }
-    if ok {
-        if let Some(result) = response.get("result").and_then(Value::as_str) {
-            text.push_str(result);
-            text.push('\n');
-        }
-        if text.is_empty() {
-            text.push_str("(no output)\n");
-        }
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(json!({
-                "kernel": "python",
-                "cell": cells_run,
-                "restarted": restarted,
-            })),
-            is_error: false,
-        })
-    } else {
-        let error = response.get("error").and_then(Value::as_str).unwrap_or("?");
-        text.push_str(error);
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(json!({
-                "kernel": "python",
-                "cell": cells_run,
-                "restarted": restarted,
-                "errorKind": "exception",
-            })),
-            is_error: true,
-        })
-    }
+    display::python_response(line, restarted, cells_run)
 }
 
 #[async_trait::async_trait]
@@ -521,7 +476,8 @@ impl Tool for EvalTool {
          one at a time within this session and return the final expression. \
          Set reset=true to discard the selected language's state before this \
          cell; the other language is unaffected. Timeouts or crashes report \
-         state loss explicitly."
+         state loss explicitly. Python display(value, mime=...) returns JSON, \
+         text, Markdown or PNG data; image input is bytes/base64, not a path."
     }
 
     fn parameters(&self) -> Value {

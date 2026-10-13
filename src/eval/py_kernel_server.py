@@ -29,15 +29,18 @@ permissions and the tool whitelist remain owned by the host.
 
 import ast
 import asyncio
+import base64
 import contextvars
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shlex
 import stat
 import sys
+import threading
 import traceback
 
 NAMESPACE = {"__name__": "__main__"}
@@ -61,6 +64,121 @@ asyncio.set_event_loop(_CELL_LOOP)
 _CELL_CONTEXT = contextvars.copy_context()
 _WORKSPACE_ROOT = Path.cwd().resolve()
 _MAX_SCRIPT_BYTES = 2 * 1024 * 1024
+_DISPLAY_CONTEXT = contextvars.ContextVar("pi_eval_display", default=None)
+_MAX_DISPLAYS = 32
+_MAX_DISPLAY_ITEM_BYTES = 2 * 1024 * 1024
+_MAX_DISPLAY_BYTES = 4 * 1024 * 1024
+
+
+def _display_json_shape(value, depth=0, remaining=None):
+    """Accept JSON data without calling custom serializers or coercing keys."""
+    if remaining is None:
+        remaining = [65536]
+    remaining[0] -= 1
+    if depth > 32 or remaining[0] < 0:
+        raise ValueError("EVAL_DISPLAY_LIMIT: JSON nesting or node budget exceeded")
+    kind = type(value)
+    if kind is str:
+        if len(value) > _MAX_DISPLAY_ITEM_BYTES:
+            raise ValueError("EVAL_DISPLAY_LIMIT: string exceeds the item budget")
+    elif kind is int:
+        if not -(1 << 63) <= value < (1 << 64):
+            raise ValueError("EVAL_DISPLAY_JSON: large integers must be explicit strings")
+    elif kind is float:
+        if not math.isfinite(value):
+            raise ValueError("EVAL_DISPLAY_JSON: non-finite numbers are not JSON")
+    elif kind in (list, tuple):
+        if len(value) > remaining[0]:
+            raise ValueError("EVAL_DISPLAY_LIMIT: JSON node budget exceeded")
+        for item in value:
+            _display_json_shape(item, depth + 1, remaining)
+    elif kind is dict:
+        if len(value) > remaining[0]:
+            raise ValueError("EVAL_DISPLAY_LIMIT: JSON node budget exceeded")
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("EVAL_DISPLAY_JSON: object keys must be strings")
+            if len(key) > _MAX_DISPLAY_ITEM_BYTES:
+                raise ValueError("EVAL_DISPLAY_LIMIT: JSON key exceeds the item budget")
+            _display_json_shape(item, depth + 1, remaining)
+    elif kind not in (bool, type(None)):
+        raise TypeError("EVAL_DISPLAY_JSON: use JSON values or an explicit text MIME type")
+
+
+def _display_png(value):
+    if type(value) not in (str, bytes, bytearray):
+        raise TypeError("EVAL_DISPLAY_PNG: expected PNG bytes or standard base64")
+    if len(value) > _MAX_DISPLAY_ITEM_BYTES:
+        raise ValueError("EVAL_DISPLAY_LIMIT: PNG exceeds the item budget")
+    if type(value) is str:
+        raw = base64.b64decode(value, validate=True)
+        encoded = base64.b64encode(raw).decode("ascii")
+        if encoded != value:
+            raise ValueError("EVAL_DISPLAY_PNG: use canonical standard base64")
+    else:
+        raw = value
+        encoded = base64.b64encode(raw).decode("ascii")
+    # Envelope admission only; no raster decompression in the kernel or host.
+    if (len(raw) < 45 or raw[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            or raw[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"):
+        raise ValueError("EVAL_DISPLAY_PNG: missing PNG header or end marker")
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    if not 0 < width <= 16384 or not 0 < height <= 16384 or width * height > 16777216:
+        raise ValueError("EVAL_DISPLAY_PNG: dimensions exceed the display budget")
+    return encoded
+
+
+class _DisplaySink:
+    def __init__(self):
+        self.frames = []
+        self.bytes = 0
+        self.active = True
+        self.thread = threading.get_ident()
+
+    def append(self, value, mime):
+        if not self.active or threading.get_ident() != self.thread:
+            raise RuntimeError("EVAL_DISPLAY_CLOSED: display belongs to an inactive cell")
+        if len(self.frames) >= _MAX_DISPLAYS:
+            raise ValueError("EVAL_DISPLAY_LIMIT: at most 32 displays per cell")
+        if mime is None:
+            mime = "text/plain" if type(value) is str else "application/json"
+        if mime == "image/png":
+            data = _display_png(value)
+        elif mime in ("text/plain", "text/markdown"):
+            if type(value) is not str:
+                raise TypeError("EVAL_DISPLAY_TEXT: explicit text displays require a string")
+            data = value
+        elif mime == "application/json":
+            data = value
+        else:
+            raise ValueError("EVAL_DISPLAY_MIME: supported types are text/plain, text/markdown, application/json, image/png")
+        _display_json_shape(data)
+        frame = {"mimeType": mime, "data": data}
+        encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        chunks = []
+        size = 0
+        for chunk in encoder.iterencode(frame):
+            size += len(chunk.encode("utf-8"))
+            if size > _MAX_DISPLAY_ITEM_BYTES or self.bytes + size > _MAX_DISPLAY_BYTES:
+                raise ValueError("EVAL_DISPLAY_LIMIT: encoded display byte budget exceeded")
+            chunks.append(chunk)
+        # Snapshot at the call, not at cell completion. Later mutations cannot
+        # change an already displayed JSON object. Refused items change nothing.
+        snapshot = json.loads("".join(chunks))
+        self.frames.append(snapshot)
+        self.bytes += size
+
+
+def display(value, *, mime=None):
+    """Capture explicit JSON, text, Markdown or PNG output for this cell."""
+    sink = _DISPLAY_CONTEXT.get()
+    if sink is None:
+        raise RuntimeError("EVAL_DISPLAY_CLOSED: no active cell")
+    sink.append(value, mime)
+
+
+NAMESPACE["display"] = display
 
 
 class ToolBridgeError(RuntimeError):
@@ -210,8 +328,9 @@ def _compile_cell(code, filename):
     return body, expression
 
 
-async def _execute_cell(code):
+async def _execute_cell(code, displays):
     global _CELL_CONTEXT
+    display_token = _DISPLAY_CONTEXT.set(displays)
     try:
         source, filename, script_dir = _prepare_cell(code)
         body, expression = _compile_cell(source, filename)
@@ -236,24 +355,29 @@ async def _execute_cell(code):
     except BaseException:  # noqa: BLE001 - SystemExit must not stop the loop
         return False, None, traceback.format_exc()
     finally:
+        # Child tasks retain this particular sink. Once the cell ends they
+        # cannot publish late output into a later cell's display collection.
+        _DISPLAY_CONTEXT.reset(display_token)
         # Each run_until_complete creates a task; keep the cell's context
         # rather than silently resetting ContextVars to the host's context.
         _CELL_CONTEXT = contextvars.copy_context()
 
 
 def run_cell(code):
+    displays = _DisplaySink()
     stdout = io.StringIO()
     stderr = io.StringIO()
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = stdout, stderr
     try:
         ok, result, error = _CELL_CONTEXT.run(
-            _CELL_LOOP.run_until_complete, _execute_cell(code)
+            _CELL_LOOP.run_until_complete, _execute_cell(code, displays)
         )
-        return ok, stdout.getvalue(), stderr.getvalue(), result, error
+        return ok, stdout.getvalue(), stderr.getvalue(), result, error, displays.frames
     except BaseException:  # noqa: BLE001 - full traceback back to the host
-        return False, stdout.getvalue(), stderr.getvalue(), None, traceback.format_exc()
+        return False, stdout.getvalue(), stderr.getvalue(), None, traceback.format_exc(), displays.frames
     finally:
+        displays.active = False
         sys.stdout, sys.stderr = old_out, old_err
 
 
@@ -267,12 +391,13 @@ def main():
             continue
         try:
             request = json.loads(line)
-            ok, out, err, result, error = run_cell(request.get("code", ""))
+            ok, out, err, result, error, displays = run_cell(request.get("code", ""))
             response = {
                 "id": request.get("id"),
                 "ok": ok,
                 "stdout": out,
                 "stderr": err,
+                "displays": displays,
             }
             if ok:
                 response["result"] = result
