@@ -5361,9 +5361,16 @@ pub async fn run(
     preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx)
         .await
         .map_err(|err| {
-            Error::session(format!(
-                "RPC stdin closed before terminal session state could be preserved: {err}"
-            ))
+            // A quarantine is already a classified terminal persistence
+            // failure. Re-wrapping it as a plain session error would strip the
+            // [SESSION_PERSISTENCE_FAILED] marker callers must treat as final.
+            if err.is_session_persistence() {
+                err
+            } else {
+                Error::session(format!(
+                    "RPC stdin closed before terminal session state could be preserved: {err}"
+                ))
+            }
         })?;
 
     flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
@@ -12896,9 +12903,12 @@ mod retry_tests {
         let runtime_handle = runtime.handle();
         runtime.block_on(Box::pin(async move {
             let temp = tempfile::tempdir().expect("tempdir");
-            let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
-            let runtime_cwd = temp
-                .path()
+            // The fixture's own save creates `<root>/sessions`, so build it in a
+            // separate root: `temp/sessions` must only appear if the fork wrote.
+            let fixture_root = temp.path().join("fixture");
+            std::fs::create_dir(&fixture_root).expect("fixture root");
+            let fixture = crate::session::fork_tests::workspace_fixture(&fixture_root, true).await;
+            let runtime_cwd = fixture_root
                 .join("previous-workspace")
                 .canonicalize()
                 .expect("runtime workspace");
@@ -12913,7 +12923,9 @@ mod retry_tests {
                 ToolRegistry::new(&[], &runtime_cwd, None),
                 AgentConfig::default(),
             );
-            let inner_session = Arc::new(asupersync::sync::Mutex::new(fixture.source.clone()));
+            let mut live_source = fixture.source.clone();
+            live_source.session_dir = Some(temp.path().join("sessions"));
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(live_source));
             let agent_session = AgentSession::new(
                 agent,
                 Arc::clone(&inner_session),
@@ -16631,6 +16643,9 @@ mod tests {
     }
 
     fn assert_placeholder_stays_opaque(transition: VaultTransition, label: &str) {
+        // Switch and fork compare the session's workspace with the runtime's,
+        // and both come from the process cwd; hold the lock cwd-changing tests take.
+        let _cwd_lock = crate::test_current_dir_lock();
         let (token, placeholder, secret) = token_seen_by_tool_after(Some(transition));
         assert_ne!(
             token, secret,
@@ -20610,6 +20625,9 @@ export default function init(pi) {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
 
+        // The in-memory source is bound to the process cwd and the runtime
+        // reads it again at fork time; tests that change the cwd hold this lock.
+        let _cwd_lock = crate::test_current_dir_lock();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime");
@@ -21635,10 +21653,12 @@ export default function init(pi) {
                     break value;
                 }
             };
+            // Matched against the lowercased terminal error, so the needle
+            // must be lowercase too.
             let expected_error = if cancel_context {
                 "abort"
             } else {
-                "invalid API key from gated provider"
+                "invalid api key from gated provider"
             };
             assert!(
                 terminal_event["error"]
@@ -23278,7 +23298,14 @@ export default function init(pi) {
             let end = &events[end_idx];
             assert_eq!(end["aborted"].as_bool(), Some(false));
             assert_eq!(end["willRetry"].as_bool(), Some(false));
-            assert_eq!(end["errorMessage"], "Missing API key for compaction");
+            // 9977dad13 removed the key-string-only pre-check so keyless and
+            // header-auth providers reach their native auth logic. With no key,
+            // the keyless NoopProvider is now called and its empty reply is the
+            // compaction failure this test drives through the error path.
+            assert_eq!(
+                end["errorMessage"],
+                "API error: Summarization returned empty text; refusing to store empty compaction summary"
+            );
             assert!(
                 end.get("result").is_none(),
                 "failed auto_compaction_end must omit absent result: {end}"
