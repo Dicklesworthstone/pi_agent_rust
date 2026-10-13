@@ -47,6 +47,8 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use uuid::Uuid;
 
+mod connect;
+
 /// Default Cursor Connect endpoint (full RPC path).
 pub const CURSOR_API_URL: &str = "https://api2.cursor.sh/agent.v1.AgentService/Run";
 
@@ -245,6 +247,9 @@ impl FrameBuffer {
             return None;
         }
         let flags = self.buf[0];
+        if flags & !(CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG) != 0 {
+            return Some(Err(connect::protocol("unsupported envelope flags")));
+        }
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
         if len > MAX_CONNECT_FRAME_LEN {
             return Some(Err(Error::api(format!(
@@ -480,6 +485,7 @@ enum BlockKind {
 struct StreamState {
     source: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
     frames: FrameBuffer,
+    encoding: connect::Encoding,
     partial: AssistantMessage,
     pending: VecDeque<StreamEvent>,
     /// The currently-open content block (index + kind), if any.
@@ -501,6 +507,7 @@ impl StreamState {
         Self {
             source,
             frames: FrameBuffer::default(),
+            encoding: connect::Encoding::default(),
             partial,
             pending: VecDeque::new(),
             open_block: None,
@@ -629,31 +636,22 @@ impl StreamState {
                 self.used_tokens = Some(used);
             }
             ServerEvent::TurnEnded => {
-                // Turn completion is confirmed by the Connect end-of-stream
-                // frame (or the body closing); nothing to emit here.
+                // An application-level turn marker cannot stand in for the
+                // Connect terminal frame, which may still carry a failure.
             }
         }
     }
 
     /// Process one Connect frame, buffering the resulting pi events.
     fn process_frame(&mut self, frame: &ConnectFrame) -> Result<()> {
-        if frame.compressed {
-            return Err(Error::api(
-                "Cursor stream sent a compressed Connect frame; compression is not supported",
-            ));
+        if self.done {
+            return Err(connect::protocol("frame received after stream termination"));
         }
+        let payload = self.encoding.decode(&frame.payload, frame.compressed)?;
         if frame.end_stream {
-            // Terminal frame: JSON trailers, optionally carrying an error.
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload)
-                && let Some(error) = value.get("error")
-            {
-                let message = error
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Cursor stream returned an error")
-                    .to_string();
-                self.error_message = Some(message);
-            }
+            // Invalid or absent terminal metadata must never promote partial
+            // output to a successful assistant message.
+            self.error_message = connect::terminal_error(&payload)?;
             self.finalize();
             // The end-of-stream frame is the protocol terminator: stop reading so
             // we neither process data frames that arrive after `Done` nor block on
@@ -663,7 +661,7 @@ impl StreamState {
             self.done = true;
             return Ok(());
         }
-        for event in decode_server_message(&frame.payload) {
+        for event in decode_server_message(&payload) {
             self.apply(event);
         }
         Ok(())
@@ -760,9 +758,13 @@ impl StreamState {
                     return Some(Err(Error::sse(&err)));
                 }
                 None => {
-                    // Body closed: finalize with whatever we accumulated.
-                    self.finalize();
                     self.done = true;
+                    let message = if self.frames.buf.is_empty() {
+                        "PI_CURSOR_STREAM_INCOMPLETE: response ended without a Connect terminal frame"
+                    } else {
+                        "PI_CURSOR_STREAM_INCOMPLETE: response ended inside a Connect frame"
+                    };
+                    return Some(Err(Error::api(message)));
                 }
             }
         }
@@ -886,6 +888,7 @@ impl Provider for CursorProvider {
             .post(&self.base_url)
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", "1")
+            .header("connect-accept-encoding", connect::ACCEPT_ENCODING)
             .header("authorization", format!("Bearer {token}"))
             .header("x-ghost-mode", "true")
             .header("x-cursor-client-type", "cli")
@@ -905,6 +908,7 @@ impl Provider for CursorProvider {
                 format!("Cursor API error (HTTP {status}): {body}"),
             ));
         }
+        let encoding = connect::Encoding::from_headers(response.headers())?;
 
         let partial = AssistantMessage {
             api: CURSOR_API_NAME.to_string(),
@@ -915,7 +919,8 @@ impl Provider for CursorProvider {
             ..AssistantMessage::default()
         };
 
-        let state = StreamState::new(response.bytes_stream(), partial);
+        let mut state = StreamState::new(response.bytes_stream(), partial);
+        state.encoding = encoding;
         let stream = stream::unfold(state, |mut state| async move {
             state.next_event().await.map(|event| (event, state))
         });
@@ -1309,7 +1314,7 @@ mod tests {
     fn stream_state_surfaces_end_stream_error() {
         let events = drive(
             &[interaction_update(1, "partial")],
-            br#"{"error":{"message":"boom"}}"#,
+            br#"{"error":{"code":"unknown","message":"boom"}}"#,
         );
         match events.last() {
             Some(StreamEvent::Error { reason, error }) => {
