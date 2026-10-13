@@ -63,7 +63,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1057,6 +1057,36 @@ impl QueuedAgentMessage {
 pub type MessageFetcher =
     Arc<dyn Fn() -> BoxFuture<'static, Vec<QueuedAgentMessage>> + Send + Sync + 'static>;
 
+/// One additive message source. Permanent RPC/extension sources carry no
+/// lifetime; turn-scoped SDK sources carry a weak lease and are removed before
+/// the next poll once their owning turn retires.
+struct RegisteredMessageFetcher {
+    fetcher: MessageFetcher,
+    lifetime: Option<Weak<()>>,
+}
+
+impl RegisteredMessageFetcher {
+    fn permanent(fetcher: MessageFetcher) -> Self {
+        Self {
+            fetcher,
+            lifetime: None,
+        }
+    }
+
+    fn scoped(fetcher: MessageFetcher, lifetime: &Arc<()>) -> Self {
+        Self {
+            fetcher,
+            lifetime: Some(Arc::downgrade(lifetime)),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.lifetime
+            .as_ref()
+            .is_none_or(|lifetime| lifetime.strong_count() > 0)
+    }
+}
+
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1787,13 +1817,13 @@ pub struct Agent {
     messages: Vec<Message>,
 
     /// Fetchers for queued steering messages (interrupts).
-    steering_fetchers: Vec<MessageFetcher>,
+    steering_fetchers: Vec<RegisteredMessageFetcher>,
 
     /// Owning surface's bounded follow-up source used for resumed handoffs.
     initial_follow_up_fetcher: Option<MessageFetcher>,
 
     /// Fetchers for queued follow-up messages (idle).
-    follow_up_fetchers: Vec<MessageFetcher>,
+    follow_up_fetchers: Vec<RegisteredMessageFetcher>,
 
     /// Whether queue sources may be polled and dispatched automatically.
     /// Hosts can pause either lane and explicitly take already staged batches.
@@ -2288,10 +2318,33 @@ impl Agent {
         follow_up: Option<MessageFetcher>,
     ) {
         if let Some(fetcher) = steering {
-            self.steering_fetchers.push(fetcher);
+            self.steering_fetchers
+                .push(RegisteredMessageFetcher::permanent(fetcher));
         }
         if let Some(fetcher) = follow_up {
-            self.follow_up_fetchers.push(fetcher);
+            self.follow_up_fetchers
+                .push(RegisteredMessageFetcher::permanent(fetcher));
+        }
+    }
+
+    /// Register message sources whose lifetime is owned by one SDK turn.
+    ///
+    /// The Agent keeps the closures only until their lease expires. This keeps
+    /// long-lived sessions from accumulating inert readers while leaving
+    /// permanent RPC/extension sources additive.
+    pub(crate) fn register_scoped_message_fetchers(
+        &mut self,
+        lifetime: &Arc<()>,
+        steering: Option<MessageFetcher>,
+        follow_up: Option<MessageFetcher>,
+    ) {
+        if let Some(fetcher) = steering {
+            self.steering_fetchers
+                .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
+        }
+        if let Some(fetcher) = follow_up {
+            self.follow_up_fetchers
+                .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
         }
     }
 
@@ -4087,8 +4140,10 @@ impl Agent {
         if !self.automatic_steering_dispatch {
             return Vec::new();
         }
-        for fetcher in &self.steering_fetchers {
-            let fetched = self.fetch_messages(Some(fetcher)).await;
+        self.steering_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
+        for registered in &self.steering_fetchers {
+            let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
                 // Fetchers own their admission and queue bounds. Preserve the
                 // complete accepted batch at the synchronous handoff instead
@@ -4133,8 +4188,10 @@ impl Agent {
     }
 
     async fn fetch_additive_follow_up_messages(&mut self) {
-        for fetcher in &self.follow_up_fetchers {
-            let fetched = self.fetch_messages(Some(fetcher)).await;
+        self.follow_up_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
+        for registered in &self.follow_up_fetchers {
+            let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
                 self.message_queue.push_follow_up(message);
             }
