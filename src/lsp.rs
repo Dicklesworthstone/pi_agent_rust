@@ -536,16 +536,17 @@ impl Tool for LspTool {
             " symbols with query searches the workspace selected by an anchor file (file or symbol, not both); file without query lists document symbols. resolve:true fills missing symbol location ranges when supported. Inspect truncated and unresolvedIndices; returned URIs are metadata, never opened or executed.",
             " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately.",
             " definition, references, type_definition, implementation and hover also accept file + exact position instead of symbol/line. Navigation preserves complete target ranges and location-link metadata; inspect total, truncated and responseComplete. Target URIs are never opened. Source changes during the request invalidate the result.",
-            " project_diagnostics uses an existing anchor file to select one server and requests its native whole-workspace diagnostic report, including unopened and virtual documents, without walking or opening them. Requires workspace diagnostic support; errors never fall back to cached success. Only file, timeout and limit are accepted. Totals cover the full server response even when displayed reports are truncated; omitted files are not proven checked."
+            " project_diagnostics uses an existing anchor file to select one server and requests its native whole-workspace diagnostic report, including unopened and virtual documents, without walking or opening them. Requires workspace diagnostic support; errors never fall back to cached success. Only file, timeout and limit are accepted. Totals cover the full server response even when displayed reports are truncated; omitted files are not proven checked.",
+            " selection_ranges asks the server for enclosing selections at file + exact position (or symbol/line), ordered from inner to outer with exact ranges and bounded source previews. Pass a chosen range to code_actions for extraction or other refactors. This is read-only inspection, not an approval handle; no extraction is guaranteed. Inspect total, count, truncated and each textTruncated flag."
         )
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename","project_diagnostics"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename","project_diagnostics","selection_ranges"]},
                 "resolve":{"type":"boolean","description":"inlay_hints: resolve retained hints for tooltips and label locations. symbols with query: resolve retained symbols missing location ranges. Requires server resolve support; omit or false for inline results. Uses the same request budget and never opens returned URIs, applies edits or executes commands."},
-                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for navigation (definition, references, type_definition, implementation, hover), completion, signature_help or rename targeting; requires file. Use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for navigation (definition, references, type_definition, implementation, hover, selection_ranges), completion, signature_help or rename targeting; requires file. Use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
                 "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers. project_diagnostics instead requires an existing anchor file to select one server for its native whole-workspace report."},
@@ -573,7 +574,7 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). format and symbol rename share a budget across startup, requests and staging after acquiring the workflow lane. workspace_diagnostics budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible. project_diagnostics includes server startup and full response processing, capped at 120 seconds."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256). project_diagnostics displays at most this many complete document reports (default 100, capped at 1000); totals include omitted reports."},
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256). project_diagnostics displays at most this many complete document reports (default 100, capped at 1000); totals include omitted reports. selection_ranges returns this many enclosing levels (default 16, capped at 64), validating omitted levels too."},
                 "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })
@@ -622,6 +623,7 @@ impl Tool for LspTool {
                     | "type_definition"
                     | "implementation"
                     | "hover"
+                    | "selection_ranges"
             )
         {
             return Err(tool_err(
@@ -665,6 +667,15 @@ impl Tool for LspTool {
                 self.run_workspace_diagnostics(&input, pattern).await
             }
             "project_diagnostics" => self.run_project_diagnostics(&input).await,
+            "selection_ranges" => {
+                self.run_position_request(
+                    &input,
+                    "selection_ranges",
+                    "textDocument/selectionRange",
+                    json!({}),
+                )
+                .await
+            }
             "definition" => {
                 self.run_position_request(
                     &input,
@@ -719,7 +730,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints|project_diagnostics"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints|project_diagnostics|selection_ranges"
             ))),
         }
     }
