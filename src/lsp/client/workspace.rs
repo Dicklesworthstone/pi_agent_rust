@@ -160,8 +160,13 @@ impl LspClient {
     }
 
     /// Replace, never merge. A queued change is not a server acknowledgement.
-    /// Source incarnations are retired before posting the update, so earlier
-    /// actions cannot be approved under a new analysis configuration.
+    /// Closures and the new settings enter the transport as one transaction.
+    /// Refusal preserves the synchronized documents, diagnostics and revision;
+    /// successful admission retires old incarnations before exposing new settings.
+    // Retain both guards through admission and local publication. A document
+    // sync cannot overtake the configuration, and a reverse configuration
+    // request cannot observe the old snapshot after the update is queued.
+    #[allow(clippy::significant_drop_tightening)]
     pub(in crate::lsp) fn set_workspace_settings(&self, settings: &Settings) -> Result<(bool, u64)> {
         let owner = AgentCx::for_current_or_request();
         crate::lsp::refactor_preview::check_owner(&owner)?;
@@ -174,17 +179,36 @@ impl LspClient {
         }
         let revision = state.revision.checked_add(1)
             .ok_or_else(|| tool_err("LSP_CONFIGURATION_INVALID", "configuration revision exhausted"))?;
-        self.invalidate_all();
+        let mut docs = Self::lock(&self.open_docs);
+        let mut uris: Vec<_> = docs
+            .iter()
+            .filter(|(_, doc)| doc.opened)
+            .map(|(uri, _)| uri.as_str())
+            .collect();
+        uris.sort_unstable();
+        let mut notifications: Vec<_> = uris
+            .into_iter()
+            .map(|uri| ("textDocument/didClose", json!({"textDocument":{"uri":uri}})))
+            .collect();
+        notifications.push((
+            "workspace/didChangeConfiguration",
+            json!({"settings":settings.value()}),
+        ));
+        let mut batch = super::JsonRpcClient::prepare_notifications(notifications);
+        crate::lsp::refactor_preview::check_owner(&owner)?;
+        // The ordinary notify path retires the server when the queue is full.
+        // Batch admission instead refuses the entire unposted transaction,
+        // with no didClose prefix and no mutation of the old local baseline.
+        self.rpc.try_admit_notifications(&mut batch)
+            .map_err(|error| tool_err(error.code(), error.message()))?;
+        // Once accepted, publish even if cancellation arrives now: the peer
+        // may already be consuming the batch. There is no safe local rollback.
+        docs.clear();
+        Self::lock(&self.diagnostics).clear();
         // Pull reports retain their monotonic request counters. Retiring the
         // documents prevents their old result IDs from matching a new wire
         // version, while versionless documents never reuse such IDs at all.
         self.quiescent.store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::lsp::refactor_preview::check_owner(&owner)?;
-        // Admission never blocks on a pipe. Holding the settings lock means
-        // a peer reacting immediately cannot observe old values after the
-        // change notification. Failed admission leaves the old snapshot intact.
-        self.rpc.notify("workspace/didChangeConfiguration", json!({"settings":settings.value()}))
-            .map_err(|error| tool_err(error.code(), error.message()))?;
         state.settings = Arc::clone(&settings.0);
         state.revision = revision;
         Ok((true, revision))

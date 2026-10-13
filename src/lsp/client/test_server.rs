@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::LspClient;
 
 pub(in crate::lsp) const SERVER: &str = r"
-import json, sys
+import json, os, sys, time
 capabilities = json.loads(sys.argv[1])
 hold_initialize = capabilities.pop('_fixtureHoldInitialize', False)
 frames, replies, held = [], {}, []
@@ -42,7 +42,12 @@ while True:
         headers[key.lower()] = value.strip()
     body = sys.stdin.buffer.read(int(headers['content-length']))
     message = json.loads(body)
-    frames.append(message)
+    # Keep pressure traffic observable without echoing megabytes back through
+    # test/frames. All actual protocol payloads remain recorded verbatim.
+    if message.get('method') == 'test/outboundPressure':
+        frames.append({'method':'test/outboundPressure','payloadBytes':len(body)})
+    else:
+        frames.append(message)
     method, params = message.get('method'), message.get('params') or {}
     if method is None:
         route = reverse.pop(message.get('id'), None)
@@ -84,6 +89,14 @@ while True:
     elif method == 'test/hang':
         held.append(message['id'])
         continue
+    elif method == 'test/stallReads':
+        send(dict(response, result=None))
+        deadline = time.monotonic() + 30
+        while not os.path.exists(params['release']):
+            if time.monotonic() >= deadline:
+                sys.exit(3)
+            time.sleep(0.005)
+        continue
     elif method == 'test/success':
         response['result'] = {'ok':True}
     elif replies.get(method):
@@ -100,6 +113,17 @@ while True:
 pub(super) struct Fixture {
     pub(super) client: LspClient,
     pub(super) runtime: Runtime,
+}
+
+/// Release the real peer even when an assertion unwinds while stdin is held.
+pub(super) struct StalledReads {
+    release: std::path::PathBuf,
+}
+
+impl Drop for StalledReads {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -147,6 +171,22 @@ impl Fixture {
             .as_array()
             .expect("frame array")
             .clone()
+    }
+
+    /// The acknowledgement precedes a bounded pause in reading stdin. Queue
+    /// saturation tests therefore do not depend on sleeps or pipe capacity.
+    pub(super) fn stall_reads(&self, root: &Path) -> StalledReads {
+        let guard = StalledReads {
+            release: root.join(format!("release-{}", uuid::Uuid::new_v4())),
+        };
+        self.runtime
+            .block_on(self.client.call(
+                "test/stallReads",
+                json!({"release":guard.release}),
+                Duration::from_secs(5),
+            ))
+            .expect("peer stopped reading stdin");
+        guard
     }
 
     /// Wait for the reader to receive an entire notification batch without
