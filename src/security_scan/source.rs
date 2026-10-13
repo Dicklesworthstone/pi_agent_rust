@@ -1282,6 +1282,16 @@ impl SecurityScanTool {
                     })
         });
         report.fixed = fixed;
+        // Computed outside `json!`: inside the macro a leading `[...]` is parsed
+        // as a JSON array literal, so a method call on it does not compile.
+        let truncated = [
+            report.new.len(),
+            report.fixed.len(),
+            report.regressed.len(),
+            unassessed.len(),
+        ]
+        .into_iter()
+        .any(|count| count > 50);
         let details = json!({
             "new": report.new.iter().take(50).collect::<Vec<_>>(),
             "fixed": report.fixed.iter().take(50).collect::<Vec<_>>(),
@@ -1289,8 +1299,7 @@ impl SecurityScanTool {
             "unassessed": unassessed.iter().take(50).collect::<Vec<_>>(),
             "counts": { "new": report.new.len(), "fixed": report.fixed.len(),
                 "regressed": report.regressed.len(), "unassessed": unassessed.len() },
-            "truncated": [report.new.len(), report.fixed.len(), report.regressed.len(), unassessed.len()]
-                .into_iter().any(|count| count > 50),
+            "truncated": truncated,
         });
         let mut output = scan_text_output(
             format!(
@@ -1535,7 +1544,8 @@ mod tests {
                 "encoding" => fs::write(dir.path().join("src/code.py"), [0xff, 0xfe]).unwrap(),
                 "ignored" => fs::write(dir.path().join("src/.ignore"), "code.py\n").unwrap(),
                 _ => {
-                    fs::rename(dir.path().join("src/code.py"), dir.path().join("saved.py")).unwrap()
+                    fs::rename(dir.path().join("src/code.py"), dir.path().join("saved.py"))
+                        .unwrap();
                 }
             }
             let output = tool
