@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+mod storage;
+
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCAN_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SCOPE_FILES: usize = 20_000;
@@ -646,53 +648,23 @@ fn confine_to_cwd(cwd: &Path, raw: &str, field: &str) -> Result<PathBuf> {
     Ok(cwd.join(candidate))
 }
 
-fn dispositions_path(project_root: &Path) -> PathBuf {
-    project_root.join(".pi").join("security-dispositions.json")
-}
-
 /// Missing store → empty map; unparseable store → error.
 ///
 /// Silently treating a corrupt store as empty would un-suppress every
 /// finding and, on the next `disposition`, overwrite it — destroying all
 /// prior dispositions.
 pub fn load_dispositions(project_root: &Path) -> Result<BTreeMap<String, Disposition>> {
-    let path = dispositions_path(project_root);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => {
-            return Err(Error::tool(
-                "security_scan",
-                format!("read {}: {e}", path.display()),
-            ));
-        }
-    };
-    serde_json::from_str(&text).map_err(|e| {
-        Error::validation(format!(
-            "corrupt disposition store {} ({e}); repair or move it aside before scanning",
-            path.display()
-        ))
-    })
+    storage::Storage::open(project_root)?.load()
 }
 
+/// Atomically replace a complete validated snapshot. For concurrent individual
+/// decisions use the tool's `disposition` operation, which holds a lock across
+/// read/merge/publication. This SDK snapshot API is intentionally replacement.
 pub fn save_dispositions(
     project_root: &Path,
     dispositions: &BTreeMap<String, Disposition>,
 ) -> Result<()> {
-    let path = dispositions_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-        })?;
-    }
-    let text = serde_json::to_string_pretty(dispositions)
-        .map_err(|e| Error::validation(format!("serialize dispositions: {e}")))?;
-    // Temp + rename: a crash mid-write must not leave a truncated store.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text)
-        .map_err(|e| Error::tool("security_scan", format!("write {}: {e}", tmp.display())))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| Error::tool("security_scan", format!("persist {}: {e}", path.display())))
+    storage::Storage::open(project_root)?.save(dispositions)
 }
 
 /// Partition findings into active vs dispositioned (status false-positive or
@@ -1019,7 +991,7 @@ impl Tool for SecurityScanTool {
                     "items": { "type": "string" },
                     "description": "Files/dirs to scope (relative to cwd); default: whole project"
                 },
-                "sarifOut": { "type": "string", "description": "run: SARIF output path (default .pi/security-scan.sarif)" },
+                "sarifOut": { "type": "string", "description": "run: NEW workspace-relative .sarif export, never overwritten; omit to atomically replace .pi/security-scan.sarif" },
                 "fingerprint": { "type": "string", "description": "disposition: finding fingerprint" },
                 "status": {
                     "type": "string",
@@ -1048,20 +1020,30 @@ impl Tool for SecurityScanTool {
         let parsed: ScanInput = serde_json::from_value(input)
             .map_err(|e| Error::validation(format!("security_scan input: {e}")))?;
         let op = parsed.op.trim().to_ascii_lowercase();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        storage::check_owner()?;
         // plan/run/compare walk and read the whole scope synchronously —
         // off the async runtime so a large repo doesn't stall the agent
         // loop mid-scan.
         let tool = Self {
             cwd: self.cwd.clone(),
         };
-        asupersync::runtime::spawn_blocking(move || match op.as_str() {
-            "plan" => tool.op_plan(&parsed),
-            "run" => tool.op_run(&parsed),
-            "disposition" => tool.op_disposition(&parsed),
-            "compare" => tool.op_compare(&parsed),
-            other => Err(Error::validation(format!(
-                "Unknown security_scan op '{other}'; expected plan, run, disposition, or compare"
-            ))),
+        asupersync::runtime::spawn_blocking(move || {
+            // Blocking workers do not inherit the polling caller's ambient
+            // authority. Reinstall the captured restricted owner explicitly.
+            let _current = owner.cx().clone().set_current_restricted();
+            storage::check_owner()?;
+            let result = match op.as_str() {
+                "plan" => tool.op_plan(&parsed),
+                "run" => tool.op_run(&parsed),
+                "disposition" => tool.op_disposition(&parsed),
+                "compare" => tool.op_compare(&parsed),
+                other => Err(Error::validation(format!(
+                    "Unknown security_scan op '{other}'; expected plan, run, disposition, or compare"
+                ))),
+            };
+            storage::check_owner()?;
+            result
         })
         .await
     }
@@ -1104,9 +1086,14 @@ impl SecurityScanTool {
 
     fn op_run(&self, input: &ScanInput) -> Result<ToolOutput> {
         use std::fmt::Write as _;
+        // Pin the publication workspace before scanning or other long work.
+        let storage = storage::Storage::open(&self.cwd)?;
+        let relative = storage::report_path(
+            input.sarif_out.as_deref().unwrap_or(storage::DEFAULT_REPORT),
+        )?;
         let packs = load_rule_packs(&self.cwd)?;
         let outcome = scan_with_packs(&self.cwd, &input.paths, &packs)?;
-        let dispositions = load_dispositions(&self.cwd)?;
+        let dispositions = storage.load()?;
         let (active, suppressed) = partition_by_disposition(outcome.findings, &dispositions);
         let mut sarif = to_sarif(&active, &suppressed, &packs);
         sarif["runs"][0]["invocations"] = json!([{ "executionSuccessful": true }]);
@@ -1115,26 +1102,13 @@ impl SecurityScanTool {
             "skippedNonUtf8Files": outcome.skipped_non_utf8,
             "bytesRead": outcome.bytes_read,
         });
-        let out_path = match input.sarif_out.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "sarifOut")?,
-        };
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-            })?;
-        }
+        let out_path = self.cwd.join(relative);
         let encoded = serde_json::to_vec_pretty(&sarif)
             .map_err(|_| scan_error("source report could not be serialized"))?;
         if encoded.len() as u64 > MAX_SOURCE_BYTES {
             return Err(scan_error("source report exceeds 16 MiB; narrow paths"));
         }
-        fs::write(&out_path, encoded).map_err(|e| {
-            Error::tool(
-                "security_scan",
-                format!("write {}: {e}", out_path.display()),
-            )
-        })?;
+        storage.write_report(input.sarif_out.as_deref(), &encoded)?;
         let by_severity = |sev: &str| active.iter().filter(|f| f.severity == sev).count();
         let details = json!({
             "schema": SCAN_SCHEMA,
@@ -1204,8 +1178,7 @@ impl SecurityScanTool {
             .clone()
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| Error::validation("security_scan disposition requires reason"))?;
-        let mut dispositions = load_dispositions(&self.cwd)?;
-        dispositions.insert(
+        let count = storage::Storage::open(&self.cwd)?.update(
             fingerprint.clone(),
             Disposition {
                 status: status.clone(),
@@ -1214,25 +1187,23 @@ impl SecurityScanTool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             },
-        );
-        save_dispositions(&self.cwd, &dispositions)?;
+        )?;
         Ok(scan_text_output(
             format!("Disposition recorded: {fingerprint} → {status}."),
             json!({
                 "schema": SCAN_SCHEMA,
                 "fingerprint": fingerprint,
                 "status": status,
-                "dispositions": dispositions.len(),
+                "dispositions": count,
             }),
         ))
     }
 
     fn op_compare(&self, input: &ScanInput) -> Result<ToolOutput> {
-        let baseline_path = match input.baseline.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "baseline")?,
-        };
-        let text = String::from_utf8(read_bounded(&baseline_path, MAX_SOURCE_BYTES)?)
+        let storage = storage::Storage::open(&self.cwd)?;
+        let selected = input.baseline.as_deref().unwrap_or(storage::DEFAULT_REPORT);
+        let baseline_path = self.cwd.join(storage::report_path(selected)?);
+        let text = String::from_utf8(storage.read_report(selected)?)
             .map_err(|_| invalid_baseline())?;
         let baseline = source_baseline(&text)?;
         let mut previous = baseline.findings;
@@ -1255,7 +1226,7 @@ impl SecurityScanTool {
         }
         let packs = load_rule_packs(&self.cwd)?;
         let current = scan_with_packs(&self.cwd, &input.paths, &packs)?;
-        let dispositions = load_dispositions(&self.cwd)?;
+        let dispositions = storage.load()?;
         let mut report = compare(&previous, &current.findings, &dispositions);
         let current_rules: BTreeMap<_, _> = compile_rules(&packs)?
             .into_iter()
