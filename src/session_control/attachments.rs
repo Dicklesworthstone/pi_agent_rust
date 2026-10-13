@@ -97,6 +97,99 @@ impl SessionControlHandle {
         self.enqueue_content(InputKind::FollowUp, content, authored_source)
     }
 
+    /// Admit several inputs together, or leave the mailbox completely unchanged.
+    /// Each tuple is `(lane, native_content, authored_source)`. Identities are
+    /// returned in that same order, and the batch appends after existing input.
+    /// This avoids a loop of individual sends accepting an instruction before
+    /// discovering that another required instruction is invalid or cannot fit.
+    ///
+    /// Every item uses the ordinary native-content and source limits; the
+    /// complete batch must fit the shared count/byte budgets. Empty batches are
+    /// rejected. Text, images and media retain their original block order and
+    /// explicit authorship. Neither the caller's payloads nor existing queued
+    /// input are changed on an error.
+    ///
+    /// Only ADMISSION is atomic. The agent still selects steering/follow-up
+    /// inputs at its normal boundaries, and may stop after consuming part of
+    /// the accepted batch. These identities acknowledge neither execution nor
+    /// persistence; reclaim only unclaimed input rather than replaying a batch.
+    pub fn enqueue_batch_with_content(
+        &self,
+        inputs: &[(InputKind, UserContent, String)],
+    ) -> Result<Vec<InputId>> {
+        if inputs.is_empty() || inputs.len() > MAX_PENDING_INPUTS {
+            return Err(control_error(
+                "SESSION_CONTROL_INPUT",
+                "a batch must contain between 1 and 100 inputs",
+            ));
+        }
+        let mut sizes = Vec::with_capacity(inputs.len());
+        let mut bytes = 0_usize;
+        for (_, content, source) in inputs {
+            let size = admitted_bytes(content, source)?;
+            bytes = bytes
+                .checked_add(size)
+                .filter(|total| *total <= MAX_PENDING_BYTES)
+                .ok_or_else(|| {
+                    control_error(
+                        "SESSION_CONTROL_FULL",
+                        "input batch exceeds the pending byte limit; no input was accepted",
+                    )
+                })?;
+            sizes.push(size);
+        }
+        // Stage bounded payload copies and all identities before publication.
+        // In particular, copying attachments must not hold up an abort/fetch.
+        let capacity_error = |_| {
+            control_error(
+                "SESSION_CONTROL_CAPACITY",
+                "cannot allocate the complete input batch; no input was accepted",
+            )
+        };
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(inputs.len())
+            .map_err(capacity_error)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(inputs.len())
+            .map_err(capacity_error)?;
+        for ((kind, content, source), size) in inputs.iter().zip(sizes) {
+            let id = InputId(uuid::Uuid::new_v4());
+            staged.push(PendingInput {
+                id,
+                kind: *kind,
+                text: source.clone(),
+                content: content.clone(),
+                bytes: size,
+            });
+            ids.push(id);
+        }
+        let mut data = lock(&self.run.data);
+        // Recheck only here: an abort, fetch or other producer could have run
+        // during validation/copying. Nothing was visible in the mailbox yet.
+        if !data.accepting_input {
+            return Err(control_error(
+                "SESSION_CONTROL_CLOSED",
+                "this turn no longer accepts input",
+            ));
+        }
+        if inputs.len() > MAX_PENDING_INPUTS.saturating_sub(data.pending.len())
+            || bytes > MAX_PENDING_BYTES.saturating_sub(data.pending_bytes)
+        {
+            return Err(control_error(
+                "SESSION_CONTROL_FULL",
+                "the entire input batch does not fit; no input was accepted",
+            ));
+        }
+        data.pending
+            .try_reserve(inputs.len())
+            .map_err(capacity_error)?;
+        data.pending.extend(staged);
+        data.pending_bytes += bytes;
+        drop(data);
+        Ok(ids)
+    }
+
     /// Correct unclaimed input without retracting it or moving it to the tail.
     /// The replacement stays in the original steering/follow-up lane. Text is
     /// treated as user-authored, exactly as with `steer` and `follow_up`.
@@ -603,5 +696,366 @@ mod tests {
             serde_json::to_value(content).unwrap()
         );
         assert!(source.take_pending().is_empty());
+    }
+
+    fn batch_text(kind: InputKind, text: &str) -> (InputKind, UserContent, String) {
+        (kind, UserContent::Text(text.to_string()), text.to_string())
+    }
+
+    #[test]
+    fn batch_appends_in_admission_order_with_exact_payloads_and_accounting() {
+        let (control, _guard, _) = live();
+        let existing = control.steer("already accepted").unwrap();
+        let existing_bytes = control.snapshot().pending_bytes;
+        let inputs = vec![
+            (
+                InputKind::FollowUp,
+                attachment(),
+                "inspect @diagram.png".to_string(),
+            ),
+            batch_text(InputKind::Steering, "  preserve constraints  "),
+            batch_text(InputKind::FollowUp, "then summarize"),
+        ];
+        let expected_bytes: usize = inputs
+            .iter()
+            .map(|(_, content, source)| serde_json::to_vec(content).unwrap().len() + source.len())
+            .sum();
+        let ids = control.enqueue_batch_with_content(&inputs).unwrap();
+        assert_eq!(ids.len(), inputs.len());
+        assert_eq!(
+            control.snapshot().pending_bytes,
+            existing_bytes + expected_bytes
+        );
+        assert_eq!(control.snapshot().handed_to_agent, 0);
+        let pending = control.take_pending();
+        assert_eq!(pending[0].id, existing);
+        for ((input, id), (kind, content, source)) in
+            pending[1..].iter().zip(ids).zip(&inputs)
+        {
+            assert_eq!(input.id, id);
+            assert_eq!(input.kind, *kind);
+            assert_eq!(&input.text, source);
+            assert_eq!(
+                serde_json::to_value(&input.content).unwrap(),
+                serde_json::to_value(content).unwrap()
+            );
+        }
+        assert_eq!(control.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn admitted_batch_uses_normal_lane_boundaries_and_explicit_authorship() {
+        let (control, _guard, _) = live();
+        let inputs = vec![
+            batch_text(InputKind::FollowUp, "after the turn"),
+            (InputKind::Steering, attachment(), String::new()),
+            batch_text(InputKind::Steering, "second steer"),
+        ];
+        let ids = control.enqueue_batch_with_content(&inputs).unwrap();
+        let first = control.run.fetch(InputKind::Steering);
+        assert_eq!(first.len(), 1, "admission must not pre-drain the batch");
+        assert_eq!(first[0].keyword_scan_source(), Some(""));
+        let Message::User(user) = first[0].message() else {
+            panic!("native user input");
+        };
+        assert_eq!(
+            serde_json::to_value(&user.content).unwrap(),
+            serde_json::to_value(&inputs[1].1).unwrap()
+        );
+        assert!(control.retract(ids[1]).is_none());
+        let second = control.run.fetch(InputKind::Steering);
+        assert_eq!(second[0].text_for_display(), Some("second steer"));
+        assert!(control.run.fetch(InputKind::Steering).is_empty());
+        let last = control.run.fetch(InputKind::FollowUp);
+        assert_eq!(last[0].text_for_display(), Some("after the turn"));
+        assert_eq!(control.snapshot().handed_to_agent, 3);
+        assert_eq!(control.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn invalid_last_item_cannot_leave_an_accepted_batch_prefix() {
+        let (control, _guard, _) = live();
+        let existing = control.steer("keep existing").unwrap();
+        let mut inputs = vec![
+            batch_text(InputKind::Steering, "first batch instruction"),
+            (
+                InputKind::FollowUp,
+                UserContent::Blocks(Vec::new()),
+                "invalid last".to_string(),
+            ),
+        ];
+        let before = control.snapshot();
+        let error = control.enqueue_batch_with_content(&inputs).unwrap_err();
+        assert!(error.to_string().contains("SESSION_CONTROL_INPUT"));
+        assert_eq!(control.snapshot(), before);
+        inputs[1] = batch_text(InputKind::FollowUp, "repaired last instruction");
+        let ids = control.enqueue_batch_with_content(&inputs).unwrap();
+        let pending = control.take_pending();
+        assert_eq!(
+            pending.len(),
+            3,
+            "retry must not duplicate a partially accepted prefix"
+        );
+        assert_eq!(pending[0].id, existing);
+        assert_eq!(pending[1].id, ids[0]);
+        assert_eq!(pending[2].id, ids[1]);
+    }
+
+    #[test]
+    fn late_serialized_or_source_limit_failure_retains_the_entire_old_queue() {
+        let (control, _guard, _) = live();
+        let existing = control.steer("keep existing").unwrap();
+        let before = control.snapshot();
+        for bad in [
+            (
+                InputKind::FollowUp,
+                UserContent::Text("\u{0001}".repeat(MAX_CONTENT_BYTES / 2)),
+                String::new(),
+            ),
+            (
+                InputKind::FollowUp,
+                attachment(),
+                "x".repeat(MAX_INPUT_BYTES + 1),
+            ),
+        ] {
+            let inputs = vec![
+                batch_text(InputKind::Steering, "must not be partially admitted"),
+                bad,
+            ];
+            assert!(control.enqueue_batch_with_content(&inputs).is_err());
+            assert_eq!(control.snapshot(), before);
+        }
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, existing);
+        assert_eq!(pending[0].text, "keep existing");
+    }
+
+    #[test]
+    fn batch_count_limit_is_all_or_nothing_and_admits_the_exact_boundary() {
+        let (control, _guard, _) = live();
+        let removable = control.steer("occupied").unwrap();
+        for _ in 1..MAX_PENDING_INPUTS - 1 {
+            control.follow_up("occupied").unwrap();
+        }
+        let inputs = [
+            batch_text(InputKind::Steering, "batch A"),
+            batch_text(InputKind::FollowUp, "batch B"),
+        ];
+        let before = control.snapshot();
+        assert!(control.enqueue_batch_with_content(&inputs).is_err());
+        assert_eq!(control.snapshot(), before);
+        control.retract(removable).unwrap();
+        let ids = control.enqueue_batch_with_content(&inputs).unwrap();
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), MAX_PENDING_INPUTS);
+        assert_eq!(pending[MAX_PENDING_INPUTS - 2].id, ids[0]);
+        assert_eq!(pending[MAX_PENDING_INPUTS - 1].id, ids[1]);
+    }
+
+    #[test]
+    fn aggregate_batch_bytes_are_bounded_even_when_every_item_fits_alone() {
+        let (control, _guard, _) = live();
+        let inputs = vec![
+            (
+                InputKind::Steering,
+                UserContent::Text("x".repeat(MAX_CONTENT_BYTES - 2)),
+                String::new(),
+            ),
+            (
+                InputKind::FollowUp,
+                UserContent::Text("y".repeat(MAX_CONTENT_BYTES - 2)),
+                String::new(),
+            ),
+            batch_text(InputKind::FollowUp, "one more byte budget consumer"),
+        ];
+        let before = control.snapshot();
+        let error = control.enqueue_batch_with_content(&inputs).unwrap_err();
+        assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
+        assert_eq!(control.snapshot(), before);
+        assert!(control.take_pending().is_empty());
+    }
+
+    #[test]
+    fn batch_capacity_includes_existing_bytes_and_allows_retry_after_retraction() {
+        let (control, _guard, _) = live();
+        let existing = control.steer("existing bytes").unwrap();
+        let inputs = vec![
+            (
+                InputKind::Steering,
+                UserContent::Text("x".repeat(MAX_CONTENT_BYTES - 2)),
+                String::new(),
+            ),
+            (
+                InputKind::FollowUp,
+                UserContent::Text("y".repeat(MAX_CONTENT_BYTES - 2)),
+                String::new(),
+            ),
+        ];
+        let before = control.snapshot();
+        let error = control.enqueue_batch_with_content(&inputs).unwrap_err();
+        assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
+        assert_eq!(control.snapshot(), before);
+        assert_eq!(control.retract(existing).unwrap().text, "existing bytes");
+        let ids = control.enqueue_batch_with_content(&inputs).unwrap();
+        assert_eq!(control.snapshot().pending_bytes, MAX_PENDING_BYTES);
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, ids[0]);
+        assert_eq!(pending[1].id, ids[1]);
+        assert_eq!(control.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn empty_or_over_count_batches_do_not_change_the_mailbox() {
+        let (control, _guard, _) = live();
+        control.steer("original").unwrap();
+        let before = control.snapshot();
+        for inputs in [
+            Vec::new(),
+            vec![batch_text(InputKind::Steering, "x"); MAX_PENDING_INPUTS + 1],
+        ] {
+            let error = control.enqueue_batch_with_content(&inputs).unwrap_err();
+            assert!(error.to_string().contains("SESSION_CONTROL_INPUT"));
+            assert_eq!(control.snapshot(), before);
+        }
+        assert_eq!(control.take_pending()[0].text, "original");
+    }
+
+    #[test]
+    fn closed_turn_refuses_a_whole_batch_without_discarding_accepted_work() {
+        for finished in [false, true] {
+            let (control, guard, _) = live();
+            let existing = control.steer("accepted earlier").unwrap();
+            if finished {
+                drop(guard);
+            } else {
+                assert!(control.abort());
+            }
+            let before = control.snapshot();
+            let error = control
+                .enqueue_batch_with_content(&[
+                    batch_text(InputKind::Steering, "A"),
+                    batch_text(InputKind::FollowUp, "B"),
+                ])
+                .unwrap_err();
+            assert!(error.to_string().contains("SESSION_CONTROL_CLOSED"));
+            assert_eq!(control.snapshot(), before);
+            assert_eq!(control.retract(existing).unwrap().text, "accepted earlier");
+        }
+    }
+
+    #[test]
+    fn competing_batches_cannot_interleave_or_split_the_last_queue_slots() {
+        let (control, _guard, _) = live();
+        for _ in 0..MAX_PENDING_INPUTS - 2 {
+            control.steer("occupied").unwrap();
+        }
+        let start = std::sync::Barrier::new(3);
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                start.wait();
+                control.enqueue_batch_with_content(&[
+                    batch_text(InputKind::Steering, "A0"),
+                    batch_text(InputKind::FollowUp, "A1"),
+                ])
+            });
+            let b = scope.spawn(|| {
+                start.wait();
+                control.enqueue_batch_with_content(&[
+                    batch_text(InputKind::Steering, "B0"),
+                    batch_text(InputKind::FollowUp, "B1"),
+                ])
+            });
+            start.wait();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_ne!(a.is_ok(), b.is_ok(), "exactly one complete batch fits");
+        let expected = if a.is_ok() {
+            ["A0", "A1"]
+        } else {
+            ["B0", "B1"]
+        };
+        let ids = a.or(b).unwrap();
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), MAX_PENDING_INPUTS);
+        for (index, item) in pending[MAX_PENDING_INPUTS - 2..].iter().enumerate() {
+            assert_eq!(item.id, ids[index]);
+            assert_eq!(item.text, expected[index]);
+        }
+    }
+
+    #[test]
+    fn abort_race_seals_the_mailbox_before_or_after_complete_batch_admission() {
+        for _ in 0..16 {
+            let (control, _guard, _) = live();
+            let start = std::sync::Barrier::new(3);
+            let accepted = std::thread::scope(|scope| {
+                let send = scope.spawn(|| {
+                    start.wait();
+                    control.enqueue_batch_with_content(&[
+                        batch_text(InputKind::Steering, "A"),
+                        batch_text(InputKind::FollowUp, "B"),
+                    ])
+                });
+                let abort = scope.spawn(|| {
+                    start.wait();
+                    control.abort()
+                });
+                start.wait();
+                assert!(abort.join().unwrap());
+                send.join().unwrap()
+            });
+            assert!(!control.snapshot().accepting_input);
+            let pending = control.take_pending();
+            match accepted {
+                Ok(ids) => {
+                    assert_eq!(pending.len(), 2);
+                    assert_eq!(pending[0].id, ids[0]);
+                    assert_eq!(pending[1].id, ids[1]);
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("SESSION_CONTROL_CLOSED"));
+                    assert!(pending.is_empty());
+                }
+            }
+            assert_eq!(control.snapshot().handed_to_agent, 0);
+        }
+    }
+
+    #[test]
+    fn reclaim_race_observes_all_or_none_of_a_newly_admitted_batch() {
+        for _ in 0..16 {
+            let (control, _guard, _) = live();
+            let inputs = (0..8)
+                .map(|index| batch_text(InputKind::FollowUp, &format!("input {index}")))
+                .collect::<Vec<_>>();
+            let start = std::sync::Barrier::new(3);
+            let (ids, reclaimed) = std::thread::scope(|scope| {
+                let send = scope.spawn(|| {
+                    start.wait();
+                    control.enqueue_batch_with_content(&inputs).unwrap()
+                });
+                let reclaim = scope.spawn(|| {
+                    start.wait();
+                    control.take_pending()
+                });
+                start.wait();
+                (send.join().unwrap(), reclaim.join().unwrap())
+            });
+            assert!(reclaimed.is_empty() || reclaimed.len() == inputs.len());
+            let remaining = control.take_pending();
+            assert_eq!(reclaimed.len() + remaining.len(), inputs.len());
+            let recovered = if reclaimed.is_empty() {
+                remaining
+            } else {
+                reclaimed
+            };
+            for (index, input) in recovered.iter().enumerate() {
+                assert_eq!(input.id, ids[index]);
+                assert_eq!(input.text, inputs[index].2);
+            }
+            assert_eq!(control.snapshot().pending_bytes, 0);
+        }
     }
 }
