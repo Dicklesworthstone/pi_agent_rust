@@ -27,6 +27,7 @@ use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent
 use serde::{Deserialize, Serialize};
 
 mod archive;
+mod replay;
 pub use archive::{SnapLimits, SnapRenderError, render_frames_with_limits};
 
 /// Schema tag stored with the frames inside `CompactionEntry.details`.
@@ -283,6 +284,8 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 
 /// Merge a snapcompact payload into existing compaction details JSON,
 /// preserving all other keys (readFiles, modifiedFiles, mode, …).
+/// Invalid or over-budget archives remove any stale snapcompact value;
+/// unrelated details and the separately stored text summary are preserved.
 #[must_use]
 pub fn payload_to_details(
     existing: Option<serde_json::Value>,
@@ -293,6 +296,15 @@ pub fn payload_to_details(
         Some(Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    if let Err(error) = replay::validate_payload(payload, SnapLimits::default()) {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = error.reason_code(),
+            "Visual archive was not persisted; retaining the text-only compaction summary"
+        );
+        details.remove(SNAPCOMPACT_DETAILS_KEY);
+        return Value::Object(details);
+    }
     if let Ok(v) = serde_json::to_value(payload) {
         details.insert(SNAPCOMPACT_DETAILS_KEY.to_string(), v);
     }
@@ -300,16 +312,23 @@ pub fn payload_to_details(
 }
 
 /// Extract validated snapcompact frames from compaction entry details.
-/// Returns `None` when absent or when the schema tag does not match exactly
-/// (fail-closed against foreign/malformed payloads).
+/// Returns `None` when absent, invalid, or over the local archive budget.
+/// Known fields are borrowed until the complete archive passes count, byte,
+/// geometry and native PNG integrity checks; unknown JSON fields are not cloned.
 #[must_use]
 pub fn frames_from_details(details: Option<&serde_json::Value>) -> Option<SnapPayload> {
     let value = details?.get(SNAPCOMPACT_DETAILS_KEY)?;
-    let payload: SnapPayload = serde_json::from_value(value.clone()).ok()?;
-    if payload.schema != SNAPCOMPACT_DETAILS_SCHEMA {
-        return None;
+    match replay::parse_payload(value, SnapLimits::default()) {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            tracing::warn!(
+                target: "snapcompact",
+                reason_code = error.reason_code(),
+                "Stored visual archive was rejected; retaining the text-only compaction summary"
+            );
+            None
+        }
     }
-    Some(payload)
 }
 
 /// Attach snapcompact frames to a freshly converted compaction-summary
@@ -317,16 +336,32 @@ pub fn frames_from_details(details: Option<&serde_json::Value>) -> Option<SnapPa
 /// without available frames is returned unchanged.
 ///
 /// Timestamps are preserved from the incoming message so context rebuilds
-/// stay deterministic relative to the source entry.
+/// stay deterministic relative to the source entry. Direct SDK payloads are
+/// validated too. Reattaching the same complete archive is a no-op; identical
+/// frames within an archive are not collapsed, since they may encode repeated
+/// history.
 #[must_use]
 pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Message {
     let Some(payload) = payload else {
         return message;
     };
-    if payload.frames.is_empty() {
+    if payload.frames.is_empty() || !matches!(&message, Message::User(_)) {
+        return message;
+    }
+    if let Err(error) = replay::validate_payload(payload, SnapLimits::default()) {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = error.reason_code(),
+            "Visual archive was not attached; retaining the original summary message"
+        );
         return message;
     }
     if let Message::User(user) = &mut message {
+        if let UserContent::Blocks(existing) = &user.content
+            && has_archive_suffix(existing, &payload.frames)
+        {
+            return message;
+        }
         let mut blocks = match &user.content {
             UserContent::Text(text) => {
                 vec![ContentBlock::Text(TextContent::new(text.clone()))]
@@ -342,6 +377,16 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
         user.content = UserContent::Blocks(blocks);
     }
     message
+}
+
+fn has_archive_suffix(blocks: &[ContentBlock], frames: &[SnapFrame]) -> bool {
+    let Some(start) = blocks.len().checked_sub(frames.len()) else {
+        return false;
+    };
+    blocks[start..].iter().zip(frames).all(|(block, frame)| {
+        matches!(block, ContentBlock::Image(image)
+            if image.mime_type == "image/png" && image.data == frame.png)
+    })
 }
 
 /// Outcome of vision gating over an outbound message list.
