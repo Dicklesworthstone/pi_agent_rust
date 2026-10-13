@@ -2,7 +2,74 @@
 
 `security_scan` retains its existing local source operations: `plan`, `run`,
 `disposition`, and `compare`. The source-rule engine is now in
-`src/security_scan/source.rs`; its implementation and tests are retained intact.
+`src/security_scan/source.rs`. Dependency operations use a separate engine.
+
+## Source scans and source comparisons
+
+```json
+{"op":"plan","paths":["src"]}
+{"op":"run","paths":["src"],"sarifOut":"source-baseline.sarif"}
+{"op":"compare","paths":["./src/"],"baseline":"source-baseline.sarif"}
+```
+
+Source rules match complete UTF-8 files, not independently truncated lines.
+Line-aware `^`/`$` anchors and CRLF handling are enabled by default. Explicit
+newlines, whitespace classes, negated character classes and equivalent inline
+flag spellings retain their regex meaning; `(?s)` is not required just to cross
+a line boundary. Dot still excludes line terminators unless enabled with `s`.
+Use `\A`/`\z` for absolute file anchors or `(?-m:...)` to disable line anchoring.
+Findings use original file line numbers; CRLF counts as one line break. Fingerprints
+remain based on rule ID, normalized path, matched text and occurrence ordinal.
+Whitespace changes inside a match can therefore change its fingerprint.
+
+Planning validates compiled rules and discovers the selected scope; it does not
+read every file's contents. A source scan refuses traversal/ignore-rule errors,
+unreadable files, non-regular inputs and invalid project rule inventories.
+Those failures do not become a successful zero-finding report. Non-UTF-8 files
+are instead explicit exclusions: the summary reports their count and the SARIF
+lists their paths. An excluded binary or undecodable text file was not assessed.
+
+Source limits are 256 selected roots, 20,000 distinct files, 16 MiB per file,
+256 MiB combined input and 10,000 findings. Project rules are capped at 64 packs,
+1 MiB per pack and 1,024 total rules. Empty/duplicate rule IDs are errors, including
+collisions with embedded rules. Source reports are capped at 16 MiB; the tool
+previews at most 50 findings while SARIF retains all admitted findings. Limits
+fail the operation rather than publishing a partial scan as complete. Rule and
+scan failures occur before report writes; filesystem writes themselves retain
+the existing source engine's overwrite and I/O-failure behavior.
+
+`compare` accepts a single native source SARIF run. Malformed rows, duplicate
+native JSON fields, duplicate finding identities, wrong tool namespaces and
+explicit failed invocations are errors, not empty baselines. The SDK function
+`findings_from_sarif` now returns `Result<Vec<Finding>>`; callers must handle
+import errors. Dependency audits belong to `compare_dependencies`, not `compare`.
+
+New reports carry a digest of each rule's matching semantics. A baseline finding
+is classified as `fixed` only when its file was successfully read and scanned
+under that same applicable rule and no longer matches. Non-UTF-8 conversions,
+ignore changes, removed files and changed/removed rules instead yield
+`unassessed`. Older reports without rule digests can retain persistent matches,
+but cannot establish absence: regenerate the baseline before relying on fixes.
+These digests compare rule definitions; they do not authenticate a report.
+
+`src`, `./src/` and `.` are normalized consistently for scope filtering.
+Comparison returns `new`, `fixed`, `regressed` and `unassessed` previews (50 each),
+full `counts` and an explicit `truncated` flag. Unassessed in-scope findings set
+`comparisonComplete: false` and `isError: true` without discarding the other
+results. Narrow `paths` to inspect a truncated comparison. Here, `fixed` means
+no longer matched under the unchanged rule, not proof of a secure program.
+
+These source operations remain pattern-based review, not reachability analysis,
+a race-free workspace snapshot or a filesystem sandbox. They retain the source
+engine's existing path and publication policies, which are distinct from the
+descriptor-confined, create-only dependency artifact operations below. Blocking
+filesystem calls and regex execution do not provide a hard real-time deadline.
+
+Sixteen source regression tests were added for completeness, limits, multiline
+matching, native import and comparison uncertainty, including the public tool
+scan/compare path. They have not run in the implementation environment: DSR is
+unavailable (`dsr: command not found`, exit 127). Compilation, formatting, Clippy
+and Rust tests remain unverified; no release or Bead-completion claim follows.
 
 ## Inspect locked dependencies without a network request
 
@@ -51,7 +118,7 @@ therefore do not become an unbounded model-facing message.
 ## Validation
 
 The implementation adds pure parser/identity/limit tests and real temporary-file
-confinement tests. Existing source scanner tests are retained unchanged. The
+confinement tests. Existing source scanner coverage is retained. The
 required quality entry point is `dsr quality --tool pi_agent_rust`; no direct
 Cargo or GitHub Actions lane substitutes for it. No Rust test or compile pass
 is claimed until that gate has run.
