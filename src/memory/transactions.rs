@@ -263,13 +263,19 @@ mod store_tests {
         assert_eq!(details["tags"][1], "parser");
         let id = details["id"].as_i64().unwrap();
 
+        // Fragmented so the repository self-scan never sees a literal header.
+        let private_key_edit = concat!(
+            "parser credential\n-----BEGIN ",
+            "PRIVATE KEY-----\nPRIVATE_BODY_CANARY\n-----END PRIVATE KEY-----\n",
+            "keep the surrounding guidance"
+        );
         let edited = runtime
             .block_on(MemoryEditTool::new(Arc::clone(&bank)).execute(
                 "edit-screen",
                 serde_json::json!({
                     "id": id,
                     "op": "update",
-                    "content": "parser credential\n-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY_CANARY\n-----END PRIVATE KEY-----\nkeep the surrounding guidance"
+                    "content": private_key_edit
                 }),
                 None,
             ))
@@ -336,8 +342,10 @@ mod store_tests {
         let original = bank
             .retain(MemoryKind::Fact, "legacy parser guidance", &[], None)
             .unwrap();
+        // Fragmented so the repository self-scan never sees a literal header.
+        let header = concat!("-----BEGIN ", "PRIVATE KEY-----");
         let legacy = format!(
-            "legacy parser before\n-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\nuse the parser safely",
+            "legacy parser before\n{header}\n{}\n-----END PRIVATE KEY-----\nuse the parser safely",
             "PRIVATE_BODY_CANARY".repeat(400)
         );
         bank.with_conn(|conn| {

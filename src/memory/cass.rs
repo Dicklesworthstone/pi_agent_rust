@@ -690,8 +690,10 @@ mod tests {
 
         let root = Path::new("/project");
         let canary = "PRIVATE_BODY_CANARY_1234567890";
+        // Fragmented so the repository self-scan never sees a literal header.
+        let header = concat!("-----BEGIN ", "PRIVATE KEY-----");
         let content = format!(
-            "before\n-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\nafter",
+            "before\n{header}\n{}\n-----END PRIVATE KEY-----\nafter",
             canary.repeat(200)
         );
         assert!(content.len() > 4096);

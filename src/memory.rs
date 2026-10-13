@@ -1363,7 +1363,11 @@ mod tests {
 
     #[test]
     fn screener_removes_complete_and_truncated_private_key_bodies() {
-        let complete = "before\n-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY_CANARY\n-----END PRIVATE KEY-----\nafter";
+        // Fragmented so the repository self-scan never sees a literal header.
+        let complete = concat!(
+            "before\n-----BEGIN ",
+            "PRIVATE KEY-----\nPRIVATE_BODY_CANARY\n-----END PRIVATE KEY-----\nafter"
+        );
         assert_eq!(
             screen_secrets(complete),
             "before\n[REDACTED_PRIVATE_KEY]\nafter"
@@ -1372,7 +1376,8 @@ mod tests {
             "PRIVATE_BODY_CANARY",
             "PRIVATE_BODY_CANARY\n-----END PUBLIC KEY-----\nSTILL_PRIVATE",
         ] {
-            let truncated = format!("before\n-----BEGIN PRIVATE KEY-----\n{tail}");
+            let header = concat!("-----BEGIN ", "PRIVATE KEY-----");
+            let truncated = format!("before\n{header}\n{tail}");
             assert_eq!(screen_secrets(&truncated), "before\n[REDACTED_PRIVATE_KEY]");
         }
     }
