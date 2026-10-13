@@ -1222,7 +1222,7 @@ Provider-count rule: Pi has 11 native provider implementation modules. Those mod
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for budget-compliant shipping artifacts
+5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for the size budget; published binaries use the speed-optimized `dist` profile (`opt-level = 3`)
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -2240,6 +2240,12 @@ Default release builds keep heavyweight extras opt-in; use `--features full`
 when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
 extras in one build.
 
+Published binaries (GitHub Releases, the installer, `pi self-update`) are built
+by DSR with `--profile dist`. It inherits every setting above and sets
+`opt-level = 3`, so the binaries people download are optimized for speed and are
+larger than a `release` build. The `binary_size_release` budget keeps measuring
+the `release` profile.
+
 ### Benchmark Evidence vs Shipping Artifacts
 
 Pi separates performance evidence artifacts from distributable release artifacts:
@@ -2247,8 +2253,8 @@ Pi separates performance evidence artifacts from distributable release artifacts
 - **Benchmark evidence artifacts** (PERF-3X and certification inputs) are produced by
   `scripts/perf/orchestrate.sh` and `scripts/bench_extension_workloads.sh`, and must carry
   run provenance (`correlation_id`) plus profile labels (for example `build_profile=perf`).
-- **Shipping artifacts** (end-user binaries) are built with Cargo `release` profile and
-  distributed via GitHub Releases + installer paths.
+- **Shipping artifacts** (end-user binaries) are built with the Cargo `dist` profile
+  (`release` with `opt-level = 3`) and distributed via GitHub Releases + installer paths.
 
 Policy implication: release/size artifacts alone are not valid evidence for global performance
 claims. Performance claims must cite benchmark evidence bundles with reproducible provenance.

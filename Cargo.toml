@@ -563,6 +563,13 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Shipped release binaries: dsr builds `--profile dist`. Same LTO, codegen,
+# panic and strip settings as `release`, optimised for speed instead of size.
+# `release` stays the size-budgeted profile that scripts/perf measures.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+
 [profile.dev]
 opt-level = 0
 debug = true
