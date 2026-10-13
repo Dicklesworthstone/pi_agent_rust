@@ -452,3 +452,176 @@ fn a_fired_timer_is_not_polled_again_after_a_test_clock_rewind() {
     };
     assert!(error.is_elapsed());
 }
+
+// Deliver an early notification through the real driver and production waker.
+// This is a scheduler probe, not a claim that the default seven-day horizon
+// truncates the SDK's at-most-24-hour timeout. The logical deadline stays fixed;
+// only this registration's delivery time is advanced, as for a clamped timer.
+fn fire_early(
+    limited: &mut DeadlineTurn<DrainProbe>,
+    clock: &VirtualClock,
+    at: Time,
+    target: &Waker,
+) {
+    let timer = limited.deadline.timer.clone();
+    let old = limited.timer_handle.take().expect("registered deadline");
+    assert!(timer.cancel(&old));
+    let waker = Waker::from(Arc::new(DeadlineTimerWaker {
+        target: target.clone(),
+        fired: Arc::clone(&limited.timer_fired),
+        deadline: Arc::downgrade(&limited.deadline),
+    }));
+    limited.timer_handle = Some(timer.register(at, waker));
+    clock.advance_to(at);
+    assert!(!limited.deadline.is_elapsed());
+    assert_eq!(timer.process_timers(), 1);
+    assert_eq!(timer.pending_count(), 0, "the old handle was consumed");
+}
+
+#[test]
+fn early_timer_wakes_rearm_for_the_current_poller_until_actual_expiry() {
+    let (clock, deadline) = clock_deadline();
+    let timer = deadline.timer.clone();
+    let native = turn(Err(Error::session("native cleanup retained")));
+    let release = Arc::clone(&native.future.release);
+    let drops = Arc::clone(&native.future.drops);
+    let control = native.control();
+    let queued = control.follow_up("recover after real expiry").unwrap();
+    let mut limited = native.with_deadline(deadline);
+    let old_wakes = Arc::new(WakeCount::default());
+    let old_waker = Waker::from(Arc::clone(&old_wakes));
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        Pin::new(&mut limited)
+            .poll(&mut Context::from_waker(&old_waker))
+            .is_pending()
+    );
+    for seconds in [3, 6] {
+        fire_early(&mut limited, &clock, Time::from_secs(seconds), &old_waker);
+        assert!(!limited.timer_fired.load(Ordering::SeqCst));
+        assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+        assert!(control.snapshot().accepting_input);
+        assert_eq!(control.snapshot().handed_to_agent, 0);
+        assert!(limited.interruption.is_none());
+        assert_eq!(timer.pending_count(), 1, "rearm a consumed handle");
+        assert_eq!(timer.next_deadline(), Some(Time::from_secs(10)));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+    let old_before = old_wakes.0.load(Ordering::SeqCst);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    clock.advance_to(Time::from_secs(10));
+    assert_eq!(timer.process_timers(), 1);
+    assert!(wakes.0.load(Ordering::SeqCst) > 0, "wake the latest task");
+    assert_eq!(old_wakes.0.load(Ordering::SeqCst), old_before);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(!control.snapshot().accepting_input);
+    assert!(!control.snapshot().finished);
+    assert_eq!(control.take_pending()[0].id, queued);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+    let Poll::Ready(Err(error)) = Pin::new(&mut limited).poll(&mut cx) else {
+        panic!("actual expiry must drain the original turn");
+    };
+    assert!(error.is_elapsed());
+    assert!(matches!(error.completion(), Some(Err(Error::Session(_)))));
+    assert!(control.snapshot().finished);
+    assert!(timer.is_empty());
+    drop(limited);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn early_timer_wake_does_not_replace_native_success_or_error() {
+    for completion in [
+        Ok(AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("complete answer"))],
+            ..AssistantMessage::default()
+        }),
+        Err(Error::session("native failure")),
+    ] {
+        let (clock, deadline) = clock_deadline();
+        let timer = deadline.timer.clone();
+        let expected_error = completion.is_err();
+        let native = turn(completion);
+        let release = Arc::clone(&native.future.release);
+        let mut limited = native.with_deadline(deadline);
+        assert!(poll(&mut limited).is_pending());
+        fire_early(&mut limited, &clock, Time::from_secs(3), Waker::noop());
+        release.store(true, Ordering::SeqCst);
+        let Poll::Ready(result) = poll(&mut limited) else {
+            panic!("native result is ready before its deadline");
+        };
+        assert_eq!(result.is_err(), expected_error);
+        match result {
+            Ok(message) => assert!(matches!(
+                &message.content[0],
+                ContentBlock::Text(text) if text.text == "complete answer"
+            )),
+            Err(error) => assert!(matches!(
+                error,
+                TurnDeadlineError::Turn(Error::Session(_))
+            )),
+        }
+        assert!(timer.is_empty());
+    }
+}
+
+#[test]
+fn owner_cancellation_after_an_early_timer_wake_still_drains_as_cancellation() {
+    let (clock, deadline) = clock_deadline();
+    let owner = deadline.owner.clone();
+    let timer = deadline.timer.clone();
+    let native = turn(Err(Error::session("cancel cleanup retained")));
+    let release = Arc::clone(&native.future.release);
+    let control = native.control();
+    let mut limited = native.with_deadline(deadline);
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    fire_early(&mut limited, &clock, Time::from_secs(3), &waker);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(control.snapshot().accepting_input);
+    let before = wakes.0.load(Ordering::SeqCst);
+    owner.cancel_with(asupersync::types::CancelKind::User, Some("after early wake"));
+    assert!(wakes.0.load(Ordering::SeqCst) > before);
+    assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
+    assert!(!control.snapshot().accepting_input);
+    assert!(!control.snapshot().finished);
+    assert!(timer.is_empty());
+    release.store(true, Ordering::SeqCst);
+    let Poll::Ready(Err(error @ TurnDeadlineError::OwnerCancelled { .. })) =
+        Pin::new(&mut limited).poll(&mut cx)
+    else {
+        panic!("an early wake must not relabel owner cancellation as expiry");
+    };
+    assert!(matches!(error.completion(), Some(Err(Error::Session(_)))));
+    assert!(control.snapshot().finished);
+}
+
+#[test]
+fn retained_timer_callback_does_not_retain_a_retired_deadline_or_wake_its_task() {
+    let (clock, deadline) = clock_deadline();
+    let timer = deadline.timer.clone();
+    let mut limited = turn(Ok(AssistantMessage::default())).with_deadline(deadline);
+    assert!(poll(&mut limited).is_pending());
+    let weak_deadline = Arc::downgrade(&limited.deadline);
+    let wakes = Arc::new(WakeCount::default());
+    let fired = Arc::clone(&limited.timer_fired);
+    // A driver can collect a callback before cancellation removes the handle,
+    // then deliver it later. It must not strongly own the turn's timer driver.
+    let delayed = Waker::from(Arc::new(DeadlineTimerWaker {
+        target: Waker::from(Arc::clone(&wakes)),
+        fired: Arc::clone(&fired),
+        deadline: weak_deadline.clone(),
+    }));
+    drop(limited);
+    assert!(weak_deadline.upgrade().is_none());
+    assert!(timer.is_empty());
+    clock.advance_to(Time::from_secs(10));
+    delayed.wake();
+    assert!(!fired.load(Ordering::SeqCst));
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+}

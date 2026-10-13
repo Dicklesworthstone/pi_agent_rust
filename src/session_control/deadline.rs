@@ -8,7 +8,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -223,16 +223,28 @@ enum Interruption {
 struct DeadlineTimerWaker {
     target: Waker,
     fired: Arc<AtomicBool>,
+    // A strong deadline reference would make a cycle through its timer driver
+    // and this registered waker. A retired turn must release its owner/clock.
+    deadline: Weak<TurnDeadline>,
 }
 
 impl Wake for DeadlineTimerWaker {
     fn wake(self: Arc<Self>) {
-        self.fired.store(true, Ordering::SeqCst);
-        self.target.wake_by_ref();
+        self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.fired.store(true, Ordering::SeqCst);
+        let Some(deadline) = self.deadline.upgrade() else {
+            return;
+        };
+        // Timer horizons/coalescing may wake before the logical deadline.
+        // Latch only verified expiry, retaining it across a later test-clock
+        // rewind. An early wake merely asks the current poller to rearm.
+        let elapsed = deadline.is_elapsed();
+        drop(deadline);
+        if elapsed {
+            self.fired.store(true, Ordering::SeqCst);
+        }
         self.target.wake_by_ref();
     }
 }
@@ -248,7 +260,7 @@ impl Wake for DeadlineTimerWaker {
 pub struct DeadlineTurn<F> {
     turn: Option<Pin<Box<ControlledTurn<F>>>>,
     control: SessionControlHandle,
-    deadline: TurnDeadline,
+    deadline: Arc<TurnDeadline>,
     timer_handle: Option<TimerHandle>,
     timer_fired: Arc<AtomicBool>,
     /// The deadline may belong to a different owner than the native turn.
@@ -271,7 +283,7 @@ impl<F> ControlledTurn<F> {
         DeadlineTurn {
             turn: Some(Box::pin(self)),
             control,
-            deadline,
+            deadline: Arc::new(deadline),
             timer_handle: None,
             timer_fired: Arc::new(AtomicBool::new(false)),
             cancellation,
@@ -335,12 +347,15 @@ impl<F> DeadlineTurn<F> {
         let waker = Waker::from(Arc::new(DeadlineTimerWaker {
             target: cx.waker().clone(),
             fired: Arc::clone(&self.timer_fired),
+            deadline: Arc::downgrade(&self.deadline),
         }));
         if let Some(handle) = self.timer_handle.take() {
-            self.timer_handle = Some(self.deadline.timer.update(&handle, self.deadline.at, waker));
-        } else {
-            self.timer_handle = Some(self.deadline.timer.register(self.deadline.at, waker));
+            // update() does not re-register a handle already consumed by a
+            // timer wake. Cancel if still live, then register unconditionally:
+            // an early wake must not leave a silent turn without a deadline.
+            let _ = self.deadline.timer.cancel(&handle);
         }
+        self.timer_handle = Some(self.deadline.timer.register(self.deadline.at, waker));
         // Time/cancellation may have changed while registering the timer.
         if self.deadline.is_elapsed() || self.timer_fired.load(Ordering::SeqCst) {
             self.interrupt(Interruption::Elapsed);
