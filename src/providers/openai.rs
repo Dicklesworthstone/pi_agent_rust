@@ -1120,7 +1120,8 @@ where
         }
 
         // Process choices
-        if let Some(choice) = chunk.choices.into_iter().next() {
+        if let Some(mut choice) = chunk.choices.into_iter().next() {
+            choice.delta.normalize_reasoning();
             if !self.started
                 && choice.finish_reason.is_none()
                 && choice.delta.content.is_none()
@@ -1708,8 +1709,40 @@ struct OpenAIDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Gateways disagree on the name of the streamed reasoning field:
+    /// `reasoning_content` (DeepSeek), `reasoning` (OpenRouter) and
+    /// `reasoning_text`. The two alternatives are read as raw JSON so that a
+    /// gateway sending a non-string there cannot fail the whole chunk.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_text: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+impl OpenAIDelta {
+    /// Fold a non-empty `reasoning` or `reasoning_text` string into
+    /// `reasoning_content` when that field carries no text itself.
+    fn normalize_reasoning(&mut self) {
+        if self
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            return;
+        }
+        let alternative = [self.reasoning.take(), self.reasoning_text.take()]
+            .into_iter()
+            .flatten()
+            .find_map(|value| match value {
+                serde_json::Value::String(text) if !text.is_empty() => Some(text),
+                _ => None,
+            });
+        if alternative.is_some() {
+            self.reasoning_content = alternative;
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4403,6 +4436,51 @@ mod tests {
             "expected ThinkingEnd after finish_reason"
         );
         assert_eq!(collect_thinking_text(&out), "plan");
+    }
+
+    #[test]
+    fn reasoning_field_aliases_emit_thinking_and_non_strings_are_ignored() {
+        for (delta, expected) in [
+            (json!({"reasoning": "plan"}), "plan"),
+            (json!({"reasoning_text": "plan"}), "plan"),
+            // `reasoning_content` wins when a gateway sends more than one.
+            (
+                json!({"reasoning_content": "kept", "reasoning": "dropped"}),
+                "kept",
+            ),
+            // An empty `reasoning_content` does not hide the alternative.
+            (
+                json!({"reasoning_content": "", "reasoning": "plan"}),
+                "plan",
+            ),
+        ] {
+            let events = vec![
+                json!({"choices": [{"delta": delta, "finish_reason": null}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                Value::String("[DONE]".to_string()),
+            ];
+            let out = collect_events(&events);
+            assert_eq!(collect_thinking_text(&out), expected, "{events:?}");
+        }
+
+        // A non-string `reasoning` (some gateways echo an object) is not
+        // thinking text and must not fail the chunk that carries the answer.
+        let events = vec![
+            json!({"choices": [{
+                "delta": {"content": "answer", "reasoning": {"effort": "high"}},
+                "finish_reason": null
+            }]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            Value::String("[DONE]".to_string()),
+        ];
+        let out = collect_events(&events);
+        assert_eq!(collect_thinking_text(&out), "");
+        assert!(
+            out.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta { delta, .. } if delta == "answer")
+            ),
+            "the answer text still streams: {out:?}"
+        );
     }
 
     #[test]
