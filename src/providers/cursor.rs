@@ -48,6 +48,7 @@ use std::pin::Pin;
 use uuid::Uuid;
 
 mod connect;
+mod stream_limits;
 #[cfg(test)]
 mod wire_tests;
 
@@ -590,6 +591,7 @@ struct StreamState {
     source: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
     frames: FrameBuffer,
     encoding: connect::Encoding,
+    budget: stream_limits::Budget,
     partial: AssistantMessage,
     pending: VecDeque<StreamEvent>,
     /// The currently-open content block (index + kind), if any.
@@ -612,6 +614,7 @@ impl StreamState {
             source,
             frames: FrameBuffer::default(),
             encoding: connect::Encoding::default(),
+            budget: stream_limits::Budget::default(),
             partial,
             pending: VecDeque::new(),
             open_block: None,
@@ -632,6 +635,15 @@ impl StreamState {
                 partial: self.partial.clone(),
             });
         }
+    }
+
+    /// Release the response body and wire buffer immediately on termination,
+    /// even if the consumer retains the stream after seeing its final event.
+    /// Already accepted preview/terminal events remain available to drain.
+    fn stop_reading(&mut self) {
+        self.done = true;
+        self.source = Box::pin(stream::empty());
+        self.frames = FrameBuffer::default();
     }
 
     /// Close the currently-open content block, emitting its `*End` event.
@@ -751,7 +763,19 @@ impl StreamState {
         if self.done {
             return Err(connect::protocol("frame received after stream termination"));
         }
+        let result = self.process_frame_inner(frame);
+        if result.is_err() {
+            // A direct decoder caller must not be able to recover from a
+            // rejected frame by appending a successful terminal afterward.
+            self.stop_reading();
+        }
+        result
+    }
+
+    fn process_frame_inner(&mut self, frame: &ConnectFrame) -> Result<()> {
+        self.budget.frame()?;
         let payload = self.encoding.decode(&frame.payload, frame.compressed)?;
+        self.budget.decoded(payload.len())?;
         if frame.end_stream {
             // Invalid or absent terminal metadata must never promote partial
             // output to a successful assistant message.
@@ -762,10 +786,13 @@ impl StreamState {
             // `source.next()` if the server holds the HTTP body open. `finalize`
             // has already enqueued the terminal `Done`/`Error` into `pending`,
             // which `next_event` drains before it observes `done`.
-            self.done = true;
+            self.stop_reading();
             return Ok(());
         }
-        for event in decode_server_message(&payload)? {
+        let events = decode_server_message(&payload)?;
+        self.budget
+            .admit(&events, self.open_block.map(|(_, kind)| kind))?;
+        for event in events {
             self.apply(event);
         }
         Ok(())
@@ -815,6 +842,10 @@ impl StreamState {
     /// body as needed. Returns `None` once the stream is fully drained.
     async fn next_event(&mut self) -> Option<Result<StreamEvent>> {
         loop {
+            if self.done && self.pending.is_empty() {
+                return None;
+            }
+            self.budget.cooperate().await;
             if let Some(event) = self.pending.pop_front() {
                 return Some(Ok(event));
             }
@@ -825,7 +856,6 @@ impl StreamState {
             match self.frames.next_frame() {
                 Some(Ok(frame)) => {
                     if let Err(err) = self.process_frame(&frame) {
-                        self.done = true;
                         return Some(Err(err));
                     }
                     continue;
@@ -833,7 +863,7 @@ impl StreamState {
                 Some(Err(err)) => {
                     // Malformed framing (e.g. an over-cap length prefix): the
                     // stream can't be resynced, so surface it and stop reading.
-                    self.done = true;
+                    self.stop_reading();
                     return Some(Err(err));
                 }
                 None => {}
@@ -841,6 +871,10 @@ impl StreamState {
 
             match self.source.next().await {
                 Some(Ok(chunk)) => {
+                    if let Err(err) = self.budget.receive(chunk.len()) {
+                        self.stop_reading();
+                        return Some(Err(err));
+                    }
                     self.transient_error_count = 0;
                     self.frames.push(&chunk);
                 }
@@ -858,16 +892,16 @@ impl StreamState {
                             continue;
                         }
                     }
-                    self.done = true;
+                    self.stop_reading();
                     return Some(Err(Error::sse(&err)));
                 }
                 None => {
-                    self.done = true;
                     let message = if self.frames.buf.is_empty() {
                         "PI_CURSOR_STREAM_INCOMPLETE: response ended without a Connect terminal frame"
                     } else {
                         "PI_CURSOR_STREAM_INCOMPLETE: response ended inside a Connect frame"
                     };
+                    self.stop_reading();
                     return Some(Err(Error::api(message)));
                 }
             }
