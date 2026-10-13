@@ -1999,14 +1999,18 @@ extract_release_artifact() {
       warn "tar is not available to extract $candidate"
       return 1
     fi
-    if ! command -v xz >/dev/null 2>&1; then
-      warn "xz is not available to extract $candidate"
-      return 1
-    fi
     local extract_dir="$TMP/extract-${candidate//\//_}"
     mkdir -p "$extract_dir"
+    # Let tar decide whether it can read xz. bsdtar (macOS, FreeBSD)
+    # decompresses xz itself, and a stock macOS has no `xz` program, so
+    # requiring one made every default install fail there. GNU tar runs the
+    # `xz` program; when that is missing, say so.
     if ! tar -xJf "$artifact_file" -C "$extract_dir"; then
-      warn "Failed to extract archive: $candidate"
+      if command -v xz >/dev/null 2>&1; then
+        warn "Failed to extract archive: $candidate"
+      else
+        warn "xz is not available to extract $candidate"
+      fi
       return 1
     fi
     local found_bin=""

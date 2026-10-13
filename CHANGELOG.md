@@ -14,6 +14,17 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installer on a stock Mac.** `install.sh` required an `xz` program before
+  extracting a release archive. macOS has none unless Homebrew or MacPorts
+  installed one, and its `tar` reads xz without it, so the documented install
+  command stopped with "xz is not available to extract
+  pi-darwin-arm64.tar.xz" after the checksum had verified. The installer now
+  lets `tar` decide and reports a missing `xz` only when extraction fails
+  ([#263](https://github.com/Dicklesworthstone/pi_agent_rust/issues/263)).
+  The fix is in the installer on `main`, so it applies to every release.
+
 ## [v0.8.0] — 2026-10-13 — Release
 
 A feature release on top of v0.7.1. Prompts can carry native audio and video;
