@@ -265,6 +265,9 @@ impl SessionControlHandle {
 struct TurnGuard {
     active: ActiveRun,
     run: Arc<Run>,
+    /// Keeps this turn's Agent-side message readers registered. Dropping the
+    /// guard retires the lease; the Agent prunes the readers before polling.
+    fetcher_lifetime: Arc<()>,
 }
 
 impl Drop for TurnGuard {
@@ -332,15 +335,10 @@ impl AgentSessionHandle {
     /// Add live, bounded, turn-scoped control without changing providers,
     /// listeners, retry/failover policy, tools, or session persistence.
     #[must_use]
-    pub fn into_controllable(mut self) -> ControllableSession {
-        let active = Arc::new(Mutex::new(Weak::new()));
-        self.session_mut().agent.register_message_fetchers(
-            Some(fetcher(&active, InputKind::Steering)),
-            Some(fetcher(&active, InputKind::FollowUp)),
-        );
+    pub fn into_controllable(self) -> ControllableSession {
         ControllableSession {
             session: self,
-            active,
+            active: Arc::new(Mutex::new(Weak::new())),
         }
     }
 }
@@ -400,13 +398,19 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
         let active: ActiveRun = Arc::new(Mutex::new(Weak::new()));
-        self.session_mut().agent.register_message_fetchers(
+        let (run, signal) = Run::new();
+        *lock(&active) = Arc::downgrade(&run);
+        let fetcher_lifetime = Arc::new(());
+        self.session_mut().agent.register_scoped_message_fetchers(
+            &fetcher_lifetime,
             Some(fetcher(&active, InputKind::Steering)),
             Some(fetcher(&active, InputKind::FollowUp)),
         );
-        let (run, signal) = Run::new();
-        *lock(&active) = Arc::downgrade(&run);
-        let guard = TurnGuard { active, run };
+        let guard = TurnGuard {
+            active,
+            run,
+            fetcher_lifetime,
+        };
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
         };
@@ -435,7 +439,7 @@ impl ControllableSession {
         &mut self.session
     }
 
-    fn begin(&self) -> Result<(TurnGuard, AbortSignal)> {
+    fn begin(&mut self) -> Result<(TurnGuard, AbortSignal)> {
         let mut active = lock(&self.active);
         if active.upgrade().is_some() {
             return Err(control_error(
@@ -446,10 +450,17 @@ impl ControllableSession {
         let (run, signal) = Run::new();
         *active = Arc::downgrade(&run);
         drop(active);
+        let fetcher_lifetime = Arc::new(());
+        self.session.session_mut().agent.register_scoped_message_fetchers(
+            &fetcher_lifetime,
+            Some(fetcher(&self.active, InputKind::Steering)),
+            Some(fetcher(&self.active, InputKind::FollowUp)),
+        );
         Ok((
             TurnGuard {
                 active: Arc::clone(&self.active),
                 run,
+                fetcher_lifetime,
             },
             signal,
         ))
@@ -530,7 +541,11 @@ mod tests {
             SessionControlHandle {
                 run: Arc::clone(&run),
             },
-            TurnGuard { active, run },
+            TurnGuard {
+                active,
+                run,
+                fetcher_lifetime: Arc::new(()),
+            },
             signal,
         )
     }
