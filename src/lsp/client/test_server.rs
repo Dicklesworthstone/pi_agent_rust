@@ -120,6 +120,22 @@ pub(super) struct StalledReads {
     release: std::path::PathBuf,
 }
 
+impl StalledReads {
+    pub(super) fn start(client: &LspClient, runtime: &Runtime, root: &Path) -> Self {
+        let guard = Self {
+            release: root.join(format!("release-{}", uuid::Uuid::new_v4())),
+        };
+        runtime
+            .block_on(client.call(
+                "test/stallReads",
+                json!({"release":guard.release}),
+                Duration::from_secs(5),
+            ))
+            .expect("peer stopped reading stdin");
+        guard
+    }
+}
+
 impl Drop for StalledReads {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.release, b"release");
@@ -176,17 +192,7 @@ impl Fixture {
     /// The acknowledgement precedes a bounded pause in reading stdin. Queue
     /// saturation tests therefore do not depend on sleeps or pipe capacity.
     pub(super) fn stall_reads(&self, root: &Path) -> StalledReads {
-        let guard = StalledReads {
-            release: root.join(format!("release-{}", uuid::Uuid::new_v4())),
-        };
-        self.runtime
-            .block_on(self.client.call(
-                "test/stallReads",
-                json!({"release":guard.release}),
-                Duration::from_secs(5),
-            ))
-            .expect("peer stopped reading stdin");
-        guard
+        StalledReads::start(&self.client, &self.runtime, root)
     }
 
     /// Wait for the reader to receive an entire notification batch without

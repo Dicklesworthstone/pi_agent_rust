@@ -7,13 +7,15 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::{LspClient, uri_to_path};
+use super::request::RequestBudget;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
-use crate::lsp::jsonrpc::RpcErrorObject;
+use crate::lsp::jsonrpc::{RpcErrorObject, TransportError};
 use crate::lsp::tool_err;
 
 const MAX_SETTINGS_BYTES: usize = 64 * 1024;
@@ -159,6 +161,38 @@ impl LspClient {
         (Arc::clone(&state.settings), state.revision)
     }
 
+    /// Wait for atomic admission within one owner/deadline budget. Only a
+    /// wholly unaccepted transaction is retried; successful queue admission
+    /// is reported even when cancellation arrives immediately afterwards.
+    pub(in crate::lsp) async fn set_workspace_settings_with_timeout(
+        &self,
+        settings: &Settings,
+        timeout: Duration,
+    ) -> Result<(bool, u64)> {
+        let owner = AgentCx::for_current_or_request();
+        let budget = RequestBudget::new(timeout);
+        crate::lsp::refactor_preview::check_owner(&owner)?;
+        let _lane = budget.acquire(&self.request_lane).await?;
+        loop {
+            if let Some(outcome) = self.try_set_workspace_settings(settings, &owner, &budget)? {
+                return Ok(outcome);
+            }
+            // No workspace/document mutex or queue reservation survives this
+            // wait. Rebuild against the current revision and documents after
+            // waking; immediate synchronization callers may have changed them.
+            budget.pause(super::WAIT_TICK).await?;
+        }
+    }
+
+    /// Single-attempt counterpart used to verify refusal without waiting.
+    #[cfg(test)]
+    pub(in crate::lsp) fn set_workspace_settings(&self, settings: &Settings) -> Result<(bool, u64)> {
+        let owner = AgentCx::for_current_or_request();
+        let budget = RequestBudget::new(super::DEFAULT_REQUEST_TIMEOUT);
+        self.try_set_workspace_settings(settings, &owner, &budget)?
+            .ok_or_else(|| tool_err("LSP_BACKPRESSURE", "workspace configuration queue is full"))
+    }
+
     /// Replace, never merge. A queued change is not a server acknowledgement.
     /// Closures and the new settings enter the transport as one transaction.
     /// Refusal preserves the synchronized documents, diagnostics and revision;
@@ -167,15 +201,21 @@ impl LspClient {
     // sync cannot overtake the configuration, and a reverse configuration
     // request cannot observe the old snapshot after the update is queued.
     #[allow(clippy::significant_drop_tightening)]
-    pub(in crate::lsp) fn set_workspace_settings(&self, settings: &Settings) -> Result<(bool, u64)> {
-        let owner = AgentCx::for_current_or_request();
-        crate::lsp::refactor_preview::check_owner(&owner)?;
+    fn try_set_workspace_settings(
+        &self,
+        settings: &Settings,
+        owner: &AgentCx,
+        budget: &RequestBudget,
+    ) -> Result<Option<(bool, u64)>> {
+        crate::lsp::refactor_preview::check_owner(owner)?;
+        budget.remaining()?;
         if !self.is_alive() {
             return Err(tool_err("LSP_TRANSPORT_CLOSED", "configuration connection closed"));
         }
         let mut state = Self::lock(&self.workspace.state);
+        budget.remaining()?;
         if state.revision != 0 && *state.settings == *settings.0 {
-            return Ok((false, state.revision));
+            return Ok(Some((false, state.revision)));
         }
         let revision = state.revision.checked_add(1)
             .ok_or_else(|| tool_err("LSP_CONFIGURATION_INVALID", "configuration revision exhausted"))?;
@@ -195,12 +235,16 @@ impl LspClient {
             json!({"settings":settings.value()}),
         ));
         let mut batch = super::JsonRpcClient::prepare_notifications(notifications);
-        crate::lsp::refactor_preview::check_owner(&owner)?;
+        crate::lsp::refactor_preview::check_owner(owner)?;
+        budget.remaining()?;
         // The ordinary notify path retires the server when the queue is full.
         // Batch admission instead refuses the entire unposted transaction,
         // with no didClose prefix and no mutation of the old local baseline.
-        self.rpc.try_admit_notifications(&mut batch)
-            .map_err(|error| tool_err(error.code(), error.message()))?;
+        match self.rpc.try_admit_notifications(&mut batch) {
+            Ok(()) => {}
+            Err(TransportError::Backpressure(_)) => return Ok(None),
+            Err(error) => return Err(tool_err(error.code(), error.message())),
+        }
         // Once accepted, publish even if cancellation arrives now: the peer
         // may already be consuming the batch. There is no safe local rollback.
         docs.clear();
@@ -211,7 +255,7 @@ impl LspClient {
         self.quiescent.store(false, std::sync::atomic::Ordering::SeqCst);
         state.settings = Arc::clone(&settings.0);
         state.revision = revision;
-        Ok((true, revision))
+        Ok(Some((true, revision)))
     }
 }
 

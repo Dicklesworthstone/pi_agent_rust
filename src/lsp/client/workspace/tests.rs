@@ -148,7 +148,7 @@ fn parsed_settings_are_immutable_copies_not_caller_owned_references() {
 
 mod protocol;
 
-fn saturate_writer(peer: &Fixture) {
+fn saturate_writer(client: &LspClient) {
     // The peer must already have acknowledged stall_reads. Smaller filler
     // frames leave less room than the 64-KiB configuration we will attempt.
     let payload = "x".repeat(32 * 1024);
@@ -157,7 +157,7 @@ fn saturate_writer(peer: &Fixture) {
             "test/outboundPressure",
             json!({"payload":payload}),
         )]);
-        match peer.client.rpc.try_admit_notifications(&mut batch) {
+        match client.rpc.try_admit_notifications(&mut batch) {
             Ok(()) => {}
             Err(TransportError::Backpressure(_)) => return,
             Err(error) => panic!("unexpected pressure admission error: {error:?}"),
@@ -188,7 +188,7 @@ fn configuration_backpressure_preserves_state_and_retry_closes_before_updating()
     peer.client.quiescent.store(true, Ordering::SeqCst);
     let after = Settings::parse(&json!({"x":"x".repeat(MAX_SETTINGS_BYTES - 8)})).unwrap();
     let stalled = peer.stall_reads(temp.path());
-    saturate_writer(&peer);
+    saturate_writer(&peer.client);
 
     // Even under pressure an unchanged snapshot consumes no queue capacity.
     assert_eq!(peer.client.set_workspace_settings(&before).unwrap(), (false, 1));
@@ -290,4 +290,211 @@ fn concurrent_configurations_publish_in_the_same_order_as_the_wire() {
     assert_eq!(revision, 2);
     assert_eq!(&updates[1]["params"]["settings"], settings.as_ref());
     assert_eq!(frames.iter().filter(|frame| frame["method"] == "textDocument/didClose").count(), 1);
+}
+
+fn pending_settings() -> Settings {
+    Settings::parse(&json!({"x":"x".repeat(MAX_SETTINGS_BYTES - 8)})).unwrap()
+}
+
+fn synced_source(peer: &Fixture, root: &std::path::Path) -> String {
+    let path = root.join("source.rs");
+    std::fs::write(&path, "fn source() {}\n").unwrap();
+    peer.client.ensure_synced(&path, "rust").unwrap()
+}
+
+fn assert_unconfigured(peer: &Fixture, uri: &str, version: u64) {
+    assert!(peer.client.is_alive());
+    assert_eq!(peer.client.workspace_settings().1, 0);
+    assert_eq!(peer.client.document_snapshots()[uri].version, version);
+    let frames = peer.frames();
+    assert!(!frames.iter().any(|frame| matches!(frame["method"].as_str(),
+        Some("workspace/didChangeConfiguration" | "textDocument/didClose"))));
+}
+
+#[test]
+fn asynchronous_configuration_waits_for_capacity_and_commits_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
+        return;
+    };
+    let uri = synced_source(&peer, temp.path());
+    let version = peer.client.document_snapshots()[&uri].version;
+    let settings = pending_settings();
+    let stalled = peer.stall_reads(temp.path());
+    saturate_writer(&peer.client);
+    peer.runtime.block_on(async {
+        let mut update = Box::pin(peer.client.set_workspace_settings_with_timeout(
+            &settings, Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(update.as_mut()).is_pending());
+        assert_eq!(peer.client.workspace_settings().1, 0);
+        assert_eq!(peer.client.document_snapshots()[&uri].version, version);
+        drop(stalled);
+        assert_eq!(update.await.unwrap(), (true, 1));
+    });
+    assert_eq!(peer.client.open_document_count(), 0);
+    let frames = peer.frames();
+    assert_eq!(frames.iter().filter(|frame| frame["method"] == "workspace/didChangeConfiguration").count(), 1);
+    assert_eq!(frames.iter().filter(|frame| frame["method"] == "textDocument/didClose").count(), 1);
+}
+
+#[test]
+fn asynchronous_configuration_timeout_preserves_the_previous_baseline() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
+        return;
+    };
+    let uri = synced_source(&peer, temp.path());
+    let version = peer.client.document_snapshots()[&uri].version;
+    let settings = pending_settings();
+    let stalled = peer.stall_reads(temp.path());
+    saturate_writer(&peer.client);
+    let started = std::time::Instant::now();
+    let error = peer.runtime.block_on(peer.client.set_workspace_settings_with_timeout(
+        &settings, Duration::from_millis(30),
+    )).unwrap_err();
+    assert!(error.to_string().contains("LSP_TIMEOUT"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(stalled);
+    assert_unconfigured(&peer, &uri, version);
+}
+
+#[test]
+fn cancelling_configuration_capacity_wait_has_no_remote_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
+        return;
+    };
+    let uri = synced_source(&peer, temp.path());
+    let version = peer.client.document_snapshots()[&uri].version;
+    let settings = pending_settings();
+    let stalled = peer.stall_reads(temp.path());
+    saturate_writer(&peer.client);
+    let owner = AgentCx::for_request();
+    peer.runtime.block_on(owner.with_current(async {
+        let mut update = Box::pin(peer.client.set_workspace_settings_with_timeout(
+            &settings, Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(update.as_mut()).is_pending());
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel configuration wait"));
+        let error = update.await.unwrap_err();
+        assert!(error.to_string().contains("LSP_CANCELLED"), "{error}");
+    }));
+    drop(stalled);
+    assert_unconfigured(&peer, &uri, version);
+}
+
+#[test]
+fn dropping_configuration_capacity_wait_releases_the_request_lane() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
+        return;
+    };
+    let uri = synced_source(&peer, temp.path());
+    let version = peer.client.document_snapshots()[&uri].version;
+    let settings = pending_settings();
+    let stalled = peer.stall_reads(temp.path());
+    saturate_writer(&peer.client);
+    peer.runtime.block_on(async {
+        let mut update = Box::pin(peer.client.set_workspace_settings_with_timeout(
+            &settings, Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(update.as_mut()).is_pending());
+        drop(update);
+        drop(stalled);
+        assert_eq!(peer.client.call("test/success", Value::Null, Duration::from_secs(5)).await.unwrap(), json!({"ok":true}));
+    });
+    assert_unconfigured(&peer, &uri, version);
+}
+
+#[test]
+fn configuration_lane_admission_and_zero_budget_cannot_dispatch_late() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
+        return;
+    };
+    let uri = synced_source(&peer, temp.path());
+    let version = peer.client.document_snapshots()[&uri].version;
+    let settings = pending_settings();
+    peer.runtime.block_on(async {
+        let error = peer.client.set_workspace_settings_with_timeout(&settings, Duration::ZERO).await.unwrap_err();
+        assert!(error.to_string().contains("LSP_TIMEOUT"));
+        let owner = AgentCx::for_current_or_request();
+        let lane = asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&peer.client.request_lane), owner.cx(),
+        ).await.unwrap();
+        let error = peer.client.set_workspace_settings_with_timeout(&settings, Duration::from_millis(30)).await.unwrap_err();
+        assert!(error.to_string().contains("LSP_TIMEOUT"));
+        drop(lane);
+    });
+    assert_unconfigured(&peer, &uri, version);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_facing_configure_waits_for_transport_capacity_before_reporting_success() {
+    use crate::config::{Config, LspServerSettings, LspSettings};
+    use crate::lsp::LspTool;
+    use crate::tools::Tool as _;
+    use std::process::{Command, Stdio};
+
+    let python = ["python3", "python"].into_iter().find(|program| {
+        Command::new(program).arg("--version")
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().is_ok_and(|status| status.success())
+    });
+    let Some(python) = python else {
+        assert!(std::env::var_os("PI_LSP_REQUIRE_PROTOCOL").is_none(),
+            "Python required for configuration backpressure protocol test");
+        eprintln!("SKIP configuration backpressure peer: Python unavailable");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join(".pressure-root"), "").unwrap();
+    let path = root.join("source.cfgpressure");
+    std::fs::write(&path, "source\n").unwrap();
+    let config = Config {
+        lsp: Some(LspSettings {
+            servers: Some(std::collections::HashMap::from([("pressure".into(), LspServerSettings {
+                command: Some(python.into()),
+                args: Some(vec!["-u".into(), "-c".into(), super::super::test_server::SERVER.into(),
+                    json!({"textDocumentSync":1}).to_string()]),
+                extensions: Some(vec![".cfgpressure".into()]),
+                languages: Some(vec!["plaintext".into()]),
+                root_markers: Some(vec![".pressure-root".into()]),
+                ..Default::default()
+            })])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let tool = LspTool::new(&root, Some(&config));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(tool.execute("inspect", json!({"action":"configure","file":"source.cfgpressure"}), None)).unwrap();
+    let entry = tool.registry.entry_for_root("pressure", &root).unwrap();
+    let uri = entry.client.ensure_synced(&path, "plaintext").unwrap();
+    let version = entry.client.document_snapshots()[&uri].version;
+    let stalled = super::super::test_server::StalledReads::start(&entry.client, &runtime, &root);
+    saturate_writer(&entry.client);
+    let settings = pending_settings();
+    let output = runtime.block_on(async {
+        let mut update = Box::pin(tool.execute("update", json!({
+            "action":"configure","file":"source.cfgpressure","payload":settings.value(),"apply":true,"timeout":5
+        }), None));
+        assert!(futures::poll!(update.as_mut()).is_pending());
+        assert_eq!(entry.client.workspace_settings().1, 0);
+        assert_eq!(entry.client.document_snapshots()[&uri].version, version);
+        drop(stalled);
+        update.await.unwrap()
+    });
+    assert!(!output.is_error);
+    let details = output.details.unwrap();
+    assert_eq!(details["applied"], true);
+    assert_eq!(details["notificationQueued"], true);
+    assert_eq!(details["revision"], 1);
+    assert_eq!(details["settings"], *settings.value());
+    assert_eq!(entry.client.open_document_count(), 0);
+    let frames = runtime.block_on(entry.client.call("test/frames", Value::Null, Duration::from_secs(5))).unwrap();
+    assert_eq!(frames.as_array().unwrap().iter().filter(|frame| frame["method"] == "workspace/didChangeConfiguration").count(), 1);
 }

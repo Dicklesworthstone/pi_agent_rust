@@ -465,7 +465,9 @@ impl LspTool {
         remaining()?;
         let (applied, current_revision) = if input.apply == Some(true) {
             let settings = proposed.as_ref().expect("validated configuration payload");
-            let outcome = entry.client.set_workspace_settings(settings)?;
+            let outcome = entry.client
+                .set_workspace_settings_with_timeout(settings, remaining()?)
+                .await?;
             if outcome.0 {
                 // The client already retired document incarnations; retire
                 // tool handles too. Never grant a command/applyEdit window.
