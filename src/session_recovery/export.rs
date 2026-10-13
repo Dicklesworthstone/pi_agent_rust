@@ -14,6 +14,8 @@ use super::{
 
 const MAX_EXPORT_BYTES: usize = 256 * 1024 * 1024;
 
+mod session_copy;
+
 /// Select historical records, not a new active session or provider context.
 #[derive(Debug, Clone, Copy)]
 pub enum RecoverySelection<'a> {
@@ -237,43 +239,56 @@ impl RecoveryReport {
     /// not a crash-durable directory or hostile-directory confinement claim.
     pub fn export_file(&self, destination: impl AsRef<Path>, format: RecoveryExport<'_>) -> Result<()> {
         let owner = AgentCx::for_current_or_request();
-        check_owner(&owner)?;
-        let destination = destination.as_ref();
-        let name = destination.file_name().ok_or_else(|| invalid("export requires a filename"))?;
-        let parent = destination.parent().filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")).canonicalize()?;
-        let destination = parent.join(name);
-        match std::fs::symlink_metadata(&destination) {
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "recovery export never replaces an existing destination").into()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let parent_identity = FileIdentity::of_path_nofollow(&parent)?;
-        check_owner(&owner)?;
-        let mut staged = tempfile::Builder::new().prefix(".pi-text-recovery-").tempfile_in(&parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        match format {
-            RecoveryExport::Json => self.write_json(&mut staged)?,
-            RecoveryExport::Text(selection) => self.write_selected_text(selection, &mut staged)?,
-        }
-        check_owner(&owner)?;
-        staged.as_file().sync_all()?;
-        if FileIdentity::of_path_nofollow(&parent)? != parent_identity
-            || !regular(&std::fs::symlink_metadata(staged.path())?)
-            || FileIdentity::of_path_nofollow(staged.path())? != FileIdentity::of_open_file(staged.as_file())?
-        {
-            return Err(invalid("export staging path changed before publication"));
-        }
-        check_owner(&owner)?;
-        drop(staged.persist_noclobber(destination).map_err(|error| error.error)?);
-        // Admission may already have committed a complete file when the owner
-        // is cancelled now. Do not misreport it as an unperformed export.
-        Ok(())
+        publish_new_file(destination.as_ref(), &owner, |_| Ok(()), |file| match format {
+            RecoveryExport::Json => self.write_json(file),
+            RecoveryExport::Text(selection) => self.write_selected_text(selection, file),
+        })
     }
+}
+
+/// Shared publication for inspection reports and explicitly requested session
+/// copies. Validation runs before staging and again immediately before the
+/// no-clobber commit; neither path can overwrite an existing destination.
+fn publish_new_file(
+    destination: &Path,
+    owner: &AgentCx,
+    validate: impl Fn(&Path) -> Result<()>,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    check_owner(owner)?;
+    let name = destination.file_name().ok_or_else(|| invalid("export requires a filename"))?;
+    let parent = destination.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".")).canonicalize()?;
+    let destination = parent.join(name);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "recovery export never replaces an existing destination").into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate(&destination)?;
+    let parent_identity = FileIdentity::of_path_nofollow(&parent)?;
+    check_owner(owner)?;
+    let mut staged = tempfile::Builder::new().prefix(".pi-text-recovery-").tempfile_in(&parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    write(staged.as_file_mut())?;
+    check_owner(owner)?;
+    staged.as_file().sync_all()?;
+    if FileIdentity::of_path_nofollow(&parent)? != parent_identity
+        || !regular(&std::fs::symlink_metadata(staged.path())?)
+        || FileIdentity::of_path_nofollow(staged.path())? != FileIdentity::of_open_file(staged.as_file())?
+    {
+        return Err(invalid("export staging path changed before publication"));
+    }
+    validate(&destination)?;
+    check_owner(owner)?;
+    drop(staged.persist_noclobber(destination).map_err(|error| error.error)?);
+    // Once admitted, a complete file may exist despite later cancellation.
+    // This syncs the file, not its directory, as documented by export_file.
+    Ok(())
 }
 
 #[cfg(test)]
