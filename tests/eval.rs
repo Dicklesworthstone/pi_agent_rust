@@ -9,6 +9,8 @@
 //! 5. Session end kills the kernel tree (no orphans).
 //! 6. Python async cells retain loop/context/task state, preserve bridge
 //!    restrictions, and recover from exceptions and host-side timeouts.
+//! 7. File-backed Python cells retain state and import context, reload only
+//!    explicitly, and reject malformed, oversized, or outside-workspace loads.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -209,7 +211,9 @@ fn python_cell(harness: &TestHarness, tool: &pi::eval::EvalTool, code: &str) -> 
         None,
     ))
     .expect("Python cell protocol");
-    harness.log().info("cell_output", first_text(&output).to_string());
+    harness
+        .log()
+        .info("cell_output", first_text(&output).to_string());
     output
 }
 
@@ -327,5 +331,158 @@ fn python_coroutine_value_is_not_implicitly_awaited() {
     assert!(first_text(&out).contains("coroutine object"));
     let out = python_cell(&harness, &tool, "coro.close()");
     assert!(!out.is_error, "{}", first_text(&out));
+    finish_case(&harness, case);
+}
+
+#[test]
+fn python_load_async_script_imports_and_reloads() {
+    let case = "python_load_async_script_imports_and_reloads";
+    let harness = TestHarness::new(case);
+    if !python_available() {
+        return;
+    }
+    let root = harness.temp_path(".");
+    std::fs::create_dir_all(root.join("scripts")).expect("script directory");
+    std::fs::write(root.join("scripts/sibling.py"), "BASE = 40\n").expect("sibling module");
+    let script = root.join("scripts/setup file.py");
+    std::fs::write(&script, "import asyncio\nfrom pathlib import Path\nfrom sibling import BASE\nload_count = globals().get('load_count', 0) + 1\nanswer = await asyncio.sleep(0, result=BASE + 2)\nasync def later():\n    import sibling\n    return sibling.BASE\n(answer, Path(__file__).name, load_count)\n").expect("async script");
+    let tool = pi::eval::EvalTool::new(&root);
+    let out = python_cell(&harness, &tool, "%load \"scripts/setup file.py\"");
+    assert!(!out.is_error, "{}", first_text(&out));
+    assert!(first_text(&out).contains("(42, 'setup file.py', 1)"));
+    let out = python_cell(&harness, &tool, "await later()");
+    assert!(!out.is_error, "{}", first_text(&out));
+    assert_eq!(first_text(&out).trim(), "40");
+    std::fs::write(&script, "load_count += 1\nanswer = 43\n").expect("edit script");
+    let out = python_cell(&harness, &tool, "(load_count, answer)");
+    assert_eq!(first_text(&out).trim(), "(1, 42)");
+    let out = python_cell(&harness, &tool, "%load \"scripts/setup file.py\"");
+    assert!(!out.is_error, "{}", first_text(&out));
+    let out = python_cell(&harness, &tool, "(load_count, answer)");
+    assert_eq!(first_text(&out).trim(), "(2, 43)");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn python_load_compile_failure_retains_state_and_runtime_errors_name_script() {
+    let case = "python_load_compile_failure_retains_state_and_runtime_errors_name_script";
+    let harness = TestHarness::new(case);
+    if !python_available() {
+        return;
+    }
+    let root = harness.temp_path(".");
+    std::fs::write(root.join("bad.py"), "sentinel = 9\nyield 1\n").expect("bad script");
+    std::fs::write(root.join("failed.py"), "sentinel = 8\nraise ValueError('loaded-failure')\n").expect("failing script");
+    let tool = pi::eval::EvalTool::new(&root);
+    let out = python_cell(&harness, &tool, "import sys\nsentinel = 7\n__file__ = 'previous.py'\nold_path = list(sys.path)");
+    assert!(!out.is_error, "{}", first_text(&out));
+    let out = python_cell(&harness, &tool, "%load bad.py");
+    assert!(out.is_error);
+    assert!(first_text(&out).contains("bad.py"));
+    assert!(first_text(&out).contains("SyntaxError"));
+    let out = python_cell(&harness, &tool, "(sentinel, __file__, old_path == sys.path)");
+    assert_eq!(first_text(&out).trim(), "(7, 'previous.py', True)");
+    let out = python_cell(&harness, &tool, "%load failed.py");
+    assert!(out.is_error);
+    assert!(first_text(&out).contains("failed.py"));
+    assert!(first_text(&out).contains("line 2"));
+    assert!(first_text(&out).contains("loaded-failure"));
+    let out = python_cell(&harness, &tool, "sentinel");
+    assert_eq!(first_text(&out).trim(), "8");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn python_load_rejects_bad_commands_urls_and_nonfiles() {
+    let case = "python_load_rejects_bad_commands_urls_and_nonfiles";
+    let harness = TestHarness::new(case);
+    if !python_available() {
+        return;
+    }
+    let root = harness.temp_path(".");
+    std::fs::write(root.join("setup.py"), "sentinel = 99\n").expect("script");
+    let tool = pi::eval::EvalTool::new(&root);
+    let out = python_cell(&harness, &tool, "sentinel = 7");
+    assert!(!out.is_error, "{}", first_text(&out));
+    for (command, expected) in [
+        ("%load", "EVAL_LOAD_USAGE"),
+        ("%load setup.py extra", "EVAL_LOAD_USAGE"),
+        ("%load \"unterminated", "EVAL_LOAD_USAGE"),
+        ("%load setup.py\nsentinel = 8", "EVAL_LOAD_USAGE"),
+        ("%pip install example", "EVAL_LOAD_USAGE"),
+        ("%load https://example.invalid/code.py", "EVAL_LOAD_PATH"),
+        ("%load artifact://example", "EVAL_LOAD_PATH"),
+        ("%load local://example", "EVAL_LOAD_PATH"),
+        ("%load .", "regular file"),
+        ("%load missing.py", "FileNotFoundError"),
+    ] {
+        let out = python_cell(&harness, &tool, command);
+        assert!(out.is_error, "{}", first_text(&out));
+        assert!(first_text(&out).contains(expected), "{}", first_text(&out));
+    }
+    let out = python_cell(&harness, &tool, "sentinel");
+    assert_eq!(first_text(&out).trim(), "7");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn python_load_limits_and_source_encodings() {
+    let case = "python_load_limits_and_source_encodings";
+    let harness = TestHarness::new(case);
+    if !python_available() {
+        return;
+    }
+    let root = harness.temp_path(".");
+    let script = root.join("large.py");
+    std::fs::write(&script, vec![b'#'; 2 * 1024 * 1024]).expect("boundary script");
+    let tool = pi::eval::EvalTool::new(&root);
+    let out = python_cell(&harness, &tool, "%load large.py");
+    assert!(!out.is_error, "{}", first_text(&out));
+    std::fs::write(&script, vec![b'#'; 2 * 1024 * 1024 + 1]).expect("oversized script");
+    let out = python_cell(&harness, &tool, "%load large.py");
+    assert!(out.is_error);
+    assert!(first_text(&out).contains("EVAL_LOAD_LIMIT"));
+    std::fs::write(root.join("latin.py"), b"# coding: latin-1\nanswer = 'caf\xe9'\nanswer\n").expect("encoded script");
+    let out = python_cell(&harness, &tool, "%load latin.py");
+    assert!(!out.is_error, "{}", first_text(&out));
+    assert_eq!(first_text(&out).trim(), "'café'");
+    std::fs::write(root.join("bom.py"), b"\xef\xbb\xbfanswer = 43\nanswer\n").expect("BOM script");
+    let out = python_cell(&harness, &tool, "%load bom.py");
+    assert!(!out.is_error, "{}", first_text(&out));
+    assert_eq!(first_text(&out).trim(), "43");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn python_load_paths_remain_workspace_anchored() {
+    let case = "python_load_paths_remain_workspace_anchored";
+    let harness = TestHarness::new(case);
+    if !python_available() {
+        return;
+    }
+    let root = harness.temp_path("workspace");
+    std::fs::create_dir_all(root.join("other")).expect("workspace");
+    std::fs::write(root.join("setup.py"), "answer = 42\nanswer\n").expect("workspace script");
+    std::fs::write(root.join("other/setup.py"), "answer = 99\nanswer\n").expect("other script");
+    let outside = harness.temp_path("outside.py");
+    std::fs::write(&outside, "outside_marker = 99\n").expect("outside script");
+    let tool = pi::eval::EvalTool::new(&root);
+    let out = python_cell(&harness, &tool, "import os\nos.chdir('other')");
+    assert!(!out.is_error, "{}", first_text(&out));
+    let out = python_cell(&harness, &tool, "%load setup.py");
+    assert!(!out.is_error, "{}", first_text(&out));
+    assert_eq!(first_text(&out).trim(), "42");
+    let out = python_cell(&harness, &tool, "%load ../outside.py");
+    assert!(out.is_error);
+    assert!(first_text(&out).contains("outside the kernel workspace"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, root.join("link.py")).expect("outside symlink");
+        let out = python_cell(&harness, &tool, "%load link.py");
+        assert!(out.is_error);
+        assert!(first_text(&out).contains("outside the kernel workspace"));
+    }
+    let out = python_cell(&harness, &tool, "'outside_marker' in globals()");
+    assert_eq!(first_text(&out).trim(), "False");
     finish_case(&harness, case);
 }

@@ -11,6 +11,14 @@ The last expression is displayed without implicitly awaiting a coroutine
 value. The host owns timeouts by killing this process. Pending tasks are
 retained, but the loop only advances while a cell is executing.
 
+A standalone `%load "relative/path with spaces.py"` cell executes a local
+Python script in that same namespace and loop. Paths resolve from the kernel's
+original workspace, not a later os.chdir(). Scripts retain their filename in
+tracebacks, set __file__, and put their directory on sys.path for imports.
+Load again to execute an edited script; ordinary Python import caching still
+applies to its dependencies. Loads are limited to regular workspace files of
+at most 2 MiB. This admission check is not a sandbox for arbitrary eval code.
+
 Tool re-entry bridge: cell code can call `tool.read(path)`, `tool.grep(...)`,
 `tool.find(...)`, `tool.ls(...)`, or `await tool.call("read", {"path": path})`.
 The kernel emits a {"bridge": {"call": m, "tool": ..., "input": {...}}} line
@@ -26,6 +34,9 @@ import inspect
 import io
 import json
 import os
+from pathlib import Path
+import shlex
+import stat
 import sys
 import traceback
 
@@ -48,6 +59,8 @@ _BRIDGE_CALL = 0
 _CELL_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_CELL_LOOP)
 _CELL_CONTEXT = contextvars.copy_context()
+_WORKSPACE_ROOT = Path.cwd().resolve()
+_MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 
 
 class ToolBridgeError(RuntimeError):
@@ -119,8 +132,68 @@ class _PiTools:
 NAMESPACE["tool"] = _PiTools()
 
 
-def _compile_cell(code):
-    tree = ast.parse(code, filename="<cell>", mode="exec")
+def _script_stamp(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _prepare_cell(code):
+    if not isinstance(code, str):
+        raise TypeError("cell code must be a string")
+    command = code.strip()
+    if not command.startswith("%"):
+        return code, "<cell>", None
+    if "\n" in command or "\r" in command:
+        raise ValueError("EVAL_LOAD_USAGE: %load must be a standalone cell")
+    try:
+        arguments = shlex.split(command)
+    except ValueError as error:
+        raise ValueError("EVAL_LOAD_USAGE: quote the script path correctly") from error
+    if len(arguments) != 2 or arguments[0] != "%load" or not arguments[1]:
+        raise ValueError("EVAL_LOAD_USAGE: %load <workspace-local Python file>")
+    if "://" in arguments[1] or "\x00" in arguments[1]:
+        raise ValueError("EVAL_LOAD_PATH: URLs and virtual documents cannot be executed")
+    path = Path(arguments[1])
+    if not path.is_absolute():
+        path = _WORKSPACE_ROOT / path
+    path = path.resolve(strict=True)
+    try:
+        path.relative_to(_WORKSPACE_ROOT)
+    except ValueError as error:
+        raise ValueError("EVAL_LOAD_PATH: script is outside the kernel workspace") from error
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("EVAL_LOAD_PATH: script must be a regular file")
+    if before.st_size > _MAX_SCRIPT_BYTES:
+        raise ValueError("EVAL_LOAD_LIMIT: script exceeds 2 MiB")
+    # Read once, bounded even if the file grows. NONBLOCK prevents a raced-in
+    # FIFO from hanging; NOFOLLOW rejects replacement of the resolved leaf
+    # with a symlink on platforms that support it. Stamp checks detect observed
+    # changes, not an atomic snapshot against a hostile workspace writer.
+    flags = os.O_RDONLY
+    for name in ("O_CLOEXEC", "O_NONBLOCK", "O_NOFOLLOW"):
+        flags |= getattr(os, name, 0)
+    with os.fdopen(os.open(path, flags), "rb") as script:
+        opened = os.fstat(script.fileno())
+        if not stat.S_ISREG(opened.st_mode) or _script_stamp(opened) != _script_stamp(before):
+            raise ValueError("EVAL_LOAD_CHANGED: script changed while opening")
+        source = script.read(_MAX_SCRIPT_BYTES + 1)
+        after = os.fstat(script.fileno())
+        if _script_stamp(after) != _script_stamp(opened):
+            raise ValueError("EVAL_LOAD_CHANGED: script changed while reading")
+    if len(source) > _MAX_SCRIPT_BYTES:
+        raise ValueError("EVAL_LOAD_LIMIT: script exceeds 2 MiB")
+    # Compile bytes so Python honors encoding cookies and UTF-8 BOMs.
+    return source, str(path), str(path.parent)
+
+
+def _compile_cell(code, filename):
+    tree = ast.parse(code, filename=filename, mode="exec")
     trailing = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         trailing = ast.Expression(tree.body[-1].value)
@@ -128,9 +201,9 @@ def _compile_cell(code):
     # Compile BOTH pieces before executing either. In particular, a syntax
     # error in a final yield/await must not leave prefix side effects behind.
     flags = ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
-    body = compile(tree, "<cell>", "exec", flags=flags, dont_inherit=True)
+    body = compile(tree, filename, "exec", flags=flags, dont_inherit=True)
     expression = (
-        compile(trailing, "<cell>", "eval", flags=flags, dont_inherit=True)
+        compile(trailing, filename, "eval", flags=flags, dont_inherit=True)
         if trailing is not None
         else None
     )
@@ -140,7 +213,15 @@ def _compile_cell(code):
 async def _execute_cell(code):
     global _CELL_CONTEXT
     try:
-        body, expression = _compile_cell(code)
+        source, filename, script_dir = _prepare_cell(code)
+        body, expression = _compile_cell(source, filename)
+        if script_dir is not None:
+            # Only mutate execution metadata after the whole script compiles.
+            # Keep it for later calls to functions defined by this script.
+            NAMESPACE["__file__"] = filename
+            if script_dir in sys.path:
+                sys.path.remove(script_dir)
+            sys.path.insert(0, script_dir)
         value = eval(body, NAMESPACE)  # noqa: S307 - intentional cell execution
         if body.co_flags & inspect.CO_COROUTINE:
             await value
