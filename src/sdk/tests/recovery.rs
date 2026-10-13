@@ -235,6 +235,10 @@ fn saving_native_content_handle(
     Arc<Mutex<PromptObservations>>,
 ) {
     let mut handle = saving_handle(dir).with_retry(Some(fast_retry_policy(1)));
+    // Both doubles below keep the handle's model identity. A bare
+    // `set_provider` resets image support fail-closed (77ef109ca), so
+    // reinstall the selected model's capability as catalog-aware callers do.
+    let accepts_images = handle.session.agent.model_accepts_images();
     let calls = Arc::new(AtomicUsize::new(0));
     let (name, model) = handle.model();
     handle
@@ -248,6 +252,10 @@ fn saving_native_content_handle(
             input_tokens: 0,
         }));
     let observations = record_system_prompts(&mut handle, None);
+    handle
+        .session
+        .agent
+        .set_model_accepts_images(accepts_images);
     (handle, calls, observations)
 }
 
@@ -701,16 +709,32 @@ fn dropping_first_or_retried_provider_future_restores_prompt_and_thinking() {
                     .count(),
                 1,
             );
+            // 721500d25: dropping an admitted turn before its outcome and save
+            // were observed fences provider re-entry on this handle until a
+            // new or resumed session is started. The refusal must neither
+            // reach the provider nor disturb the restored baseline above.
             install_system_prompt_hook(&mut handle, None);
-            let result = run_async(handle.prompt("after cancellation", |_| {})).unwrap();
-            assert_eq!(result.stop_reason, StopReason::Stop);
-            assert_eq!(
-                prompts.lock().unwrap().prompts.last().unwrap().as_deref(),
-                Some("base-system"),
+            let before = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let error = run_async(handle.prompt("after cancellation", |_| {}))
+                .expect_err("a dropped admitted turn must fence provider re-entry");
+            assert!(error.is_session_persistence(), "{error}");
+            assert!(
+                error.to_string().contains("SDK_TURN_INTERRUPTED"),
+                "{error}"
             );
             assert_eq!(
-                prompts.lock().unwrap().thinking_levels.last().copied(),
-                Some(Some(crate::model::ThinkingLevel::Off)),
+                prompts.lock().unwrap().prompts.len(),
+                pending_call + 1,
+                "the fenced prompt must not reach the provider",
+            );
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before
+            );
+            assert_eq!(handle.session.agent.system_prompt(), Some("base-system"));
+            assert_eq!(
+                handle.session.agent.stream_options().thinking_level,
+                Some(crate::model::ThinkingLevel::Off),
             );
         }
     }

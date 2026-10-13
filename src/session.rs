@@ -14172,6 +14172,10 @@ mod tests {
         let path = sessions_root
             .join(encode_cwd(&original))
             .join(format!("recovered.{extension}"));
+        // An explicit JSONL path is saved in place: its original storage
+        // folder must exist, exactly as it did before the project moved.
+        std::fs::create_dir_all(path.parent().expect("original storage folder"))
+            .expect("create original storage folder");
         session.path = Some(path.clone());
         session.append_message(make_test_message("before recovery"));
         crate::session_workdir::attach_session_workdir(&mut session, &replacement).expect("attach");

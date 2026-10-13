@@ -10068,6 +10068,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn standalone_launch_binds_shell_tools_and_replacements_to_the_saved_workspace() {
+        // Relative locators resolve against, and the test finally checks, the
+        // process cwd, which other unit tests change while holding this lock.
+        let _cwd_lock = crate::test_current_dir_lock();
         let process_cwd = std::env::current_dir().expect("process cwd");
         let root = tempfile::tempdir_in(&process_cwd).expect("relative locator fixture");
         let cwd = root.path().join("attached-workspace");
@@ -10096,6 +10099,9 @@ mod tests {
                 provider: Some(String::from("openai")),
                 model: Some(String::from("gpt-4o")),
                 api_key: Some(String::from("ftui-workspace-fixture-key")),
+                // `SessionOptions::default()` is an in-memory launch, which
+                // deliberately bypasses saved-workspace recovery.
+                no_session: false,
                 session_path: Some(path.strip_prefix(&process_cwd).unwrap().to_path_buf()),
                 session_dir: Some(
                     sessions_dir
@@ -10227,6 +10233,9 @@ mod tests {
 
     #[test]
     fn standalone_launch_rejects_mismatched_or_missing_saved_workspaces() {
+        // Launch preparation reads the process cwd, which other unit tests
+        // change while holding this lock.
+        let _cwd_lock = crate::test_current_dir_lock();
         let root = tempfile::tempdir().expect("fixture root");
         let cwd = root.path().join("saved-workspace");
         let other = root.path().join("other-workspace");
@@ -10236,11 +10245,16 @@ mod tests {
         let mut source = crate::session::Session::in_memory();
         source.header.cwd = cwd.display().to_string();
         source.path = Some(path.clone());
+        // Keep the save's session-index bookkeeping out of the user's store.
+        source.session_dir = Some(root.path().join("sessions"));
         futures::executor::block_on(async {
             source.save().await.expect("save source");
             let original_bytes = std::fs::read(&path).expect("source bytes");
             for explicit_handle in [false, true] {
+                // `SessionOptions::default()` is an in-memory launch, which
+                // deliberately bypasses saved-workspace recovery.
                 let mut options = crate::sdk::SessionOptions {
+                    no_session: false,
                     session_path: Some(path.clone()),
                     ..crate::sdk::SessionOptions::default()
                 };
@@ -10260,6 +10274,7 @@ mod tests {
             }
             std::fs::rename(&cwd, root.path().join("moved-workspace")).expect("move workspace");
             let error = prepare_driver_session_options(crate::sdk::SessionOptions {
+                no_session: false,
                 session_path: Some(path.clone()),
                 ..crate::sdk::SessionOptions::default()
             })

@@ -5137,12 +5137,15 @@ mod tests {
     #[test]
     fn classic_fork_rejects_a_newer_attachment_outside_its_runtime_workspace() {
         let temp = TempDir::new().expect("tempdir");
+        // Saving the fixture's source initializes its own `sessions` index
+        // namespace, so build it apart from the store a fork would write to.
+        let fixture_root = temp.path().join("fixture");
+        std::fs::create_dir(&fixture_root).expect("fixture root");
         let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
-            temp.path(),
+            &fixture_root,
             true,
         ));
-        let runtime_cwd = temp
-            .path()
+        let runtime_cwd = fixture_root
             .join("previous-workspace")
             .canonicalize()
             .expect("runtime workspace");
@@ -5151,7 +5154,9 @@ mod tests {
                 .expect("lazy active branch still sees its earlier binding"),
             runtime_cwd
         );
-        let source = Arc::new(Mutex::new(fixture.source.clone()));
+        let mut live_source = fixture.source.clone();
+        live_source.session_dir = Some(temp.path().join("sessions"));
+        let source = Arc::new(Mutex::new(live_source));
         let (mut app, mut event_rx) = build_bash_test_app(source, &runtime_cwd);
         let source_id = current_session_id(&app);
 
