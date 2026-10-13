@@ -9673,6 +9673,26 @@ mod extensions_integration_tests {
             "live-model",
             true,
         )]);
+
+        // Without extensions nothing can read the compaction registry, so
+        // setting the registry and auth does not build it.
+        session.set_model_registry(registry.clone());
+        session.set_auth_storage(auth.clone());
+        assert!(
+            session
+                .extension_ai_completion
+                .lock()
+                .unwrap()
+                .compaction_models
+                .registry
+                .is_none(),
+            "the compaction registry is built only for sessions with extensions"
+        );
+
+        // With extensions it follows every registry and auth update.
+        session.extensions = Some(crate::extensions::ExtensionRegion::new(
+            crate::extensions::ExtensionManager::new(),
+        ));
         session.set_model_registry(registry);
         for key in ["first-live-key", "replacement-live-key"] {
             auth.set(
@@ -14766,6 +14786,14 @@ impl AgentSession {
     }
 
     fn refresh_extension_compaction_models(&self) {
+        // Only extensions read this state (`ctx.compact` with a `model`), and
+        // building it deep-copies the whole model registry and auth store.
+        // Startup sets both, so a session without extensions paid for two
+        // copies it could never use, several milliseconds of every start.
+        // Installing extensions calls this again, so they still get it.
+        if self.extensions.is_none() {
+            return;
+        }
         let models = ExtensionCompactionModelState {
             registry: self.model_registry.clone().map(Arc::new),
             auth: self.auth_storage.clone().map(Arc::new),
