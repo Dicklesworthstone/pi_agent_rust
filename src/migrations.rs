@@ -21,7 +21,7 @@ const MANAGED_TOOL_BINARIES: &[&str] = &["fd", "rg", "fd.exe", "rg.exe"];
 pub struct MigrationReport {
     /// Providers migrated into `auth.json`.
     pub migrated_auth_providers: Vec<String>,
-    /// Number of session files moved from `~/.pi/agent/*.jsonl` to `sessions/<encoded-cwd>/`.
+    /// Number of legacy session files moved or safely copied into `sessions/<encoded-cwd>/`.
     pub migrated_session_files: usize,
     /// Directories where `commands/` was renamed to `prompts/`.
     pub migrated_commands_dirs: Vec<PathBuf>,
@@ -406,15 +406,35 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path, warnings: &mut Vec<String>
         if target_path.exists() {
             continue;
         }
-        if let Err(err) = fs::rename(&source_path, &target_path) {
-            warnings.push(format!(
+        // Attachment references are relative to the complete JSONL filename.
+        // Never move that filename away from its authoritative media directory.
+        // A blob-backed migration publishes a validated copy and retains the
+        // entire original bundle for recovery, including on publication failure.
+        let sidecar = crate::session::attachments::sidecar_path(&source_path);
+        let result = match fs::symlink_metadata(&sidecar) {
+            Ok(_) => session_bundle::copy(&source_path, &target_path).map(|()| true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(&source_path, &target_path).map(|()| false)
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(retained) => {
+                migrated_count += 1;
+                if retained {
+                    warnings.push(format!(
+                        "migrated media session {}; original transcript and attachments retained as a recovery copy at {}",
+                        target_path.display(),
+                        source_path.display()
+                    ));
+                }
+            }
+            Err(err) => warnings.push(format!(
                 "could not migrate session file {} to {}: {err}",
                 source_path.display(),
                 target_path.display()
-            ));
-            continue;
+            )),
         }
-        migrated_count += 1;
     }
 
     migrated_count
@@ -1156,6 +1176,523 @@ mod tests {
                 if n_deprecations > 0 { expected += 2; } // guide + docs URLs
                 assert_eq!(msgs.len(), expected);
             }
+        }
+    }
+}
+
+mod session_bundle {
+    //! Copy blob-backed legacy sessions without splitting their authoritative data.
+    //!
+    //! The original transcript and attachment directory are deliberately retained.
+    //! Two independent renames cannot atomically move a transcript and its blobs.
+    //! Publish a complete destination snapshot instead, under both persistence
+    //! locks, and leave the source usable for recovery even after an I/O failure.
+
+    use crate::file_identity::FileIdentity;
+    use crate::session::attachments::{decode_stored_entry, sidecar_path};
+    use crate::session_store_v2::{self, ArtifactWriteMode};
+    use sha2::{Digest as _, Sha256};
+    use std::fs::{self, File};
+    use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
+    use std::path::{Path, PathBuf};
+
+    const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+    const COPY_BUFFER_BYTES: usize = 16 * 1024;
+    // Match native session admission, without retaining the whole transcript.
+    const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
+
+    fn migration_error(error: impl std::fmt::Display) -> io::Error {
+        io::Error::other(error.to_string())
+    }
+
+    fn require_absent(path: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session migration destination is already occupied",
+            )),
+        }
+    }
+
+    fn persistence_lock(session: &Path) -> io::Result<File> {
+        let mut path = session.as_os_str().to_os_string();
+        path.push(".lock");
+        let file = session_store_v2::open_regular_file_for_write(
+            Path::new(&path),
+            true,
+            ArtifactWriteMode::Preserve,
+        )
+        .map_err(migration_error)?;
+        // Startup must not block behind an active writer. This is the same
+        // <session>.lock regular-file protocol used by JSONL persistence. A
+        // directory lock, symlink or non-private lock file is refused by the opener.
+        fs4::FileExt::try_lock(&file).map_err(migration_error)?;
+        Ok(file)
+    }
+
+    struct PinnedDirectory {
+        path: PathBuf,
+        handle: File,
+        identity: FileIdentity,
+    }
+
+    impl PinnedDirectory {
+        fn open(path: PathBuf, create: bool) -> io::Result<Self> {
+            let handle =
+                session_store_v2::open_private_directory(&path, create).map_err(migration_error)?;
+            let identity = FileIdentity::of_open_file(&handle)?;
+            let directory = Self {
+                path,
+                handle,
+                identity,
+            };
+            directory.validate()?;
+            Ok(directory)
+        }
+
+        fn validate(&self) -> io::Result<()> {
+            check_identity(&self.path, &self.handle, &self.identity)
+        }
+
+        fn sync(&self) -> io::Result<()> {
+            self.validate()?;
+            super::sync_migration_directory(&self.path)?;
+            self.validate()
+        }
+    }
+
+    fn check_identity(path: &Path, file: &File, identity: &FileIdentity) -> io::Result<()> {
+        if &FileIdentity::of_open_file(file)? != identity
+            || &FileIdentity::of_path_nofollow(path)? != identity
+        {
+            return Err(io::Error::other(
+                "session migration source or directory changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_source(path: &Path) -> io::Result<File> {
+        session_store_v2::open_regular_file_for_read(path)
+            .map_err(migration_error)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session source is missing"))
+    }
+
+    /// Copy a verified content-addressed blob using a fixed-size buffer. Check
+    /// the hash before publication; filename shape alone never authenticates data.
+    fn copy_verified_blob(source: &Path, name: &str, target: &PinnedDirectory) -> io::Result<()> {
+        let mut input = open_source(source)?;
+        let identity = FileIdentity::of_open_file(&input)?;
+        let length = input.metadata()?.len();
+        if length == 0 || length > MAX_BLOB_BYTES {
+            return Err(io::Error::other(
+                "session attachment exceeds migration byte limits",
+            ));
+        }
+        target.validate()?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".pi-migration-")
+            .tempfile_in(&target.path)?;
+        let mut hasher = Sha256::new();
+        let mut count = 0_u64;
+        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+        loop {
+            let read = match input.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if read == 0 {
+                break;
+            }
+            count += read as u64;
+            if count > length {
+                return Err(io::Error::other("session attachment grew during migration"));
+            }
+            hasher.update(&buffer[..read]);
+            staged.write_all(&buffer[..read])?;
+        }
+        if count != length || crate::package_manager::hex_encode(&hasher.finalize()) != name {
+            return Err(io::Error::other(
+                "session attachment digest or byte count does not match",
+            ));
+        }
+        check_identity(source, &input, &identity)?;
+        staged.as_file().sync_all()?;
+        target.validate()?;
+        let destination = target.path.join(name);
+        match staged.persist_noclobber(&destination) {
+            Ok(file) => drop(file),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                // A previous interrupted migration may have copied this digest.
+                // Reuse only a private, regular, byte-identical file. Never truncate
+                // an existing blob and never treat a partial copy as success.
+                let mut existing = open_source(&destination)?;
+                let existing_identity = FileIdentity::of_open_file(&existing)?;
+                if existing.metadata()?.len() != length {
+                    return Err(io::Error::other(
+                        "existing migrated attachment has wrong size",
+                    ));
+                }
+                let mut hasher = Sha256::new();
+                let mut bounded = (&mut existing).take(length + 1);
+                let mut count = 0_u64;
+                loop {
+                    let read = match bounded.read(&mut buffer) {
+                        Ok(read) => read,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    count += read as u64;
+                    hasher.update(&buffer[..read]);
+                }
+                if count != length || crate::package_manager::hex_encode(&hasher.finalize()) != name {
+                    return Err(io::Error::other("existing migrated attachment is corrupt"));
+                }
+                check_identity(&destination, &existing, &existing_identity)?;
+                existing.sync_all()?;
+            }
+            Err(error) => return Err(error.error),
+        }
+        target.validate()
+    }
+
+    /// Apply native reference/schema validation against the destination before
+    /// publishing its transcript. Copying the directory alone cannot establish
+    /// that every reference exists, has the declared size, or uses valid encoding.
+    /// Native validation streams blob hashes instead of hydrating base64 payloads.
+    fn validate_transcript(file: &mut File, target: &Path) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut header = true;
+        loop {
+            line.clear();
+            let read = (&mut reader)
+                .take(MAX_JSONL_LINE_BYTES as u64 + 2)
+                .read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            if line.strip_suffix('\n').unwrap_or(&line).len() > MAX_JSONL_LINE_BYTES {
+                return Err(io::Error::other(
+                    "session migration JSONL line exceeds byte limit",
+                ));
+            }
+            if header {
+                // Startup has already admitted the legacy header's cwd. Keep its
+                // bytes/legacy version untouched instead of rewriting the format.
+                let value: serde_json::Value =
+                    serde_json::from_str(&line).map_err(migration_error)?;
+                if value["type"] != "session" || !value["cwd"].is_string() {
+                    return Err(io::Error::other("invalid legacy session header"));
+                }
+                header = false;
+            } else if !line.trim().is_empty() {
+                decode_stored_entry(Some(target), &line).map_err(migration_error)?;
+            }
+        }
+        if header {
+            return Err(io::Error::other("legacy session is empty"));
+        }
+        Ok(())
+    }
+
+    /// The destination transcript is the commit point. On failure no source data
+    /// is removed; already-copied immutable blobs are safe to verify and reuse on
+    /// a later attempt. Keep the original bundle even after success, rather than
+    /// introducing a second, non-atomic cleanup transaction at startup.
+    pub(super) fn copy(source: &Path, target: &Path) -> io::Result<()> {
+        require_absent(target)?;
+        let _source_lock = persistence_lock(source)?;
+        let _target_lock = persistence_lock(target)?;
+        require_absent(target)?;
+        let mut input = open_source(source)?;
+        let identity = FileIdentity::of_open_file(&input)?;
+        let metadata = input.metadata()?;
+        let length = metadata.len();
+        let modified = metadata.modified()?;
+        let source_blobs = PinnedDirectory::open(sidecar_path(source), false)?;
+        let target_blobs = PinnedDirectory::open(sidecar_path(target), true)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::other("session destination has no parent"))?;
+        let mut transcript = tempfile::Builder::new()
+            .prefix(".pi-migration-")
+            .tempfile_in(parent)?;
+        let limit = length
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session transcript is too large"))?;
+        if io::copy(&mut (&mut input).take(limit), &mut transcript)? != length {
+            return Err(io::Error::other(
+                "session transcript changed during migration",
+            ));
+        }
+
+        for entry in fs::read_dir(&source_blobs.path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("invalid session attachment filename"))?;
+            // Unpublished persistence staging files cannot be referenced by JSONL.
+            if name.starts_with(".pending-") {
+                continue;
+            }
+            if name.len() != 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(io::Error::other("invalid session attachment digest filename"));
+            }
+            source_blobs.validate()?;
+            copy_verified_blob(&entry.path(), name, &target_blobs)?;
+        }
+        source_blobs.validate()?;
+        target_blobs.sync()?;
+        // Make the newly created sidecar directory durable before publishing a
+        // transcript that refers to it, including when it has no blobs yet.
+        super::sync_migration_directory(parent)?;
+        check_identity(source, &input, &identity)?;
+        let current = input.metadata()?;
+        if current.len() != length || current.modified()? != modified {
+            return Err(io::Error::other(
+                "session transcript changed during migration",
+            ));
+        }
+        validate_transcript(transcript.as_file_mut(), target)?;
+        transcript.as_file().sync_all()?;
+        target_blobs.validate()?;
+        drop(
+            transcript
+                .persist_noclobber(target)
+                .map_err(|error| error.error)?,
+        );
+        super::sync_migration_directory(parent)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use base64::Engine as _;
+        use serde_json::json;
+
+        fn fixture(root: &Path) -> (PathBuf, PathBuf, String, Vec<u8>) {
+            let source = root.join("legacy.jsonl");
+            let target = root.join("sessions/workspace/legacy.jsonl");
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let bytes = vec![0x61; 70 * 1024];
+            let name = crate::package_manager::hex_encode(&Sha256::digest(&bytes));
+            let directory = PinnedDirectory::open(sidecar_path(&source), true).unwrap();
+            let mut blob = session_store_v2::open_regular_file_for_write(
+                &directory.path.join(&name),
+                true,
+                ArtifactWriteMode::CreateNew,
+            )
+            .unwrap();
+            blob.write_all(&bytes).unwrap();
+            let mut session = session_store_v2::open_regular_file_for_write(
+                &source,
+                true,
+                ArtifactWriteMode::CreateNew,
+            )
+            .unwrap();
+            writeln!(
+                session,
+                "{}",
+                json!({"type":"session","version":3,"id":"legacy","cwd":"/workspace"})
+            )
+            .unwrap();
+            writeln!(
+                session,
+                "{}",
+                json!({
+                    "type":"message","id":"m1","parentId":null,
+                    "timestamp":"2026-10-13T00:00:00.000Z",
+                    "message":{"role":"user","timestamp":1,"content":[{
+                        "type":"image","mimeType":"image/png",
+                        "data":{"$piBlob":format!("sha256:{name}"),"sizeBytes":bytes.len(),"encoding":"base64"}
+                    }]}
+                })
+            )
+            .unwrap();
+            (source, target, name, bytes)
+        }
+
+        #[test]
+        fn copies_exact_transcript_and_media_and_retains_the_complete_source() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, name, bytes) = fixture(temp.path());
+            let transcript = fs::read(&source).unwrap();
+            copy(&source, &target).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), transcript);
+            assert_eq!(fs::read(&source).unwrap(), transcript);
+            assert_eq!(fs::read(sidecar_path(&target).join(&name)).unwrap(), bytes);
+            assert_eq!(fs::read(sidecar_path(&source).join(&name)).unwrap(), bytes);
+            let line = String::from_utf8(transcript).unwrap();
+            let line = line.lines().nth(1).unwrap();
+            // Exercise native hydration, not just the byte-copy helper.
+            let entry = crate::session::attachments::decode_entry(Some(&target), line).unwrap();
+            let value = serde_json::to_value(entry).unwrap();
+            let encoded = value["message"]["content"][0]["data"].as_str().unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap(),
+                bytes
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for path in [
+                    &target,
+                    &sidecar_path(&target),
+                    &sidecar_path(&target).join(&name),
+                ] {
+                    assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn corrupt_source_never_publishes_a_transcript_or_removes_original_data() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, name, bytes) = fixture(temp.path());
+            let blob = sidecar_path(&source).join(&name);
+            fs::write(&blob, vec![0x62; bytes.len()]).unwrap();
+            let transcript = fs::read(&source).unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert!(!target.exists());
+            assert_eq!(fs::read(&source).unwrap(), transcript);
+            assert_eq!(fs::read(&blob).unwrap(), vec![0x62; bytes.len()]);
+        }
+
+        #[test]
+        fn missing_or_malformed_references_never_publish_a_transcript() {
+            for bad_size in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (source, target, name, _) = fixture(temp.path());
+                if bad_size {
+                    let text = fs::read_to_string(&source).unwrap();
+                    let mut lines = text.lines();
+                    let header = lines.next().unwrap();
+                    let mut entry: serde_json::Value =
+                        serde_json::from_str(lines.next().unwrap()).unwrap();
+                    entry["message"]["content"][0]["data"]["sizeBytes"] = json!(1);
+                    fs::write(&source, format!("{header}\n{entry}\n")).unwrap();
+                } else {
+                    fs::remove_file(sidecar_path(&source).join(&name)).unwrap();
+                }
+                let transcript = fs::read(&source).unwrap();
+                assert!(copy(&source, &target).is_err());
+                assert!(!target.exists());
+                assert_eq!(fs::read(&source).unwrap(), transcript);
+            }
+        }
+
+        #[test]
+        fn retries_reuse_only_verified_copies_and_never_replace_existing_blobs() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, name, bytes) = fixture(temp.path());
+            let target_blobs = PinnedDirectory::open(sidecar_path(&target), true).unwrap();
+            copy_verified_blob(&sidecar_path(&source).join(&name), &name, &target_blobs).unwrap();
+            copy(&source, &target).unwrap();
+            assert_eq!(fs::read(sidecar_path(&target).join(&name)).unwrap(), bytes);
+
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, name, bytes) = fixture(temp.path());
+            let directory = PinnedDirectory::open(sidecar_path(&target), true).unwrap();
+            let mut blob = session_store_v2::open_regular_file_for_write(
+                &directory.path.join(&name),
+                true,
+                ArtifactWriteMode::CreateNew,
+            )
+            .unwrap();
+            let corrupt = vec![0x62; bytes.len()];
+            blob.write_all(&corrupt).unwrap();
+            drop(blob);
+            assert!(copy(&source, &target).is_err());
+            assert!(!target.exists());
+            assert_eq!(fs::read(directory.path.join(&name)).unwrap(), corrupt);
+            assert_eq!(fs::read(sidecar_path(&source).join(&name)).unwrap(), bytes);
+        }
+
+        #[test]
+        fn occupied_destination_and_native_persistence_locks_are_respected() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, _, _) = fixture(temp.path());
+            // Hold the actual persistence guard, not our helper, to establish that
+            // a running native session and startup migration mutually exclude.
+            let guard = crate::session::lock_session_persistence(&source).unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert!(!target.exists());
+            drop(guard);
+            let guard = crate::session::lock_session_persistence(&target).unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert!(!target.exists());
+            drop(guard);
+            fs::write(&target, b"other session").unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"other session");
+            assert!(source.exists());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinked_attachment_or_destination_is_never_followed() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, name, bytes) = fixture(temp.path());
+            let original_blob = sidecar_path(&source).join(&name);
+            let moved_blob = temp.path().join("outside");
+            fs::rename(&original_blob, &moved_blob).unwrap();
+            std::os::unix::fs::symlink(&moved_blob, &original_blob).unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert!(!target.exists());
+            assert_eq!(fs::read(&moved_blob).unwrap(), bytes);
+            assert!(source.exists());
+
+            let temp = tempfile::tempdir().unwrap();
+            let (source, target, _, _) = fixture(temp.path());
+            let missing = temp.path().join("missing");
+            std::os::unix::fs::symlink(&missing, &target).unwrap();
+            assert!(copy(&source, &target).is_err());
+            assert_eq!(fs::read_link(&target).unwrap(), missing);
+            assert!(!missing.exists());
+            assert!(source.exists());
+        }
+
+        #[test]
+        fn startup_migrates_blob_backed_sessions_once_and_retains_a_recovery_copy() {
+            let temp = tempfile::tempdir().unwrap();
+            let (source, _, name, bytes) = fixture(temp.path());
+            let cwd = Path::new("/workspace");
+            let target = temp
+                .path()
+                .join("sessions")
+                .join(crate::session::encode_cwd(cwd))
+                .join("legacy.jsonl");
+            let original = fs::read(&source).unwrap();
+            let first = super::super::run_startup_migrations_with_agent_dir(temp.path(), cwd);
+            assert_eq!(first.migrated_session_files, 1, "{:?}", first.warnings);
+            assert!(
+                first
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("recovery copy"))
+            );
+            assert_eq!(fs::read(&target).unwrap(), original);
+            assert_eq!(fs::read(&source).unwrap(), original);
+            assert_eq!(fs::read(sidecar_path(&target).join(&name)).unwrap(), bytes);
+            let second = super::super::run_startup_migrations_with_agent_dir(temp.path(), cwd);
+            assert_eq!(second.migrated_session_files, 0);
+            assert_eq!(fs::read(&target).unwrap(), original);
+            assert_eq!(fs::read(sidecar_path(&source).join(&name)).unwrap(), bytes);
         }
     }
 }
