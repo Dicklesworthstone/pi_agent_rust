@@ -119,18 +119,26 @@ pub fn redact_inputs_with_vault(
 /// Keeping JSON structure preserves assignment context and anchored patterns.
 /// The supplied vault must be a private projection snapshot. Successful scans
 /// retain discoveries for subsequent projections without changing a live Agent.
+/// Secret-bearing primitives become non-restorable text in this descriptive
+/// projection; clean primitives retain their types. Never use this projection
+/// as executable tool arguments or write it back into the original transcript.
 pub fn redact_json_with_vault(
     value: &serde_json::Value,
     privacy: &AuxiliaryPrivacy,
     known_secrets: &mut crate::secrets::SecretVault,
 ) -> Result<serde_json::Value> {
     let mut vault = known_secrets.clone();
-    let (protected, _) = crate::secrets::transform_outbound_json(
+    // Discover over the complete structure before masking any field. Unlike
+    // executable arguments, a summary does not need to round-trip credentials:
+    // refusing a numeric match here can make a long session uncompactionable.
+    // Keep the operational transform's strict primitive policy unchanged.
+    crate::secrets::discover_outbound_json(
         value,
         &mut vault,
         privacy.mode,
         &privacy.extra_patterns,
     )?;
+    let protected = crate::secrets::mask_known_json(value, &vault)?;
     let protected = redact_json_placeholders(protected, &vault)?;
     *known_secrets = vault;
     Ok(protected)
@@ -420,6 +428,179 @@ mod tests {
         let error = redact_inputs_with_vault(&[known], &block, &vault).unwrap_err();
         assert!(error.to_string().contains("PI_SECRET_BLOCK"));
         assert!(!error.to_string().contains(known));
+    }
+
+    #[test]
+    fn auxiliary_projection_redacts_numeric_assignments_and_prior_echoes() {
+        let number = 1_234_567_890_123_456_u64;
+        let source = serde_json::json!([
+            number,
+            format!("earlier echo: {number}"),
+            {"api_key": number, "limit": 3, "enabled": true, "optional": null}
+        ]);
+        let original = source.clone();
+        let mut vault = crate::secrets::SecretVault::default();
+        let protected =
+            redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
+                .expect("descriptive context can redact a numeric credential");
+        assert_eq!(
+            protected,
+            serde_json::json!([
+                "<pi-secret:redacted>",
+                "earlier echo: <pi-secret:redacted>",
+                {"api_key": "<pi-secret:redacted>", "limit": 3, "enabled": true, "optional": null}
+            ])
+        );
+        assert_eq!(
+            source, original,
+            "persisted/executable source remains untouched"
+        );
+        assert!(!protected.to_string().contains(&number.to_string()));
+        // The private projection snapshot retains discoveries for later chunks.
+        let later = redact_json_with_vault(
+            &serde_json::json!({"echo": number}),
+            &AuxiliaryPrivacy::default(),
+            &mut vault,
+        )
+        .expect("remembered numeric echo");
+        assert_eq!(later, serde_json::json!({"echo": "<pi-secret:redacted>"}));
+        assert_eq!(vault.restore(&protected.to_string()), protected.to_string());
+    }
+
+    #[test]
+    fn auxiliary_projection_patterns_cover_primitives_without_erasing_clean_types() {
+        let source = serde_json::json!({
+            "number": 731942, "boolean": true, "missing": null,
+            "echo": "true", "embedded": "prefix731942suffix",
+            "clean": [42, 1.25, false, "ordinary"]
+        });
+        for mode in ["obfuscate", "off"] {
+            let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: Some(vec![r"^(731942|true|null)$".to_string()]),
+            }));
+            let protected = redact_json_with_vault(
+                &source,
+                &privacy,
+                &mut crate::secrets::SecretVault::default(),
+            )
+            .expect("auxiliary privacy floor includes scalar matches");
+            assert_eq!(
+                protected,
+                serde_json::json!({
+                    "number": "<pi-secret:redacted>",
+                    "boolean": "<pi-secret:redacted>",
+                    "missing": "<pi-secret:redacted>",
+                    "echo": "<pi-secret:redacted>",
+                    "embedded": "prefix<pi-secret:redacted>suffix",
+                    "clean": [42, 1.25, false, "ordinary"]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_projection_preserves_clean_structured_values_exactly() {
+        let source = serde_json::json!({
+            "arguments": {"line": 31, "ratio": -0.125, "recursive": false},
+            "items": [null, true, false, 0, "  α\r\n\\quoted\"  ", {}, []]
+        });
+        let mut vault = crate::secrets::SecretVault::default();
+        assert_eq!(
+            redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault).unwrap(),
+            source
+        );
+        assert_eq!(vault.len(), 0);
+    }
+
+    #[test]
+    fn auxiliary_block_policy_still_refuses_detected_and_remembered_primitives() {
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^(731942|true|null)$".to_string()]),
+        }));
+        for source in [
+            serde_json::json!({"api_key": 1_234_567_890_123_456_u64}),
+            serde_json::json!(731942),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut vault = crate::secrets::SecretVault::default();
+            let error = redact_json_with_vault(&source, &privacy, &mut vault).unwrap_err();
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(vault.len(), 0, "refusal must not commit discoveries");
+        }
+        let mut vault = crate::secrets::SecretVault::default();
+        let number = "900123";
+        let _ = crate::secrets::obfuscate(
+            number,
+            &mut vault,
+            &[regex::Regex::new(r"^900123$").unwrap()],
+        );
+        let error = redact_json_with_vault(&serde_json::json!(900123), &privacy, &mut vault)
+            .expect_err("remembered values remain blocked without a matching current pattern");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+        assert!(!error.to_string().contains(number));
+        assert_eq!(vault.len(), 1);
+    }
+
+    #[test]
+    fn auxiliary_numeric_redaction_does_not_weaken_operational_argument_validation() {
+        let source = serde_json::json!({"api_key": 1_234_567_890_123_456_u64});
+        let mut vault = crate::secrets::SecretVault::default();
+        let error = crate::secrets::transform_outbound_json(
+            &source,
+            &mut vault,
+            crate::secrets::SecretsMode::Obfuscate,
+            &[],
+        )
+        .expect_err("executable arguments must not change numeric credentials into strings");
+        assert!(error.to_string().contains("PI_SECRET_JSON_PRIMITIVE"));
+        assert_eq!(vault.len(), 0);
+        assert!(source["api_key"].is_number());
+    }
+
+    #[test]
+    fn auxiliary_key_collision_rolls_back_all_new_discoveries() {
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            extra_patterns: Some(vec![r"ACME-\d{4}".to_string()]),
+            ..Default::default()
+        }));
+        let source = serde_json::json!({"ACME-1111": 1, "ACME-2222": 2});
+        let original = source.clone();
+        let mut vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate(
+            "API_KEY=rememberedCredentialValue123456",
+            &mut vault,
+            &[],
+        );
+        let before = vault.mask("rememberedCredentialValue123456");
+        let error = redact_json_with_vault(&source, &privacy, &mut vault)
+            .expect_err("non-restorable key markers must not discard an object member");
+        assert!(error.to_string().contains("PI_AUXILIARY_KEY_COLLISION"));
+        assert!(!error.to_string().contains("ACME-"));
+        assert_eq!(vault.len(), 1);
+        assert_eq!(vault.mask("rememberedCredentialValue123456"), before);
+        assert_eq!(vault.mask("ACME-1111 ACME-2222"), "ACME-1111 ACME-2222");
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn auxiliary_depth_refusal_does_not_commit_earlier_discoveries() {
+        let mut nested = serde_json::json!(42);
+        for _ in 0..130 {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        let source = serde_json::json!([
+            {"api_key": 1_234_567_890_123_456_u64},
+            nested
+        ]);
+        let mut vault = crate::secrets::SecretVault::default();
+        let error = redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
+            .expect_err("the existing structured depth bound remains authoritative");
+        assert!(error.to_string().contains("PI_SECRET_JSON_DEPTH"));
+        assert_eq!(vault.len(), 0);
+        assert_eq!(vault.mask("1234567890123456"), "1234567890123456");
     }
 
     #[test]
