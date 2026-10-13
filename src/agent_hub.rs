@@ -161,6 +161,9 @@ pub struct AgentHubRegistry {
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
+    /// Only an exclusively created namespace belongs to this registry.
+    /// Explicit test directories and stale PID directories are never retired.
+    owns_dir: bool,
 }
 
 pub(crate) struct RevivalSource {
@@ -209,25 +212,81 @@ impl AgentHubRegistry {
     #[doc(hidden)]
     pub fn set_dir_for_tests(&mut self, dir: PathBuf) {
         self.dir = Some(dir);
+        self.owns_dir = false;
     }
 
-    /// Artifacts directory for hub files: `<global_dir>/agent-hub/<pid>/`.
-    /// Created lazily; per-process so concurrent sessions never share files.
+    /// Allocate one private namespace per registry, not merely per OS PID.
+    /// A crashed process can leave queued instructions and transcripts behind;
+    /// PID reuse must never turn those files into a new child's input/history.
     fn dir(&mut self) -> Result<PathBuf> {
-        let dir = self.dir.clone().unwrap_or_else(|| {
-            crate::config::Config::global_dir()
-                .join("agent-hub")
-                .join(std::process::id().to_string())
-        });
-        // Idempotent: also covers pre-set test dirs that were never created.
-        fs::create_dir_all(&dir).map_err(|e| {
+        self.dir_in(&crate::config::Config::global_dir().join("agent-hub"))
+    }
+
+    fn dir_in(&mut self, root: &Path) -> Result<PathBuf> {
+        if let Some(dir) = &self.dir {
+            if self.owns_dir {
+                // Do not silently recreate a vanished namespace or adopt a
+                // symlink: older children still reference its original files.
+                let metadata = fs::symlink_metadata(dir).map_err(|error| {
+                    Error::tool(
+                        "hub",
+                        format!("inspect hub dir {}: {error}", dir.display()),
+                    )
+                })?;
+                if !metadata.file_type().is_dir() {
+                    return Err(Error::tool(
+                        "hub",
+                        "agent-hub namespace is no longer a directory",
+                    ));
+                }
+            } else {
+                // Explicit test overrides remain caller-owned, including
+                // fixtures that supply a directory which does not exist yet.
+                fs::create_dir_all(dir).map_err(|error| {
+                    Error::tool(
+                        "hub",
+                        format!("create hub test dir {}: {error}", dir.display()),
+                    )
+                })?;
+            }
+            return Ok(dir.clone());
+        }
+        fs::create_dir_all(root).map_err(|error| {
             Error::tool(
                 "hub",
-                format!("create agent-hub dir {}: {e}", dir.display()),
+                format!("create agent-hub root {}: {error}", root.display()),
             )
         })?;
-        self.dir = Some(dir.clone());
-        Ok(dir)
+        for _ in 0..16 {
+            let dir = root.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            // Exclusive creation, never create_dir_all on the random leaf.
+            // Even a collision must not adopt existing queues or recovery files.
+            match builder.create(&dir) {
+                Ok(()) => {
+                    self.dir = Some(dir.clone());
+                    self.owns_dir = true;
+                    return Ok(dir);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(Error::tool(
+                        "hub",
+                        format!("create private hub dir {}: {error}", dir.display()),
+                    ));
+                }
+            }
+        }
+        Err(Error::tool(
+            "hub",
+            "could not allocate an unused agent-hub namespace",
+        ))
     }
 
     /// Register a child at spawn time. Returns the assigned run id.
@@ -392,11 +451,14 @@ impl AgentHubRegistry {
             return;
         };
         entry.output_bytes = entry.output_bytes.saturating_add(line.len());
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&entry.transcript_path)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(&entry.transcript_path) {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -583,12 +645,48 @@ impl AgentHubRegistry {
         Ok((entry, task))
     }
 
-    /// Remove this session's hub artifacts directory (session exit).
+    /// Remove only this registry's retired namespace (session exit).
+    /// Busy registries, live children and unfinished native cleanup retain
+    /// their files. No PID-derived directory or caller-owned fixture is removed.
     pub fn cleanup_session_files() {
-        let dir = crate::config::Config::global_dir()
-            .join("agent-hub")
-            .join(std::process::id().to_string());
-        let _ = fs::remove_dir_all(dir);
+        if let Some(registry) = REGISTRY.get() {
+            cleanup_registry_files(registry);
+        }
+    }
+
+    fn take_retired_dir(&mut self) -> Option<PathBuf> {
+        if !self.owns_dir
+            || !self.live_processes.is_empty()
+            || !self.active_executions.is_empty()
+            || self.entries.values().any(|entry| !entry.status.settled())
+        {
+            return None;
+        }
+        self.owns_dir = false;
+        self.dir.take()
+    }
+}
+
+fn cleanup_registry_files(registry: &Mutex<AgentHubRegistry>) {
+    let Ok(mut hub) = registry.try_lock() else {
+        return;
+    };
+    let Some(dir) = hub.take_retired_dir() else {
+        return;
+    };
+    // A subsequent registration gets a different namespace. Filesystem cleanup
+    // must not hold the hub mutex or sweep sibling sessions/recovery artifacts.
+    drop(hub);
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if let Err(error) = fs::remove_dir_all(&dir) {
+                tracing::warn!(path = %dir.display(), %error, "could not remove retired hub files");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            tracing::warn!(path = %dir.display(), "retired hub path changed; leaving it in place");
+        }
     }
 }
 
@@ -961,6 +1059,263 @@ mod tests {
 
     fn poll_until_ready(path: &Path) -> SteerDrain {
         poll_until_uncontended(path).expect("steering poll")
+    }
+
+    #[test]
+    fn fresh_namespace_never_adopts_a_stale_pid_queue_or_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(std::process::id().to_string());
+        fs::create_dir(&legacy).unwrap();
+        let frame = BusMessage {
+            seq: 1,
+            from: "old-parent".to_string(),
+            to: "worker-1".to_string(),
+            body: "instruction from a crashed session".to_string(),
+            sent_ms: 0,
+        };
+        let mut wire = serde_json::to_vec(&frame).unwrap();
+        wire.push(b'\n');
+        for name in ["worker-1.steer", "worker-1.draining"] {
+            fs::write(legacy.join(name), &wire).unwrap();
+        }
+        let transcript = legacy.join("worker-1.transcript.jsonl");
+        fs::write(&transcript, "old session transcript\n").unwrap();
+
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "new assignment").unwrap();
+        assert_eq!(child.id, "worker-1");
+        assert_ne!(dir, legacy);
+        assert_eq!(child.steer_path.parent(), Some(dir.as_path()));
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
+        assert_eq!(reg.transcript_page(&child.id).unwrap(), "");
+        assert!(reg.inbox(&child.id).is_empty());
+        for name in ["worker-1.steer", "worker-1.draining"] {
+            assert_eq!(fs::read(legacy.join(name)).unwrap(), wire);
+        }
+        assert_eq!(
+            fs::read_to_string(transcript).unwrap(),
+            "old session transcript\n"
+        );
+    }
+
+    #[test]
+    fn registries_in_the_same_process_have_independent_disk_delivery_and_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = fresh_registry();
+        let first_dir = first.dir_in(temp.path()).unwrap();
+        let a = first.register("worker", "assignment A").unwrap();
+        first.steer(&a.id, "parent", "only A").unwrap();
+        first.append_transcript(&a.id, "progress A");
+        let recovering = a.steer_path.with_extension("draining");
+        fs::rename(&a.steer_path, &recovering).unwrap();
+        let retained = fs::read(&recovering).unwrap();
+
+        let mut second = fresh_registry();
+        let second_dir = second.dir_in(temp.path()).unwrap();
+        let b = second.register("worker", "assignment B").unwrap();
+        assert_eq!(a.id, b.id);
+        assert_ne!(first_dir, second_dir);
+        second.steer(&b.id, "parent", "only B").unwrap();
+        second.append_transcript(&b.id, "progress B");
+        assert_eq!(
+            poll_until_ready(&b.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] only B".to_string()])
+        );
+        assert_eq!(fs::read(&recovering).unwrap(), retained);
+        assert_eq!(
+            poll_until_ready(&a.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] only A".to_string()])
+        );
+        assert_eq!(first.transcript_page(&a.id).unwrap(), "progress A\n");
+        assert_eq!(second.transcript_page(&b.id).unwrap(), "progress B\n");
+    }
+
+    #[test]
+    fn namespace_is_stable_for_children_and_failed_creation_is_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("hub-root");
+        fs::write(&root, "do not overwrite").unwrap();
+        let mut reg = fresh_registry();
+        assert!(reg.dir_in(&root).is_err());
+        assert!(reg.dir.is_none());
+        assert!(!reg.owns_dir);
+        assert_eq!(reg.seq, 0);
+        assert!(reg.roster().is_empty());
+        assert_eq!(fs::read_to_string(&root).unwrap(), "do not overwrite");
+        fs::rename(&root, temp.path().join("retained-file")).unwrap();
+
+        let dir = reg.dir_in(&root).unwrap();
+        let first = reg.register("worker", "first").unwrap();
+        let second = reg.register("worker", "second").unwrap();
+        assert_eq!(first.steer_path.parent(), Some(dir.as_path()));
+        assert_eq!(second.steer_path.parent(), Some(dir.as_path()));
+        let unrelated = temp.path().join("different-root");
+        assert_eq!(reg.dir_in(&unrelated).unwrap(), dir);
+        assert!(
+            !unrelated.exists(),
+            "a cached namespace must not change roots"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_owned_namespace_is_not_recreated_for_later_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "first").unwrap();
+        reg.steer(&child.id, "parent", "retained input").unwrap();
+        let wire = fs::read(&child.steer_path).unwrap();
+        let moved = temp.path().join("retained-namespace");
+        fs::rename(&dir, &moved).unwrap();
+
+        assert!(
+            reg.register("worker", "must not adopt a fresh directory")
+                .is_err()
+        );
+        assert_eq!(reg.seq, 1);
+        assert_eq!(reg.roster().len(), 1);
+        assert!(!dir.exists());
+        assert_eq!(
+            fs::read(moved.join(child.steer_path.file_name().unwrap())).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn cleanup_waits_for_starting_running_and_native_writeback_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.steer(&child.id, "parent", "pending").unwrap();
+        let bytes = fs::read(&child.steer_path).unwrap();
+        let registry = Mutex::new(reg);
+        cleanup_registry_files(&registry);
+        assert_eq!(fs::read(&child.steer_path).unwrap(), bytes);
+
+        registry.lock().unwrap().mark_running(&child.id, 4242);
+        cleanup_registry_files(&registry);
+        assert!(dir.exists());
+        {
+            let mut hub = registry.lock().unwrap();
+            hub.mark_process_reaped(&child.id);
+            hub.active_executions.insert(child.id.clone());
+        }
+        cleanup_registry_files(&registry);
+        assert!(dir.exists(), "reap alone is not completed writeback");
+        registry.lock().unwrap().mark_killed(&child.id);
+        cleanup_registry_files(&registry);
+        assert!(
+            dir.exists(),
+            "terminal status does not release the native lease"
+        );
+        registry.lock().unwrap().finish_native_execution(&child.id);
+        cleanup_registry_files(&registry);
+        assert!(!dir.exists());
+        assert!(registry.lock().unwrap().dir.is_none());
+        cleanup_registry_files(&registry);
+        assert!(temp.path().exists());
+    }
+
+    #[test]
+    fn cleanup_removes_only_its_retired_namespace_and_next_use_gets_a_fresh_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(std::process::id().to_string());
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("recovery"), "retain legacy files").unwrap();
+        let mut a = fresh_registry();
+        let a_dir = a.dir_in(temp.path()).unwrap();
+        let first = a.register("worker", "first").unwrap();
+        a.append_transcript(&first.id, "completed work");
+        a.settle(&first.id, ChildStatus::Done);
+        let mut b = fresh_registry();
+        let b_dir = b.dir_in(temp.path()).unwrap();
+        let second = b.register("worker", "unrelated live child").unwrap();
+        b.steer(&second.id, "parent", "do not remove").unwrap();
+        let wire = fs::read(&second.steer_path).unwrap();
+
+        let registry = Mutex::new(a);
+        cleanup_registry_files(&registry);
+        assert!(!a_dir.exists());
+        assert_eq!(fs::read(&second.steer_path).unwrap(), wire);
+        assert_eq!(
+            fs::read_to_string(legacy.join("recovery")).unwrap(),
+            "retain legacy files"
+        );
+        let next = registry.lock().unwrap().dir_in(temp.path()).unwrap();
+        assert_ne!(next, a_dir);
+        assert_ne!(next, b_dir);
+        assert!(next.exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_claim_explicit_caller_owned_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().join("caller-owned"));
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "caller-owned history");
+        reg.settle(&child.id, ChildStatus::Done);
+        let registry = Mutex::new(reg);
+        cleanup_registry_files(&registry);
+        assert_eq!(
+            fs::read_to_string(child.transcript_path).unwrap(),
+            "caller-owned history\n"
+        );
+        assert!(registry.lock().unwrap().dir.is_some());
+        assert!(fresh_registry().take_retired_dir().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_namespaces_and_transcripts_are_private_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "private transcript");
+        reg.steer(&child.id, "parent", "private instruction").unwrap();
+        for path in [
+            dir,
+            child.transcript_path,
+            child.steer_path.with_extension("steer.lock"),
+            child.steer_path,
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_namespace_symlink_is_neither_adopted_nor_cleaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "original history");
+        let retained = temp.path().join("retained");
+        fs::rename(&dir, &retained).unwrap();
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep"), "unrelated data").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &dir).unwrap();
+        assert!(reg.register("worker", "must not follow the link").is_err());
+        assert_eq!(reg.seq, 1);
+        reg.settle(&child.id, ChildStatus::Done);
+        cleanup_registry_files(&Mutex::new(reg));
+        assert_eq!(fs::read_link(dir).unwrap(), unrelated);
+        assert_eq!(
+            fs::read_to_string(unrelated.join("keep")).unwrap(),
+            "unrelated data"
+        );
+        assert_eq!(
+            fs::read_to_string(retained.join(child.transcript_path.file_name().unwrap())).unwrap(),
+            "original history\n"
+        );
     }
 
     #[test]
