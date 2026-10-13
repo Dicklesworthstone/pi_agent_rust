@@ -18,7 +18,9 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 mod driver;
+mod rpc;
 pub use driver::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalRunStop, GoalSession};
+pub(crate) use rpc::{rpc_goal_command, rpc_goal_state};
 
 #[cfg(test)]
 mod tests;

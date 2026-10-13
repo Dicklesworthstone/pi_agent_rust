@@ -299,6 +299,7 @@ fn command_can_advance_rpc_session(command_type: &str) -> bool {
             | "steer"
             | "follow_up"
             | "set_plan_mode"
+            | "goal"
             | "approve_plan"
             | "reject_plan"
             | "set_model"
@@ -360,6 +361,10 @@ fn command_payload_can_advance_rpc_session(
             parsed.get("provider").and_then(Value::as_str).is_some()
                 && parsed.get("modelId").and_then(Value::as_str).is_some()
         }
+        "goal" => parsed
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(|op| matches!(op, "create" | "resume" | "pause" | "drop")),
         "set_thinking_level" => parsed
             .get("level")
             .and_then(Value::as_str)
@@ -2888,6 +2893,51 @@ pub async fn run(
                     handle.abort();
                 }
                 let _ = out_tx.send(response_ok(id, "abort", None));
+            }
+
+            "goal" => {
+                let op = parsed.get("op").and_then(Value::as_str);
+                if op == Some("get") {
+                    let result = {
+                        let inner = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
+                            .await
+                            .map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                        crate::goal::rpc_goal_state(&inner)
+                    };
+                    match result {
+                        Ok(data) => {
+                            let _ = out_tx.send(response_ok(id, "goal", Some(data)));
+                        }
+                        Err(error) => {
+                            let _ = out_tx.send(response_error_with_hints(id, "goal", &error));
+                        }
+                    }
+                    continue;
+                }
+                if rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "goal",
+                        "Goal lifecycle changes require an idle RPC session".to_string(),
+                    ));
+                    continue;
+                }
+                let result = {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    crate::goal::rpc_goal_command(&mut guard, &cx, &parsed).await
+                };
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "goal", Some(data)));
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "goal", &error));
+                    }
+                }
             }
 
             "set_plan_mode" => {
