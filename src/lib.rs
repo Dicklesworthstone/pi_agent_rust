@@ -306,6 +306,7 @@ pub mod session_metrics;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod session_picker;
+pub mod session_recovery;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
