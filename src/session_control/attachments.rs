@@ -97,6 +97,75 @@ impl SessionControlHandle {
         self.enqueue_content(InputKind::FollowUp, content, authored_source)
     }
 
+    /// Correct unclaimed input without retracting it or moving it to the tail.
+    /// The replacement stays in the original steering/follow-up lane. Text is
+    /// treated as user-authored, exactly as with `steer` and `follow_up`.
+    ///
+    /// `Some(new_id)` retires the old identity: a stale editor cannot overwrite
+    /// or retract the correction. `None` means that identity is no longer in
+    /// this queue (possibly already handed to the agent); it is NOT permission
+    /// to resubmit the text. Validation, capacity and closed-turn errors leave
+    /// the original input untouched. Admission is still not a durable receipt.
+    pub fn replace_pending(&self, id: InputId, text: &str) -> Result<Option<InputId>> {
+        if text.len() > MAX_INPUT_BYTES || text.trim().is_empty() {
+            return Err(control_error(
+                "SESSION_CONTROL_INPUT",
+                "input must be nonblank and at most 256 KiB",
+            ));
+        }
+        self.replace_pending_with_content(id, &UserContent::Text(text.to_string()), text)
+    }
+
+    /// Atomically replace a queued input's native payload and authored source.
+    /// Block order and bytes are preserved; attachments are never flattened,
+    /// re-read or implicitly granted keyword authority. This operation competes
+    /// with fetch/retract under the same mailbox lock, so only the complete old
+    /// or complete new input can be handed off, never both or a mixture.
+    ///
+    /// The original position and lane survive. Byte admission credits the old
+    /// payload, allowing corrections in a count-full queue and smaller edits in
+    /// a byte-full queue. A failed edit does not withdraw accepted work.
+    pub fn replace_pending_with_content(
+        &self,
+        id: InputId,
+        content: &UserContent,
+        authored_source: &str,
+    ) -> Result<Option<InputId>> {
+        let bytes = admitted_bytes(content, authored_source)?;
+        let mut data = lock(&self.run.data);
+        if !data.accepting_input {
+            return Err(control_error(
+                "SESSION_CONTROL_CLOSED",
+                "this turn no longer accepts input",
+            ));
+        }
+        let Some(index) = data.pending.iter().position(|input| input.id == id) else {
+            return Ok(None);
+        };
+        let retained_bytes = data.pending_bytes - data.pending[index].bytes;
+        if bytes > MAX_PENDING_BYTES.saturating_sub(retained_bytes) {
+            return Err(control_error(
+                "SESSION_CONTROL_FULL",
+                "replacement exceeds pending input capacity; original input was retained",
+            ));
+        }
+        // Finish allocation and identity generation before changing the queue.
+        let new_id = InputId(uuid::Uuid::new_v4());
+        let replacement = PendingInput {
+            id: new_id,
+            kind: data.pending[index].kind,
+            text: authored_source.to_string(),
+            content: content.clone(),
+            bytes,
+        };
+        let previous = std::mem::replace(&mut data.pending[index], replacement);
+        data.pending_bytes = retained_bytes + bytes;
+        drop(data);
+        // Large replaced attachments are released outside the mailbox lock.
+        drop(previous);
+        Ok(Some(new_id))
+    }
+
     pub(super) fn enqueue_content(
         &self,
         kind: InputKind,
@@ -235,5 +304,304 @@ mod tests {
         assert_ne!(stale_id, new_id);
         assert!(new.retract(stale_id).is_none());
         assert_eq!(new.retract(new_id).unwrap().text, "new input");
+    }
+
+    #[test]
+    fn replacement_preserves_position_lane_and_exact_authored_text() {
+        let (control, _guard, _) = live();
+        let first = control.follow_up("first").unwrap();
+        let old = control.steer("draft").unwrap();
+        let last = control.follow_up("last").unwrap();
+        let replacement = "  corrected\nrequest  ";
+        let new = control.replace_pending(old, replacement).unwrap().unwrap();
+        assert_ne!(new, old);
+        assert!(control.retract(old).is_none());
+        assert_eq!(control.replace_pending(old, "stale edit").unwrap(), None);
+        assert_eq!(control.snapshot().handed_to_agent, 0);
+        let pending = control.take_pending();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|input| (input.id, input.kind, input.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (first, InputKind::FollowUp, "first"),
+                (new, InputKind::Steering, replacement),
+                (last, InputKind::FollowUp, "last"),
+            ]
+        );
+        assert!(matches!(
+            &pending[1].content,
+            UserContent::Text(text) if text == replacement
+        ));
+        assert_eq!(control.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn native_replacement_preserves_images_media_and_keyword_provenance() {
+        let (control, _guard, _) = live();
+        let old = control.follow_up("before attachments were ready").unwrap();
+        let mut content = attachment();
+        let UserContent::Blocks(blocks) = &mut content else {
+            panic!("fixture is native content");
+        };
+        blocks.insert(
+            1,
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "AP+A/w==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            }),
+        );
+        control
+            .replace_pending_with_content(old, &content, "inspect the files")
+            .unwrap()
+            .unwrap();
+        assert!(control.run.fetch(InputKind::Steering).is_empty());
+        let claimed = control.run.fetch(InputKind::FollowUp);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].keyword_scan_source(),
+            Some("inspect the files")
+        );
+        let Message::User(user) = claimed[0].message() else {
+            panic!("native user input");
+        };
+        assert_eq!(
+            serde_json::to_value(&user.content).unwrap(),
+            serde_json::to_value(&content).unwrap()
+        );
+        assert_eq!(control.snapshot().pending_bytes, 0);
+        assert_eq!(control.snapshot().handed_to_agent, 1);
+        assert!(control.run.fetch(InputKind::FollowUp).is_empty());
+    }
+
+    #[test]
+    fn replacement_is_allowed_at_the_input_count_limit() {
+        let (control, _guard, _) = live();
+        let old = control.steer("before").unwrap();
+        for _ in 1..MAX_PENDING_INPUTS {
+            control.follow_up("occupied").unwrap();
+        }
+        assert!(control.steer("does not fit").is_err());
+        let corrected = control
+            .replace_pending(old, "corrected without reordering")
+            .unwrap()
+            .unwrap();
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.pending_steering, 1);
+        assert_eq!(snapshot.pending_follow_up, MAX_PENDING_INPUTS - 1);
+        let pending = control.take_pending();
+        assert_eq!(pending[0].id, corrected);
+        assert_eq!(pending[0].text, "corrected without reordering");
+    }
+
+    #[test]
+    fn replacement_credits_old_bytes_and_refuses_growth_without_losing_input() {
+        let (control, _guard, _) = live();
+        let old = control.steer("original").unwrap();
+        // Two native text payloads occupy every remaining counted byte.
+        let large = UserContent::Text("x".repeat(MAX_CONTENT_BYTES - 2));
+        control.follow_up_with_content(&large, "").unwrap();
+        let remaining = MAX_PENDING_BYTES - control.snapshot().pending_bytes;
+        let rest = UserContent::Text("y".repeat(remaining - 2));
+        control.follow_up_with_content(&rest, "").unwrap();
+        let full = control.snapshot();
+        assert_eq!(full.pending_bytes, MAX_PENDING_BYTES);
+        let error = control
+            .replace_pending(old, "larger than the original input")
+            .unwrap_err();
+        assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
+        assert_eq!(control.snapshot(), full);
+        let corrected = control.replace_pending(old, "a").unwrap().unwrap();
+        let refunded =
+            admitted_bytes(&UserContent::Text("original".to_string()), "original").unwrap()
+                - admitted_bytes(&UserContent::Text("a".to_string()), "a").unwrap();
+        assert_eq!(
+            control.snapshot().pending_bytes,
+            MAX_PENDING_BYTES - refunded
+        );
+        control
+            .steer("z")
+            .expect("refunded bytes admit later input");
+        let pending = control.take_pending();
+        assert_eq!(pending[0].id, corrected);
+        assert_eq!(pending[0].text, "a");
+        assert_eq!(pending.len(), 4);
+        assert_eq!(control.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn invalid_replacements_leave_the_original_identity_and_payload_intact() {
+        let (control, _guard, _) = live();
+        let content = attachment();
+        let old = control
+            .steer_with_content(&content, "keep original")
+            .unwrap();
+        let before = control.snapshot();
+        for bad in [
+            UserContent::Blocks(Vec::new()),
+            UserContent::Text(" \n ".to_string()),
+            UserContent::Text("\u{0001}".repeat(MAX_CONTENT_BYTES / 2)),
+            UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("x"));
+                MAX_CONTENT_BLOCKS + 1
+            ]),
+        ] {
+            assert!(
+                control
+                    .replace_pending_with_content(old, &bad, "valid source")
+                    .is_err()
+            );
+            assert_eq!(control.snapshot(), before);
+        }
+        assert!(
+            control
+                .replace_pending_with_content(old, &content, &"x".repeat(MAX_INPUT_BYTES + 1))
+                .is_err()
+        );
+        assert!(control.replace_pending(old, " ").is_err());
+        assert!(
+            control
+                .replace_pending(old, &"x".repeat(MAX_INPUT_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(control.snapshot(), before);
+        let retained = control
+            .retract(old)
+            .expect("failed edits must not retire the original");
+        assert_eq!(retained.text, "keep original");
+        assert_eq!(
+            serde_json::to_value(retained.content).unwrap(),
+            serde_json::to_value(content).unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_or_handed_off_id_is_not_requeued_by_an_edit() {
+        let (control, _guard, _) = live();
+        let consumed = control.steer("consumed").unwrap();
+        control.run.fetch(InputKind::Steering);
+        let retracted = control.follow_up("withdrawn").unwrap();
+        control.retract(retracted).unwrap();
+        let (other, _other_guard, _) = live();
+        let foreign = other.steer("other turn").unwrap();
+        let before = control.snapshot();
+        for id in [consumed, retracted, foreign] {
+            assert_eq!(
+                control.replace_pending(id, "must not be enqueued").unwrap(),
+                None
+            );
+            assert_eq!(control.snapshot(), before);
+        }
+        assert_eq!(other.retract(foreign).unwrap().text, "other turn");
+        assert_eq!(control.snapshot().handed_to_agent, 1);
+    }
+
+    #[test]
+    fn abort_and_completion_refuse_edits_without_discarding_recoverable_input() {
+        for finished in [false, true] {
+            let (control, guard, _) = live();
+            let old = control.steer("accepted work").unwrap();
+            if finished {
+                drop(guard);
+            } else {
+                assert!(control.abort());
+            }
+            let before = control.snapshot();
+            let error = control.replace_pending(old, "too late").unwrap_err();
+            assert!(error.to_string().contains("SESSION_CONTROL_CLOSED"));
+            assert_eq!(control.snapshot(), before);
+            assert_eq!(control.retract(old).unwrap().text, "accepted work");
+        }
+    }
+
+    #[test]
+    fn competing_editors_cannot_overwrite_a_newer_revision() {
+        let (control, _guard, _) = live();
+        let old = control.steer("original").unwrap();
+        let start = std::sync::Barrier::new(3);
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                start.wait();
+                control.replace_pending(old, "candidate A").unwrap()
+            });
+            let b = scope.spawn(|| {
+                start.wait();
+                control.replace_pending(old, "candidate B").unwrap()
+            });
+            start.wait();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_ne!(
+            a.is_some(),
+            b.is_some(),
+            "exactly one edit owns the old revision"
+        );
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(Some(pending[0].id), a.or(b));
+        assert_eq!(
+            pending[0].text,
+            if a.is_some() { "candidate A" } else { "candidate B" }
+        );
+    }
+
+    #[test]
+    fn racing_fetch_observes_one_complete_input_not_both_revisions() {
+        for _ in 0..32 {
+            let (control, _guard, _) = live();
+            let old = control.steer("original").unwrap();
+            let start = std::sync::Barrier::new(3);
+            let (edited, claimed) = std::thread::scope(|scope| {
+                let edit = scope.spawn(|| {
+                    start.wait();
+                    control.replace_pending(old, "corrected").unwrap()
+                });
+                let fetch = scope.spawn(|| {
+                    start.wait();
+                    control.run.fetch(InputKind::Steering)
+                });
+                start.wait();
+                (edit.join().unwrap(), fetch.join().unwrap())
+            });
+            let expected = if edited.is_some() {
+                "corrected"
+            } else {
+                "original"
+            };
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].keyword_scan_source(), Some(expected));
+            assert_eq!(claimed[0].text_for_display(), Some(expected));
+            assert_eq!(control.snapshot().handed_to_agent, 1);
+            assert_eq!(control.snapshot().pending_bytes, 0);
+            assert!(control.take_pending().is_empty());
+        }
+    }
+
+    #[test]
+    fn corrected_native_input_remains_recoverable_after_the_turn_finishes() {
+        let (source, guard, _) = live();
+        let old = source.follow_up("initial draft").unwrap();
+        let content = attachment();
+        let corrected = source
+            .replace_pending_with_content(old, &content, "corrected source")
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        let receipts = source.transfer_pending_to(&target).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].previous_id, corrected);
+        assert_eq!(receipts[0].kind, InputKind::FollowUp);
+        assert!(target.retract(old).is_none());
+        assert!(target.retract(corrected).is_none());
+        let recovered = target.retract(receipts[0].new_id).unwrap();
+        assert_eq!(recovered.text, "corrected source");
+        assert_eq!(
+            serde_json::to_value(recovered.content).unwrap(),
+            serde_json::to_value(content).unwrap()
+        );
+        assert!(source.take_pending().is_empty());
     }
 }
