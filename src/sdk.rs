@@ -4001,6 +4001,24 @@ mod tests {
         runtime.block_on(Box::pin(future))
     }
 
+    /// `run_async` with a blocking pool, as the CLI runtime has
+    /// (`blocking_threads(1, 2)` in `src/main.rs`). Without a pool,
+    /// asupersync's `spawn_blocking` runs the closure inline, so a test that
+    /// holds the session persistence lock while polling a save would block
+    /// its own thread in `flock` and never get to release the lock.
+    fn run_async_with_blocking_pool<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let reactor = create_reactor().expect("create reactor");
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build runtime");
+        runtime.block_on(Box::pin(future))
+    }
+
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_current_dir_lock()
     }
@@ -4593,7 +4611,7 @@ mod tests {
         let proposed = root.path().join("proposed");
         std::fs::create_dir(&previous).unwrap();
         std::fs::create_dir(&proposed).unwrap();
-        run_async(async {
+        run_async_with_blocking_pool(async {
             handle.add_workspace_root(&previous).await.unwrap();
             let store = handle.session_store();
             let path = store.try_lock().unwrap().path.clone().unwrap();
@@ -4652,7 +4670,7 @@ mod tests {
         let probe = extra.join("probe.txt");
         std::fs::write(&probe, "must remain untouched").unwrap();
         let tools = handle.session.agent.shared_tools().snapshot();
-        run_async(async {
+        run_async_with_blocking_pool(async {
             handle.add_workspace_root(&extra).await.unwrap();
             let store = handle.session_store();
             let path = store.try_lock().unwrap().path.clone().unwrap();
