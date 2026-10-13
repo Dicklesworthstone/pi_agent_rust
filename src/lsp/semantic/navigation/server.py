@@ -46,6 +46,28 @@ def reply(message):
             result["contents"] = [{"language": "rust", "value": "fn alpha()"}, "docs"]
         elif MODE == "bad-hover":
             result["contents"] = ["valid", False]
+    if method == "textDocument/selectionRange":
+        params = message["params"]
+        assert "position" not in params and len(params["positions"]) == 1
+        cursor = params["positions"][0]["character"]
+        inner = span(8, 13) if cursor >= 8 else span(2, 7)
+        result = [{"range": inner, "parent": {"range": span(2, 13),
+                  "parent": {"range": span(0, 13)}}}]
+        if MODE == "selection-none":
+            result = [{"range": span(cursor, cursor)}]
+        elif MODE == "selection-bad-parent":
+            result[0]["parent"] = {"range": span(2, 6)}
+        elif MODE == "selection-surrogate":
+            result[0]["range"] = span(1, 7)
+        elif MODE == "selection-deep":
+            node = {"range": inner}
+            for _ in range(64):
+                node = {"range": inner, "parent": node}
+            result = [node]
+        elif MODE == "selection-partial":
+            send({"jsonrpc": "2.0", "method": "$/progress",
+                  "params": {"token": params["partialResultToken"], "value": result}})
+            result = None
     if MODE == "null":
         result = None
     elif MODE == "empty":
@@ -87,11 +109,14 @@ while True:
         caps = {"textDocumentSync": 1}
         for key in ("definitionProvider", "referencesProvider", "typeDefinitionProvider", "implementationProvider", "hoverProvider"):
             caps[key] = MODE != "disabled"
+        if MODE != "selection-absent":
+            caps["selectionRangeProvider"] = MODE != "disabled"
+        caps["codeActionProvider"] = True
         if MODE == "encoding":
             caps["positionEncoding"] = "utf-8"
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": caps}})
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
-    elif method in ("textDocument/definition", "textDocument/references", "textDocument/typeDefinition", "textDocument/implementation", "textDocument/hover"):
+    elif method in ("textDocument/definition", "textDocument/references", "textDocument/typeDefinition", "textDocument/implementation", "textDocument/hover", "textDocument/selectionRange"):
         if MODE in ("hold", "hang"):
             PENDING = message
             continue
@@ -101,5 +126,13 @@ while True:
                   "params": {"edit": {"changes": {uri: [{"range": span(0, 4), "newText": "wrong"}]}}}})
             (ROOT / "probe.json").write_text(json.dumps(read()), encoding="utf-8")
         reply(message)
+    elif method == "textDocument/codeAction":
+        params = message["params"]
+        assert params["context"]["only"] == ["refactor.extract"]
+        result = [{"title": "Extract selected expression", "kind": "refactor.extract.function",
+                   "edit": {"documentChanges": [{"textDocument": {
+                       "uri": params["textDocument"]["uri"], "version": None}, "edits": [
+                       {"range": params["range"], "newText": "extracted()"}]}]}}]
+        send({"jsonrpc": "2.0", "id": message["id"], "result": result})
     else:
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"barrier": True}})
