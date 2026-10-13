@@ -45,12 +45,14 @@ struct Surface {
 
 /// The complete set of surfaces that build an agent-event callback.
 ///
-/// Four rows for the five surfaces named above: the ftui stack has no callback
-/// of its own, it drives the SDK handle, so `src/sdk.rs` is where its
-/// obligation is discharged and a separate row would assert the same file
-/// twice. The ftui half is covered by
+/// Three rows for the five surfaces named above. Neither the ftui stack nor the
+/// classic stack has a callback of its own: both drive the SDK handle, so
+/// `src/sdk.rs` is where their obligation is discharged and a separate row would
+/// assert the same file again. The ftui half is covered by
 /// `the_sdk_session_can_be_given_a_runtime_to_dispatch_events_on`, which pins
-/// the other thing ftui owes: handing the SDK a runtime to dispatch onto.
+/// the other thing ftui owes: handing the SDK a runtime to dispatch onto. The
+/// classic half is covered by
+/// `the_classic_stack_drives_turns_through_the_sdk_recovery_driver`.
 ///
 /// Adding a surface means adding a row. A row with `routes: false` must carry a
 /// reason that survives review.
@@ -68,13 +70,7 @@ const SURFACES: &[Surface] = &[
         reason: "builds a coalescer and dispatches from both its event paths",
     },
     Surface {
-        name: "classic interactive",
-        file: "src/interactive/agent.rs",
-        routes: true,
-        reason: "builds a coalescer at each of its three agent-driving sites",
-    },
-    Surface {
-        name: "SDK handle (and the default ftui stack, which drives it)",
+        name: "SDK handle (and the default ftui and classic stacks, which drive it)",
         file: "src/sdk.rs",
         routes: true,
         reason: "routes from make_combined_callback, the single fan-out point every SDK event \
@@ -145,6 +141,31 @@ fn every_agent_driving_surface_routes_observation_events_to_extensions() {
          Extensions on a surface that does not route see the four lifecycle events and nothing \
          else, with no error and no warning (bd-82331).",
         missing.join("\n\n")
+    );
+}
+
+/// The classic stack routes by handing every turn to the SDK.
+///
+/// It used to build a coalescer at each of its three agent-driving sites.
+/// Since it moved onto the SDK's recovery driver, its one turn site calls
+/// `run_recoverable_turn`, which builds its callback with
+/// `make_combined_callback`, and that is where the coalescer lives. A classic
+/// turn site that drove the agent directly would bypass the routing again, so
+/// pin both links of the hand-off.
+#[test]
+fn the_classic_stack_drives_turns_through_the_sdk_recovery_driver() {
+    let root = project_root();
+    let classic = read(&root.join("src/interactive/agent.rs"));
+    assert!(
+        has_live_call(&classic, ".run_recoverable_turn("),
+        "src/interactive/agent.rs no longer hands its turns to the SDK recovery driver. Route \
+         its observation events some other way and give it its own SURFACES row (bd-82331)."
+    );
+    let driver = read(&root.join("src/sdk/recovery.rs"));
+    assert!(
+        has_live_call(&driver, "make_combined_callback("),
+        "the SDK recovery driver no longer builds its callback with make_combined_callback, so \
+         turns it drives (the classic stack's) do not reach extensions (bd-82331)."
     );
 }
 

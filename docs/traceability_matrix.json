@@ -230,6 +230,10 @@
           "justification": "SQLite-backed session persistence and retrieval correctness checks."
         },
         {
+          "path": "tests/session_workdir_recovery.rs",
+          "justification": "Explicit session workdir attachment (bd-yutps): bindings survive JSONL/SQLite save and reopen, and SDK resume binds configuration and real tools to the saved workspace or rejects a mismatched or missing one."
+        },
+        {
           "path": "tests/sse_strict_compliance.rs",
           "justification": "Strict Server-Sent Events parsing and protocol compliance verification."
         },
@@ -2247,6 +2251,10 @@
           "justification": "FTUI native Windows console-input lease and restoration on a real ConHost (opt-in lane)."
         },
         {
+          "path": "tests/ftui_reasoning_liveness.rs",
+          "justification": "FTUI mixed-width reasoning liveness (GH #255): wrap progress, stream/resume/abort, and a loopback SSE provider driven through SDK persistence, Program and ANSI presentation under supervised child deadlines."
+        },
+        {
           "path": "tests/e2e_lsp.rs",
           "justification": "LSP bridge exercised end-to-end through the real binary."
         },
@@ -2361,6 +2369,14 @@
         {
           "path": "tests/browser_frames.rs",
           "justification": "Browser frame selection preflight; the live Chromium iframe-input scenario runs in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_forms.rs",
+          "justification": "Browser form actions (select_option, set_checked): schema and preflight without a connection, and verification and replay counts against a loopback CDP peer; the live Chromium DOM scenarios run in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_remote_pointer.rs",
+          "justification": "Native pointer input (click, scroll) into an out-of-process iframe renderer; a live Chromium scenario that runs only in the DSR browser lane."
         },
         {
           "path": "tests/browser_cdp.rs",

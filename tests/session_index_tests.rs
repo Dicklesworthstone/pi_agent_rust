@@ -59,6 +59,10 @@ async fn saved_attachment_discovery_round_trip(extension: &str) {
     let path = sessions_root
         .join(pi::session::encode_cwd(&original))
         .join(format!("recovered.{extension}"));
+    // An explicit JSONL path is saved in place: its original storage folder
+    // must exist, exactly as it did before the project moved.
+    fs::create_dir_all(path.parent().expect("original storage folder"))
+        .expect("create original storage folder");
     session.path = Some(path.clone());
     session.append_message(make_user_message("before the move"));
     session.save().await.expect("save original session");
@@ -195,6 +199,8 @@ fn indexing_a_partial_v2_view_keeps_the_binding_outside_its_loaded_branch() {
         let sessions_root = harness.temp_path("sessions");
         let replacement = harness.temp_path("replacement");
         fs::create_dir_all(&replacement).expect("replacement workspace");
+        // An explicit JSONL path is saved in place: its folder must exist.
+        fs::create_dir_all(&sessions_root).expect("create sessions dir");
         let path = sessions_root.join("lazy.jsonl");
         let mut source = Session::create_with_dir(Some(sessions_root.clone()));
         source.header.cwd = harness.temp_path("original").display().to_string();
@@ -262,6 +268,8 @@ async fn malformed_saved_binding_is_not_discoverable(extension: &str) {
     let sessions_root = harness.temp_path("sessions");
     let replacement = harness.temp_path("replacement");
     fs::create_dir_all(&replacement).expect("replacement");
+    // An explicit JSONL path is saved in place: its folder must exist.
+    fs::create_dir_all(&sessions_root).expect("create sessions dir");
     let mut session = Session::create_with_dir(Some(sessions_root.clone()));
     session.header.cwd = harness.temp_path("missing-original").display().to_string();
     session.path = Some(sessions_root.join(format!("malformed.{extension}")));

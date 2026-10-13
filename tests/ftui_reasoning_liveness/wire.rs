@@ -634,9 +634,13 @@ fn run_ui(mode: Mode, path: &Path, url: &str, ack: mpsc::SyncSender<usize>) {
         .with_thinking_visible(true)
         .with_turn_control(slot)
         .with_submit_channel(submit_tx);
+    // The default stack launches `ftui::App::fullscreen`. A bare
+    // `ProgramConfig::default()` is a four-row inline UI: pi's header, status,
+    // editor and footer take all four, the conversation body gets zero rows,
+    // and no thinking tail can ever be presented.
     let config = ProgramConfig {
         intercept_signals: false,
-        ..ProgramConfig::default().with_forced_size(COLS, ROWS)
+        ..ProgramConfig::fullscreen().with_forced_size(COLS, ROWS)
     };
     let mut capabilities = TerminalCapabilities::basic();
     capabilities.color_depth = ftui::ColorDepth::Ansi256;

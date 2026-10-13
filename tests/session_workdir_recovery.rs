@@ -100,6 +100,9 @@ fn resumed_sdk_options(path: &Path) -> SessionOptions {
         model: Some("gpt-4o".to_string()),
         api_key: Some("workdir-fixture-key".to_string()),
         session_path: Some(path.to_path_buf()),
+        // The default is an ephemeral session (`no_session: true`), which by
+        // design ignores `session_path` and bypasses saved-workdir recovery.
+        no_session: false,
         enabled_tools: Some(vec!["read".to_string(), "write".to_string()]),
         ..SessionOptions::default()
     }

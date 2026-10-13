@@ -918,10 +918,13 @@ fn reflect_rejects_truncated_failed_and_invented_citation_responses() {
         )
         .unwrap();
     for (body, expected) in [
-        (gemini_body("partial", None), "without Done event"),
+        (
+            gemini_body("partial", None),
+            "stream ended before finishReason (unexpected EOF)",
+        ),
         (
             gemini_body("blocked", Some("SAFETY")),
-            "did not finish cleanly",
+            "stopped generation: SAFETY",
         ),
         (
             gemini_body("truncated", Some("MAX_TOKENS")),
