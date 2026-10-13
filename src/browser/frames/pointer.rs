@@ -12,6 +12,11 @@ use std::collections::BTreeMap;
 
 const MAX_COORDINATE: f64 = 1_000_000.0;
 const EPSILON: f64 = 1e-9;
+/// Homography arithmetic can leave a mathematically integral coordinate a few
+/// ulps away from it (`310.0 / 600.0 * 600.0 + 50.0` is `360.00000000000006`).
+/// Chromium hit-tests in 1/64 px layout units, so residue this small cannot
+/// reach a neighbouring pixel and must not add one to the hit grid.
+const GRID_SNAP: f64 = 1e-6;
 const VIEWPORT: &str = r"({
     width: innerWidth, height: innerHeight, scrollX, scrollY,
     visibleWidth: visualViewport ? visualViewport.width : innerWidth,
@@ -106,6 +111,16 @@ impl Viewport {
                 "projected iframe hit-test coordinate exceeds its limit",
             ));
         }
+        // Only the hit-test grid is snapped; native input keeps `point`.
+        let snap = |coordinate: f64| {
+            let nearest = coordinate.round();
+            if (coordinate - nearest).abs() <= GRID_SNAP {
+                nearest
+            } else {
+                coordinate
+            }
+        };
+        let (x, y) = (snap(x), snap(y));
         let mut grid = Vec::with_capacity(4);
         for x in [x.floor(), x.ceil()] {
             for y in [y.floor(), y.ceil()] {
