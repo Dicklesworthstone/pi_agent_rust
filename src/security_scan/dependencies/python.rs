@@ -34,7 +34,11 @@ pub(super) fn version(raw: &str) -> Option<String> {
         return None;
     }
     let captures = PUBLIC_VERSION.captures(raw.trim())?;
-    let number = |field: &str| captures.name(field).map_or("0", |value| decimal(value.as_str()));
+    let number = |field: &str| {
+        captures
+            .name(field)
+            .map_or("0", |value| decimal(value.as_str()))
+    };
     let mut result = String::new();
     let epoch = number("epoch");
     if epoch != "0" {
@@ -77,7 +81,9 @@ pub(super) fn name(raw: &str) -> Option<String> {
     if raw.len() > 256
         || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
         || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        || !bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(byte))
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(byte))
     {
         return None;
     }
@@ -143,13 +149,20 @@ fn public_index(raw: &str) -> bool {
 }
 
 fn source_text<'a>(source: &'a toml::Table, field: &str) -> Result<Option<&'a str>> {
-    source.get(field).map(|value| {
-        value.as_str().ok_or_else(|| error("invalid Python lockfile source descriptor"))
-    }).transpose()
+    source
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| error("invalid Python lockfile source descriptor"))
+        })
+        .transpose()
 }
 
 fn uv_public(source: Option<&toml::Table>) -> Result<bool> {
-    let Some(source) = source else { return Ok(false) };
+    let Some(source) = source else {
+        return Ok(false);
+    };
     let registry = source_text(source, "registry")?;
     // A registry plus a direct/path/git source is ambiguous, never public by
     // precedence. Unknown future source shapes remain explicit exclusions.
@@ -159,13 +172,17 @@ fn uv_public(source: Option<&toml::Table>) -> Result<bool> {
 fn poetry_public(source: Option<&toml::Table>) -> Result<bool> {
     // Poetry's locker omits `source` for default PyPI packages. Unlike uv, this
     // omission has defined semantics; an explicit empty/unknown source does not.
-    let Some(source) = source else { return Ok(true) };
+    let Some(source) = source else {
+        return Ok(true);
+    };
     let kind = source_text(source, "type")?;
     let url = source_text(source, "url")?;
     source_text(source, "reference")?;
     Ok(kind == Some("legacy")
         && url.is_some_and(public_index)
-        && source.keys().all(|key| matches!(key.as_str(), "type" | "url" | "reference")))
+        && source
+            .keys()
+            .all(|key| matches!(key.as_str(), "type" | "url" | "reference")))
 }
 
 pub(super) fn parse(text: &str, path: &str, format: &str, builder: &mut Builder) -> Result<()> {
@@ -182,7 +199,9 @@ pub(super) fn parse(text: &str, path: &str, format: &str, builder: &mut Builder)
             let lock: PoetryLock = toml::from_str(text)
                 .map_err(|_| error("malformed Poetry lockfile; parser contents are not exposed"))?;
             if !matches!(lock.metadata.lock_version.as_str(), "1.1" | "2.0" | "2.1") {
-                return Err(error("unsupported Poetry lock version; expected 1.1, 2.0 or 2.1"));
+                return Err(error(
+                    "unsupported Poetry lock version; expected 1.1, 2.0 or 2.1",
+                ));
             }
             lock.package
         }

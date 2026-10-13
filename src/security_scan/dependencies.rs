@@ -108,9 +108,10 @@ impl Builder {
         version: &str,
         location: Location,
     ) -> Result<()> {
-        let (Some(name), Some(version)) =
-            (canonical_name(ecosystem, name), canonical_version(ecosystem, version))
-        else {
+        let (Some(name), Some(version)) = (
+            canonical_name(ecosystem, name),
+            canonical_version(ecosystem, version),
+        ) else {
             self.exclude(location, "invalid_or_unpinned_package_identity");
             return Ok(());
         };
