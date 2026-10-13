@@ -219,10 +219,11 @@ impl LspClient {
                     "callHierarchy":{"dynamicRegistration":false},
                     "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
-                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":false},
+                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":true},
                     "codeAction":{
                         "dynamicRegistration":false,"dataSupport":true,
                         "disabledSupport":true,"isPreferredSupport":true,
+                        "honorsChangeAnnotations":true,
                         "codeActionLiteralSupport":{"codeActionKind":{"valueSet":[
                             "quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source"
                         ]}},
@@ -232,7 +233,8 @@ impl LspClient {
                 "workspace":{
                     "diagnostics":{"refreshSupport":false},
                     "applyEdit":true,"workspaceEdit":{
-                        "documentChanges":true,"resourceOperations":["create","rename","delete"]
+                        "documentChanges":true,"resourceOperations":["create","rename","delete"],
+                        "changeAnnotationSupport":{"groupsOnLabel":false}
                     },
                     "symbol":{
                         "dynamicRegistration":false,

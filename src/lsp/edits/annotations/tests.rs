@@ -7,6 +7,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 
+fn sample_uri(name: &str) -> String {
+    try_path_to_uri(&std::env::temp_dir().join(name)).unwrap()
+}
+
 fn text(uri: &str, annotation: Option<&str>) -> Value {
     let mut edit = json!({
         "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
@@ -35,11 +39,12 @@ fn file(root: &Path, name: &str) -> (std::path::PathBuf, String) {
 
 #[test]
 fn text_and_resource_references_preserve_exact_annotation_identity() {
-    let mut raw = workspace("file:///source.rs");
+    let uri = sample_uri("source.rs");
+    let mut raw = workspace(&uri);
     raw["changeAnnotations"]["move"] = json!({"label":"Move module","needsConfirmation":false});
     raw["changeAnnotations"]["unused"] = json!({"label":"Unrelated","needsConfirmation":true});
     raw["documentChanges"].as_array_mut().unwrap().push(json!({
-        "kind":"rename","oldUri":"file:///source.rs","newUri":"file:///target.rs","annotationId":"move"
+        "kind":"rename","oldUri":uri,"newUri":sample_uri("target.rs"),"annotationId":"move"
     }));
     let plan = parse_workspace_edit(&raw).unwrap();
     assert_eq!(plan.annotations.required(), vec!["public-api"]);
@@ -51,7 +56,7 @@ fn text_and_resource_references_preserve_exact_annotation_identity() {
 
 #[test]
 fn wrapper_annotations_are_honored_but_conflicting_ids_fail() {
-    let original = workspace("file:///source.rs");
+    let original = workspace(&sample_uri("source.rs"));
     let edit = original["documentChanges"][0]["edits"][0].clone();
     for outer in [false, true] {
         let mut raw = original.clone();
@@ -67,16 +72,16 @@ fn wrapper_annotations_are_honored_but_conflicting_ids_fail() {
 #[test]
 fn undefined_wrong_typed_and_misplaced_references_never_disappear() {
     for value in [Value::Null, json!(true), json!(7), json!(""), json!("missing"), json!("x".repeat(129))] {
-        let mut raw = workspace("file:///source.rs");
+        let mut raw = workspace(&sample_uri("source.rs"));
         raw["documentChanges"][0]["edits"][0]["annotationId"] = value.clone();
         assert!(parse_workspace_edit(&raw).is_err(), "{value}");
-        raw["documentChanges"] = json!([{"kind":"delete","uri":"file:///source.rs","annotationId":value}]);
+        raw["documentChanges"] = json!([{"kind":"delete","uri":sample_uri("source.rs"),"annotationId":value}]);
         assert!(parse_workspace_edit(&raw).is_err());
     }
-    let mut raw = workspace("file:///source.rs");
+    let mut raw = workspace(&sample_uri("source.rs"));
     raw.as_object_mut().unwrap().remove("changeAnnotations");
     assert!(parse_workspace_edit(&raw).is_err());
-    let mut raw = workspace("file:///source.rs");
+    let mut raw = workspace(&sample_uri("source.rs"));
     raw["documentChanges"][0]["annotationId"] = json!("public-api");
     assert!(parse_workspace_edit(&raw).is_err());
 }
@@ -123,7 +128,7 @@ fn effective_document_changes_take_precedence_without_inheriting_ignored_confirm
     let plan = parse_workspace_edit(&raw).unwrap();
     assert!(plan.annotations.required().is_empty());
     assert_eq!(plan.annotations.value(), json!({}));
-    let mut raw = workspace("file:///source.rs");
+    let mut raw = workspace(&sample_uri("source.rs"));
     raw["changes"] = json!({"file:///other.rs":[]});
     assert_eq!(parse_workspace_edit(&raw).unwrap().annotations.required(), vec!["public-api"]);
 }
@@ -239,3 +244,5 @@ fn resource_operations_keep_the_confirmation_boundary() {
         assert_eq!(target.exists(), kind != "delete");
     }
 }
+
+mod protocol;
