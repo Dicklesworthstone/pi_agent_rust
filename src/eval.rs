@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 mod display;
 mod js_kernel;
 mod lifecycle;
+mod output;
 mod transport;
 
 /// The kernel server script, shipped inside the binary.
@@ -110,8 +111,13 @@ impl PyKernel {
     /// Takes `&mut self` deliberately: `mpsc::Receiver` is `!Sync`, so a
     /// shared borrow held across the await would make the future `!Send`.
     #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn next_line(&mut self, deadline: Instant) -> Result<Option<String>> {
+    async fn next_line(
+        &mut self,
+        deadline: Instant,
+        capture: &mut output::Capture,
+    ) -> Result<Option<String>> {
         loop {
+            capture.publish(false);
             let received = self
                 .lines
                 .lock()
@@ -283,7 +289,12 @@ impl EvalTool {
     /// blocking thread while this async fn polls with the cell budget. On
     /// timeout the kernel is killed (state loss) and the next cell restarts.
     #[allow(clippy::too_many_lines)]
-    async fn run_py_cell(&self, code: &str, timeout: Duration) -> Result<ToolOutput> {
+    async fn run_py_cell(
+        &self,
+        code: &str,
+        timeout: Duration,
+        capture: &mut output::Capture,
+    ) -> Result<ToolOutput> {
         // Take the kernel out (or spawn) so the mutex is not held across await.
         let taken = self
             .kernel
@@ -324,6 +335,11 @@ impl EvalTool {
         // pi tools mid-cell and their results resume the kernel.
         let deadline = Instant::now() + timeout;
         let final_line = loop {
+            // A continuously readable stream may not yield Pending to the
+            // enclosing watchdog. Observe its captured owner here too.
+            crate::agent_cx::AgentCx::for_current_or_request().checkpoint().map_err(|_| {
+                Error::tool("eval", "EVAL_CANCELLED; EVAL_STATE_RESET: Python kernel discarded")
+            })?;
             // Deadline check up front: a cell looping on bridge calls
             // keeps lines flowing, so the Empty-branch check inside
             // next_line alone would never fire and the cell could run
@@ -338,7 +354,7 @@ impl EvalTool {
                     ),
                 ));
             }
-            let line = match kernel.next_line(deadline).await {
+            let line = match kernel.next_line(deadline, capture).await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
                     // EOF: crashed mid-cell (e.g. os._exit). State lost.
@@ -366,7 +382,7 @@ impl EvalTool {
             if trimmed.is_empty() {
                 continue;
             }
-            let parsed: Value = match serde_json::from_str(trimmed) {
+            let mut parsed: Value = match serde_json::from_str(trimmed) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     kernel.kill();
@@ -378,8 +394,14 @@ impl EvalTool {
                     ));
                 }
             };
+            if parsed.get("stream").is_some() {
+                capture.accept(&parsed, id)?;
+                capture.publish(false);
+                continue;
+            }
             if let Some(bridge) = parsed.get("bridge") {
                 transport::validate_bridge(&parsed)?;
+                capture.publish(true);
                 let reply = self.run_bridge_call(bridge).await;
                 let line = json!({"bridge_result": reply}).to_string();
                 kernel
@@ -390,7 +412,8 @@ impl EvalTool {
                 continue;
             }
             transport::validate_response(&parsed, id)?;
-            break trimmed.to_string();
+            capture.finish_response(&mut parsed)?;
+            break serde_json::to_string(&parsed)?;
         };
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
@@ -398,7 +421,9 @@ impl EvalTool {
         // Validate all rich output before making the kernel reusable. A
         // malformed protocol result discards this connection, not just its
         // bad frame, and cannot partially publish a successful tool result.
-        let output = format_cell_response(&final_line, restarted, cells_run)?;
+        let mut output = format_cell_response(&final_line, restarted, cells_run)?;
+        capture.annotate(&mut output);
+        capture.publish(true);
 
         // Return the kernel to the slot for the next cell.
         {
@@ -448,7 +473,9 @@ impl Tool for EvalTool {
          cell; the other language is unaffected. Timeouts or crashes report \
          state loss explicitly. Rich output: Python display(value, mime=...) \
          or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
-         PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL."
+         PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
+         Python stdout/stderr stream live; large console output retains a \
+         labelled bounded head/tail rather than filling session memory."
     }
 
     fn parameters(&self) -> Value {
@@ -482,9 +509,9 @@ impl Tool for EvalTool {
         &self,
         _tool_call_id: &str,
         input: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_cell(input).await
+        self.execute_cell(input, on_update).await
     }
 
     fn effects(&self) -> ToolEffects {

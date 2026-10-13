@@ -2,8 +2,14 @@
 
 JSON-lines protocol over stdio:
   request:  {"id": <int>, "code": "<source>"}
-  response: {"id": <int>, "ok": true,  "stdout": "...", "stderr": "...", "result": "<repr|null>"}
-            {"id": <int>, "ok": false, "stdout": "...", "stderr": "...", "error": "<traceback>"}
+  stream:   {"id": <int>, "stream": {"sequence": <int>, "name": "stdout|stderr", "text": "..."}}
+  response: {"id": <int>, "ok": true, "stdout": "", "stderr": "", "result": "<repr|null>", "outputSequence": <int>}
+            {"id": <int>, "ok": false, "stdout": "", "stderr": "", "error": "<traceback>", "outputSequence": <int>}
+
+Console bytes stream to the host in bounded, ordered frames, never duplicated
+in the final response. The host owns previews and bounded head/tail capture.
+Context-copied workers may print while their owning cell is active; closed
+contexts and unattributed background threads cannot emit into later cells.
 
 One persistent namespace and asyncio loop across cells. Top-level await,
 async for, and async with are supported; use await instead of asyncio.run().
@@ -68,6 +74,88 @@ _DISPLAY_CONTEXT = contextvars.ContextVar("pi_eval_display", default=None)
 _MAX_DISPLAYS = 32
 _MAX_DISPLAY_ITEM_BYTES = 2 * 1024 * 1024
 _MAX_DISPLAY_BYTES = 4 * 1024 * 1024
+_OUTPUT_CONTEXT = contextvars.ContextVar("pi_eval_output", default=None)
+_MAX_RESULT_BYTES = 1024 * 1024
+_PROTOCOL_WRITE_LOCK = threading.RLock()
+
+
+def _send_frame(frame):
+    encoded = json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with _PROTOCOL_WRITE_LOCK:
+        _REAL_STDOUT.write(encoded)
+        _REAL_STDOUT.flush()
+
+
+class _CellOutput:
+    """No unbounded kernel-side stdout buffer; the host owns bounded capture."""
+
+    def __init__(self, cell_id):
+        self.cell_id = cell_id
+        self.sequence = 0
+        self.active = True
+
+    def write(self, name, text):
+        if not self.active or _OUTPUT_CONTEXT.get() is not self:
+            raise RuntimeError("EVAL_OUTPUT_CLOSED: output belongs to an inactive cell")
+        # Slice BEFORE encoding: a large write cannot create another equally
+        # large capture/JSON string. Surrogates use the explicit printable
+        # backslash form rather than corrupting the host's UTF-8 protocol.
+        for offset in range(0, len(text), 8192):
+            chunk = text[offset:offset + 8192].encode("utf-8", "backslashreplace").decode("utf-8")
+            # Context-copied, awaited workers (asyncio.to_thread) may print.
+            # Serialize complete frames with bridge/final replies and close
+            # the sink under this same lock at the cell boundary.
+            with _PROTOCOL_WRITE_LOCK:
+                if not self.active:
+                    raise RuntimeError("EVAL_OUTPUT_CLOSED: output belongs to an inactive cell")
+                self.sequence += 1
+                _send_frame({"id": self.cell_id, "stream": {
+                    "sequence": self.sequence, "name": name, "text": chunk,
+                }})
+        return len(text)
+
+
+class _CellStream(io.TextIOBase):
+    encoding = "utf-8"
+    errors = "backslashreplace"
+
+    def __init__(self, owner, name):
+        self.owner = owner
+        self.name = name
+
+    def writable(self):
+        return True
+
+    def write(self, text):
+        if self.closed:
+            raise ValueError("I/O operation on closed eval stream")
+        if not isinstance(text, str):
+            raise TypeError("eval stream write() requires str")
+        return self.owner.write(self.name, text)
+
+    def flush(self):
+        # Every write already flushes its protocol frames. No thread, timer,
+        # queued fragment, or post-cell flush can leak output into another cell.
+        return None
+
+
+def _result_text(value):
+    text = repr(value)
+    if len(text) > _MAX_RESULT_BYTES:
+        raise ValueError("EVAL_RESULT_LIMIT: final repr exceeds 1 MiB; print or display a bounded selection")
+    encoded = text.encode("utf-8", "backslashreplace")
+    if len(encoded) > _MAX_RESULT_BYTES:
+        raise ValueError("EVAL_RESULT_LIMIT: final repr exceeds 1 MiB; print or display a bounded selection")
+    return encoded.decode("utf-8")
+
+
+def _error_text():
+    text = traceback.format_exc()
+    # Traceback construction and arbitrary guest repr allocations are not
+    # sandboxed. Bound what is retained/serialized into the protocol response.
+    if len(text) > _MAX_RESULT_BYTES // 8:
+        text = "EVAL_ERROR_TRUNCATED: traceback tail follows\n" + text[-(_MAX_RESULT_BYTES // 8):]
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _display_json_shape(value, depth=0, remaining=None):
@@ -189,10 +277,7 @@ def _bridge_call(tool_name, tool_input):
     global _BRIDGE_CALL
     _BRIDGE_CALL += 1
     call_id = _BRIDGE_CALL
-    _REAL_STDOUT.write(
-        json.dumps({"bridge": {"call": call_id, "tool": tool_name, "input": tool_input}}) + "\n"
-    )
-    _REAL_STDOUT.flush()
+    _send_frame({"bridge": {"call": call_id, "tool": tool_name, "input": tool_input}})
     line = _REAL_STDIN.readline()
     if not line:
         raise ToolBridgeError("bridge closed")
@@ -328,9 +413,10 @@ def _compile_cell(code, filename):
     return body, expression
 
 
-async def _execute_cell(code, displays):
+async def _execute_cell(code, displays, output):
     global _CELL_CONTEXT
     display_token = _DISPLAY_CONTEXT.set(displays)
+    output_token = _OUTPUT_CONTEXT.set(output)
     try:
         source, filename, script_dir = _prepare_cell(code)
         body, expression = _compile_cell(source, filename)
@@ -351,34 +437,39 @@ async def _execute_cell(code, displays):
         # awaitable that happens to be the final value (normal REPL semantics).
         if expression.co_flags & inspect.CO_COROUTINE:
             value = await value
-        return True, repr(value) if value is not None else None, None
+        return True, _result_text(value) if value is not None else None, None
     except BaseException:  # noqa: BLE001 - SystemExit must not stop the loop
-        return False, None, traceback.format_exc()
+        return False, None, _error_text()
     finally:
         # Child tasks retain this particular sink. Once the cell ends they
         # cannot publish late output into a later cell's display collection.
         _DISPLAY_CONTEXT.reset(display_token)
+        _OUTPUT_CONTEXT.reset(output_token)
         # Each run_until_complete creates a task; keep the cell's context
         # rather than silently resetting ContextVars to the host's context.
         _CELL_CONTEXT = contextvars.copy_context()
 
 
-def run_cell(code):
+def run_cell(code, cell_id):
     displays = _DisplaySink()
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    output = _CellOutput(cell_id)
+    stdout = _CellStream(output, "stdout")
+    stderr = _CellStream(output, "stderr")
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = stdout, stderr
     try:
         ok, result, error = _CELL_CONTEXT.run(
-            _CELL_LOOP.run_until_complete, _execute_cell(code, displays)
+            _CELL_LOOP.run_until_complete, _execute_cell(code, displays, output)
         )
-        return ok, stdout.getvalue(), stderr.getvalue(), result, error, displays.frames
     except BaseException:  # noqa: BLE001 - full traceback back to the host
-        return False, stdout.getvalue(), stderr.getvalue(), None, traceback.format_exc(), displays.frames
+        ok, result, error = False, None, _error_text()
     finally:
         displays.active = False
+        with _PROTOCOL_WRITE_LOCK:
+            output.active = False
+            sequence = output.sequence
         sys.stdout, sys.stderr = old_out, old_err
+    return ok, result, error, displays.frames, sequence
 
 
 def main():
@@ -391,13 +482,14 @@ def main():
             continue
         try:
             request = json.loads(line)
-            ok, out, err, result, error, displays = run_cell(request.get("code", ""))
+            ok, result, error, displays, sequence = run_cell(request.get("code", ""), request.get("id"))
             response = {
                 "id": request.get("id"),
                 "ok": ok,
-                "stdout": out,
-                "stderr": err,
+                "stdout": "",
+                "stderr": "",
                 "displays": displays,
+                "outputSequence": sequence,
             }
             if ok:
                 response["result"] = result
@@ -405,8 +497,7 @@ def main():
                 response["error"] = error
         except Exception as exc:  # noqa: BLE001 - protocol-level failure
             response = {"id": None, "ok": False, "stdout": "", "stderr": "", "error": str(exc)}
-        _REAL_STDOUT.write(json.dumps(response) + "\n")
-        _REAL_STDOUT.flush()
+        _send_frame(response)
 
 
 if __name__ == "__main__":

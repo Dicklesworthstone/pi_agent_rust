@@ -8,7 +8,7 @@ use super::{DEFAULT_CELL_TIMEOUT_SECS, EvalTool};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::ToolOutput;
+use crate::tools::{ToolOutput, ToolUpdate};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::future::Future;
@@ -110,7 +110,11 @@ fn before_execution_stop(stop: CellStop) -> Error {
 }
 
 impl EvalTool {
-    pub(super) async fn execute_cell(&self, input: Value) -> Result<ToolOutput> {
+    pub(super) async fn execute_cell(
+        &self,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
         // Validate before waiting, spawning, or destroying any retained state.
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
@@ -150,9 +154,12 @@ impl EvalTool {
             let slot = self.js.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.as_ref().map_or((1, true), |kernel| (kernel.cells_run.saturating_add(1), false))
         };
+        // The capture outlives the checked-out Python future: cancellation
+        // can retire its process without discarding already received output.
+        let mut capture = super::output::Capture::new(on_update);
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
-            Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout)).await,
+            Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout, &mut capture)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
                 wait_owned(&owner, Some(deadline), self.run_js_cell(code, timeout)).await
@@ -183,6 +190,7 @@ impl EvalTool {
             }
         };
         let mut output = outcome.map_err(|error| {
+            let error = capture.with_error(error);
             if cell.reset {
                 Error::tool(
                     "eval",
