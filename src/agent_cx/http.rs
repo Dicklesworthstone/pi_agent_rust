@@ -11,11 +11,15 @@ use super::AgentCx;
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder, Response};
 use futures::{Future, Stream, TryStreamExt};
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 const DEFAULT_BODY_LIMIT: usize = 50 * 1024 * 1024;
+// Bound inline collection work independently of the retained byte limit.
+// Empty chunks consume scheduling budget too; they consume no byte budget.
+const BODY_CHUNKS_PER_YIELD: usize = 64;
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
 type CancelWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -116,7 +120,7 @@ impl<'a> AgentHttpRequest<'a> {
 
     /// Disable the transport timeout, not the owner's cancellation boundary.
     #[must_use]
-    pub fn no_timeout(mut self) -> Self {
+    pub fn no_timeout(mut self, ) -> Self {
         self.request = self.request.no_timeout();
         self
     }
@@ -171,16 +175,7 @@ impl AgentHttpResponse {
     }
 
     pub async fn bytes_limited(self, limit: usize) -> Result<Vec<u8>> {
-        self.bytes_stream()
-            .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                if chunk.len() > limit.saturating_sub(bytes.len()) {
-                    return Err(std::io::Error::other("response body too large"));
-                }
-                bytes.extend_from_slice(&chunk);
-                Ok(bytes)
-            })
-            .await
-            .map_err(Error::from)
+        collect_body_limited(self.bytes_stream(), limit).await
     }
 
     pub async fn text_limited(self, limit: usize) -> Result<String> {
@@ -191,6 +186,38 @@ impl AgentHttpResponse {
     pub async fn text(self) -> Result<String> {
         self.text_limited(DEFAULT_BODY_LIMIT).await
     }
+}
+
+/// Collection must yield even if a transport/replay source is always ready.
+/// A byte limit alone does not bound an empty-chunk flood, and try_fold can
+/// otherwise monopolize one executor poll before a sibling can request abort.
+/// Yielding introduces no timer, detached task, data truncation or byte-limit
+/// change. A single native read/copy remains cooperative, not preemptible.
+async fn collect_body_limited(mut body: ByteStream, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunks = 0;
+    while let Some(chunk) = body.try_next().await? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(std::io::Error::other("response body too large").into());
+        }
+        bytes.extend_from_slice(&chunk);
+        chunks += 1;
+        if chunks == BODY_CHUNKS_PER_YIELD {
+            chunks = 0;
+            let mut yielded = false;
+            poll_fn(|task| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+    Ok(bytes)
 }
 
 struct OwnedBody {
@@ -634,5 +661,183 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(matches!(Pin::new(&mut sse).poll_next(&mut task), Poll::Ready(None)));
+    }
+
+    struct ReadyBody {
+        chunks: std::vec::IntoIter<std::io::Result<Vec<u8>>>,
+        reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Stream for ReadyBody {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> ReadPoll {
+            let this = self.get_mut();
+            this.reads.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(this.chunks.next())
+        }
+    }
+
+    impl Drop for ReadyBody {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn ready_body(
+        owner: AgentCx,
+        chunks: Vec<std::io::Result<Vec<u8>>>,
+    ) -> (ByteStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let native = ReadyBody {
+            chunks: chunks.into_iter(),
+            reads: Arc::clone(&reads),
+            drops: Arc::clone(&drops),
+        };
+        (Box::pin(OwnedBody::new(owner, Box::pin(native))), reads, drops)
+    }
+
+    #[test]
+    fn body_collection_yields_in_bounded_batches_without_changing_binary_output() {
+        let chunks: Vec<_> = (0..BODY_CHUNKS_PER_YIELD * 3 + 5)
+            .map(|index| vec![u8::try_from(index % 256).unwrap(), 0, 255])
+            .collect();
+        let expected: Vec<_> = chunks.iter().flatten().copied().collect();
+        let (body, reads, drops) = ready_body(
+            AgentCx::for_request(),
+            chunks.into_iter().map(Ok).collect(),
+        );
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        let mut collect = Box::pin(collect_body_limited(body, expected.len()));
+        for batch in 1..=3 {
+            assert!(collect.as_mut().poll(&mut task).is_pending());
+            assert_eq!(reads.load(Ordering::SeqCst), batch * BODY_CHUNKS_PER_YIELD);
+            assert_eq!(counter.0.load(Ordering::SeqCst), batch);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        let Poll::Ready(Ok(actual)) = collect.as_mut().poll(&mut task) else {
+            panic!("finite body must complete after its remaining chunks");
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD * 3 + 6);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_chunks_yield_at_zero_byte_limit_and_remain_cancellable() {
+        let owner = AgentCx::for_request();
+        // Finite fixture: without the yield this fails, rather than hanging.
+        let (body, reads, drops) = ready_body(
+            owner.clone(),
+            (0..BODY_CHUNKS_PER_YIELD * 4).map(|_| Ok(Vec::new())).collect(),
+        );
+        let mut collect = Box::pin(collect_body_limited(body, 0));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(collect.as_mut().poll(&mut task).is_pending());
+        assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD);
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel empty body"));
+        let Poll::Ready(Err(error)) = collect.as_mut().poll(&mut task) else {
+            panic!("cancellation must retire the body before another native read");
+        };
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exact_byte_limit_and_empty_eof_survive_collection_yields() {
+        let (body, _, drops) = ready_body(
+            AgentCx::for_request(),
+            (0..BODY_CHUNKS_PER_YIELD).map(|_| Ok(vec![42])).collect(),
+        );
+        let mut collect = Box::pin(collect_body_limited(body, BODY_CHUNKS_PER_YIELD));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(collect.as_mut().poll(&mut task).is_pending());
+        let Poll::Ready(Ok(bytes)) = collect.as_mut().poll(&mut task) else {
+            panic!("exactly-at-limit body must be accepted");
+        };
+        assert_eq!(bytes, vec![42; BODY_CHUNKS_PER_YIELD]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let (empty, _, _) = ready_body(AgentCx::for_request(), Vec::new());
+        let mut empty = Box::pin(collect_body_limited(empty, 0));
+        assert!(matches!(empty.as_mut().poll(&mut task), Poll::Ready(Ok(bytes)) if bytes.is_empty()));
+    }
+
+    #[test]
+    fn overflow_after_a_yield_is_not_partial_success_and_releases_the_body() {
+        let (body, reads, drops) = ready_body(
+            AgentCx::for_request(),
+            (0..BODY_CHUNKS_PER_YIELD + 2).map(|_| Ok(vec![42])).collect(),
+        );
+        let mut collect = Box::pin(collect_body_limited(body, BODY_CHUNKS_PER_YIELD));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(collect.as_mut().poll(&mut task).is_pending());
+        let Poll::Ready(Err(error)) = collect.as_mut().poll(&mut task) else {
+            panic!("one byte past the limit must reject the entire collection");
+        };
+        assert!(error.to_string().contains("response body too large"));
+        assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD + 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transport_error_after_a_yield_is_not_lost_or_replaced_with_eof() {
+        let mut chunks: Vec<_> = (0..BODY_CHUNKS_PER_YIELD).map(|_| Ok(Vec::new())).collect();
+        chunks.push(Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "body reset")));
+        let (body, reads, drops) = ready_body(AgentCx::for_request(), chunks);
+        let mut collect = Box::pin(collect_body_limited(body, 0));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(collect.as_mut().poll(&mut task).is_pending());
+        let Poll::Ready(Err(error)) = collect.as_mut().poll(&mut task) else {
+            panic!("native failure after scheduling boundary must be preserved");
+        };
+        assert!(error.to_string().contains("body reset"));
+        assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD + 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropping_a_yielded_collection_retires_transport_and_cancel_registration() {
+        let owner = AgentCx::for_request();
+        let (body, _, drops) = ready_body(
+            owner.clone(),
+            (0..BODY_CHUNKS_PER_YIELD * 2).map(|_| Ok(Vec::new())).collect(),
+        );
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        let mut collect = Box::pin(collect_body_limited(body, 0));
+        assert!(collect.as_mut().poll(&mut task).is_pending());
+        drop(collect);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let before = counter.0.load(Ordering::SeqCst);
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("after collection drop"));
+        assert_eq!(counter.0.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn joined_canceller_runs_before_a_ready_body_is_fully_collected() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        runtime.block_on(async {
+            let (body, reads, drops) = ready_body(
+                owner.clone(),
+                (0..BODY_CHUNKS_PER_YIELD * 4).map(|_| Ok(Vec::new())).collect(),
+            );
+            let collect = collect_body_limited(body, 0);
+            let cancel = async {
+                assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD);
+                owner.cancel_with(asupersync::types::CancelKind::User, Some("sibling cancel"));
+            };
+            let (result, ()) = futures::join!(collect, cancel);
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+            assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!Cx::current().unwrap().is_cancel_requested());
+        });
     }
 }
