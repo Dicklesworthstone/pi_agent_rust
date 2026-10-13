@@ -11,9 +11,11 @@
 
 use asupersync::{Budget, Cx};
 use std::ffi::OsStr;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::ops::Deref;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 mod http;
@@ -90,18 +92,21 @@ impl AgentCx {
         &self.cx
     }
 
-    /// Poll ambient-context APIs under this owner, not under the caller's task.
+    /// Poll and retire ambient-context APIs under this owner, not the caller.
     ///
     /// The thread-local guard must end before returning `Pending`: holding it
     /// across an await would leak authority into other tasks on the same worker
     /// and could restore the wrong thread's context after task migration.
-    pub(crate) async fn with_current<F: Future>(&self, future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        poll_fn(|task_cx| {
-            let _guard = self.cx.clone().set_current_restricted();
-            future.as_mut().poll(task_cx)
-        })
-        .await
+    ///
+    /// The native future also retains this owner during synchronous cleanup,
+    /// even if never polled or dropped on another worker. Completion retires
+    /// it before returning its output; ownership of that output passes to the
+    /// caller. Dropping a future does not promise async cleanup or rollback.
+    pub(crate) fn with_current<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        ScopedOperation {
+            owner: self,
+            future: Some(Box::pin(future)),
+        }
     }
 
     /// Filesystem capability accessor.
@@ -134,6 +139,44 @@ impl Deref for AgentCx {
 
     fn deref(&self) -> &Self::Target {
         self.cx()
+    }
+}
+
+/// Keep the pinned native future independently droppable while a temporary
+/// owner guard is installed. No thread-local guard is stored across polls or
+/// moved between workers. Pin<Box<F>> supports !Unpin futures without unsafe
+/// projection, and taking the option before drop prevents double retirement
+/// if the native destructor unwinds.
+struct ScopedOperation<'a, F> {
+    owner: &'a AgentCx,
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F: Future> Future for ScopedOperation<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, task_cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _guard = this.owner.cx.clone().set_current_restricted();
+        let output = this
+            .future
+            .as_mut()
+            .expect("completed scoped operation cannot be polled again")
+            .as_mut()
+            .poll(task_cx);
+        if output.is_ready() {
+            drop(this.future.take());
+        }
+        output
+    }
+}
+
+impl<F> Drop for ScopedOperation<'_, F> {
+    fn drop(&mut self) {
+        if self.future.is_some() {
+            let _guard = self.owner.cx.clone().set_current_restricted();
+            drop(self.future.take());
+        }
     }
 }
 
@@ -252,6 +295,246 @@ impl AgentProcess<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::poll_fn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Deliberately !Unpin: cleanup must retire the same pinned native future,
+    // not rely on moving it out of its allocation after it has been polled.
+    struct CleanupProbe<'a> {
+        cleanup: Option<Box<dyn FnOnce() + Send + 'a>>,
+        output: Poll<Result<u32, &'static str>>,
+        panic_on_poll: bool,
+        _pin: std::marker::PhantomPinned,
+    }
+
+    impl Future for CleanupProbe<'_> {
+        type Output = Result<u32, &'static str>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.as_ref().get_ref();
+            assert!(!this.panic_on_poll, "intentional native poll panic");
+            this.output
+        }
+    }
+
+    impl Drop for CleanupProbe<'_> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.cleanup.take() {
+                cleanup();
+            }
+        }
+    }
+
+    fn cleanup_probe<'a>(
+        output: Poll<Result<u32, &'static str>>,
+        cleanup: impl FnOnce() + Send + 'a,
+    ) -> CleanupProbe<'a> {
+        CleanupProbe {
+            cleanup: Some(Box::new(cleanup)),
+            output,
+            panic_on_poll: false,
+            _pin: std::marker::PhantomPinned,
+        }
+    }
+
+    fn restricted_owner(quota: u32) -> AgentCx {
+        let source = Cx::for_request_with_budget(Budget::new().with_poll_quota(quota));
+        let _guard = source
+            .restrict::<asupersync::cx::cap::None>()
+            .set_current_restricted();
+        AgentCx::for_current_or_request()
+    }
+
+    fn assert_current_owner(owner: &Cx) {
+        let current = Cx::current().expect("operation owner installed");
+        assert_eq!(current.budget(), owner.budget());
+        assert_eq!(current.capabilities(), owner.capabilities());
+        assert_eq!(current.is_cancel_requested(), owner.is_cancel_requested());
+    }
+
+    #[test]
+    fn unpolled_scoped_drop_retains_owner_and_restores_parent() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let scoped = owner.with_current(native);
+        assert_current_owner(&parent);
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn pending_scoped_drop_retains_cancelled_owner_not_the_dropping_task() {
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            assert!(Cx::current().unwrap().is_cancel_requested());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(scoped.as_mut().poll(&mut task).is_pending());
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+        let unrelated = Cx::for_request_with_budget(Budget::new().with_poll_quota(99));
+        let _unrelated = unrelated.clone().set_current_restricted();
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&unrelated);
+        assert!(!unrelated.is_cancel_requested());
+    }
+
+    #[test]
+    fn ready_scoped_operation_retires_native_before_returning_success_or_error() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        for expected in [Ok(42), Err("native failure")] {
+            let drops = AtomicUsize::new(0);
+            let native = cleanup_probe(Poll::Ready(expected), || {
+                assert_current_owner(owner.cx());
+                drops.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut scoped = Box::pin(owner.with_current(native));
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(scoped.as_mut().poll(&mut task), Poll::Ready(expected));
+            // The completed wrapper remains alive; native resources do not.
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_current_owner(&parent);
+            drop(scoped);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scoped_cleanup_after_worker_migration_restores_both_threads() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(scoped.as_mut().poll(&mut task).is_pending());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let destination =
+                        Cx::for_request_with_budget(Budget::new().with_poll_quota(57));
+                    let _destination = destination.clone().set_current_restricted();
+                    drop(scoped);
+                    assert_current_owner(&destination);
+                })
+                .join()
+                .expect("cleanup worker");
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn native_poll_unwind_drops_under_owner_then_restores_parent() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let observed = std::sync::Mutex::new(None);
+        let mut native = cleanup_probe(Poll::Pending, || {
+            // Record rather than assert during unwinding: a regression must
+            // fail this test, not abort the suite with a second panic.
+            *observed.lock().unwrap() = Cx::current();
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        native.panic_on_poll = true;
+        let _panic_guard = crate::crash::SuppressPanicHook::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scoped = Box::pin(owner.with_current(native));
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            let _ = scoped.as_mut().poll(&mut task);
+        }));
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let observed = observed.into_inner().unwrap().expect("cleanup context");
+        assert_eq!(observed.budget(), owner.budget());
+        assert_eq!(observed.capabilities(), owner.capabilities());
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn cleanup_unwind_restores_parent_without_double_retirement() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Ready(Ok(42)), || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+            panic!("intentional native cleanup panic");
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let _panic_guard = crate::crash::SuppressPanicHook::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            let _ = scoped.as_mut().poll(&mut task);
+        }));
+        assert!(result.is_err());
+        assert_current_owner(&parent);
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn nested_scoped_operations_retire_under_their_respective_owners() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let outer = restricted_owner(7);
+        let inner = restricted_owner(3);
+        let retired = std::sync::Mutex::new(Vec::new());
+        let native = cleanup_probe(Poll::Ready(Ok(42)), || {
+            assert_current_owner(inner.cx());
+            retired.lock().unwrap().push("inner");
+        });
+        let outer_cleanup = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(outer.cx());
+            retired.lock().unwrap().push("outer");
+        });
+        let mut scoped = Box::pin(outer.with_current(async {
+            let _cleanup = outer_cleanup;
+            inner.with_current(native).await
+        }));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(scoped.as_mut().poll(&mut task), Poll::Ready(Ok(42)));
+        assert_eq!(*retired.lock().unwrap(), vec!["inner", "outer"]);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn scoped_drop_restores_absence_of_ambient_context() {
+        std::thread::spawn(|| {
+            assert!(Cx::current().is_none());
+            let owner = restricted_owner(7);
+            let drops = AtomicUsize::new(0);
+            let native = cleanup_probe(Poll::Pending, || {
+                assert_current_owner(owner.cx());
+                drops.fetch_add(1, Ordering::SeqCst);
+            });
+            drop(owner.with_current(native));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(Cx::current().is_none());
+        })
+        .join()
+        .expect("context-free cleanup worker");
+    }
 
     #[test]
     fn for_request_creates_valid_context() {
