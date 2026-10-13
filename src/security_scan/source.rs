@@ -6,13 +6,56 @@
 //! (`.pi/security-dispositions.json`), and an optional OSV dependency lookup
 //! that degrades to a warning offline. Code never leaves the machine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SCAN_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SCOPE_FILES: usize = 20_000;
+const MAX_FINDINGS: usize = 10_000;
+
+fn scan_error(message: impl Into<String>) -> Error {
+    Error::tool("security_scan", format!("[SOURCE_SCAN_INCOMPLETE] {}", message.into()))
+}
+
+// A failed read is not a binary-file classification. Check regular-file type
+// and cap the read itself, not just a racy metadata length. NONBLOCK prevents
+// a Unix FIFO substituted after traversal from hanging a blocking worker.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let metadata = fs::metadata(path)
+        .map_err(|_| scan_error(format!("cannot inspect {}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(scan_error(format!("{} must be a regular file of at most {limit} bytes", path.display())));
+    }
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        fs::File::from(rustix::fs::open(
+            path, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty(),
+        ).map_err(|_| scan_error(format!("cannot open {}", path.display())))?)
+    };
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
+    let file = fs::File::open(path)
+        .map_err(|_| scan_error(format!("cannot open {}", path.display())))?;
+    let metadata = file.metadata()
+        .map_err(|_| scan_error(format!("cannot inspect opened {}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(scan_error(format!("{} changed type or exceeds its byte limit", path.display())));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)
+        .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+    if bytes.len() as u64 > limit {
+        return Err(scan_error(format!("{} grew beyond its byte limit", path.display())));
+    }
+    Ok(bytes)
+}
 
 pub const SCAN_SCHEMA: &str = "pi.security-scan/v1";
 /// SARIF version emitted by `run`.
@@ -150,25 +193,38 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
         Error::validation(format!("embedded security rule pack failed to parse: {e}"))
     })?];
     let overrides = project_root.join(".pi").join("security-rules");
-    if overrides.is_dir() {
-        let mut entries: Vec<PathBuf> = fs::read_dir(&overrides)
+    let has_overrides = match fs::symlink_metadata(&overrides) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => return Err(scan_error("project security-rules path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(scan_error("cannot inspect project security-rules directory")),
+    };
+    if has_overrides {
+        let reader = fs::read_dir(&overrides)
             .map_err(|e| {
                 Error::tool(
                     "security_scan",
                     format!("read {}: {e}", overrides.display()),
                 )
-            })?
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
-            .collect();
+            })?;
+        let mut entries = Vec::new();
+        for entry in reader {
+            let path = entry
+                .map_err(|_| scan_error("cannot enumerate every project security rule pack"))?
+                .path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                if entries.len() == 64 {
+                    return Err(scan_error("project rule packs exceed 64; narrow the rule inventory"));
+                }
+                entries.push(path);
+            }
+        }
         entries.sort();
         for path in entries {
-            let text = fs::read_to_string(&path).map_err(|e| {
-                Error::tool("security_scan", format!("read {}: {e}", path.display()))
-            })?;
+            let text = String::from_utf8(read_bounded(&path, 1024 * 1024)?)
+                .map_err(|_| scan_error(format!("rule pack {} is not UTF-8", path.display())))?;
             let pack: RulePack = toml::from_str(&text)
-                .map_err(|e| Error::validation(format!("rule pack {}: {e}", path.display())))?;
+                .map_err(|_| scan_error(format!("rule pack {} is malformed", path.display())))?;
             packs.push(pack);
         }
     }
@@ -178,7 +234,10 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
 /// Scope a scan: explicit paths, or the project root. Directories walk
 /// gitignore-respecting file lists via the repo's ignore machinery.
 fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
+    if paths.len() > 256 {
+        return Err(scan_error("at most 256 scan roots may be selected"));
+    }
+    let mut files = BTreeSet::new();
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
@@ -189,15 +248,12 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
     };
     for root in roots {
         // A mistyped scope must not yield a false-clean "0 findings".
-        if !root.exists() {
-            return Err(Error::validation(format!(
-                "security_scan scope path does not exist: {}",
-                root.display()
-            )));
-        }
-        if root.is_file() {
-            files.push(root);
-        } else if root.is_dir() {
+        let metadata = fs::metadata(&root).map_err(|_| scan_error(format!(
+            "scope path does not exist or cannot be inspected: {}", root.display()
+        )))?;
+        if metadata.is_file() {
+            files.insert(root);
+        } else if metadata.is_dir() {
             // `.hidden(false)` so dotfiles are scanned: `.env`, `.npmrc`,
             // `.aws/credentials` and CI workflow files are the classic
             // secret carriers. `.git/` itself is still skipped below.
@@ -206,17 +262,35 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
                 .git_ignore(true)
                 .filter_entry(|entry| entry.file_name() != ".git")
                 .build();
-            for entry in walker.flatten() {
+            for entry in walker {
+                let entry = entry.map_err(|_| scan_error(format!(
+                    "cannot completely traverse scope {}", root.display()
+                )))?;
+                // Walk errors can accompany an otherwise usable entry (for
+                // example an invalid ignore file). Such a scope is not proven.
+                if entry.error().is_some() {
+                    return Err(scan_error(format!("invalid ignore rules while traversing {}", root.display())));
+                }
                 let path = entry.path();
-                if path.is_file() {
-                    files.push(path.to_path_buf());
+                let metadata = fs::metadata(path)
+                    .map_err(|_| scan_error(format!("cannot inspect discovered {}", path.display())))?;
+                if metadata.is_file() {
+                    files.insert(path.to_path_buf());
+                    if files.len() > MAX_SCOPE_FILES {
+                        return Err(scan_error("scan exceeds 20000 files; narrow paths"));
+                    }
+                } else if !metadata.is_dir() {
+                    return Err(scan_error(format!("unsupported non-regular scan entry {}", path.display())));
                 }
             }
+        } else {
+            return Err(scan_error(format!("scope {} is not a file or directory", root.display())));
+        }
+        if files.len() > MAX_SCOPE_FILES {
+            return Err(scan_error("scan exceeds 20000 files; narrow paths"));
         }
     }
-    files.sort();
-    files.dedup();
-    Ok(files)
+    Ok(files.into_iter().collect())
 }
 
 /// A rule compiled for scanning: regex, optional glob scope, multi-line flag.
@@ -263,11 +337,8 @@ impl CompiledRule {
 }
 
 /// Run compiled rules over one file, returning findings with paths relative
-/// to `cwd`. Binary/undecodable files are skipped.
-fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec<Finding>) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return; // binary or unreadable — regex packs only scan text
-    };
+/// to `cwd`. The caller has already completed a bounded UTF-8 read.
+fn scan_file(cwd: &Path, path: &Path, content: &str, rules: &[CompiledRule], findings: &mut Vec<Finding>) -> Result<()> {
     let rel = path
         .strip_prefix(cwd)
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
@@ -275,7 +346,10 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec
     // Per (rule, matched-text) occurrence counter within this file, so
     // identical matches get distinct fingerprints.
     let mut occurrences: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut push = |rule: &Rule, line_no: usize, matched: &str, out: &mut Vec<Finding>| {
+    let mut push = |rule: &Rule, line_no: usize, matched: &str, out: &mut Vec<Finding>| -> Result<()> {
+        if out.len() >= MAX_FINDINGS {
+            return Err(scan_error("scan exceeds 10000 findings; narrow paths"));
+        }
         let counter = occurrences
             .entry((rule.id.clone(), matched.to_string()))
             .or_insert(0);
@@ -290,6 +364,7 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec
             fingerprint: fingerprint(&rule.id, &rel_display, matched, occurrence),
             fix_hint: rule.fix_hint.clone(),
         });
+        Ok(())
     };
     for compiled in rules {
         if let Some(globs) = &compiled.applies_to {
@@ -304,18 +379,26 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec
             // `(?s)` rules span lines: match the whole file and derive the
             // line from the match offset (line-based iteration can never
             // fire these — a silent false-negative factory).
-            for m in compiled.regex.find_iter(&content) {
+            for m in compiled.regex.find_iter(content) {
                 let line_no = content[..m.start()].matches('\n').count() + 1;
-                push(&compiled.rule, line_no, m.as_str(), findings);
+                push(&compiled.rule, line_no, m.as_str(), findings)?;
             }
         } else {
             for (idx, line) in content.lines().enumerate() {
                 for m in compiled.regex.find_iter(line) {
-                    push(&compiled.rule, idx + 1, m.as_str(), findings);
+                    push(&compiled.rule, idx + 1, m.as_str(), findings)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+struct ScanOutcome {
+    findings: Vec<Finding>,
+    scanned: BTreeSet<String>,
+    skipped_non_utf8: Vec<String>,
+    bytes_read: usize,
 }
 
 /// Compile + run the packs over the scope. Rules with un compilable patterns
@@ -323,23 +406,50 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec
 /// factory).
 pub fn run_scan(cwd: &Path, paths: &[String]) -> Result<Vec<Finding>> {
     let packs = load_rule_packs(cwd)?;
+    Ok(scan_with_packs(cwd, paths, &packs)?.findings)
+}
+
+fn compile_rules(packs: &[RulePack]) -> Result<Vec<CompiledRule>> {
     let mut compiled: Vec<CompiledRule> = Vec::new();
-    for pack in &packs {
+    let mut ids = BTreeSet::new();
+    for pack in packs {
         for rule in &pack.rules {
+            if compiled.len() >= 1024 || rule.id.trim().is_empty() || !ids.insert(&rule.id) {
+                return Err(scan_error("rule inventory exceeds 1024 or contains empty/duplicate IDs"));
+            }
             compiled.push(CompiledRule::build(rule)?);
         }
     }
-    let mut findings = Vec::new();
+    Ok(compiled)
+}
+
+// The same loaded packs drive detection and SARIF metadata. Loading twice
+// could attribute findings to different rules after a concurrent pack change.
+fn scan_with_packs(cwd: &Path, paths: &[String], packs: &[RulePack]) -> Result<ScanOutcome> {
+    let compiled = compile_rules(packs)?;
+    let mut outcome = ScanOutcome {
+        findings: Vec::new(), scanned: BTreeSet::new(), skipped_non_utf8: Vec::new(), bytes_read: 0,
+    };
     for file in scope_files(cwd, paths)? {
-        scan_file(cwd, &file, &compiled, &mut findings);
+        let bytes = read_bounded(&file, MAX_SOURCE_BYTES)?;
+        outcome.bytes_read = outcome.bytes_read.checked_add(bytes.len())
+            .filter(|total| *total <= MAX_SCAN_BYTES)
+            .ok_or_else(|| scan_error("scan exceeds 256 MiB; narrow paths"))?;
+        let relative = file.strip_prefix(cwd).unwrap_or(&file).display().to_string();
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            outcome.skipped_non_utf8.push(relative);
+            continue;
+        };
+        scan_file(cwd, &file, content, &compiled, &mut outcome.findings)?;
+        outcome.scanned.insert(relative);
     }
-    findings.sort_by(|a, b| {
+    outcome.findings.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
             .then(a.line.cmp(&b.line))
             .then(a.rule_id.cmp(&b.rule_id))
     });
-    Ok(findings)
+    Ok(outcome)
 }
 
 /// SARIF level for our severity vocabulary.
@@ -743,6 +853,7 @@ impl Tool for SecurityScanTool {
 impl SecurityScanTool {
     fn op_plan(&self, input: &ScanInput) -> Result<ToolOutput> {
         let packs = load_rule_packs(&self.cwd)?;
+        compile_rules(&packs)?;
         let files = scope_files(&self.cwd, &input.paths)?;
         let rule_count: usize = packs.iter().map(|p| p.rules.len()).sum();
         let details = json!({
@@ -777,10 +888,16 @@ impl SecurityScanTool {
     fn op_run(&self, input: &ScanInput) -> Result<ToolOutput> {
         use std::fmt::Write as _;
         let packs = load_rule_packs(&self.cwd)?;
-        let findings = run_scan(&self.cwd, &input.paths)?;
+        let outcome = scan_with_packs(&self.cwd, &input.paths, &packs)?;
         let dispositions = load_dispositions(&self.cwd)?;
-        let (active, suppressed) = partition_by_disposition(findings, &dispositions);
-        let sarif = to_sarif(&active, &suppressed, &packs);
+        let (active, suppressed) = partition_by_disposition(outcome.findings, &dispositions);
+        let mut sarif = to_sarif(&active, &suppressed, &packs);
+        sarif["runs"][0]["invocations"] = json!([{ "executionSuccessful": true }]);
+        sarif["runs"][0]["properties"] = json!({
+            "scannedTextFiles": outcome.scanned.len(),
+            "skippedNonUtf8Files": outcome.skipped_non_utf8,
+            "bytesRead": outcome.bytes_read,
+        });
         let out_path = match input.sarif_out.as_deref() {
             None => self.cwd.join(".pi/security-scan.sarif"),
             Some(p) => confine_to_cwd(&self.cwd, p, "sarifOut")?,
@@ -810,7 +927,11 @@ impl SecurityScanTool {
             "errors": by_severity("error"),
             "warnings": by_severity("warning"),
             "notes": by_severity("note"),
-            "findings": active,
+            "findings": active.iter().take(50).collect::<Vec<_>>(),
+            "findingsTruncated": active.len() > 50,
+            "scannedTextFiles": outcome.scanned.len(),
+            "skippedNonUtf8Files": outcome.skipped_non_utf8.len(),
+            "bytesRead": outcome.bytes_read,
         });
         let mut text = format!(
             "Security scan: {} active finding(s) ({} error, {} warning, {} note), {} suppressed. SARIF: {}",
@@ -821,6 +942,8 @@ impl SecurityScanTool {
             suppressed.len(),
             out_path.display()
         );
+        let _ = write!(text, "\nScanned {} UTF-8 file(s); {} non-UTF-8 file(s) were not assessed (listed in SARIF).",
+            outcome.scanned.len(), outcome.skipped_non_utf8.len());
         for finding in active.iter().take(20) {
             let _ = write!(
                 text,
@@ -931,6 +1054,123 @@ impl SecurityScanTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_input(value: Value) -> ScanInput {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn bounded_reads_distinguish_io_failures_from_non_utf8_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        fs::write(&path, [0xff, 0x00, 0x41, 0x42]).unwrap();
+        assert_eq!(read_bounded(&path, 4).unwrap(), [0xff, 0x00, 0x41, 0x42]);
+        assert!(read_bounded(&path, 3).is_err());
+        assert!(read_bounded(dir.path(), 100).is_err());
+        fs::rename(&path, dir.path().join("moved.bin")).unwrap();
+        let failure = read_bounded(&path, 100).unwrap_err().to_string();
+        assert!(failure.contains("SOURCE_SCAN_INCOMPLETE"));
+    }
+
+    #[test]
+    fn source_scan_reports_unassessed_encoding_in_summary_and_sarif() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("clean.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("opaque.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        let output = tool.op_run(&scan_input(json!({"op":"run",
+            "paths":["clean.rs","opaque.bin"], "sarifOut":"report.sarif"}))).unwrap();
+        let details = output.details.unwrap();
+        assert_eq!(details["scannedTextFiles"], 1);
+        assert_eq!(details["skippedNonUtf8Files"], 1);
+        assert_eq!(details["active"], 0);
+        let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("report.sarif")).unwrap()).unwrap();
+        assert_eq!(saved["runs"][0]["properties"]["skippedNonUtf8Files"], json!(["opaque.bin"]));
+        assert_eq!(saved["runs"][0]["properties"]["scannedTextFiles"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_discovered_entry_cannot_replace_an_existing_success_report() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/clean.rs"), "fn main() {}\n").unwrap();
+        std::os::unix::fs::symlink("missing.rs", dir.path().join("src/unreadable.rs")).unwrap();
+        let report = dir.path().join("report.sarif");
+        fs::write(&report, "preserve previous completed scan").unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        for op in ["plan", "run"] {
+            let input = scan_input(json!({"op":op,"paths":["src"],"sarifOut":"report.sarif"}));
+            let result = if op == "run" { tool.op_run(&input) } else { tool.op_plan(&input) };
+            assert!(result.unwrap_err().to_string().contains("SOURCE_SCAN_INCOMPLETE"));
+        }
+        assert_eq!(fs::read_to_string(&report).unwrap(), "preserve previous completed scan");
+    }
+
+    #[test]
+    fn invalid_rule_directory_and_malformed_pack_never_fall_back_to_default_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let pi = dir.path().join(".pi");
+        fs::create_dir(&pi).unwrap();
+        fs::write(pi.join("security-rules"), "not a directory").unwrap();
+        assert!(load_rule_packs(dir.path()).is_err());
+        fs::rename(pi.join("security-rules"), pi.join("saved-invalid-rules")).unwrap();
+        fs::create_dir(pi.join("security-rules")).unwrap();
+        fs::write(pi.join("security-rules/bad.toml"), "name = PRIVATE-CANARY [").unwrap();
+        let failure = load_rule_packs(dir.path()).unwrap_err().to_string();
+        assert!(failure.contains("malformed"));
+        assert!(!failure.contains("PRIVATE-CANARY"));
+    }
+
+    #[test]
+    fn project_rule_ids_cannot_override_or_collide_with_the_embedded_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join(".pi/security-rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("duplicate.toml"), r#"
+name = "collision"
+version = "1"
+[[rules]]
+id = "secret.aws-access-key"
+pattern = "never-match"
+severity = "note"
+message = "collision"
+"#).unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        assert!(tool.op_plan(&scan_input(json!({"op":"plan"}))).is_err());
+        assert!(run_scan(dir.path(), &[]).is_err());
+    }
+
+    #[test]
+    fn oversized_source_and_finding_budget_never_publish_a_partial_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.py");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+        let input = scan_input(json!({"op":"run","paths":["large.py"],"sarifOut":"result.sarif"}));
+        let tool = SecurityScanTool::new(dir.path());
+        assert!(tool.op_run(&input).is_err());
+        assert!(!dir.path().join("result.sarif").exists());
+        fs::write(&path, "pickle.loads(data)\n".repeat(MAX_FINDINGS + 1)).unwrap();
+        assert!(tool.op_run(&input).unwrap_err().to_string().contains("10000 findings"));
+        assert!(!dir.path().join("result.sarif").exists());
+    }
+
+    #[test]
+    fn tool_preview_is_bounded_while_saved_findings_remain_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("code.py"), "pickle.loads(data)\n".repeat(51)).unwrap();
+        let output = SecurityScanTool::new(dir.path()).op_run(&scan_input(json!({
+            "op":"run","paths":["code.py"],"sarifOut":"report.sarif"
+        }))).unwrap();
+        let details = output.details.unwrap();
+        assert_eq!(details["active"], 51);
+        assert_eq!(details["findings"].as_array().unwrap().len(), 50);
+        assert_eq!(details["findingsTruncated"], true);
+        let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("report.sarif")).unwrap()).unwrap();
+        assert_eq!(saved["runs"][0]["results"].as_array().unwrap().len(), 51);
+    }
 
     fn packs() -> Vec<RulePack> {
         load_rule_packs(Path::new("/nonexistent-root")).expect("default pack parses")
