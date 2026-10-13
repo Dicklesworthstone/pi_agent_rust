@@ -269,6 +269,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/completion/tests/protocol.rs` | LSP completion protocol scenario tests | Test module; protocol scenarios. |
 | `src/lsp/diagnostics_tests.rs` | LSP model-facing diagnostics test suite | Test module; diagnostics tool tests. |
 | `src/lsp/edits.rs` | LSP edits | `tests/lsp.rs`. |
+| `src/lsp/edits/annotations.rs` | LSP change annotations retained with a workspace edit, and the reviewed-confirmation requirement | Unit (`annotations/tests.rs`). |
+| `src/lsp/edits/annotations/tests.rs` | LSP change annotation test suite | Test module; annotation retention and confirmation tests. |
+| `src/lsp/edits/annotations/tests/protocol.rs` | LSP change annotation protocol tests against a scripted language-server fixture | Test module; negotiation and reviewed-approval scenarios (`server.py` fixture). |
 | `src/lsp/edits/sequence.rs` | LSP workspace edit sequence parser and validator | Unit; in-module tests. |
 | `src/lsp/edits/sequence/tests.rs` | LSP workspace edit sequence test suite | Test module; sequence tests. |
 | `src/lsp/edits/transaction.rs` | LSP atomic workspace edit transaction engine | Unit; in-module tests. |

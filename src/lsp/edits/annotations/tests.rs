@@ -16,7 +16,9 @@ fn text(uri: &str, annotation: Option<&str>) -> Value {
         "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
         "newText":"new"
     });
-    if let Some(id) = annotation { edit["annotationId"] = json!(id); }
+    if let Some(id) = annotation {
+        edit["annotationId"] = json!(id);
+    }
     json!({"textDocument":{"uri":uri,"version":null},"edits":[edit]})
 }
 
@@ -49,7 +51,10 @@ fn text_and_resource_references_preserve_exact_annotation_identity() {
     let plan = parse_workspace_edit(&raw).unwrap();
     assert_eq!(plan.annotations.required(), vec!["public-api"]);
     let annotations = plan.annotations.value();
-    assert_eq!(annotations["public-api"], raw["changeAnnotations"]["public-api"]);
+    assert_eq!(
+        annotations["public-api"],
+        raw["changeAnnotations"]["public-api"]
+    );
     assert_eq!(annotations["move"], raw["changeAnnotations"]["move"]);
     assert!(annotations.get("unused").is_none());
 }
@@ -61,9 +66,14 @@ fn wrapper_annotations_are_honored_but_conflicting_ids_fail() {
     for outer in [false, true] {
         let mut raw = original.clone();
         let mut wrapped = json!({"textEdit":edit});
-        if outer { wrapped["annotationId"] = json!("public-api"); }
+        if outer {
+            wrapped["annotationId"] = json!("public-api");
+        }
         raw["documentChanges"][0]["edits"][0] = wrapped;
-        assert_eq!(parse_workspace_edit(&raw).unwrap().annotations.required(), vec!["public-api"]);
+        assert_eq!(
+            parse_workspace_edit(&raw).unwrap().annotations.required(),
+            vec!["public-api"]
+        );
         raw["documentChanges"][0]["edits"][0]["annotationId"] = json!("different");
         assert!(parse_workspace_edit(&raw).is_err());
     }
@@ -71,11 +81,19 @@ fn wrapper_annotations_are_honored_but_conflicting_ids_fail() {
 
 #[test]
 fn undefined_wrong_typed_and_misplaced_references_never_disappear() {
-    for value in [Value::Null, json!(true), json!(7), json!(""), json!("missing"), json!("x".repeat(129))] {
+    for value in [
+        Value::Null,
+        json!(true),
+        json!(7),
+        json!(""),
+        json!("missing"),
+        json!("x".repeat(129)),
+    ] {
         let mut raw = workspace(&sample_uri("source.rs"));
         raw["documentChanges"][0]["edits"][0]["annotationId"] = value.clone();
         assert!(parse_workspace_edit(&raw).is_err(), "{value}");
-        raw["documentChanges"] = json!([{"kind":"delete","uri":sample_uri("source.rs"),"annotationId":value}]);
+        raw["documentChanges"] =
+            json!([{"kind":"delete","uri":sample_uri("source.rs"),"annotationId":value}]);
         assert!(parse_workspace_edit(&raw).is_err());
     }
     let mut raw = workspace(&sample_uri("source.rs"));
@@ -89,10 +107,15 @@ fn undefined_wrong_typed_and_misplaced_references_never_disappear() {
 #[test]
 fn malformed_definitions_fail_even_when_unused() {
     for annotation in [
-        Value::Null, json!([]), json!({}), json!({"label":null}), json!({"label":""}),
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"label":null}),
+        json!({"label":""}),
         json!({"label":"x","needsConfirmation":"true"}),
         json!({"label":"x","needsConfirmation":null}),
-        json!({"label":"x","description":false}), json!({"label":"x","description":null}),
+        json!({"label":"x","description":false}),
+        json!({"label":"x","description":null}),
         json!({"label":"x".repeat(MAX_LABEL_BYTES + 1)}),
         json!({"label":"x","description":"y".repeat(MAX_DESCRIPTION_BYTES + 1)}),
     ] {
@@ -115,7 +138,12 @@ fn count_and_serialized_byte_limits_apply_before_retaining_annotations() {
     let error = parse_workspace_edit(&json!({"changeAnnotations":entries})).unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_LIMIT"));
     let raw = json!({"changeAnnotations":{"a":{"label":"safe","extension":"x".repeat(MAX_ANNOTATION_BYTES)}}});
-    assert!(parse_workspace_edit(&raw).unwrap_err().to_string().contains("LSP_EDIT_LIMIT"));
+    assert!(
+        parse_workspace_edit(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("LSP_EDIT_LIMIT")
+    );
 }
 
 #[test]
@@ -130,7 +158,10 @@ fn effective_document_changes_take_precedence_without_inheriting_ignored_confirm
     assert_eq!(plan.annotations.value(), json!({}));
     let mut raw = workspace(&sample_uri("source.rs"));
     raw["changes"] = json!({"file:///other.rs":[]});
-    assert_eq!(parse_workspace_edit(&raw).unwrap().annotations.required(), vec!["public-api"]);
+    assert_eq!(
+        parse_workspace_edit(&raw).unwrap().annotations.required(),
+        vec!["public-api"]
+    );
 }
 
 #[test]
@@ -139,7 +170,10 @@ fn direct_apply_rejects_the_entire_batch_before_any_file_changes() {
     let (a, uri_a) = file(temp.path(), "a.rs");
     let (b, uri_b) = file(temp.path(), "b.rs");
     let mut raw = workspace(&uri_b);
-    raw["documentChanges"].as_array_mut().unwrap().insert(0, text(&uri_a, None));
+    raw["documentChanges"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, text(&uri_a, None));
     let plan = parse_workspace_edit(&raw).unwrap();
     let error = apply_workspace_edit(&plan, None).unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_CONFIRMATION_REQUIRED"));
@@ -165,7 +199,10 @@ fn informational_annotations_do_not_block_immediate_application() {
     let temp = tempfile::tempdir().unwrap();
     let (path, uri) = file(temp.path(), "a.rs");
     let mut raw = workspace(&uri);
-    raw["changeAnnotations"]["public-api"].as_object_mut().unwrap().remove("needsConfirmation");
+    raw["changeAnnotations"]["public-api"]
+        .as_object_mut()
+        .unwrap()
+        .remove("needsConfirmation");
     let plan = parse_workspace_edit(&raw).unwrap();
     apply_workspace_edit(&plan, None).unwrap();
     assert_eq!(std::fs::read(path).unwrap(), b"new\n");
@@ -179,7 +216,13 @@ fn staged_edits_retain_annotations_and_only_reviewed_commit_accepts_them() {
     let plan = parse_workspace_edit(&raw).unwrap();
     let pending = PreparedEdit::new(&plan, &HashMap::new()).unwrap();
     assert_eq!(pending.required_annotations(), vec!["public-api"]);
-    assert!(pending.commit(|| Ok(())).unwrap_err().to_string().contains("LSP_EDIT_CONFIRMATION_REQUIRED"));
+    assert!(
+        pending
+            .commit(|| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("LSP_EDIT_CONFIRMATION_REQUIRED")
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
     let reviewed = PreparedEdit::new(&plan, &HashMap::new()).unwrap();
     raw["changeAnnotations"]["public-api"]["needsConfirmation"] = json!(false);
@@ -198,9 +241,13 @@ fn command_batch_confirmation_is_not_implied_by_an_open_edit_window() {
     let error = apply_checked(&plan, &HashMap::new(), || {
         guard_ran.set(true);
         Ok(())
-    }).unwrap_err();
+    })
+    .unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_CONFIRMATION_REQUIRED"));
-    assert!(!guard_ran.get(), "no commit admission or receipt for an unreviewed batch");
+    assert!(
+        !guard_ran.get(),
+        "no commit admission or receipt for an unreviewed batch"
+    );
     assert_eq!(std::fs::read(path).unwrap(), b"old\n");
 }
 
@@ -210,7 +257,9 @@ fn annotation_approval_does_not_bypass_source_or_owner_checks() {
     let (path, uri) = file(temp.path(), "a.rs");
     let plan = parse_workspace_edit(&workspace(&uri)).unwrap();
     let reviewed = PreparedEdit::new(&plan, &HashMap::new()).unwrap();
-    let error = reviewed.commit_reviewed(|| Err(plan_error("LSP_CANCELLED", "cancelled"))).unwrap_err();
+    let error = reviewed
+        .commit_reviewed(|| Err(plan_error("LSP_CANCELLED", "cancelled")))
+        .unwrap_err();
     assert!(error.to_string().contains("LSP_CANCELLED"));
     assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
     let reviewed = PreparedEdit::new(&plan, &HashMap::new()).unwrap();
@@ -236,10 +285,18 @@ fn resource_operations_keep_the_confirmation_boundary() {
         let mut raw = workspace("file:///unused.rs");
         raw["documentChanges"] = json!([operation]);
         let plan = parse_workspace_edit(&raw).unwrap();
-        assert!(apply_workspace_edit(&plan, None).unwrap_err().to_string().contains("LSP_EDIT_CONFIRMATION_REQUIRED"));
+        assert!(
+            apply_workspace_edit(&plan, None)
+                .unwrap_err()
+                .to_string()
+                .contains("LSP_EDIT_CONFIRMATION_REQUIRED")
+        );
         assert!(path.exists());
         assert!(!target.exists());
-        PreparedEdit::new(&plan, &HashMap::new()).unwrap().commit_reviewed(|| Ok(())).unwrap();
+        PreparedEdit::new(&plan, &HashMap::new())
+            .unwrap()
+            .commit_reviewed(|| Ok(()))
+            .unwrap();
         assert_eq!(path.exists(), kind == "create");
         assert_eq!(target.exists(), kind != "delete");
     }

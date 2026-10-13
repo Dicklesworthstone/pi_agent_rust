@@ -581,7 +581,10 @@ mod tests {
             );
             assert_eq!(output.details.as_ref().unwrap()["mock"], false);
             assert_eq!(output.details.as_ref().unwrap()["model"], model);
-            assert_eq!(output.details.as_ref().unwrap()["preview"]["included"], true);
+            assert_eq!(
+                output.details.as_ref().unwrap()["preview"]["included"],
+                true
+            );
             let ContentBlock::Image(image) = &output.content[1] else {
                 panic!("visual review must receive a native image, not base64 text");
             };
@@ -875,7 +878,11 @@ mod tests {
             ))
             .err()
             .expect("invalid controls must not be silently ignored");
-        assert!(error.to_string().contains("include_image must be a boolean"));
+        assert!(
+            error
+                .to_string()
+                .contains("include_image must be a boolean")
+        );
         assert!(!dir.path().join("out.png").exists());
     }
 }

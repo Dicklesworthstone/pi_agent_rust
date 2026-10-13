@@ -8,8 +8,8 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use super::{ApplyOutcome, Image, Result, Transaction, WorkspaceEditPlan, conflict};
 use super::super::annotations::Annotations;
+use super::{ApplyOutcome, Image, Result, Transaction, WorkspaceEditPlan, conflict};
 use crate::lsp::text::content_hash_for_drift;
 
 /// Absence is evidence too: a deleted or moved-away path must not be silently
