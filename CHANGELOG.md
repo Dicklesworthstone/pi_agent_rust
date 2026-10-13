@@ -14,6 +14,510 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.8.0] — 2026-10-13 — Release
+
+A feature release on top of v0.7.1. Prompts can carry native audio and video;
+a resumed session runs in the workspace it was saved in; ACP editors can
+reopen saved sessions and attach MCP servers; and the classic stack and ACP
+get the retry, failover and persistence fences that the default stack, print
+mode and RPC already had. Much of the rest hardens tool-call handling, LSP,
+MCP and process ownership. Published binaries are now built for speed
+rather than size, and the default interface no longer stops redrawing when
+frames are slow, as they are during a long reasoning block.
+
+A minor release because three library items that `docs/sdk.md` marks Stable
+changed incompatibly (see **Changed**). The CLI gains one flag
+(`--session-workdir`) and loses none; settings gain one key
+(`http.proxyLoopback`) and lose none. Session files written by earlier
+releases open unchanged. The reverse no longer holds for every session: a
+JSONL session that v0.8.0 saves with an image, audio or video payload over
+64 KiB keeps that payload in a sidecar directory, which v0.7.1 and earlier do
+not read.
+
+### Changed
+
+- **Breaking (library API).** Three items that `docs/sdk.md` marks Stable
+  changed incompatibly:
+  - `pi::sdk::SessionOptions` gained two public fields,
+    `model_scope: Option<Vec<String>>` and
+    `max_time: Option<std::time::Duration>`, both `None` by default. Code
+    that builds the struct by listing every field must add them; code that
+    ends the literal with `..Default::default()` is unaffected.
+  - `pi::sdk::AgentSessionHandle::mount_mcp_server_tools_if_absent(&mut self,
+    server_name: &str) -> usize` was removed. Call
+    `refresh_mcp_server_tools(&mut self, server_name: &str) -> usize`
+    instead. It is not a pure rename: besides mounting missing tools it gives
+    already-mounted tools the server's current schemas and removes tools the
+    server no longer offers, and the returned count is wrappers added,
+    replaced or removed (it was wrappers added).
+  - `pi::sdk::Agent::restore_secrets_inbound(&self, tool_call: ToolCall)`
+    returns `Result<ToolCall>` (was `ToolCall`). It fails with
+    `PI_SECRET_JSON_RESTORE_KEY_COLLISION` when restoring placeholders would
+    merge two distinct argument keys, and with `PI_SECRET_JSON_DEPTH` when
+    the arguments are nested too deeply. Callers must handle the error.
+
+  The Stable trait `pi::sdk::Tool` gained four methods
+  (`execute_with_auxiliary_privacy`, `effects_for_input`, `bind_model_scope`,
+  `mcp_manager`); all have default bodies, so existing implementations
+  compile unchanged.
+- **SDK turns are owned until they are saved.** Dropping an admitted
+  `prompt*` or `continue_turn*` future now fences the handle exactly as a
+  failed session save does: later prompts return an error until a new or
+  resumed session replaces the handle. To cancel and keep the handle, abort
+  through the `AbortSignal` and await the outcome. The fence now applies at
+  every entry point, including an image prompt whose retry cannot be saved.
+  `mark_checkpoint`, `rewind_to_checkpoint`, `rewind_to_user_message` and
+  retry preparation save their change before replacing the live
+  conversation, and a failed save leaves it as it was. `prepare_retry()`
+  refuses a turn that holds images or media; use `prepare_retry_content()`.
+  The typed `on_stream_event` hook now receives the provider's terminal
+  `Done`/`Error` events.
+- **`Agent::set_provider` resets image support.** Installing a provider
+  object directly now turns the agent's image-input capability off (thinking
+  and the tool-call dialect were already reset), because a bare provider
+  carries no catalog metadata. Embedders that swap in a provider for a
+  vision model must call `set_model_accepts_images(true)` afterwards, or
+  images reach the model as a "does not support image input" placeholder.
+  Model switches made through the CLI and the SDK's own selection paths
+  restore the capability themselves.
+- **SDK RPC client (`RpcTransportClient`).** Requests and prompts no longer
+  block the caller's executor while waiting on the subprocess pipes.
+  Dropping an in-flight request or prompt future closes the connection and
+  stops the subprocess tree: reconnect before the next request, or abort the
+  turn with `RpcControlHandle::abort()` and keep polling to keep the
+  connection. An acknowledgement must carry a boolean `success`; a
+  mismatched or duplicate prompt acknowledgement closes the connection. One
+  JSON line may be 128 MiB (was 8 MiB) and the pre-acknowledgement buffer
+  256 MiB (was 4 MiB), to fit echoed native media.
+- **Library items outside `pi::sdk`** are not covered by SemVer, but
+  embedders that reach into them should know: `pi::compaction::compact`,
+  `compact_auto` and `summarize_entries`, and
+  `pi::checkpoint::summarize_span`, take `&StreamOptions` where they took
+  `api_key: &str`, plus a trailing `&CompactionPrivacy`; `compact_local` and
+  `compact_shake` take a trailing `&CompactionPrivacy`;
+  `ExtensionHostActions::compact_session` takes a second
+  `ExtensionCompactionOptions` argument; `pi::tools::ProcessedFiles` and
+  `pi::app::InitialMessage` replace `images: Vec<ImageContent>` with
+  `attachments: Vec<ContentBlock>`; and `pi::http::proxy::HttpSettings` (the
+  type of the Stable `Config.http` field) gained
+  `proxy_loopback: Option<bool>`.
+- **Resumed sessions run in their saved workspace.** `pi --session`,
+  `--continue` and `--resume` now resolve the session's saved working
+  directory before loading project settings, trust, tools or extensions, and
+  use it instead of the directory pi was started from. Project resources,
+  prompt files, MCP configuration, credential commands and tool paths
+  resolve there, and the session's saved additional roots are restored. If
+  the saved directory is gone, startup stops with
+  `PI_SESSION_WORKDIR_UNAVAILABLE` rather than using the current directory:
+  pass `--session-workdir <PATH>` together with `--session` to attach the
+  session to its new location. `--no-session` and read-only modes are
+  unaffected. In the SDK, omit `SessionOptions::working_directory` when
+  resuming to follow the saved workspace; a value naming a different
+  directory fails with `PI_SESSION_WORKDIR_MISMATCH`. A running classic or
+  RPC session refuses to switch or fork to a session of another workspace;
+  start a new `pi --session ...` process instead. `--continue`, `--resume`
+  and the session pickers list a reattached session under its new workspace.
+- **Large attachments are stored beside the session file.** When a JSONL
+  session is saved, each image, audio or video payload over 64 KiB is written
+  once to `<session>.jsonl.blobs/<sha256>` and the JSONL line keeps a
+  `$piBlob` reference. Copy or back up the `.jsonl` file together with its
+  `.blobs` directory, and rename the directory if you rename the file. A
+  missing or corrupt blob stops the session from opening with
+  `PI_SESSION_ATTACHMENT_INVALID` instead of being skipped. Forks and HTML
+  exports are self-contained, deleting a session removes its blobs, and
+  nothing else garbage-collects them. Older releases do not read these
+  references from JSONL, so do not reopen such a session with v0.7.1.
+- **Windows: commands are contained at creation, and source builds need
+  nightly.** The bash tool, background jobs, subagents, MCP and language
+  servers, the browser, debug adapters and the SDK's RPC subprocess now join
+  their kill-on-close Job as part of process creation, so a child cannot
+  start descendants before it is contained, and a command is refused when
+  its Job cannot be set up. This relies on the unstable std feature
+  `windows_process_extensions_raw_attribute`, which the library now enables
+  on Windows: building pi, or a crate that depends on it, for a Windows
+  target requires a nightly toolchain (the repository pins
+  `nightly-2026-08-31`). Other targets are unaffected and `rust-version`
+  stays 1.95.
+- **Installer.** `install.sh` reads the latest version from the `tag_name`
+  field of GitHub's release metadata whether the JSON is compact or
+  pretty-printed; with compact JSON it used to select the release body and
+  fail (#253). `--source-dir <DIR>` (which implies `--from-source`) now
+  installs a local checkout without contacting GitHub: no release lookup,
+  no network preflight and no `git` requirement. It always rebuilds, instead
+  of skipping because the previous install recorded the same version.
+- **Loopback model servers bypass the proxy.** Requests to `localhost`,
+  `127.0.0.0/8`, `::1` and IPv4-mapped loopback addresses now go direct even
+  when an HTTP or SOCKS proxy is configured, so the `NO_PROXY` entries
+  v0.7.1 needed for Ollama or LM Studio are no longer required. Set
+  `"http": { "proxyLoopback": true }` (also `proxy_loopback`) to send
+  loopback traffic through the proxy; `NO_PROXY` and `http.noProxy` still
+  take precedence. Bash children now receive only HTTP proxy endpoints as
+  `HTTP_PROXY`/`HTTPS_PROXY`. With a SOCKS proxy their inherited proxy
+  variables are left alone, so an authenticated `ALL_PROXY` keeps its
+  credentials; a SOCKS proxy set only in pi's settings or `PI_*_PROXY` no
+  longer reaches child tools.
+- **Retry and failover on the classic stack and in ACP.** `pi --classic` and
+  ACP editor sessions now run turns through the same recovery driver as the
+  default stack: same-provider retries, `retry.fallbackChains`, restoration
+  of the primary model after its cooldown, and the persistence fence. A
+  fallback chain that the classic stack silently ignored now runs there.
+  Explicitly choosing a model, including the active fallback, ends automatic
+  restoration, and that choice is saved. Print mode and RPC keep a system
+  prompt that an extension selected for the turn through retries and
+  fallback hops, and RPC rebuilds failover state after `switch_session` and
+  `fork`.
+- **ACP sessions honor the launch flags.** `--provider`, `--model`,
+  `--models`, `--thinking`, `--api-key`, `--tools`, `--no-tools`,
+  `--system-prompt`, `--append-system-prompt`, `--no-context-files`,
+  `--hide-cwd-in-prompt`, `--max-tool-iterations` and `--max-time` now reach
+  every editor session. An unreadable prompt file rejects session creation.
+- **`--no-tools` means no built-in tools.** `--no-tools`, and an empty
+  `enabled_tools` list in the SDK, now also remove the tools that settings
+  turn on. Tools from explicitly loaded extensions and MCP servers still
+  mount. Plan mode cannot start in such a session: `--plan-mode` prints a
+  warning and `/plan` reports `PLAN_TOOLS_DISABLED`.
+- **A model scope emptied by provider settings is an error.** When every
+  model matched by `--models` or the workspace's model scope belongs to a
+  disabled provider, startup fails with `MODEL_SCOPE_DISABLED` instead of
+  selecting an unrelated model. The check runs after extensions register
+  their providers.
+- **Default stack: extension commands take precedence.** A command that an
+  extension registers now wins over a built-in of the same name (`/plan`,
+  `/status`, `/todos`, `/branch`, ...). Registrations are refreshed after a
+  session is replaced and after `/reload`.
+- **A time cap stops queued work.** When `--max-time` ends a turn, queued
+  steering and follow-up messages are no longer started automatically on
+  either terminal stack or over RPC; they stay queued until you send or
+  retry. RPC also skips automatic compaction after a capped turn.
+- **Tool calls are validated as a whole batch.** Before any approval prompt,
+  hook or tool runs, every call in a reply must have a non-blank, unique id,
+  a non-blank name and JSON-object arguments; otherwise none of the batch
+  runs (`PI_TOOL_CALL_PROTOCOL`). The provider adapters apply the same rule
+  while streaming: OpenAI Chat, Azure and OpenAI Responses/Codex reject a
+  response with missing, duplicate or contradictory call identities or
+  malformed arguments, and Gemini and Vertex reject a response whose finish
+  reason reports a failure. A valid sibling of a malformed call is no longer
+  executed.
+- **Extension provider streams must agree with what they streamed.** The
+  terminal message may not drop or retype a block, or change completed text,
+  thinking, tool arguments, ids, names or signatures. A tool call may not
+  change its id or name mid-stream or reuse an id at a second content index,
+  and text deltas must match the cumulative text. Previewed content is
+  limited to 32 MiB per stream. A successful reply that ends with `stop` but
+  contains complete tool calls is now treated as `toolUse`, and the calls
+  run.
+- **Signed assistant content is replayed verbatim only to its own model.**
+  v0.7.1 sent provider-signed content unchanged to whichever model was
+  active. An exact match of API, provider and model is now required. After a
+  model switch, earlier content is screened like other text, and its
+  signature fields, and on OpenAI Responses its reasoning and item ids, are
+  left out of the request; Bedrock reasoning follows the same rule. The
+  stored session is not modified, so switching back restores exact replay.
+  In `obfuscate` mode, numbers and other JSON primitives in a model's own
+  tool-call arguments keep their type when replayed to that same model.
+- **Secret screening covers auxiliary requests and memory.** The advisor
+  and `/btw` apply the configured `secrets` policy, including
+  `extra_patterns`, `block` mode and values the session already holds in its
+  vault. Compaction (manual, automatic, background, rewind, branch and
+  extension-driven) and memory reflection are screened the same way. Memory
+  facts, tags and learned skills are redacted irreversibly with the shared
+  detector before they are stored, even when `secrets.mode` is `off`. When
+  restoring placeholders in tool-call arguments would merge two distinct
+  keys, the call is refused before approval.
+- **Detector ruleset v6.** OpenAI and Anthropic `sk-` keys are now found
+  directly after a literal control escape such as `\n` or `\t` in escaped
+  text (JSON strings, debug-formatted crash bundles). Keys inside ordinary
+  identifiers are still not matched.
+- **Hub service logs are capped.** Each service run keeps the first 16 MiB
+  of raw output. Pi keeps draining the service after that, so readiness
+  checks, live tails and PTY input continue; `logs`, `ps` and `describe`
+  report `logCapture` byte counts and truncation.
+- **Context estimates.** Audio counts as 32 tokens per second and video as
+  300 tokens per second when the container reports a duration (it was sized
+  by encoded bytes); text containing a literal control-token spelling such
+  as `<|endoftext|>` is counted as ordinary text; and the fallback estimate
+  in builds without `bpe-tokens` rounds up. These move the point at which
+  automatic compaction starts.
+- **Published binaries are optimized for speed.** Release binaries were built
+  with `opt-level = "z"` (size). They are now built with a new `dist` Cargo
+  profile: the same fat LTO, single codegen unit, `panic = "abort"` and
+  stripping, with `opt-level = 3`. Measured on Linux x86_64 with the same
+  source built both ways, in interleaved runs: the binary is 43% larger
+  (78.0 MB against 54.7 MB) and takes 25% less time to process a
+  20,000-delta streamed response in print mode, 25% less for a complete RPC
+  turn with a tool call, and 15% less to start. Against the published
+  v0.7.1 binary, the published v0.8.0 binary takes about a fifth less time
+  on those workloads.
+  `cargo build --release` and `cargo install` still use the size-budgeted
+  `release` profile; build with `--profile dist` to match the published
+  binaries.
+- **Dependencies.** `fsqlite` 0.4.10 (from 0.3.18): it is built on
+  `asupersync` 0.5, the version pi already uses, so the second copy of
+  `asupersync` (0.4.11) leaves the build. `ftui` and `ftui-extras` 0.9.0
+  (from 0.7), `rich_rust` 0.2.3, and a refresh of the semver-compatible
+  dependencies. `charmed-bubbletea` and `charmed-bubbles` are pinned to
+  exactly 0.2.0: 0.2.1 through 0.2.4 hide the wrapped tail of long
+  classic-stack status lines. `asupersync` stays on 0.5.0, the newest
+  published release. `wasmtime` stays on 47 behind the optional `wasm-host`
+  feature, which release binaries do not enable
+  ([#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258)).
+
+### Added
+
+- **Native audio and video in prompts.**
+  `pi @voice.wav @clip.mp4 "Compare these recordings"` attaches audio and
+  video (`.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`;
+  5 MiB per file by default) alongside images, in argument order, on both
+  terminal stacks. Gemini-family providers receive the media natively; other
+  providers receive a `[media omitted: ...]` placeholder, and the session
+  keeps the attachment. Attachments survive retry, failover and `/retry`.
+- **`--session-workdir <PATH>`** attaches an existing `--session` to a
+  moved project directory, saves that attachment, and resumes there.
+- **SDK:** `AgentSessionHandle::prompt_with_content`,
+  `prompt_with_content_with_abort` and `prompt_controlled_with_content` send
+  ordered text, image, audio and video blocks;
+  `SessionTransport::prompt_with_content` and
+  `RpcTransportClient::prompt_with_content` /
+  `prompt_with_content_streaming` do the same over either backend.
+  `prepare_retry_content` returns an abandoned turn with its attachments;
+  `retry_policy` and `set_retry_policy` read and change the retry policy of
+  a live handle. `MediaContent` is exported from `pi::sdk` and has
+  `duration()`. `SessionOptions::model_scope` takes the patterns `--models`
+  takes, and `SessionOptions::max_time` sets a wall-clock run limit.
+  `ToolRegistry::without_builtins` builds a registry with no built-in tools.
+- **RPC:** `prompt`, `steer` and `follow_up` accept a `media` array, or an
+  ordered `content` array of text, image and media blocks.
+  `set_output_mode` switches a connection to `compact` output, in which
+  image and media payloads become attachment references and `message_update`
+  events carry deltas only; `get_attachment` reads a referenced payload in
+  byte ranges. `get_state` reports `outputMode`. The default `full` output
+  is unchanged.
+- **ACP:** prompts may contain images and embedded editor context;
+  `session/load` replays a saved session's selected branch to the editor and
+  `session/resume` reopens it without replay; `session/list` merges saved
+  and live sessions and pages 50 at a time with opaque cursors; MCP servers
+  that the editor supplies for a session (stdio and HTTP) connect behind
+  pi's trust check with per-tool editor approval, managed with
+  `/mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME`;
+  tool results keep their images, audio and video in editor updates.
+- **Default (FTUI) stack:** `/skillful [on|off|status]` removes the skills
+  listing from the system prompt or puts it back; `/settings` or F2 opens an
+  editor for retry and fallback, automatic compaction, steering and
+  follow-up delivery, image resizing, thinking visibility, transcript
+  spacing, the double-Escape action and completion menu height, and saves
+  each change; new sessions are named automatically by the model configured
+  for the `tiny`/`smol` role after their first saved exchange.
+- **LSP:** the `lsp` tool's `project_diagnostics` action asks the language
+  server for its whole-workspace diagnostics, including files that are not
+  open (servers that advertise `workspaceDiagnostics`); workspace `symbols`,
+  `references`, `definition`, `type_definition`, `implementation` and
+  project diagnostics accept results the server streams in parts; semantic
+  completion expands named snippet variables, with values supplied through
+  `snippetValues`.
+- **Browser tool:** `list_frames` discovers nested cross-process iframes,
+  and snapshots, accessibility inspection, evaluation, selector waits,
+  typing, native clicks and scrolling work inside them; `select_option`
+  selects options of a `<select>` by value, label or index and verifies the
+  result; `set_checked` sets a checkbox or radio to an explicit state with a
+  native click, and does nothing when the state already matches.
+- **Computer tool on macOS.** The opt-in `computer` tool works on macOS 14
+  or newer without X11, through a bundled Swift helper run by
+  `/usr/bin/swift` (Xcode Command Line Tools required): `list_displays`,
+  `list_windows`, `screenshot`, `clipboard_read`, `clipboard_write`,
+  `ax_tree`, `focus_window`, `mouse_move`, `mouse_click`, scrolling,
+  dragging, `key_type` and `key_press`. It needs the Screen Recording and
+  Accessibility permissions; see `docs/tools/computer-macos.md`.
+- **security_scan:** `compare_dependencies` compares two saved dependency
+  audits offline and reports, per package, what persisted, appeared or could
+  not be determined; `disposition_dependencies` records `accepted_risk`,
+  `false_positive` or `reopen` decisions for exact findings in a new SARIF
+  file bound to the hash of the audit it reviews. `dependency_plan` also
+  reads `uv.lock` (schema 1) and `poetry.lock` (1.1, 2.0, 2.1) offline, next
+  to Cargo and npm lockfiles, and picks up root lockfiles of all four kinds
+  when `paths` is empty. Only packages from public PyPI are inventoried;
+  private indexes, direct URLs, Git, path and editable packages and local
+  versions are reported as exclusions without their names or URLs. See
+  `docs/tools/python-dependencies.md`.
+- **Memory:** `memory.backend: "cass"` keeps the local memory bank and tools
+  and adds read-only recall from the project's past agent sessions through
+  an installed `cass` (Unix only). `recall` takes `includeHistory: false` to
+  search the local bank alone.
+- **Subagents:** native children get the `hub` tool by default and can
+  message their siblings and the parent (`hub` with `op: "agent"` and the
+  actions `roster`, `send` and `inbox`); an agent definition with an
+  explicit tool allowlist must list `hub` to take part.
+- **Extensions:** `ctx.compact(preparation, options)` accepts
+  `model: { provider, id }`, `customInstructions` and `thinkingLevel`, so a
+  `session_before_compact` handler can summarize with another registered
+  model; the host resolves that model's endpoint and credentials (#178).
+  Cancelling a running compaction from JavaScript is still not propagated.
+  On Windows, `node:path` has Windows semantics (drive letters, UNC shares),
+  `path.win32` and `path.posix` exist on every host, and the `node:fs` shim
+  keeps UNC and extended-length roots intact (#182).
+- **Release verification:** `scripts/verify_published_release.py` checks a
+  published release's signed manifest and payload checksums and runs
+  offline CLI checks; see `docs/published-release-checks.md`.
+
+### Fixed
+
+- **Providers:** on OpenAI Chat Completions and Azure, parallel tool calls
+  that return images are sent as contiguous `tool` messages followed by
+  their images, each labeled with its tool name and call id, instead of the
+  interleaved `tool`/`user` messages that strict providers reject; images
+  are no longer sent to a text-only model, and are sent again once a vision
+  model is selected (#248). OpenAI Responses and Codex keep images in tool
+  results. Gemini and Vertex receive all results of a parallel tool turn in
+  one message.
+- **Reasoning from OpenAI-compatible gateways:** reasoning streamed as
+  `delta.reasoning` (OpenRouter and others) or `delta.reasoning_text` is now
+  shown as thinking. Only `delta.reasoning_content` was read, so with those
+  gateways pi showed nothing while the model was reasoning.
+- **Gemini media:** staging counts the whole request against the inline
+  budget and accepts base64 with or without padding; an upload that expires,
+  is deleted, or is rejected during generation is re-uploaded once.
+- **Default stack no longer stops redrawing when frames are slow.** The
+  terminal library gives a frame 16 ms and does not present one that took
+  longer; it also lowers render quality under load, and its lowest levels
+  blank the transcript. With a long in-flight reasoning block, on a loaded
+  machine or in an unoptimized build, every frame can take longer than that:
+  the screen then stayed on its last frame, or went blank except for the
+  editor, typed keys were not echoed and the final answer never appeared,
+  while the session kept running. pi now sets that budget far above any real
+  frame time, so a late frame is shown instead of dropped and render quality
+  is never lowered. Measured with the real binaries in a terminal, on a
+  quiet 128-core Linux host: v0.7.1 stops redrawing about 4,000 lines into
+  an 8,192-line reasoning block and never shows the answer (under load, as
+  early as 1,000 to 2,000 lines); v0.8.0 shows all of 8,192 and 16,384 lines
+  and the answer. On an ordinary stream the two are equally fast.
+- **Default stack:** wrapping a double-width character that did not fit the
+  rest of a row could loop forever, freezing live reasoning and the replay
+  of a resumed session (#255); files and messages given on the command line
+  are submitted instead of dropped; `--models` and `--max-time` are honored.
+- **Agent:** cancelling a batch of parallel tool calls keeps the results of
+  calls that had already finished instead of recording them as aborted; an
+  abort raised while a waiter subscribes is no longer lost; the advisor
+  reviews a turn only after it is saved, and never a failed, aborted or
+  time-capped one; a turn parked on a silent provider wakes as soon as the
+  owner of its deadline cancels.
+- **MCP:** tool lists are refreshed before each provider request, so changed
+  schemas replace old ones and withdrawn or denied tools disappear;
+  cancelling or timing out a queued call no longer tears down the shared
+  server, and a call that was never written is not sent.
+- **LSP:** a full outbound queue no longer restarts the language server:
+  requests wait for capacity within their own deadline, cancellations have
+  reserved capacity, and document open/change/close batches are admitted
+  whole or not at all. A failed, cancelled or raced diagnostic pull returns
+  an error or `LSP_DIAGNOSTICS_PENDING` rather than a cached clean result,
+  also after dropped notifications. A server's `retriggerRequest: false` is
+  honored, a lost reply to a server request closes the connection instead of
+  hanging, and server process trees are cleaned up when a connection fails.
+- **RPC:** a turn the server accepted runs to its terminal event and saves
+  queued input when the client cancels.
+- **ACP:** prompt and save failures reach the editor as one `session/update`
+  notice, without provider bodies or file paths; a stalled or failed stdout
+  no longer blocks cancellation, and final responses are flushed before
+  shutdown.
+- **Hub:** `stop` and `restart` wait until the old service has been
+  terminated and reaped; a cancelled or abandoned service start stops that
+  service; service operations no longer block the executor; reviving a
+  subagent runs it again with its original task, tools, model, working
+  directory and isolation instead of only registering it.
+- **Subagents:** children inherit the parent's active provider and model
+  unless the agent definition or the `task`/`smol` role pins one; parallel
+  `isolation: "worktree"` tasks start from one snapshot of the workspace and
+  apply their patches in task order; an isolated task runs in the package
+  directory it was started from, not the repository root.
+- **Windows:** output pipes of background jobs can be cancelled, so a child
+  that keeps a pipe open no longer strands its reader (#182).
+- **Handoff:** continuation briefs use only the selected branch, drop
+  completed tasks from next steps, ignore fenced code examples, keep the
+  latest status, and report a file as modified only when a matching
+  successful tool result exists.
+- **Stores and imports:** the permission store is not overwritten when it is
+  corrupt, unreadable or from a newer schema; credential migration saves the
+  new auth file before removing API keys from settings or archiving legacy
+  OAuth files; an SSH remote edit is refused with `PI_SSH_EDIT_CONFLICT`
+  when the remote file changed after it was read; imported sessions keep
+  interrupted or ambiguous tool exchanges as non-executable history.
+- **Compaction:** summaries work with keyless and header-authenticated
+  providers and keep the provider's required headers, thinking budgets,
+  cache settings and service tier.
+- **Bedrock:** credentials are reloaded from the session's own auth file and
+  workspace on every request, including for summaries and other auxiliary
+  requests.
+- **SDK:** `add_workspace_root` and `remove_workspace_root` save the change
+  before granting tool access, and a removal takes effect immediately.
+- **Classic stack `/mcp add` and `/mcp remove`:** a `.pi/mcp.json` whose top
+  level or `mcpServers` member is not an object (an array, a string, a
+  number) used to abort pi; it is now refused with `MCP_CONFIG_INVALID` and
+  left untouched. `/mcp remove` of a server that is not in the file reports
+  `MCP_UNKNOWN_SERVER` instead of claiming success.
+- **RPC:** when stdin closes while the session is quarantined after a failed
+  save, `pi --mode rpc` exits with the session-persistence error itself
+  (`[SESSION_PERSISTENCE_FAILED]` first), not wrapped in a generic message.
+- **Startup without extensions:** pi no longer copies the whole model
+  registry and credential store twice while starting a session that loads
+  no extension. Only extensions can use that copy (it resolves the `model`
+  option of `ctx.compact`, new in this release), and it added several
+  milliseconds to the start of every print-mode or RPC run.
+- **Runtime stack size:** the main runtime's worker threads get a 16 MiB
+  stack (it was the runtime default of 2 MiB). A pi built without
+  optimization (`cargo build`, `cargo run`) aborted with
+  "thread 'asupersync-worker-N' has overflowed its stack" on the first agent
+  turn in `--mode rpc`.
+- **Sessions:** migrating a JSONL session that contains a row which is not a
+  session entry fails with "Bad JSONL entry: ..." again, instead of a bare
+  JSON parse error.
+- **Extensions:** the `compact` hostcall refuses `options` (or
+  `options.model`) that is not an object instead of running a default
+  compaction; `AbortSignal.abort()` and `controller.abort()` without a
+  reason now produce an `AbortError`, so `error.name === "AbortError"`
+  checks work.
+- **ACP:** a trusted MCP server whose catalog has failed no longer keeps its
+  `mcp_context_<server>` tool in the editor session's tool list.
+- **Browser tool:** a click or wheel at an integral point inside nested
+  iframes no longer probes the neighbouring pixel, which could refuse the
+  action as occluded at a frame edge.
+- **Build:** the library compiles again in non-test builds (two errors from
+  unbuilt commits), and three integration-test targets compile again
+  ([#256](https://github.com/Dicklesworthstone/pi_agent_rust/issues/256)).
+- **Performance tooling:** parallel evidence staging no longer fails when
+  two runs create the same intermediate directory
+  ([#251](https://github.com/Dicklesworthstone/pi_agent_rust/issues/251)),
+  and `scripts/perf/render_perf_budgets_md.py` no longer overwrites the
+  generated `PERF_BUDGETS.md`.
+
+### Known issues
+
+- **Long reasoning is drawn slowly on the default stack.** The in-flight
+  reasoning block is laid out again on every frame, so frame time grows with
+  its length. Since this release every frame is shown (see **Fixed**), but
+  with several thousand lines of reasoning in one block the display falls
+  behind the stream. The root cause of the old freeze, a terminal library
+  that does not present a late frame, is reported upstream
+  ([frankentui#104](https://github.com/Dicklesworthstone/frankentui/issues/104));
+  pi works around it.
+- **Performance claims remain unauthorized.** The retained
+  performance-budget evidence is older than its 168-hour freshness window
+  ([#252](https://github.com/Dicklesworthstone/pi_agent_rust/issues/252)), so
+  `performance_budgets_report_has_exact_v2_contract`
+  (`tests/release_evidence_gate.rs`) fails and the full test suite is not
+  reported green.
+- **The size-budgeted `release` build is over its size budget.** Built with
+  `cargo build --release` on Linux x86_64, pi is 52.1 MiB against a 48 MiB
+  budget (v0.7.1 was 49.9 MiB), so `binary_size_check`
+  (`tests/perf_regression.rs`) fails wherever a release-profile binary has
+  been built. Published binaries use the `dist` profile, which that check
+  does not measure.
+- **Opt-in SQLite session storage** still cannot open an existing WAL/SHM
+  pair whose auxiliary files are readable but not writable
+  ([#250](https://github.com/Dicklesworthstone/pi_agent_rust/issues/250)).
+- **Windows command containment** relies on an unstable standard-library
+  feature and is not yet qualified against the stable library contract
+  ([#257](https://github.com/Dicklesworthstone/pi_agent_rust/issues/257));
+  the optional `wasm-host` feature stays on wasmtime 47
+  ([#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258)).
+
 ## [v0.7.1] — 2026-10-02 — Release
 
 The first release of the 0.7 line. v0.7.0 was tagged but could not be built
