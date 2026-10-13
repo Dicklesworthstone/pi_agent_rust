@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+mod operation;
 mod storage;
 
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -33,6 +34,7 @@ fn scan_error(message: impl Into<String>) -> Error {
 // a Unix FIFO substituted after traversal from hanging a blocking worker.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read as _;
+    operation::checkpoint()?;
     let metadata =
         fs::metadata(path).map_err(|_| scan_error(format!("cannot inspect {}", path.display())))?;
     if !metadata.is_file() || metadata.len() > limit {
@@ -66,9 +68,16 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
         )));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+    let mut reader = file.take(limit + 1);
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        operation::checkpoint()?;
+        let count = reader.read(&mut chunk)
+            .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+        if count == 0 { break; }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    operation::checkpoint()?;
     if bytes.len() as u64 > limit {
         return Err(scan_error(format!(
             "{} grew beyond its byte limit",
@@ -212,6 +221,7 @@ fixHint = "Canonicalize and check against allowed roots."
 /// `<project>/.pi/security-rules/*.toml`. A malformed project pack is a
 /// named error (fail loud — silently dropping security rules is worse).
 pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
+    operation::checkpoint()?;
     let mut packs: Vec<RulePack> = vec![toml::from_str(DEFAULT_PACK).map_err(|e| {
         Error::validation(format!("embedded security rule pack failed to parse: {e}"))
     })?];
@@ -235,6 +245,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
         })?;
         let mut entries = Vec::new();
         for entry in reader {
+            operation::checkpoint()?;
             let path = entry
                 .map_err(|_| scan_error("cannot enumerate every project security rule pack"))?
                 .path();
@@ -249,6 +260,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
         }
         entries.sort();
         for path in entries {
+            operation::checkpoint()?;
             let text = String::from_utf8(read_bounded(&path, 1024 * 1024)?)
                 .map_err(|_| scan_error(format!("rule pack {} is not UTF-8", path.display())))?;
             let pack: RulePack = toml::from_str(&text)
@@ -262,6 +274,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
 /// Scope a scan: explicit paths, or the project root. Directories walk
 /// gitignore-respecting file lists via the repo's ignore machinery.
 fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
+    operation::checkpoint()?;
     if paths.len() > 256 {
         return Err(scan_error("at most 256 scan roots may be selected"));
     }
@@ -275,6 +288,7 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
             .collect::<Result<Vec<_>>>()?
     };
     for root in roots {
+        operation::checkpoint()?;
         // A mistyped scope must not yield a false-clean "0 findings".
         let metadata = fs::metadata(&root).map_err(|_| {
             scan_error(format!(
@@ -294,6 +308,7 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
                 .filter_entry(|entry| entry.file_name() != ".git")
                 .build();
             for entry in walker {
+                operation::checkpoint()?;
                 let entry = entry.map_err(|_| {
                     scan_error(format!(
                         "cannot completely traverse scope {}",
@@ -428,6 +443,7 @@ fn scan_file(
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
     let rel_display = relative_key(&rel)?;
     for compiled in rules {
+        operation::checkpoint()?;
         if !compiled.applies_to_path(Path::new(&rel_display)) {
             continue;
         }
@@ -437,6 +453,7 @@ fn scan_file(
         let mut cursor = 0;
         let mut line_no = 1_usize;
         for matched in compiled.regex.find_iter(content) {
+            operation::checkpoint()?;
             if findings.len() >= MAX_FINDINGS {
                 return Err(scan_error("scan exceeds 10000 findings; narrow paths"));
             }
@@ -489,6 +506,7 @@ fn compile_rules(packs: &[RulePack]) -> Result<Vec<CompiledRule>> {
     let mut ids = BTreeSet::new();
     for pack in packs {
         for rule in &pack.rules {
+            operation::checkpoint()?;
             if compiled.len() >= 1024 || rule.id.trim().is_empty() || !ids.insert(&rule.id) {
                 return Err(scan_error(
                     "rule inventory exceeds 1024 or contains empty/duplicate IDs",
@@ -511,6 +529,7 @@ fn scan_with_packs(cwd: &Path, paths: &[String], packs: &[RulePack]) -> Result<S
         bytes_read: 0,
     };
     for file in scope_files(cwd, paths)? {
+        operation::checkpoint()?;
         let bytes = read_bounded(&file, MAX_SOURCE_BYTES)?;
         outcome.bytes_read = outcome
             .bytes_read
@@ -1020,30 +1039,20 @@ impl Tool for SecurityScanTool {
         let parsed: ScanInput = serde_json::from_value(input)
             .map_err(|e| Error::validation(format!("security_scan input: {e}")))?;
         let op = parsed.op.trim().to_ascii_lowercase();
-        let owner = crate::agent_cx::AgentCx::for_current_or_request();
-        storage::check_owner()?;
         // plan/run/compare walk and read the whole scope synchronously —
         // off the async runtime so a large repo doesn't stall the agent
         // loop mid-scan.
         let tool = Self {
             cwd: self.cwd.clone(),
         };
-        asupersync::runtime::spawn_blocking(move || {
-            // Blocking workers do not inherit the polling caller's ambient
-            // authority. Reinstall the captured restricted owner explicitly.
-            let _current = owner.cx().clone().set_current_restricted();
-            storage::check_owner()?;
-            let result = match op.as_str() {
-                "plan" => tool.op_plan(&parsed),
-                "run" => tool.op_run(&parsed),
-                "disposition" => tool.op_disposition(&parsed),
-                "compare" => tool.op_compare(&parsed),
-                other => Err(Error::validation(format!(
-                    "Unknown security_scan op '{other}'; expected plan, run, disposition, or compare"
-                ))),
-            };
-            storage::check_owner()?;
-            result
+        operation::run(move || match op.as_str() {
+            "plan" => tool.op_plan(&parsed),
+            "run" => tool.op_run(&parsed),
+            "disposition" => tool.op_disposition(&parsed),
+            "compare" => tool.op_compare(&parsed),
+            other => Err(Error::validation(format!(
+                "Unknown security_scan op '{other}'; expected plan, run, disposition, or compare"
+            ))),
         })
         .await
     }

@@ -35,8 +35,7 @@ Source limits are 256 selected roots, 20,000 distinct files, 16 MiB per file,
 collisions with embedded rules. Source reports are capped at 16 MiB; the tool
 previews at most 50 findings while SARIF retains all admitted findings. Limits
 fail the operation rather than publishing a partial scan as complete. Rule and
-scan failures occur before report writes; filesystem writes themselves retain
-the existing source engine's overwrite and I/O-failure behavior.
+scan failures occur before report publication.
 
 `compare` accepts a single native source SARIF run. Malformed rows, duplicate
 native JSON fields, duplicate finding identities, wrong tool namespaces and
@@ -59,17 +58,79 @@ full `counts` and an explicit `truncated` flag. Unassessed in-scope findings set
 results. Narrow `paths` to inspect a truncated comparison. Here, `fixed` means
 no longer matched under the unchanged rule, not proof of a secure program.
 
+### Source report and review persistence
+
+An explicit `sarifOut` must name a **new workspace-relative `.sarif` file**.
+Existing destinations are never overwritten, even if created concurrently.
+Omitting it still updates the conventional `.pi/security-scan.sarif`, but now
+by atomic replacement of a fully written and synced private staging file.
+An existing report inode (including other hard-link names for it) is never
+truncated. Explicitly selecting the conventional filename is also create-only;
+omit `sarifOut` to use its reserved replacement behavior.
+
+Baseline and disposition reads are bounded, regular-file-only and no-follow
+through every relative component. The workspace directory is pinned before
+scanning, and publication uses pinned parent descriptors rather than reopening
+paths after asynchronous work. Symlink ancestors and final symlinks are refused.
+Named exports use a create-only hard link; only Pi-owned default state permits
+replacement. Payload sync precedes publication; directory-entry crash durability
+is not promised. Staging files are cleaned up on errors.
+
+Source `disposition` holds a persistent lock across reading the latest map,
+merging one decision and atomic publication. Competing cooperating writers get
+a busy error and may retry; successful individual updates are not lost through
+an unlocked read/modify/write. Do not remove `.pi/security-dispositions.lock`:
+replacing the lock inode defeats coordination. The locked `.pi` directory stays
+pinned for the transaction, including if its name changes.
+
+Stored maps are capped at 4 MiB and 10,000 entries. Keys must be 16 lowercase
+hexadecimal source fingerprints; statuses remain `false-positive`, `accepted`
+and `fixed`. Reasons must be nonblank and at most 2,048 UTF-8 bytes. Duplicate
+keys/fields, invalid entries and corrupt existing maps are errors, never an
+empty policy or permission to overwrite prior decisions. The SDK
+`save_dispositions` function remains an intentional whole-map replacement,
+not a concurrent per-entry merge; the tool operation provides the latter.
+
+The hardened persistence backend currently requires supported Unix descriptor
+APIs. Other platforms explicitly refuse source report/baseline/disposition
+persistence instead of falling back to path-based writes. Pure matching and
+source discovery remain separate. This is a platform limitation, not a claim
+of Windows persistence support.
+
+### Request lifetime
+
+Source tool calls retain the captured restricted owner in their blocking worker.
+Dropping the awaiting request also revokes a per-invocation lease without
+cancelling the shared session or sibling scans. Queued work refuses to start;
+running work checks revocation between directory entries, rule compilation,
+64 KiB source-read chunks, files and regex matches. Individual filesystem calls
+and regex searches are not preemptible.
+
+Only the final atomic rename/link holds the publication gate. A request dropped
+before admission prevents publication. A commit already admitted may finish;
+dropping the request waits for that syscall before completing revocation, after
+which no later commit can be admitted. This is not a hard real-time cancellation
+bound or rollback: a report published before cancellation remains published,
+and preparation may have created directories or a persistent lock file.
+
 These source operations remain pattern-based review, not reachability analysis,
-a race-free workspace snapshot or a filesystem sandbox. They retain the source
-engine's existing path and publication policies, which are distinct from the
-descriptor-confined, create-only dependency artifact operations below. Blocking
-filesystem calls and regex execution do not provide a hard real-time deadline.
+a race-free workspace snapshot or a filesystem sandbox. Source/rule discovery
+and content reads still have their separate path-based confinement limitations;
+hardening report persistence does not make those reads a sandbox. Other code
+running as the same OS user is outside this confinement model.
 
 Sixteen source regression tests were added for completeness, limits, multiline
 matching, native import and comparison uncertainty, including the public tool
 scan/compare path. They have not run in the implementation environment: DSR is
 unavailable (`dsr: command not found`, exit 127). Compilation, formatting, Clippy
 and Rust tests remain unverified; no release or Bead-completion claim follows.
+
+Ten additional persistence regressions and nine request-lifetime regressions
+were authored, covering actual filesystem publication, stored-state corruption,
+lock contention, path substitutions, cancelled workers and dropping the real
+blocking future after its publisher starts. These tests also remain unexecuted:
+the DSR entry point was unavailable (exit 127) during implementation. Static
+source/hash/whitespace checks are not a compile or test pass.
 
 ## Inspect locked dependencies without a network request
 

@@ -6,7 +6,6 @@
 //! are not a sandbox against other code running as the same OS user.
 
 use super::{Disposition, MAX_FINDINGS, MAX_SOURCE_BYTES, Result, scan_error};
-use crate::agent_cx::AgentCx;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -15,13 +14,7 @@ const DISPOSITIONS: &str = ".pi/security-dispositions.json";
 const STORE_LIMIT: u64 = 4 * 1024 * 1024;
 
 pub(super) fn check_owner() -> Result<()> {
-    let owner = AgentCx::for_current_or_request();
-    if !owner.capabilities().io {
-        return Err(scan_error("source persistence requires I/O capability"));
-    }
-    owner
-        .checkpoint()
-        .map_err(|_| scan_error("source operation cancelled before persistence"))
+    super::operation::checkpoint()
 }
 
 fn relative_file(raw: &str) -> Result<PathBuf> {
@@ -218,14 +211,14 @@ mod platform {
             let mut file = File::from(descriptor);
             file.write_all(bytes).and_then(|()| file.sync_all())
                 .map_err(|_| scan_error("source staging write/sync failed; destination unchanged"))?;
-            check_owner()?;
-            let result = if replace {
-                rustix::fs::renameat(&parent, staging.as_str(), &parent, name)
-            } else {
-                rustix::fs::linkat(&parent, staging.as_str(), &parent, name, AtFlags::empty())
-            };
-            result.map_err(|_| scan_error("source report publication failed; no file was truncated"))?;
-            Ok(())
+            super::super::operation::publish(|| {
+                let result = if replace {
+                    rustix::fs::renameat(&parent, staging.as_str(), &parent, name)
+                } else {
+                    rustix::fs::linkat(&parent, staging.as_str(), &parent, name, AtFlags::empty())
+                };
+                result.map_err(|_| scan_error("source report publication failed; no file was truncated"))
+            })
         }
 
         // Persistent lock inode: never unlink after use. Replacing/removing a
