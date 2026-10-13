@@ -77,7 +77,9 @@ fn supervise(case: &str) {
         if let Some(status) = child.try_wait().expect("poll supervised child") {
             break status;
         }
-        if started.elapsed() > Duration::from_secs(120) {
+        // Above the child's own 300-second script deadline, so the child
+        // reports where it stopped before the supervisor has to kill it.
+        if started.elapsed() > Duration::from_secs(360) {
             let _ = child.kill();
             let _ = child.wait();
             let trace = std::fs::read_to_string(log.path()).unwrap_or_default();

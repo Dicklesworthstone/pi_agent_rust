@@ -616,7 +616,11 @@ fn run_ui(mode: Mode, path: &Path, url: &str, ack: mpsc::SyncSender<usize>) {
         probes: 0,
         cold_resume: false,
         last_flush: 0,
-        deadline: Instant::now() + Duration::from_secs(90),
+        // Whole-script bound, there so a stuck run ends; liveness itself is
+        // the per-checkpoint `WAIT`. An unoptimised build lays the growing
+        // thinking block out again on every frame and, on a quiet 128-core
+        // host, presents about 3,700 of the 4,096 deltas in 90 seconds.
+        deadline: Instant::now() + Duration::from_secs(300),
     }));
     let events = Input {
         screen: Arc::clone(&screen),
@@ -638,9 +642,13 @@ fn run_ui(mode: Mode, path: &Path, url: &str, ack: mpsc::SyncSender<usize>) {
     // `ProgramConfig::default()` is a four-row inline UI: pi's header, status,
     // editor and footer take all four, the conversation body gets zero rows,
     // and no thinking tail can ever be presented.
+    // It also runs with pi's frame budget, so a frame that takes longer than
+    // ftui's default 16 ms is still presented, as in the product.
     let config = ProgramConfig {
         intercept_signals: false,
-        ..ProgramConfig::fullscreen().with_forced_size(COLS, ROWS)
+        ..ProgramConfig::fullscreen()
+            .with_budget(pi::interactive_ftui::frame_budget())
+            .with_forced_size(COLS, ROWS)
     };
     let mut capabilities = TerminalCapabilities::basic();
     capabilities.color_depth = ftui::ColorDepth::Ansi256;

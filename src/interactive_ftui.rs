@@ -149,6 +149,27 @@ const PICKER_HINT: &str = "type to filter · ↑/↓ navigate · Enter apply · 
 /// the next present is late by at least this much.
 const LOOP_STALL_BUDGET: Duration = Duration::from_millis(250);
 
+/// Frame budget handed to ftui for the interactive stack.
+///
+/// ftui gives a frame 16 ms by default and does not present a frame that used
+/// more than that: the buffer is rendered, the present phase is skipped, and
+/// the next frame starts from scratch. A view that keeps costing more than the
+/// budget (an unoptimised build, a heavily loaded machine, a long in-flight
+/// reasoning block) therefore never reaches the terminal again. The screen
+/// stays on its last frame and typed keys are not echoed, while the session
+/// itself keeps running. A late frame is better than no frame, so the budget
+/// is set far above any real frame time. That also keeps ftui's load governor,
+/// whose target is this value, from lowering render quality: the lower levels
+/// blank the transcript. Slow frames are still reported through
+/// `LOOP_STALL_BUDGET`.
+const FRAME_BUDGET: Duration = Duration::from_hours(1);
+
+/// The frame budget every surface that runs [`PiFtuiModel`] must use.
+#[must_use]
+pub fn frame_budget() -> ftui::render::budget::FrameBudgetConfig {
+    ftui::render::budget::FrameBudgetConfig::strict(FRAME_BUDGET)
+}
+
 /// Event-loop phase a stall is attributed to. Mirrors the render / input /
 /// agent-event split that omp's `loop-watchdog.ts` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9823,7 +9844,9 @@ pub fn run(
         ftui::App::inline_auto(model, INLINE_MIN_HEIGHT, INLINE_MAX_HEIGHT)
     } else {
         ftui::App::fullscreen(model)
-    };
+    }
+    // Present every frame, however late (see `FRAME_BUDGET`).
+    .with_budget(frame_budget());
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
