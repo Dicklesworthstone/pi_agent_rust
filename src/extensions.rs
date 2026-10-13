@@ -19478,6 +19478,19 @@ async fn dispatch_hostcall_events_ref(
             let preparation = payload.get("preparation").cloned().unwrap_or(Value::Null);
             let options = match payload.get("options") {
                 None | Some(Value::Null) => ExtensionCompactionOptions::default(),
+                // serde deserializes a JSON array positionally into these
+                // structs (`[]` becomes default options), so require objects.
+                Some(value)
+                    if !value.is_object()
+                        || value
+                            .get("model")
+                            .is_some_and(|model| !model.is_null() && !model.is_object()) =>
+                {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "compact: options and options.model must be objects".to_string(),
+                    };
+                }
                 Some(value) => {
                     match serde_json::from_value::<ExtensionCompactionOptions>(value.clone()) {
                         Ok(options) => options,

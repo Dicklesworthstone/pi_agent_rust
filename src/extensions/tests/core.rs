@@ -4111,8 +4111,8 @@ fn cache_policy_prompt_decision_uses_runtime_extension_id_for_named_extension() 
 fn invalid_permissions_file_still_allows_future_decisions_to_persist() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("extension-permissions.json");
-    std::fs::write(&path, r#"{"version":999,"decisions":{}}"#)
-        .expect("write invalid permissions file");
+    let newer_schema = r#"{"version":999,"decisions":{}}"#;
+    std::fs::write(&path, newer_schema).expect("write invalid permissions file");
 
     let manager = extension_manager_no_persisted_permissions();
     {
@@ -4139,6 +4139,26 @@ fn invalid_permissions_file_still_allows_future_decisions_to_persist() {
             .insert("ext.persist".to_string(), "1.2.3".to_string());
     }
 
+    // 412ddfa17 made persisted updates transactional: a newer-schema store is
+    // never overwritten from a stale handle. The decision stays session-cached
+    // and the error reports that the durable write was refused.
+    let err = manager
+        .cache_policy_prompt_decision("ext.persist", "exec", true)
+        .expect_err("newer-schema permissions file must not be overwritten");
+    assert!(
+        err.to_string()
+            .contains("Unsupported permissions file schema version"),
+        "unexpected error: {err}"
+    );
+    let untouched = std::fs::read_to_string(&path).expect("read untouched permissions file");
+    assert_eq!(untouched, newer_schema);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.persist", "exec"),
+        Some(true)
+    );
+
+    // Once the file is repaired externally, future decisions persist again.
+    std::fs::write(&path, r#"{"version":1,"decisions":{}}"#).expect("repair permissions file");
     manager
         .cache_policy_prompt_decision("ext.persist", "exec", true)
         .expect("persist repaired permission decision");

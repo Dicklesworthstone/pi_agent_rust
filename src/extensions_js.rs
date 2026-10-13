@@ -25464,13 +25464,15 @@ if (typeof globalThis.fetch !== 'function') {
 
     // AbortController / AbortSignal polyfill — many npm packages check for these
     if (typeof globalThis.AbortController === 'undefined') {
+        // Web semantics: aborting without an explicit reason yields an AbortError.
+        const abortError = () => { const e = new Error('This operation was aborted'); e.name = 'AbortError'; return e; };
         class AbortSignal {
             constructor() { this.aborted = false; this._listeners = []; }
-            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : new Error('This operation was aborted')) : undefined; }
+            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : abortError()) : undefined; }
             addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
             removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
             throwIfAborted() { if (this.aborted) throw this.reason; }
-            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : new Error('This operation was aborted'); return s; }
+            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : abortError(); return s; }
             static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._reason = new Error('The operation was aborted due to timeout'); s._listeners.forEach(fn => fn()); }, ms); return s; }
         }
         class AbortController {
@@ -25725,11 +25727,16 @@ mod tests {
     /// sha `f74b473e…` -> `61463384…`), from adding the `DefaultPackageManager`
     /// shim export that gh #223 hits. Re-pinned in the same commit as the edit,
     /// which is what this table exists to force.
+    ///
+    /// Re-pinned 2026-10-12 (bridge): only `<bridge>` moved, 204_644 ->
+    /// 204_796 (+152 bytes, sha `604f528a…` -> `68c0c0e6…`). The
+    /// `AbortSignal` polyfill now gives a reasonless abort an `AbortError`
+    /// (Web semantics), which `ctx.compact()` pre-abort rejection relies on.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            204_644,
-            "604f528a04a890d0091b7243ad2286bf5a874d94712cacd8c45ae218ad276fb1",
+            204_796,
+            "68c0c0e6f90a6a671128024f17bf1e39dff877c100cfd3390fa4846cbc7e52eb",
         ),
         (
             "node:fs",
