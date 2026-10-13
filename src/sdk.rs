@@ -808,6 +808,74 @@ pub struct RpcSessionState {
     pub durability_mode: String,
 }
 
+/// Goal operation accepted by RPC `goal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcGoalOp {
+    Get,
+    Create,
+    Resume,
+    Pause,
+    Drop,
+}
+
+impl RpcGoalOp {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Create => "create",
+            Self::Resume => "resume",
+            Self::Pause => "pause",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+/// OMP-compatible goal progress returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoal {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub time_used_seconds: u64,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub max_prompts: Option<u32>,
+    #[serde(default)]
+    pub prompts_started: Option<u32>,
+    #[serde(default)]
+    pub interrupted: bool,
+}
+
+/// Goal-mode state returned alongside RPC goal progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcGoalModeState {
+    pub enabled: bool,
+    pub mode: String,
+    pub goal: RpcGoal,
+}
+
+/// Result payload returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoalResult {
+    #[serde(default)]
+    pub goal: Option<RpcGoal>,
+    #[serde(default)]
+    pub state: Option<RpcGoalModeState>,
+    #[serde(default)]
+    pub persistence: Option<String>,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
+}
+
 /// Session-level token aggregates returned by RPC `get_session_stats`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1498,6 +1566,51 @@ impl RpcTransportClient {
 
     pub async fn get_session_stats(&mut self) -> Result<RpcSessionStats> {
         self.request_typed("get_session_stats", Map::new()).await
+    }
+
+    /// Read or mutate the persistent goal attached to the current RPC session.
+    ///
+    /// This matches OMP's get/create/resume/pause/drop operation set. Create
+    /// accepts an optional token budget; `max_prompts` is an additive Rust
+    /// extension. No operation here automatically starts a provider turn.
+    pub async fn goal(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+    ) -> Result<RpcGoalResult> {
+        self.goal_with_limits(op, objective, token_budget, None).await
+    }
+
+    /// `goal` with an optional native prompt-count budget.
+    pub async fn goal_with_limits(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+        max_prompts: Option<u32>,
+    ) -> Result<RpcGoalResult> {
+        let mut payload = Map::new();
+        payload.insert("op".to_string(), Value::String(op.as_str().to_string()));
+        if let Some(objective) = objective {
+            payload.insert(
+                "objective".to_string(),
+                Value::String(objective.to_string()),
+            );
+        }
+        if let Some(token_budget) = token_budget {
+            payload.insert(
+                "token_budget".to_string(),
+                Value::Number(token_budget.into()),
+            );
+        }
+        if let Some(max_prompts) = max_prompts {
+            payload.insert(
+                "max_prompts".to_string(),
+                Value::Number(u64::from(max_prompts).into()),
+            );
+        }
+        self.request_typed("goal", payload).await
     }
 
     pub async fn get_messages(&mut self) -> Result<Vec<Value>> {
