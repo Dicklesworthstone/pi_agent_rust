@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::model::ContentBlock;
 use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 mod display;
 mod js_kernel;
 mod lifecycle;
+mod transport;
 
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
@@ -32,8 +33,8 @@ struct PyKernel {
     stdin: ChildStdin,
     /// Lines from the kernel's stdout, streamed by a dedicated reader thread
     /// (a cell may emit several bridge-request lines before its final
-    /// response). `None` = EOF (kernel exited).
-    lines: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+    /// response). Disconnection is EOF; protocol read failures are explicit.
+    lines: std::sync::Mutex<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
     next_id: u64,
     cells_run: u64,
 }
@@ -69,7 +70,9 @@ impl PyKernel {
             let _ = child.terminate_and_wait();
             return Err(Error::tool("eval", "EVAL_SPAWN: kernel pipes unavailable"));
         };
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Backpressure bounds complete queued frames independently of their
+        // individual byte limit. Dropping the receiver unblocks the reader.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         // Own the child before starting the reader. A thread-creation failure
         // must close the Job/process group and reap the kernel as well.
         let kernel = Self {
@@ -84,14 +87,14 @@ impl PyKernel {
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => {
-                            let _ = tx.send(None);
+                    match transport::read_frame(&mut reader) {
+                        Ok(None) => return,
+                        Err(error) => {
+                            let _ = tx.send(Err(format!("EVAL_PROTOCOL_READ: {error}")));
                             return;
                         }
-                        Ok(_) => {
-                            if tx.send(Some(line)).is_err() {
+                        Ok(Some(line)) => {
+                            if tx.send(Ok(line)).is_err() {
                                 return;
                             }
                         }
@@ -115,10 +118,11 @@ impl PyKernel {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .try_recv();
             match received {
-                Ok(line) => return Ok(line),
+                Ok(Ok(line)) => return Ok(Some(line)),
+                Ok(Err(message)) => return Err(Error::tool("eval", message)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if Instant::now() > deadline {
-                        return Err(Error::tool("eval", "EVAL_DEADLINE"));
+                        return Err(Error::tool("eval", "EVAL_TIMEOUT: cell budget exhausted"));
                     }
                     asupersync::time::sleep(
                         asupersync::time::wall_now(),
@@ -292,7 +296,7 @@ impl EvalTool {
             None => PyKernel::spawn(&self.python_path, &self.cwd)?,
         };
 
-        let id = kernel.next_id;
+        let mut id = kernel.next_id;
         kernel.next_id += 1;
         let request = json!({"id": id, "code": code}).to_string();
         if kernel
@@ -304,7 +308,7 @@ impl EvalTool {
             // Kernel died between cells: restart once, transparently-but-loudly.
             kernel.kill();
             let mut fresh = PyKernel::spawn(&self.python_path, &self.cwd)?;
-            let id = fresh.next_id;
+            id = fresh.next_id;
             fresh.next_id += 1;
             let request = json!({"id": id, "code": code}).to_string();
             fresh
@@ -345,15 +349,15 @@ impl EvalTool {
                          was lost, next cell starts fresh",
                     ));
                 }
-                Err(_) => {
-                    // Budget exhausted: kill and report state loss.
+                Err(error) => {
+                    // Transport failures are not deadlines. Keep their named
+                    // diagnostic and retire this connection in either case.
                     kernel.kill();
                     return Err(Error::tool(
                         "eval",
                         format!(
-                            "EVAL_TIMEOUT: cell exceeded {}s; kernel discarded — \
-                             state was lost, next cell starts fresh",
-                            timeout.as_secs()
+                            "{error}; EVAL_STATE_RESET: Python kernel discarded — \
+                             state was lost, next cell starts fresh"
                         ),
                     ));
                 }
@@ -375,6 +379,7 @@ impl EvalTool {
                 }
             };
             if let Some(bridge) = parsed.get("bridge") {
+                transport::validate_bridge(&parsed)?;
                 let reply = self.run_bridge_call(bridge).await;
                 let line = json!({"bridge_result": reply}).to_string();
                 kernel
@@ -384,6 +389,7 @@ impl EvalTool {
                     .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
                 continue;
             }
+            transport::validate_response(&parsed, id)?;
             break trimmed.to_string();
         };
         kernel.cells_run += 1;
