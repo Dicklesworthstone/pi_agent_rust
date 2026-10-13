@@ -1152,9 +1152,13 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
                 name: Some("motion.mp4".to_string()),
             }),
         ];
+        // The fixture's `read` takes the 8 MiB prompt line a byte at a time.
+        // That alone is about 30 seconds on a 128-core Linux host, so a
+        // 30-second limit passed or failed with the load (30.7 s passed, 32 s
+        // ended the fixture and the client saw a broken pipe).
         let mut client = client(
             r#"
-IFS= read -r -t 30 frame || exit 1
+IFS= read -r -t 180 frame || exit 1
 printf '{"type":"message_start","message":%s}\n' "$frame"
 printf '{"type":"response","command":"prompt","id":"rpc-1","success":true}\n'
 printf '{"type":"agent_end","messages":[%s]}\n' "$frame"

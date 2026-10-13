@@ -402,6 +402,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
 | `src/security_scan/dependencies.rs` | Cargo dependency security analysis | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/dependencies/tests.rs` | Dependency security scanning tests | Test support module; exercises dependency scanner. |
+| `src/security_scan/dependencies/python.rs` | Offline `uv.lock` and `poetry.lock` inventory for `dependency_plan` | Unit (`python/tests.rs`). |
+| `src/security_scan/dependencies/python/tests.rs` | Python lockfile inventory tests | Test support module; parser schemas, normalization, variants, privacy, limits, discovery, confinement. |
 | `src/security_scan/dependency_review.rs` | Offline comparison and review of native dependency-audit artifacts | Unit; `src/security_scan/dependency_review/tests.rs`, `src/security_scan/dependency_review/tests/wire.rs`. |
 | `src/security_scan/dependency_review/disposition.rs` | Explicit, version-bound dependency triage written as a new SARIF artifact | Unit; `src/security_scan/dependency_review/disposition/tests.rs`. |
 | `src/security_scan/dependency_review/disposition/tests.rs` | Dependency disposition test suite | Test module; disposition tests (8 tests). |
