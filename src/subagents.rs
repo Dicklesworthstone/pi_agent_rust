@@ -29,6 +29,7 @@ mod execution;
 #[cfg(test)]
 mod execution_tests;
 mod protocol;
+mod workspace;
 
 use deadline::Deadline;
 use execution::ChildRunner;
@@ -446,7 +447,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {
@@ -455,6 +456,9 @@ impl Tool for SubagentTool {
             "properties": {
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
+                "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
+                "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Single delegation isolation. worktree uses the existing captured-baseline and acceptance gates; non-Git directories refuse rather than falling back."},
+                "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "description": "Single delegation worktree disposition, requiring isolation: worktree. Defaults to apply; keep preserves it for inspection, drop reports the patch without writeback."},
                 "outputSchema": {"type": "object", "description": "JSON Schema the single delegation's final output must match; the parent validates and returns parsed data."},
                 "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "permissive keeps an invalid result with a warning; strict fails the task."},
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
@@ -470,9 +474,9 @@ impl Tool for SubagentTool {
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
-                        "cwd": {"type": "string"},
+                        "cwd": {"type": "string", "minLength": 1},
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
-                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion."},
+                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion; requires isolation: worktree."},
                         "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
                         "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"}
                     }
@@ -507,6 +511,7 @@ impl Tool for SubagentTool {
                 "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
         }
+        workspace::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         let update = on_update.map(Arc::from);
@@ -547,6 +552,13 @@ struct SubagentRequest {
     agent: Option<String>,
     #[serde(default)]
     task: Option<String>,
+    /// Single-delegation workspace controls use the same runner as array entries.
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    isolation: Option<String>,
+    #[serde(default)]
+    iso_apply: Option<String>,
     /// Single-delegation form of the per-task `outputSchema` (bd-cv653.5.1).
     #[serde(default)]
     output_schema: Option<Value>,
@@ -566,6 +578,14 @@ struct SubagentRequest {
 
 impl SubagentRequest {
     fn mode(&self) -> Result<RequestMode> {
+        if (self.tasks.is_some() || self.chain.is_some())
+            && (self.cwd.is_some() || self.isolation.is_some() || self.iso_apply.is_some())
+        {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKSPACE_SCOPE: cwd, isolation and isoApply belong on each tasks/chain entry, not the batch",
+            ));
+        }
         let single = self
             .agent
             .as_ref()
@@ -573,9 +593,9 @@ impl SubagentRequest {
             .map(|(agent, task)| SubagentTask {
                 agent: agent.clone(),
                 task: task.clone(),
-                cwd: None,
-                isolation: None,
-                iso_apply: None,
+                cwd: self.cwd.clone(),
+                isolation: self.isolation.clone(),
+                iso_apply: self.iso_apply.clone(),
                 output_schema: self.output_schema.clone(),
                 schema_mode: self.schema_mode,
             });

@@ -42,3 +42,26 @@ Parallel and chained calls, structured-output validation and its bounded retry,
 request-wide deadlines, inherited cancellation, hub bookkeeping and worktree
 acceptance continue through the existing runner. Enabling this catalog does
 not enable the opt-in tool globally and does not create or publish Git commits.
+
+## Single-task workspace selection
+
+Single-task calls now accept the same `cwd`, `isolation` and `isoApply` options
+as entries in `tasks` and `chain`:
+
+```json
+{"agent":"task","task":"Implement the parser fix and run the permitted checks","cwd":"packages/parser","isolation":"worktree","isoApply":"keep"}
+```
+
+`cwd` is absolute or relative to the host workspace. In worktree mode its
+repository-relative location is retained inside the captured checkout; a
+missing/non-Git workspace fails instead of running in another directory.
+`keep` retains accepted edits for inspection, `apply` uses existing serialized
+writeback, and `drop` reports the patch without applying it. Omitting all three
+options retains the previous unisolated host-directory default.
+
+An explicit `isoApply` requires `isolation: "worktree"`. Nulls, wrong types,
+unknown policy values, empty paths and NUL-containing paths are rejected
+before agent discovery or process launch, including SDK calls that bypass the
+tool JSON Schema. For `tasks`/`chain`, workspace options must be placed on each
+entry; top-level options are rejected rather than ignored or broadcast. These
+checks do not add path confinement or change authored-agent discovery roots.
