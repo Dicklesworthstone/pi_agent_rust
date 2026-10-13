@@ -23,6 +23,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 mod async_host;
+mod display;
 mod evaluate;
 #[cfg(test)]
 mod evaluation_tests;
@@ -40,6 +41,8 @@ pub struct JsCellResponse {
     pub console: String,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Detached JSON snapshots, independently validated by the Tool host.
+    pub displays: Vec<Value>,
 }
 
 /// A tool re-entry request from inside a JS cell.
@@ -143,13 +146,18 @@ fn kernel_thread(
         context.with(|ctx| install_globals(&ctx, &console, bridge_tx, &deadline, origin));
         let Ok(evaluator) = context.with(|ctx| evaluate::Evaluator::new(&ctx)) else { return; };
         let Ok(host) = context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(&stopped))) else { return; };
+        let Ok(displays) = context.with(|ctx| display::DisplaySink::install(&ctx, deadline.clone(), origin)) else {
+            return;
+        };
         let mut rebuild = false;
         while let Ok(request) = requests.recv() {
             if stopped.load(Ordering::SeqCst) { return; }
             deadline.set(request.deadline, origin);
             host.begin(request.deadline);
+            displays.begin();
             console.borrow_mut().clear();
             let mut response = run_cell(&context, &runtime, &request, &deadline, origin, &evaluator, &host, bridge_tx);
+            response.displays = displays.finish();
             let expired = deadline.expired(origin);
             if stopped.load(Ordering::SeqCst) { return; }
             // Cleanup uses captured built-ins only, not arbitrary guest code.
@@ -306,6 +314,7 @@ fn run_cell(
                         error: Some(String::from(
                             "EVAL_TIMEOUT: promise still pending at the cell budget",
                         )),
+                        displays: Vec::new(),
                     };
                 }
                 match runtime.execute_pending_job() {
@@ -337,6 +346,7 @@ fn run_cell(
                 console: String::new(),
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise restore failed")),
+                displays: Vec::new(),
             };
         };
         match promise.result::<rquickjs::Value<'_>>() {
@@ -347,6 +357,7 @@ fn run_cell(
                 console: String::new(),
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise never settled")),
+                displays: Vec::new(),
             },
         }
     })
@@ -362,6 +373,7 @@ fn drain_jobs(
             return Some(JsCellResponse {
                 ok: false, console: String::new(), result: None,
                 error: Some("EVAL_TIMEOUT: microtasks exceeded the cell budget".into()),
+                displays: Vec::new(),
             });
         }
         match runtime.execute_pending_job() {
@@ -395,6 +407,7 @@ fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -
         console: String::new(),
         result,
         error: None,
+        displays: Vec::new(),
     }
 }
 
@@ -411,6 +424,7 @@ fn error_response(ctx: &rquickjs::Ctx<'_>, err: &rquickjs::Error) -> JsCellRespo
         console: String::new(),
         result: None,
         error: Some(detail),
+        displays: Vec::new(),
     }
 }
 

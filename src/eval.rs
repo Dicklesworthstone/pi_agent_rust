@@ -8,7 +8,7 @@
 //! for the other. Both retain the host's read-only tool bridge policy.
 
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, TextContent};
+use crate::model::ContentBlock;
 use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -230,6 +230,9 @@ impl EvalTool {
         };
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
+        // Reject the entire rich result before making this realm reusable.
+        // On malformed output, dropping the owned kernel revokes its worker.
+        let output = display::javascript_response(response, restarted, cells_run)?;
         {
             let mut slot = self
                 .js
@@ -238,46 +241,7 @@ impl EvalTool {
             *slot = Some(kernel);
         }
 
-        let mut text = String::new();
-        if restarted && cells_run == 1 {
-            text.push_str("(js kernel started)\n");
-        }
-        if !response.console.is_empty() {
-            text.push_str(&response.console);
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-        }
-        if response.ok {
-            if let Some(result) = &response.result {
-                text.push_str(result);
-                text.push('\n');
-            }
-            if text.is_empty() {
-                text.push_str("(no output)\n");
-            }
-            Ok(ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(text))],
-                details: Some(json!({
-                    "kernel": "js",
-                    "cell": cells_run,
-                    "restarted": restarted,
-                })),
-                is_error: false,
-            })
-        } else {
-            text.push_str(response.error.as_deref().unwrap_or("?"));
-            Ok(ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(text))],
-                details: Some(json!({
-                    "kernel": "js",
-                    "cell": cells_run,
-                    "restarted": restarted,
-                    "errorKind": "exception",
-                })),
-                is_error: true,
-            })
-        }
+        Ok(output)
     }
 
     /// Bridge dispatch shared by both kernels.
@@ -476,8 +440,9 @@ impl Tool for EvalTool {
          one at a time within this session and return the final expression. \
          Set reset=true to discard the selected language's state before this \
          cell; the other language is unaffected. Timeouts or crashes report \
-         state loss explicitly. Python display(value, mime=...) returns JSON, \
-         text, Markdown or PNG data; image input is bytes/base64, not a path."
+         state loss explicitly. Rich output: Python display(value, mime=...) \
+         or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
+         PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL."
     }
 
     fn parameters(&self) -> Value {

@@ -72,7 +72,7 @@ Only the active cell's thread/context may display. A retained task from a prior
 cell keeps that prior sink, which closes at its boundary; late display attempts
 raise `EVAL_DISPLAY_CLOSED` rather than polluting another result. Awaiting a child
 task within its originating cell works. This does not turn retained tasks into
-managed background jobs. JavaScript rich displays are not provided by this API.
+managed background jobs. JavaScript has the separate helper described below.
 
 ## Async Python cells
 
@@ -196,12 +196,54 @@ Kernel regressions live under `src/eval/js_kernel/`; `tests/eval_async_js.rs`
 exercises these helpers through the actual Rust `EvalTool`. JavaScript-bootstrap
 probes under Node do not establish QuickJS, Rust-host, or DSR acceptance.
 
+## JavaScript rich displays
+
+`display(value, mimeType = "application/json")` returns explicit JSON snapshots,
+plain text, Markdown, and PNG images. Unlike Python, strings also default to
+JSON; pass `"text/plain"` to display them without JSON quotes.
+
+```javascript
+const observations = {answer: 42, checks: [true, null]};
+display(observations);
+observations.answer = 0; // the captured snapshot still contains 42
+display("## Result\nChecks completed.", "text/markdown");
+await sleep(1);
+display(pngBytes, "image/png"); // Uint8Array or canonical standard base64
+```
+
+No paths, URLs, notebook MIME hooks, or implicit `toJSON()` methods are opened
+or invoked. JSON accepts null, booleans, finite numbers, well-formed Unicode
+strings, dense arrays, and plain/null-prototype objects with enumerable string
+data properties. Cycles, accessors, custom instances, enumerable symbols,
+undefined, bigint, NaN and infinities are refused instead of silently losing
+data. Convert unsupported values explicitly. Reflection on a Proxy can still
+run its traps under the cell deadline; eval is not a sandbox.
+
+The same Rust formatter and MIME validator serve both kernels. Displays retain
+call order, images become native image blocks, and JSON values are available in
+`details.jsonOutputs`. Captured console output precedes displays, and the final
+expression or exception follows them; ordinary final-expression semantics are
+unchanged. Valid displays preceding an ordinary exception remain available in
+an errored result. The byte/count/structure and PNG-envelope limits above apply
+equally. Invalid PNG envelopes are rejected by the host as a whole-result error,
+and that kernel is discarded. Raster decompression/validation is not performed.
+
+Calls capture into the currently executing JavaScript cell. Awaited timer and
+promise callbacks can display while it runs; the sink closes when it returns.
+The existing reactor retires unawaited timers and requests, and a timeout resets
+the realm. Deliberately invoking a saved function in a later cell uses that
+later cell's sink; this is not Python's originating-task ContextVar contract.
+These are final-cell captures, not live output, artifact spill, detached tasks,
+or a general memory bound on JavaScript or console output. Regression coverage
+is shared in `tests/eval_display.rs`, with native sink/bootstrap tests under
+`src/eval/js_kernel/display.rs`.
+
 ## Scope and validation
 
 These additions target the persistent-async and file-backed-cell capabilities
 in OMP v18.10.4's `docs/tools/eval.md`; they do not claim complete OMP eval parity.
-JavaScript rich displays, tracked auto-backgrounding, general session-tool and
-subagent bridges, and the Bun runtime remain separate work. Python rich-output
+Tracked auto-backgrounding, general session-tool and subagent bridges, and the
+Bun runtime remain separate work. Python and JavaScript rich-output
 coverage is in `tests/eval_display.rs` and `src/eval/display.rs`.
 
 Regression coverage is in `tests/eval.rs`, through the actual Rust `EvalTool`.

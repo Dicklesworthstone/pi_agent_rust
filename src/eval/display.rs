@@ -11,9 +11,9 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
 use crate::tools::ToolOutput;
 
-const MAX_DISPLAYS: usize = 32;
-const MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_DISPLAYS: usize = 32;
+pub(super) const MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NODES: usize = 65_536;
 const MAX_DEPTH: usize = 32;
 
@@ -134,10 +134,36 @@ fn append_line(text: &mut String, value: &str) {
 pub(super) fn python_response(line: &str, restarted: bool, cells_run: u64) -> Result<ToolOutput> {
     let response: Value = serde_json::from_str(line)
         .map_err(|error| Error::tool("eval", format!("EVAL_PROTOCOL: {error}")))?;
-    let displays = collect(&response)?;
+    response_output(&response, "python", restarted, cells_run)
+}
+
+pub(super) fn javascript_response(
+    response: super::js_kernel::JsCellResponse,
+    restarted: bool,
+    cells_run: u64,
+) -> Result<ToolOutput> {
+    let response = json!({
+        "ok": response.ok,
+        "stdout": response.console,
+        "result": response.result,
+        "error": response.error,
+        "displays": response.displays,
+    });
+    response_output(&response, "js", restarted, cells_run)
+}
+
+fn response_output(
+    response: &Value,
+    kernel: &str,
+    restarted: bool,
+    cells_run: u64,
+) -> Result<ToolOutput> {
+    let displays = collect(response)?;
     let ok = response.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut text = String::new();
-    if restarted && cells_run == 1 { text.push_str("(kernel started)\n"); }
+    if restarted && cells_run == 1 {
+        text.push_str(if kernel == "js" { "(js kernel started)\n" } else { "(kernel started)\n" });
+    }
     append_line(&mut text, response.get("stdout").and_then(Value::as_str).unwrap_or(""));
     append_line(&mut text, response.get("stderr").and_then(Value::as_str).unwrap_or(""));
     let mut content = Vec::new();
@@ -155,7 +181,7 @@ pub(super) fn python_response(line: &str, restarted: bool, cells_run: u64) -> Re
     }
     if content.is_empty() && text.is_empty() { text.push_str("(no output)\n"); }
     if !text.is_empty() { content.push(ContentBlock::Text(TextContent::new(text))); }
-    let mut details = json!({"kernel":"python", "cell":cells_run, "restarted":restarted});
+    let mut details = json!({"kernel":kernel, "cell":cells_run, "restarted":restarted});
     if !displays.descriptors.is_empty() {
         details["displays"] = Value::Array(displays.descriptors);
         details["jsonOutputs"] = Value::Array(displays.json_outputs);
@@ -270,5 +296,50 @@ mod tests {
         assert!(out.details.unwrap().get("displays").is_none());
         let out = python_response(r#"{"ok":true,"result":null,"displays":[]}"#, false, 2).unwrap();
         assert!(matches!(&out.content[0], ContentBlock::Text(text) if text.text == "(no output)\n"));
+    }
+}
+
+#[cfg(test)]
+mod javascript_tests {
+    use super::*;
+    use super::super::js_kernel::JsCellResponse;
+
+    fn response(displays: Vec<Value>) -> JsCellResponse {
+        JsCellResponse {
+            ok: true, console: "console".into(), result: Some("17".into()),
+            error: None, displays,
+        }
+    }
+
+    #[test]
+    fn javascript_uses_the_same_host_admission_as_python() {
+        let frames = vec![json!({"mimeType":"application/json","data":{"answer":42}})];
+        let js = javascript_response(response(frames.clone()), false, 2).unwrap();
+        let py = python_response(&json!({"ok":true,"stdout":"console","result":"17","displays":frames}).to_string(), false, 2).unwrap();
+        assert_eq!(serde_json::to_value(&js.content).unwrap(), serde_json::to_value(&py.content).unwrap());
+        assert_eq!(js.details.as_ref().unwrap()["jsonOutputs"], py.details.as_ref().unwrap()["jsonOutputs"]);
+        assert_eq!(js.details.unwrap()["kernel"], "js");
+        assert_eq!(py.details.unwrap()["kernel"], "python");
+    }
+
+    #[test]
+    fn malformed_native_javascript_frame_never_publishes_its_valid_prefix() {
+        for bad in [json!({"mimeType":"text/html","data":"bad"}), Value::Null,
+            json!({"mimeType":"image/png","data":"bad"})] {
+            let frames = vec![json!({"mimeType":"text/plain","data":"prefix"}), bad];
+            assert!(javascript_response(response(frames), false, 2).is_err());
+        }
+        let over = vec![json!({"mimeType":"application/json","data":0}); MAX_DISPLAYS + 1];
+        assert!(javascript_response(response(over), false, 2).is_err());
+    }
+
+    #[test]
+    fn plain_javascript_output_and_start_notice_remain_unchanged() {
+        for (restarted, expected) in [(false, "console\n17\n"), (true, "(js kernel started)\nconsole\n17\n")] {
+            let output = javascript_response(response(Vec::new()), restarted, 1).unwrap();
+            assert_eq!(output.content.len(), 1);
+            assert!(matches!(&output.content[0], ContentBlock::Text(text) if text.text == expected));
+            assert!(output.details.unwrap().get("displays").is_none());
+        }
     }
 }
