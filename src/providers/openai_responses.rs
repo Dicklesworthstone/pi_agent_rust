@@ -672,7 +672,9 @@ impl Provider for OpenAIResponsesProvider {
             },
         );
 
-        Ok(Box::pin(stream))
+        // Fuse so a repoll after the terminal `None` stays at EOF instead of
+        // hitting `Unfold`'s poll-after-completion panic (an abort in release).
+        Ok(Box::pin(stream.fuse()))
     }
 }
 

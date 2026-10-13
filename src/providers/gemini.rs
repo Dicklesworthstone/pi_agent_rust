@@ -584,6 +584,9 @@ where
         }
     }
 
+    /// The returned stream is fused: once it yields `None` every later poll
+    /// also yields `None`, so a caller that repolls a terminal response sees
+    /// EOF instead of `Unfold`'s poll-after-completion panic.
     pub(super) fn into_stream(
         self,
         cloud_cli_mode: bool,
@@ -625,6 +628,7 @@ where
                 }
             }
         })
+        .fuse()
     }
 
     /// Terminal outcome once the transport closes. A close without a
