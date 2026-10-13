@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::{Arc, Weak};
 
+mod driver;
+pub use driver::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalRunStop, GoalSession};
+
 #[cfg(test)]
 mod tests;
 
