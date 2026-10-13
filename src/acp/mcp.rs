@@ -156,11 +156,13 @@ pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     }
 
     // The native manager exposes only complete, fresh, healthy, trusted
-    // catalogs. Replacing the overlay withdraws removed tools and resource/
-    // prompt context wrappers as well as adding or revising current tools.
+    // catalogs; context wrappers are gated on that same admitted catalog
+    // (they are otherwise trust-derived). Replacing the overlay withdraws
+    // removed tools and the resource/prompt context wrappers of unavailable
+    // or denied servers, as well as adding or revising current tools.
     // Do not filter by name prefix: a host tool is not owned by this manager
     // merely because it has an MCP-looking name.
-    next.extend(crate::mcp::mount_tools(&state.manager));
+    next.extend(crate::mcp::mount_admitted_tools(&state.manager));
     shared.update(|registry| *registry = next);
     // SharedToolRegistry's version invalidates the provider schema cache.
     // Old snapshots held by an in-flight caller still use native per-call

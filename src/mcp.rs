@@ -550,6 +550,28 @@ pub fn mount_tools(manager: &std::sync::Arc<McpManager>) -> Vec<Box<dyn Tool>> {
     out
 }
 
+/// Mount only currently admitted catalogs: tools from fresh, healthy, trusted
+/// servers, and context wrappers for those same servers. Context eligibility
+/// is otherwise derived from trust alone, so a trusted server whose catalog is
+/// unavailable would keep advertising last-known-good authority. A valid empty
+/// catalog (including a resource-only server's) keeps its context wrapper.
+#[must_use]
+pub(crate) fn mount_admitted_tools(manager: &std::sync::Arc<McpManager>) -> Vec<Box<dyn Tool>> {
+    let catalogs = manager.mounted_tool_metas();
+    let mut out: Vec<Box<dyn Tool>> = Vec::new();
+    for (server, metas) in &catalogs {
+        for meta in metas {
+            out.push(Box::new(McpTool::new(server, meta, manager.clone())));
+        }
+    }
+    for server in manager.context_server_names(None) {
+        if catalogs.iter().any(|(admitted, _)| *admitted == server) {
+            out.push(Box::new(McpContextTool::new(&server, manager.clone())));
+        }
+    }
+    out
+}
+
 /// Mount cached and context wrappers for one server only.
 ///
 /// Runtime trust/test flows use this targeted form so a newly available
