@@ -1,12 +1,12 @@
 use super::*;
 
-fn header(leaf: Option<&str>) -> Value {
+pub(super) fn header(leaf: Option<&str>) -> Value {
     let mut header = Session::in_memory().header;
     header.current_leaf = leaf.map(str::to_string);
     serde_json::to_value(header).unwrap()
 }
 
-fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
+pub(super) fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
     json!({
         "type":"message", "id":id, "parentId":parent,
         "timestamp":"2026-10-13T00:00:00Z",
@@ -14,7 +14,7 @@ fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
     })
 }
 
-fn transcript(path: &Path, header: &Value, rows: &[Value]) -> Vec<u8> {
+pub(super) fn transcript(path: &Path, header: &Value, rows: &[Value]) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(header).unwrap();
     bytes.push(b'\n');
     for row in rows {
@@ -186,7 +186,7 @@ fn invalid_native_records_and_torn_rows_never_become_successful_partial_reports(
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
     let mut complete_without_newline = good;
-    complete_without_newline.pop();
+    assert_eq!(complete_without_newline.pop(), Some(b'\n'));
     std::fs::write(&path, &complete_without_newline).unwrap();
     assert!(recover_session_text(&path).unwrap().unterminated_final_row);
     assert_eq!(std::fs::read(&path).unwrap(), complete_without_newline);

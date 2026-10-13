@@ -22,7 +22,9 @@ use crate::error::{Error, Result};
 use crate::file_identity::FileIdentity;
 use crate::session::{Session, SessionEntry, SessionHeader};
 
+mod export;
 mod strict_json;
+pub use export::{RecoveryExport, RecoverySelection};
 #[cfg(test)]
 mod tests;
 
