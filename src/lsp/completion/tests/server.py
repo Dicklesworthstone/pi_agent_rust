@@ -65,7 +65,8 @@ def result():
     elif mode == "command":
         item["command"] = {"title": "Run", "command": "unsafe.run", "arguments": ["opaque"]}
     elif mode == "indent":
-        item["insertTextMode"] = 2
+        # Mode 2 is supported; retain this negative case for unknown modes.
+        item["insertTextMode"] = 3
     if mode in ("array", "plain", "replace", "snippet", "command", "indent"):
         return [item]
     return {"isIncomplete": True, "itemDefaults": {"editRange": span(12, 14), "insertTextFormat": 1, "data": opaque},

@@ -216,7 +216,7 @@ impl LspClient {
                         "completionItem":{
                             "snippetSupport":true,"insertReplaceSupport":true,
                             "documentationFormat":["markdown","plaintext"],
-                            "insertTextModeSupport":{"valueSet":[1]},
+                            "insertTextModeSupport":{"valueSet":[1,2]},
                             "resolveSupport":{"properties":["detail","documentation","additionalTextEdits"]}
                         },
                         "completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}
@@ -370,7 +370,7 @@ impl LspClient {
     #[allow(clippy::significant_drop_tightening)]
     pub fn poll_notifications(&self) {
         // Hold one owner across drain and apply: concurrent callers must not
-        // publish an earlier batch after a newer one has already been applied.
+        // publish an earlier batch after a newer one was already applied.
         let mut generation = Self::lock(&self.notification_generation);
         self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
         for notification in self.rpc.drain_notifications() {
