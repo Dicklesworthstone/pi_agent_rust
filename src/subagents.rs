@@ -21,6 +21,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod bundled;
 mod deadline;
 #[cfg(test)]
 mod deadline_tests;
@@ -445,7 +446,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {
@@ -773,7 +774,8 @@ fn discover_agents_with_roots(
     global_dir: &Path,
     scope: AgentScope,
 ) -> Result<BTreeMap<String, AgentDefinition>> {
-    let mut agents = BTreeMap::new();
+    // Scope selects authored overrides; bundled definitions are always available.
+    let mut agents = bundled::definitions();
     if !matches!(scope, AgentScope::Project) {
         load_agent_dir(&global_dir.join("agents"), AgentSource::User, &mut agents)?;
     }
@@ -1775,7 +1777,7 @@ mod tests {
         runtime
             .block_on(tool.execute(
                 "subagent-structured",
-                json!({"agent": "scout", "task": "inspect"}),
+                json!({"agent": "missing-agent-fixture", "task": "inspect"}),
                 None,
             ))
             .expect("execute returns tool output")
@@ -1792,7 +1794,7 @@ mod tests {
     fn structured_block_disabled_by_default_keeps_output_byte_identical() {
         let output = execute_unknown_agent(false);
         let text = output_text(&output);
-        assert_eq!(text, "## scout\nUnknown agent: scout");
+        assert_eq!(text, "## missing-agent-fixture\nUnknown agent: missing-agent-fixture");
         assert!(!text.contains(STRUCTURED_BLOCK_OPEN));
         assert!(output.is_error);
     }
@@ -1801,7 +1803,7 @@ mod tests {
     fn structured_block_appends_parseable_json_matching_details() {
         let output = execute_unknown_agent(true);
         let text = output_text(&output);
-        let prefix = "## scout\nUnknown agent: scout\n\n";
+        let prefix = "## missing-agent-fixture\nUnknown agent: missing-agent-fixture\n\n";
         assert!(text.starts_with(prefix), "unexpected text: {text}");
         let block = &text[prefix.len()..];
         let body = block
