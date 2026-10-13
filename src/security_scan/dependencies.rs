@@ -10,6 +10,8 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
+mod python;
+
 pub const INVENTORY_SCHEMA: &str = "pi.security-dependency-inventory/v1";
 const MAX_LOCKFILES: usize = 32;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -106,14 +108,13 @@ impl Builder {
         version: &str,
         location: Location,
     ) -> Result<()> {
-        if !valid_name(ecosystem, name)
-            || version.len() > 256
-            || semver::Version::parse(version).is_err()
-        {
+        let (Some(name), Some(version)) =
+            (canonical_name(ecosystem, name), canonical_version(ecosystem, version))
+        else {
             self.exclude(location, "invalid_or_unpinned_package_identity");
             return Ok(());
-        }
-        let key = (ecosystem.to_string(), name.to_string(), version.to_string());
+        };
+        let key = (ecosystem.to_string(), name, version);
         if !self.packages.contains_key(&key) && self.packages.len() >= MAX_PACKAGES {
             return Err(error("unique public package/version pairs exceed 10000"));
         }
@@ -141,6 +142,12 @@ impl Builder {
 }
 
 pub(super) fn valid_name(ecosystem: &str, name: &str) -> bool {
+    if ecosystem == "PyPI" {
+        return python::name(name).as_deref() == Some(name);
+    }
+    if !matches!(ecosystem, "crates.io" | "npm") {
+        return false;
+    }
     let component = |part: &str| {
         !part.is_empty()
             && part
@@ -161,6 +168,29 @@ pub(super) fn valid_name(ecosystem: &str, name: &str) -> bool {
             .is_some_and(|(scope, package)| component(scope) && component(package));
     }
     component(name)
+}
+
+/// Shared by inventory, advisory metadata and saved-report admission.
+pub(super) fn canonical_name(ecosystem: &str, name: &str) -> Option<String> {
+    if ecosystem == "PyPI" {
+        python::name(name)
+    } else {
+        valid_name(ecosystem, name).then(|| name.to_string())
+    }
+}
+
+/// A concrete public version, never a constraint, Git hash or patched local build.
+pub(super) fn canonical_version(ecosystem: &str, version: &str) -> Option<String> {
+    if ecosystem == "PyPI" {
+        python::version(version)
+    } else if matches!(ecosystem, "crates.io" | "npm")
+        && version.len() <= 256
+        && semver::Version::parse(version).is_ok()
+    {
+        Some(version.to_string())
+    } else {
+        None
+    }
 }
 
 fn normalized_path(raw: &str) -> Result<String> {
@@ -197,13 +227,15 @@ fn format_for(path: &str) -> Result<&'static str> {
     match Path::new(path).file_name().and_then(|name| name.to_str()) {
         Some("Cargo.lock") => Ok("cargo"),
         Some("package-lock.json" | "npm-shrinkwrap.json") => Ok("npm"),
+        Some("uv.lock") => Ok("uv"),
+        Some("poetry.lock") => Ok("poetry"),
         _ => Err(error(
-            "supported lockfiles are Cargo.lock, package-lock.json and npm-shrinkwrap.json",
+            "supported lockfiles are Cargo.lock, package-lock.json, npm-shrinkwrap.json, uv.lock and poetry.lock",
         )),
     }
 }
 
-/// Build a deterministic inventory. Empty paths inspect the two conventional
+/// Build a deterministic inventory. Empty paths inspect the conventional
 /// root lockfiles only. Nested workspaces must supply their lockfiles explicitly.
 pub fn inventory(cwd: &Path, paths: &[String]) -> Result<Inventory> {
     if paths.len() > MAX_LOCKFILES {
@@ -211,7 +243,10 @@ pub fn inventory(cwd: &Path, paths: &[String]) -> Result<Inventory> {
     }
     let defaults = paths.is_empty();
     let selected = if defaults {
-        vec!["Cargo.lock".to_string(), "package-lock.json".to_string()]
+        ["Cargo.lock", "package-lock.json", "uv.lock", "poetry.lock"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     } else {
         paths.to_vec()
     };
@@ -243,6 +278,7 @@ pub fn inventory(cwd: &Path, paths: &[String]) -> Result<Inventory> {
         match format {
             "cargo" => parse_cargo(text, &path, &mut builder)?,
             "npm" => parse_npm(text, &path, &mut builder)?,
+            "uv" | "poetry" => python::parse(text, &path, format, &mut builder)?,
             _ => unreachable!("format_for validates format"),
         }
         lockfiles.push(Lockfile {
