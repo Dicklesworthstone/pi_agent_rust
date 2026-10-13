@@ -8360,7 +8360,17 @@ fn read_jsonl_entries_for_v2<R: std::io::BufRead>(
         if line.trim().is_empty() {
             continue;
         }
-        entries.push(attachments::decode_stored_entry(Some(jsonl_source), &line)?);
+        let entry = match attachments::decode_stored_entry(Some(jsonl_source), &line) {
+            Ok(entry) => entry,
+            // Name a row that is not a session entry, as migration did before
+            // attachment-aware decoding. Attachment and I/O failures keep
+            // their own classification.
+            Err(Error::Json(source)) => {
+                return Err(Error::session(format!("Bad JSONL entry: {source}")));
+            }
+            Err(other) => return Err(other),
+        };
+        entries.push(entry);
     }
     // Legacy rows without IDs must be normalized before validating the graph,
     // but migration must never turn an ambiguous authoritative JSONL history
