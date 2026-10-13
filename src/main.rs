@@ -132,6 +132,18 @@ impl std::error::Error for ApprovalSurfaceUnavailable {}
 /// and resource loading issues without parsing stderr.
 const EXIT_CODE_RESOURCE_LOAD_FAILED: i32 = 4;
 
+/// Stack size of the main runtime's worker threads.
+///
+/// asupersync gives each worker an explicit 2 MiB stack, so `RUST_MIN_STACK`
+/// does not apply to them. Tasks the runtime spawns are polled on these
+/// workers, and an RPC agent turn's future chain no longer fits 2 MiB in an
+/// unoptimised build: `pi --mode rpc` aborted with "thread
+/// 'asupersync-worker-N' has overflowed its stack" as soon as it accepted a
+/// prompt. This is the headroom the FTUI driver thread already has
+/// (`DRIVER_STACK_BYTES`). The reservation is virtual; pages are committed
+/// only when touched.
+const RUNTIME_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Raised when configured skills, prompts, themes, or extensions fail to load (gh #223).
 #[derive(Debug)]
 struct ConfiguredResourceLoadFailed(String);
@@ -1062,6 +1074,7 @@ fn main_impl() -> Result<()> {
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
         .blocking_threads(1, 2)
+        .thread_stack_size(RUNTIME_WORKER_STACK_BYTES)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;

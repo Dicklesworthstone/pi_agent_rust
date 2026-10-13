@@ -732,6 +732,7 @@ fn rpc_concurrent_keyless_swarm_e2e_preserves_session_index_and_filesystem_state
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 8)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();
@@ -1355,6 +1356,7 @@ fn run_crash_interrupt_recovery_active_worker(
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 4)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build active worker runtime");
     let handle = runtime.handle();
@@ -1517,6 +1519,7 @@ fn run_crash_interrupt_recovery_restart_worker(
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 4)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build restart worker runtime");
     let handle = runtime.handle();
@@ -5327,6 +5330,7 @@ fn rpc_checkpoint_rewind_fresh_retry_cycle() {
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 8)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();
