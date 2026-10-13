@@ -1,12 +1,11 @@
 //! Eval tool (bd-cv653.1.4): persistent code kernels with Jupyter-like cell
 //! semantics — state persists across cells within a session.
 //!
-//! v1 ships the **Python** kernel: a `python3` subprocess running an embedded
-//! JSON-lines REPL server (`src/eval/py_kernel_server.py`) with a persistent
-//! namespace, per-cell timeouts enforced host-side (kill + restart with an
-//! explicit state-loss warning), and stdout/stderr/result capture. The JS
-//! kernel (dedicated QuickJS realm) and the tool re-entry bridge are tracked
-//! follow-ups on the bead.
+//! Python uses a retained subprocess and JavaScript a dedicated QuickJS realm.
+//! Cells on one tool instance execute exclusively, including SDK callers that
+//! bypass agent scheduling. Explicit reset discards only the selected language.
+//! Timeout/crash state loss is reported; neither language silently substitutes
+//! for the other. Both retain the host's read-only tool bridge policy.
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -19,6 +18,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod js_kernel;
+mod lifecycle;
 
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
@@ -149,6 +149,9 @@ pub struct EvalTool {
     python_path: String,
     kernel: Mutex<Option<PyKernel>>,
     js: Mutex<Option<js_kernel::JsKernel>>,
+    // Slot mutexes protect storage, not execution: each runner takes its
+    // kernel out across awaits. Keep this lease until it returns or drops.
+    execution: futures::lock::Mutex<()>,
 }
 
 impl EvalTool {
@@ -160,6 +163,7 @@ impl EvalTool {
             python_path,
             kernel: Mutex::new(None),
             js: Mutex::new(None),
+            execution: futures::lock::Mutex::new(()),
         }
     }
 
@@ -199,8 +203,8 @@ impl EvalTool {
             match reply_rx.try_recv() {
                 Ok(response) => break response,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // The interrupt handler aborts the CELL at the deadline
-                    // (kernel survives); allow slack, then declare it wedged.
+                    // The interrupt handler retires the timed-out realm;
+                    // allow cleanup slack, then declare the worker wedged.
                     if Instant::now() > deadline + Duration::from_secs(5) {
                         return Err(Error::tool(
                             "eval",
@@ -513,10 +517,11 @@ impl Tool for EvalTool {
     }
 
     fn description(&self) -> &str {
-        "Run code in a persistent Python kernel (Jupyter-like cells): variables \
-         and imports persist across calls within the session. The final \
-         expression's value is returned like a REPL. Timeouts or crashes \
-         restart the kernel with an explicit state-loss notice."
+        "Run a Python or JavaScript cell in a persistent kernel. Cells execute \
+         one at a time within this session and return the final expression. \
+         Set reset=true to discard the selected language's state before this \
+         cell; the other language is unaffected. Timeouts or crashes report \
+         state loss explicitly."
     }
 
     fn parameters(&self) -> Value {
@@ -525,7 +530,7 @@ impl Tool for EvalTool {
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python source to execute in the persistent kernel"
+                    "description": "Source for the selected language; empty code is allowed for reset-only calls"
                 },
                 "kernel": {
                     "type": "string",
@@ -534,7 +539,12 @@ impl Tool for EvalTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Per-cell budget in seconds (default 30)"
+                    "description": "Active cell budget in seconds (default 30, clamped to 1–600); excludes waiting for another cell"
+                },
+                "reset": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Discard only the selected language's retained state before executing code"
                 }
             },
             "required": ["code"]
@@ -547,29 +557,7 @@ impl Tool for EvalTool {
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let code = input
-            .get("code")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::tool("eval", "missing required field: code"))?;
-        let kernel = input
-            .get("kernel")
-            .and_then(Value::as_str)
-            .unwrap_or("python");
-        let timeout = Duration::from_secs(
-            input
-                .get("timeout_secs")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_CELL_TIMEOUT_SECS)
-                .clamp(1, 600),
-        );
-        match kernel {
-            "python" => self.run_py_cell(code, timeout).await,
-            "js" => self.run_js_cell(code, timeout).await,
-            other => Err(Error::tool(
-                "eval",
-                format!("unknown kernel: {other} (python|js)"),
-            )),
-        }
+        self.execute_cell(input).await
     }
 
     fn effects(&self) -> ToolEffects {
@@ -871,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn js_infinite_loop_times_out_and_kernel_state_survives() {
+    fn js_infinite_loop_times_out_and_discards_kernel_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = EvalTool::new(dir.path());
         let out = run_js_cell_sync(&tool, "globalThis.keep = 5").expect("seed");
@@ -887,12 +875,14 @@ mod tests {
             ))
             .expect("interrupted cell returns");
         assert!(out.is_error, "loop should abort: {}", output_text(&out));
-        // The interrupt aborts the CELL, not the kernel: state survives.
-        let out = run_js_cell_sync(&tool, "keep").expect("post-timeout");
+        // Timed-out realms are retired so old async continuations cannot
+        // execute under another cell's deadline (the async-host contract).
+        assert!(output_text(&out).contains("EVAL_STATE_RESET"));
+        let out = run_js_cell_sync(&tool, "typeof keep").expect("post-timeout");
         assert!(!out.is_error, "kernel died: {}", output_text(&out));
         assert!(
-            output_text(&out).contains('5'),
-            "state lost: {}",
+            output_text(&out).contains("undefined"),
+            "timed-out state leaked: {}",
             output_text(&out)
         );
     }
