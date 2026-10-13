@@ -191,6 +191,10 @@ impl LspTool {
         payload["preview"] = json!(true);
         payload["expiresInSecs"] = json!(PREVIEW_AGE.as_secs());
         payload["files"] = json!(prepared.summary(&self.cwd));
+        payload["changeAnnotations"] = prepared.change_annotations();
+        let required = prepared.required_annotations();
+        payload["confirmationRequired"] = json!(!required.is_empty());
+        payload["requiredConfirmationIds"] = json!(required);
         payload["workspaceEdit"] = edit;
         payload["notificationRequested"] = json!(notification.is_some());
         payload["notificationWritten"] = json!(false);
@@ -260,7 +264,10 @@ impl LspTool {
             created,
             ..
         } = preview;
-        let result = prepared.commit(|| {
+        // The complete bounded preview includes every referenced annotation.
+        // apply:true confirms that exact batch, never an unseen callback.
+        let confirmed_annotations = prepared.required_annotations();
+        let result = prepared.commit_reviewed(|| {
             check_owner(owner)?;
             if started.elapsed() >= timeout {
                 return Err(tool_err(
@@ -286,6 +293,8 @@ impl LspTool {
         metadata["applied"] = json!(true);
         metadata["preview"] = json!(false);
         metadata["filesChanged"] = json!(files);
+        metadata["confirmedAnnotations"] = json!(confirmed_annotations);
+        metadata["confirmationRequired"] = json!(false);
         if input.action == "format" {
             metadata["previewOnly"] = json!(false);
             // A reviewed no-op is consumed and checked but does not represent

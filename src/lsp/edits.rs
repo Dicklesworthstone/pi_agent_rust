@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::text::TextEdit;
 
+mod annotations;
 mod sequence;
 mod transaction;
 
@@ -45,6 +46,9 @@ pub struct WorkspaceEditPlan {
     /// Interleaving indices into the public collections, retained for parsed
     /// documentChanges. Application validates these indices before staging.
     sequence: Option<Vec<sequence::Step>>,
+    // Confirmation requirements are private so editing the public operation
+    // collections cannot accidentally discard the server's approval boundary.
+    annotations: annotations::Annotations,
 }
 
 /// Errors carry a machine-readable taxonomy prefix.
@@ -58,7 +62,9 @@ fn plan_error(code: &str, message: impl Into<String>) -> crate::error::Error {
 ///
 /// Returns `[LSP_EDIT_MALFORMED]` when the payload cannot be interpreted.
 pub fn parse_workspace_edit(raw: &Value) -> Result<WorkspaceEditPlan, crate::error::Error> {
-    sequence::parse(raw)
+    let mut plan = sequence::parse(raw)?;
+    plan.annotations = annotations::parse(raw)?;
+    Ok(plan)
 }
 
 fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Error> {
@@ -113,11 +119,14 @@ pub struct ApplyOutcome {
 /// `[LSP_EDIT_ROLLBACK]` for incomplete rollback, and `[LSP_EDIT_LIMIT]` for
 /// admission limits. No filesystem sandbox against hostile concurrent path
 /// replacement is implied; callers must still enforce workspace scope.
+/// `[LSP_EDIT_CONFIRMATION_REQUIRED]` refuses edits requiring annotation
+/// confirmation. Those edits must use the retained review/approval workflow.
 #[allow(clippy::implicit_hasher)] // concrete RandomState keeps `None` call sites inference-free
 pub fn apply_workspace_edit(
     plan: &WorkspaceEditPlan,
     expected_hashes: Option<&HashMap<PathBuf, u64>>,
 ) -> Result<ApplyOutcome, crate::error::Error> {
+    plan.annotations.require_no_confirmation()?;
     transaction::apply(plan, expected_hashes)
 }
 
@@ -200,6 +209,7 @@ mod tests {
     #[test]
     fn parse_annotated_text_edits() {
         let raw = serde_json::json!({
+            "changeAnnotations": { "note-1": { "label": "Update reference" } },
             "documentChanges": [
                 {
                     "textDocument": { "uri": "file:///tmp/a.rs", "version": 1 },

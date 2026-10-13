@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use super::{ApplyOutcome, Image, Result, Transaction, WorkspaceEditPlan, conflict};
+use super::super::annotations::Annotations;
 use crate::lsp::text::content_hash_for_drift;
 
 /// Absence is evidence too: a deleted or moved-away path must not be silently
@@ -68,7 +69,7 @@ fn prepare_checked(
 /// Staging creates no directories, backups or temporary files. Commit consumes
 /// this value and checks the exact original bytes, permissions and absence;
 /// it never stages a replacement plan against newly read contents.
-pub(in crate::lsp) struct PreparedEdit(Transaction);
+pub(in crate::lsp) struct PreparedEdit(Transaction, Annotations);
 
 impl PreparedEdit {
     #[allow(clippy::implicit_hasher)]
@@ -76,7 +77,16 @@ impl PreparedEdit {
         plan: &WorkspaceEditPlan,
         expected: &HashMap<PathBuf, FileEvidence>,
     ) -> Result<Self> {
-        prepare_checked(plan, expected).map(Self)
+        let transaction = prepare_checked(plan, expected)?;
+        Ok(Self(transaction, plan.annotations.clone()))
+    }
+
+    pub(in crate::lsp) fn change_annotations(&self) -> serde_json::Value {
+        self.1.value()
+    }
+
+    pub(in crate::lsp) fn required_annotations(&self) -> Vec<String> {
+        self.1.required()
     }
 
     pub(in crate::lsp) fn paths(&self) -> impl Iterator<Item = &PathBuf> {
@@ -119,6 +129,17 @@ impl PreparedEdit {
         self,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<ApplyOutcome> {
+        self.1.require_no_confirmation()?;
+        self.commit_reviewed(before_commit)
+    }
+
+    /// Only the selected, complete refactor preview authorizes this path.
+    /// Approval covers all of that immutable transaction's annotations, not
+    /// a later server request or any subsequent command callback.
+    pub(in crate::lsp) fn commit_reviewed(
+        self,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<ApplyOutcome> {
         self.verify()?;
         // Recheck the caller after potentially expensive original-image reads.
         before_commit()?;
@@ -137,6 +158,9 @@ pub(in crate::lsp) fn apply_checked(
     expected: &HashMap<PathBuf, FileEvidence>,
     before_commit: impl FnOnce() -> Result<()>,
 ) -> Result<CheckedApply> {
+    // A selected command grants a bounded edit window, not confirmation of
+    // server annotations that the caller has never been shown.
+    plan.annotations.require_no_confirmation()?;
     let transaction = prepare_checked(plan, expected)?;
     let states = transaction
         .files
