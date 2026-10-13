@@ -198,6 +198,7 @@ pub mod gallery;
 pub mod gc;
 #[doc(hidden)]
 pub mod github;
+pub mod goal;
 pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
