@@ -5,14 +5,16 @@
 //! independent of the untrusted response body.
 
 use std::borrow::Cow;
+use std::io::Read;
 
+use flate2::bufread::MultiGzDecoder;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
 
 use super::MAX_CONNECT_FRAME_LEN;
 
-pub(super) const ACCEPT_ENCODING: &str = "identity";
+pub(super) const ACCEPT_ENCODING: &str = "gzip, identity";
 
 pub(super) fn protocol(message: &str) -> Error {
     Error::api(format!("PI_CURSOR_PROTOCOL: {message}"))
@@ -22,6 +24,7 @@ pub(super) fn protocol(message: &str) -> Error {
 pub(super) enum Encoding {
     #[default]
     Identity,
+    Gzip,
 }
 
 impl Encoding {
@@ -40,19 +43,52 @@ impl Encoding {
         match single_header(headers, "connect-content-encoding")? {
             None => Ok(Self::Identity),
             Some(value) if value.eq_ignore_ascii_case("identity") => Ok(Self::Identity),
+            Some(value) if value.eq_ignore_ascii_case("gzip") => Ok(Self::Gzip),
             Some(_) => Err(protocol("unsupported Connect response encoding")),
         }
     }
 
     pub(super) fn decode(self, payload: &[u8], compressed: bool) -> Result<Cow<'_, [u8]>> {
         if payload.len() > MAX_CONNECT_FRAME_LEN {
-            return Err(protocol("frame exceeds the decoded byte limit"));
+            return Err(protocol("frame exceeds the encoded byte limit"));
         }
-        if compressed {
-            return Err(protocol("compressed frame without a negotiated encoding"));
+        // Compression is per envelope, not per HTTP body. Even when gzip was
+        // negotiated, a clear compression bit means the payload is plain.
+        if !compressed {
+            return Ok(Cow::Borrowed(payload));
         }
-        Ok(Cow::Borrowed(payload))
+        match self {
+            Self::Identity => Err(protocol("compressed frame without a negotiated encoding")),
+            Self::Gzip => decode_gzip(payload, MAX_CONNECT_FRAME_LEN).map(Cow::Owned),
+        }
     }
+}
+
+/// Read at most one byte beyond the decoded budget. Reading through EOF at
+/// the exact limit is essential: it verifies the gzip footer, rather than
+/// accepting a valid-looking prefix with a truncated or corrupt checksum.
+/// Each call owns a fresh decoder. Multiple gzip members inside one envelope
+/// are legal, but share this budget and must all be valid; trailing garbage
+/// must not be silently ignored after a successful first member.
+fn decode_gzip(payload: &[u8], max_decoded: usize) -> Result<Vec<u8>> {
+    let limit = u64::try_from(max_decoded)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| protocol("invalid decoded byte limit"))?;
+    let mut decoder = MultiGzDecoder::new(payload);
+    let mut decoded = Vec::new();
+    decoder
+        .by_ref()
+        .take(limit)
+        .read_to_end(&mut decoded)
+        .map_err(|_| protocol("invalid or truncated gzip frame"))?;
+    if decoded.len() > max_decoded {
+        return Err(protocol("frame exceeds the decoded byte limit"));
+    }
+    if !decoder.get_ref().is_empty() {
+        return Err(protocol("unconsumed bytes after gzip frame"));
+    }
+    Ok(decoded)
 }
 
 fn single_header<'a>(headers: &'a [(String, String)], name: &str) -> Result<Option<&'a str>> {
@@ -134,16 +170,19 @@ pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::io::Write;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use futures::stream::{self, Stream, StreamExt};
 
     use super::super::{
         CONNECT_COMPRESSED_FLAG, CONNECT_END_STREAM_FLAG, StreamState, encode_frame, pb,
     };
     use super::*;
-    use crate::model::{AssistantMessage, StopReason, StreamEvent};
+    use crate::model::{AssistantMessage, ContentBlock, StopReason, StreamEvent};
 
     fn next_ready(state: &mut StreamState) -> Option<Result<StreamEvent>> {
         let mut future = std::pin::pin!(state.next_event());
@@ -155,9 +194,17 @@ mod tests {
     }
 
     fn drain(chunks: Vec<Vec<u8>>) -> Vec<Result<StreamEvent>> {
+        drain_with_encoding(chunks, Encoding::Identity)
+    }
+
+    fn drain_with_encoding(
+        chunks: Vec<Vec<u8>>,
+        encoding: Encoding,
+    ) -> Vec<Result<StreamEvent>> {
         let source: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
             Box::pin(stream::iter(chunks.into_iter().map(Ok)));
         let mut state = StreamState::new(source, AssistantMessage::default());
+        state.encoding = encoding;
         let mut events = Vec::new();
         for _ in 0..64 {
             match next_ready(&mut state) {
@@ -251,7 +298,10 @@ mod tests {
         );
         assert!(matches!(
             events.last(),
-            Some(Ok(StreamEvent::Done { reason: StopReason::Stop, .. }))
+            Some(Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            }))
         ));
     }
 
@@ -262,8 +312,14 @@ mod tests {
             panic!("source polled after Connect terminal")
         }));
         let mut state = StreamState::new(Box::pin(source), AssistantMessage::default());
-        assert!(matches!(next_ready(&mut state), Some(Ok(StreamEvent::Start { .. }))));
-        assert!(matches!(next_ready(&mut state), Some(Ok(StreamEvent::Done { .. }))));
+        assert!(matches!(
+            next_ready(&mut state),
+            Some(Ok(StreamEvent::Start { .. }))
+        ));
+        assert!(matches!(
+            next_ready(&mut state),
+            Some(Ok(StreamEvent::Done { .. }))
+        ));
         assert!(next_ready(&mut state).is_none());
         assert!(next_ready(&mut state).is_none());
     }
@@ -304,7 +360,11 @@ mod tests {
             ),
         ]);
         assert!(events.iter().all(Result::is_ok));
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+        );
         match events.last() {
             Some(Ok(StreamEvent::Error { error, reason })) => {
                 assert_eq!(*reason, StopReason::Error);
@@ -363,19 +423,23 @@ mod tests {
 
     #[test]
     fn response_admission_requires_the_expected_content_type() {
-        assert_eq!(Encoding::from_headers(&headers(&[])).unwrap(), Encoding::Identity);
+        assert_eq!(
+            Encoding::from_headers(&headers(&[])).unwrap(),
+            Encoding::Identity
+        );
         assert_eq!(
             Encoding::from_headers(&[(
                 "CONTENT-TYPE".to_string(),
                 "Application/Connect+Proto; charset=utf-8".to_string(),
-            )]).unwrap(),
+            )])
+            .unwrap(),
             Encoding::Identity
         );
         assert!(Encoding::from_headers(&[]).is_err());
-        assert!(Encoding::from_headers(&[(
-            "content-type".to_string(),
-            "text/html".to_string(),
-        )]).is_err());
+        assert!(
+            Encoding::from_headers(&[("content-type".to_string(), "text/html".to_string())])
+                .is_err()
+        );
         assert!(Encoding::from_headers(&headers(&[("content-type", "text/html")])).is_err());
     }
 
@@ -385,14 +449,167 @@ mod tests {
             Encoding::from_headers(&headers(&[("Connect-Content-Encoding", "identity")])).unwrap(),
             Encoding::Identity
         );
-        for encoding in ["", "gzip", "br", "identity, gzip", "credential-marker"] {
+        for encoding in ["", "br", "identity, gzip", "credential-marker"] {
             let error = Encoding::from_headers(&headers(&[("connect-content-encoding", encoding)]))
                 .unwrap_err();
             assert!(!error.to_string().contains("credential-marker"));
         }
-        assert!(Encoding::from_headers(&headers(&[
-            ("connect-content-encoding", "identity"),
-            ("Connect-Content-Encoding", "identity"),
-        ])).is_err());
+        assert!(
+            Encoding::from_headers(&headers(&[
+                ("connect-content-encoding", "identity"),
+                ("Connect-Content-Encoding", "identity"),
+            ]))
+            .is_err()
+        );
+    }
+
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn compressed_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
+        encode_frame(flags | CONNECT_COMPRESSED_FLAG, &gzip(payload))
+    }
+
+    #[test]
+    fn gzip_is_advertised_and_negotiated_case_insensitively() {
+        assert_eq!(ACCEPT_ENCODING, "gzip, identity");
+        assert_eq!(
+            Encoding::from_headers(&headers(&[("Connect-Content-Encoding", " GZip ")])).unwrap(),
+            Encoding::Gzip
+        );
+    }
+
+    #[test]
+    fn negotiated_gzip_still_accepts_uncompressed_frames_without_copying() {
+        assert!(matches!(
+            Encoding::Gzip.decode(b"plain protobuf", false).unwrap(),
+            Cow::Borrowed(b"plain protobuf")
+        ));
+    }
+
+    #[test]
+    fn gzip_round_trips_empty_and_binary_payloads() {
+        for payload in [b"".as_slice(), b"\0\xff\x01protobuf\0".as_slice()] {
+            assert_eq!(
+                Encoding::Gzip.decode(&gzip(payload), true).unwrap().as_ref(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_limit_checks_the_boundary_and_bounds_compression_bombs() {
+        let exact = [b'x'; 32];
+        assert_eq!(decode_gzip(&gzip(&exact), exact.len()).unwrap(), exact);
+        assert!(decode_gzip(&gzip(&exact), exact.len() - 1).is_err());
+        assert!(decode_gzip(&gzip(&[]), 0).unwrap().is_empty());
+        let bomb = gzip(&vec![b'x'; 64 * 1024]);
+        assert!(bomb.len() < 4096);
+        let error = decode_gzip(&bomb, 1024).unwrap_err();
+        assert!(error.to_string().contains("decoded byte limit"));
+    }
+
+    #[test]
+    fn every_truncated_gzip_prefix_and_a_corrupt_footer_fail() {
+        let payload = b"must verify the checksum too";
+        let compressed = gzip(payload);
+        for length in 0..compressed.len() {
+            assert!(decode_gzip(&compressed[..length], payload.len()).is_err());
+        }
+        let mut corrupt = compressed;
+        let checksum = corrupt.len() - 8;
+        corrupt[checksum] ^= 1;
+        assert!(decode_gzip(&corrupt, payload.len()).is_err());
+    }
+
+    #[test]
+    fn gzip_members_share_one_output_budget_and_reject_trailing_garbage() {
+        let mut members = gzip(b"first");
+        members.extend_from_slice(&gzip(b"second"));
+        assert_eq!(decode_gzip(&members, 11).unwrap(), b"firstsecond");
+        assert!(decode_gzip(&members, 10).is_err());
+        for suffix in [b"trailing garbage".as_slice(), b"\x1f\x8b".as_slice()] {
+            let mut corrupt = members.clone();
+            corrupt.extend_from_slice(suffix);
+            assert!(decode_gzip(&corrupt, 11).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_fragmented_gzip_and_plain_frames_complete_in_order() {
+        let first = text_frame("Hello");
+        let mut wire = compressed_frame(0, &first[5..]);
+        wire.extend_from_slice(&text_frame(", world"));
+        wire.extend_from_slice(&compressed_frame(CONNECT_END_STREAM_FLAG, b"{}"));
+        let events = drain_with_encoding(
+            wire.into_iter().map(|byte| vec![byte]).collect(),
+            Encoding::Gzip,
+        );
+        assert!(events.iter().all(Result::is_ok));
+        match events.last() {
+            Some(Ok(StreamEvent::Done { message, .. })) => {
+                assert!(matches!(
+                    &message.content[0],
+                    ContentBlock::Text(text) if text.text == "Hello, world"
+                ));
+            }
+            event => panic!("expected complete gzip stream, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn gzip_data_can_finish_with_an_uncompressed_terminal() {
+        let text = text_frame("answer");
+        let events = drain_with_encoding(
+            vec![
+                compressed_frame(0, &text[5..]),
+                encode_frame(CONNECT_END_STREAM_FLAG, b"{}"),
+            ],
+            Encoding::Gzip,
+        );
+        assert!(events.iter().all(Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
+    }
+
+    #[test]
+    fn corrupt_compressed_terminal_never_completes_partial_output() {
+        let mut compressed = gzip(b"{}");
+        let checksum = compressed.len() - 8;
+        compressed[checksum] ^= 1;
+        let events = drain_with_encoding(
+            vec![
+                text_frame("partial"),
+                encode_frame(CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG, &compressed),
+            ],
+            Encoding::Gzip,
+        );
+        assert_failed(&events, "invalid or truncated gzip frame");
+    }
+
+    #[test]
+    fn compressed_provider_error_stays_an_error() {
+        let events = drain_with_encoding(
+            vec![
+                text_frame("preview"),
+                compressed_frame(
+                    CONNECT_END_STREAM_FLAG,
+                    br#"{"error":{"code":"unavailable"}}"#,
+                ),
+            ],
+            Encoding::Gzip,
+        );
+        assert!(events.iter().all(Result::is_ok));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Ok(StreamEvent::Error { reason: StopReason::Error, .. }))
+        ));
     }
 }
