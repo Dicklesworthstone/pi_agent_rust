@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
+mod source;
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Kernel {
@@ -46,6 +48,10 @@ impl EvalTool {
         // Python. Unknown extension fields remain ignored as before.
         let cell: Cell = serde_json::from_value(input)
             .map_err(|error| Error::tool("eval", format!("EVAL_INPUT: {error}")))?;
+        let load_path = match cell.kernel {
+            Kernel::Js => source::load_path(&cell.code)?,
+            Kernel::Python => None,
+        };
         let timeout = Duration::from_secs(
             cell.timeout_secs
                 .unwrap_or(DEFAULT_CELL_TIMEOUT_SECS)
@@ -55,6 +61,12 @@ impl EvalTool {
         // guard releases on success, error, panic, or future abandonment.
         // No FIFO ordering is promised between simultaneous callers.
         let _execution = self.execution.lock().await;
+        // Read on admission, not while queued. Preparation errors never
+        // discard a retained kernel, even for a reset request.
+        let prepared = match load_path {
+            Some(path) => Some(source::load(self.cwd.clone(), path).await?),
+            None => None,
+        };
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.
@@ -79,7 +91,10 @@ impl EvalTool {
         }
         let outcome = match cell.kernel {
             Kernel::Python => self.run_py_cell(&cell.code, timeout).await,
-            Kernel::Js => self.run_js_cell(&cell.code, timeout).await,
+            Kernel::Js => {
+                let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
+                self.run_js_cell(code, timeout).await
+            }
         };
         let mut output = outcome.map_err(|error| {
             if cell.reset {
@@ -96,6 +111,17 @@ impl EvalTool {
         })?;
         if let Some(Value::Object(details)) = output.details.as_mut() {
             details.insert("reset".to_string(), Value::Bool(cell.reset));
+            if let Some(file) = &prepared {
+                details.insert("sourcePath".into(), Value::String(file.path.clone()));
+                details.insert("sourceCommand".into(), Value::String(cell.code));
+            }
+        }
+        if let Some(file) = prepared.as_ref().filter(|_| output.is_error) {
+            // The embedded engine still uses its ordinary eval stack labels;
+            // report the inspected file without claiming a module loader.
+            output.content.insert(0, ContentBlock::Text(TextContent::new(format!(
+                "EVAL_LOAD: error executing {}\n", serde_json::to_string(&file.path)?
+            ))));
         }
         if cell.reset {
             let notice = format!(
