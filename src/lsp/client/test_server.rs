@@ -10,14 +10,26 @@ use serde_json::{Value, json};
 
 use super::LspClient;
 
-const SERVER: &str = r"
+pub(in crate::lsp) const SERVER: &str = r"
 import json, sys
 capabilities = json.loads(sys.argv[1])
+hold_initialize = capabilities.pop('_fixtureHoldInitialize', False)
 frames, replies, held = [], {}, []
+startup = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+reverse, initializing = {}, None
 def send(value):
     body = json.dumps(value, separators=(',', ':')).encode('utf-8')
     sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode('ascii') + body)
     sys.stdout.buffer.flush()
+def next_startup():
+    global initializing
+    if startup:
+        request = startup.pop(0)
+        reverse[request['id']] = ('initialize', initializing)
+        send(dict(request, jsonrpc='2.0'))
+    else:
+        send({'jsonrpc':'2.0', 'id':initializing, 'result':{'capabilities':capabilities}})
+        initializing = None
 while True:
     headers = {}
     while True:
@@ -32,6 +44,15 @@ while True:
     message = json.loads(body)
     frames.append(message)
     method, params = message.get('method'), message.get('params') or {}
+    if method is None:
+        route = reverse.pop(message.get('id'), None)
+        if route is not None:
+            kind, owner = route
+            if kind == 'initialize':
+                next_startup()
+            else:
+                send({'jsonrpc':'2.0', 'id':owner, 'result':message})
+        continue
     if method == 'test/release':
         request_id = held.pop(0)
         send({'jsonrpc':'2.0', 'id':request_id, 'result':params['result']})
@@ -40,7 +61,17 @@ while True:
         continue
     response = {'jsonrpc':'2.0', 'id':message['id']}
     if method == 'initialize':
+        if hold_initialize:
+            continue
+        if startup:
+            initializing = message['id']
+            next_startup()
+            continue
         response['result'] = {'capabilities':capabilities}
+    elif method == 'test/clientRequest':
+        reverse[params['id']] = ('request', message['id'])
+        send(dict(params, jsonrpc='2.0'))
+        continue
     elif method == 'test/frames':
         response['result'] = frames
     elif method == 'test/configure':

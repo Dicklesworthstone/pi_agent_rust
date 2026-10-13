@@ -163,6 +163,13 @@ pub(super) struct PreparedNotifications {
 /// `Some(result)` overrides the default null response.
 pub type ServerRequestHandler = std::sync::Arc<dyn Fn(&str, &Value) -> Option<Value> + Send + Sync>;
 
+/// Native request services can reject invalid parameters without turning an
+/// error object into a successful `result`. The public result-only callback
+/// remains useful for application-specific requests such as applyEdit.
+pub(super) type ServerRequestResponder = Arc<
+    dyn Fn(&str, &Value) -> Option<std::result::Result<Value, RpcErrorObject>> + Send + Sync,
+>;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -642,7 +649,7 @@ fn reader_loop(
     stderr_tail: std::sync::Arc<Mutex<TailBuffer>>,
     notification_tx: StdSyncSender<ServerNotification>,
     dropped: std::sync::Arc<AtomicU64>,
-    handler: std::sync::Arc<Mutex<Option<ServerRequestHandler>>>,
+    handler: std::sync::Arc<Mutex<Option<ServerRequestResponder>>>,
 ) -> impl FnOnce() + Send + 'static {
     move || {
         let mut reader = BufReader::new(stdout);
@@ -693,7 +700,7 @@ pub struct JsonRpcClient {
     stderr_tail: std::sync::Arc<Mutex<TailBuffer>>,
     notification_rx: Mutex<StdReceiver<ServerNotification>>,
     dropped_notifications: std::sync::Arc<AtomicU64>,
-    server_request_handler: std::sync::Arc<Mutex<Option<ServerRequestHandler>>>,
+    server_request_handler: std::sync::Arc<Mutex<Option<ServerRequestResponder>>>,
 }
 
 impl JsonRpcClient {
@@ -857,6 +864,12 @@ impl JsonRpcClient {
     /// reader thread; it must stay fast and non-blocking (file I/O for
     /// `workspace/applyEdit` is acceptable and bounded).
     pub fn set_server_request_handler(&self, handler: ServerRequestHandler) {
+        self.set_server_request_responder(Arc::new(move |method, params| {
+            handler(method, params).map(Ok)
+        }));
+    }
+
+    pub(super) fn set_server_request_responder(&self, handler: ServerRequestResponder) {
         *lock(&self.server_request_handler) = Some(handler);
     }
 
@@ -1182,7 +1195,7 @@ fn handle_message<W: Write>(
     notification_tx: &StdSyncSender<ServerNotification>,
     dropped: &AtomicU64,
     stderr_tail: &Mutex<TailBuffer>,
-    handler: &Mutex<Option<ServerRequestHandler>>,
+    handler: &Mutex<Option<ServerRequestResponder>>,
 ) -> std::io::Result<()> {
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str);
@@ -1216,9 +1229,9 @@ fn handle_message<W: Write>(
 
     if let (Some(id), Some(method)) = (id, method) {
         // Server -> client request: consult the installed handler first
-        // (workspace/applyEdit and friends), otherwise respond with a null
-        // result so the server never blocks on us (workspace/configuration,
-        // registerCapability, workDoneProgress/create, showMessageRequest).
+        // (workspace services, applyEdit and friends). Unhandled requests keep
+        // the transport's default null response; native services may instead
+        // produce a proper JSON-RPC error with the same opaque request id.
         // The id is echoed verbatim (servers may use string ids).
         // Never invoke host code under the registration lock. A handler may
         // replace its registration or enter other client APIs while answering.
@@ -1229,11 +1242,15 @@ fn handle_message<W: Write>(
                 &message.get("params").cloned().unwrap_or(Value::Null),
             )
         });
-        let frame = encode_frame(&serde_json::json!({
+        let mut response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": custom.unwrap_or(Value::Null),
-        }));
+        });
+        match custom.unwrap_or(Ok(Value::Null)) {
+            Ok(result) => response["result"] = result,
+            Err(error) => response["error"] = serde_json::json!(error),
+        }
+        let frame = encode_frame(&response);
         {
             let mut guard = lock(writer);
             guard.write_all(&frame).and_then(|()| guard.flush())?;
@@ -1272,6 +1289,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_request_errors_echo_the_id_without_a_success_result() {
+        for id in [serde_json::json!(7), serde_json::json!("server/7")] {
+            let handler: ServerRequestResponder = Arc::new(|_, _| {
+                Some(Err(RpcErrorObject {
+                    code: -32602,
+                    message: "invalid workspace request".into(),
+                    data: None,
+                }))
+            });
+            let writer = Mutex::new(Vec::new());
+            let (notifications, receiver) = std::sync::mpsc::sync_channel(1);
+            handle_message(
+                &serde_json::json!({"jsonrpc":"2.0","id":id,
+                    "method":"workspace/configuration","params":{}}),
+                &Mutex::new(HashMap::new()),
+                &writer,
+                &notifications,
+                &AtomicU64::new(0),
+                &Mutex::new(TailBuffer::default()),
+                &Mutex::new(Some(handler)),
+            )
+            .expect("error reply admitted");
+            let bytes = writer.into_inner().unwrap();
+            let reply = read_frame(&mut BufReader::new(bytes.as_slice())).unwrap().unwrap();
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["error"]["code"], -32602);
+            assert!(reply.get("result").is_none());
+            assert!(reply["error"].get("data").is_none());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn server_reply_write_failure_is_not_reported_as_success() {
         let pending = Mutex::new(HashMap::new());
         let (notification_tx, _rx) = std::sync::mpsc::sync_channel(1);
@@ -1295,7 +1345,7 @@ mod tests {
 
     #[test]
     fn server_request_handler_can_replace_its_registration_without_deadlocking() {
-        let handlers = std::sync::Arc::new(Mutex::new(None::<ServerRequestHandler>));
+        let handlers = std::sync::Arc::new(Mutex::new(None::<ServerRequestResponder>));
         let registration = std::sync::Arc::downgrade(&handlers);
         *lock(&handlers) = Some(std::sync::Arc::new(move |method, params| {
             assert_eq!(method, "workspace/configuration");
@@ -1304,7 +1354,7 @@ mod tests {
             *registration
                 .try_lock()
                 .expect("callback must not hold registration lock") = None;
-            Some(serde_json::json!({"configured":true}))
+            Some(Ok(serde_json::json!({"configured":true})))
         }));
         let (reader, pipe) = std::io::pipe().expect("pipe");
         let (notification_tx, _rx) = std::sync::mpsc::sync_channel(1);

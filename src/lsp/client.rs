@@ -16,6 +16,7 @@ mod document_sync;
 mod file_uri;
 mod pull_diagnostics;
 mod request;
+pub(in crate::lsp) mod workspace;
 #[cfg(test)]
 mod test_server;
 pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
@@ -131,6 +132,7 @@ pub struct ServerCapabilities {
 
 pub struct LspClient {
     rpc: JsonRpcClient,
+    workspace: std::sync::Arc<workspace::Workspace>,
     root: PathBuf,
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
@@ -165,9 +167,11 @@ impl LspClient {
         // relative native path as the server's document root.
         let root = root.canonicalize()?;
         let root_uri = try_path_to_uri(&root)?;
+        let workspace = std::sync::Arc::new(workspace::Workspace::new(&root_uri)?);
         let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
+            workspace,
             root,
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
@@ -181,6 +185,9 @@ impl LspClient {
             quiescent: std::sync::atomic::AtomicBool::new(false),
             next_document_version: AtomicU64::new(1),
         };
+        // A server may ask for workspace data while initialize is pending.
+        // Install the service before posting that request, not at first edit.
+        client.set_server_request_handler(std::sync::Arc::new(|_, _| None));
         let mut params = serde_json::json!({
             "processId":std::process::id(),"rootUri":root_uri,
             "workspaceFolders":[{"uri":root_uri,"name":"workspace"}],
@@ -231,6 +238,8 @@ impl LspClient {
                     }
                 },
                 "workspace":{
+                    "configuration":true,
+                    "didChangeConfiguration":{"dynamicRegistration":false},
                     "diagnostics":{"refreshSupport":false},
                     "applyEdit":true,"workspaceEdit":{
                         "documentChanges":true,"resourceOperations":["create","rename","delete"],
@@ -450,7 +459,12 @@ impl LspClient {
     }
 
     pub fn set_server_request_handler(&self, handler: super::jsonrpc::ServerRequestHandler) {
-        self.rpc.set_server_request_handler(handler);
+        // Reserved workspace services survive installation/replacement of an
+        // application's applyEdit handler and cannot be overridden by it.
+        let workspace = std::sync::Arc::clone(&self.workspace);
+        self.rpc.set_server_request_responder(std::sync::Arc::new(move |method, params| {
+            workspace.respond(method, params).or_else(|| handler(method, params).map(Ok))
+        }));
     }
 
     pub fn call_no_wait_notify(
