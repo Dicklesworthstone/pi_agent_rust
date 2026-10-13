@@ -21,6 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+mod evaluate;
+#[cfg(test)]
+mod evaluation_tests;
+
 /// A cell request for the kernel thread.
 pub struct JsCellRequest {
     pub code: String,
@@ -127,10 +131,14 @@ fn kernel_thread(requests: &Receiver<JsCellRequest>, bridge_tx: &Sender<JsBridge
         install_globals(&ctx, &console, bridge_tx);
     });
 
+    let Ok(evaluator) = context.with(|ctx| evaluate::Evaluator::new(&ctx)) else {
+        return;
+    };
+
     while let Ok(request) = requests.recv() {
         deadline.set(request.deadline, origin);
         console.borrow_mut().clear();
-        let response = run_cell(&context, &runtime, &request, &deadline, origin);
+        let response = run_cell(&context, &runtime, &request, &deadline, origin, &evaluator);
         deadline.clear();
         let response = JsCellResponse {
             console: std::mem::take(&mut *console.borrow_mut()),
@@ -215,6 +223,7 @@ fn run_cell(
     request: &JsCellRequest,
     deadline: &DeadlineCell,
     origin: Instant,
+    evaluator: &evaluate::Evaluator,
 ) -> JsCellResponse {
     // Phase 1: evaluate. A returned promise is saved as a Persistent so job
     // pumping can happen OUTSIDE Context::with (execute_pending_job inside
@@ -224,47 +233,9 @@ fn run_cell(
         Pending(rquickjs::Persistent<rquickjs::Promise<'static>>),
     }
     let phase1 = context.with(|ctx| {
-        // Script mode first: top-level `const`/`let` bindings persist in the
-        // shared script scope. Top-level await needs JS_EVAL_FLAG_ASYNC
-        // (rquickjs `EvalOptions.promise`) — retry with it on a syntax error
-        // (an `await ...` cell). Bindings made inside an async-mode cell do
-        // NOT persist (documented kernel limitation).
-        let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
-        let evaluated = match evaluated {
-            Ok(value) => Ok(value),
-            Err(err) if matches!(&err, rquickjs::Error::Exception) => {
-                // ctx.catch() consumes the pending exception, so capture it
-                // ONCE: it decides retry eligibility AND renders the error.
-                // Top-level await surfaces as a parse-time SyntaxError; ONLY
-                // that earns the async-mode retry — re-running on a runtime
-                // throw would re-execute the whole cell, doubling every side
-                // effect that ran before the throw.
-                let caught = ctx.catch();
-                let is_syntax_error = caught.as_exception().is_some_and(|exception| {
-                    exception
-                        .get::<_, String>("name")
-                        .is_ok_and(|name| name == "SyntaxError")
-                });
-                if is_syntax_error {
-                    let mut options = rquickjs::context::EvalOptions::default();
-                    options.global = true;
-                    options.strict = true;
-                    options.promise = true;
-                    ctx.eval_with_options(request.code.as_bytes(), options)
-                } else {
-                    let detail = caught
-                        .as_exception()
-                        .map_or_else(|| err.to_string(), |exception| format!("{exception}"));
-                    return Phase1::Done(JsCellResponse {
-                        ok: false,
-                        console: String::new(),
-                        result: None,
-                        error: Some(detail),
-                    });
-                }
-            }
-            Err(err) => Err(err),
-        };
+        // Select the grammar before executing any user statements. A runtime
+        // SyntaxError (including JSON.parse failures) never retries the cell.
+        let evaluated = evaluator.evaluate(&ctx, &request.code);
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
             Ok(value) => rquickjs::Promise::from_value(value.clone()).map_or_else(
