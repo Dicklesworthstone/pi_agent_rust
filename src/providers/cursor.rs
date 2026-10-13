@@ -902,7 +902,13 @@ impl StreamState {
                         "PI_CURSOR_STREAM_INCOMPLETE: response ended inside a Connect frame"
                     };
                     self.stop_reading();
-                    return Some(Err(Error::api(message)));
+                    // Actual EOF is a transport interruption. Preserve the
+                    // existing incomplete-stream marker while using the same
+                    // source-classified recovery path as other providers.
+                    return Some(Err(Error::sse(&std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        message,
+                    ))));
                 }
             }
         }
@@ -1457,7 +1463,10 @@ mod tests {
         match events.last() {
             Some(StreamEvent::Error { reason, error }) => {
                 assert_eq!(*reason, StopReason::Error);
-                assert_eq!(error.error_message.as_deref(), Some("boom"));
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("PI_CONNECT_ERROR[unknown]: boom")
+                );
             }
             other => panic!("expected Error, got {other:?}"),
         }

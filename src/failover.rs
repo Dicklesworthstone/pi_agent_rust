@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+pub(crate) mod provider_code;
+
 /// Failure classes relevant to failover decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailoverClass {
@@ -101,6 +103,9 @@ fn is_quota_exhaustion(lower: &str) -> bool {
 }
 
 fn response_refuses_retry(lower: &str) -> bool {
+    if let Some(class) = provider_code::connect_recovery(lower) {
+        return class.is_none();
+    }
     recovery_http_status(lower)
         .is_some_and(|status| (400..=499).contains(&status) && !matches!(status, 408 | 429))
 }
@@ -115,6 +120,9 @@ fn provider_text_is_retryable(
 ) -> bool {
     if crate::error::is_context_overflow(error_text, usage_input_tokens, context_window) {
         return false;
+    }
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class.is_some();
     }
     let lower = error_text.to_ascii_lowercase();
     if let Some(status) = recovery_http_status(&lower)
@@ -207,6 +215,11 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     // Auth: loud, user-actionable, never a failover trigger.
     if is_auth_failure(&text) {
         return None;
+    }
+    // A validated Connect code is the response classification, not an HTTP
+    // status inferred from its explanation. Refusals above still win.
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class;
     }
     if is_quota_exhaustion(&text) {
         return Some(FailoverClass::Quota);

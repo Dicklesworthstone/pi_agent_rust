@@ -11,6 +11,7 @@ use flate2::bufread::MultiGzDecoder;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::failover::provider_code::ConnectCode;
 
 use super::MAX_CONNECT_FRAME_LEN;
 
@@ -132,27 +133,7 @@ pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
     let code = error
         .get("code")
         .and_then(Value::as_str)
-        .filter(|code| {
-            matches!(
-                *code,
-                "canceled"
-                    | "unknown"
-                    | "invalid_argument"
-                    | "deadline_exceeded"
-                    | "not_found"
-                    | "already_exists"
-                    | "permission_denied"
-                    | "resource_exhausted"
-                    | "failed_precondition"
-                    | "aborted"
-                    | "out_of_range"
-                    | "unimplemented"
-                    | "internal"
-                    | "unavailable"
-                    | "data_loss"
-                    | "unauthenticated"
-            )
-        })
+        .and_then(ConnectCode::parse)
         .ok_or_else(|| protocol("invalid Connect terminal error code"))?;
     let message = match error.get("message") {
         None => "",
@@ -160,11 +141,10 @@ pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
             .as_str()
             .ok_or_else(|| protocol("invalid Connect terminal error message"))?,
     };
-    Ok(Some(if message.is_empty() {
-        format!("Cursor stream returned {code}")
-    } else {
-        message.to_string()
-    }))
+    // The agent flattens stream errors into message text. Carry the validated
+    // code across that boundary rather than asking recovery to infer it from
+    // optional, untrusted prose. No synthetic HTTP status is introduced.
+    Ok(Some(code.diagnostic(message)))
 }
 
 #[cfg(test)]
@@ -368,7 +348,10 @@ mod tests {
         match events.last() {
             Some(Ok(StreamEvent::Error { error, reason })) => {
                 assert_eq!(*reason, StopReason::Error);
-                assert_eq!(error.error_message.as_deref(), Some("try later"));
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("PI_CONNECT_ERROR[unavailable]: try later")
+                );
                 assert!(!error.content.is_empty());
             }
             event => panic!("expected provider error, got {event:?}"),
@@ -379,7 +362,10 @@ mod tests {
     fn code_only_error_is_not_lost_and_metadata_is_supported() {
         assert_eq!(
             terminal_error(br#"{"error":{"code":"resource_exhausted"}}"#).unwrap(),
-            Some("Cursor stream returned resource_exhausted".to_string())
+            Some(
+                "PI_CONNECT_ERROR[resource_exhausted]: Cursor stream returned resource_exhausted"
+                    .to_string()
+            )
         );
         assert_eq!(
             terminal_error(br#"{"metadata":{"cost":["1","2"]},"future":true}"#).unwrap(),
@@ -611,5 +597,202 @@ mod tests {
             events.last(),
             Some(Ok(StreamEvent::Error { reason: StopReason::Error, .. }))
         ));
+    }
+
+    fn recovery_policy() -> crate::failover::RetryPolicy {
+        crate::failover::RetryPolicy {
+            max_retries: 2,
+            max_failovers_per_turn: 1,
+            base_delay_ms: 250,
+            max_delay_ms: 1_000,
+        }
+    }
+
+    fn fresh_progress() -> crate::failover::TurnProgress {
+        crate::failover::TurnProgress {
+            retry_count: 0,
+            failovers_this_turn: 0,
+            stream_can_retry: true,
+        }
+    }
+
+    #[test]
+    fn decoded_error_codes_control_recovery_even_with_opaque_or_misleading_prose() {
+        use crate::failover::{TurnDecision, TurnOutcome, decide};
+
+        for (code, recoverable) in [
+            ("canceled", false),
+            ("unknown", false),
+            ("invalid_argument", false),
+            ("deadline_exceeded", true),
+            ("not_found", false),
+            ("already_exists", false),
+            ("permission_denied", false),
+            ("resource_exhausted", true),
+            ("failed_precondition", false),
+            ("aborted", false),
+            ("out_of_range", false),
+            ("unimplemented", false),
+            ("internal", false),
+            ("unavailable", true),
+            ("data_loss", false),
+            ("unauthenticated", false),
+        ] {
+            for detail in ["", "opaque", "HTTP 503: timeout; quota exceeded"] {
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "error": { "code": code, "message": detail }
+                }))
+                .unwrap();
+                for encoding in [Encoding::Identity, Encoding::Gzip] {
+                    let terminal = if encoding == Encoding::Gzip {
+                        compressed_frame(CONNECT_END_STREAM_FLAG, &payload)
+                    } else {
+                        encode_frame(CONNECT_END_STREAM_FLAG, &payload)
+                    };
+                    let events =
+                        drain_with_encoding(vec![text_frame("preview"), terminal], encoding);
+                    assert!(events.iter().all(Result::is_ok));
+                    let Some(Ok(StreamEvent::Error { error, reason })) = events.last() else {
+                        panic!("expected {code} error terminal, got {events:?}");
+                    };
+                    assert_eq!(*reason, StopReason::Error);
+                    assert!(matches!(
+                        &error.content[0],
+                        ContentBlock::Text(text) if text.text == "preview"
+                    ));
+                    let diagnostic = error.error_message.as_deref().unwrap();
+                    assert!(diagnostic.starts_with(&format!("PI_CONNECT_ERROR[{code}]: ")));
+                    assert!(detail.is_empty() || diagnostic.ends_with(detail));
+                    assert_eq!(
+                        decide(
+                            TurnOutcome::Completed(error),
+                            &fresh_progress(),
+                            &recovery_policy(),
+                            None,
+                        ),
+                        if recoverable {
+                            TurnDecision::Retry {
+                                attempt: 1,
+                                delay_ms: 250,
+                            }
+                        } else {
+                            TurnDecision::Finish { success: false }
+                        },
+                        "{code}: {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_auth_and_context_refusals_do_not_become_capacity_retries() {
+        use crate::failover::{TurnDecision, TurnOutcome, decide};
+
+        for detail in [
+            "invalid_api_key",
+            "prompt is too long",
+            "HTTP 401: retry delay",
+        ] {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "error": { "code": "unavailable", "message": detail }
+            }))
+            .unwrap();
+            let events = drain(vec![encode_frame(CONNECT_END_STREAM_FLAG, &payload)]);
+            let Some(Ok(StreamEvent::Error { error, .. })) = events.last() else {
+                panic!("missing provider error");
+            };
+            assert_eq!(
+                decide(
+                    TurnOutcome::Completed(error),
+                    &fresh_progress(),
+                    &recovery_policy(),
+                    None,
+                ),
+                TurnDecision::Finish { success: false }
+            );
+        }
+    }
+
+    #[test]
+    fn premature_eof_is_retryable_without_becoming_a_successful_message() {
+        use crate::failover::{TurnDecision, TurnOutcome, decide};
+
+        let terminal = encode_frame(CONNECT_END_STREAM_FLAG, b"{}");
+        for length in 0..terminal.len() {
+            let events = drain(vec![text_frame("preview"), terminal[..length].to_vec()]);
+            assert_failed(&events, "PI_CURSOR_STREAM_INCOMPLETE");
+            let error = events.last().unwrap().as_ref().unwrap_err();
+            let policy = recovery_policy();
+            assert_eq!(
+                decide(TurnOutcome::Failed(error), &fresh_progress(), &policy, None),
+                TurnDecision::Retry {
+                    attempt: 1,
+                    delay_ms: 250,
+                }
+            );
+            // Print and any other surface that cannot retract already-visible
+            // output must still refuse both same-provider and chain reentry.
+            let mut visible = fresh_progress();
+            visible.stream_can_retry = false;
+            assert_eq!(
+                decide(TurnOutcome::Failed(error), &visible, &policy, None),
+                TurnDecision::Finish { success: false }
+            );
+            let flattened = AssistantMessage {
+                stop_reason: StopReason::Error,
+                error_message: Some(error.to_string()),
+                ..AssistantMessage::default()
+            };
+            assert_eq!(
+                decide(
+                    TurnOutcome::Completed(&flattened),
+                    &fresh_progress(),
+                    &policy,
+                    None,
+                ),
+                TurnDecision::Retry {
+                    attempt: 1,
+                    delay_ms: 250,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_protocol_and_host_limits_remain_non_retryable() {
+        use crate::failover::{TurnDecision, TurnOutcome, decide};
+
+        for wire in [
+            encode_frame(CONNECT_END_STREAM_FLAG, b"not valid JSON: quota exceeded"),
+            encode_frame(
+                CONNECT_END_STREAM_FLAG,
+                br#"{"error":{"code":"INVALID"}}"#,
+            ),
+            encode_frame(0, &[0]),
+            encode_frame(4, b"{}"),
+        ] {
+            let events = drain(vec![wire]);
+            let error = events.last().unwrap().as_ref().unwrap_err();
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(error),
+                    &fresh_progress(),
+                    &recovery_policy(),
+                    None,
+                ),
+                TurnDecision::Finish { success: false }
+            );
+        }
+        let limit = super::super::stream_limits::exceeded();
+        assert_eq!(
+            decide(
+                TurnOutcome::Failed(&limit),
+                &fresh_progress(),
+                &recovery_policy(),
+                None,
+            ),
+            TurnDecision::Finish { success: false }
+        );
     }
 }
