@@ -3,6 +3,7 @@
 
 pub mod adapters;
 mod breakpoints;
+mod configuration;
 pub mod dap;
 mod ownership;
 mod remote;
@@ -125,13 +126,14 @@ impl DebugTool {
             .adapter
             .as_deref()
             .or_else(|| input.go_mode.as_ref().map(|_| "dlv"));
-        let adapter = adapters::select_adapter(program.as_deref(), requested, &self.adapters)
-            .ok_or_else(|| {
-                tool_err(
-                    "DAP_ADAPTER_MISSING",
-                    "no matching debug adapter; install lldb-dap, debugpy, or dlv",
-                )
-            })?;
+        let selected = configuration::select(
+            &self.cwd,
+            program.as_deref(),
+            requested,
+            input.adapter_config.as_deref(),
+            &self.adapters,
+        )?;
+        let adapter = &selected.adapter;
         if input.go_mode.is_some() && adapter.id != "dlv" {
             return Err(tool_err("DAP_USAGE", "goMode requires the dlv adapter"));
         }
@@ -139,10 +141,10 @@ impl DebugTool {
         if terminal && !matches!(adapter.id.as_str(), "debugpy" | "lldb-dap") {
             return Err(tool_err("DAP_UNSUPPORTED", "runInTerminal supports local debugpy and lldb-dap launches"));
         }
-        if program.as_ref().is_some_and(|path| path.is_dir()) && adapter.id != "dlv" {
+        if program.as_ref().is_some_and(|path| path.is_dir()) && !selected.accepts_directory_program {
             return Err(tool_err(
                 "DAP_USAGE",
-                "directory launch targets require the dlv adapter",
+                "directory launch targets require an adapter that accepts directory programs",
             ));
         }
         let command = adapter.resolve_command().ok_or_else(|| {
@@ -165,19 +167,18 @@ impl DebugTool {
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "debug launch cancelled"))?;
         let mut arguments = program.as_ref().map_or_else(
-            || adapters::attach_arguments(&adapter, input.pid.expect("validated pid")),
+            || adapters::attach_arguments(adapter, input.pid.expect("validated pid")),
             |p| {
                 adapters::launch_arguments(
-                    &adapter,
+                    adapter,
                     p,
                     input.args.as_deref().unwrap_or(&[]),
                     &self.cwd,
                 )
             },
         );
-        if let Some(stop) = input.stop_on_entry {
-            arguments["stopOnEntry"] = json!(stop);
-        }
+        selected.apply_defaults(&input.action, &mut arguments);
+        configuration::set_stop_on_entry(&adapter.id, &mut arguments, input.stop_on_entry);
         if let Some(mode) = &input.go_mode {
             arguments["mode"] = json!(mode);
         }
@@ -802,6 +803,7 @@ struct DebugInput {
     program: Option<String>,
     args: Option<Vec<String>>,
     adapter: Option<String>,
+    adapter_config: Option<String>,
     go_mode: Option<String>,
     startup_timeout_ms: Option<u64>,
     pid: Option<u32>,
@@ -868,6 +870,12 @@ impl DebugInput {
 
     fn validate(&self) -> Result<()> {
         self.remote.validate(self)?;
+        configuration::validate_request(
+            self.adapter_config.as_deref(),
+            self.adapter.as_deref(),
+            &self.action,
+            self.remote.port.is_some(),
+        )?;
         if self.run_in_terminal.is_some() && self.action != "launch" {
             return Err(tool_err("DAP_USAGE", "runInTerminal is local-launch-only"));
         }
@@ -986,7 +994,7 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority. For a configured local backend, explicitly pass adapterConfig (workspace-relative dap.json) and adapter (ID). This executes that file's selected command through the same process/session policy; no configuration is auto-loaded."
     }
     fn parameters(&self) -> Value {
         remote::schema(json!({
@@ -1001,6 +1009,7 @@ impl Tool for DebugTool {
                 "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
+                "adapterConfig":{"type":"string","maxLength":4096,"description":"Explicit workspace-relative dap.json with an adapters map; requires adapter ID. Local launch/pid-attach only. Executes the selected configured command; never auto-loaded."},
                 "goMode":{"type":"string","enum":["debug","test","exec"]},
                 "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":120_000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
