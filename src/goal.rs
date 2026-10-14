@@ -19,6 +19,8 @@ use std::sync::{Arc, Weak};
 
 mod driver;
 mod rpc;
+#[cfg(feature = "ftui")]
+pub(crate) mod terminal;
 pub use driver::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalRunStop, GoalSession};
 pub(crate) use rpc::{rpc_goal_command, rpc_goal_state};
 

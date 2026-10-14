@@ -1,6 +1,6 @@
 //! OMP workspace commands on the default stack: `/rules`, `/omfg`,
 //! `/commit`, `/review`, `/handoff`, `/approval`, `/advisor`, `/memory`,
-//! `/hub` (alias `/agents`), `/security`, `/plugins`. The work is
+//! `/hub` (alias `/agents`), `/security`, `/plugins`, and `/goal`. The work is
 //! shared with the classic stack (`interactive::workspace_reports`); this
 //! module routes them through the driver and renders the result.
 
@@ -25,6 +25,7 @@ pub enum WorkspaceCommand {
     Hub,
     Security,
     Plugins,
+    Goal,
 }
 
 impl WorkspaceCommand {
@@ -42,6 +43,7 @@ impl WorkspaceCommand {
             "/hub" | "/agents" => Self::Hub,
             "/security" => Self::Security,
             "/plugins" | "/packages" => Self::Plugins,
+            "/goal" => Self::Goal,
             _ => return None,
         })
     }
@@ -91,6 +93,10 @@ pub async fn run(
             }
         }
         WorkspaceCommand::Approval => run_approval(handle, args).await,
+        WorkspaceCommand::Goal => match Box::pin(crate::goal::terminal::run(handle, args)).await {
+            Ok(text) => PiMsg::System(text),
+            Err(error) => PiMsg::AgentError(format!("goal: {error}")),
+        },
     };
     let _ = agent_tx.send(msg);
 }
@@ -136,5 +142,64 @@ mod tests {
         }
         assert_eq!(WorkspaceCommand::parse("/rule"), None);
         assert_eq!(WorkspaceCommand::parse("rules"), None);
+    }
+
+    #[test]
+    fn default_terminal_routes_goal_without_claiming_extension_prefixes() {
+        use super::super::{PiFtuiModel, UiCommand};
+        let (_agent_tx, agent_rx) = std::sync::mpsc::channel();
+        let (submit_tx, submit_rx) = std::sync::mpsc::channel();
+        let mut model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+        assert!(model.route_slash_command("/GoAl status"));
+        assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Workspace {
+            command: WorkspaceCommand::Goal,
+            args: "status".to_string(),
+        });
+        model.busy = None; // The first command's driver reply ends its busy state.
+        assert!(model.route_slash_command("/goalkeeper exact Argument"));
+        assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::ExtensionCommand {
+            name: "goalkeeper".to_string(),
+            args: "exact Argument".to_string(),
+        });
+        assert_eq!(WorkspaceCommand::parse("goal"), None);
+    }
+
+    #[test]
+    fn default_driver_goal_controls_change_the_actual_session_without_agent_work() {
+        use crate::agent::{Agent, AgentConfig, AgentSession};
+        use crate::compaction::ResolvedCompactionSettings;
+        use crate::providers::openai::OpenAIProvider;
+        use crate::sdk::EventListeners;
+        use crate::session::Session;
+        use crate::tools::ToolRegistry;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let provider = Arc::new(OpenAIProvider::new("terminal-goal-routing")
+            .with_base_url("http://127.0.0.1:1/v1"));
+        let agent = Agent::new(provider, ToolRegistry::new(&[], Path::new("."), None), AgentConfig::default());
+        let session = AgentSession::new(agent, Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+            false, ResolvedCompactionSettings::default());
+        let events = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&events);
+        let listeners = EventListeners::default();
+        let _ = listeners.subscribe(Arc::new(move |_| { counted.fetch_add(1, Ordering::SeqCst); }));
+        let mut handle = AgentSessionHandle::from_session_with_listeners(session, listeners);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runtime.block_on(run(WorkspaceCommand::Goal, "status", &mut handle, Path::new("."), None, None, &sender));
+        let PiMsg::System(status) = receiver.try_recv().unwrap() else { panic!("goal status"); };
+        let token = status.lines().find_map(|line| line.strip_prefix("Review: ")).unwrap();
+        runtime.block_on(run(WorkspaceCommand::Goal, &format!("create {token} -- routed objective"),
+            &mut handle, Path::new("."), None, None, &sender));
+        let PiMsg::System(created) = receiver.try_recv().unwrap() else { panic!("goal creation"); };
+        assert!(created.contains("Memory-only"));
+        assert_eq!(handle.current_goal().unwrap().unwrap().objective(), "routed objective");
+        runtime.block_on(run(WorkspaceCommand::Goal, &format!("drop {token} -- stale queued command"),
+            &mut handle, Path::new("."), None, None, &sender));
+        let PiMsg::AgentError(error) = receiver.try_recv().unwrap() else { panic!("stale receipt refused"); };
+        assert!(error.contains("GOAL_STALE"));
+        assert_eq!(handle.current_goal().unwrap().unwrap().status(), crate::goal::GoalStatus::Active);
+        assert_eq!(events.load(Ordering::SeqCst), 0);
     }
 }

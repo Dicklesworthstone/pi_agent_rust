@@ -2,11 +2,82 @@
 
 Pi's in-process SDK can now retain an objective across several native prompts,
 stop for review, and resume with its remaining prompt/token budget. This is an
-OMP-inspired **SDK workflow**. The execution driver does not install `/goal` in
-either terminal interface or expose a model-facing `goal` tool. This page covers
-in-process execution, not the separate RPC lifecycle adapter.
+OMP-inspired **SDK workflow**. The default FrankenTUI also exposes `/goal`
+lifecycle controls described below. Bounded execution remains an SDK workflow,
+not a terminal execution command or a model-facing `goal` tool. The separate
+RPC lifecycle adapter is not the in-process execution driver.
 The types currently live in `pi::goal`, an unstable module under the library's
 public API policy; the lifecycle methods are on `AgentSessionHandle`.
+
+## Default terminal: inspect and control a saved objective
+
+In the default FrankenTUI, run `/goal` or `/goal status` while idle. It displays
+the current branch's objective, state, prompt/token accounting, interruption
+status and a `Review: g1-...` revision receipt. No goal is also a reviewable
+state, so creation cannot be silently redirected to another queued session.
+Copy the actual receipt into the command; `<review>` below is a placeholder:
+
+```text
+/goal status
+/goal create <review> --tokens 50000 --prompts 8 -- Implement and verify the parser
+```
+
+The command records the objective in the native session journal and displays
+its new receipt. It does not start a provider request. Creation defaults to
+100,000 tokens and 16 goal prompts; repeated or unknown flags, invalid budgets,
+missing `--`, blank text and oversized input are errors. Text after `--` is
+literal, preserving interior whitespace, case and Unicode; it is not expanded
+as a shell command, prompt template or `@file` reference.
+
+Use the receipt of the state you actually reviewed for subsequent changes:
+
+```text
+/goal pause <review>
+/goal resume <review>
+/goal drop <review> -- This objective is no longer needed
+/goal complete <review> -- Inspected the deliverables and checked the results
+/goal save <review>
+```
+
+Every successful transition displays a fresh receipt. Pause/resume preserve
+spent counters; an exhausted goal cannot be resumed with reset counters.
+Completion is an explicit user attestation and requires nonblank evidence, not
+an assistant's completion claim or a proof independently checked by Pi. An
+unfinished intent must be reconciled before completion; a redundant pause
+cannot clear its interrupted marker. Drop retains history;
+it does not delete the session or undo tools. Create/resume refuse both live
+and replayed plan mode until it is off. Other lifecycle controls remain usable
+for stopping or saving an existing objective.
+
+The SHA-256 receipt binds session identity, branch leaf, the full latest goal
+record including accumulated usage, plan state and persistence mode. Validation
+and append share the same owned journal lock. Another branch, intervening input,
+replacement goal or differently identified session yields `GOAL_STALE` with no
+mutation; run `/goal status` again. Receipts identify logical state, not secret
+authority, authentication or proof that somebody read it. Reopening the exact
+unchanged saved state, or returning to the exact unchanged branch, preserves
+the receipt. This differs deliberately from the SDK's in-memory `GoalSnapshot`
+incarnation checks. It is not a cross-process execution lease or filesystem
+transaction, and does not coordinate independent writers to the same session.
+
+Saved, memory-only and unconfirmed persistence are reported separately. A save
+failure keeps the live change and its new receipt; use `/goal save` to retry
+the native save without appending/replaying the decision. A malformed latest
+goal checkpoint is an error, not permission to resurrect an older objective.
+Displayed objective/evidence lines are quoted; control characters, non-ASCII
+scalars and backslashes are visibly escaped, while the journal retains the
+original text. Persistence diagnostics are bounded and explicitly labelled
+when truncated.
+
+**These commands manage lifecycle, not autonomous terminal execution.** They
+do not add `/goal step` or `/goal run`, a new live cancellation lane, a selected
+verifier, or a model-facing completion tool. Ordinary terminal prompts do not
+invoke the bounded goal driver, consume its prompt counter, or become governed
+by its token budget; active-interval assistant usage is still accounted by the
+journal. Use the SDK runners below for actual bounded multi-prompt execution.
+The classic terminal is unchanged. Regression coverage uses native sessions in
+`src/goal/terminal/tests.rs` and the default routing/driver in
+`src/interactive_ftui/workspace_commands.rs`; authored tests still require DSR.
 
 ## Create an objective and drive it
 
