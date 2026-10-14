@@ -119,21 +119,46 @@ pub fn omfg(cwd: &Path, args: &str) -> Report {
     }
 }
 
-/// Paths from `git status --porcelain` output. Each line is `XY <path>` (or
-/// `XY <old> -> <new>` for a rename); X is a space for an unstaged change,
-/// so the line must not be trimmed before the path is sliced off.
-fn porcelain_paths(status: &str) -> Vec<String> {
-    status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| {
-            path.split_once(" -> ")
-                .map_or(path, |(_, new)| new)
-                .trim()
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
-        .collect()
+/// Parse NUL-delimited porcelain v1 paths without losing whitespace, quoted
+/// characters, or rename destinations. Git emits the destination first for
+/// renames/copies under -z, then a second NUL-terminated source name.
+fn porcelain_paths_zero(status: &[u8]) -> Result<Vec<String>, String> {
+    if status.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !status.ends_with(&[0]) {
+        return Err("truncated git porcelain status".into());
+    }
+    let mut fields = status.split(|byte| *byte == 0).peekable();
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            if fields.peek().is_none() {
+                break;
+            }
+            return Err("empty git porcelain record".into());
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("invalid git porcelain status record".into());
+        }
+        let path = std::str::from_utf8(&record[3..])
+            .map_err(|_| "non-UTF-8 filenames cannot be safely committed through /commit")?;
+        if path.is_empty() {
+            return Err("empty path in git porcelain status".into());
+        }
+        let renamed = matches!(record[0], b'R' | b'C')
+            || matches!(record[1], b'R' | b'C');
+        if renamed {
+            let Some(original) = fields.next() else {
+                return Err("missing source path for git rename/copy".into());
+            };
+            if original.is_empty() {
+                return Err("empty rename/copy source path".into());
+            }
+        }
+        paths.push(path.to_string());
+    }
+    Ok(paths)
 }
 
 /// `/commit [--dry-run|-n|plan] [--include-lockfiles]`: split the working
@@ -150,30 +175,49 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
         .any(|arg| arg == "--include-lockfiles");
 
     let status_out = match std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["-c", "core.quotePath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
     {
-        Ok(o) => o,
-        Err(e) => return Report::status(format!("Failed to run git status: {e}")),
+        Ok(output) if output.status.success() => output,
+        Ok(output) => return Report::status(format!(
+            "Git status failed ({}): {}",
+            output.status, String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => return Report::status(format!("Failed to run git status: {error}")),
     };
-    let changed_files = porcelain_paths(&String::from_utf8_lossy(&status_out.stdout));
+    let changed_files = match porcelain_paths_zero(&status_out.stdout) {
+        Ok(paths) => paths,
+        Err(error) => return Report::status(format!("Cannot plan commits: {error}")),
+    };
     if changed_files.is_empty() {
         return Report::status("Working tree clean; nothing to commit.");
     }
 
-    let hunks = std::process::Command::new("git")
-        .args(["diff", "HEAD"])
+    // A failed Git invocation or malformed diff is not an empty diff: falling
+    // back to an empty hunk list could silently produce a misleading plan.
+    let diff_out = match std::process::Command::new("git")
+        .args(["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"])
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
-        .ok()
-        .and_then(|out| {
-            crate::commit_split::DiffParser::parse_unified_diff(&String::from_utf8_lossy(
-                &out.stdout,
-            ))
-            .ok()
-        })
-        .unwrap_or_default();
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => return Report::status(format!(
+            "Git diff failed ({}): {}",
+            output.status, String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => return Report::status(format!("Failed to run git diff: {error}")),
+    };
+    let diff = match std::str::from_utf8(&diff_out.stdout) {
+        Ok(diff) => diff,
+        Err(_) => return Report::status("Git diff is not UTF-8; refusing to plan an incomplete commit."),
+    };
+    let hunks = match crate::commit_split::DiffParser::parse_unified_diff(diff) {
+        Ok(hunks) => hunks,
+        Err(error) => return Report::status(format!("Cannot parse Git diff: {error}")),
+    };
 
     let options = crate::commit_split::CommitOptions {
         dry_run,
@@ -541,6 +585,30 @@ mod tests {
 
     /// `/memory` over a real (per-test) project bank: retained facts are
     /// listed and searchable, and `forget` removes one.
+    #[test]
+    fn nul_porcelain_preserves_paths_and_rename_destinations() {
+        let bytes = b" M leading space.txt\0?? weird -> literal.txt\0R  new name.rs\0old name.rs\0 C other.rs\0old copy.rs\0";
+        assert_eq!(
+            porcelain_paths_zero(bytes).unwrap(),
+            ["leading space.txt", "weird -> literal.txt", "new name.rs", "other.rs"]
+        );
+        assert_eq!(
+            porcelain_paths_zero(b"??  leading.txt\0").unwrap(),
+            [" leading.txt"]
+        );
+        assert!(porcelain_paths_zero(b" M unfinished").is_err());
+        assert!(porcelain_paths_zero(b"R  moved\0").is_err());
+        assert!(porcelain_paths_zero(b"?? \xff\0").is_err());
+        assert!(porcelain_paths_zero(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_reports_git_failure_instead_of_an_empty_plan() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let report = commit(dir.path(), "--dry-run");
+        assert!(report.status.starts_with("Git status failed"), "{report:?}");
+    }
+
     #[test]
     fn memory_lists_searches_and_forgets() {
         let root = std::env::temp_dir().join(format!(
