@@ -42,13 +42,31 @@ struct PyKernel {
     lines: std::sync::Mutex<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
     next_id: u64,
     cells_run: u64,
+    // Retired after the process tree, including on reset/eviction/failure.
+    // Also holds the bootstrap script so Windows command-line limits cannot
+    // be exceeded as the embedded kernel grows.
+    _packages: tempfile::TempDir,
 }
 
 impl PyKernel {
     fn spawn(python_path: &str, cwd: &Path) -> Result<Self> {
+        let packages = tempfile::Builder::new()
+            .prefix("pi-eval-python-")
+            .tempdir()
+            .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
+        let script = packages.path().join("kernel.py");
+        std::fs::write(&script, PY_KERNEL_SERVER)
+            .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
         let mut command = Command::new(python_path);
         command
-            .args(["-c", PY_KERNEL_SERVER])
+            // Keep -c's workspace import semantics; only the large bootstrap
+            // moves to owned storage, not the kernel's default sys.path.
+            .args([
+                "-c",
+                "import sys\nwith open(sys.argv[1], encoding='utf-8') as source:\n code = source.read()\nexec(compile(code, sys.argv[1], 'exec'))",
+            ])
+            .arg(&script)
+            .env("_PI_EVAL_PACKAGE_ROOT", packages.path())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -86,6 +104,7 @@ impl PyKernel {
             lines: std::sync::Mutex::new(rx),
             next_id: 1,
             cells_run: 0,
+            _packages: packages,
         };
         std::thread::Builder::new()
             .name("eval-py-read".into())
@@ -562,6 +581,10 @@ impl Tool for EvalTool {
          PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
          Both kernels stream stdout/stderr live; large console output retains a \
          labelled bounded head/tail rather than filling session memory. \
+         Python %pip install --managed <packages> installs into private \
+         kernel-local storage without losing variables or changing system \
+         Python. Reset discards managed packages; installation time counts \
+         against timeout_secs. Plain %pip install keeps normal pip behavior. \
          Set output_path to a new workspace-relative .jsonl file to retain \
          complete received console frames on disk (64 MiB encoded limit). \
          JavaScript can await import('./helper.js') for local .js/.mjs ES modules \
