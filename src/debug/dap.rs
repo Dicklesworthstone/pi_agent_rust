@@ -1,4 +1,5 @@
 //! Content-Length-framed DAP over owned adapter stdio or loopback TCP.
+//! Connected external adapters are socket-owned, never process-owned.
 //! Dedicated, bounded writer/reader lanes keep blocking I/O off the reactor.
 
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{await_completion, encode_frame, read_frame_with_scratch};
 
+mod connect;
 mod delve;
 
 const MAX_PENDING: usize = 32;
@@ -91,7 +93,7 @@ impl std::fmt::Display for DapError {
 type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, DapError>>>>;
 
 struct Lifetime {
-    child: Mutex<crate::tools::ProcessGuard>,
+    child: Mutex<Option<crate::tools::ProcessGuard>>,
     // Shutting down a clone wakes both TCP I/O lanes, even if the peer never
     // closes its end. Process teardown alone is insufficient for TCP streams.
     socket: Option<TcpStream>,
@@ -109,7 +111,9 @@ impl Lifetime {
             for (_, sender) in waiting {
                 let _ = sender.try_send(Err(DapError::Transport(reason.to_string())));
             }
-            let _ = lock(&self.child).kill();
+            if let Some(child) = lock(&self.child).as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -172,7 +176,8 @@ struct AdapterIo {
     tail: OutputTail,
 }
 
-/// The session owns the adapter; each request owns its pending wait and frame.
+/// The session owns its connection and, only for spawned adapters, its process.
+/// Each request owns its pending wait and frame.
 /// Blocking OS I/O and process cleanup are not hard real-time operations.
 pub struct DapTransport {
     life: Arc<Lifetime>,
@@ -263,10 +268,20 @@ impl DapTransport {
     }
 
     fn from_io(io: AdapterIo) -> Self {
+        Self::from_lanes(Some(io.child), io.input, io.output, io.socket, io.tail)
+    }
+
+    fn from_lanes(
+        child: Option<crate::tools::ProcessGuard>,
+        input: Box<dyn Write + Send>,
+        output: Box<dyn Read + Send>,
+        socket: Option<TcpStream>,
+        tail: OutputTail,
+    ) -> Self {
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         let life = Arc::new(Lifetime {
-            child: Mutex::new(io.child),
-            socket: io.socket,
+            child: Mutex::new(child),
+            socket,
             alive: AtomicBool::new(true),
             pending: Arc::clone(&pending),
         });
@@ -274,11 +289,11 @@ impl DapTransport {
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(512);
         let (writer, writes) = std::sync::mpsc::sync_channel::<Frame>(MAX_PENDING);
         let frames_read = Arc::new(AtomicU64::new(0));
-        spawn_writer(io.input, writes, Arc::clone(&life));
+        spawn_writer(input, writes, Arc::clone(&life));
         spawn_reader(
-            io.output,
+            output,
             Arc::clone(&life),
-            Arc::clone(&io.tail),
+            Arc::clone(&tail),
             writer.clone(),
             Arc::clone(&next_seq),
             Arc::clone(&frames_read),
@@ -289,7 +304,7 @@ impl DapTransport {
             writer,
             pending,
             next_seq,
-            stderr_tail: io.tail,
+            stderr_tail: tail,
             event_rx: Mutex::new(event_rx),
             frames_read,
         }
@@ -305,8 +320,10 @@ impl DapTransport {
         if !self.life.alive.load(Ordering::SeqCst) {
             return false;
         }
-        let status = lock(&self.life.child).try_wait_child();
-        if !matches!(status, Ok(None)) {
+        let exited = lock(&self.life.child)
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait_child(), Ok(None)));
+        if exited {
             self.life
                 .close("adapter process exited or could not be queried");
         }
@@ -392,8 +409,10 @@ impl DapTransport {
         lock(&self.stderr_tail).tail()
     }
 
+    /// Close both I/O lanes and fail pending requests. Only a process spawned
+    /// by this transport is killed; an external adapter has no process guard.
     pub fn kill(&self) {
-        self.life.close("adapter terminated by the client");
+        self.life.close("adapter connection retired by the client");
     }
 }
 
