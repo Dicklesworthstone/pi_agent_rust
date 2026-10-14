@@ -20,6 +20,8 @@ use crate::lsp::jsonrpc::{await_completion, encode_frame, read_frame_with_scratc
 
 mod connect;
 mod delve;
+mod reverse;
+pub use reverse::ReverseRequestHandler;
 
 const MAX_PENDING: usize = 32;
 const MAX_OUTBOUND: usize = 2 * 1024 * 1024;
@@ -99,11 +101,13 @@ struct Lifetime {
     socket: Option<TcpStream>,
     alive: AtomicBool,
     pending: Arc<PendingMap>,
+    reverse: reverse::State,
 }
 
 impl Lifetime {
     fn close(&self, reason: &str) {
         if self.alive.swap(false, Ordering::SeqCst) {
+            self.reverse.close();
             if let Some(socket) = &self.socket {
                 let _ = socket.shutdown(Shutdown::Both);
             }
@@ -284,6 +288,7 @@ impl DapTransport {
             socket,
             alive: AtomicBool::new(true),
             pending: Arc::clone(&pending),
+            reverse: reverse::State::default(),
         });
         let next_seq = Arc::new(AtomicU64::new(1));
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(512);
@@ -336,6 +341,32 @@ impl DapTransport {
         arguments: Value,
         timeout: Duration,
     ) -> std::result::Result<Value, DapError> {
+        self.request_inner(command, arguments, timeout, None).await
+    }
+
+    /// Service adapter-to-host requests only while this request is pending.
+    /// The host callback, not the adapter, owns policy and resource cleanup.
+    /// Callbacks run serially on the async caller under its original AgentCx,
+    /// never on the DAP reader. Default requests still refuse reverse calls.
+    /// Only one such window can be active per connection; ordinary requests
+    /// (for example configurationDone) may proceed concurrently.
+    pub async fn request_with_reverse(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        handler: ReverseRequestHandler,
+    ) -> std::result::Result<Value, DapError> {
+        self.request_inner(command, arguments, timeout, Some(handler)).await
+    }
+
+    async fn request_inner(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        handler: Option<ReverseRequestHandler>,
+    ) -> std::result::Result<Value, DapError> {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| DapError::Cancelled)?;
         if !owner.capabilities().io || !owner.capabilities().time {
@@ -358,6 +389,9 @@ impl DapTransport {
                 "outbound DAP frame exceeds 2 MiB".into(),
             ));
         }
+        let reverse = handler
+            .map(|handler| reverse::Permit::open(self, owner.clone(), timeout, handler))
+            .transpose()?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         {
             let mut pending = lock(&self.pending);
@@ -379,7 +413,21 @@ impl DapTransport {
         self.writer
             .try_send(Frame { bytes, phase })
             .map_err(|_| DapError::Transport("DAP writer queue is full or closed".into()))?;
-        let outcome = await_completion(receiver, timeout, || {}).await;
+        let completion = await_completion(receiver, timeout, || {});
+        let outcome = if let Some(reverse) = &reverse {
+            match futures::future::select(Box::pin(completion), Box::pin(reverse.drive())).await {
+                futures::future::Either::Left((result, pending)) => {
+                    drop(pending);
+                    result
+                }
+                futures::future::Either::Right((error, pending)) => {
+                    drop(pending);
+                    return Err(error);
+                }
+            }
+        } else {
+            completion.await
+        };
         lease.answered = outcome.is_ok();
         match outcome {
             Ok(result) => result,
@@ -494,6 +542,13 @@ fn spawn_reader(
             match read_frame_with_scratch(&mut reader, &mut scratch) {
                 Ok(Some(message)) => {
                     frames.fetch_add(1, Ordering::SeqCst);
+                    // Admission only: never execute host code on this lane.
+                    if let Some(accepted) = life.reverse.enqueue(&message) {
+                        if accepted {
+                            continue;
+                        }
+                        break "DAP reverse-request admission failed";
+                    }
                     if !dispatch(&message, &life.pending, &events, &tail, &writer, &sequence) {
                         break "DAP event/reply buffer overflow or invalid control message";
                     }
