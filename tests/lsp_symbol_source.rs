@@ -195,3 +195,47 @@ fn flat_ranges_remain_literal_and_invalid_or_changed_sources_produce_no_excerpt(
         assert!(peer.run(json!({"symbol":"Box","limit":1})).is_err(), "{mode} cannot return partial source success");
     }
 }
+
+#[test]
+fn line_focused_read_reaches_the_end_of_a_large_method_and_its_containing_class() {
+    let text = SOURCE.replace("    return", &format!("{}    return", "    padding();\r\n".repeat(3000)));
+    let focus = text.find("    return").unwrap();
+    let line = pi::lsp::text::offset_to_position(&text, focus).unwrap().line + 1;
+    let Some(peer) = Peer::new("stream", &text) else { return };
+    let output = peer.run(json!({"line":line})).unwrap();
+    assert_eq!(output["count"], 2, "the class and its method both contain the line");
+    assert_eq!(output["sourceTruncated"], true);
+    assert_eq!(output["truncated"], false);
+    for row in output["symbols"].as_array().unwrap() {
+        let source = &row["source"];
+        assert!(source["text"].as_str().unwrap().contains("return \"日本😀\";"));
+        assert_eq!(source["mode"], "line_context");
+        assert_eq!(source["focusLine"], line);
+        assert!(source["omittedBeforeBytes"].as_u64().unwrap() > 0);
+        assert_eq!(source["omittedAfterBytes"], 0);
+        assert_exact_source(row, &text);
+    }
+    assert_eq!(std::fs::read(peer.root.path().join("source.pisource")).unwrap(), text.as_bytes());
+    assert_eq!(peer.frames().iter().filter(|frame| frame["method"] == "textDocument/documentSymbol").count(), 1);
+}
+
+#[test]
+fn repeated_line_reads_keep_exact_context_and_preserve_source_fingerprints() {
+    let padding = "    padding();\r\n".repeat(4000);
+    let text = SOURCE.replace("    return", &format!("{padding}    return"));
+    let Some(peer) = Peer::new("legacy", &text) else { return };
+    let early = peer.run(json!({"symbol":"run","line":10})).unwrap();
+    let late = peer.run(json!({"symbol":"run","line":3900})).unwrap();
+    assert_eq!(early["count"], 1);
+    assert_eq!(late["count"], 1);
+    assert_eq!(early["sourceSha256"], late["sourceSha256"]);
+    for output in [&early, &late] {
+        let source = &output["symbols"][0]["source"];
+        assert_exact_source(&output["symbols"][0], &text);
+        assert!(source["text"].as_str().unwrap().len() <= 16 * 1024);
+        assert_eq!(source["omittedBeforeBytes"].as_u64().unwrap() + source["omittedAfterBytes"].as_u64().unwrap(), source["omittedBytes"].as_u64().unwrap());
+    }
+    assert!(early["symbols"][0]["source"]["omittedAfterBytes"].as_u64().unwrap() > 0);
+    assert!(late["symbols"][0]["source"]["omittedBeforeBytes"].as_u64().unwrap() > 0);
+    assert_ne!(early["symbols"][0]["source"]["byteRange"], late["symbols"][0]["source"]["byteRange"]);
+}

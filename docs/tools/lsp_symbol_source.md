@@ -19,15 +19,29 @@ intersection, and a one-based source line intersecting the full definition.
 Comments and call sites do not contribute to the numbered definition matches.
 `query` still means workspace-symbol search and is not changed by this feature.
 
+To inspect code near the bottom of a large method or class, keep its definition
+name and supply a line inside the desired region. This is a new checked source
+read, not a pinned pagination cursor: compare `sourceSha256` across results and
+never assume separate reads share an atomic snapshot. Very long individual
+lines can still be clipped; line context is bounded, not a complete-line promise.
+
 An unfiltered `symbols` request remains a metadata-only outline. A selected
 request sets `sourceIncluded: true` and includes `source` on every displayed row:
 
-* `text` is an exact prefix of the server-reported full symbol range, at most
-  16 KiB of UTF-8. It is not just the identifier's `selectionRange`.
+* `text` is an exact contiguous excerpt within the server-reported full symbol
+  range, at most 16 KiB of UTF-8. It is not just the identifier's
+  `selectionRange`. Short definitions are returned whole. Long name-only
+  selections start at the definition; long line selections show the requested
+  part of the definition, with about a quarter of the byte budget reserved for
+  preceding context. A near-end window can be smaller than the cap.
 * `range` gives the returned excerpt's zero-based UTF-16 start and end;
   `byteRange` gives its absolute half-open UTF-8 offsets in the source file.
 * `totalBytes`, `omittedBytes`, and `truncated` distinguish a complete extent
-  from clipped source. The row's original `range` remains the full extent.
+  from clipped source. `omittedBeforeBytes` and `omittedAfterBytes` split the
+  omission count by side. The row's original `range` remains the full extent.
+* `mode` is `full`, `prefix`, or `line_context`. `focusLine` is the supplied
+  one-based line, or null when only a name selected the source. A line-context
+  window does not include unrelated code outside the selected symbol.
 * `extent` is `document_symbol_range` for a hierarchical document symbol, or
   `symbol_location_range` for a flat symbol. A flat location may describe only
   an identifier. Pi does not infer braces, a body, or a hierarchy for it.
@@ -49,7 +63,9 @@ that budget. Large selections may return fewer complete rows; use a more
 specific name, line, or numbered match. Existing 2 MiB source/response, 8192
 symbol, and 32-level hierarchy limits remain unchanged. Endpoint offsets are
 retained from the one-pass validation rather than rescanning the whole file for
-each definition.
+each definition. For line-context windows, a sparse position index adds roughly
+one checkpoint per 4 KiB, not one allocation for every source line. Window
+endpoint lookups therefore do not repeatedly scan the whole enclosing class.
 
 All server members, including hidden and filtered-out symbols, are validated
 before any source excerpt is returned. Source changes or a retired server fail
