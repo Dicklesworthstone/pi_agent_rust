@@ -2670,7 +2670,7 @@ pub enum Commands {
 
     /// Diagnose environment health and extension compatibility
     Doctor {
-        /// Extension path to check (omit to run all environment checks)
+        /// Extension path to check (omit to check ordinary installation health)
         path: Option<String>,
         /// Output format: text (default), json, markdown
         #[arg(long, default_value = "text")]
@@ -2681,7 +2681,7 @@ pub enum Commands {
         /// Automatically fix safe issues (missing dirs, permissions)
         #[arg(long)]
         fix: bool,
-        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions
+        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions (swarm is opt-in)
         #[arg(long)]
         only: Option<String>,
     },

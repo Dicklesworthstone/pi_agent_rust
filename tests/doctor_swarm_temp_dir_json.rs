@@ -28,6 +28,161 @@ const SWARM_TEMP_WARN_AVAILABLE_KB: u64 = 10 * 1024 * 1024;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+// Subprocess isolation keeps developer credentials, tools and swarm overrides
+// out of consumer-installation regressions without mutating the test process.
+#[cfg(unix)]
+fn run_consumer_doctor(
+    args: &[&str],
+    broken_file: Option<&str>,
+    beads_checkout: bool,
+) -> TestResult<std::process::Output> {
+    let root = tempfile::tempdir()?;
+    let agent = root.path().join("agent");
+    let bin = root.path().join("bin");
+    let cwd = root.path().join("project");
+    for dir in [&agent, &bin, &cwd] {
+        fs::create_dir_all(dir)?;
+    }
+    for dir in ["sessions", "packages"] {
+        fs::create_dir_all(agent.join(dir))?;
+    }
+    fs::write(agent.join("settings.json"), "{}")?;
+    if let Some(file) = broken_file {
+        fs::write(agent.join(file), "{ invalid json")?;
+    }
+    if beads_checkout {
+        fs::create_dir_all(cwd.join(".beads"))?;
+        fs::write(cwd.join(".beads/issues.jsonl"), "")?;
+    }
+    // Only ordinary shell tools are discoverable: no br, rch or Agent Mail.
+    std::os::unix::fs::symlink("/bin/sh", bin.join("sh"))?;
+    std::os::unix::fs::symlink("/bin/sh", bin.join("bash"))?;
+    Ok(Command::new(env!("CARGO_BIN_EXE_pi"))
+        .arg("doctor")
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .env("PATH", &bin)
+        .stdin(Stdio::null())
+        .output()?)
+}
+
+#[cfg(unix)]
+#[test]
+fn consumer_doctor_defaults_exclude_swarm_even_in_beads_checkout() -> TestResult {
+    for beads_checkout in [false, true] {
+        for format in ["text", "json", "markdown"] {
+            let output = run_consumer_doctor(&["--format", format], None, beads_checkout)?;
+            require_eq(&output.status.code(), &Some(0), "consumer exit")?;
+            let stdout = String::from_utf8(output.stdout)?;
+            if format == "json" {
+                let report: Value = serde_json::from_str(&stdout)?;
+                require_eq(
+                    &field_u64(field(&report, "summary")?, "fail")?,
+                    &0,
+                    "fail count",
+                )?;
+                let findings = field(&report, "findings")?
+                    .as_array()
+                    .ok_or("findings array")?;
+                for category in ["config", "dirs", "auth", "shell", "sessions"] {
+                    require(findings.iter().any(|f| f["category"] == category), category)?;
+                }
+                require(
+                    findings.iter().all(|f| f["category"] != "swarm"),
+                    "no default swarm",
+                )?;
+            } else {
+                require(
+                    !stdout.contains("Swarm Coordination"),
+                    "no default swarm section",
+                )?;
+                require(!stdout.contains("[FAIL]"), "no consumer failures")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn consumer_doctor_explicit_swarm_remains_fail_closed() -> TestResult {
+    for only in ["swarm", "coordination", "leases", "config,swarm"] {
+        for format in ["text", "json"] {
+            let output =
+                run_consumer_doctor(&["--only", only, "--format", format], None, false)?;
+            require_eq(&output.status.code(), &Some(1), "swarm exit")?;
+            let stdout = String::from_utf8(output.stdout)?;
+            if format == "json" {
+                let report: Value = serde_json::from_str(&stdout)?;
+                let preflight = finding_by_schema(&report, SWARM_RESOURCE_PREFLIGHT_SCHEMA)?;
+                require_eq(field_str(preflight, "severity")?, "fail", "strict preflight")?;
+                require_eq(field_str(&report, "overall")?, "fail", "overall")?;
+                let findings = field(&report, "findings")?
+                    .as_array()
+                    .ok_or("findings array")?;
+                require(
+                    findings.iter().all(|f| {
+                        f["category"] == "swarm"
+                            || (only == "config,swarm" && f["category"] == "config")
+                    }),
+                    "explicit selection must exclude unrelated categories",
+                )?;
+            } else {
+                require(
+                    stdout.contains("[FAIL] Swarm Coordination"),
+                    "swarm text failure",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn consumer_doctor_preserves_config_and_auth_failures() -> TestResult {
+    for (file, category) in [("settings.json", "config"), ("auth.json", "auth")] {
+        for only in [None, Some(category)] {
+            for format in ["text", "json"] {
+                let mut args = vec!["--format", format];
+                if let Some(category) = only {
+                    args.extend(["--only", category]);
+                }
+                let output = run_consumer_doctor(&args, Some(file), false)?;
+                require_eq(&output.status.code(), &Some(1), "ordinary failure exit")?;
+                let stdout = String::from_utf8(output.stdout)?;
+                if format == "json" {
+                    let report: Value = serde_json::from_str(&stdout)?;
+                    require_eq(field_str(&report, "overall")?, "fail", "overall")?;
+                    let findings = field(&report, "findings")?
+                        .as_array()
+                        .ok_or("findings array")?;
+                    require(
+                        findings
+                            .iter()
+                            .any(|f| f["category"] == category && f["severity"] == "fail"),
+                        "ordinary failure must remain in report",
+                    )?;
+                    require(
+                        findings.iter().all(|f| {
+                            f["category"] != "swarm"
+                                && (only.is_none() || f["category"] == category)
+                        }),
+                        "category selection",
+                    )?;
+                } else {
+                    require(stdout.contains("[FAIL]"), "ordinary text failure")?;
+                    require(!stdout.contains("Swarm Coordination"), "no implicit swarm")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct TestError(String);
 

@@ -2,6 +2,7 @@
 //!
 //! When invoked without a path, checks config, directories, auth, shell tools,
 //! and sessions. When invoked with a path, runs extension preflight analysis.
+//! Swarm coordination checks run only when explicitly selected with `--only swarm`.
 //! With `--fix`, automatically repairs safe issues (missing dirs, permissions).
 
 use crate::auth::{AuthStorage, CredentialStatus};
@@ -424,7 +425,11 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
         if extension_only_default {
             return false;
         }
-        opts.only.as_ref().is_none_or(|set| set.contains(&cat))
+        // Swarm readiness is a development/operator preflight, not a requirement
+        // for a healthy consumer installation. Explicit selections stay strict.
+        opts.only
+            .as_ref()
+            .map_or(cat != CheckCategory::Swarm, |set| set.contains(&cat))
     };
 
     if let Some(ext_path) = opts.extension_path {
