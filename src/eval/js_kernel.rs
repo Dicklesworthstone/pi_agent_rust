@@ -23,6 +23,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 mod async_host;
+mod console;
 mod display;
 mod evaluate;
 #[cfg(test)]
@@ -142,7 +143,7 @@ fn kernel_thread(
             let deadline = deadline.clone();
             runtime.set_interrupt_handler(Some(Box::new(move || deadline.expired(origin))));
         }
-        let console = Rc::new(RefCell::new(String::new()));
+        let console = Rc::new(RefCell::new(console::ConsoleCapture::new()));
         context.with(|ctx| install_globals(&ctx, &console, bridge_tx, &deadline, origin));
         let Ok(evaluator) = context.with(|ctx| evaluate::Evaluator::new(&ctx)) else { return; };
         let Ok(host) = context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(&stopped))) else { return; };
@@ -155,22 +156,31 @@ fn kernel_thread(
             deadline.set(request.deadline, origin);
             host.begin(request.deadline);
             displays.begin();
-            console.borrow_mut().clear();
+            console.borrow_mut().begin();
             let mut response = run_cell(&context, &runtime, &request, &deadline, origin, &evaluator, &host, bridge_tx);
             response.displays = displays.finish();
+            let console_result = console.borrow_mut().finish();
+            let console_failed = console_result.is_err();
+            match console_result {
+                Ok(text) => response.console = text,
+                Err(error) => {
+                    response.ok = false;
+                    response.result = None;
+                    response.error = Some(format!("EVAL_CONSOLE_CAPTURE: {error}"));
+                }
+            }
             let expired = deadline.expired(origin);
             if stopped.load(Ordering::SeqCst) { return; }
             // Cleanup uses captured built-ins only, not arbitrary guest code.
             deadline.clear();
             let cleanup_failed = context.with(|ctx| host.finish(&ctx)).is_err();
-            rebuild = expired || cleanup_failed || runtime.is_job_pending();
+            rebuild = expired || console_failed || cleanup_failed || runtime.is_job_pending();
             if rebuild {
                 response.ok = false;
                 response.result = None;
                 let error = response.error.get_or_insert_with(|| "EVAL_ASYNC_INCOMPLETE: unfinished JavaScript work".into());
                 error.push_str("; EVAL_STATE_RESET: kernel state discarded, next cell starts fresh");
             }
-            response.console = std::mem::take(&mut *console.borrow_mut());
             let _ = request.reply.send(response);
             if rebuild { break; }
         }
@@ -181,7 +191,7 @@ fn kernel_thread(
 
 fn install_globals(
     ctx: &rquickjs::Ctx<'_>,
-    console: &Rc<RefCell<String>>,
+    console: &Rc<RefCell<console::ConsoleCapture>>,
     bridge_tx: &Sender<JsBridgeRequest>,
     deadline: &DeadlineCell,
     origin: Instant,
@@ -189,30 +199,7 @@ fn install_globals(
     use rquickjs::function::Func;
 
     let globals = ctx.globals();
-
-    // console.log / console.error append to the per-cell buffer.
-    let sink = Rc::clone(console);
-    let log = Func::from(
-        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-            let mut buffer = sink.borrow_mut();
-            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-            buffer.push_str(&parts.join(" "));
-            buffer.push('\n');
-        },
-    );
-    let console_obj = rquickjs::Object::new(ctx.clone()).expect("console object");
-    console_obj.set("log", log).expect("console.log");
-    let sink = Rc::clone(console);
-    let error = Func::from(
-        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-            let mut buffer = sink.borrow_mut();
-            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-            buffer.push_str(&parts.join(" "));
-            buffer.push('\n');
-        },
-    );
-    console_obj.set("error", error).expect("console.error");
-    globals.set("console", console_obj).expect("console global");
+    console::install(ctx, console, deadline, origin).expect("console globals");
 
     // Low-level bridge: (tool, payloadJson) -> content string. Typed as
     // plain Strings so no JS value lifetimes couple into the closure; the
