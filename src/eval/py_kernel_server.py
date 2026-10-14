@@ -3,6 +3,7 @@
 JSON-lines protocol over stdio:
   request:  {"id": <int>, "code": "<source>"}
   stream:   {"id": <int>, "stream": {"sequence": <int>, "name": "stdout|stderr", "text": "..."}}
+  display:  {"id": <int>, "stream": {"sequence": <display index>, "name": "display", "display": {"mimeType": "...", "data": ...}}}
   response: {"id": <int>, "ok": true, "stdout": "", "stderr": "", "result": "<repr|null>", "outputSequence": <int>}
             {"id": <int>, "ok": false, "stdout": "", "stderr": "", "error": "<traceback>", "outputSequence": <int>}
 
@@ -130,6 +131,17 @@ class _CellOutput:
                     "sequence": self.sequence, "name": name, "text": chunk,
                 }})
         return len(text)
+
+    def display(self, sequence, snapshot):
+        # A distinct display index leaves stdout/stderr accounting and console
+        # archives unchanged. Send a complete bounded MIME snapshot, not text
+        # chunks that could expose a partial JSON value or PNG to the host.
+        with _PROTOCOL_WRITE_LOCK:
+            if not self.active or _OUTPUT_CONTEXT.get() is not self:
+                raise RuntimeError("EVAL_OUTPUT_CLOSED: display belongs to an inactive cell")
+            _send_frame({"id": self.cell_id, "stream": {
+                "sequence": sequence, "name": "display", "display": snapshot,
+            }})
 
 
 class _CellStream(io.TextIOBase):
@@ -271,6 +283,12 @@ class _DisplaySink:
         # Snapshot at the call, not at cell completion. Later mutations cannot
         # change an already displayed JSON object. Refused items change nothing.
         snapshot = json.loads("".join(chunks))
+        output = _OUTPUT_CONTEXT.get()
+        if output is None:
+            raise RuntimeError("EVAL_DISPLAY_CLOSED: no active output owner")
+        output.display(len(self.frames) + 1, snapshot)
+        # Only successfully sent snapshots enter the final collection. The
+        # host compares that collection with the live prefix before reuse.
         self.frames.append(snapshot)
         self.bytes += size
 

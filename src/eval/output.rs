@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 mod archive;
+mod live;
 pub(super) use archive::Archive;
 
 const CAPTURE_BYTES: usize = 512 * 1024;
@@ -97,6 +98,7 @@ pub(super) struct Capture {
     last_update: Option<Instant>,
     on_update: Option<Update>,
     archive: Option<Archive>,
+    displays: live::LiveDisplays,
 }
 
 fn invalid(message: &str) -> Error {
@@ -114,6 +116,7 @@ impl Capture {
             last_update: None,
             on_update,
             archive: None,
+            displays: live::LiveDisplays::default(),
         }
     }
 
@@ -126,6 +129,13 @@ impl Capture {
         let stream = &frame["stream"];
         if stream.as_object().is_none_or(|object| object.len() != 3) {
             return Err(invalid("malformed stream frame"));
+        }
+        // Rich output shares this cell-owned, backpressured transport but has
+        // its own bounded sequence. Console counts and archives stay unchanged.
+        if stream.get("name").and_then(Value::as_str) == Some("display") {
+            self.displays.accept(stream)?;
+            self.dirty = true;
+            return Ok(());
         }
         let sequence = self.sequence.checked_add(1).ok_or_else(|| invalid("output sequence exhausted"))?;
         if stream.get("sequence").and_then(Value::as_u64) != Some(sequence) {
@@ -156,11 +166,14 @@ impl Capture {
         let (out, out_omitted) = self.stdout.preview();
         let (err, err_omitted) = self.stderr.preview();
         let details = self.details(out_omitted, err_omitted, true);
+        let mut details = json!({"kernel":self.kernel, "status":"running", "output":details});
+        let mut content = Vec::new();
+        if !out.is_empty() || !err.is_empty() || self.displays.is_empty() {
+            content.push(ContentBlock::Text(TextContent::new(format!("{out}{err}"))));
+        }
+        self.displays.append(&mut content, &mut details, false);
         // No native mutex or RefCell borrow is held across caller code.
-        callback(ToolUpdate {
-            content: vec![ContentBlock::Text(TextContent::new(format!("{out}{err}")))],
-            details: Some(json!({"kernel":self.kernel, "status":"running", "output":details})),
-        });
+        callback(ToolUpdate { content, details: Some(details) });
         self.dirty = false;
         self.last_update = Some(now);
     }
@@ -185,6 +198,7 @@ impl Capture {
         {
             return Err(invalid("final response duplicates streamed console output"));
         }
+        self.displays.verify(response.get("displays").and_then(Value::as_array))?;
         response["stdout"] = Value::String(self.stdout.render());
         response["stderr"] = Value::String(self.stderr.render());
         Ok(())
@@ -196,12 +210,16 @@ impl Capture {
         if !response.console.is_empty() {
             return Err(invalid("JavaScript response duplicates streamed console output"));
         }
+        self.displays.verify(Some(&response.displays))?;
         response.console = self.stdout.render();
         response.console.push_str(&self.stderr.render());
         Ok(())
     }
 
     pub(super) fn annotate(&self, output: &mut ToolOutput) {
+        if let Some(details) = output.details.as_mut() {
+            self.displays.annotate(details, true);
+        }
         if self.sequence > 0 {
             if let Some(Value::Object(details)) = output.details.as_mut() {
                 details.insert("output".into(), self.details(self.stdout.omitted(), self.stderr.omitted(), false));
@@ -226,6 +244,14 @@ impl Capture {
         let error = if self.archive.is_some() {
             Error::tool("eval", format!("{error}; EVAL_ARTIFACT_NOT_PUBLISHED: requested console archive is incomplete"))
         } else { error };
+        // Python retains its Error contract; rich blocks already delivered in
+        // running updates cannot be attached to that text-only error value.
+        let error = if self.displays.is_empty() { error } else {
+            Error::tool("eval", format!(
+                "{error}; EVAL_DISPLAY_INCOMPLETE: {} provisional rich displays were received; cell did not complete",
+                self.displays.len()
+            ))
+        };
         let Some((partial, _)) = self.partial_output() else { return error; };
         Error::tool("eval", format!("{error}\n{partial}"))
     }
@@ -234,6 +260,10 @@ impl Capture {
     /// diagnostic first and describe the actual preview, not a larger capture
     /// which is deliberately not copied into this partial failure response.
     pub(super) fn append_partial(&self, output: &mut ToolOutput) {
+        if !self.displays.is_empty() {
+            let details = output.details.get_or_insert_with(|| json!({}));
+            self.displays.append(&mut output.content, details, false);
+        }
         if let Some((partial, metadata)) = self.partial_output() {
             match output.content.first_mut() {
                 Some(ContentBlock::Text(text)) => {
