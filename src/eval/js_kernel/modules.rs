@@ -1,8 +1,10 @@
 //! Local ES modules for the retained eval realm, not the extension loader.
 //!
 //! QuickJS owns linking, cycles, live bindings and evaluation caching. This
-//! adapter owns file admission and the current cell's authority. No packages,
-//! virtual modules, native libraries, remote URLs or implicit extension search.
+//! adapter owns file admission and the current cell's authority. JavaScript
+//! and TypeScript modules share one linker/cache; TypeScript is lowered to
+//! JavaScript before QuickJS sees it. No packages, virtual modules, native
+//! libraries, remote URLs or implicit extension search.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -19,12 +21,20 @@ use rquickjs::{Ctx, Exception, Module};
 use crate::agent_cx::AgentCx;
 use crate::eval::lifecycle::source;
 
+mod typescript;
+
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RESOLUTIONS: usize = 4096;
 const MAX_MODULES: usize = 128;
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
 type Admission<T> = std::result::Result<T, String>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleLanguage {
+    JavaScript,
+    TypeScript,
+}
 
 struct Active {
     owner: AgentCx,
@@ -44,7 +54,10 @@ struct State {
 
 impl State {
     fn check(&self) -> Admission<()> {
-        let active = self.active.as_ref().ok_or("EVAL_MODULE_CLOSED: no active cell")?;
+        let active = self
+            .active
+            .as_ref()
+            .ok_or("EVAL_MODULE_CLOSED: no active cell")?;
         if self.stopped.load(Ordering::SeqCst) || active.owner.checkpoint().is_err() {
             return Err("EVAL_CANCELLED: module owner stopped".into());
         }
@@ -75,7 +88,11 @@ impl ModuleFiles {
     }
 
     pub(super) fn begin(&self, owner: AgentCx, deadline: Instant) {
-        self.0.borrow_mut().active = Some(Active { owner, deadline, resolutions: 0 });
+        self.0.borrow_mut().active = Some(Active {
+            owner,
+            deadline,
+            resolutions: 0,
+        });
     }
 
     pub(super) fn finish(&self) {
@@ -114,9 +131,12 @@ impl ModuleFiles {
         // paths, UNC endpoints and every protocol on Windows and Unix alike.
         if !valid_spelling(name)
             || !(name.starts_with("./") || name.starts_with("../"))
-            || !javascript_extension(Path::new(name))
+            || module_language(Path::new(name)).is_none()
         {
-            return Err("EVAL_MODULE_SPECIFIER: use an explicit relative .js or .mjs path without URL/query/fragment syntax".into());
+            return Err(
+                "EVAL_MODULE_SPECIFIER: use an explicit relative .js, .mjs, .ts, or .mts path without URL/query/fragment syntax"
+                    .into(),
+            );
         }
         let root = self.root()?;
         let base_path = if base == "eval_script" {
@@ -127,19 +147,28 @@ impl ModuleFiles {
         if !base_path.is_absolute() || !base_path.starts_with(&root) {
             return Err("EVAL_MODULE_BASE: importer is not a workspace script".into());
         }
-        let parent = base_path.parent().ok_or("EVAL_MODULE_BASE: importer has no directory")?;
+        let parent = base_path
+            .parent()
+            .ok_or("EVAL_MODULE_BASE: importer has no directory")?;
         let resolved = std::fs::canonicalize(parent.join(name))
             .map_err(|error| format!("EVAL_MODULE_PATH: module unavailable: {error}"))?;
         self.0.borrow().check()?;
-        if !resolved.starts_with(&root) || !javascript_extension(&resolved) {
-            return Err("EVAL_MODULE_PATH: module must be a .js or .mjs file inside the workspace".into());
+        if !resolved.starts_with(&root) || module_language(&resolved).is_none() {
+            return Err(
+                "EVAL_MODULE_PATH: module must be a .js, .mjs, .ts, or .mts file inside the workspace"
+                    .into(),
+            );
         }
-        let resolved = resolved.to_str()
+        let resolved = resolved
+            .to_str()
             .filter(|path| path.len() <= MAX_PATH_BYTES && !path.chars().any(char::is_control))
-            .ok_or("EVAL_MODULE_PATH: module path is not bounded UTF-8")?.to_owned();
+            .ok_or("EVAL_MODULE_PATH: module path is not bounded UTF-8")?
+            .to_owned();
         let mut state = self.0.borrow_mut();
         if !state.approved.contains(&resolved) && state.approved.len() >= MAX_MODULES {
-            return Err("EVAL_MODULE_LIMIT: module catalog exhausted; reset JavaScript to clear it".into());
+            return Err(
+                "EVAL_MODULE_LIMIT: module catalog exhausted; reset JavaScript to clear it".into(),
+            );
         }
         state.approved.insert(resolved.clone());
         Ok(resolved)
@@ -153,21 +182,33 @@ impl ModuleFiles {
                 return Err("EVAL_MODULE_PATH: module was not admitted by the resolver".into());
             }
             if state.declarations >= MAX_MODULES {
-                return Err("EVAL_MODULE_LIMIT: module compilation budget exhausted; reset JavaScript".into());
+                return Err(
+                    "EVAL_MODULE_LIMIT: module compilation budget exhausted; reset JavaScript"
+                        .into(),
+                );
             }
             // Failed attempts count too. QuickJS can ask again after a parse
             // failure; repeating it must not create an unbounded host loop.
             state.declarations += 1;
         }
         let root = self.root()?;
-        let source = source::load_sync(&root, Path::new(name))
+        let mut source = source::load_sync(&root, Path::new(name))
             .map_err(|error| format!("EVAL_MODULE_READ: {error}"))?;
-        let mut state = self.0.borrow_mut();
-        state.check()?;
+        {
+            let state = self.0.borrow();
+            state.check()?;
+        }
         if source.path != name {
             return Err("EVAL_MODULE_CHANGED: module target changed after resolution".into());
         }
-        let total = state.source_bytes.checked_add(source.code.len())
+        if module_language(Path::new(name)) == Some(ModuleLanguage::TypeScript) {
+            source.code = typescript::transpile(Path::new(name), &source.code)?;
+            self.0.borrow().check()?;
+        }
+        let mut state = self.0.borrow_mut();
+        let total = state
+            .source_bytes
+            .checked_add(source.code.len())
             .filter(|total| *total <= MAX_SOURCE_BYTES)
             .ok_or("EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript")?;
         state.source_bytes = total;
@@ -177,16 +218,28 @@ impl ModuleFiles {
 
 fn valid_spelling(name: &str) -> bool {
     name.len() <= MAX_PATH_BYTES
-        && !name.chars().any(|ch| ch.is_control() || matches!(ch, ':' | '?' | '#' | '\\'))
+        && !name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, ':' | '?' | '#' | '\\'))
 }
 
-fn javascript_extension(path: &Path) -> bool {
-    matches!(path.extension().and_then(|extension| extension.to_str()), Some("js" | "mjs"))
+fn module_language(path: &Path) -> Option<ModuleLanguage> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("js" | "mjs") => Some(ModuleLanguage::JavaScript),
+        Some("ts" | "mts") => Some(ModuleLanguage::TypeScript),
+        _ => None,
+    }
 }
 
-fn reject_attributes(ctx: &Ctx<'_>, attributes: Option<ImportAttributes<'_>>) -> rquickjs::Result<()> {
+fn reject_attributes(
+    ctx: &Ctx<'_>,
+    attributes: Option<ImportAttributes<'_>>,
+) -> rquickjs::Result<()> {
     if attributes.is_some_and(|attributes| attributes.keys().next().is_some()) {
-        return Err(Exception::throw_message(ctx, "EVAL_MODULE_ATTRIBUTES: only JavaScript modules without import attributes are supported"));
+        return Err(Exception::throw_message(
+            ctx,
+            "EVAL_MODULE_ATTRIBUTES: only JavaScript/TypeScript modules without import attributes are supported",
+        ));
     }
     Ok(())
 }
@@ -200,7 +253,8 @@ impl Resolver for ModuleFiles {
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
         reject_attributes(ctx, attributes)?;
-        self.resolve_path(base, name).map_err(|error| Exception::throw_message(ctx, &error))
+        self.resolve_path(base, name)
+            .map_err(|error| Exception::throw_message(ctx, &error))
     }
 }
 
@@ -212,12 +266,18 @@ impl Loader for ModuleFiles {
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
         reject_attributes(ctx, attributes)?;
-        let source = self.read_module(name).map_err(|error| Exception::throw_message(ctx, &error))?;
+        let source = self
+            .read_module(name)
+            .map_err(|error| Exception::throw_message(ctx, &error))?;
         // Linking can recursively invoke our callbacks. Do not retain a
         // RefCell borrow (or any open file) across the engine boundary.
         let module = Module::declare(ctx.clone(), name, source.code)?;
-        let url = url::Url::from_file_path(name)
-            .map_err(|()| Exception::throw_message(ctx, "EVAL_MODULE_PATH: cannot represent module file URL"))?;
+        let url = url::Url::from_file_path(name).map_err(|()| {
+            Exception::throw_message(
+                ctx,
+                "EVAL_MODULE_PATH: cannot represent module file URL",
+            )
+        })?;
         module.meta()?.set("url", url.as_str())?;
         Ok(module)
     }

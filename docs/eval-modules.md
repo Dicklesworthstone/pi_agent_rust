@@ -1,55 +1,78 @@
-# Workspace JavaScript modules in eval
+# Workspace JavaScript and TypeScript modules in eval
 
 The retained QuickJS kernel supports local ES modules through `import()`:
 
 ```json
-{"kernel":"js","code":"globalThis.math = await import('./analysis/math.mjs'); display(math.answer)"}
+{"kernel":"js","code":"globalThis.math = await import('./analysis/math.mts'); display(math.answer)"}
 ```
 
-Imported `.js` and `.mjs` files use ES module syntax. They may use static
-imports, re-exports, live bindings, cycles and top-level await. They also use
-the same timers, read-only tool bridge, rich displays and console capture as
-ordinary cells. Importing a module does not create another runtime or grant
-new tool permissions. For example, `analysis/math.mjs` can contain:
+Imported `.js`, `.mjs`, `.ts`, and `.mts` files use ES module syntax. TypeScript
+source is parsed and stripped with the SWC stack already linked into Pi, then the
+resulting JavaScript is handed to the same QuickJS linker and cache as ordinary
+JavaScript modules. There is no Bun/Node subprocess and no second module runtime.
 
-```javascript
-import {base} from './constants.js';
+Modules may use static imports, re-exports, live bindings, cycles and top-level
+await. Type-only imports/exports and type annotations are removed; runtime
+imports remain native ES-module edges. TypeScript enums and other syntax lowered
+by SWC execute in QuickJS. TSX/JSX is deliberately not enabled.
+
+All modules use the same timers, read-only tool bridge, rich displays and console
+capture as ordinary cells. Importing a module does not grant new tool
+permissions. For example, `analysis/math.mts` can contain:
+
+```typescript
+import type {Shape} from './shape.ts';
+import {base} from './constants.ts';
+
 await sleep(1);
-export const answer = base + 2;
+const value: Shape = {answer: base + 2};
+export const answer: number = value.answer;
 ```
 
 Inline cells resolve imports from the primary workspace. Existing `%load`
-JavaScript scripts now carry their canonical source filename into QuickJS,
-so their imports resolve beside the script. A function defined by that script
-keeps its importer origin when invoked in a later cell. Inline cells do not
-inherit the last loaded script's directory. Imported modules expose a correctly
-encoded canonical file URL in `import.meta.url`.
+JavaScript scripts carry their canonical source filename into QuickJS, so their
+imports resolve beside the script. A function defined by that script keeps its
+importer origin when invoked in a later cell. Inline cells do not inherit the
+last loaded script's directory. Imported modules expose a correctly encoded
+canonical file URL in `import.meta.url`.
 
 `%load setup.js` remains a script cell with persistent script bindings; it is
 not converted into a module and static import declarations in that entry cell
-are not supported. Use `await import('./setup.mjs')` for a module entry and
-`globalThis` or an exported namespace for values to retain. Local module names
-do not become globals automatically.
+are not supported. TypeScript is supported as a module input, not as a
+`%load` script dialect. Use `await import('./setup.mts')` for a TypeScript
+entry and `globalThis` or an exported namespace for values to retain. Local
+module names do not become globals automatically.
 
-## Resolution, caching and reset
+## Resolution, transpilation, caching and reset
 
-Use explicit relative specifiers starting with `./` or `../`, including the
-`.js` or `.mjs` extension. There is no package search, extension guessing,
-CommonJS `require`, Node/Bun built-in, TypeScript transpilation, native-library
-loader, remote URL, virtual scheme, query string, fragment or import attribute.
-Use forward slashes in import specifiers on all platforms. A parent traversal
-is permitted only when the resolved file remains inside the primary workspace.
+Use explicit relative specifiers starting with `./` or `../`, including one
+of the supported extensions. There is no package search, extension guessing,
+CommonJS `require`, Node/Bun built-in, TSX/JSX transform, declaration-file
+runtime, native-library loader, remote URL, virtual scheme, query string,
+fragment, or import attribute. Use forward slashes in import specifiers on all
+platforms. A parent traversal is permitted only when the resolved file remains
+inside the primary workspace.
+
+TypeScript lowering is fail-closed. Recovered parser errors are treated as hard
+errors, so malformed TypeScript cannot execute a valid-looking prefix. Generated
+JavaScript is limited to 4 MiB per module before QuickJS compilation. Source maps
+are not emitted; engine stack traces identify the canonical module path but do
+not claim TypeScript source-position remapping.
+
 Symlink aliases within the workspace share their canonical module identity;
 symlinks escaping it are refused. Source is UTF-8; an initial BOM is removed.
+JavaScript and TypeScript files that canonicalize to the same path use one native
+QuickJS module identity.
 
-QuickJS owns module linking and caching. Successfully evaluated modules are
-not rerun by later imports of the same canonical file, and their live state
-survives later cells in the same retained kernel. Editing the file or reloading
-a script does not invalidate the module cache. `reset: true` clears the selected
-JavaScript namespace and its modules. Other instances and retained session
-namespaces are unaffected. The resolver still requires a valid workspace-local
-target when importing a cached module; deleting or moving it can make a later
-import fail. Parse and execution failure behavior follows the native engine.
+QuickJS owns module linking and caching. Successfully evaluated modules are not
+rerun by later imports of the same canonical file, and their live state survives
+later cells in the same retained kernel. Editing the file does not invalidate
+that cache. `reset: true` clears the selected JavaScript namespace and its
+modules, including transpiled TypeScript. Other tool instances and retained
+session namespaces are unaffected. The resolver still requires a valid
+workspace-local target when importing a cached module; deleting or moving it can
+make a later import fail. Parse and execution failure behavior follows the
+native engine.
 
 ## Lifetimes and bounds
 
@@ -63,13 +86,20 @@ earlier cell that created the kernel.
 File reads reuse the bounded `%load` reader: regular files only, at most 2 MiB
 each, with no-follow/nonblocking leaf opening on Unix and observed metadata
 change detection. A realm permits 128 admitted module names, 128 compilation
-attempts and 16 MiB of compiled source, with 4096 resolutions per cell and
-4096-byte paths. Failed attempts consume limits too; reset clears the realm's
-budgets. These are host input bounds, not a sandbox or a general JavaScript
-heap limit. Synchronous filesystem calls can outlast a cooperative deadline;
-identity checks do not provide an atomic snapshot against a hostile writer.
+attempts and 16 MiB of JavaScript actually handed to QuickJS, with 4096
+resolutions per cell and 4096-byte paths. Failed attempts consume limits too;
+reset clears the realm's budgets. TypeScript's generated-output limit is
+independent from the aggregate realm limit. These are host input bounds, not a
+sandbox or a general JavaScript heap limit.
 
-Regression coverage is in `src/eval/js_kernel/modules/tests.rs` and the public
-`tests/eval_modules.rs`. Run the repository's `dsr quality --tool pi_agent_rust`
-entry point for Rust validation. Source inspection alone is not a passing test
-or QuickJS interoperability result.
+Synchronous filesystem and TypeScript transformation work can outlast a
+cooperative deadline between checks; authority and deadline are checked before
+and after those stages. Identity checks do not provide an atomic snapshot
+against a hostile writer.
+
+Regression coverage is in `src/eval/js_kernel/modules/tests.rs`,
+`src/eval/js_kernel/modules/typescript.rs`, `tests/eval_modules.rs`, and
+`tests/eval_typescript.rs`. Run the repository's
+`dsr quality --tool pi_agent_rust` entry point for Rust validation. Source
+inspection alone is not a passing test, compile result, or live QuickJS/SWC
+interoperability result.
