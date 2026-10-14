@@ -218,7 +218,7 @@ fn invalid_package_commands_do_not_spawn_and_reset_discards_installed_packages()
         "%pip install --managed --find-links --no-index sample", "%pip install --managed 'unterminated",
         "%pip install --managed sample\nseed = 0",
     ] {
-        let output = cell(tool, code);
+        let output = cell(&tool, code);
         assert!(output.is_error, "{code}");
         assert!(text(&output).contains("EVAL_PIP_"), "{}", text(&output));
         assert!(!text(&output).contains("EVAL_PIP_INSTALLING"), "{code}");
