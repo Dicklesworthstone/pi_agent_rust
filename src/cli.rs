@@ -57,6 +57,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "stats",
     "profile",
     "import",
+    "recover",
     "grievances",
     "self-update",
     "web",
@@ -174,6 +175,16 @@ fn is_negative_numeric_token(token: &str) -> bool {
         return false;
     }
     token.parse::<i64>().is_ok() || token.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+fn recovery_entry_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value.len() > 1024 {
+        return Err(
+            "branch ID must be nonempty and at most 1024 UTF-8 bytes; use --root for a new path"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[allow(clippy::too_many_lines)] // Argument normalization needs single-pass stateful parsing.
@@ -1289,6 +1300,71 @@ mod tests {
         };
         assert_eq!(name, "auto-commit-on-exit");
         Ok(())
+    }
+
+    #[test]
+    fn parse_recover_inspection_and_session_copy_modes() -> Result<(), String> {
+        let cli = Cli::parse_from(["pi", "recover", "saved.jsonl", "--active"]);
+        let Some(Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(source, PathBuf::from("saved.jsonl"));
+        assert!(output.is_none() && session_output.is_none() && !json && active);
+        assert!(branch.is_none() && !root);
+
+        let cli = Cli::parse_from([
+            "pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--branch", "answer",
+        ]);
+        let Some(Commands::Recover {
+            session_output,
+            branch,
+            ..
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(session_output, Some(PathBuf::from("copy.jsonl")));
+        assert_eq!(branch.as_deref(), Some("answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_ambiguous_or_destructive_mode_combinations() {
+        for argv in [
+            vec!["pi", "recover", "saved.jsonl", "--root"],
+            vec!["pi", "recover", "saved.jsonl", "--branch", ""],
+            vec!["pi", "recover", "saved.jsonl", "--active", "--branch", "id"],
+            vec!["pi", "recover", "saved.jsonl", "--json", "--branch", "id"],
+            vec!["pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--output", "report.txt"],
+            vec!["pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--root", "--branch", "id"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn recover_is_not_misclassified_as_an_extension_flag() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "recover", "saved.jsonl", "--json"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("recover subcommand");
+        assert!(matches!(
+            parsed.cli.command,
+            Some(Commands::Recover { json: true, .. })
+        ));
+        assert!(parsed.extension_flags.is_empty());
     }
 
     #[test]
@@ -2439,6 +2515,39 @@ pub enum Commands {
         /// Import from Codex (~/.codex/sessions/**/*.jsonl)
         #[arg(long, conflicts_with = "from_claude")]
         from_codex: Option<String>,
+    },
+
+    /// Recover readable text from a v3 JSONL session without opening media sidecars.
+    ///
+    /// Inspection is read-only by default. --session-output explicitly creates a
+    /// separate text-only native session with a new identity; it never repairs or
+    /// overwrites the source.
+    #[command(name = "recover")]
+    Recover {
+        /// Authoritative version-3 JSONL source.
+        source: PathBuf,
+        /// Create a new report file. Existing destinations are never replaced.
+        #[arg(long, conflicts_with = "session_output")]
+        output: Option<PathBuf>,
+        /// Create a NEW resumable text-only .jsonl session. Existing files and sidecars are refused.
+        #[arg(long, conflicts_with_all = ["output", "json"])]
+        session_output: Option<PathBuf>,
+        /// Emit the complete machine-readable recovery report.
+        #[arg(long, conflicts_with_all = ["active", "branch", "root", "session_output"])]
+        json: bool,
+        /// Inspect only the source's saved active path. Default inspection shows all records.
+        #[arg(long, conflicts_with_all = ["branch", "root", "session_output"])]
+        active: bool,
+        /// Inspect this exact root-to-entry path, or select it in a new session copy.
+        #[arg(long, conflicts_with = "root", value_parser = recovery_entry_id)]
+        branch: Option<String>,
+        /// Start a new session copy at the root while preserving source history off-path.
+        #[arg(
+            long,
+            requires = "session_output",
+            conflicts_with_all = ["active", "branch", "json"]
+        )]
+        root: bool,
     },
 
     /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)

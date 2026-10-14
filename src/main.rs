@@ -733,6 +733,53 @@ fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
     }
 }
 
+fn handle_recover_blocking(
+    source: &Path,
+    output: Option<&Path>,
+    session_output: Option<&Path>,
+    json_output: bool,
+    active: bool,
+    branch: Option<&str>,
+    root: bool,
+) -> Result<()> {
+    if let Some(destination) = session_output {
+        let selected = if root { Some("") } else { branch };
+        let id = Session::fork_recovered_text(source, destination, selected)?;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Created text-only recovery session {id}. Resume it with pi --session."
+        );
+        return Ok(());
+    }
+
+    let report = Session::recover_text(source)?;
+    let selection = match branch {
+        Some(id) => pi::session_recovery::RecoverySelection::Branch(id),
+        None if active => pi::session_recovery::RecoverySelection::Active,
+        None => pi::session_recovery::RecoverySelection::All,
+    };
+    let format = if json_output {
+        pi::session_recovery::RecoveryExport::Json
+    } else {
+        pi::session_recovery::RecoveryExport::Text(selection)
+    };
+
+    if let Some(destination) = output {
+        report.export_file(destination, format)?;
+        return Ok(());
+    }
+
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    match format {
+        pi::session_recovery::RecoveryExport::Json => report.write_json(&mut writer)?,
+        pi::session_recovery::RecoveryExport::Text(selection) => {
+            report.write_selected_text(selection, &mut writer)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
@@ -747,6 +794,30 @@ fn main_impl() -> Result<()> {
 
     if cli.version {
         print_version();
+        return Ok(());
+    }
+
+    // Recovery intentionally precedes crash capture, config/auth loading,
+    // migrations, resource discovery, tracing, and async-runtime startup.
+    if let Some(cli::Commands::Recover {
+        source,
+        output,
+        session_output,
+        json,
+        active,
+        branch,
+        root,
+    }) = &cli.command
+    {
+        handle_recover_blocking(
+            source,
+            output.as_deref(),
+            session_output.as_deref(),
+            *json,
+            *active,
+            branch.as_deref(),
+            *root,
+        )?;
         return Ok(());
     }
 
@@ -3248,6 +3319,25 @@ async fn handle_subcommand(
             from_codex,
         } => {
             handle_import(from_claude.as_deref(), from_codex.as_deref())?;
+        }
+        cli::Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        } => {
+            handle_recover_blocking(
+                &source,
+                output.as_deref(),
+                session_output.as_deref(),
+                json,
+                active,
+                branch.as_deref(),
+                root,
+            )?;
         }
         cli::Commands::Handoff {
             to,
