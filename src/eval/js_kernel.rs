@@ -198,9 +198,11 @@ fn kernel_thread(
             deadline.set(request.deadline, origin);
             modules.begin(request.owner.clone(), request.deadline);
             host.begin(request.deadline);
-            displays.begin();
+            displays.begin_with_output(request.output.clone());
             console.borrow_mut().begin(request.output.take());
             let mut response = run_cell(&context, &runtime, &request, &deadline, origin, &evaluator, &host, bridge_tx);
+            let display_error = displays.failure();
+            let display_failed = display_error.is_some();
             response.displays = displays.finish();
             let console_result = console.borrow_mut().finish();
             let console_failed = console_result.is_err();
@@ -212,6 +214,14 @@ fn kernel_thread(
                     response.error = Some(format!("EVAL_CONSOLE_CAPTURE: {error}"));
                 }
             }
+            if let Some(error) = display_error {
+                // A guest catch cannot hide a disconnected/backpressured
+                // rich stream or make this realm reusable after data loss.
+                response.ok = false;
+                response.result = None;
+                let detail = response.error.take().unwrap_or_default();
+                response.error = Some(format!("EVAL_DISPLAY_STREAM: {error}; {detail}"));
+            }
             let expired = deadline.expired(origin);
             if stopped.load(Ordering::SeqCst) { return; }
             if expired {
@@ -222,7 +232,7 @@ fn kernel_thread(
             deadline.clear();
             let cleanup_failed = context.with(|ctx| host.finish(&ctx)).is_err();
             modules.finish();
-            rebuild = expired || console_failed || cleanup_failed || runtime.is_job_pending();
+            rebuild = expired || console_failed || display_failed || cleanup_failed || runtime.is_job_pending();
             if rebuild {
                 response.ok = false;
                 response.result = None;

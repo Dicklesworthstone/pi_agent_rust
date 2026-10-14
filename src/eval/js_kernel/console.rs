@@ -15,6 +15,32 @@ use std::time::{Duration, Instant};
 
 const CHUNK_BYTES: usize = 64 * 1024;
 
+/// Share one revocable delivery path for console and rich-display frames.
+/// This waits only on the dedicated kernel thread, never the async host.
+pub(super) fn deliver(
+    output: &SyncSender<Value>,
+    mut frame: Value,
+    deadline: &DeadlineCell,
+    origin: Instant,
+    kind: &'static str,
+) -> Result<(), String> {
+    loop {
+        if deadline.expired(origin) {
+            return Err(format!("EVAL_TIMEOUT: {kind} delivery exceeded the cell budget"));
+        }
+        match output.try_send(frame) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(pending)) => {
+                frame = pending;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(format!("EVAL_OUTPUT_CLOSED: {kind} host disconnected"));
+            }
+        }
+    }
+}
+
 pub(super) struct ConsoleCapture {
     capture: Option<Capture>,
     output: Option<SyncSender<Value>>,
@@ -56,26 +82,12 @@ impl ConsoleCapture {
                 .ok_or_else(|| "EVAL_OUTPUT_LIMIT: console sequence exhausted".to_string())?;
             // The channel belongs to exactly one invocation. This internal
             // id is not a session identity or a guest-supplied identifier.
-            let mut frame = json!({
+            let frame = json!({
                 "id": 1,
                 "stream": {"sequence": sequence, "name": name, "text": &text[..end]},
             });
             if let Some(output) = &self.output {
-                loop {
-                    if deadline.expired(origin) {
-                        return Err("EVAL_TIMEOUT: console delivery exceeded the cell budget".into());
-                    }
-                    match output.try_send(frame) {
-                        Ok(()) => break,
-                        Err(TrySendError::Full(pending)) => {
-                            frame = pending;
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
-                            return Err("EVAL_OUTPUT_CLOSED: console host disconnected".into());
-                        }
-                    }
-                }
+                deliver(output, frame, deadline, origin, "console")?;
             } else if let Some(capture) = &mut self.capture {
                 capture.accept(&frame, 1).map_err(|error| error.to_string())?;
             } else {

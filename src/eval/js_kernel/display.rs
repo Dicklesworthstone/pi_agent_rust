@@ -1,13 +1,16 @@
 //! A cell-owned rich-output sink. Serialize before borrowing it; callbacks and
 //! proxy traps must never execute under a native RefCell borrow. The final
-//! ToolOutput is independently admitted by eval's shared MIME validator.
+//! ToolOutput and each live frame are independently admitted by eval's shared
+//! MIME validator. Live output uses the console's bounded, revocable channel;
+//! a broken delivery cannot be caught by guest code and turned into success.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
 use rquickjs::{Ctx, Function};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::DeadlineCell;
 use super::super::display::{MAX_DISPLAYS, MAX_ITEM_BYTES, MAX_TOTAL_BYTES};
@@ -16,10 +19,15 @@ use super::super::display::{MAX_DISPLAYS, MAX_ITEM_BYTES, MAX_TOTAL_BYTES};
 struct Capture {
     frames: Vec<Value>,
     bytes: usize,
+    output: Option<SyncSender<Value>>,
+    failure: Option<String>,
 }
 
 impl Capture {
     fn push(&mut self, encoded: &str) -> Result<(), &'static str> {
+        if self.failure.is_some() {
+            return Err("EVAL_DISPLAY_STREAM: live delivery has already failed");
+        }
         let bytes = self.bytes.checked_add(encoded.len())
             .filter(|bytes| *bytes <= MAX_TOTAL_BYTES)
             .ok_or("EVAL_DISPLAY_LIMIT: aggregate rich output is too large")?;
@@ -50,13 +58,41 @@ impl DisplaySink {
                 return Err(rquickjs::Exception::throw_message(&ctx,
                     "EVAL_TIMEOUT: display owner expired"));
             }
-            let result = {
+            let delivery = {
                 let mut active = native_sink.borrow_mut();
                 active.as_mut()
                     .ok_or("EVAL_DISPLAY_CLOSED: no active cell")
-                    .and_then(|capture| capture.push(&encoded))
+                    .and_then(|capture| {
+                        capture.push(&encoded)?;
+                        // Detached JSON only. Serialization/proxy traps have
+                        // already completed, and no guest values cross threads.
+                        Ok(capture.output.as_ref().map(|output| {
+                            (output.clone(), json!({
+                                "id": 1,
+                                "stream": {
+                                    "sequence": capture.frames.len(),
+                                    "name": "display",
+                                    "display": capture.frames.last(),
+                                },
+                            }))
+                        }))
+                    })
             };
-            result.map_err(|message| rquickjs::Exception::throw_message(&ctx, message))
+            // Release the capture borrow before backpressure or exception
+            // construction. The host alone invokes user-facing callbacks.
+            let delivery = delivery
+                .map_err(|message| rquickjs::Exception::throw_message(&ctx, message))?;
+            if let Some((output, frame)) = delivery
+                && let Err(error) = super::console::deliver(
+                    &output, frame, &deadline, origin, "rich display",
+                )
+            {
+                if let Some(capture) = native_sink.borrow_mut().as_mut() {
+                    capture.failure = Some(error.clone());
+                }
+                return Err(rquickjs::Exception::throw_message(&ctx, &error));
+            }
+            Ok(())
         })?;
         let factory: Function<'_> = ctx.eval(include_str!("display.js"))?;
         let display: Function<'_> = factory.call((native,))?;
@@ -64,11 +100,25 @@ impl DisplaySink {
         Ok(Self(sink))
     }
 
+    #[cfg(test)]
     pub(super) fn begin(&self) {
-        *self.0.borrow_mut() = Some(Capture::default());
+        self.begin_with_output(None);
+    }
+
+    pub(super) fn begin_with_output(&self, output: Option<SyncSender<Value>>) {
+        *self.0.borrow_mut() = Some(Capture { output, ..Capture::default() });
+    }
+
+    /// Transport failure is latched independently of the guest exception.
+    /// Even `try { display(...) } catch {}` must retire the broken realm.
+    pub(super) fn failure(&self) -> Option<String> {
+        self.0.borrow().as_ref().and_then(|capture| capture.failure.clone())
     }
 
     /// No JS is executed during retirement, including after interruption.
+    /// Drop this invocation's sender before the final kernel reply. A failed
+    /// delivery may have an unsent frame here; the worker reports failure and
+    /// the host independently refuses a mismatch with the accepted prefix.
     pub(super) fn finish(&self) -> Vec<Value> {
         self.0.borrow_mut().take().map_or_else(Vec::new, |capture| capture.frames)
     }
@@ -206,5 +256,109 @@ mod tests {
             let _ = ctx.catch();
             assert!(sink.finish().is_empty());
         });
+    }
+
+    #[test]
+    fn live_proxy_reentrancy_keeps_display_and_console_sequences_independent() {
+        let kernel = JsKernel::spawn().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let reply = kernel.submit_with_output(
+            concat!(
+                "const observed = new Proxy({answer:42}, {ownKeys(target) {",
+                "display('inner'); console.log('inside'); return Reflect.ownKeys(target); }});",
+                "display(observed); 17"
+            ).into(),
+            Instant::now() + Duration::from_secs(10), Some(sender),
+        ).unwrap();
+        let response = reply.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.as_deref(), Some("17"));
+        assert!(response.console.is_empty(), "no duplicate console in the reply");
+        let frames: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], json!({"id":1,"stream":{
+            "name":"display","sequence":1,
+            "display":{"mimeType":"application/json","data":"inner"}
+        }}));
+        assert_eq!(frames[1], json!({"id":1,"stream":{
+            "name":"stdout","sequence":1,"text":"inside\n"
+        }}));
+        assert_eq!(frames[2]["stream"]["sequence"], 2);
+        assert_eq!(frames[2]["stream"]["display"]["data"], json!({"answer":42}));
+        assert_eq!(response.displays, vec![
+            frames[0]["stream"]["display"].clone(), frames[2]["stream"]["display"].clone(),
+        ]);
+        assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)),
+            "both native sinks close before the final reply");
+    }
+
+    #[test]
+    fn caught_live_delivery_failure_still_fails_and_rebuilds_the_realm() {
+        let kernel = JsKernel::spawn().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        let reply = kernel.submit_with_output(
+            "globalThis.keep = 42; try { display(1); } catch (error) {} 17".into(),
+            Instant::now() + Duration::from_secs(10), Some(sender),
+        ).unwrap();
+        let response = reply.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(!response.ok, "guest catch must not turn a broken stream into success");
+        assert!(response.result.is_none());
+        let error = response.error.unwrap();
+        assert!(error.contains("EVAL_DISPLAY_STREAM"), "{error}");
+        assert!(error.contains("EVAL_OUTPUT_CLOSED"), "{error}");
+        assert!(error.contains("EVAL_STATE_RESET"), "{error}");
+        let next = cell(&kernel, "typeof keep === 'undefined'");
+        assert!(next.ok);
+        assert_eq!(next.result.as_deref(), Some("true"));
+        assert!(next.displays.is_empty());
+    }
+
+    #[test]
+    fn full_live_display_channel_expires_without_silently_dropping_a_frame() {
+        let runtime = rquickjs::Runtime::new().unwrap();
+        let context = rquickjs::Context::full(&runtime).unwrap();
+        let origin = Instant::now();
+        let deadline = DeadlineCell::new(Arc::new(AtomicBool::new(false)));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        context.with(|ctx| {
+            let sink = DisplaySink::install(&ctx, deadline.clone(), origin).unwrap();
+            sink.begin_with_output(Some(sender));
+            ctx.eval::<(), _>("display('accepted')").unwrap();
+            // Arm only after the first frame is known queued. The second
+            // call must block on the real bounded channel until its budget.
+            deadline.set(Instant::now() + Duration::from_secs(1), origin);
+            let started = Instant::now();
+            ctx.eval::<(), _>("try {display('blocked')} catch (error) {}").unwrap();
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(sink.failure().unwrap().contains("EVAL_TIMEOUT"));
+            let accepted = receiver.try_recv().unwrap();
+            assert_eq!(accepted["stream"]["display"]["data"], "accepted");
+            assert_eq!(accepted["stream"]["sequence"], 1);
+            deadline.clear();
+            assert!(ctx.eval::<(), _>("display('must remain refused')").is_err());
+            let _ = ctx.catch();
+            let captured = sink.finish();
+            assert_eq!(captured.len(), 2, "failure must not pretend every frame was delivered");
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+        });
+    }
+
+    #[test]
+    fn dropping_a_kernel_revokes_live_display_backpressure() {
+        let kernel = JsKernel::spawn().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reply = kernel.submit_with_output(
+            "for (let i=0; i<32; i++) display({index:i});".into(),
+            Instant::now() + Duration::from_secs(60), Some(sender),
+        ).unwrap();
+        let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first["stream"]["display"]["data"]["index"], 0);
+        drop(kernel);
+        assert!(matches!(reply.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        let remaining: Vec<_> = receiver.try_iter().collect();
+        assert!(remaining.len() <= 1, "one bounded queue, no spill producer");
+        assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
     }
 }
