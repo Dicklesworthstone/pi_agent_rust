@@ -26,6 +26,8 @@ pub(crate) use rpc::{rpc_goal_command, rpc_goal_state};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod budget_tests;
 
 const CHECKPOINT_TYPE: &str = "goal_checkpoint";
 const SCHEMA: &str = "pi.goal.checkpoint.v1";
@@ -389,6 +391,7 @@ enum Transition<'a> {
     Resume,
     Complete(&'a str),
     Drop(&'a str),
+    Budget { budget: GoalBudget, reason: &'a str },
 }
 
 fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
@@ -415,6 +418,27 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
             record.status = GoalStatus::Active;
             record.note.clear();
         }
+        Transition::Budget { budget, reason } => {
+            budget.validate()?;
+            validate_text(reason, "budget revision reason")?;
+            if budget.max_prompts < record.prompts_started {
+                return Err(failure("GOAL_BUDGET", "prompt total cannot be less than already started prompts"));
+            }
+            if budget.max_prompts == record.max_prompts && budget.token_budget == record.token_budget {
+                return Err(failure("GOAL_BUDGET", "the proposed total budget is unchanged"));
+            }
+            record.max_prompts = budget.max_prompts;
+            record.token_budget = budget.token_budget;
+            record.note = reason.to_string();
+            // A new allowance is not permission to run. Unfinished intents
+            // keep their marker and schema-required raw Active status; their
+            // effective state is still paused (or budget-limited). In
+            // particular, budget revision cannot acknowledge interrupted work.
+            if !record.in_flight {
+                record.status = GoalStatus::Paused;
+            }
+            return Ok(record);
+        }
         Transition::Pause(reason) | Transition::Drop(reason) | Transition::Complete(reason) => {
             validate_text(reason, "reason or completion evidence")?;
             if matches!(action, Transition::Complete(_)) && record.in_flight {
@@ -427,7 +451,7 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
                 Transition::Pause(_) => GoalStatus::Paused,
                 Transition::Drop(_) => GoalStatus::Dropped,
                 Transition::Complete(_) => GoalStatus::Complete,
-                Transition::Resume => unreachable!(),
+                Transition::Resume | Transition::Budget { .. } => unreachable!(),
             };
             record.note = reason.to_string();
         }
@@ -485,6 +509,22 @@ impl AgentSessionHandle {
         reason: &str,
     ) -> Result<GoalChange> {
         change(self, owner, expected, Transition::Pause(reason)).await
+    }
+
+    /// Set reviewed total allowances without resetting recorded work.
+    /// The same goal remains paused or budget-limited; explicit resume and run
+    /// are separate operations. An interrupted intent remains interrupted.
+    /// Inspect persistence before continuing; an unconfirmed save is retried
+    /// with `flush_goal`, not by replaying this revision. No tool authority is
+    /// changed and a live runner must release its mutable borrow first.
+    pub async fn set_goal_budget(
+        &mut self,
+        owner: &AgentCx,
+        expected: &GoalSnapshot,
+        budget: GoalBudget,
+        reason: &str,
+    ) -> Result<GoalChange> {
+        change(self, owner, expected, Transition::Budget { budget, reason }).await
     }
 
     /// Resume explicitly, keeping all already consumed prompt/token budgets.
