@@ -1,19 +1,13 @@
-//! TypeScript-to-JavaScript lowering for eval's local ES-module loader.
+//! Module admission for eval's shared TypeScript compiler.
 //!
 //! This is deliberately a syntax transform, not a package/runtime shim. SWC
-//! removes TypeScript-only syntax while preserving ESM imports/exports for
-//! QuickJS to link through the same workspace-scoped module loader.
+//! Script preflight and module compilation use the same SWC pipeline. This
+//! boundary retains module diagnostics and does not load an extension realm.
 
 use std::path::Path;
 
-use swc_common::{FileName, Globals, Mark, SourceMap, GLOBALS, sync::Lrc};
-use swc_ecma_ast::EsVersion;
-use swc_ecma_codegen::to_code_default;
-use swc_ecma_parser::{Syntax, TsSyntax, parse_file_as_program};
-use swc_ecma_transforms_base::{fixer::fixer, resolver};
-use swc_ecma_transforms_typescript::strip;
+use crate::eval::lifecycle::source;
 
-const MAX_GENERATED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 
 fn diagnostic(label: &str, value: &impl std::fmt::Debug) -> String {
@@ -35,39 +29,14 @@ fn diagnostic(label: &str, value: &impl std::fmt::Debug) -> String {
 /// not part of this transform. Recovered parser errors are failures rather than
 /// best-effort output: eval must not execute a prefix from malformed source.
 pub(super) fn transpile(path: &Path, source: &str) -> Result<String, String> {
-    let cm: Lrc<SourceMap> = Default::default();
-    let file = cm.new_source_file(
-        FileName::Real(path.to_path_buf()).into(),
-        source.to_owned(),
-    );
-    let mut recovered = Vec::new();
-    let program = parse_file_as_program(
-        &file,
-        Syntax::Typescript(TsSyntax::default()),
-        EsVersion::latest(),
-        None,
-        &mut recovered,
-    )
-    .map_err(|error| diagnostic("PARSE", &error))?;
-    if let Some(error) = recovered.first() {
-        return Err(diagnostic("PARSE", error));
-    }
-
-    let output = GLOBALS.set(&Globals::default(), || {
-        let unresolved = Mark::new();
-        let top_level = Mark::new();
-        let program = program
-            .apply(resolver(unresolved, top_level, false))
-            .apply(strip(unresolved, top_level))
-            .apply(fixer(None));
-        to_code_default(cm, None, &program)
-    });
-    if output.len() > MAX_GENERATED_BYTES {
-        return Err(
-            "EVAL_TYPESCRIPT_LIMIT: generated JavaScript exceeds 4 MiB".to_string(),
-        );
-    }
-    Ok(output)
+    source::prepare_module(path, source.to_owned()).map_err(|error| {
+        let label = if error.to_string().contains("EVAL_LOAD_LIMIT") {
+            "LIMIT"
+        } else {
+            "PARSE"
+        };
+        diagnostic(label, &error)
+    })
 }
 
 #[cfg(test)]

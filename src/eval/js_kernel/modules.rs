@@ -201,14 +201,22 @@ impl ModuleFiles {
         if source.path != name {
             return Err("EVAL_MODULE_CHANGED: module target changed after resolution".into());
         }
+        let original_bytes = source.code.len();
+        if original_bytes > MAX_SOURCE_BYTES.saturating_sub(self.0.borrow().source_bytes) {
+            return Err("EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript".into());
+        }
         if module_language(Path::new(name)) == Some(ModuleLanguage::TypeScript) {
+            // Reuse the same compiler as typed scripts, retaining native ESM
+            // linking. No registry borrow crosses the compiler boundary.
             source.code = typescript::transpile(Path::new(name), &source.code)?;
             self.0.borrow().check()?;
         }
         let mut state = self.0.borrow_mut();
+        // Charge the larger representation: erased types cannot bypass input
+        // budgets, and lowered enums cannot bypass generated-output budgets.
         let total = state
             .source_bytes
-            .checked_add(source.code.len())
+            .checked_add(source.code.len().max(original_bytes))
             .filter(|total| *total <= MAX_SOURCE_BYTES)
             .ok_or("EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript")?;
         state.source_bytes = total;
@@ -285,3 +293,47 @@ impl Loader for ModuleFiles {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod typescript_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn files(root: &Path) -> ModuleFiles {
+        let files = ModuleFiles::new(root.to_path_buf(), Arc::new(AtomicBool::new(false)));
+        files.begin(AgentCx::for_testing_with_io(), Instant::now() + Duration::from_secs(10));
+        files
+    }
+
+    #[test]
+    fn erased_types_cannot_bypass_the_original_source_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let fields = (0..100).map(|index| format!("field{index}: number;")).collect::<String>();
+        let input = format!("interface Padding {{ {fields} }}\nexport const answer: number = 42;");
+        std::fs::write(dir.path().join("types.ts"), &input).unwrap();
+        let files = files(dir.path());
+        let path = files.resolve_path("eval_script", "./types.ts").unwrap();
+        files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len() + 1;
+        assert!(files.read_module(&path).err().unwrap().contains("EVAL_MODULE_LIMIT"));
+        files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len();
+        let loaded = files.read_module(&path).unwrap();
+        assert!(loaded.code.len() < input.len(), "type declarations should be erased");
+        assert_eq!(files.0.borrow().source_bytes, MAX_SOURCE_BYTES);
+    }
+
+    #[test]
+    fn enum_lowering_cannot_bypass_the_emitted_source_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "export enum Code { A, B, C, D }";
+        std::fs::write(dir.path().join("enum.ts"), input).unwrap();
+        let files = files(dir.path());
+        let path = files.resolve_path("eval_script", "./enum.ts").unwrap();
+        files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len();
+        assert!(files.read_module(&path).err().unwrap().contains("EVAL_MODULE_LIMIT"));
+        assert_eq!(files.0.borrow().source_bytes, MAX_SOURCE_BYTES - input.len());
+        files.0.borrow_mut().source_bytes = 0;
+        let loaded = files.read_module(&path).unwrap();
+        assert!(loaded.code.len() > input.len());
+        assert_eq!(files.0.borrow().source_bytes, loaded.code.len());
+    }
+}

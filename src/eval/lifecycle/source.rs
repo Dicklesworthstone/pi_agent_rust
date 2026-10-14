@@ -1,8 +1,11 @@
-//! Shared bounded file admission for JavaScript `%load` cells and ES modules.
+//! Shared bounded file admission for JavaScript/TypeScript scripts and ES modules.
 
 use crate::error::{Error, Result};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+mod typescript;
+pub(in crate::eval) use typescript::prepare_module;
 
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -51,9 +54,13 @@ pub(super) fn load_path(code: &str) -> Result<Option<PathBuf>> {
 }
 
 pub(super) async fn load(cwd: PathBuf, path: PathBuf) -> Result<Source> {
-    // This worker only reads a bounded regular file. Abandoning the await
-    // cannot execute the script or reset the caller's retained kernel.
-    asupersync::runtime::spawn_blocking_io(move || load_sync(&cwd, &path)).await
+    // This worker reads a bounded regular file and compiles typed scripts.
+    // Abandoning the await cannot execute source or reset retained state.
+    asupersync::runtime::spawn_blocking_io(move || {
+        let mut source = load_sync(&cwd, &path)?;
+        source.code = typescript::prepare(Path::new(&source.path), source.code)?;
+        Ok(source)
+    }).await
 }
 
 // Callers own authority and cancellation admission. Module reads run on the

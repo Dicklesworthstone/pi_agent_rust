@@ -1,5 +1,6 @@
 //! Offline package-installation workflows through the public retained EvalTool.
 //! Installs only an inert local wheel into each test's private target directory.
+#![recursion_limit = "512"]
 
 use pi::eval::EvalTool;
 use pi::model::ContentBlock;
@@ -188,7 +189,6 @@ fn missing_import_only_suggests_explicit_installation() {
 
 #[test]
 fn cancellation_during_a_real_build_retires_installer_descendants_and_kernel() {
-    use std::future::Future as _;
     use std::time::{Duration, Instant};
     if !available(true) { return; }
     let dir = tempfile::tempdir().unwrap();
@@ -231,7 +231,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     let stopped = run(futures::future::poll_fn(|task| {
         // Install the test owner for each poll, never across an executor wait.
         let _owner = owner.clone().set_current_restricted();
-        request.as_mut().poll(task)
+        std::future::Future::poll(request.as_mut(), task)
     })).expect_err("cancelled installation must fail");
     drop(request);
     assert!(observed.load(std::sync::atomic::Ordering::SeqCst), "real build must start");
