@@ -3,7 +3,7 @@
 //! Validate the whole response before selecting a bounded display prefix. Flat
 //! SymbolInformation is not a hierarchy: containerName never invents parents.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -17,6 +17,8 @@ use crate::lsp::client::uri_to_path;
 use crate::lsp::text::{Position, Range, position_to_offset_exact};
 use crate::lsp::{MAX_PAYLOAD_BYTES, display_path, text_output, tool_err};
 use crate::tools::ToolOutput;
+
+mod source_text;
 
 const MAX_SYMBOLS: usize = 8192;
 const MAX_DEPTH: usize = 32;
@@ -35,6 +37,7 @@ struct Symbol<'a> {
 struct Outline<'a> {
     symbols: Vec<Symbol<'a>>,
     shape: &'static str,
+    offsets: BTreeMap<Position, usize>,
 }
 
 /// Name matching addresses semantic definitions, never arbitrary source hits.
@@ -190,18 +193,21 @@ fn validate_boundaries(
     text: &str,
     boundaries: &BTreeSet<Position>,
     budget: &Budget,
-) -> Result<()> {
+) -> Result<BTreeMap<Position, usize>> {
     budget.remaining()?;
+    let mut offsets = BTreeMap::new();
     let mut wanted = boundaries.iter().copied().peekable();
     let mut chars = text.char_indices().peekable();
     let mut current = Position { line: 0, character: 0 };
     let mut checkpoint = 0;
     loop {
         if wanted.peek() == Some(&current) {
+            let offset = chars.peek().map_or(text.len(), |(offset, _)| *offset);
+            offsets.insert(current, offset);
             wanted.next();
         }
         match wanted.peek() {
-            None => return budget.remaining().map(|_| ()),
+            None => return budget.remaining().map(|_| offsets),
             Some(next) if *next < current => {
                 return Err(malformed("document symbol endpoint is not an exact source boundary"));
             }
@@ -288,9 +294,10 @@ fn parse<'a>(raw: &'a Value, path: &Path, text: &str, budget: &Budget) -> Result
             }
         }
     }
-    validate_boundaries(text, &boundaries, budget)?;
+    let offsets = validate_boundaries(text, &boundaries, budget)?;
     Ok(Outline {
         symbols,
+        offsets,
         shape: if roots.is_empty() { "empty" } else if flat { "flat" } else { "hierarchical" },
     })
 }
@@ -306,10 +313,21 @@ fn summary(index: usize, symbol: &Symbol<'_>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn displayed(
     outline: &Outline<'_>,
     indices: impl Iterator<Item = usize>,
     limit: usize,
+    budget: &Budget,
+) -> Result<Vec<Value>> {
+    displayed_with_source(outline, indices, limit, None, budget)
+}
+
+fn displayed_with_source(
+    outline: &Outline<'_>,
+    indices: impl Iterator<Item = usize>,
+    limit: usize,
+    source: Option<&str>,
     budget: &Budget,
 ) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
@@ -333,6 +351,9 @@ fn displayed(
         }
         ancestors.reverse();
         row["ancestors"] = json!(ancestors);
+        if let Some(text) = source {
+            row["source"] = source_text::excerpt(text, outline, symbol, budget)?;
+        }
         let size = bounded_size(&row, MAX_RESPONSE_BYTES)? + usize::from(!rows.is_empty());
         if size > (MAX_PAYLOAD_BYTES - 8192).saturating_sub(bytes) {
             break;
@@ -363,7 +384,17 @@ impl LspTool {
         source.verify(&budget)?;
         let outline = parse(&raw, &source.path, &source.text, &budget)?;
         let matching = select(&outline, &filter, &budget)?;
-        let rows = displayed(&outline, matching.indices.iter().copied(), input.limit.unwrap_or(100), &budget)?;
+        // Selecting definitions also reads their code from the exact immutable
+        // source used to validate the outline. The unfiltered outline remains
+        // metadata-only; no returned URI is opened and no second LSP call runs.
+        let include_source = filter.name.is_some() || filter.line.is_some();
+        let rows = displayed_with_source(
+            &outline, matching.indices.iter().copied(), input.limit.unwrap_or(100),
+            include_source.then_some(source.text.as_ref()), &budget,
+        )?;
+        let source_sha256 = include_source
+            .then(|| source_text::fingerprint(&source.text, &budget)).transpose()?;
+        let source_truncated = rows.iter().any(|row| row["source"]["truncated"] == true);
         let total = outline.symbols.len();
         let truncated = rows.len() < matching.indices.len();
         let payload = json!({
@@ -373,7 +404,9 @@ impl LspTool {
             "selectedCount":matching.indices.len(),"count":rows.len(),
             "filter":{"symbol":input.symbol,"name":filter.name,"occurrence":filter.occurrence,"line":input.line},
             "truncated":truncated,"responseComplete":true,"symbols":rows,
-            "note":"The complete outline is validated before filtering. symbol matches case-sensitive definition names, not source text; optional #N selects the Nth match in server preorder after line filtering. One-based line intersects full half-open definition ranges. total counts every symbol, matched counts name/line matches, selectedCount applies #N, and count is the displayed subset. index/parentIndex refer to the whole outline; ancestors retain omitted containing symbols. Flat containerName never implies a parent. Exact zero-based UTF-16 ranges can be used with navigation or refactor tools, but are not approval handles."
+            "sourceIncluded":include_source,"sourceSha256":source_sha256,
+            "sourceTruncated":source_truncated,
+            "note":"The complete outline is validated before filtering. symbol matches case-sensitive definition names, not source text; optional #N selects the Nth match in server preorder after line filtering. One-based line intersects full half-open definition ranges. total counts every symbol, matched counts name/line matches, selectedCount applies #N, and count is the displayed subset. index/parentIndex refer to the whole outline; ancestors retain omitted containing symbols. Flat containerName never implies a parent. Name or line selection includes exact source excerpts, capped at 16 KiB per displayed definition and sharing the response budget. source.range and source.byteRange describe only the returned text; the symbol range remains the full server extent. source.truncated and sourceTruncated report omitted code independently of omitted symbols. A flat location may cover only an identifier, not a body. sourceSha256 identifies the checked source text, not an approval handle or an atomic workspace snapshot. Exact zero-based UTF-16 ranges can be used with navigation or refactor tools, but are not approval handles."
         });
         let text = payload.to_string();
         let details = json!({"truncated":truncated,"payload":payload});
