@@ -365,6 +365,7 @@ impl McpManager {
                         "the connection disappeared before tools/call was dispatched",
                     )
                 })?;
+                Self::invalidate_notified_catalog(entry, &transport);
                 let catalog_is_fresh = publication
                     .original
                     .as_ref()

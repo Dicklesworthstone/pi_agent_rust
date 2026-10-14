@@ -59,6 +59,11 @@ pub trait McpTransport: Send + Sync {
     fn progress_generation(&self) -> u64 {
         0
     }
+    /// Consume a server tools/list invalidation for this transport generation.
+    /// Custom transports that do not receive server notifications remain false.
+    fn take_tools_list_changed(&self) -> bool {
+        false
+    }
     /// Send a request and await its response.
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value>;
     /// Send with a manager-owned dispatch lease. A transport that queues work
@@ -707,6 +712,7 @@ fn reader_loop(
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
     progress: std::sync::Arc<ProgressRegistry>,
+    tools_list_changed: std::sync::Arc<AtomicBool>,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
     tree_cleanup_state: std::sync::Arc<Mutex<TreeCleanupState>>,
@@ -729,6 +735,12 @@ fn reader_loop(
                     return;
                 }
                 progress.publish(&message, 0);
+                if message.get("method").and_then(Value::as_str)
+                    == Some("notifications/tools/list_changed")
+                    && message.get("id").is_none()
+                {
+                    tools_list_changed.store(true, Ordering::Release);
+                }
             }
             Ok(None) => {
                 stop_reader_connection(
@@ -792,6 +804,7 @@ struct McpStdioClient {
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
     progress: std::sync::Arc<ProgressRegistry>,
+    tools_list_changed: std::sync::Arc<AtomicBool>,
     next_id: AtomicU64,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
@@ -861,6 +874,7 @@ impl McpStdioClient {
 
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let progress = std::sync::Arc::new(ProgressRegistry::default());
+        let tools_list_changed = std::sync::Arc::new(AtomicBool::new(false));
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
         let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
@@ -902,6 +916,7 @@ impl McpStdioClient {
             let writer_tx = writer_tx.clone();
             let pending = std::sync::Arc::clone(&pending);
             let progress = std::sync::Arc::clone(&progress);
+            let tools_list_changed = std::sync::Arc::clone(&tools_list_changed);
             let alive = std::sync::Arc::clone(&alive);
             let closing = std::sync::Arc::clone(&closing);
             let tree_cleanup_state = std::sync::Arc::clone(&tree_cleanup_state);
@@ -913,6 +928,7 @@ impl McpStdioClient {
                         writer_tx,
                         pending,
                         progress,
+                        tools_list_changed,
                         alive,
                         closing,
                         tree_cleanup_state,
@@ -967,6 +983,7 @@ impl McpStdioClient {
             writer_tx,
             pending,
             progress,
+            tools_list_changed,
             next_id: AtomicU64::new(1),
             alive,
             closing,
@@ -1235,6 +1252,10 @@ impl McpTransport for StdioTransport {
         Some(&self.rpc.progress)
     }
 
+    fn take_tools_list_changed(&self) -> bool {
+        self.rpc.tools_list_changed.swap(false, Ordering::AcqRel)
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.request_with_dispatch(
             method,
@@ -1389,6 +1410,7 @@ pub struct HttpTransport {
     headers: Vec<(String, String)>,
     session: Mutex<HttpSessionState>,
     progress: std::sync::Arc<ProgressRegistry>,
+    tools_list_changed_generation: AtomicU64,
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
     listener_started: AtomicBool,
@@ -1714,6 +1736,7 @@ impl HttpTransport {
             headers,
             session: Mutex::new(HttpSessionState::default()),
             progress: std::sync::Arc::new(ProgressRegistry::default()),
+            tools_list_changed_generation: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
             listener_started: AtomicBool::new(false),
@@ -2503,6 +2526,11 @@ impl HttpTransport {
                 // session: an old stream must not address a new subscription.
                 if method == "notifications/progress" {
                     self.progress.publish(&value, wire_state.generation);
+                } else if method == "notifications/tools/list_changed" {
+                    self.tools_list_changed_generation.store(
+                        wire_state.generation.wrapping_add(1),
+                        Ordering::Release,
+                    );
                 }
                 return Ok(None);
             };
@@ -3036,6 +3064,11 @@ impl McpTransport for HttpTransport {
         self.session_generation()
     }
 
+    fn take_tools_list_changed(&self) -> bool {
+        let current = self.session_generation().wrapping_add(1);
+        self.tools_list_changed_generation.swap(0, Ordering::AcqRel) == current
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let _lane =
@@ -3448,6 +3481,7 @@ pub(crate) mod tests {
                 writer_tx,
                 pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 progress: std::sync::Arc::new(ProgressRegistry::default()),
+                tools_list_changed: std::sync::Arc::new(AtomicBool::new(false)),
                 next_id: AtomicU64::new(1),
                 alive: std::sync::Arc::new(AtomicBool::new(true)),
                 closing: std::sync::Arc::new(AtomicBool::new(false)),

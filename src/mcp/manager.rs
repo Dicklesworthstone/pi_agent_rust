@@ -708,24 +708,41 @@ impl McpManager {
                 "connection changed before tools/list dispatch",
             ));
         }
-        // A server's catalog may span several opaque cursor pages. Retain
-        // the connection lane and publish only the complete validated set.
-        let tools = self.collect_tool_catalog(entry, &transport).await?;
-        self.check_running()?;
-        // Narrow the final cross-process revocation window immediately before
-        // publishing schemas, then bind publication to this exact connection.
-        if let Err(err) = self.check_trust(entry) {
-            Self::close_revoked_transport(entry, &transport).await;
-            return Err(err);
+        // Clear any notification that predates this refresh. A notification
+        // arriving while tools/list is in flight means the returned catalog
+        // may already be stale, so repeat once under the same connection lane.
+        let _ = transport.take_tools_list_changed();
+        for attempt in 0..2 {
+            // A server's catalog may span several opaque cursor pages. Retain
+            // the connection lane and publish only a complete validated set.
+            let tools = self.collect_tool_catalog(entry, &transport).await?;
+            if transport.take_tools_list_changed() {
+                Self::lock(&entry.tools_cache).take();
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(tool_err(
+                    "MCP_CATALOG_CHURN",
+                    "server changed its tool catalog repeatedly during refresh; retry at the next request boundary",
+                ));
+            }
+            self.check_running()?;
+            // Narrow the final cross-process revocation window immediately before
+            // publishing schemas, then bind publication to this exact connection.
+            if let Err(err) = self.check_trust(entry) {
+                Self::close_revoked_transport(entry, &transport).await;
+                return Err(err);
+            }
+            if !self.publish_tools_if_current(entry, &transport, &tools) {
+                transport.abort();
+                return Err(tool_err(
+                    "MCP_TRANSPORT_SUPERSEDED",
+                    "connection changed before tools/list publication",
+                ));
+            }
+            return Ok(tools);
         }
-        if !self.publish_tools_if_current(entry, &transport, &tools) {
-            transport.abort();
-            return Err(tool_err(
-                "MCP_TRANSPORT_SUPERSEDED",
-                "connection changed before tools/list publication",
-            ));
-        }
-        Ok(tools)
+        unreachable!("two catalog refresh attempts either publish or return")
     }
 
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
@@ -1373,18 +1390,10 @@ impl McpManager {
                 {
                     return None;
                 }
-                if !matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. }) {
+                if !Self::catalog_is_fresh(entry) {
                     return None;
                 }
-                let transport = Self::lock(&entry.transport).clone()?;
-                if !transport.is_alive() {
-                    return None;
-                }
-                let tools = Self::lock(&entry.tools_cache).clone()?;
-                let (cached_at, tools) = tools;
-                if cached_at.elapsed() > TOOL_CACHE_TTL {
-                    return None;
-                }
+                let tools = Self::lock(&entry.tools_cache).clone()?.1;
                 Some((entry.config.name.clone(), tools))
             })
             .collect()
@@ -1463,12 +1472,36 @@ impl McpManager {
             .await;
     }
 
-    fn catalog_is_fresh(entry: &ServerEntry) -> bool {
-        let transport = Self::lock(&entry.transport);
-        transport
+    fn invalidate_notified_catalog(
+        entry: &ServerEntry,
+        transport: &Arc<dyn McpTransport>,
+    ) -> bool {
+        if !transport.take_tools_list_changed() {
+            return false;
+        }
+        let current = Self::lock(&entry.transport);
+        if !current
             .as_ref()
-            .is_some_and(|transport| transport.is_alive())
-            && matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. })
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
+        {
+            return false;
+        }
+        Self::lock(&entry.tools_cache).take();
+        if matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. }) {
+            *Self::lock(&entry.health) = ServerHealth::Ready { tools: 0 };
+        }
+        true
+    }
+
+    fn catalog_is_fresh(entry: &ServerEntry) -> bool {
+        let Some(transport) = Self::lock(&entry.transport).clone() else {
+            return false;
+        };
+        if !transport.is_alive() {
+            return false;
+        }
+        Self::invalidate_notified_catalog(entry, &transport);
+        matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. })
             && Self::lock(&entry.tools_cache)
                 .as_ref()
                 .is_some_and(|(at, _)| at.elapsed() <= TOOL_CACHE_TTL)
