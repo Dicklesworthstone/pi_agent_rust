@@ -12,11 +12,15 @@ use asupersync::{Budget, Cx};
 use serde_json::json;
 
 const PEER: &str = r#"
-import json, pathlib, sys, time
+import json, pathlib, queue, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 root = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
+get_messages = queue.Queue(maxsize=16)
+get_ready = threading.Event()
+get_stopped = threading.Event()
+
 
 def exchange(frame, emit):
     method = frame.get('method')
@@ -32,6 +36,8 @@ def exchange(frame, emit):
         result = {}
     elif method == 'tools/call':
         (root / 'request.json').write_text(json.dumps(frame))
+        with (root / 'calls.jsonl').open('a') as log:
+            log.write(json.dumps(frame) + '\n')
         token = frame['params'].get('_meta', {}).get('progressToken')
         def report(value, selected=token):
             emit({'jsonrpc':'2.0', 'method':'notifications/progress', 'params':{
@@ -50,7 +56,7 @@ def exchange(frame, emit):
                 report(value)  # duplicate, not another callback
                 report(value - 1)  # regression
                 until = time.monotonic() + 5
-                ack = root / ('ack-' + str(value))
+                ack = root / ('ack-' + str(ident) + '-' + str(value))
                 while not ack.exists():
                     if time.monotonic() >= until:
                         raise RuntimeError('progress callback never acknowledged live status')
@@ -60,7 +66,7 @@ def exchange(frame, emit):
         raise RuntimeError('unexpected method: ' + repr(method))
     emit({'jsonrpc':'2.0', 'id':ident, 'result':result})
 
-if mode != 'http':
+if mode not in ('http', 'http-get'):
     def emit(frame):
         print(json.dumps(frame), flush=True)
     for line in sys.stdin:
@@ -71,10 +77,31 @@ else:
         def log_message(self, *args):
             pass
         def do_GET(self):
-            self.send_response(405)
-            self.send_header('Content-Length', '0')
+            if mode != 'http-get':
+                self.send_response(405)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            assert self.headers.get('Mcp-Session-Id') == 'progress-session'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Connection', 'close')
             self.end_headers()
+            self.wfile.flush()
+            get_ready.set()
+            until = time.monotonic() + 15
+            while not get_stopped.is_set() and time.monotonic() < until:
+                try:
+                    value = get_messages.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                # No JSON-RPC response may appear on this unsolicited stream.
+                assert 'method' in value and 'id' not in value
+                self.wfile.write(('data: ' + json.dumps(value) + '\n\n').encode())
+                self.wfile.flush()
+            self.close_connection = True
         def do_DELETE(self):
+            get_stopped.set()
             self.send_response(200)
             self.send_header('Content-Length', '0')
             self.end_headers()
@@ -87,7 +114,7 @@ else:
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return
-            if frame['method'] == 'tools/call':
+            if frame['method'] == 'tools/call' and mode == 'http':
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Connection', 'close')
@@ -99,7 +126,15 @@ else:
                 self.close_connection = True
             else:
                 replies = []
-                exchange(frame, replies.append)
+                def emit(value):
+                    if value.get('method') == 'notifications/progress':
+                        assert mode == 'http-get' and get_ready.wait(5)
+                        # Every notification travels on one stream only.
+                        get_messages.put(value, timeout=5)
+                    else:
+                        replies.append(value)
+                exchange(frame, emit)
+                assert len(replies) == 1
                 payload = json.dumps(replies[0]).encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -131,7 +166,8 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
         root.display().to_string(), mode.to_string(),
     ];
     let mut child = None;
-    let url = if mode == "http" {
+    let is_http = matches!(mode, "http" | "http-get");
+    let url = if is_http {
         child = Some(PeerChild(Command::new("python3").args(&args)
             .stdin(Stdio::null()).stdout(Stdio::null()).spawn().expect("Python protocol peer")));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -147,10 +183,10 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
     };
     (ConfiguredServer {
         name: "progress".to_string(),
-        command: (mode != "http").then(|| "python3".to_string()),
-        args: if mode == "http" { Vec::new() } else { args },
+        command: (!is_http).then(|| "python3".to_string()),
+        args: if is_http { Vec::new() } else { args },
         env: Vec::new(), url, headers: Vec::new(),
-        transport_hint: Some(if mode == "http" { "http" } else { "stdio" }.to_string()),
+        transport_hint: Some(if is_http { "http" } else { "stdio" }.to_string()),
         provenance: Provenance::ProjectPi,
         source_file: root.join("mcp.json"),
     }, child)
@@ -161,8 +197,18 @@ fn manager(root: &Path, config: ConfiguredServer) -> (Arc<McpManager>, Arc<Serve
         servers: vec![config], warnings: Vec::new(),
     }));
     let entry = manager.entry("progress").unwrap();
-    TrustStore::load(&manager.inner.trust_path).unwrap()
-        .acknowledge("progress", &manager.trust_fingerprint_for(&entry), "operator").unwrap();
+    // Mirror the public trust operation instead of bypassing its executable
+    // binding. A fingerprint-only approval is not sufficient for stdio.
+    let identity = entry.config
+        .execution_identity(&entry.effective_cwd(&manager.inner.cwd))
+        .expect("resolve the fixture's executable identity");
+    let fingerprint = manager.trust_fingerprint_for(&entry);
+    let mut store = TrustStore::load(&manager.inner.trust_path).unwrap();
+    if let Some(execution) = identity {
+        store.acknowledge_execution("progress", &fingerprint, "operator", execution).unwrap();
+    } else {
+        store.acknowledge("progress", &fingerprint, "operator").unwrap();
+    }
     (manager, entry)
 }
 
@@ -173,7 +219,7 @@ fn runtime() -> asupersync::runtime::Runtime {
 #[cfg(unix)]
 #[test]
 fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_results() {
-    for mode in ["stdio", "http"] {
+    for mode in ["stdio", "http", "http-get"] {
         let temp = tempfile::tempdir().unwrap();
         let (config, _peer) = configured(temp.path(), mode);
         let (manager, entry) = manager(temp.path(), config);
@@ -193,7 +239,11 @@ fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_resul
             assert!([1, 2].contains(&count));
             assert!(!details["message"].as_str().unwrap().chars().any(char::is_control));
             updates.lock().unwrap().push(details);
-            std::fs::write(root.join(format!("ack-{count}")), "observed").unwrap();
+            let request: Value = serde_json::from_str(
+                &std::fs::read_to_string(root.join("request.json")).unwrap()
+            ).unwrap();
+            let id = request["id"].as_u64().unwrap();
+            std::fs::write(root.join(format!("ack-{id}-{count}")), "observed").unwrap();
         };
         runtime.block_on(owner.with_current(async {
             let result = tool.execute("call-1", json!({"_meta":{"progressToken":"model-literal"}}), Some(Box::new(callback))).await;
@@ -255,4 +305,70 @@ fn continuous_progress_does_not_restart_the_manager_deadline() {
         assert!(began.elapsed() < Duration::from_secs(5));
         assert!(observed.load(Ordering::SeqCst) > 0, "peer progress never reached the caller");
     }));
+}
+
+
+/// The mounted callback can stop its owning native turn. No second callback,
+/// successful result, reconnect or replay may escape the cancelled owner.
+#[cfg(unix)]
+#[test]
+fn a_live_progress_callback_can_cancel_its_native_call_without_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, _peer) = configured(temp.path(), "timeout");
+    let (manager, entry) = manager(temp.path(), config);
+    let runtime = runtime();
+    let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+    let callback_owner = owner.clone();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_by_callback = Arc::clone(&observed);
+    let callback = move |_update: ToolUpdate| {
+        observed_by_callback.fetch_add(1, Ordering::SeqCst);
+        callback_owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("stop after observing real server progress"),
+        );
+    };
+    let meta = McpToolMeta {
+        name: "work".to_string(), description: "Work".to_string(),
+        input_schema: json!({"type":"object"}), output_schema: None,
+    };
+    let tool = McpTool::new("progress", &meta, Arc::clone(&manager));
+    runtime.block_on(owner.with_current(async {
+        // Keep a reference to the actual connection so cleanup is observable
+        // even after cancellation removes the manager's published generation.
+        let (transport, _) = manager.prepare_tool_call(
+            &owner, &entry, "work", DEFAULT_MCP_TIMEOUT,
+        ).await.unwrap();
+        let result = tool.execute("cancelled-call", json!({}), Some(Box::new(callback))).await;
+        let alive = transport.is_alive();
+        transport.abort();
+        assert!(result.unwrap_err().to_string().contains("MCP_CANCELLED"));
+        assert!(!alive, "cancellation must retire this dispatched stdio request");
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+    }));
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    let calls = std::fs::read_to_string(temp.path().join("calls.jsonl")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "a cancelled call must not be replayed");
+}
+
+#[cfg(unix)]
+#[test]
+fn observing_progress_cannot_admit_an_untrusted_stdio_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, _peer) = configured(temp.path(), "stdio");
+    let manager = Arc::new(McpManager::new(temp.path(), temp.path(), McpDiscovery {
+        servers: vec![config], warnings: Vec::new(),
+    }));
+    let entry = manager.entry("progress").unwrap();
+    let runtime = runtime();
+    let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+    let result = runtime.block_on(owner.with_current(manager.call_tool_with_updates(
+        "progress", "work", json!({}), Some(Box::new(|_| panic!("untrusted progress"))),
+    )));
+    assert!(result.unwrap_err().to_string().contains("MCP_TRUST"));
+    assert!(McpManager::lock(&entry.transport).is_none());
+    assert!(!temp.path().join("request.json").exists());
+    assert!(!temp.path().join("calls.jsonl").exists());
 }

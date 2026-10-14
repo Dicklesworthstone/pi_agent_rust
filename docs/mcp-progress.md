@@ -75,18 +75,30 @@ completion verdict or permission to execute another operation.
 
 ## Validation status for this patch
 
-Seventeen Rust tests are authored, **not executed**. They cover correlation,
+Nineteen Rust tests are authored, **not executed**. They cover correlation,
 HTTP generation isolation, malformed and duplicate updates, integer precision,
 mailbox and delivery limits, escaping, waiter cleanup, result precedence,
 reentrant callbacks, abandoned/unpolled futures, and native mounted-tool
 stdio/HTTP workflows. The scripted peer withholds its final response until the
 actual tool callback acknowledges live progress; a separate native stdio case
-continues sending progress while the manager deadline expires. The public-path
-workflows are Unix-gated and require Python 3 only as a test fixture dependency.
+continues sending progress while the manager deadline expires. Additional native
+cases cancel the owning call from a live callback and reject an untrusted server
+before any progress or server execution. The public-path workflows are Unix-gated
+and require Python 3 only as a test fixture dependency. Stdio fixtures bind the
+resolved executable identity, matching the normal trust gate rather than relying
+on an insufficient fingerprint-only acknowledgement.
 
-HTTP POST SSE is exercised by the scripted-peer workflow. The common handler
-used by the optional GET stream has a generation-routing unit test; there is no
-claim of a full network-level GET-stream or third-party MCP server acceptance run.
+The mounted-tool workflow covers stdio, HTTP POST SSE, and an optional HTTP GET
+stream carrying notifications while the final result stays on its originating
+POST. Each acknowledged phase is scoped to the exact request ID. A separate
+unit test rejects notifications from obsolete HTTP receive generations.
+
+An independent probe executed the exact embedded Python peer and passed 23
+checks across those three transport modes: handshake/session headers, live
+acknowledgements before the final response, unchanged literal tool arguments,
+no progress for unobserved calls, and GET/DELETE cleanup. This validates the
+fixture's real process/socket behavior, **not** the Rust client, its cancellation
+or deadline enforcement, or interoperability with a third-party MCP server.
 
 The required `dsr quality --tool pi_agent_rust` command could not start because
 `dsr` was absent (exit 127). Rust compilation, tests, rustfmt and Clippy remain
