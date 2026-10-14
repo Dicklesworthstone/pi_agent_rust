@@ -25,6 +25,13 @@ Load again to execute an edited script; ordinary Python import caching still
 applies to its dependencies. Loads are limited to regular workspace files of
 at most 2 MiB. This admission check is not a sandbox for arbitrary eval code.
 
+A standalone `%pip install <requirements/options>` cell runs pip using this
+kernel's interpreter, without a shell or a replacement kernel. Installer
+stdout/stderr use the existing cell-owned output frames. The ordinary active
+cell timeout still applies; installations do not pause or extend it. Relative
+paths resolve from the original workspace. Package/build side effects are not
+rolled back, and already imported modules are not reloaded automatically.
+
 Tool re-entry bridge: cell code can call `tool.read(path)`, `tool.grep(...)`,
 `tool.find(...)`, `tool.ls(...)`, or `await tool.call("read", {"path": path})`.
 The kernel emits a {"bridge": {"call": m, "tool": ..., "input": {...}}} line
@@ -36,7 +43,9 @@ permissions and the tool whitelist remain owned by the host.
 import ast
 import asyncio
 import base64
+import codecs
 import contextvars
+import importlib
 import inspect
 import io
 import json
@@ -69,6 +78,7 @@ _CELL_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_CELL_LOOP)
 _CELL_CONTEXT = contextvars.copy_context()
 _WORKSPACE_ROOT = Path.cwd().resolve()
+_KERNEL_PYTHON = os.path.abspath(sys.executable)
 _MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 _DISPLAY_CONTEXT = contextvars.ContextVar("pi_eval_display", default=None)
 _MAX_DISPLAYS = 32
@@ -413,11 +423,106 @@ def _compile_cell(code, filename):
     return body, expression
 
 
+def _pip_arguments(code):
+    """Recognize one explicit install command; never interpret shell syntax."""
+    if not isinstance(code, str):
+        raise TypeError("cell code must be a string")
+    command = code.strip()
+    if not command or command.split(None, 1)[0] != "%pip":
+        return None
+    if "\n" in command or "\r" in command or "\x00" in command:
+        raise ValueError("EVAL_PIP_USAGE: %pip install must be a standalone cell without NUL bytes")
+    if len(command) > 16384 or len(command.encode("utf-8")) > 16384:
+        raise ValueError("EVAL_PIP_LIMIT: install command exceeds 16 KiB")
+    try:
+        arguments = shlex.split(command)
+    except ValueError as error:
+        raise ValueError("EVAL_PIP_USAGE: quote requirements and paths correctly") from error
+    if len(arguments) < 3 or arguments[:2] != ["%pip", "install"]:
+        raise ValueError("EVAL_PIP_USAGE: %pip install <requirements/options>; other pip commands are not supported")
+    if len(arguments) > 130 or any(not argument for argument in arguments[2:]):
+        raise ValueError("EVAL_PIP_LIMIT: use at most 128 nonempty install arguments")
+    return arguments[2:]
+
+
+async def _forward_pip_output(reader, output):
+    # Incremental decoding preserves code points split across pipe reads.
+    # communicate() would buffer the entire installation log in the kernel.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    while True:
+        chunk = await reader.read(8192)
+        if not chunk:
+            break
+        text = decoder.decode(chunk)
+        if text:
+            output.write(text)
+    final = decoder.decode(b"", final=True)
+    if final:
+        output.write(final)
+
+
+async def _install_python_packages(arguments):
+    # -I prevents a workspace pip.py/PYTHONPATH from replacing the installer.
+    # Pip itself retains its usual configuration and requested install options;
+    # this is not a sandbox, lockfile resolver or automatic environment manager.
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "utf-8:replace"
+    environment["PYTHONUNBUFFERED"] = "1"
+    print("EVAL_PIP_START: running pip with the retained Python interpreter", flush=True)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            _KERNEL_PYTHON, "-I", "-u", "-X", "utf8", "-m", "pip", "--disable-pip-version-check",
+            "--no-input", "--no-color", "install", *arguments,
+            cwd=str(_WORKSPACE_ROOT), env=environment,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            limit=65536,
+        )
+    except (OSError, NotImplementedError) as error:
+        raise RuntimeError("EVAL_PIP_START_FAILED: unable to start this interpreter's pip") from error
+    # The child inherits the kernel's process group/Windows Job. The Rust
+    # owner retires that tree on timeout, cancellation, or session shutdown.
+    readers = []
+    try:
+        readers.append(asyncio.create_task(_forward_pip_output(process.stdout, sys.stdout)))
+        readers.append(asyncio.create_task(_forward_pip_output(process.stderr, sys.stderr)))
+        await asyncio.gather(*readers)
+        status = await process.wait()
+    except BaseException:
+        # Also own cleanup for a Python task cancellation/output failure. Do
+        # not retain pump tasks that could resume against another cell's sink.
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+        await process.wait()
+        raise
+    finally:
+        # Failure may have installed some packages. Never promise rollback,
+        # replay .pth hooks, or discard/reload the caller's imported modules.
+        importlib.invalidate_caches()
+    if status != 0:
+        raise RuntimeError(
+            f"EVAL_PIP_FAILED: pip exited with code {status}; see installer output. "
+            "If pip is missing, provision it for PI_EVAL_PYTHON; no bootstrap was run. "
+            "Package changes already made are not rolled back."
+        )
+    print("EVAL_PIP_DONE: pip completed; import caches refreshed, existing modules retained", flush=True)
+
+
 async def _execute_cell(code, displays, output):
     global _CELL_CONTEXT
     display_token = _DISPLAY_CONTEXT.set(displays)
     output_token = _OUTPUT_CONTEXT.set(output)
     try:
+        install = _pip_arguments(code)
+        if install is not None:
+            await _install_python_packages(install)
+            return True, None, None
         source, filename, script_dir = _prepare_cell(code)
         body, expression = _compile_cell(source, filename)
         if script_dir is not None:
@@ -438,6 +543,12 @@ async def _execute_cell(code, displays, output):
         if expression.co_flags & inspect.CO_COROUTINE:
             value = await value
         return True, _result_text(value) if value is not None else None, None
+    except ModuleNotFoundError:
+        return False, None, _error_text() + (
+            "\nEVAL_PACKAGE_HINT: use a separate `%pip install <distribution>` cell "
+            "for this interpreter. Distribution and import names may differ "
+            "(for example, pillow provides PIL). Nothing was installed automatically.\n"
+        )
     except BaseException:  # noqa: BLE001 - SystemExit must not stop the loop
         return False, None, _error_text()
     finally:

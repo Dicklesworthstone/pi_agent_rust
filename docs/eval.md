@@ -142,8 +142,68 @@ checks detect observed changes during reading; they are not an atomic snapshot
 against a hostile concurrent writer or a security boundary for arbitrary code.
 
 `%load` must occupy the entire cell and take exactly one path. It never invokes
-a shell. `%pip`, `%bun`, JS file loading, and automatic dependency installation
-are not implemented by this Python command.
+a shell or installs dependencies. `%bun` is not a Python command.
+
+## Python packages with `%pip install`
+
+Install dependencies without replacing the retained Python process:
+
+```json
+{"kernel":"python","code":"%pip install pillow","timeout_secs":600}
+```
+
+Later cells can import installed packages while retaining variables, the asyncio
+loop and ContextVars. Only explicit standalone `%pip install` is supported; a
+missing import suggests this command but never installs anything automatically.
+Distribution and import names can differ, such as `pillow` and `PIL`.
+
+The launcher uses the kernel's captured interpreter, not a `pip` found on PATH.
+Python isolated mode prevents a workspace `pip.py` or `PYTHONPATH` from replacing
+the installer. Pip must already be installed in that interpreter's environment;
+user-site-only pip is not visible to isolated mode. Pi does not bootstrap pip,
+create a virtual environment, invoke a shell, or inject `--break-system-packages`.
+Select a suitable virtual-environment interpreter using `PI_EVAL_PYTHON` before
+starting the session. Pip's own configuration and the supplied install options
+still control package sources and destinations; this is not an installation
+sandbox, an approval bypass, or a reproducible dependency resolver.
+
+Requirements, wheels and option values use shell-style quoting, without shell
+execution. Relative paths always resolve from the original kernel workspace,
+even after `os.chdir()`. For example, an offline installation can use
+`%pip install --no-index --no-deps 'wheel house/example-1.0-py3-none-any.whl'`.
+The command is limited to 16 KiB and 128 nonempty install arguments. Requirements
+files remain pip inputs, not executable eval cells. Non-install subcommands,
+malformed quoting, multiline commands and NUL bytes are rejected.
+
+Installer stdout and stderr flow through the existing sequenced output capture,
+live `ToolUpdate` previews and console archives. They are consumed concurrently
+in bounded chunks, not accumulated in a second unbounded subprocess buffer.
+`EVAL_PIP_START` and `EVAL_PIP_DONE` identify launcher progress; a nonzero pip exit
+returns `EVAL_PIP_FAILED` with captured diagnostics, never a successful cell.
+Ordinary installer failures leave the namespace usable. There is no automatic
+retry, and a failed or interrupted install may have changed packages on disk.
+
+**The normal active cell timeout applies, including downloads and builds.**
+Unlike OMP's paused package watchdog, this implementation does not pause or
+extend the budget. Use an explicit `timeout_secs` for longer installs, up to the
+existing 600-second limit. Host timeout/cancellation retires the selected kernel
+and its owned process tree, including the installer. This loses Python variables
+but cannot roll back completed installation effects. Build hooks are ordinary
+package-manager code with the current user's privileges, not sandboxed scripts.
+
+Import discovery caches are refreshed after pip exits, including a failed exit
+that may have installed some dependencies. Already imported modules are not
+reloaded, `sys.path` is not rewritten, and `.pth` hooks are not replayed. An
+explicit `--target`, newly created user-site directory, editable installation or
+new import hook can require a deliberate path change or kernel reset before use.
+Package files remain on disk across a kernel reset; the reset only discards
+runtime state. An explicit `reset:true` applies before the Python command, even
+when that command later fails validation or installation.
+
+Offline integration regressions are in `tests/eval_python_packages.rs`; their
+inert wheel installs use private temporary targets, never the test interpreter's
+global package directory. Python-only subprocess probes establish kernel behavior,
+not Rust-host, cross-platform or DSR acceptance.
 
 ## Async JavaScript cells
 
