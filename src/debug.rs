@@ -7,6 +7,7 @@ pub mod dap;
 mod ownership;
 mod remote;
 pub mod session;
+mod terminal;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -134,6 +135,10 @@ impl DebugTool {
         if input.go_mode.is_some() && adapter.id != "dlv" {
             return Err(tool_err("DAP_USAGE", "goMode requires the dlv adapter"));
         }
+        let terminal = input.run_in_terminal.unwrap_or(false);
+        if terminal && !matches!(adapter.id.as_str(), "debugpy" | "lldb-dap") {
+            return Err(tool_err("DAP_UNSUPPORTED", "runInTerminal supports local debugpy and lldb-dap launches"));
+        }
         if program.as_ref().is_some_and(|path| path.is_dir()) && adapter.id != "dlv" {
             return Err(tool_err(
                 "DAP_USAGE",
@@ -175,6 +180,16 @@ impl DebugTool {
         }
         if let Some(mode) = &input.go_mode {
             arguments["mode"] = json!(mode);
+        }
+        if terminal {
+            arguments["console"] = json!("integratedTerminal");
+            if adapter.id == "lldb-dap" {
+                // Older LLDB-DAP versions use this spelling instead of console.
+                arguments["runInTerminal"] = json!(true);
+            } else {
+                arguments["redirectOutput"] = json!(false);
+                arguments["subProcess"] = json!(false);
+            }
         }
         let mut artifacts = None;
         if adapter.id == "dlv"
@@ -219,9 +234,11 @@ impl DebugTool {
         } else {
             dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &self.cwd)?
         };
-        let session = DapSession::begin(transport)
-            .await?
-            .with_launch_artifacts(artifacts);
+        let session = if terminal {
+            DapSession::begin_with_terminal(transport, &self.cwd).await?
+        } else {
+            DapSession::begin(transport).await?
+        }.with_launch_artifacts(artifacts);
         let timeout_ms = input.startup_timeout_ms.unwrap_or(120_000);
         session
             .start(
@@ -395,7 +412,11 @@ impl DebugTool {
                 session.invalidate_inspection()?;
                 json!({"command":command,"result":session.call(command,input.payload.clone().unwrap_or_else(||json!({}))).await?})
             }
-            "output" => json!({"tail":session.output_tail()}),
+            "output" => json!({"tail":session.output_tail(),"execution":session.execution_snapshot()}),
+            "terminal_input" => session.terminal_input(
+                input.text.as_deref().ok_or_else(|| tool_err("DAP_USAGE", "terminal_input requires text"))?,
+                input.enter.unwrap_or(true),
+            ).await?,
             "terminate" | "disconnect" => {
                 let terminate = input.action == "terminate";
                 let result = session.disconnect(terminate).await;
@@ -813,6 +834,9 @@ struct DebugInput {
     initial_breakpoints: Option<Vec<breakpoints::SourceInput>>,
     exception_filters: Option<Vec<String>>,
     stop_on_entry: Option<bool>,
+    run_in_terminal: Option<bool>,
+    text: Option<String>,
+    enter: Option<bool>,
 }
 
 impl DebugInput {
@@ -844,6 +868,18 @@ impl DebugInput {
 
     fn validate(&self) -> Result<()> {
         self.remote.validate(self)?;
+        if self.run_in_terminal.is_some() && self.action != "launch" {
+            return Err(tool_err("DAP_USAGE", "runInTerminal is local-launch-only"));
+        }
+        if self.action == "terminal_input" {
+            if self.text.as_ref().is_none_or(|text| {
+                text.len() > 1024 || text.contains('\0') || (text.is_empty() && !self.enter.unwrap_or(true))
+            }) {
+                return Err(tool_err("DAP_USAGE", "terminal_input requires NUL-free text of at most 1024 UTF-8 bytes"));
+            }
+        } else if self.text.is_some() || self.enter.is_some() {
+            return Err(tool_err("DAP_USAGE", "text and enter are terminal_input-only"));
+        }
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > 1_000_000)
@@ -950,7 +986,7 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority."
     }
     fn parameters(&self) -> Value {
         remote::schema(json!({
@@ -961,7 +997,7 @@ impl Tool for DebugTool {
                     "data_breakpoint_info","set_data_breakpoint","remove_data_breakpoint","list_breakpoints","set_exception_breakpoints",
                     "continue","step_over","step_in","step_out","pause","evaluate","stack_trace","threads","scopes","variables",
                     "exception_info","set_variable","set_expression","disassemble","read_memory","write_memory","modules",
-                    "loaded_sources","custom_request","output","terminate","disconnect","sessions"]},
+                    "loaded_sources","custom_request","output","terminal_input","terminate","disconnect","sessions"]},
                 "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
@@ -992,6 +1028,9 @@ impl Tool for DebugTool {
                 "filter":{"type":"string","enum":["named","indexed"]},
                 "command":{"type":"string"}, "payload":{"type":"object"},
                 "stopOnEntry":{"type":"boolean","default":true},
+                "runInTerminal":{"type":"boolean","default":false,"description":"Local launch only: use a real host-owned PTY with debugpy/lldb-dap; no external terminal window or child-session debugging"},
+                "text":{"type":"string","maxLength":1024,"description":"terminal_input text, at most 1024 UTF-8 bytes; no implicit shell"},
+                "enter":{"type":"boolean","default":true,"description":"terminal_input: append carriage return after text"},
                 "exceptionFilters":{"type":"array","maxItems":64,"items":{"type":"string"}},
                 "initialBreakpoints":{"type":"array","maxItems":1024,
                     "items":{"type":"object","required":["file","line"],"additionalProperties":false,

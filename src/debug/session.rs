@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::breakpoints::{self, Change, Group, Store};
 use super::dap::{DapError, DapEvent, DapTransport};
+use super::terminal::TerminalHost;
 use super::tool_err;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
@@ -87,17 +88,33 @@ pub struct DapSession {
     state: Mutex<State>,
     pub(super) breakpoints: Arc<asupersync::sync::Mutex<Store>>,
     inspection: Arc<asupersync::sync::Mutex<inspection::Handles>>,
+    terminal: Option<Arc<TerminalHost>>,
     launch_artifacts: Option<tempfile::TempDir>,
 }
 
 impl DapSession {
     pub async fn begin(transport: DapTransport) -> Result<Self> {
+        Self::begin_inner(transport, None).await
+    }
+
+    /// Only the explicit local-launch path calls this. External/PID attach
+    /// retains begin(), and never advertises local process-launch authority.
+    pub(super) async fn begin_with_terminal(
+        transport: DapTransport,
+        workspace: &std::path::Path,
+    ) -> Result<Self> {
+        let terminal = TerminalHost::new(workspace, transport.connection_liveness())?;
+        Self::begin_inner(transport, Some(terminal)).await
+    }
+
+    async fn begin_inner(transport: DapTransport, terminal: Option<Arc<TerminalHost>>) -> Result<Self> {
         let capabilities = transport.request("initialize", json!({
             "clientID": "pi_agent_rust", "clientName": "pi_agent_rust", "adapterID": "pi-dap",
             "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path",
             "supportsVariableType": true, "supportsVariablePaging": true,
             "supportsInvalidatedEvent": true,
-            "supportsRunInTerminalRequest": false, "supportsStartDebuggingRequest": false
+            "supportsRunInTerminalRequest": terminal.is_some(),
+            "supportsArgsCanBeInterpretedByShell": false, "supportsStartDebuggingRequest": false
         }), DEFAULT_DAP_TIMEOUT).await?;
         if !capabilities.is_object() {
             return Err(tool_err(
@@ -118,6 +135,7 @@ impl DapSession {
             }),
             breakpoints: Arc::new(asupersync::sync::Mutex::new(Store::default())),
             inspection: Arc::new(asupersync::sync::Mutex::new(inspection::Handles::default())),
+            terminal,
             launch_artifacts: None,
         })
     }
@@ -171,6 +189,9 @@ impl DapSession {
         if let Some(fault) = &fault {
             snapshot["fault"] = json!(fault);
         }
+        if let Some(terminal) = &self.terminal {
+            snapshot["terminal"] = terminal.snapshot();
+        }
         snapshot
     }
 
@@ -181,7 +202,18 @@ impl DapSession {
     #[must_use]
     pub fn output_tail(&self) -> String {
         self.pump_events();
-        self.transport.stderr_tail()
+        let mut text = self.transport.stderr_tail();
+        if let Some(terminal) = &self.terminal {
+            text.push_str("\n[debuggee terminal]\n");
+            text.push_str(&terminal.output());
+        }
+        text
+    }
+
+    pub(super) async fn terminal_input(&self, text: &str, enter: bool) -> Result<Value> {
+        self.terminal.as_ref()
+            .ok_or_else(|| tool_err("DAP_TERMINAL_NOT_STARTED", "this debugger has no host-owned terminal"))?
+            .send(text, enter).await
     }
 
     #[must_use]
@@ -233,6 +265,9 @@ impl DapSession {
                 "startup timeout must be in 1..=300000 ms",
             ));
         }
+        if self.terminal.is_some() && command != "launch" {
+            return Err(tool_err("DAP_TERMINAL_DENIED", "terminal host is local-launch-only"));
+        }
         Self::lock(&self.state).origin = Some(origin);
         let configure = async {
             self.wait_initialized_for(timeout).await?;
@@ -274,12 +309,15 @@ impl DapSession {
         };
         let operation = async {
             let launch = async {
-                self.transport
-                    .request(command, arguments, timeout)
-                    .await
-                    .map_err(crate::error::Error::from)
+                let response = if let Some(terminal) = &self.terminal {
+                    self.transport.request_with_reverse(command, arguments, timeout, terminal.handler()).await
+                } else {
+                    self.transport.request(command, arguments, timeout).await
+                };
+                response.map_err(crate::error::Error::from)
             };
             futures::future::try_join(launch, configure).await?;
+            if let Some(terminal) = &self.terminal { terminal.require_started()?; }
             self.pump_events();
             Self::lock(&self.state).check()?;
             Ok(())

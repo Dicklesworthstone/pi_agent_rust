@@ -320,6 +320,13 @@ impl DapTransport {
         self.frames_read.load(Ordering::SeqCst)
     }
 
+    /// A terminal owner observes connection retirement without retaining the
+    /// transport itself. The closure cannot send messages or select a target.
+    pub(super) fn connection_liveness(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let life = Arc::clone(&self.life);
+        Arc::new(move || life.alive.load(Ordering::SeqCst))
+    }
+
     #[must_use]
     pub fn is_alive(&self) -> bool {
         if !self.life.alive.load(Ordering::SeqCst) {
