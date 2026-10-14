@@ -10,6 +10,7 @@
 pub mod config;
 mod content;
 pub mod manager;
+pub mod progress;
 pub mod transport;
 pub mod trust;
 mod uri_template;
@@ -142,11 +143,11 @@ impl Tool for McpTool {
         &self,
         _tool_call_id: &str,
         input: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> crate::error::Result<ToolOutput> {
         let result = self
             .manager
-            .call_tool(&self.server, &self.tool_name, input)
+            .call_tool_with_updates(&self.server, &self.tool_name, input, on_update)
             .await?;
         Ok(mcp_result_to_output(&result))
     }

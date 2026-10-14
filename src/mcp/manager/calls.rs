@@ -9,11 +9,16 @@ use super::{
     Value, catalog, is_indeterminate_call_delivery, tool_err,
 };
 use crate::agent_cx::AgentCx;
+use crate::mcp::progress::{self, ProgressSubscription};
 use crate::mcp::transport::RequestDispatch;
+use crate::tools::ToolUpdate;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+#[cfg(all(test, unix))]
+mod progress_tests;
 
 /// Setup and recovery include more than JSON-RPC requests: lock admission,
 /// secret resolution, initialization notifications and receive activation can
@@ -399,6 +404,23 @@ impl McpManager {
     /// transport, or server errors. An abandoned/superseded call may already
     /// have had remote side effects; output-contract errors are not replayed.
     pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
+        self.call_tool_with_updates(server, tool, arguments, None).await
+    }
+
+    /// Execute through the normal call lifecycle while reporting bounded,
+    /// advisory progress. The observer runs on the initiating task, never on
+    /// a transport reader, and cannot extend the call's absolute deadline.
+    ///
+    /// # Errors
+    /// Returns the same admission, execution and output-contract errors as
+    /// `call_tool`; progress never authorizes replay or substitutes a result.
+    pub async fn call_tool_with_updates(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         // Reject an attenuated/cancelled caller before setup can resolve
         // secrets, run a command, or open a connection.
@@ -422,6 +444,7 @@ impl McpManager {
                         &arguments,
                         DEFAULT_MCP_TIMEOUT,
                         contract.output_schema,
+                        on_update.as_deref(),
                     )
                     .await
                 {
@@ -481,11 +504,11 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        self.execute_tool_call(entry, transport, tool, arguments, timeout, None)
+        self.execute_tool_call(entry, transport, tool, arguments, timeout, None, None)
             .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_tool_call(
         &self,
         entry: &Arc<ServerEntry>,
@@ -494,6 +517,7 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
         output_schema: Option<super::McpOutputSchema>,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         catalog::check_request_owner(&owner)?;
@@ -529,18 +553,39 @@ impl McpManager {
             dispatch: Arc::new(RequestDispatch::new()),
             armed: true,
         };
+        let progress = on_update
+            .and_then(|_| transport.progress_registry())
+            .and_then(|registry| {
+                registry.subscribe(Arc::clone(&guard.dispatch), transport.progress_generation())
+            });
+        let generation = progress.as_ref().map(ProgressSubscription::generation);
+        let mut params = serde_json::json!({"name": tool, "arguments": arguments});
+        if let Some(progress) = &progress {
+            // This is request metadata, never a model-supplied tool argument.
+            params["_meta"] = serde_json::json!({"progressToken": progress.token()});
+        }
         let result = catalog::operation_with_owner(
             &owner,
-            async {
-                transport
-                    .request_with_dispatch(
-                        "tools/call",
-                        serde_json::json!({"name": tool, "arguments": arguments}),
-                        timeout,
-                        Arc::clone(&guard.dispatch),
-                    )
-                    .await
-            },
+            progress::observe(
+                transport.request_with_dispatch(
+                    "tools/call",
+                    params,
+                    timeout,
+                    Arc::clone(&guard.dispatch),
+                ),
+                progress,
+                on_update,
+                || {
+                    catalog::check_request_owner(&owner).is_ok()
+                        && self.check_running().is_ok()
+                        && is_current(entry, transport)
+                        && transport.is_alive()
+                        && self.check_trust(entry).is_ok()
+                        && generation.is_none_or(|expected| {
+                            transport.progress_generation() == expected
+                        })
+                },
+            ),
             timeout,
         )
         .await

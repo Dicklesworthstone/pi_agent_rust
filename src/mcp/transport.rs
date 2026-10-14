@@ -23,6 +23,10 @@ use crate::lsp::jsonrpc::{
     CompletionWaitError, MCP_ENV_ALLOWLIST, PublicTailBuffer, RpcErrorObject, await_completion,
 };
 use crate::tools::{ProcessCleanupMode, ProcessGuard};
+use super::progress::ProgressRegistry;
+
+#[cfg(test)]
+mod progress_tests;
 
 /// Default per-request timeout for MCP calls.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +49,16 @@ fn tool_err(code: &str, message: impl Into<String>) -> Error {
 /// One transport connection to an MCP server.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
+    /// Optional, connection-owned progress router. Existing custom transports
+    /// remain valid without an observer and receive no progress token.
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        None
+    }
+    /// Logical protocol-session generation used to isolate progress across
+    /// in-place HTTP session renewal. A stdio connection has one generation.
+    fn progress_generation(&self) -> u64 {
+        0
+    }
     /// Send a request and await its response.
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value>;
     /// Send with a manager-owned dispatch lease. A transport that queues work
@@ -119,6 +133,11 @@ impl RequestDispatch {
 
     pub(crate) const fn new() -> Self {
         Self(AtomicU8::new(Self::QUEUED))
+    }
+
+    /// Observation cannot promote queued or revoked work to dispatched work.
+    pub(crate) fn is_claimed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::CLAIMED
     }
 
     /// Claim permission immediately before dispatch. A false result forbids
@@ -426,7 +445,7 @@ fn route_stdio_message(
             ));
         }
         let Some(id) = id else {
-            return Ok(()); // Valid server notification; no consumer in v1.
+            return Ok(()); // Valid notification; the reader routes progress.
         };
         if !valid_server_request_id(id) {
             return Err(McpStdioError::Protocol(
@@ -682,11 +701,12 @@ fn classify_read_error(error: &std::io::Error) -> McpStdioError {
 }
 
 // Ownership is part of the call contract here.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn reader_loop(
     stdout: std::process::ChildStdout,
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
+    progress: std::sync::Arc<ProgressRegistry>,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
     tree_cleanup_state: std::sync::Arc<Mutex<TreeCleanupState>>,
@@ -708,6 +728,7 @@ fn reader_loop(
                     );
                     return;
                 }
+                progress.publish(&message, 0);
             }
             Ok(None) => {
                 stop_reader_connection(
@@ -770,6 +791,7 @@ struct McpStdioClient {
     pid: u32,
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
+    progress: std::sync::Arc<ProgressRegistry>,
     next_id: AtomicU64,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
@@ -838,6 +860,7 @@ impl McpStdioClient {
         };
 
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let progress = std::sync::Arc::new(ProgressRegistry::default());
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
         let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
@@ -878,6 +901,7 @@ impl McpStdioClient {
         let reader_thread = {
             let writer_tx = writer_tx.clone();
             let pending = std::sync::Arc::clone(&pending);
+            let progress = std::sync::Arc::clone(&progress);
             let alive = std::sync::Arc::clone(&alive);
             let closing = std::sync::Arc::clone(&closing);
             let tree_cleanup_state = std::sync::Arc::clone(&tree_cleanup_state);
@@ -888,6 +912,7 @@ impl McpStdioClient {
                         stdout,
                         writer_tx,
                         pending,
+                        progress,
                         alive,
                         closing,
                         tree_cleanup_state,
@@ -941,6 +966,7 @@ impl McpStdioClient {
             pid,
             writer_tx,
             pending,
+            progress,
             next_id: AtomicU64::new(1),
             alive,
             closing,
@@ -1205,6 +1231,10 @@ impl StdioTransport {
 
 #[async_trait]
 impl McpTransport for StdioTransport {
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        Some(&self.rpc.progress)
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.request_with_dispatch(
             method,
@@ -1358,6 +1388,7 @@ pub struct HttpTransport {
     url: String,
     headers: Vec<(String, String)>,
     session: Mutex<HttpSessionState>,
+    progress: std::sync::Arc<ProgressRegistry>,
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
     listener_started: AtomicBool,
@@ -1682,6 +1713,7 @@ impl HttpTransport {
             url: url.to_string(),
             headers,
             session: Mutex::new(HttpSessionState::default()),
+            progress: std::sync::Arc::new(ProgressRegistry::default()),
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
             listener_started: AtomicBool::new(false),
@@ -2466,9 +2498,12 @@ impl HttpTransport {
                 ));
             }
             let Some(id) = object.get("id") else {
-                // Notifications do not require a response. Optional client
-                // features are not advertised by this transport today, so
-                // no notification dispatch is required at this layer.
+                // Both POST SSE and the optional GET stream reach this path.
+                // Match the receiving stream's generation, not the latest
+                // session: an old stream must not address a new subscription.
+                if method == "notifications/progress" {
+                    self.progress.publish(&value, wire_state.generation);
+                }
                 return Ok(None);
             };
             if !matches!(id, Value::Number(_) | Value::String(_)) {
@@ -2993,6 +3028,14 @@ fn parse_sse_responses(body: &str, expected_id: u64) -> Result<Value> {
 
 #[async_trait]
 impl McpTransport for HttpTransport {
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        Some(&self.progress)
+    }
+
+    fn progress_generation(&self) -> u64 {
+        self.session_generation()
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let _lane =
@@ -3404,6 +3447,7 @@ pub(crate) mod tests {
                 pid,
                 writer_tx,
                 pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
+                progress: std::sync::Arc::new(ProgressRegistry::default()),
                 next_id: AtomicU64::new(1),
                 alive: std::sync::Arc::new(AtomicBool::new(true)),
                 closing: std::sync::Arc::new(AtomicBool::new(false)),
@@ -5381,7 +5425,7 @@ pub(crate) mod tests {
     fn streamable_http_dropped_initialize_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
         let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+            HttpTransport::new(&server.url(), Vec::new()).expect("transport"),
         );
         let runtime = runtime_for_tests();
         runtime.block_on(async {
@@ -5415,7 +5459,7 @@ pub(crate) mod tests {
     fn streamable_http_dropped_initialized_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
         let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
+            HttpTransport::new(&server.url(), Vec::new()).expect("transport"),
         );
         transport
             .capture_initialize_state(
