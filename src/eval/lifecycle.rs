@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-mod source;
+pub(super) mod source;
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -181,7 +181,8 @@ impl EvalTool {
             Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout, &mut capture)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
-                wait_owned(&owner, Some(deadline), self.run_js_cell(code, timeout, &mut capture)).await
+                let filename = prepared.as_ref().map(|file| file.path.as_str());
+                wait_owned(&owner, Some(deadline), self.run_js_cell(code, filename, timeout, &mut capture)).await
             }
         };
         let interrupted = outcome.is_err();
@@ -237,8 +238,8 @@ impl EvalTool {
             }
         }
         if let Some(file) = prepared.as_ref().filter(|_| output.is_error) {
-            // The embedded engine still uses its ordinary eval stack labels;
-            // report the inspected file without claiming a module loader.
+            // Keep the inspected entry path visible even when a nested module
+            // supplies the failing stack frame.
             output.content.insert(0, ContentBlock::Text(TextContent::new(format!(
                 "EVAL_LOAD: error executing {}\n", serde_json::to_string(&file.path)?
             ))));

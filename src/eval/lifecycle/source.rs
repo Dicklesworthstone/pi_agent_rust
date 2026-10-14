@@ -1,4 +1,4 @@
-//! Host-side admission for JavaScript `%load` cells. No shell or module loader.
+//! Shared bounded file admission for JavaScript `%load` cells and ES modules.
 
 use crate::error::{Error, Result};
 use std::io::Read as _;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 
-pub(super) struct Source {
+pub(in crate::eval) struct Source {
     pub code: String,
     pub path: String,
 }
@@ -56,7 +56,9 @@ pub(super) async fn load(cwd: PathBuf, path: PathBuf) -> Result<Source> {
     asupersync::runtime::spawn_blocking_io(move || load_sync(&cwd, &path)).await
 }
 
-fn load_sync(cwd: &Path, path: &Path) -> Result<Source> {
+// Callers own authority and cancellation admission. Module reads run on the
+// existing dedicated kernel thread, not on an async executor worker.
+pub(in crate::eval) fn load_sync(cwd: &Path, path: &Path) -> Result<Source> {
     let root = std::fs::canonicalize(cwd).map_err(|error| failure("PATH", error))?;
     let requested = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
     let path = std::fs::canonicalize(requested).map_err(|error| failure("PATH", error))?;

@@ -1,8 +1,8 @@
 //! Persistent JavaScript kernel for the eval tool (bd-cv653.1.4).
 //!
 //! A dedicated OS thread owns a **sync** QuickJS `Runtime` + `Context` — a
-//! separate trust domain from the extension realm (`extensions_js`), with no
-//! module loader and no extension hostcalls. Cells evaluate as scripts (the
+//! separate trust domain from the extension realm (`extensions_js`), with a
+//! workspace-only ES module loader and no extension hostcalls. Cells evaluate as scripts (the
 //! completion value of the last statement returns, REPL-style), `console.*`
 //! output streams through an invocation-owned bounded channel, globals persist
 //! across cells, and top-level promises settle by pumping pending jobs.
@@ -17,6 +17,7 @@
 
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +28,7 @@ mod async_host;
 mod console;
 mod display;
 mod evaluate;
+mod modules;
 #[cfg(test)]
 mod evaluation_tests;
 
@@ -36,6 +38,8 @@ pub struct JsCellRequest {
     pub deadline: Instant,
     pub reply: Sender<JsCellResponse>,
     pub output: Option<SyncSender<Value>>,
+    pub filename: Option<String>,
+    pub owner: crate::agent_cx::AgentCx,
 }
 
 /// Cell outcome from the kernel thread.
@@ -63,14 +67,22 @@ pub struct JsKernel {
 }
 
 impl JsKernel {
+    #[cfg(test)]
     pub fn spawn() -> std::io::Result<Self> {
+        Self::spawn_in(&std::env::current_dir()?)
+    }
+
+    pub fn spawn_in(cwd: &Path) -> std::io::Result<Self> {
+        // Freeze relative workspace spelling now, not on a later worker poll.
+        // Canonicalization and all actual file reads require a cell owner.
+        let workspace = std::path::absolute(cwd)?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<JsCellRequest>();
         let (bridge_tx, bridge_rx) = std::sync::mpsc::channel::<JsBridgeRequest>();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         std::thread::Builder::new()
             .name("eval-js-kernel".into())
-            .spawn(move || kernel_thread(&req_rx, &bridge_tx, worker_stopped))?;
+            .spawn(move || kernel_thread(&req_rx, &bridge_tx, worker_stopped, workspace))?;
         Ok(Self {
             requests: req_tx,
             bridge: bridge_rx,
@@ -91,9 +103,20 @@ impl JsKernel {
 
     /// The output sender belongs to this request alone and closes before its
     /// final reply. Revoking the kernel also interrupts blocked output delivery.
+    #[cfg(test)]
     pub fn submit_with_output(
         &self,
         code: String,
+        deadline: Instant,
+        output: Option<SyncSender<Value>>,
+    ) -> Result<Receiver<JsCellResponse>, String> {
+        self.submit_source_with_output(code, None, deadline, output)
+    }
+
+    pub fn submit_source_with_output(
+        &self,
+        code: String,
+        filename: Option<String>,
         deadline: Instant,
         output: Option<SyncSender<Value>>,
     ) -> Result<Receiver<JsCellResponse>, String> {
@@ -104,6 +127,8 @@ impl JsKernel {
                 deadline,
                 reply: reply_tx,
                 output,
+                filename,
+                owner: crate::agent_cx::AgentCx::for_current_or_request(),
             })
             .map_err(|_| String::from("kernel thread gone"))?;
         Ok(reply_rx)
@@ -144,12 +169,15 @@ fn kernel_thread(
     requests: &Receiver<JsCellRequest>,
     bridge_tx: &Sender<JsBridgeRequest>,
     stopped: Arc<AtomicBool>,
+    workspace: PathBuf,
 ) {
     // A timed-out realm may still contain promise continuations. Rebuild it
     // before another cell rather than running old work under a new deadline.
     loop {
         if stopped.load(Ordering::SeqCst) { return; }
         let Ok(runtime) = rquickjs::Runtime::new() else { return; };
+        let modules = modules::ModuleFiles::new(workspace.clone(), Arc::clone(&stopped));
+        runtime.set_loader(modules.clone(), modules.clone());
         let Ok(context) = rquickjs::Context::full(&runtime) else { return; };
         let origin = Instant::now();
         let deadline = DeadlineCell::new(Arc::clone(&stopped));
@@ -168,6 +196,7 @@ fn kernel_thread(
         while let Ok(mut request) = requests.recv() {
             if stopped.load(Ordering::SeqCst) { return; }
             deadline.set(request.deadline, origin);
+            modules.begin(request.owner.clone(), request.deadline);
             host.begin(request.deadline);
             displays.begin();
             console.borrow_mut().begin(request.output.take());
@@ -192,6 +221,7 @@ fn kernel_thread(
             // Cleanup uses captured built-ins only, not arbitrary guest code.
             deadline.clear();
             let cleanup_failed = context.with(|ctx| host.finish(&ctx)).is_err();
+            modules.finish();
             rebuild = expired || console_failed || cleanup_failed || runtime.is_job_pending();
             if rebuild {
                 response.ok = false;
@@ -282,7 +312,7 @@ fn run_cell(
     let phase1 = context.with(|ctx| {
         // Select the grammar before executing any user statements. A runtime
         // SyntaxError (including JSON.parse failures) never retries the cell.
-        let evaluated = evaluator.evaluate(&ctx, &request.code);
+        let evaluated = evaluator.evaluate(&ctx, &request.code, request.filename.as_deref());
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
             Ok(value) => rquickjs::Promise::from_value(value.clone()).map_or_else(

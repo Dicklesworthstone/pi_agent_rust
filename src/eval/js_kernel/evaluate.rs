@@ -26,6 +26,7 @@ impl Evaluator {
         &self,
         ctx: &Ctx<'js>,
         code: &str,
+        filename: Option<&str>,
     ) -> rquickjs::Result<Value<'js>> {
         let constructor = self.compile_body.clone().restore(ctx)?;
         // Hashbangs are valid only at the start of a script, not a function
@@ -53,6 +54,9 @@ impl Evaluator {
         };
         let mut options = rquickjs::context::EvalOptions::default();
         options.promise = needs_async;
+        // Preserve the real origin for stacks and dynamic imports, including
+        // functions defined by this script and invoked in later cells.
+        options.filename = filename.map(str::to_owned);
         ctx.eval_with_options(code.as_bytes(), options)
     }
 }

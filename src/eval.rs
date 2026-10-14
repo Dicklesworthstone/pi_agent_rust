@@ -194,6 +194,7 @@ impl EvalTool {
     async fn run_js_cell(
         &self,
         code: &str,
+        filename: Option<&str>,
         timeout: Duration,
         capture: &mut output::Capture,
     ) -> Result<ToolOutput> {
@@ -209,14 +210,14 @@ impl EvalTool {
             kernel
         } else {
             restarted = true;
-            js_kernel::JsKernel::spawn()
+            js_kernel::JsKernel::spawn_in(&self.cwd)
                 .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
         };
         let deadline = Instant::now() + timeout;
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let (output_tx, output_rx) = std::sync::mpsc::sync_channel(JS_OUTPUT_QUEUE);
         let reply_rx = kernel
-            .submit_with_output(code.to_string(), deadline, Some(output_tx))
+            .submit_source_with_output(code.to_string(), filename.map(str::to_owned), deadline, Some(output_tx))
             .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
 
         let mut response = loop {
@@ -546,7 +547,10 @@ impl Tool for EvalTool {
          Both kernels stream stdout/stderr live; large console output retains a \
          labelled bounded head/tail rather than filling session memory. \
          Set output_path to a new workspace-relative .jsonl file to retain \
-         complete received console frames on disk (64 MiB encoded limit)."
+         complete received console frames on disk (64 MiB encoded limit). \
+         JavaScript can await import('./helper.js') for local .js/.mjs ES modules \
+         inside this workspace; imports in %load scripts resolve beside the script. \
+         Module state is cached until reset. No package, network or Node imports."
     }
 
     fn parameters(&self) -> Value {
