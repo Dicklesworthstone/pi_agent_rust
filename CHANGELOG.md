@@ -24,6 +24,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   lets `tar` decide and reports a missing `xz` only when extraction fails
   ([#263](https://github.com/Dicklesworthstone/pi_agent_rust/issues/263)).
   The fix is in the installer on `main`, so it applies to every release.
+- **Installer on Ubuntu 22.04 and Debian 12.** `install.sh` matched SHA-256
+  digests with the awk pattern `/^[0-9a-fA-F]{64}$/`. The default awk on
+  those systems, mawk 1.3.4 20200120, has no interval expressions, so the
+  pattern never matched and every install stopped with "Checksum sidecar for
+  pi-linux-amd64.tar.xz does not contain one usable SHA-256 digest". The
+  installer now checks the length and the characters separately, and
+  `tests/installer_regression.sh` rejects interval expressions in its awk
+  and grep patterns
+  ([#265](https://github.com/Dicklesworthstone/pi_agent_rust/issues/265)).
 
 ## [v0.8.0] — 2026-10-13 — Release
 

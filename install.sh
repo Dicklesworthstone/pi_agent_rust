@@ -1856,9 +1856,13 @@ verify_download_checksum() {
     fi
   fi
 
+  # A SHA-256 digest field is 64 hex characters. The awk programs below test
+  # the length and the character class separately: mawk 1.3.4 before 2024
+  # (Ubuntu 22.04, Debian 12) has no interval expressions, so `{64}` in an
+  # awk regex never matches there.
   if [ -z "$expected" ]; then
     expected=$(awk -v name="$asset_name" '
-      $1 ~ /^[0-9a-fA-F]{64}$/ {
+      length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {
         file=$2
         sub(/^\*/, "", file)
         sub(/^\.\//, "", file)
@@ -1872,9 +1876,9 @@ verify_download_checksum() {
     if [ -z "$expected" ]; then
       if [ "$checksum_source_kind" != "release-manifest" ]; then
         local checksum_count checksum_entry_name
-        checksum_count=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { c += 1 } END { print c + 0 }' "$checksum_file")
+        checksum_count=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { c += 1 } END { print c + 0 }' "$checksum_file")
         if [ "$checksum_count" -eq 1 ]; then
-          checksum_entry_name=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ {
+          checksum_entry_name=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {
             file=$2
             sub(/^\*/, "", file)
             sub(/^\.\//, "", file)
@@ -1882,7 +1886,7 @@ verify_download_checksum() {
             exit
           }' "$checksum_file")
           if [ -z "$checksum_entry_name" ]; then
-            expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+            expected=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print $1; exit }' "$checksum_file")
           fi
         fi
       fi

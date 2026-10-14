@@ -704,6 +704,22 @@ require_tar_reading_xz_without_an_xz_program() {
   return 0
 }
 
+# mawk 1.3.4 before 2024, the default awk of Ubuntu 22.04 and Debian 12, has
+# no interval expressions: `/^[0-9a-f]{64}$/` silently never matches there,
+# and the installer then rejected every release checksum on those systems.
+# The cases below run with the host's awk (gawk or BSD awk, which have
+# intervals), so they cannot catch this; check the source instead. Bash's own
+# `[[ ... =~ ... ]]` supports intervals and is allowed.
+test_installer_regexes_avoid_interval_expressions() {
+  local hits
+  hits="$(grep -nE '\]\{[0-9]+(,[0-9]*)?\}' "${INSTALLER}" | grep -v '=~' || true)"
+  if [ -n "$hits" ]; then
+    echo "install.sh uses regex interval expressions outside bash =~ tests:" >&2
+    printf '%s\n' "$hits" >&2
+    return 1
+  fi
+}
+
 test_help_lists_installer_flags() {
   local dir
   dir="$(case_dir "help-flags")"
@@ -2992,6 +3008,7 @@ main() {
     exit 0
   fi
 
+  run_test test_installer_regexes_avoid_interval_expressions
   run_test test_help_lists_installer_flags
   run_test test_release_publish_no_verify_is_secret_scoped
   run_test test_installer_retain_temp_mode_preserves_owned_scratch
