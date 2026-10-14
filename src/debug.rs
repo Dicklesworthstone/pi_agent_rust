@@ -5,6 +5,7 @@ pub mod adapters;
 mod breakpoints;
 pub mod dap;
 mod ownership;
+mod remote;
 pub mod session;
 
 use std::path::{Path, PathBuf};
@@ -90,6 +91,9 @@ impl DebugTool {
             ));
         }
         self.require_debug_capacity()?;
+        if input.remote.port.is_some() {
+            return self.run_remote_start(input).await;
+        }
         let program = if input.action == "launch" {
             let name = input.required("program", input.program.as_deref())?;
             let path = std::fs::canonicalize(self.cwd.join(name)).map_err(|error| {
@@ -772,6 +776,8 @@ impl DebugTool {
 #[serde(rename_all = "camelCase")]
 struct DebugInput {
     action: String,
+    #[serde(flatten)]
+    remote: remote::AttachOptions,
     program: Option<String>,
     args: Option<Vec<String>>,
     adapter: Option<String>,
@@ -837,6 +843,7 @@ impl DebugInput {
     }
 
     fn validate(&self) -> Result<()> {
+        self.remote.validate(self)?;
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > 1_000_000)
@@ -943,10 +950,10 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target."
     }
     fn parameters(&self) -> Value {
-        json!({
+        remote::schema(json!({
             "type":"object", "required":["action"],
             "properties": {
                 "action":{"type":"string","enum":["launch","attach","set_breakpoint","remove_breakpoint",
@@ -992,7 +999,7 @@ impl Tool for DebugTool {
                             "column":{"type":"integer","minimum":1},"condition":{"type":"string"},
                             "hitCondition":{"type":"string"},"logMessage":{"type":"string"}}}}
             }
-        })
+        }))
     }
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.bind_debug_scope(scope);

@@ -90,3 +90,99 @@ a real language debugger. Python must be available; `PI_DEBUG_REQUIRE_PROTOCOL`
 makes its absence fail rather than skip. Run the repository's authoritative
 `dsr quality --tool pi_agent_rust` workflow for Rust acceptance. Authored source
 and protocol tests alone do not establish compilation or a passing quality gate.
+
+## Attach to an existing Python service
+
+Port attachment connects directly to an already-running **debugpy DAP server**.
+It does not look up or spawn a local adapter, inject into a PID, install Python
+packages, or change the debuggee's working directory. For example, start your
+program with its own interpreter and installed debugpy:
+
+```bash
+python -m debugpy --listen 127.0.0.1:5678 --wait-for-client --configure-subProcess false app.py
+```
+
+Then call the `debug` tool:
+
+```json
+{"action":"attach","port":5678}
+```
+
+`adapter` may be omitted or set to `"debugpy"`. Port attachment is mutually
+exclusive with `pid`, `program`, `args`, `goMode`, and `stopOnEntry`. Existing
+PID-based native/Python/Go attachment remains unchanged. This public port path
+is not a generic Node inspector, GDB remote, or arbitrary vendor DAP adapter.
+It retains the debugger's process/network effects and normal approval policy.
+
+### Forwarded services and source mappings
+
+For a remote/containerized service, establish a trusted tunnel to a local port
+separately. Bind the remote debugger safely; do not expose an unauthenticated
+debug port to an untrusted network. Debugger access can execute code and alter
+the target. Loopback is a routing restriction, **not authentication**.
+
+The default `host` is `127.0.0.1`. Literal loopback IPs are accepted; `localhost`
+always means IPv4 loopback without DNS lookup, and `::1` selects IPv6 explicitly.
+Other hosts, zero ports and DNS names are refused. Pi does not create the tunnel,
+scan ports, authenticate the server, retry connection failures or negotiate TLS.
+
+Map local source to the server's copy and configure breakpoints before allowing
+the attached program to run:
+
+```json
+{
+  "action": "attach",
+  "host": "127.0.0.1",
+  "port": 5678,
+  "pathMappings": [{"localRoot": ".", "remoteRoot": "/srv/app"}],
+  "initialBreakpoints": [{"file": "app.py", "line": 42}],
+  "justMyCode": true
+}
+```
+
+At most 16 mappings are accepted. Local roots resolve to existing directories
+inside the tool's canonical primary workspace; missing, escaping or duplicate
+canonical roots are refused before connecting. Each root is limited to 4096
+UTF-8 bytes. `remoteRoot` is passed unchanged to debugpy, using the remote OS's
+path conventions. Pi does not fetch remote files, synchronize source copies,
+verify that they match, or apply a second path-mapping algorithm. Debugpy maps
+breakpoints and returned stack source paths. Keep those source copies aligned.
+
+The existing initialized/breakpoints/configurationDone handshake, exception
+filters, suspension-scoped inspection, evaluation and assignments are reused.
+Attachment completion does not itself promise a stopped target; use initial
+breakpoints, `pause`, and `sessions` to inspect its actual state. `justMyCode`
+defaults to true. Child-session debugging and reverse terminal requests remain
+unsupported; the attach request sets `subProcess: false`. Configure that on the
+external debugpy server before attachment as well when it starts subprocesses.
+
+### Connection lifetime and budgets
+
+The connected transport owns its socket, not the external adapter or process.
+It shares the four-conversation capacity and existing ownership checks above.
+Successful results report `transport: "tcp"`, `adapterProcessOwned: false`, the
+endpoint, resolved mappings and startup budgets. A failed handshake does not
+publish a retained session. There is no implicit retry or PID fallback.
+
+`disconnect` requests preservation of an attached target through the existing
+DAP policy and closes the client connection. `terminate` remains explicit and
+adapter-capability-gated. Transport drop and failed-start cleanup close the
+connection without sending an OS signal to an external target. Cancellation of
+an already-sent request may retain the connection; it does not undo that request.
+Actual target behavior after connection loss is controlled by the server, not
+guaranteed by Pi. Completed adapter/debuggee side effects are not rolled back.
+
+`connectTimeoutMs` defaults to 5000, with a range of 1–30000. Initialization has
+its existing separate 30-second request budget. `startupTimeoutMs` then covers
+attachment and configuration, defaulting to 120000 with a maximum of 300000.
+These are separate stages, not a single end-to-end deadline. Connect waits are
+cancellable; a bounded OS connect already dispatched may finish later, but an
+unclaimed socket closes without sending DAP messages. At most eight connect
+workers exist process-wide, including abandoned pending attempts.
+
+Protocol regressions in `tests/debug_attach.rs` exercise the actual tool and
+registry without requiring an installed debugger. `src/debug/remote.rs` includes
+an explicitly ignored live-debugpy test; opt into it through DSR with a suitable
+`PI_DEBUG_TEST_PYTHON` (default `python3`). The independent debugpy wire probe run
+during development is not Rust-host or cross-platform acceptance. Both the new
+Rust tests and the existing debugger suites still require DSR validation.
