@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+mod archive;
+pub(super) use archive::Archive;
+
 const CAPTURE_BYTES: usize = 512 * 1024;
 const PREVIEW_BYTES: usize = 32 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -93,6 +96,7 @@ pub(super) struct Capture {
     dirty: bool,
     last_update: Option<Instant>,
     on_update: Option<Update>,
+    archive: Option<Archive>,
 }
 
 fn invalid(message: &str) -> Error {
@@ -109,6 +113,7 @@ impl Capture {
             dirty: false,
             last_update: None,
             on_update,
+            archive: None,
         }
     }
 
@@ -137,6 +142,7 @@ impl Capture {
         target.push(text);
         self.sequence = sequence;
         self.dirty |= !text.is_empty();
+        if let Some(archive) = &mut self.archive { archive.record(stream)?; }
         Ok(())
     }
 
@@ -217,6 +223,9 @@ impl Capture {
     /// Keep each language's existing Error convention while retaining a
     /// bounded tail received before timeout, cancellation, crash or bad frames.
     pub(super) fn with_error(&self, error: Error) -> Error {
+        let error = if self.archive.is_some() {
+            Error::tool("eval", format!("{error}; EVAL_ARTIFACT_NOT_PUBLISHED: requested console archive is incomplete"))
+        } else { error };
         let Some((partial, _)) = self.partial_output() else { return error; };
         Error::tool("eval", format!("{error}\n{partial}"))
     }

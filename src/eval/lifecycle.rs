@@ -118,6 +118,7 @@ impl EvalTool {
         // Validate before waiting, spawning, or destroying any retained state.
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
+        let archive_path = super::output::Archive::requested_path(&input)?;
         let cell: Cell = serde_json::from_value(input)
             .map_err(|error| Error::tool("eval", format!("EVAL_INPUT: {error}")))?;
         let load_path = match cell.kernel {
@@ -142,6 +143,12 @@ impl EvalTool {
                 .await.map_err(before_execution_stop)??),
             None => None,
         };
+        let archive = match archive_path {
+            Some(path) => Some(wait_owned(&owner, None,
+                super::output::Archive::prepare(self.cwd.clone(), path, cell.kernel.name()))
+                .await.map_err(before_execution_stop)??),
+            None => None,
+        };
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.
@@ -157,6 +164,7 @@ impl EvalTool {
         // Capture outlives either checked-out kernel future: cancellation can
         // retire the producer without discarding already received output.
         let mut capture = super::output::Capture::new(cell.kernel.name(), on_update);
+        capture.attach_archive(archive);
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
             Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout, &mut capture)).await,
@@ -165,6 +173,7 @@ impl EvalTool {
                 wait_owned(&owner, Some(deadline), self.run_js_cell(code, timeout, &mut capture)).await
             }
         };
+        let interrupted = outcome.is_err();
         let outcome = match outcome {
             Ok(output) => output,
             Err(stop) => {
@@ -234,6 +243,7 @@ impl EvalTool {
                     .insert(0, ContentBlock::Text(TextContent::new(notice))),
             }
         }
+        capture.finish_archive(&mut output, interrupted).await;
         Ok(output)
     }
 

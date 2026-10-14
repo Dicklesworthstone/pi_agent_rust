@@ -537,7 +537,9 @@ impl Tool for EvalTool {
          or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
          PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
          Both kernels stream stdout/stderr live; large console output retains a \
-         labelled bounded head/tail rather than filling session memory."
+         labelled bounded head/tail rather than filling session memory. \
+         Set output_path to a new workspace-relative .jsonl file to retain \
+         complete received console frames on disk (64 MiB encoded limit)."
     }
 
     fn parameters(&self) -> Value {
@@ -561,6 +563,10 @@ impl Tool for EvalTool {
                     "type": "boolean",
                     "default": false,
                     "description": "Discard only the selected language's retained state before executing code"
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional new workspace-relative .jsonl console archive; create-only, up to 64 MiB encoded. Validated before reset/execution. No file is published for an incomplete run."
                 }
             },
             "required": ["code"]
