@@ -1,0 +1,392 @@
+diff --git a/src/interactive_ftui.rs b/src/interactive_ftui.rs
+--- a/src/interactive_ftui.rs
++++ b/src/interactive_ftui.rs
+@@ -96,6 +96,10 @@ pub enum PiFtuiMsg {
+         width: u16,
+         height: u16,
+     },
++    /// Terminal reacquisition failed. The runtime must stop rather than
++    /// continue polling a potentially cooked console. Kept distinct from an
++    /// editor error, which is recoverable once terminal ownership is restored.
++    TerminalRestoreFailed(std::io::Error),
+     /// A clipboard image paste finished off the loop thread (WSL): the
+     /// `@file` reference to insert, or `None` when there was no image.
+     PastedImage(Option<String>),
+@@ -503,24 +507,36 @@ fn external_editor_task(
+ ) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+     move || {
+-        // Always answer with `Edited` (errors in `text`): it is the message
+-        // that clears `suspending` and repaints, whatever went wrong.
+-        let text = release_terminal(alt_screen)
+-            .map_err(|err| format!("external editor: {err}"))
+-            .and_then(|()| {
+-                run_external_editor(&external_editor_command(), &draft)
+-                    .map_err(|err| format!("external editor: {err}"))
+-            });
+-        let (text, (width, height)) = match reacquire_terminal(alt_screen, mouse) {
+-            Ok(size) => (text, size),
+-            Err(err) => (
+-                Err(format!("external editor: terminal not restored: {err}")),
+-                crossterm::terminal::size().unwrap_or((80, 24)),
+-            ),
+-        };
+-        PiFtuiMsg::Edited {
++        external_editor_handoff(
++            || release_terminal(alt_screen),
++            || run_external_editor(&external_editor_command(), &draft),
++            || reacquire_terminal(alt_screen, mouse),
++        )
++    }
++}
++
++/// Complete the synchronous editor handoff. Reacquisition is mandatory even
++/// if release failed partway or the editor could not start. Only a successful
++/// reacquisition permits `Edited` and a return to the input loop.
++fn external_editor_handoff(
++    release: impl FnOnce() -> std::io::Result<()>,
++    edit: impl FnOnce() -> std::io::Result<String>,
++    reacquire: impl FnOnce() -> std::io::Result<(u16, u16)>,
++) -> PiFtuiMsg {
++    let text = release()
++        .and_then(|()| edit())
++        .map_err(|error| format!("external editor: {error}"));
++    match reacquire() {
++        Ok((width, height)) => PiFtuiMsg::Edited {
+             text,
+             width,
+             height,
++        },
++        Err(error) => {
++            let detail = match text {
++                Ok(_) => format!("external editor: terminal not restored: {error}"),
++                Err(edit_error) => format!("{edit_error}; terminal not restored: {error}"),
++            };
++            PiFtuiMsg::TerminalRestoreFailed(std::io::Error::new(error.kind(), detail))
+         }
+     }
+ }
+@@ -1945,6 +1961,10 @@ pub struct PiFtuiModel {
+     /// Transcript markdown spacing policy (issue #202), resolved from
+     /// `markdown.spacing` in settings at launch.
+     markdown_spacing: crate::config::MarkdownSpacing,
++    /// App::run consumes the model and returns success for Cmd::quit. Retain
++    /// a fatal terminal failure outside it so the launcher returns an error
++    /// after cleanup instead of silently treating that quit as successful.
++    terminal_failure: Arc<Mutex<Option<std::io::Error>>>,
+ }
+ 
+ /// One cached transcript block (issue #201): the styled lines produced for
+@@ -2218,6 +2238,7 @@ impl PiFtuiModel {
+             extension_commands: Vec::new(),
+             extension_command_registry: None,
+             submit_tx: None,
++            terminal_failure: Arc::new(Mutex::new(None)),
+         }
+     }
+ 
+@@ -4754,18 +4775,8 @@ impl PiFtuiModel {
+                 if ctrl_c {
+                     // Issue #205: cancel the in-flight turn before quitting;
+                     // otherwise teardown blocks on the driver joining a full
+                     // provider stream plus remaining tool calls.
+-                    if let Some(slot) = &self.turn_abort
+-                        && let Some(handle) = slot
+-                            .lock()
+-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+-                            .take()
+-                    {
+-                        handle.abort();
+-                    }
+-                    if let Some(control) = self.live_turn_control() {
+-                        control.abort();
+-                    }
++                    self.abort_running_turn();
+                     return Cmd::quit();
+                 }
+ 
+@@ -5470,8 +5481,9 @@ impl Model for PiFtuiModel {
+         let probe = self.watchdog.start();
+         let phase = match &msg {
+-            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
+-                LoopPhase::Input
+-            }
++            PiFtuiMsg::Term(_)
++            | PiFtuiMsg::Edited { .. }
++            | PiFtuiMsg::PastedImage(_)
++            | PiFtuiMsg::TerminalRestoreFailed(_) => LoopPhase::Input,
+             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed => LoopPhase::AgentEvent,
+         };
+         let cmd = match msg {
+@@ -5490,6 +5502,27 @@ impl Model for PiFtuiModel {
+                 }
+                 cmd
+             }
++            PiFtuiMsg::TerminalRestoreFailed(error) => {
++                tracing::error!(
++                    target: "pi::ftui::console",
++                    event = "ftui.terminal.reacquire_failed",
++                    %error,
++                    "stopping FTUI because terminal ownership could not be restored"
++                );
++                {
++                    let mut failure = self
++                        .terminal_failure
++                        .lock()
++                        .unwrap_or_else(std::sync::PoisonError::into_inner);
++                    if failure.is_none() {
++                        *failure = Some(error);
++                    }
++                }
++                self.suspending = false;
++                self.pending_quit = true;
++                self.abort_running_turn();
++                Cmd::quit()
++            }
+             PiFtuiMsg::PastedImage(reference) => {
+                 self.insert_pasted_image(reference);
+                 Cmd::none()
+@@ -5530,4 +5563,20 @@ impl PiFtuiModel {
+ impl PiFtuiModel {
++    /// Shared by explicit exit and fatal terminal recovery. A runtime quit
++    /// alone drops the UI but can leave the driver blocked on a live turn.
++    fn abort_running_turn(&self) {
++        if let Some(slot) = &self.turn_abort
++            && let Some(handle) = slot
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .take()
++        {
++            handle.abort();
++        }
++        if let Some(control) = self.live_turn_control() {
++            control.abort();
++        }
++    }
++
+     /// Counters for the loop watchdog (`pi.tui.loop_watchdog.v1`). Timings
+     /// only — never prompt, tool, or model content.
+     #[must_use]
+@@ -8910,3 +8959,18 @@
++/// A fatal model-side terminal error uses Cmd::quit so FTUI can tear down
++/// normally. Convert that otherwise-successful runtime exit back into the
++/// original failure, retaining any additional runtime/console cleanup error.
++fn finish_terminal_run(
++    app_result: std::io::Result<()>,
++    terminal_failure: &Mutex<Option<std::io::Error>>,
++) -> std::io::Result<()> {
++    let failure = terminal_failure
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .take()
++        .map_or(Ok(()), Err);
++    console_input::combine_results(failure, app_result)
++}
++
+ fn finish_ftui_run(
+     app_result: std::io::Result<()>,
+     driver_result: std::thread::Result<std::io::Result<()>>,
+@@ -9816,6 +9880,9 @@
+     if let Some(workspace) = workspace {
+         model.autocomplete.provider.set_workspace(workspace);
+     }
++    // Retain the terminal failure after App::run consumes the model. A normal
++    // Cmd::quit must not hide an unrecoverable raw-mode/console-mode failure.
++    let terminal_failure = Arc::clone(&model.terminal_failure);
+     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
+     // anchors at the bottom, auto-sized to content within bounds; alt-screen
+     // remains the default.
+@@ -9840,6 +9907,7 @@
+             app.with_mouse().run()
+         }
+     });
++    let result = finish_terminal_run(result, &terminal_failure);
+     drop(log_guard);
+ 
+     // The UI (and with it the submit sender) is gone; the driver's next poll
+@@ -10445,3 +10513,186 @@ mod tests {
++    #[test]
++    fn editor_handoff_reacquires_after_a_partial_release_failure() {
++        let reacquired = std::cell::Cell::new(false);
++        let message = external_editor_handoff(
++            || Err(std::io::Error::other("release write failed")),
++            || panic!("must not launch an editor after partial release"),
++            || {
++                reacquired.set(true);
++                Ok((80, 24))
++            },
++        );
++        assert!(reacquired.get(), "a failed release still needs recovery");
++        assert!(matches!(
++            message,
++            PiFtuiMsg::Edited { text: Err(error), width: 80, height: 24 }
++                if error.contains("release write failed")
++        ));
++    }
++
++    #[test]
++    fn editor_handoff_restores_after_an_editor_error() {
++        let steps = std::cell::RefCell::new(Vec::new());
++        let message = external_editor_handoff(
++            || {
++                steps.borrow_mut().push("release");
++                Ok(())
++            },
++            || {
++                steps.borrow_mut().push("edit");
++                Err(std::io::Error::other("editor could not start"))
++            },
++            || {
++                steps.borrow_mut().push("reacquire");
++                Ok((100, 30))
++            },
++        );
++        assert_eq!(*steps.borrow(), ["release", "edit", "reacquire"]);
++        assert!(matches!(
++            message,
++            PiFtuiMsg::Edited { text: Err(error), width: 100, height: 30 }
++                if error.contains("editor could not start")
++        ));
++    }
++
++    #[test]
++    fn editor_handoff_returns_saved_text_only_after_reacquisition() {
++        let steps = std::cell::RefCell::new(Vec::new());
++        let message = external_editor_handoff(
++            || {
++                steps.borrow_mut().push("release");
++                Ok(())
++            },
++            || {
++                steps.borrow_mut().push("edit");
++                Ok(String::from("saved draft\n"))
++            },
++            || {
++                steps.borrow_mut().push("reacquire");
++                Ok((80, 24))
++            },
++        );
++        assert_eq!(*steps.borrow(), ["release", "edit", "reacquire"]);
++        assert!(matches!(
++            message,
++            PiFtuiMsg::Edited { text: Ok(text), width: 80, height: 24 }
++                if text == "saved draft\n"
++        ));
++    }
++
++    #[test]
++    fn terminal_reacquisition_failure_is_not_an_ordinary_editor_error() {
++        let message = external_editor_handoff(
++            || Ok(()),
++            || Ok(String::from("edited")),
++            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
++        );
++        let PiFtuiMsg::TerminalRestoreFailed(error) = message else {
++            panic!("failed reacquisition must not return Edited and resume polling");
++        };
++        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++        assert!(error.to_string().contains("terminal not restored"));
++    }
++
++    #[test]
++    fn failed_edit_and_failed_reacquisition_keep_both_causes() {
++        let message = external_editor_handoff(
++            || Ok(()),
++            || Err(std::io::Error::other("editor exited with 1")),
++            || Err(std::io::Error::other("console mode write failed")),
++        );
++        let PiFtuiMsg::TerminalRestoreFailed(error) = message else {
++            panic!("reacquisition failure must be terminal");
++        };
++        let message = error.to_string();
++        assert!(message.contains("editor exited with 1"));
++        assert!(message.contains("console mode write failed"));
++    }
++
++    #[test]
++    fn ctrl_g_terminal_failure_quits_and_aborts_instead_of_waiting_for_input() {
++        let (_tx, model) = new_model();
++        let (abort, signal) = crate::agent::AbortHandle::new();
++        let abort_slot = Arc::new(Mutex::new(Some(abort)));
++        let model = model
++            .with_turn_abort(Arc::clone(&abort_slot))
++            .with_turn_control(Arc::new(Mutex::new(None)))
++            .with_suspend_task(|| {
++                external_editor_handoff(
++                    || Ok(()),
++                    || Ok(String::from("edited")),
++                    || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
++                )
++            });
++        let failure = Arc::clone(&model.terminal_failure);
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        type_str(&mut sim, "original draft");
++        sim.model_mut().state = AgentUiState::Working;
++        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
++
++        assert!(!sim.is_running(), "no further key is required to end a broken UI");
++        assert!(sim.model().pending_quit);
++        assert!(!sim.model().suspending);
++        assert_eq!(sim.model().input.text(), "original draft");
++        assert!(signal.is_aborted(), "the driver must not await a live turn");
++        assert!(abort_slot.lock().expect("abort slot").is_none());
++        assert!(
++            sim.command_log().iter().any(|record| matches!(record, CmdRecord::Quit))
++        );
++        let error = finish_terminal_run(Ok(()), &failure)
++            .expect_err("Cmd::quit must not convert terminal failure into success");
++        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++    }
++
++    #[test]
++    fn a_recoverable_editor_failure_still_accepts_windows_keystrokes() {
++        let (_tx, model) = new_model();
++        let model = model.with_suspend_task(|| {
++            external_editor_handoff(
++                || Ok(()),
++                || Err(std::io::Error::other("editor exited with 1")),
++                || Ok((80, 24)),
++            )
++        });
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        windows_type_str(&mut sim, "keep");
++        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
++        windows_keystroke(&mut sim, KeyCode::Char('x'));
++        assert!(sim.is_running());
++        assert_eq!(sim.model().input.text(), "keepx");
++        assert!(sim.model().terminal_failure.lock().expect("failure slot").is_none());
++    }
++
++    #[test]
++    fn terminal_failure_exit_preserves_secondary_runtime_cleanup_error() {
++        let failure = Mutex::new(Some(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "raw mode reacquisition failed",
++        )));
++        let error = finish_terminal_run(
++            Err(std::io::Error::other("runtime output cleanup failed")),
++            &failure,
++        )
++        .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++        assert!(error.to_string().contains("raw mode reacquisition failed"));
++        assert!(error.to_string().contains("runtime output cleanup failed"));
++        assert!(failure.lock().expect("failure slot").is_none());
++    }
++
++    #[test]
++    fn terminal_failure_exit_does_not_change_ordinary_runtime_results() {
++        let failure = Mutex::new(None);
++        assert!(finish_terminal_run(Ok(()), &failure).is_ok());
++        let error = finish_terminal_run(
++            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
++            &failure,
++        )
++        .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
++    }
++
+     /// A user who bound ctrl+g to an editing action keeps it: the default
+     /// external-editor chord yields to their binding.
+     #[test]

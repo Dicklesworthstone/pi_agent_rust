@@ -1,0 +1,61 @@
+diff --git a/src/interactive_ftui.rs b/src/interactive_ftui.rs
+--- a/src/interactive_ftui.rs
++++ b/src/interactive_ftui.rs
+@@ -65,6 +65,7 @@
+ use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
+ use std::collections::{HashMap, VecDeque};
+ 
++mod console_input;
+ mod info_commands;
+ mod plan_commands;
+ pub mod session_pins;
+@@ -451,7 +452,10 @@ fn release_terminal(alt_screen: bool) -> std::io::Result<()> {
+         out.write_all(b"\x1b[?1049l")?; // leave alternate screen
+     }
+     out.write_all(b"\x1b[?25h")?; // show cursor
+-    out.flush()
++    out.flush()?;
++    // Restore native selection only after our last output write. Enabling
++    // QuickEdit before flushing would expose that flush to selection stalls.
++    console_input::suspend()
+ }
+ 
+ /// Take the terminal back after [`release_terminal`]; returns its size so the
+@@ -460,6 +464,9 @@ fn reacquire_terminal(alt_screen: bool, mouse: bool) -> std::io::Result<(u16, u16)> {
+     use std::io::{Write, stdout};
+ 
+     crossterm::terminal::enable_raw_mode()?;
++    // ANSI mouse sequences do not establish the Windows console input flags.
++    // Reapply the lease before any output can block on ConHost selection.
++    console_input::resume()?;
+     {
+         let mut out = stdout();
+         if alt_screen {
+@@ -9848,17 +9855,22 @@
+     // Present every frame, however late (see `FRAME_BUDGET`).
+     .with_budget(frame_budget());
+     // Divert tracing output away from the terminal while the TUI owns it
+     // (bd-trkef); restored on drop.
+     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
+     // Mouse capture defaults on; when the user asked for native terminal
+     // selection it must stay off, exactly as the classic frontend does.
+-    let result = if disable_mouse_capture {
+-        app.run()
+-    } else {
+-        app.with_mouse().run()
+-    };
++    // Native flags must be established before App::run's first write and
++    // restored after its terminal session drops. On acquisition failure the
++    // helper drops the unrun app, releasing its submit channel before join.
++    let result = console_input::run(app, !disable_mouse_capture, |app| {
++        if disable_mouse_capture {
++            app.run()
++        } else {
++            app.with_mouse().run()
++        }
++    });
+     drop(log_guard);
+ 
+     // The UI (and with it the submit sender) is gone; the driver's next poll
+     // sees Disconnected and unwinds. Await the teardown result so final save
+     // or resource-shutdown failures cannot be reported as a successful exit.
