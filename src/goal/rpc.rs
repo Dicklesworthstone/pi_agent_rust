@@ -2,7 +2,8 @@
 //!
 //! This exposes host lifecycle operations only. It does not create a
 //! model-visible goal tool or submit provider turns. Mutations are admitted by
-//! the RPC loop only while idle; get is read-only.
+//! the RPC loop only while idle; get is read-only. Budget revision is an atomic
+//! pause operation, retaining the outer loop's existing input-recovery preflight.
 
 use super::{
     GoalBudget, GoalPersistence, GoalStatus, Record, Transition, append, check_owner, failure,
@@ -13,6 +14,8 @@ use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use crate::session::Session;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 fn status_name(status: GoalStatus) -> &'static str {
@@ -42,6 +45,7 @@ fn result_value(record: Option<&Record>) -> Value {
         "maxPrompts": record.max_prompts,
         "promptsStarted": record.prompts_started,
         "interrupted": record.in_flight,
+        "note": record.note,
     });
     json!({
         "goal": goal,
@@ -53,11 +57,36 @@ fn result_value(record: Option<&Record>) -> Value {
     })
 }
 
+// A logical revision receipt, not a bearer capability. Bind dynamic recorded
+// usage as well as the journal leaf, so neither queued input nor another
+// branch/goal can inherit a budget decision. Unchanged saved state has the
+// same receipt after reopening; SDK incarnation checks are intentionally
+// stronger. Live tool authority and execution deadlines are not changed here.
+fn revision(session: &Session, current: &Option<(String, Record)>) -> Result<String> {
+    if session.header.id.is_empty() || session.header.id.len() > 1024
+        || session.leaf_id().is_some_and(|id| id.len() > 1024)
+    {
+        return Err(failure("GOAL_REVIEW", "session identity is missing or oversized"));
+    }
+    let bytes = serde_json::to_vec(&(
+        "pi.goal.rpc-review.v1",
+        &session.header.id,
+        session.leaf_id(),
+        current,
+        crate::plan::replayed_plan_mode(session).as_str(),
+    ))?;
+    let mut receipt = String::from("gr1-");
+    for byte in Sha256::digest(&bytes) {
+        let _ = write!(receipt, "{byte:02x}");
+    }
+    Ok(receipt)
+}
+
 pub(crate) fn rpc_goal_state(session: &Session) -> Result<Value> {
-    Ok(latest(session)?.map_or_else(
-        || result_value(None),
-        |(_, record)| result_value(Some(&record)),
-    ))
+    let current = latest(session)?;
+    let mut value = result_value(current.as_ref().map(|(_, record)| record));
+    value["revision"] = Value::String(revision(session, &current)?);
+    Ok(value)
 }
 
 fn requested_budget(request: &Value) -> Result<GoalBudget> {
@@ -80,6 +109,29 @@ fn requested_budget(request: &Value) -> Result<GoalBudget> {
     Ok(GoalBudget { max_prompts, token_budget })
 }
 
+fn revised_budget(session: &Session, request: &Value) -> Result<Record> {
+    let budget = &request["budget"];
+    if budget.as_object().is_none_or(|object| object.len() != 2)
+        || budget.get("token_budget").is_none_or(Value::is_null)
+        || budget.get("max_prompts").is_none_or(Value::is_null)
+    {
+        return Err(failure("GOAL_RPC", "budget must contain exactly the new token_budget and max_prompts totals"));
+    }
+    let budget = requested_budget(budget)?;
+    let reason = request.get("reason").and_then(Value::as_str)
+        .ok_or_else(|| failure("GOAL_RPC", "budget revision requires an explicit reason"))?;
+    let reviewed = request.get("revision").and_then(Value::as_str)
+        .filter(|value| value.len() == 68 && value.starts_with("gr1-"))
+        .ok_or_else(|| failure("GOAL_RPC", "budget revision requires the receipt from goal get"))?;
+    let current = latest(session)?;
+    if reviewed != revision(session, &current)? {
+        return Err(failure("GOAL_STALE", "session, branch or goal changed; get and review it again. Nothing was changed."));
+    }
+    let (_, record) = current
+        .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+    transition(record, Transition::Budget { budget, reason })
+}
+
 fn require_no_plan_mode(session: &Session) -> Result<()> {
     if crate::plan::replayed_plan_mode(session) != crate::plan::PlanMode::Off {
         return Err(failure(
@@ -99,6 +151,11 @@ pub(crate) async fn rpc_goal_command(
         .get("op")
         .and_then(Value::as_str)
         .ok_or_else(|| failure("GOAL_RPC", "goal op is required"))?;
+    // Refuse misplaced budget edits rather than silently resuming with an
+    // ignored allowance. A plain pause keeps its existing wire contract.
+    if request.get("budget").is_some() && op != "pause" {
+        return Err(failure("GOAL_RPC", "a budget revision requires op=pause"));
+    }
     if op == "get" {
         let store = Arc::clone(&agent_session.session);
         let session = store
@@ -141,6 +198,7 @@ pub(crate) async fn rpc_goal_command(
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
             transition(record, Transition::Resume)?
         }
+        "pause" if request.get("budget").is_some() => revised_budget(&session, request)?,
         "pause" => {
             let (_, record) = latest(&session)?
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
@@ -158,7 +216,7 @@ pub(crate) async fn rpc_goal_command(
     append(&mut session, &next)?;
     agent_session.invalidate_background_compaction();
     let persistence = persist(&mut session, owner, enabled).await;
-    let mut value = result_value(Some(&next));
+    let mut value = rpc_goal_state(&session)?;
     value["persistence"] = Value::String(
         match &persistence {
             GoalPersistence::MemoryOnly => "memory_only",

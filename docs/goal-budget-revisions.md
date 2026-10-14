@@ -37,6 +37,62 @@ reset or decrease. The same objective and goal ID remain attached to the same
 branch. The previous checkpoint retains the prior limits, and the new one
 records the authored reason. There is no automatic budget increase.
 
+## Default terminal
+
+Run `/goal status` and review the displayed objective and usage. Copy its actual
+`g1-...` receipt into the command; both proposed totals and a reason are required:
+
+```text
+/goal budget <review> --tokens 150000 --prompts 24 -- Reviewed the remaining migration
+```
+
+The result shows the new totals, unchanged usage, recorded reason and fresh
+receipt. Use that new receipt for `/goal resume` after inspecting the result.
+No goal execution starts from either command. Missing or repeated flags,
+unlimited settings, stale receipts and empty reasons fail without appending a
+goal decision. Text after `--` is literal, not a shell command or file reference.
+Existing `/goal create` defaults are unchanged; budget revision never supplies
+an omitted limit from those defaults. `/goal save <new-review>` retries an
+unconfirmed native save without replaying the budget decision.
+
+## RPC hosts: pause and revise atomically
+
+First send `{"type":"goal","op":"get"}`. Its response data includes the goal's
+totals, usage, note and an additive `revision` field. After reviewing that state,
+copy `data.revision` into a pause request with a `budget` object:
+
+```json
+{
+  "type": "goal",
+  "op": "pause",
+  "revision": "<actual gr1-... receipt from goal get>",
+  "budget": { "token_budget": 150000, "max_prompts": 24 },
+  "reason": "Reviewed the remaining migration"
+}
+```
+
+This is one journal transition, not a pause followed by an unguarded update.
+It uses the existing idle-only RPC pause dispatch and terminal-input recovery
+preflight. The nested budget must contain exactly both non-null integer totals.
+The result carries a new `revision`, the retained usage, `note`, paused or
+budget-limited state, and the existing persistence acknowledgement. No separate
+`op: "budget"`, model-facing operation or new command-dispatch lane is added.
+A budget attached to create/resume/drop is rejected rather than ignored.
+Plain RPC pause requests retain their existing behavior.
+
+The RPC receipt binds session ID, branch leaf, the full goal record including
+recorded usage, and replayed plan state. It identifies logical state, not tool
+authority, authentication or proof of review. It does not bind an in-memory
+store incarnation, live settings or a save acknowledgement; unchanged saved
+state can retain its receipt after reopening. It is separate from terminal
+receipts and the SDK's exact snapshot. Input recovery that advances the journal
+also makes a pending budget receipt stale. Read again rather than retrying it.
+
+An unconfirmed RPC save still leaves the new totals live and paused. Do not
+replay the old pause-and-revise request. Inspect the returned state and repair
+native persistence; `flush_goal` is the SDK retry operation. No new RPC save
+operation or automatic recovery execution is introduced here.
+
 ## Review, pause and interruption
 
 The setter requires the SDK's exact `GoalSnapshot`. Another branch, input,
@@ -78,6 +134,10 @@ This is not a new file format or a cross-process execution lease.
 
 `src/goal/budget_tests.rs` covers total-budget arithmetic, interrupted intent,
 terminal states, invalid inputs, revision rejection, branch/store isolation,
-active-interval accounting, native failed-save recovery and reopening. These
+active-interval accounting, native failed-save recovery and reopening. It also
+covers the default-terminal and RPC adapters with native sessions: required
+fields, stale usage/session receipts, preserved interruption, literal reasons
+and unconfirmed persistence. Existing driver routing and RPC dispatch are
+reused, not replaced. These
 are authored Rust tests, not a claim of a passing quality gate. Run the
 repository's authoritative `dsr quality --tool pi_agent_rust` workflow.

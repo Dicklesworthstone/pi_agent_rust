@@ -17,12 +17,13 @@ use crate::session::Session;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
+const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
 const RECEIPT_PREFIX: &str = "g1-";
 
 #[derive(Clone, Copy)]
 enum Action<'a> {
     Create { objective: &'a str, budget: GoalBudget },
+    Budget { reason: &'a str, budget: GoalBudget },
     Pause,
     Resume,
     Drop(&'a str),
@@ -79,7 +80,8 @@ fn parse(args: &str) -> Result<Command<'_>> {
         return Err(usage());
     }
     let action = match verb.to_ascii_lowercase().as_str() {
-        "create" => {
+        "create" | "budget" => {
+            let revising = verb.eq_ignore_ascii_case("budget");
             let mut budget = GoalBudget::default();
             let (mut tokens_seen, mut prompts_seen) = (false, false);
             loop {
@@ -102,8 +104,16 @@ fn parse(args: &str) -> Result<Command<'_>> {
                     _ => return Err(usage()),
                 }
             }
+            // Existing creation defaults remain useful, but revising one
+            // total must not silently reset the other to a default allowance.
+            if revising && !(tokens_seen && prompts_seen) { return Err(usage()); }
             budget.validate()?;
-            Action::Create { objective: text_tail(&mut remaining)?, budget }
+            let text = text_tail(&mut remaining)?;
+            if revising {
+                Action::Budget { reason: text, budget }
+            } else {
+                Action::Create { objective: text, budget }
+            }
         }
         "drop" => Action::Drop(text_tail(&mut remaining)?),
         "complete" => Action::Complete(text_tail(&mut remaining)?),
@@ -184,6 +194,11 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
                 return Err(failure("GOAL_EXISTS", "resume or explicitly drop the existing goal before replacing it"));
             }
             Some(Record::new(objective, budget)?)
+        }
+        Action::Budget { budget, reason } => {
+            let (_, record) = current.as_ref()
+                .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+            Some(transition(record.clone(), Transition::Budget { budget, reason })?)
         }
         Action::Save => {
             if current.is_none() { return Err(failure("GOAL_MISSING", "this branch has no goal to save")); }
@@ -282,6 +297,7 @@ fn render(record: Option<&Record>, review: &str) -> String {
         let _ = writeln!(text, "Create: /goal create {review} --tokens 100000 --prompts 16 -- <objective>");
     } else {
         let _ = writeln!(text, "Pause: /goal pause {review}\nResume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nAttest completion: /goal complete {review} -- <evidence>\nRetry saving: /goal save {review}");
+        let _ = writeln!(text, "Revise total budgets: /goal budget {review} --tokens N --prompts N -- <reason>\nBudget revision preserves spent counters and interruption; it does not resume work.");
     }
     text.push_str("Lifecycle controls only: no model request was started or resumed. Bounded execution uses the SDK run_goal APIs; ordinary terminal prompts do not run that driver.\nToken accounting is reported usage, not a hard billing ceiling. Completion evidence is an attestation, not an independently verified test result.");
     text

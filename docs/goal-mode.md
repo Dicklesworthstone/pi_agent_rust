@@ -34,6 +34,7 @@ Use the receipt of the state you actually reviewed for subsequent changes:
 ```text
 /goal pause <review>
 /goal resume <review>
+/goal budget <review> --tokens 150000 --prompts 24 -- Reviewed the remaining work
 /goal drop <review> -- This objective is no longer needed
 /goal complete <review> -- Inspected the deliverables and checked the results
 /goal save <review>
@@ -41,13 +42,18 @@ Use the receipt of the state you actually reviewed for subsequent changes:
 
 Every successful transition displays a fresh receipt. Pause/resume preserve
 spent counters; an exhausted goal cannot be resumed with reset counters.
+An explicit `/goal budget` revision changes both total allowances while keeping
+the same goal, usage and history. Both totals and a nonblank reason are required;
+the revised goal stays paused or budget-limited until explicitly resumed.
+Interrupted work remains interrupted. See [budget revisions](goal-budget-revisions.md)
+for the SDK setter, terminal workflow and atomic RPC pause-and-revise request.
 Completion is an explicit user attestation and requires nonblank evidence, not
 an assistant's completion claim or a proof independently checked by Pi. An
 unfinished intent must be reconciled before completion; a redundant pause
 cannot clear its interrupted marker. Drop retains history;
 it does not delete the session or undo tools. Create/resume refuse both live
 and replayed plan mode until it is off. Other lifecycle controls remain usable
-for stopping or saving an existing objective.
+for stopping, revising budgets or saving an existing objective.
 
 The SHA-256 receipt binds session identity, branch leaf, the full latest goal
 record including accumulated usage, plan state and persistence mode. Validation
@@ -246,8 +252,11 @@ host callbacks are not forcibly preempted.
 
 Exhaustion is `BudgetLimited`, never automatic completion. A successful final
 prompt may still be explicitly verified complete at the budget boundary. An
-exhausted goal cannot be resumed by resetting its counters; creating replacement
-work requires explicitly dropping the old goal and creating a new objective.
+exhausted goal cannot be resumed by resetting its counters. A host can explicitly
+revise its total allowances with `set_goal_budget` (or `/goal budget`) while
+retaining spent work, then review and resume the paused goal. Replacing the
+objective instead requires explicitly dropping the old goal and creating a new
+one. See [budget revisions](goal-budget-revisions.md) for limits and recovery.
 
 ## Pause, input and interruption
 
@@ -281,7 +290,7 @@ paused/terminal intervals does not charge that goal. Malformed newest goal
 records are rejected rather than falling back to an older active objective.
 
 The public methods `current_goal`, `create_goal`, `pause_goal`, `resume_goal`,
-`complete_goal`, `drop_goal` and `flush_goal` never start provider work by
+`set_goal_budget`, `complete_goal`, `drop_goal` and `flush_goal` never start provider work by
 themselves. Mutations require a snapshot of the exact storage incarnation,
 session identity, current branch leaf and goal revision. A stale UI decision
 cannot complete a replacement objective. After reopening, obtain a fresh
