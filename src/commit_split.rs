@@ -513,7 +513,8 @@ impl CommitExecutor {
         let screened_msg = screen_secrets(&msg);
 
         let mut add_cmd = Command::new("git");
-        add_cmd.arg("add").args(&unit.files).current_dir(cwd);
+        // Stage deletions as well as modifications, and separate options from paths.
+        add_cmd.arg("add").arg("-A").arg("--").args(&unit.files).current_dir(cwd);
 
         let add_res = add_cmd.status();
         let add_ok = add_res.is_ok_and(|s| s.success());
@@ -530,10 +531,16 @@ impl CommitExecutor {
         }
 
         let mut commit_cmd = Command::new("git");
+        // Commit only this unit: unrelated staged changes belong to their own commits.
+        // Path-only mode retains unrelated index entries rather than silently
+        // sweeping every staged file into the first planned commit.
         commit_cmd
             .arg("commit")
+            .arg("--only")
             .arg("-m")
             .arg(&screened_msg)
+            .arg("--")
+            .args(&unit.files)
             .current_dir(cwd);
 
         let commit_output = commit_cmd.output();
@@ -627,6 +634,47 @@ impl CommitExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_commit_preserves_unrelated_staged_changes() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git").args(args).current_dir(cwd).output().expect("git available");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Atomic Commit Test"]);
+        git(&["config", "user.email", "atomic@example.invalid"]);
+        std::fs::write(cwd.join("selected.txt"), "initial\n").unwrap();
+        std::fs::write(cwd.join("other.txt"), "initial\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(cwd.join("selected.txt"), "selected update\n").unwrap();
+        std::fs::write(cwd.join("other.txt"), "other staged update\n").unwrap();
+        git(&["add", "--", "other.txt"]);
+
+        let unit = CommitUnit {
+            id: "unit-selected".into(),
+            commit_type: "fix".into(),
+            scope: "selected".into(),
+            summary: "selected update".into(),
+            files: vec!["selected.txt".into()],
+            category: FileCategory::Source,
+            score: 1,
+            dependencies: Vec::new(),
+            rationale: None,
+        };
+        let result = CommitExecutor::execute_single_unit(cwd, &unit, None);
+        assert!(result.success, "{result:?}");
+        let committed = String::from_utf8(git(&["show", "--format=", "--name-only", "HEAD"])).unwrap();
+        assert_eq!(committed.trim(), "selected.txt", "unrelated staged file entered this commit");
+        let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"])).unwrap();
+        assert_eq!(staged.trim(), "other.txt", "unrelated staged edit was lost");
+        assert_eq!(std::fs::read_to_string(cwd.join("other.txt")).unwrap(), "other staged update\n");
+    }
 
     #[test]
     fn test_file_categorization_and_scoring() {
