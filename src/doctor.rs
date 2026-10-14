@@ -483,6 +483,12 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
 fn check_config(cwd: &Path, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Config;
 
+    // An explicit config override replaces both settings layers at startup.
+    if let Some(path) = Config::config_path_override_from_env(cwd) {
+        check_settings_file(cat, &path, "Settings override (PI_CONFIG_PATH)", findings);
+        return;
+    }
+
     // Global settings
     let global_path = Config::global_dir().join("settings.json");
     check_settings_file(cat, &global_path, "Global settings", findings);
@@ -508,6 +514,11 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
     }
     match std::fs::read_to_string(path) {
         Ok(content) => {
+            // Startup treats an empty settings file as the default configuration.
+            if content.trim().is_empty() {
+                findings.push(Finding::pass(cat, format!("{label}: empty (using defaults)")));
+                return;
+            }
             let value: serde_json::Value = match serde_json::from_str(&content) {
                 Ok(value) => value,
                 Err(e) => {
@@ -532,6 +543,21 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 return;
             };
 
+            // Validate typed settings from the original text, preserving duplicate
+            // fields that a Value round trip would silently discard. Never print
+            // serde's error text: it may contain sensitive user-provided values.
+            if let Err(err) = serde_json::from_str::<Config>(&content) {
+                findings.push(
+                    Finding::fail(cat, format!("{label}: invalid settings values"))
+                        .with_detail(format!(
+                            "Settings cannot be loaded at line {}, column {} (values omitted)",
+                            err.line(), err.column(),
+                        ))
+                        .with_remediation("Correct invalid setting types or duplicate fields"),
+                );
+                return;
+            }
+
             // The same walk pi runs at startup, so the two surfaces cannot
             // disagree about what counts as a typo. It reaches inside settings
             // objects — `bash.mediatoin` is reported as such — and it leaves
@@ -554,6 +580,46 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                     .with_detail(e.to_string())
                     .with_remediation(format!("Check file permissions on {}", path.display())),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod doctor_typed_settings_regressions {
+    use super::{check_settings_file, CheckCategory, DoctorReport, Severity};
+
+    #[test]
+    fn invalid_typed_settings_fail_without_leaking_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        for content in [
+            r#"{"hideThinkingBlock":"private-invalid-value"}"#,
+            r#"{"hideThinkingBlock":true,"hideThinkingBlock":false}"#,
+            r#"{"retry":{"maxRetries":"not-an-integer"}}"#,
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let mut findings = Vec::new();
+            check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);
+            let report = DoctorReport::from_findings(findings);
+            assert_eq!(report.overall, Severity::Fail);
+            assert_eq!(report.summary.fail, 1);
+            for rendered in [report.render_text(), report.render_markdown(), report.to_json().unwrap()] {
+                assert!(!rendered.contains("private-invalid-value"));
+                assert!(!rendered.contains("not-an-integer"));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_settings_and_unknown_keys_remain_nonfatal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        for (content, expected) in [("", Severity::Pass), ("  \n", Severity::Pass),
+            (r#"{"hideThinkngBlock":true}"#, Severity::Warn)] {
+            std::fs::write(&path, content).unwrap();
+            let mut findings = Vec::new();
+            check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);
+            assert_eq!(DoctorReport::from_findings(findings).overall, expected);
         }
     }
 }
