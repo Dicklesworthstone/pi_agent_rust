@@ -231,9 +231,9 @@ impl<F: Future<Output = GoalRunReport>> Future for GoalRun<F> {
     }
 }
 
-/// Reuses the controlled session's queue fetchers rather than registering
-/// another pair per continuation. The session remains exclusively borrowed
-/// throughout a run; ordinary lifecycle operations are available while idle.
+/// Owned-session convenience wrapper around the shared borrowed goal driver.
+/// The session remains exclusively borrowed throughout a run; ordinary
+/// lifecycle operations are available through `session_mut` while idle.
 pub struct GoalSession {
     session: ControllableSession,
 }
@@ -251,6 +251,22 @@ impl GoalSession {
         self.session.session_mut()
     }
 
+    /// Drive this owned session through the same implementation used by
+    /// borrowed SDK handles. No second agent or goal journal is created.
+    pub fn run_goal<'a>(
+        &'a mut self,
+        owner: &AgentCx,
+        expected: &GoalSnapshot,
+        timeout: Duration,
+        on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
+        decide: impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision + Send + 'a,
+    ) -> Result<GoalRun<impl Future<Output = GoalRunReport> + 'a>> {
+        self.session_mut()
+            .run_goal(owner, expected, timeout, on_event, decide)
+    }
+}
+
+impl AgentSessionHandle {
     /// Run the exact reviewed goal until explicit completion/pause or a limit.
     /// Construct in the runtime: the absolute deadline starts NOW, not on first
     /// poll, and includes all prompts, retries and tool loops. The host verdict
@@ -280,7 +296,7 @@ impl GoalSession {
         let future = async move {
             let _guard = guard;
             owner
-                .with_current(self.drive(&owner, expected, deadline, run_control, on_event, decide))
+                .with_current(self.drive_goal(&owner, expected, deadline, run_control, on_event, decide))
                 .await
         };
         Ok(GoalRun {
@@ -289,7 +305,7 @@ impl GoalSession {
         })
     }
 
-    async fn drive(
+    async fn drive_goal(
         &mut self,
         owner: &AgentCx,
         expected: GoalSnapshot,
@@ -307,7 +323,7 @@ impl GoalSession {
             pending: Vec::new(),
         };
         let on_event = Arc::new(on_event);
-        if let Err(error) = verify_current(self.session_mut(), &report.goal) {
+        if let Err(error) = verify_current(self, &report.goal) {
             return failed(report, error);
         }
         loop {
@@ -323,7 +339,7 @@ impl GoalSession {
                 };
                 return report;
             }
-            let intent = match start_attempt(self.session_mut(), owner, &report.goal).await {
+            let intent = match start_attempt(self, owner, &report.goal).await {
                 Ok(change) => change,
                 Err(error) => return failed(report, error),
             };
@@ -337,19 +353,19 @@ impl GoalSession {
             let prompt = prompt_for(&ticket.record);
             let callback = Arc::clone(&on_event);
             let callback_control = control.clone();
-            let turn = match self.session.prompt_with_control(prompt, move |_, event| {
+            // The borrowed SDK path installs scoped fetchers for this turn;
+            // they retire with it instead of accumulating on a retained handle.
+            // Native hooks, retry/failover and persistence keep their owner.
+            let turn = self.prompt_controlled(prompt, move |event| {
                 callback(&callback_control, event);
-            }) {
-                Ok(turn) => turn,
-                Err(error) => return failed(report, error),
-            };
+            });
             let native_control = turn.control();
             control.install(native_control.clone());
             report.completion = Some(turn.with_deadline(deadline.clone()).await);
             control.retire_turn();
             report.pending = native_control.take_pending();
 
-            let observed = match self.session_mut().current_goal() {
+            let observed = match self.current_goal() {
                 Ok(Some(goal)) => goal,
                 Ok(None) => return failed(report, failure("GOAL_MISSING", "goal disappeared during execution")),
                 Err(error) => return failed(report, error),
@@ -360,7 +376,7 @@ impl GoalSession {
             report.goal = observed;
             let (decision, stop) = decide_next(&mut report, owner, &deadline, &control, &mut decide);
             let (settled, late_stop) = match settle_attempt(
-                self.session_mut(), owner, &report.goal, decision, &deadline, &control,
+                self, owner, &report.goal, decision, &deadline, &control,
             ).await {
                 Ok(settled) => settled,
                 Err(error) => {
