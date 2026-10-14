@@ -131,11 +131,17 @@ impl EvalTool {
                 .clamp(1, 600),
         );
         let owner = AgentCx::for_current_or_request();
+        // Bind on first poll, before queueing. Never redirect an old request
+        // or reset into whichever session happens to be current on admission.
+        let requested_session = wait_owned(&owner, None, self.eval_session_id())
+            .await.map_err(before_execution_stop)??;
         // Waiting is asynchronous and consumes no cell runtime budget. The
         // guard releases on success, error, panic, or future abandonment.
         // No FIFO ordering is promised between simultaneous callers.
         let _execution = wait_owned(&owner, None, self.execution.lock())
             .await.map_err(before_execution_stop)?;
+        wait_owned(&owner, None, self.require_eval_session(&requested_session))
+            .await.map_err(before_execution_stop)??;
         // Read on admission, not while queued. Preparation errors never
         // discard a retained kernel, even for a reset request.
         let prepared = match load_path {
@@ -149,6 +155,11 @@ impl EvalTool {
                 .await.map_err(before_execution_stop)??),
             None => None,
         };
+        // Preflight may await disk I/O. Recheck before rotating namespaces or
+        // destroying either language's retained state.
+        wait_owned(&owner, None, self.require_eval_session(&requested_session))
+            .await.map_err(before_execution_stop)??;
+        let activation = self.activate_eval_session(&requested_session, &_execution, &owner);
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.
@@ -217,6 +228,7 @@ impl EvalTool {
                 error
             }
         })?;
+        activation.annotate(&mut output);
         if let Some(Value::Object(details)) = output.details.as_mut() {
             details.insert("reset".to_string(), Value::Bool(cell.reset));
             if let Some(file) = &prepared {

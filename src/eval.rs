@@ -21,6 +21,7 @@ mod display;
 mod js_kernel;
 mod lifecycle;
 mod output;
+mod session;
 mod transport;
 
 /// The kernel server script, shipped inside the binary.
@@ -163,6 +164,10 @@ pub struct EvalTool {
     python_path: String,
     kernel: Mutex<Option<PyKernel>>,
     js: Mutex<Option<js_kernel::JsKernel>>,
+    // Registry snapshots share this resolver. The active slots above belong
+    // only to the selected session; other retained namespaces are bounded.
+    session_scope: crate::jobs::JobSessionScope,
+    retained_sessions: Mutex<session::RetainedSessions>,
     // Slot mutexes protect storage, not execution: each runner takes its
     // kernel out across awaits. Keep this lease until it returns or drops.
     execution: futures::lock::Mutex<()>,
@@ -177,6 +182,8 @@ impl EvalTool {
             python_path,
             kernel: Mutex::new(None),
             js: Mutex::new(None),
+            session_scope: crate::jobs::JobSessionScope::default(),
+            retained_sessions: Mutex::new(session::RetainedSessions::default()),
             execution: futures::lock::Mutex::new(()),
         }
     }
@@ -404,8 +411,8 @@ impl EvalTool {
                     kernel.kill();
                     return Err(Error::tool(
                         "eval",
-                        "EVAL_KERNEL_CRASH: the Python kernel exited mid-cell — state \
-                         was lost, next cell starts fresh",
+                        "EVAL_KERNEL_CRASH: the Python kernel exited mid-cell — state was \
+                         lost, next cell starts fresh",
                     ));
                 }
                 Err(error) => {
@@ -585,6 +592,10 @@ impl Tool for EvalTool {
     fn effects(&self) -> ToolEffects {
         // Arbitrary code: process-level effects, serialized fail-closed.
         ToolEffects::process()
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.bind_eval_session_scope(scope);
     }
 }
 
