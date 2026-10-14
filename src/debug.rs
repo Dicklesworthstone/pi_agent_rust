@@ -4,6 +4,7 @@
 pub mod adapters;
 mod breakpoints;
 pub mod dap;
+mod ownership;
 pub mod session;
 
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ pub struct DebugTool {
     cwd: PathBuf,
     adapters: Vec<AdapterSpec>,
     session: Mutex<Option<Arc<DapSession>>>,
+    session_scope: crate::jobs::JobSessionScope,
+    session_owners: Mutex<ownership::SessionOwners>,
     operations: Arc<asupersync::sync::Mutex<()>>,
 }
 
@@ -57,6 +60,8 @@ impl DebugTool {
             cwd: cwd.to_path_buf(),
             adapters: adapters::default_adapters(),
             session: Mutex::new(None),
+            session_scope: crate::jobs::JobSessionScope::default(),
+            session_owners: Mutex::new(ownership::SessionOwners::default()),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
@@ -84,6 +89,7 @@ impl DebugTool {
                 "terminate or disconnect the existing debug session before launch or attach",
             ));
         }
+        self.require_debug_capacity()?;
         let program = if input.action == "launch" {
             let name = input.required("program", input.program.as_deref())?;
             let path = std::fs::canonicalize(self.cwd.join(name)).map_err(|error| {
@@ -937,7 +943,7 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -988,6 +994,9 @@ impl Tool for DebugTool {
             }
         })
     }
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.bind_debug_scope(scope);
+    }
     fn effects(&self) -> ToolEffects {
         ToolEffects::process().union(ToolEffects::network())
     }
@@ -1001,17 +1010,24 @@ impl Tool for DebugTool {
             .map_err(|error| tool_err("DAP_USAGE", format!("invalid input: {error}")))?;
         input.validate()?;
         let owner = AgentCx::for_current_or_request();
+        let requested_owner = self.debug_owner(&owner).await?;
         let _operation = OwnedMutexGuard::lock(Arc::clone(&self.operations), owner.cx())
             .await
             .map_err(|_| tool_err("DAP_CANCELLED", "debug operation cancelled while queued"))?;
-        match input.action.as_str() {
+        self.require_debug_owner(&requested_owner, &owner).await?;
+        self.activate_debug_owner(&requested_owner);
+        let output = match input.action.as_str() {
             "launch" | "attach" => self.run_start(&input).await,
             "sessions" if lock(&self.session).is_none() => {
                 let payload = json!({"action":"sessions","sessions":[]});
                 Ok(text_output(payload.to_string(), payload))
             }
             _ => self.run_simple(&input).await,
-        }
+        };
+        // Do not publish an old conversation's result into a new one. The
+        // original adapter stays owned; admitted side effects are not undone.
+        self.require_debug_owner(&requested_owner, &owner).await?;
+        output
     }
 }
 
