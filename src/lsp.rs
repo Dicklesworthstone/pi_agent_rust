@@ -277,32 +277,7 @@ impl LspTool {
                 "symbol resolution requires a workspace query",
             ));
         }
-        match (input.file.as_deref(), input.query.as_deref()) {
-            (Some(file), _) => {
-                let path = resolve_tool_path(file, &self.cwd);
-                let (uri, entry) = self
-                    .synced_with_timeout(&path, self.request_timeout(input))
-                    .await?;
-                let result = entry
-                    .client
-                    .call(
-                        "textDocument/documentSymbol",
-                        json!({"textDocument":{"uri":uri}}),
-                        self.request_timeout(input),
-                    )
-                    .await?;
-                let (payload, truncated) = cap_payload(
-                    json!({"action":"symbols","file":display_path(&path,&self.cwd),"server":entry.spec_name,"symbols":result}),
-                );
-                Ok(text_output(
-                    payload.to_string(),
-                    json!({"truncated":truncated,"payload":payload}),
-                ))
-            }
-            (None, _) => Ok(usage_error(
-                "lsp symbols requires `file` (document symbols) or `query` (workspace symbols)",
-            )),
-        }
+        self.run_document_symbols(input).await
     }
 
     fn code_action_range(input: &LspInput, path: &Path) -> Result<Value> {
@@ -620,7 +595,7 @@ impl Tool for LspTool {
             " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.",
             " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application.",
             " prepare_rename inspects the server-confirmed symbol range and placeholder without computing edits. It and rename accept file + exact position instead of symbol/line. Fresh rename automatically prepares when supported; a refusal stops before computing edits. Preparation is not an approval handle.",
-            " symbols with query searches the workspace selected by an anchor file (file or symbol, not both); file without query lists document symbols. resolve:true fills missing symbol location ranges when supported. Inspect truncated and unresolvedIndices; returned URIs are metadata, never opened or executed.",
+            " symbols with query searches the workspace selected by an anchor file (file or symbol, not both). resolve:true fills missing workspace symbol location ranges when supported. File without query returns a source-checked document outline, including streamed nested symbols, exact ranges and explicit parentIndex/depth. Inspect total, count, truncated and responseComplete; limits shorten only the display, not validation. Document outlines never resolve symbols, open returned URIs or authorize edits.",
             " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately.",
             " definition, references, type_definition, implementation and hover also accept file + exact position instead of symbol/line. Navigation preserves complete target ranges and location-link metadata; inspect total, truncated and responseComplete. Target URIs are never opened. Source changes during the request invalidate the result.",
             " project_diagnostics uses an existing anchor file to select one server and requests its native whole-workspace diagnostic report, including unopened and virtual documents, without walking or opening them. Requires workspace diagnostic support; errors never fall back to cached success. Only file, timeout and limit are accepted. Totals cover the full server response even when displayed reports are truncated; omitted files are not proven checked.",
@@ -662,7 +637,7 @@ impl Tool for LspTool {
                 "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). format and symbol rename share a budget across startup, requests and staging after acquiring the workflow lane. workspace_diagnostics budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible. project_diagnostics includes server startup and full response processing, capped at 120 seconds."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
                 "payload":{"description":"Raw JSON params for request. For configure, a complete nested settings object (at most 64 KiB) for this server connection; preview by default, repeat with apply:true to replace and notify. Not merged, not initializationOptions, and not saved to disk."},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256). project_diagnostics displays at most this many complete document reports (default 100, capped at 1000); totals include omitted reports. selection_ranges returns this many enclosing levels (default 16, capped at 64), validating omitted levels too."},
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. Document symbols default to 100, capped at 1000 and the structured output byte budget; totals include omitted nested symbols. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256). project_diagnostics displays at most this many complete document reports (default 100, capped at 1000); totals include omitted reports. selection_ranges returns this many enclosing levels (default 16, capped at 64), validating omitted levels too."},
                 "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })

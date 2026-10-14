@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 
 mod hints;
 mod navigation;
+mod outline;
 mod signatures;
 mod symbols;
 
