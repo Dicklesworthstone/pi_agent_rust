@@ -33,6 +33,14 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   `tests/installer_regression.sh` rejects interval expressions in its awk
   and grep patterns
   ([#265](https://github.com/Dicklesworthstone/pi_agent_rust/issues/265)).
+- **`pi self-update` with large release binaries.** The updater downloaded
+  at most 64 MiB and treated a larger binary as missing, so it stopped with
+  "No compatible binary candidate found" for v0.8.0 on Linux x86_64, macOS
+  Intel and Windows, whose binaries are 70 to 78 MB. The limit is now
+  256 MiB, and a response that declares a larger `Content-Length` is
+  refused before it is read. This takes effect only in builds that contain
+  it: v0.7.1 and v0.8.0 users on those platforms run the installer once
+  ([#266](https://github.com/Dicklesworthstone/pi_agent_rust/issues/266)).
 
 ## [v0.8.0] — 2026-10-13 — Release
 
@@ -509,6 +517,16 @@ not read.
 
 ### Known issues
 
+- **`pi self-update` cannot install this release on Linux x86_64, macOS
+  Intel or Windows.** The updater downloads at most 64 MiB, and the
+  speed-optimized binaries for those platforms are larger (78, 71 and 74 MB),
+  so it stops with "No compatible binary candidate found". Run the installer
+  once instead:
+  `curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh | bash`.
+  On Apple Silicon and Linux arm64, `pi self-update` works. The limit is
+  being raised on `main`; until a release that contains the change is
+  installed, updates on those three platforms need the installer
+  ([#266](https://github.com/Dicklesworthstone/pi_agent_rust/issues/266)).
 - **Long reasoning is drawn slowly on the default stack.** The in-flight
   reasoning block is laid out again on every frame, so frame time grows with
   its length. Since this release every frame is shown (see **Fixed**), but
