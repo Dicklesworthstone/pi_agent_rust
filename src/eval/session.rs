@@ -11,6 +11,7 @@ use crate::jobs::JobSessionScope;
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 /// Includes the active namespace. Each namespace may own one of each kernel.
 const MAX_RETAINED_SESSIONS: usize = 4;
@@ -27,6 +28,80 @@ pub(super) struct RetainedSessions {
     active: Option<String>,
     /// Least recently active first. Empty namespaces consume no cache entry.
     dormant: VecDeque<StoredKernels>,
+}
+
+/// A live identity failure is distinct from cancellation and cell timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnershipStop {
+    Changed,
+    Unavailable,
+}
+
+impl OwnershipStop {
+    pub(super) const fn code(self) -> &'static str {
+        match self {
+            Self::Changed => "EVAL_SESSION_CHANGED",
+            Self::Unavailable => "EVAL_SESSION_UNAVAILABLE",
+        }
+    }
+
+    pub(super) const fn kind(self) -> &'static str {
+        match self {
+            Self::Changed => "sessionChanged",
+            Self::Unavailable => "sessionUnavailable",
+        }
+    }
+
+    pub(super) fn tool_error(self) -> Error {
+        Error::tool("eval", format!(
+            "{}: active cell no longer has its original session owner; EVAL_STATE_RESET: selected kernel discarded",
+            self.code()
+        ))
+    }
+}
+
+/// Frozen ownership for one active invocation. A detected mismatch is sticky:
+/// switching back cannot turn already-rejected work into a successful result.
+/// This detects observed identities, not unobserved A-to-B-to-A transitions.
+/// No resolver, guest code, callback or await runs with the stop lock held.
+pub(super) struct CellSession {
+    expected: String,
+    scope: JobSessionScope,
+    stop: Mutex<Option<OwnershipStop>>,
+}
+
+impl CellSession {
+    pub(super) fn new(scope: JobSessionScope, expected: String) -> Self {
+        Self { expected, scope, stop: Mutex::new(None) }
+    }
+
+    fn stopped(&self) -> Option<OwnershipStop> {
+        *self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) async fn check(&self) -> std::result::Result<(), OwnershipStop> {
+        if let Some(stop) = self.stopped() {
+            return Err(stop);
+        }
+        let failure = match self.scope.session_id().await {
+            Ok(id) if id.len() > MAX_SESSION_ID_BYTES => Some(OwnershipStop::Unavailable),
+            Ok(id) if id != self.expected => Some(OwnershipStop::Changed),
+            Ok(_) => None,
+            Err(_) => Some(OwnershipStop::Unavailable),
+        };
+        let mut stop = self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(failure) = failure {
+            let _ = stop.get_or_insert(failure);
+        }
+        match *stop {
+            Some(stop) => Err(stop),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) async fn check_tool(&self) -> Result<()> {
+        self.check().await.map_err(OwnershipStop::tool_error)
+    }
 }
 
 pub(super) struct Activation {

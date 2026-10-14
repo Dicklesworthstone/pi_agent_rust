@@ -7,6 +7,82 @@ Pi's input fields are `code`, `kernel` (`python` or `js`, default `python`),
 OMP's `language`/`timeout` wire format. Python requires a usable interpreter;
 `PI_EVAL_PYTHON` selects it instead of `python3`.
 
+## Session namespaces and live ownership
+
+Eval uses the owning tool registry's existing live session-identity resolver.
+When the host binds that resolver, separate session IDs receive separate Python
+and JavaScript namespaces, including lexical bindings, imports and cell counters.
+For example, define `const value = 42` in session A, switch to B and observe
+`typeof value` as `"undefined"`; switching back to retained A restores its value.
+A new or forked session ID does not inherit the preceding session's variables.
+
+This works at the shared tool layer, not through a special eval slash command.
+`ToolRegistry::new`, `from_tools` and later tool mounts bind the same scope used
+by jobs. Shallow registry snapshots keep the original tool handles and resolver;
+a snapshot is not a new kernel namespace. `AgentSession` already supplies its
+live session resolver through this binding. Standalone `EvalTool::new` instances
+have independent fixed scopes unless their host binds a live one. Embedders must
+return the current, nonempty identity; an unavailable identity never selects a
+process-global or preceding-session kernel. IDs are bounded to 1024 bytes.
+
+One tool instance retains at most **four namespaces**, including the active one.
+Each may contain one Python and one JavaScript kernel. Least-recently-active
+idle namespaces are evicted through the existing process-tree/worker cleanup,
+outside cache and slot locks. A later call to an evicted namespace starts fresh
+and reports `restarted: true` and cell number one; it never substitutes another
+session's state. Moving an owned tool into a new registry retires all of its
+previous namespaces. Dropping the tool also drops its retained kernels.
+
+`details.kernelSession` reports `scope: "session"`, `changed`,
+`namespaceRestored`, `idleNamespaceEvicted`, and `capacity`. These flags describe
+the current activation; they do not expose other session IDs or their contents.
+`namespaceRestored` means an idle cached namespace was activated, not a durable
+snapshot was loaded. Reset still affects only the selected language in the
+active namespace. It does not clear the other language or other sessions.
+
+### Queued and active session changes
+
+A call captures its session identity on first poll, before waiting for exclusive
+admission. The host rechecks it after admission and asynchronous source/archive
+preflight. A changed identity produces `EVAL_SESSION_CHANGED` before code or the
+requested reset runs. Invalid input, missing identity, abandoned queued calls,
+and failed preflight do not rotate the namespace cache.
+
+Active execution also checks its frozen identity: while polling either kernel,
+around output callbacks, before and after native tool-bridge calls, and before
+accepting the final kernel result. A 20 ms cooperative watch covers quiet cells
+and bridge waits. Session-lock contention remains an asynchronous wait rather
+than an invented missing-session error; it is still covered by the same cell
+deadline and owner cancellation. Identity checks do not create another thread.
+
+An observed change or unavailable identity stops the original cell and retires
+only its selected kernel under the still-held execution lease. It does **not**
+activate or reset the newly selected session. Python retains its tool-error
+convention; JavaScript returns an unsuccessful `ToolOutput` with
+`errorKind: "sessionChanged"` or `"sessionUnavailable"` and `stateReset: true`.
+Both preserve the existing bounded partial-console-output behavior. An
+ownership-interrupted kernel run does not publish its requested console archive.
+Once observed, ownership failure remains latched even if the host switches back
+before handling the error. No further running update is emitted after that stop.
+
+These are cooperative checks, not an atomic session-transition lock or a
+sandbox. They cannot detect an A-to-B-to-A transition that occurs entirely
+between checks, nor do they roll back completed guest or native-tool effects.
+Hosts must still route responses to their originating request; downstream
+response delivery and archive finalization are not a transaction with frontend
+session changes. Eval retains its tool instance's original workspace/interpreter
+configuration: a different workspace should construct appropriately rooted tools.
+Namespaces do not isolate filesystem access, arbitrary Python threads or other
+OS effects. No bound on arbitrary guest memory is added.
+
+Retention is in-process and per tool instance, not saved with the session log.
+It is not a cross-process kernel service, durable notebook checkpoint, managed
+background-job system, or implicit sharing across separately constructed
+subagents. For live console output and optional create-only archives, see
+[eval output](tools/eval-output.md). Session regression coverage is in
+`src/eval/session/tests.rs` and the lifecycle tests; authored tests require the
+DSR quality workflow below before runtime acceptance can be claimed.
+
 ## Exclusive execution and reset
 
 Calls on one `EvalTool` instance execute exclusively, including direct SDK calls

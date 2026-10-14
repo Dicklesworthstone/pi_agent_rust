@@ -119,8 +119,10 @@ impl PyKernel {
         &mut self,
         deadline: Instant,
         capture: &mut output::Capture,
+        session_guard: &session::CellSession,
     ) -> Result<Option<String>> {
         loop {
+            session_guard.check_tool().await?;
             capture.publish(false);
             let received = self
                 .lines
@@ -197,6 +199,7 @@ impl EvalTool {
         filename: Option<&str>,
         timeout: Duration,
         capture: &mut output::Capture,
+        session_guard: &session::CellSession,
     ) -> Result<ToolOutput> {
         let kernel = {
             let mut slot = self
@@ -224,13 +227,15 @@ impl EvalTool {
             owner.checkpoint().map_err(|_| Error::tool(
                 "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
             ))?;
+            session_guard.check_tool().await?;
             let received = drain_js_console(&output_rx, capture)?;
             capture.publish(false);
-            // User callbacks may cancel. Do not start a new bridge operation
-            // after such a callback just because native frames remain ready.
+            // Callbacks may cancel or switch sessions. Observe both before
+            // admitting a bridge, even with a continuously ready producer.
             owner.checkpoint().map_err(|_| Error::tool(
                 "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
             ))?;
+            session_guard.check_tool().await?;
             if let Ok(bridge) = kernel.bridge.try_recv() {
                 // At most one queue's worth of frames can precede this bridge.
                 // Publish them before entering a potentially slow native tool.
@@ -239,15 +244,18 @@ impl EvalTool {
                 owner.checkpoint().map_err(|_| Error::tool(
                     "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
                 ))?;
+                session_guard.check_tool().await?;
                 let mut pending = Box::pin(self.run_bridge_call_parts(&bridge.tool, bridge.input));
                 let reply = loop {
                     // An async JS timer can print while its tool request is in
                     // flight. Keep draining instead of blocking that producer.
+                    session_guard.check_tool().await?;
                     drain_js_console(&output_rx, capture)?;
                     capture.publish(false);
                     owner.checkpoint().map_err(|_| Error::tool(
                         "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
                     ))?;
+                    session_guard.check_tool().await?;
                     let sleeper = Box::pin(asupersync::time::sleep(
                         asupersync::time::wall_now(), Duration::from_millis(15),
                     ));
@@ -256,6 +264,7 @@ impl EvalTool {
                         futures::future::Either::Right(((), operation)) => pending = operation,
                     }
                 };
+                session_guard.check_tool().await?;
                 let _ = bridge.reply.send(reply);
             }
             match reply_rx.try_recv() {
@@ -294,6 +303,7 @@ impl EvalTool {
         // On malformed output, dropping the owned kernel revokes its worker.
         let mut output = display::javascript_response(response, restarted, cells_run)?;
         capture.annotate(&mut output);
+        session_guard.check_tool().await?;
         capture.publish(true);
         {
             let mut slot = self
@@ -345,6 +355,7 @@ impl EvalTool {
         code: &str,
         timeout: Duration,
         capture: &mut output::Capture,
+        session_guard: &session::CellSession,
     ) -> Result<ToolOutput> {
         // Take the kernel out (or spawn) so the mutex is not held across await.
         let taken = self
@@ -391,6 +402,7 @@ impl EvalTool {
             crate::agent_cx::AgentCx::for_current_or_request().checkpoint().map_err(|_| {
                 Error::tool("eval", "EVAL_CANCELLED; EVAL_STATE_RESET: Python kernel discarded")
             })?;
+            session_guard.check_tool().await?;
             // Deadline check up front: a cell looping on bridge calls
             // keeps lines flowing, so the Empty-branch check inside
             // next_line alone would never fire and the cell could run
@@ -405,7 +417,7 @@ impl EvalTool {
                     ),
                 ));
             }
-            let line = match kernel.next_line(deadline, capture).await {
+            let line = match kernel.next_line(deadline, capture, session_guard).await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
                     // EOF: crashed mid-cell (e.g. os._exit). State lost.
@@ -429,6 +441,7 @@ impl EvalTool {
                     ));
                 }
             };
+            session_guard.check_tool().await?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -453,7 +466,9 @@ impl EvalTool {
             if let Some(bridge) = parsed.get("bridge") {
                 transport::validate_bridge(&parsed)?;
                 capture.publish(true);
+                session_guard.check_tool().await?;
                 let reply = self.run_bridge_call(bridge).await;
+                session_guard.check_tool().await?;
                 let line = json!({"bridge_result": reply}).to_string();
                 kernel
                     .stdin
@@ -474,6 +489,7 @@ impl EvalTool {
         // bad frame, and cannot partially publish a successful tool result.
         let mut output = format_cell_response(&final_line, restarted, cells_run)?;
         capture.annotate(&mut output);
+        session_guard.check_tool().await?;
         capture.publish(true);
 
         // Return the kernel to the slot for the next cell.

@@ -4,6 +4,7 @@
 //! temporarily empty while its kernel executes is not permission for another
 //! SDK call to spawn a competing kernel and overwrite the returned state.
 
+use super::session::{CellSession, OwnershipStop};
 use super::{DEFAULT_CELL_TIMEOUT_SECS, EvalTool};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -47,6 +48,7 @@ struct Cell {
 enum CellStop {
     Cancelled,
     Timeout,
+    Session(OwnershipStop),
 }
 
 impl CellStop {
@@ -54,6 +56,7 @@ impl CellStop {
         match self {
             Self::Cancelled => "EVAL_CANCELLED",
             Self::Timeout => "EVAL_TIMEOUT",
+            Self::Session(stop) => stop.code(),
         }
     }
 
@@ -61,6 +64,7 @@ impl CellStop {
         match self {
             Self::Cancelled => "cancelled",
             Self::Timeout => "timeout",
+            Self::Session(stop) => stop.kind(),
         }
     }
 }
@@ -100,6 +104,35 @@ async fn wait_owned<F: Future>(
             futures::future::Either::Right(((), operation)) => pending = operation,
         }
     }
+}
+
+/// Watch quiet kernels and native bridge waits as well as output-producing
+/// cells. The outer watchdog covers identity resolution too: a contended
+/// session lock remains pending, but cannot hide cancellation or the deadline.
+async fn wait_in_session<F: Future>(
+    owner: &AgentCx,
+    deadline: Instant,
+    session: &CellSession,
+    future: F,
+) -> std::result::Result<F::Output, CellStop> {
+    wait_owned(owner, Some(deadline), async {
+        let mut pending = Box::pin(future);
+        loop {
+            session.check().await.map_err(CellStop::Session)?;
+            let time = owner.time();
+            let sleeper = Box::pin(time.sleep(Duration::from_millis(20)));
+            match futures::future::select(pending, sleeper).await {
+                futures::future::Either::Left((output, _)) => {
+                    // Includes a callback changing session during a Ready
+                    // poll. The kernel may already have returned to its slot;
+                    // the caller retires it while still holding admission.
+                    session.check().await.map_err(CellStop::Session)?;
+                    return Ok(output);
+                }
+                futures::future::Either::Right(((), operation)) => pending = operation,
+            }
+        }
+    }).await?
 }
 
 fn before_execution_stop(stop: CellStop) -> Error {
@@ -160,6 +193,7 @@ impl EvalTool {
         wait_owned(&owner, None, self.require_eval_session(&requested_session))
             .await.map_err(before_execution_stop)??;
         let activation = self.activate_eval_session(&requested_session, &_execution, &owner);
+        let session_guard = CellSession::new(self.session_scope.clone(), requested_session);
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.
@@ -178,20 +212,22 @@ impl EvalTool {
         capture.attach_archive(archive);
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
-            Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout, &mut capture)).await,
+            Kernel::Python => wait_in_session(&owner, deadline, &session_guard,
+                self.run_py_cell(&cell.code, timeout, &mut capture, &session_guard)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
                 let filename = prepared.as_ref().map(|file| file.path.as_str());
-                wait_owned(&owner, Some(deadline), self.run_js_cell(code, filename, timeout, &mut capture)).await
+                wait_in_session(&owner, deadline, &session_guard,
+                    self.run_js_cell(code, filename, timeout, &mut capture, &session_guard)).await
             }
         };
         let interrupted = outcome.is_err();
         let outcome = match outcome {
             Ok(output) => output,
             Err(stop) => {
-                // Dropping wait_owned retired the active future and its
-                // checked-out kernel. Also remove a kernel that was returned
-                // to its slot during a late Ready poll before the final check.
+                // The execution lease still pins the original namespace.
+                // Never select the new session in order to retire this cell.
+                // Also remove a kernel returned during a late Ready poll.
                 self.retire_kernel(cell.kernel, &owner);
                 let message = format!(
                     "{}: {} cell stopped; EVAL_STATE_RESET: selected kernel state discarded, next cell starts fresh",
@@ -214,7 +250,12 @@ impl EvalTool {
                 }
             }
         };
-        capture.publish(true);
+        // Do not emit another running update after an interrupted cell. Do
+        // not await its resolver outside the watchdog during error cleanup.
+        // Already received bytes remain in the existing failure result.
+        if !interrupted {
+            capture.publish(true);
+        }
         let mut output = outcome.map_err(|error| {
             let error = capture.with_error(error);
             if cell.reset {
@@ -657,5 +698,47 @@ mod tests {
             assert_eq!(reset.details.as_ref().unwrap()["cell"], 1);
             assert_eq!(text(&js(&tool, "keep").await).trim(), "8");
         });
+    }
+
+    #[test]
+    fn session_watch_rechecks_ready_results_and_never_polls_rejected_work() {
+        let owner = AgentCx::for_testing();
+        let scope = crate::jobs::JobSessionScope::fixed("a");
+        let session = CellSession::new(scope.clone(), "a".into());
+        let result = run(wait_in_session(&owner, Instant::now() + Duration::from_secs(5), &session, async {
+            scope.bind(std::sync::Arc::new(|| Box::pin(async { Some("b".into()) })));
+            42
+        }));
+        assert_eq!(result, Err(CellStop::Session(OwnershipStop::Changed)));
+        let started = std::cell::Cell::new(false);
+        let result = run(wait_in_session(&owner, Instant::now() + Duration::from_secs(5), &session, async {
+            started.set(true);
+        }));
+        assert_eq!(result, Err(CellStop::Session(OwnershipStop::Changed)));
+        assert!(!started.get());
+    }
+
+    #[test]
+    fn unresolved_identity_cannot_hide_cell_deadline_or_owner_cancellation() {
+        let owner = AgentCx::for_testing();
+        let scope = crate::jobs::JobSessionScope::fixed("a");
+        scope.bind(std::sync::Arc::new(|| Box::pin(std::future::pending())));
+        let session = CellSession::new(scope, "a".into());
+        let started = std::cell::Cell::new(false);
+        let result = run(wait_in_session(&owner, Instant::now() + Duration::from_millis(30), &session, async {
+            started.set(true);
+        }));
+        assert_eq!(result, Err(CellStop::Timeout));
+        assert!(!started.get());
+        run(async {
+            let mut waiting = Box::pin(wait_in_session(
+                &owner, Instant::now() + Duration::from_secs(60), &session,
+                async { started.set(true); },
+            ));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            owner.set_cancel_requested(true);
+            assert_eq!(waiting.await, Err(CellStop::Cancelled));
+        });
+        assert!(!started.get());
     }
 }
