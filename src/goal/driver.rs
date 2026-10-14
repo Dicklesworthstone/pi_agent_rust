@@ -26,6 +26,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
+mod verification;
 
 /// An explicit host decision after a successful native prompt. Evidence text
 /// is an attestation by the host, not proof verified by Pi. A continuation is
@@ -82,6 +83,7 @@ struct ControlState {
     finished: bool,
     turn: Option<SessionControlHandle>,
     pending: Vec<PendingInput>,
+    verification_waker: Option<std::task::Waker>,
 }
 
 /// A handle for ONE run, including the gaps between its prompts. `pause`
@@ -100,6 +102,7 @@ impl GoalControl {
                 finished: false,
                 turn: None,
                 pending: Vec::new(),
+                verification_waker: None,
             })),
         }
     }
@@ -113,16 +116,22 @@ impl GoalControl {
     /// Seal continuation even between prompts. Await the run to drain native
     /// cancellation. Dropping does not promise completed async cleanup.
     pub fn pause(&self) -> bool {
-        let turn = {
+        let (turn, waker) = {
             let mut state = self.lock();
             if state.finished || state.paused {
                 return false;
             }
             state.paused = true;
-            state.turn.clone()
+            (state.turn.clone(), state.verification_waker.take())
         };
         if let Some(turn) = turn {
             turn.abort();
+        }
+        // A verifier may be waiting on external I/O with no native turn to
+        // abort. Wake it after releasing the control lock, even if it never
+        // registered its own wakeup. Pause remains latched between prompts.
+        if let Some(waker) = waker {
+            waker.wake();
         }
         true
     }
@@ -183,11 +192,17 @@ impl GoalControl {
     }
 
     fn finish(&self) {
-        let mut state = self.lock();
-        state.finished = true;
-        if let Some(turn) = state.turn.take() {
-            turn.abort();
-            state.pending.extend(turn.take_pending());
+        let waker = {
+            let mut state = self.lock();
+            state.finished = true;
+            if let Some(turn) = state.turn.take() {
+                turn.abort();
+                state.pending.extend(turn.take_pending());
+            }
+            state.verification_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -264,6 +279,22 @@ impl GoalSession {
         self.session_mut()
             .run_goal(owner, expected, timeout, on_event, decide)
     }
+
+    /// Asynchronous verification on the same owned session and goal driver.
+    pub fn run_goal_with_verifier<'a, F>(
+        &'a mut self,
+        owner: &AgentCx,
+        expected: &GoalSnapshot,
+        timeout: Duration,
+        on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
+        verify: impl FnMut(GoalSnapshot, AssistantMessage) -> F + Send + 'a,
+    ) -> Result<GoalRun<impl Future<Output = GoalRunReport> + 'a>>
+    where
+        F: Future<Output = Result<GoalDecision>> + Send + 'a,
+    {
+        self.session_mut()
+            .run_goal_with_verifier(owner, expected, timeout, on_event, verify)
+    }
 }
 
 impl AgentSessionHandle {
@@ -283,8 +314,38 @@ impl AgentSessionHandle {
         expected: &GoalSnapshot,
         timeout: Duration,
         on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
-        decide: impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision + Send + 'a,
+        mut decide: impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision + Send + 'a,
     ) -> Result<GoalRun<impl Future<Output = GoalRunReport> + 'a>> {
+        self.run_goal_with_verifier(owner, expected, timeout, on_event, move |goal, message| {
+            std::future::ready(Ok(decide(&goal, &message)))
+        })
+    }
+
+    /// Await host-owned validation before continuing or completing a goal.
+    ///
+    /// The verifier receives owned snapshots of the goal and last successful
+    /// assistant response, not the mutable session or additional tool rights.
+    /// Its future shares this run's absolute deadline and cancellation owner.
+    /// Pause, cancellation or expiry drops the verifier under that owner and
+    /// never commits a late verdict. Verifier errors pause work and remain in
+    /// `GoalRunReport::error`; the native completion is retained independently.
+    ///
+    /// Verifiers must own cancellation-safe cleanup of their resources. Drop
+    /// does not join detached work, roll back its side effects, or preempt a
+    /// blocking callback/poll. No verifier is called for an unsuccessful native
+    /// turn, a native time cap, or unclaimed user input. Creating an unused run
+    /// invokes neither the verifier nor the provider.
+    pub fn run_goal_with_verifier<'a, F>(
+        &'a mut self,
+        owner: &AgentCx,
+        expected: &GoalSnapshot,
+        timeout: Duration,
+        on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
+        verify: impl FnMut(GoalSnapshot, AssistantMessage) -> F + Send + 'a,
+    ) -> Result<GoalRun<impl Future<Output = GoalRunReport> + 'a>>
+    where
+        F: Future<Output = Result<GoalDecision>> + Send + 'a,
+    {
         let deadline = TurnDeadline::after(owner, timeout)?;
         let owner = owner.clone();
         let expected = expected.clone();
@@ -296,7 +357,7 @@ impl AgentSessionHandle {
         let future = async move {
             let _guard = guard;
             owner
-                .with_current(self.drive_goal(&owner, expected, deadline, run_control, on_event, decide))
+                .with_current(self.drive_goal(&owner, expected, deadline, run_control, on_event, verify))
                 .await
         };
         Ok(GoalRun {
@@ -305,15 +366,18 @@ impl AgentSessionHandle {
         })
     }
 
-    async fn drive_goal(
+    async fn drive_goal<F>(
         &mut self,
         owner: &AgentCx,
         expected: GoalSnapshot,
         deadline: TurnDeadline,
         control: GoalControl,
         on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
-        mut decide: impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision + Send,
-    ) -> GoalRunReport {
+        mut verify: impl FnMut(GoalSnapshot, AssistantMessage) -> F + Send,
+    ) -> GoalRunReport
+    where
+        F: Future<Output = Result<GoalDecision>> + Send,
+    {
         let mut report = GoalRunReport {
             stop: GoalRunStop::Paused,
             goal: expected,
@@ -374,7 +438,9 @@ impl AgentSessionHandle {
                 return failed(report, error);
             }
             report.goal = observed;
-            let (decision, stop) = decide_next(&mut report, owner, &deadline, &control, &mut decide);
+            let (decision, stop) = verification::decide_next(
+                &mut report, owner, &deadline, &control, &mut verify,
+            ).await;
             let (settled, late_stop) = match settle_attempt(
                 self, owner, &report.goal, decision, &deadline, &control,
             ).await {
@@ -437,54 +503,6 @@ fn successful(message: &AssistantMessage) -> bool {
         && message.content.iter().any(|block| {
             matches!(block, ContentBlock::Text(text) if !text.text.trim().is_empty())
         })
-}
-
-fn decide_next(
-    report: &mut GoalRunReport,
-    owner: &AgentCx,
-    deadline: &TurnDeadline,
-    control: &GoalControl,
-    decide: &mut impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision,
-) -> (GoalDecision, Option<GoalRunStop>) {
-    if let Some(stop) = interruption(owner, deadline, control) {
-        return (pause_decision("run interrupted; inspect native completion before resuming"), Some(stop));
-    }
-    let Some(Ok(message)) = report.completion.as_ref() else {
-        let stop = match report.completion.as_ref() {
-            Some(Err(TurnDeadlineError::Elapsed { .. })) => GoalRunStop::Deadline,
-            Some(Err(TurnDeadlineError::OwnerCancelled { .. })) => GoalRunStop::Cancelled,
-            _ => GoalRunStop::NativeFailure,
-        };
-        return (
-            pause_decision("native prompt failed; inspect completion before resuming"),
-            Some(stop),
-        );
-    };
-    if !successful(message) {
-        return (pause_decision("native prompt did not produce a successful final answer"), Some(GoalRunStop::NativeFailure));
-    }
-    if !report.pending.is_empty() {
-        return (
-            pause_decision("unclaimed user input returned to host"),
-            Some(GoalRunStop::Paused),
-        );
-    }
-    let decision = decide(&report.goal, message);
-    // A host callback may request pause or take time. Its late verdict must
-    // not turn an interrupted run into success or authorize another prompt.
-    if let Some(stop) = interruption(owner, deadline, control) {
-        return (pause_decision("run interrupted while host reviewed the result"), Some(stop));
-    }
-    let (text, stop) = match &decision {
-        GoalDecision::Continue { instruction } => (instruction, None),
-        GoalDecision::Pause { reason } => (reason, Some(GoalRunStop::Paused)),
-        GoalDecision::Complete { evidence } => (evidence, Some(GoalRunStop::Complete)),
-    };
-    if let Err(error) = validate_text(text, "host verdict") {
-        report.error = Some(error);
-        return (pause_decision("host verdict was empty or oversized"), Some(GoalRunStop::Failed));
-    }
-    (decision, stop)
 }
 
 fn prepare_intent(mut record: Record) -> Result<Record> {

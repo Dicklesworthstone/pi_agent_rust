@@ -2,16 +2,19 @@
 
 Pi's in-process SDK can now retain an objective across several native prompts,
 stop for review, and resume with its remaining prompt/token budget. This is an
-OMP-inspired **SDK workflow**. It does not install `/goal` in either terminal
-interface, add RPC goal commands, or expose a model-facing `goal` tool.
+OMP-inspired **SDK workflow**. The execution driver does not install `/goal` in
+either terminal interface or expose a model-facing `goal` tool. This page covers
+in-process execution, not the separate RPC lifecycle adapter.
 The types currently live in `pi::goal`, an unstable module under the library's
 public API policy; the lifecycle methods are on `AgentSessionHandle`.
 
 ## Create an objective and drive it
 
-Convert an existing SDK handle once with `handle.into_goal_session()`. The
-wrapper uses the existing controlled session rather than constructing a second
-agent. Provider selection, authentication, tools and their approval policies,
+Call `AgentSessionHandle::run_goal` on a borrowed handle, or convert it once with
+`handle.into_goal_session()` for an owned convenience wrapper. Both use the same
+driver and existing session rather than constructing a second agent. The handle
+remains exclusively borrowed until the run is finished or dropped, then ordinary
+session operations are available again. Provider selection, authentication, tools and their approval policies,
 input hooks, retry/failover, compaction and native session persistence remain
 owned by that session. Goal mode grants no additional tool permissions.
 
@@ -69,6 +72,81 @@ should inspect the actual deliverables and verification results. The callback
 is synchronous; it cannot be preempted. The driver rechecks cancellation and
 time after the callback and again before publishing its decision.
 
+## Await real host verification
+
+`run_goal_with_verifier` is available on both `AgentSessionHandle` and
+`GoalSession`. Its host-supplied callback returns a future with output
+`Result<GoalDecision>`, so it can await an external validator or other evidence
+instead of blocking the executor or accepting an assistant's completion claim.
+For a reviewed, active goal, an embedding can use:
+
+```rust
+use std::future::Future;
+use std::time::Duration;
+use pi::agent_cx::AgentCx;
+use pi::goal::{GoalDecision, GoalRunReport, GoalSnapshot};
+use pi::sdk::{AgentSessionHandle, AssistantMessage, Result};
+
+async fn run_checked<F>(
+    session: &mut AgentSessionHandle,
+    expected: &GoalSnapshot,
+    verify: impl FnMut(GoalSnapshot, AssistantMessage) -> F + Send,
+) -> Result<GoalRunReport>
+where
+    F: Future<Output = Result<GoalDecision>> + Send,
+{
+    let owner = AgentCx::for_current_or_request();
+    let run = session.run_goal_with_verifier(
+        &owner,
+        expected,
+        Duration::from_secs(15 * 60),
+        |_control, _event| {},
+        verify,
+    )?;
+    // Publish run.control() to the host UI before awaiting as needed.
+    Ok(run.await)
+}
+```
+
+Each callback receives owned snapshots of the exact current goal and last
+successful native response, not the whole history, mutable session, credentials,
+or additional tool authority. The callback decides what constitutes acceptable
+evidence. Pi does not independently certify that evidence. The synchronous
+`run_goal` API remains available and uses the same verification/commit path.
+
+Verification shares the absolute deadline constructed at run creation, including
+time already spent on provider requests, retries and previous checks. Waiting
+does not pause or restart that clock. `GoalControl::pause()` wakes even a silent
+verifier with no native prompt running. Owner cancellation and timer expiry also
+wake it without a polling task. A late success, including one returned by a poll
+which itself paused the run or crossed the deadline, cannot authorize another
+prompt or complete the goal. The final journal transition rechecks the exact
+snapshot, pause state and deadline as well.
+
+An ordinary verifier error stops with `GoalRunStop::Failed` and pauses the goal;
+the error is reported separately from the preserved native `completion`. A later
+goal-journal error can take precedence in `error`; inspect persistence and obtain
+a fresh snapshot before acting. Invalid empty/oversized evidence fails closed.
+Native errors, refusal, incomplete answers, unclaimed user inputs and native
+run-time-cap messages do not even construct a verifier future. A native time cap
+pauses instead of starting another prompt with a fresh cap.
+
+The host must own cancellation-safe cleanup for its verifier's resources.
+Pause, expiry or cancellation drops the pending verifier under its initiating
+context and removes its timer/control registrations. This does not join detached
+host tasks, forcibly terminate arbitrary processes, roll back side effects, or
+preempt a blocking callback/poll. Native agent turns still use their existing
+abort-and-drain path. A cancelled owner may be unable to persist the goal's pause;
+the interrupted intent remains visible and is not permission to replay work.
+
+Dropping during verification leaves the prior unfinished intent interrupted,
+even if the native prompt already returned successfully. An unused unpolled run
+constructs neither a verifier nor a provider request. Verification has no live
+native input mailbox: `steer`/`follow_up` reject input there instead of silently
+queueing it for another prompt. Keep pending host input separately until the
+next explicit run. No terminal `/goal` workflow, autonomous verifier selection,
+or model-facing completion tool is introduced by these SDK methods.
+
 ## Limits and accounting
 
 Both budgets are mandatory: `max_prompts` is 1–1024 and `token_budget` is positive.
@@ -86,9 +164,10 @@ Accounting is conservative: for every recorded assistant message, use the larger
 of `total_tokens` and the saturating sum of input, output and cache buckets.
 This can overestimate when a provider overlaps those buckets.
 
-The timeout starts when `run_goal` constructs its future, not at its first poll.
+The timeout starts when `run_goal` or `run_goal_with_verifier` constructs its
+future, not at its first poll.
 All prompts in that invocation share the same absolute runtime deadline,
-including retries and follow-ups. An inherited deadline can only shorten it.
+including retries, follow-ups and host verification. An inherited deadline can only shorten it.
 A new explicit invocation gets a new time allowance, but retains the goal's
 spent prompt/token budgets. Expiry requests native abort and drains that same
 future; cooperative cleanup may outlive the timeout. Blocking native work and
@@ -171,3 +250,8 @@ input recovery and failed persistence. They were authored but not executed in
 the implementation environment because `dsr quality --tool pi_agent_rust` could
 not start (`dsr` absent, exit 127). Compilation, tests, rustfmt and Clippy still
 require the repository's DSR quality lane. No quality gate was substituted.
+
+Borrowed-session and asynchronous-verification workflows are covered in
+`tests/goal_borrowed.rs`; timer/cancellation registration probes are in
+`src/goal/driver/verification.rs`. These tests were also authored but not run in
+the implementation environment. Source inspection is not runtime acceptance.
