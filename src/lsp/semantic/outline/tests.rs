@@ -35,7 +35,7 @@ fn tree() -> Value {
 fn outline_preserves_server_preorder_duplicates_and_explicit_hierarchy() {
     let raw = tree();
     let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
-    let rows = displayed(&outline, 100, &budget()).unwrap();
+    let rows = displayed(&outline, 0..outline.symbols.len(), 100, &budget()).unwrap();
     assert_eq!(outline.shape, "hierarchical");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["name"], "Box");
@@ -60,7 +60,7 @@ fn flat_container_names_never_invent_parent_or_identifier_ranges() {
          "location":{"uri":uri,"range":span(at(1,2),at(1,10))}}
     ]);
     let outline = parse(&raw, &path, SOURCE, &budget()).unwrap();
-    let rows = displayed(&outline, 1, &budget()).unwrap();
+    let rows = displayed(&outline, 0..outline.symbols.len(), 1, &budget()).unwrap();
     assert_eq!(outline.shape, "flat");
     assert_eq!(rows[0]["containerName"], "Box");
     assert_eq!(rows[0]["deprecated"], true);
@@ -136,13 +136,13 @@ fn display_caps_keep_whole_structured_symbols_and_full_totals() {
     item["detail"] = json!("界".repeat(4000));
     let raw = json!(vec![item; 64]);
     let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
-    let rows = displayed(&outline, MAX_DISPLAY, &budget()).unwrap();
+    let rows = displayed(&outline, 0..outline.symbols.len(), MAX_DISPLAY, &budget()).unwrap();
     assert_eq!(outline.symbols.len(), 64);
     assert!(!rows.is_empty() && rows.len() < 64);
     assert!(rows.iter().all(Value::is_object));
     assert_eq!(rows[0]["detail"].as_str().unwrap().len(), 12000);
     assert!(serde_json::to_vec(&rows).unwrap().len() < MAX_PAYLOAD_BYTES - 8192);
-    assert_eq!(displayed(&outline, 1, &budget()).unwrap().len(), 1);
+    assert_eq!(displayed(&outline, 0..outline.symbols.len(), 1, &budget()).unwrap().len(), 1);
 }
 
 #[test]
@@ -354,4 +354,134 @@ fn abandoning_a_streamed_outline_releases_the_workflow_and_discards_fragments() 
     assert_eq!(cancelled.len(), 1);
     assert_eq!(cancelled[0]["params"]["id"], requests[0]["id"]);
     peer.assert_read_only();
+}
+
+fn filter(extra: Value) -> Filter {
+    let input: LspInput = serde_json::from_value(Peer::input(extra)).unwrap();
+    Filter::parse(&input).unwrap()
+}
+
+#[test]
+fn semantic_name_filter_preserves_ancestors_and_ordinal_identity() {
+    let raw = tree();
+    let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
+    let matching = select(&outline, &filter(json!({"symbol":"run"})), &budget()).unwrap();
+    assert_eq!(matching.matched, 2);
+    assert_eq!(matching.indices, vec![1, 2]);
+    let rows = displayed(&outline, matching.indices.iter().copied(), 100, &budget()).unwrap();
+    assert_eq!(rows[0]["index"], 1);
+    assert_eq!(rows[0]["parentIndex"], 0);
+    assert_eq!(rows[0]["ancestors"][0]["index"], 0);
+    assert_eq!(rows[0]["ancestors"][0]["name"], "Box");
+    assert_eq!(rows[0]["ancestors"][0]["selectionRange"], span(at(0,6), at(0,9)));
+    assert_eq!(rows[1]["ancestors"], json!([]));
+    let second = select(&outline, &filter(json!({"symbol":"run#2"})), &budget()).unwrap();
+    assert_eq!(second.matched, 2);
+    assert_eq!(second.indices, vec![2]);
+    assert!(select(&outline, &filter(json!({"symbol":"run#3"})), &budget()).is_err());
+    assert!(select(&outline, &filter(json!({"symbol":"Run"})), &budget()).unwrap().indices.is_empty());
+}
+
+#[test]
+fn line_filter_respects_half_open_endpoints_and_keeps_enclosing_definitions() {
+    let raw = tree();
+    let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
+    for (line, expected) in [(1, vec![0]), (2, vec![0, 1]), (3, vec![0]), (4, vec![2]), (5, vec![])] {
+        let filter = filter(json!({"line":line}));
+        filter.validate_source(SOURCE).unwrap();
+        assert_eq!(select(&outline, &filter, &budget()).unwrap().indices, expected);
+    }
+    let end_at_next_line = Range { start:at(0,0), end:at(1,0) };
+    assert!(intersects_line(end_at_next_line, 0));
+    assert!(!intersects_line(end_at_next_line, 1));
+    assert!(intersects_line(Range { start:at(1,0), end:at(1,0) }, 1));
+    assert!(!intersects_line(Range { start:at(1,0), end:at(1,0) }, 0));
+    assert!(filter(json!({"line":6})).validate_source(SOURCE).is_err());
+}
+
+#[test]
+fn line_and_name_intersect_before_numbered_definition_selection() {
+    let raw = tree();
+    let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
+    let matching = select(&outline, &filter(json!({"symbol":"run#1","line":4})), &budget()).unwrap();
+    assert_eq!(matching.matched, 1);
+    assert_eq!(matching.indices, vec![2]);
+    assert!(select(&outline, &filter(json!({"symbol":"run#2","line":4})), &budget()).is_err());
+    assert!(select(&outline, &filter(json!({"symbol":"Box","line":4})), &budget()).unwrap().indices.is_empty());
+}
+
+#[test]
+fn filter_is_bounded_literal_matching_and_does_not_validate_only_selected_nodes() {
+    for raw in ["", " ", "#1", "   #2"] {
+        let input: LspInput = serde_json::from_value(Peer::input(json!({"symbol":raw}))).unwrap();
+        // A leading # has no nonempty name and is an ordinary literal under
+        // the shared selector grammar; it does not mean select any symbol.
+        if raw == "#1" {
+            assert_eq!(Filter::parse(&input).unwrap().name.as_deref(), Some("#1"));
+        } else {
+            assert!(Filter::parse(&input).is_err());
+        }
+    }
+    for extra in [json!({"symbol":"界".repeat(342)}), json!({"line":0}), json!({"after":"cursor"}),
+        json!({"snippetValues":{}}), json!({"only":[]}), json!({"refactorId":"old"})]
+    {
+        let input: LspInput = serde_json::from_value(Peer::input(extra)).unwrap();
+        assert!(Filter::parse(&input).is_err());
+    }
+    let raw = json!([
+        symbol("a.*", at(0,0), at(0,1)), symbol("ab", at(0,0), at(0,1)),
+        symbol("日本語", at(0,0), at(0,1))
+    ]);
+    let outline = parse(&raw, Path::new("unused"), SOURCE, &budget()).unwrap();
+    assert_eq!(select(&outline, &filter(json!({"symbol":"a.*"})), &budget()).unwrap().indices, vec![0]);
+    assert_eq!(select(&outline, &filter(json!({"symbol":"日本"})), &budget()).unwrap().indices, vec![2]);
+    let bad_tail = json!([raw[0], symbol("not-matched", at(99,0), at(99,1))]);
+    assert!(parse(&bad_tail, Path::new("unused"), SOURCE, &budget()).is_err());
+}
+
+#[test]
+fn native_definition_search_ignores_source_hits_and_reports_filter_totals() {
+    let Some(peer) = Peer::new("stream") else { return };
+    // These textual matches are not definitions and must never affect #N.
+    let original = format!("{SOURCE}// run run run\r\n");
+    std::fs::write(peer.root.path().join("source.pioutline"), &original).unwrap();
+    let limited = peer.run(json!({"symbol":"run","limit":1})).unwrap().details.unwrap();
+    assert_eq!(limited["payload"]["total"], 3);
+    assert_eq!(limited["payload"]["matched"], 2);
+    assert_eq!(limited["payload"]["selectedCount"], 2);
+    assert_eq!(limited["payload"]["count"], 1);
+    assert_eq!(limited["truncated"], true);
+    assert_eq!(limited["payload"]["symbols"][0]["ancestors"][0]["name"], "Box");
+    let second = peer.run(json!({"symbol":"run#2","limit":1})).unwrap().details.unwrap();
+    assert_eq!(second["payload"]["matched"], 2);
+    assert_eq!(second["payload"]["selectedCount"], 1);
+    assert_eq!(second["truncated"], false, "intentional filtering is not truncation");
+    assert_eq!(second["payload"]["symbols"][0]["index"], 2);
+    assert_eq!(second["payload"]["symbols"][0]["selectionRange"], span(at(3,9),at(3,12)));
+    let empty = peer.run(json!({"symbol":"run","line":5})).unwrap().details.unwrap();
+    assert_eq!(empty["payload"]["total"], 3);
+    assert_eq!(empty["payload"]["matched"], 0);
+    assert_eq!(empty["truncated"], false);
+    assert_eq!(std::fs::read_to_string(peer.root.path().join("source.pioutline")).unwrap(), original);
+    assert!(!peer.frames().iter().any(|frame| matches!(frame["method"].as_str(),
+        Some("workspace/symbol" | "workspace/executeCommand" | "completionItem/resolve"))));
+}
+
+#[test]
+fn native_enclosing_line_search_disambiguates_names_and_rejects_bad_hidden_tail() {
+    let Some(peer) = Peer::new("stream") else { return };
+    let enclosing = peer.run(json!({"line":2})).unwrap().details.unwrap();
+    assert_eq!(enclosing["payload"]["matched"], 2);
+    assert_eq!(enclosing["payload"]["symbols"][0]["name"], "Box");
+    assert_eq!(enclosing["payload"]["symbols"][1]["name"], "run");
+    let intersected = peer.run(json!({"symbol":"run#1","line":4})).unwrap().details.unwrap();
+    assert_eq!(intersected["payload"]["matched"], 1);
+    assert_eq!(intersected["payload"]["symbols"][0]["index"], 2);
+    assert!(peer.run(json!({"symbol":"run#2","line":4})).is_err());
+    std::fs::write(peer.root.path().join("mode"), "bad-tail").unwrap();
+    assert!(peer.run(json!({"symbol":"Box","limit":1})).is_err(), "a filtered-out invalid method must still fail the outline");
+    peer.assert_read_only();
+    let Some(peer) = Peer::new("stream") else { return };
+    assert!(peer.run(json!({"line":6})).is_err());
+    assert!(peer.frames().is_empty(), "reject nonexistent lines before server startup");
 }

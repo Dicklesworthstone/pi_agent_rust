@@ -10,11 +10,11 @@ use serde_json::{Value, json};
 
 use super::{
     Budget, LspInput, LspTool, MAX_RESPONSE_BYTES, Source, bounded_size, malformed,
-    read_only_input, uint,
+    uint,
 };
 use crate::error::Result;
 use crate::lsp::client::uri_to_path;
-use crate::lsp::text::{Position, Range};
+use crate::lsp::text::{Position, Range, position_to_offset_exact};
 use crate::lsp::{MAX_PAYLOAD_BYTES, display_path, text_output, tool_err};
 use crate::tools::ToolOutput;
 
@@ -37,6 +37,91 @@ struct Outline<'a> {
     shape: &'static str,
 }
 
+/// Name matching addresses semantic definitions, never arbitrary source hits.
+/// A line narrows definitions by their full half-open range, not their name.
+#[derive(Debug, Default)]
+struct Filter {
+    name: Option<String>,
+    occurrence: Option<usize>,
+    line: Option<u32>, // zero-based after validating the one-based input
+}
+
+impl Filter {
+    fn parse(input: &LspInput) -> Result<Self> {
+        if input.position.is_some() || input.range.is_some() || input.resolve.is_some()
+            || input.query.is_some() || input.apply.is_some() || input.action_id.is_some()
+            || input.refactor_id.is_some() || input.completion_id.is_some()
+            || input.snippet_values.is_some() || input.hierarchy_id.is_some()
+            || input.new_name.is_some() || input.new_file.is_some()
+            || input.format_options.is_some() || input.method.is_some() || input.payload.is_some()
+            || input.only.is_some() || input.after.is_some() || input.limit == Some(0)
+            || input.file.as_ref().is_none_or(|file| file.is_empty() || file.len() > 8192)
+        {
+            return Err(tool_err("LSP_USAGE", "document symbols accept file, symbol, line, limit and timeout only"));
+        }
+        let (name, occurrence) = match input.symbol.as_deref() {
+            None => (None, None),
+            Some(raw) if !raw.trim().is_empty() && raw.len() <= 1024 => {
+                let (name, occurrence) = crate::lsp::parse_symbol_selector(raw);
+                if name.trim().is_empty() {
+                    return Err(tool_err("LSP_USAGE", "document symbol name must not be empty"));
+                }
+                (Some(name), occurrence)
+            }
+            Some(_) => return Err(tool_err("LSP_USAGE", "document symbol must be a nonempty string within 1024 bytes")),
+        };
+        let line = input.line.map(|line| line.checked_sub(1)
+            .ok_or_else(|| tool_err("LSP_USAGE", "document symbol line must be one-based")))
+            .transpose()?;
+        Ok(Self { name, occurrence, line })
+    }
+
+    fn validate_source(&self, text: &str) -> Result<()> {
+        if self.line.is_some_and(|line| {
+            position_to_offset_exact(text, Position { line, character: 0 }).is_none()
+        }) {
+            return Err(tool_err("LSP_USAGE", "document symbol line is outside the source"));
+        }
+        Ok(())
+    }
+
+    fn includes(&self, symbol: &Symbol<'_>) -> bool {
+        self.name.as_ref().is_none_or(|name| {
+            symbol.value["name"].as_str().is_some_and(|value| value.contains(name.as_str()))
+        }) && self.line.is_none_or(|line| intersects_line(symbol.range, line))
+    }
+}
+
+fn intersects_line(range: Range, line: u32) -> bool {
+    range.start.line <= line && (range.end.line > line
+        || (range.end.line == line && (range.end.character > 0 || range.start == range.end)))
+}
+
+struct Matches {
+    indices: Vec<usize>,
+    matched: usize,
+}
+
+fn select(outline: &Outline<'_>, filter: &Filter, budget: &Budget) -> Result<Matches> {
+    let mut indices = Vec::new();
+    for (index, symbol) in outline.symbols.iter().enumerate() {
+        budget.remaining()?;
+        if filter.includes(symbol) {
+            indices.push(index);
+        }
+    }
+    let matched = indices.len();
+    if let Some(nth) = filter.occurrence {
+        let index = nth.checked_sub(1).and_then(|index| indices.get(index)).copied()
+            .ok_or_else(|| tool_err("LSP_SYMBOL_AMBIGUOUS", format!(
+                "document symbol occurrence #{nth} is outside {matched} matching definitions; inspect the unnumbered search"
+            )))?;
+        indices = vec![index];
+    }
+    budget.remaining()?;
+    Ok(Matches { indices, matched })
+}
+
 fn position(value: &Value) -> Result<Position> {
     let coordinate = |key: &str| -> Result<u32> {
         u32::try_from(uint(&value[key])?)
@@ -50,8 +135,8 @@ fn position(value: &Value) -> Result<Position> {
 
 fn range(value: &Value, boundaries: &mut BTreeSet<Position>) -> Result<Range> {
     let range = Range {
-        start: position(&value["start"])?,
-        end: position(&value["end"])?,
+        start: position(&value["start"])? ,
+        end: position(&value["end"])? ,
     };
     if range.end < range.start {
         return Err(malformed("document symbol range is reversed"));
@@ -221,12 +306,33 @@ fn summary(index: usize, symbol: &Symbol<'_>) -> Value {
     })
 }
 
-fn displayed(outline: &Outline<'_>, limit: usize, budget: &Budget) -> Result<Vec<Value>> {
+fn displayed(
+    outline: &Outline<'_>,
+    indices: impl Iterator<Item = usize>,
+    limit: usize,
+    budget: &Budget,
+) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
     let mut bytes = 2_usize; // array brackets
-    for (index, symbol) in outline.symbols.iter().enumerate().take(limit.min(MAX_DISPLAY)) {
+    for index in indices.take(limit.min(MAX_DISPLAY)) {
         budget.remaining()?;
-        let row = summary(index, symbol);
+        let symbol = &outline.symbols[index];
+        let mut row = summary(index, symbol);
+        // Filtering can omit a containing class. Preserve its semantic path
+        // on the result instead of inventing a new parent or losing context.
+        let mut ancestors = Vec::new();
+        let mut parent = symbol.parent;
+        while let Some(index) = parent {
+            budget.remaining()?;
+            let ancestor = &outline.symbols[index];
+            ancestors.push(json!({
+                "index":index,"name":ancestor.value["name"],"kind":ancestor.value["kind"],
+                "range":ancestor.range,"selectionRange":ancestor.selection
+            }));
+            parent = ancestor.parent;
+        }
+        ancestors.reverse();
+        row["ancestors"] = json!(ancestors);
         let size = bounded_size(&row, MAX_RESPONSE_BYTES)? + usize::from(!rows.is_empty());
         if size > (MAX_PAYLOAD_BYTES - 8192).saturating_sub(bytes) {
             break;
@@ -239,15 +345,9 @@ fn displayed(outline: &Outline<'_>, limit: usize, budget: &Budget) -> Result<Vec
 
 impl LspTool {
     pub(in crate::lsp) async fn run_document_symbols(&self, input: &LspInput) -> Result<ToolOutput> {
-        read_only_input(input)?;
-        if input.position.is_some() || input.range.is_some() || input.resolve.is_some()
-            || input.refactor_id.is_some()
-            || input.file.as_ref().is_none_or(|file| file.is_empty() || file.len() > 8192)
-        {
-            return Err(tool_err("LSP_USAGE", "document symbols require file and optional limit/timeout"));
-        }
+        let filter = Filter::parse(input)?;
         let budget = Budget::new(self.request_timeout(input));
-        let source = Source::open(self, input, &budget, |_| Ok(())).await?;
+        let source = Source::open(self, input, &budget, |text| filter.validate_source(text)).await?;
         match source.entry.client.capabilities().raw.get("documentSymbolProvider") {
             Some(Value::Bool(true) | Value::Object(_)) => {}
             None | Some(Value::Bool(false)) => {
@@ -262,15 +362,18 @@ impl LspTool {
         ).await?;
         source.verify(&budget)?;
         let outline = parse(&raw, &source.path, &source.text, &budget)?;
-        let rows = displayed(&outline, input.limit.unwrap_or(100), &budget)?;
+        let matching = select(&outline, &filter, &budget)?;
+        let rows = displayed(&outline, matching.indices.iter().copied(), input.limit.unwrap_or(100), &budget)?;
         let total = outline.symbols.len();
-        let truncated = rows.len() < total;
+        let truncated = rows.len() < matching.indices.len();
         let payload = json!({
             "schema":"pi.lsp.document_symbols.v1","action":"symbols",
             "file":display_path(&source.path, &self.cwd),"server":source.entry.spec_name,
-            "shape":outline.shape,"total":total,"count":rows.len(),
+            "shape":outline.shape,"total":total,"matched":matching.matched,
+            "selectedCount":matching.indices.len(),"count":rows.len(),
+            "filter":{"symbol":input.symbol,"name":filter.name,"occurrence":filter.occurrence,"line":input.line},
             "truncated":truncated,"responseComplete":true,"symbols":rows,
-            "note":"Complete response validated before display limits. Symbols are in server preorder; index and parentIndex refer to that whole outline. Flat containerName never implies a parent. Ranges use exact zero-based UTF-16 positions; no edits or commands were authorized."
+            "note":"The complete outline is validated before filtering. symbol matches case-sensitive definition names, not source text; optional #N selects the Nth match in server preorder after line filtering. One-based line intersects full half-open definition ranges. total counts every symbol, matched counts name/line matches, selectedCount applies #N, and count is the displayed subset. index/parentIndex refer to the whole outline; ancestors retain omitted containing symbols. Flat containerName never implies a parent. Exact zero-based UTF-16 ranges can be used with navigation or refactor tools, but are not approval handles."
         });
         let text = payload.to_string();
         let details = json!({"truncated":truncated,"payload":payload});
