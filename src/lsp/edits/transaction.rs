@@ -3,8 +3,9 @@
 //! Stage every operation before changing a target. Commit final file images,
 //! retaining sibling backups until completion. This is rollback on reported
 //! failure, not a multi-file filesystem transaction or a power-loss guarantee.
-//! Directories, symlinks, shared hard links, special files and path-shape changes are rejected
-//! before commit; they need a different snapshot/restore contract.
+//! A final directory rename may follow text edits. It retains the original
+//! tree and moves only after all edits succeed. Symlinks, shared hard links,
+//! special files and other directory/path-shape operations remain unsupported.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, Permissions};
@@ -21,6 +22,7 @@ const MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSACTION_FILES: usize = 1024;
 
 pub(super) mod evidence;
+mod directory;
 
 #[derive(Clone, PartialEq, Eq)]
 struct Image {
@@ -39,6 +41,7 @@ pub(super) struct Transaction {
     text_paths: BTreeSet<PathBuf>,
     operations: Vec<String>,
     bytes: usize,
+    directory: Option<directory::DirectoryMove>,
 }
 
 fn conflict(message: impl Into<String>) -> crate::error::Error {
@@ -181,6 +184,7 @@ impl Transaction {
     }
 
     pub(super) fn edit(&mut self, path: &Path, edits: &[TextEdit]) -> Result<()> {
+        self.require_before_directory_move()?;
         let normalized = self.load(path)?;
         let image = self.files[&normalized].after.as_ref().ok_or_else(|| {
             conflict(format!(
@@ -226,6 +230,31 @@ impl Transaction {
         ignore_exists: bool,
         ignore_missing: bool,
     ) -> Result<()> {
+        self.require_before_directory_move()?;
+        if let FileOp::Rename { old_path, new_path, overwrite } = operation
+            && std::fs::symlink_metadata(old_path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            if *overwrite || ignore_exists || !self.operations.is_empty() {
+                return Err(conflict(
+                    "directory rename must be the only resource operation, without overwrite or ignoreIfExists",
+                ));
+            }
+            let moving = directory::DirectoryMove::capture(old_path, new_path)
+                .map_err(|error| io_context(old_path, &error))?;
+            // Snapshot binary and unedited files too. Existing byte, hard-link,
+            // permissions and file-count admission remains authoritative.
+            for path in moving.files() {
+                self.load(path)?;
+            }
+            if self.files.keys().any(|path| {
+                path.starts_with(&moving.new) || moving.new.starts_with(path)
+            }) {
+                return Err(conflict("directory destination overlaps another edit target"));
+            }
+            self.directory = Some(moving);
+            self.operations.push(describe_file_op(operation));
+            return Ok(());
+        }
         match operation {
             FileOp::Create { path, overwrite } => {
                 let path = self.load(path)?;
@@ -288,6 +317,20 @@ impl Transaction {
         Ok(())
     }
 
+    fn require_before_directory_move(&self) -> Result<()> {
+        if self.directory.is_some() {
+            return Err(conflict("directory rename must be the final workspace edit operation"));
+        }
+        Ok(())
+    }
+
+    fn verify_directory(&self) -> Result<()> {
+        if let Some(moving) = &self.directory {
+            moving.verify().map_err(|error| io_context(&moving.old, &error))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn check_hashes(&self, hashes: Option<&HashMap<PathBuf, u64>>) -> Result<()> {
         if let Some(hashes) = hashes {
             for (path, expected) in hashes {
@@ -321,10 +364,17 @@ impl Transaction {
         mut self,
         mut after_change: impl FnMut(usize, &Path) -> io::Result<()>,
     ) -> Result<ApplyOutcome> {
+        self.verify_directory()?;
         // Validate ALL read preimages, including no-op targets, before commit.
         for (path, staged) in &self.files {
             verify_image(path, staged.before.as_ref()).map_err(|error| io_context(path, &error))?;
         }
+        // Retain the expected final images of every moved file, including
+        // unedited binary data, for the boundary immediately before the move.
+        let moved_images: Vec<_> = self.files.iter().filter_map(|(path, staged)| {
+            self.directory.as_ref().filter(|moving| path.starts_with(&moving.old))
+                .map(|_| (path.clone(), staged.after.clone()))
+        }).collect();
         self.files.retain(|_, staged| staged.before != staged.after);
         let mut changes: Vec<_> = self
             .files
@@ -342,12 +392,27 @@ impl Transaction {
         changes.sort_by_key(|change| change.staged.after.is_none());
         let mut directories = Vec::new();
         let result = (|| -> io::Result<()> {
+            if let Some(moving) = &self.directory {
+                ensure_parents(&moving.new, &mut directories)?;
+            }
             for change in &mut changes {
-                change.prepare(&mut directories)?;
+                if let Some(moving) = &self.directory
+                    && change.path.starts_with(&moving.old)
+                {
+                    change.prepare_with_backup_anchor(&mut directories, &moving.old)?;
+                } else {
+                    change.prepare(&mut directories)?;
+                }
             }
             for (index, change) in changes.iter_mut().enumerate() {
                 change.apply()?;
                 after_change(index, &change.path)?;
+            }
+            if let Some(moving) = &self.directory {
+                for (path, image) in &moved_images {
+                    verify_image(path, image.as_ref())?;
+                }
+                moving.finish()?;
             }
             Ok(())
         })();
@@ -385,7 +450,9 @@ impl Transaction {
             });
         }
         Ok(ApplyOutcome {
-            files_changed: self.text_paths.into_iter().collect(),
+            files_changed: self.text_paths.into_iter().map(|path| {
+                self.directory.as_ref().map_or_else(|| path.clone(), |moving| moving.moved_path(&path))
+            }).collect(),
             file_ops_applied: self.operations,
         })
     }
@@ -444,11 +511,19 @@ struct Change {
 
 impl Change {
     fn prepare(&mut self, directories: &mut Vec<PathBuf>) -> io::Result<()> {
+        self.prepare_with_backup_anchor(directories, &self.path.clone())
+    }
+
+    fn prepare_with_backup_anchor(
+        &mut self,
+        directories: &mut Vec<PathBuf>,
+        backup_anchor: &Path,
+    ) -> io::Result<()> {
         if self.staged.after.is_some() {
             ensure_parents(&self.path, directories)?;
         }
         if let Some(image) = &self.staged.before {
-            self.backup = Some(scratch(&self.path, image, ".pi-lsp-backup-")?);
+            self.backup = Some(scratch(backup_anchor, image, ".pi-lsp-backup-")?);
         }
         if let Some(image) = &self.staged.after {
             self.replacement = Some(scratch(&self.path, image, ".pi-lsp-edit-")?);

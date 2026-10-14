@@ -103,21 +103,33 @@ impl PreparedEdit {
 
     /// Includes guard-only and no-op files, which also constrain approval.
     pub(in crate::lsp) fn summary(&self, cwd: &Path) -> Vec<serde_json::Value> {
-        self.0
+        let mut files: Vec<_> = self.0
             .files
             .iter()
             .map(|(path, file)| {
-                serde_json::json!({
+                let moved_to = self.0.directory.as_ref()
+                    .filter(|moving| path.starts_with(&moving.old))
+                    .map(|moving| crate::lsp::display_path(&moving.moved_path(path), cwd));
+                let mut item = serde_json::json!({
                     "file":crate::lsp::display_path(path, cwd),
                     "beforeBytes":file.before.as_ref().map(|image| image.bytes.len()),
                     "afterBytes":file.after.as_ref().map(|image| image.bytes.len()),
-                    "changed":file.before != file.after
-                })
+                    "changed":file.before != file.after || moved_to.is_some()
+                });
+                if let Some(moved_to) = moved_to {
+                    item["movedTo"] = serde_json::json!(moved_to);
+                }
+                item
             })
-            .collect()
+            .collect();
+        if let Some(moving) = &self.0.directory {
+            files.push(moving.summary(cwd));
+        }
+        files
     }
 
     pub(in crate::lsp) fn verify(&self) -> Result<()> {
+        self.0.verify_directory()?;
         for (path, file) in &self.0.files {
             super::verify_image(path, file.before.as_ref())
                 .map_err(|error| super::io_context(path, &error))?;
@@ -162,7 +174,7 @@ pub(in crate::lsp) fn apply_checked(
     // server annotations that the caller has never been shown.
     plan.annotations.require_no_confirmation()?;
     let transaction = prepare_checked(plan, expected)?;
-    let states = transaction
+    let mut states: HashMap<_, _> = transaction
         .files
         .iter()
         .map(|(path, staged)| {
@@ -172,6 +184,13 @@ pub(in crate::lsp) fn apply_checked(
             )
         })
         .collect();
+    if let Some(moving) = &transaction.directory {
+        for path in moving.files() {
+            let state = FileEvidence::from_image(transaction.files[path].after.as_ref());
+            states.insert(path.clone(), FileEvidence::Absent);
+            states.insert(moving.moved_path(path), state);
+        }
+    }
     before_commit()?;
     let outcome = transaction.commit()?;
     Ok(CheckedApply { outcome, states })
