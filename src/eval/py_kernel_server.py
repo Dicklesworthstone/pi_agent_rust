@@ -53,8 +53,10 @@ import math
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import sys
+import tempfile
 import threading
 import traceback
 
@@ -87,6 +89,11 @@ _MAX_DISPLAY_BYTES = 4 * 1024 * 1024
 _OUTPUT_CONTEXT = contextvars.ContextVar("pi_eval_output", default=None)
 _MAX_RESULT_BYTES = 1024 * 1024
 _PROTOCOL_WRITE_LOCK = threading.RLock()
+# Host ownership outlives Python's process group/Windows Job, including when
+# cancellation kills this process before Python cleanup can run.
+_PACKAGE_ROOT = os.environ.pop("_PI_EVAL_PACKAGE_ROOT", None)
+_PACKAGE_LAYERS = []
+_MAX_PACKAGE_LAYERS = 32
 
 
 def _send_frame(frame):
@@ -461,11 +468,81 @@ async def _forward_pip_output(reader, output):
         output.write(final)
 
 
-async def _install_python_packages(arguments):
+def _managed_pip_arguments(arguments):
+    """Keep managed storage/interpreter policy out of caller-controlled flags."""
+    flags = {"--no-index", "--no-deps", "--pre", "--upgrade"}
+    valued = {"--find-links", "-f", "--index-url", "-i", "--extra-index-url"}
+    result = []
+    requirements = 0
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        key, separator, value = argument.partition("=")
+        if argument in flags:
+            result.append(argument)
+        elif key in valued:
+            if not separator:
+                index += 1
+                value = arguments[index] if index < len(arguments) else ""
+            if not value or value.startswith("-"):
+                raise ValueError("EVAL_PIP_USAGE: index/find-links options require a value")
+            result.extend([key, value])
+        elif not argument or argument.startswith("-"):
+            raise ValueError("EVAL_PIP_OPTION: unsupported managed option; targets and interpreter are host-owned")
+        else:
+            result.append(argument)
+            requirements += 1
+        index += 1
+    if not requirements:
+        raise ValueError("EVAL_PIP_USAGE: managed installation requires at least one package")
+    return result
+
+
+async def _install_managed_packages(arguments):
+    arguments = _managed_pip_arguments(arguments)
+    if _PACKAGE_ROOT is None or not Path(_PACKAGE_ROOT).is_dir():
+        raise RuntimeError("EVAL_PIP_UNAVAILABLE: no host-owned package directory")
+    if len(_PACKAGE_LAYERS) >= _MAX_PACKAGE_LAYERS:
+        raise ValueError("EVAL_PIP_LIMIT: at most 32 managed installs; reset the Python kernel")
+    transaction = Path(tempfile.mkdtemp(prefix="install-", dir=_PACKAGE_ROOT))
+    target = transaction / "site"
+    activated = False
+    try:
+        scratch = transaction / "tmp"
+        scratch.mkdir()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("PIP_")}
+        environment.update({"PIP_CONFIG_FILE": os.devnull,
+                            "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch)})
+        print("EVAL_PIP_INSTALLING: staging isolated kernel-local packages")
+        # Use the same concurrent output pumps, interpreter and cancellation
+        # path as ordinary pip. Never pause/extend the host's cell watchdog.
+        await _install_python_packages([
+            "--ignore-installed", "--only-binary=:all:", "--no-compile",
+            "--no-cache-dir", "--progress-bar", "off", "--target", str(target),
+            *arguments,
+        ], environment=environment)
+        if not target.is_dir() or next(target.iterdir(), None) is None:
+            print("EVAL_PACKAGES_UNCHANGED: pip selected no packages for this interpreter")
+            return
+        # No addsitedir/.pth hooks and no automatic reload of live modules.
+        # Every dependency generation is complete before it enters sys.path.
+        sys.path.insert(0, str(target))
+        _PACKAGE_LAYERS.append(str(target))
+        activated = True
+        print("EVAL_PACKAGES_READY: active until Python reset; existing imports remain cached")
+    finally:
+        if not activated:
+            shutil.rmtree(transaction)
+
+
+async def _install_python_packages(arguments, *, environment=None):
+    if arguments and arguments[0] == "--managed":
+        return await _install_managed_packages(arguments[1:])
     # -I prevents a workspace pip.py/PYTHONPATH from replacing the installer.
     # Pip itself retains its usual configuration and requested install options;
     # this is not a sandbox, lockfile resolver or automatic environment manager.
-    environment = os.environ.copy()
+    environment = (os.environ if environment is None else environment).copy()
     environment["PYTHONIOENCODING"] = "utf-8:replace"
     environment["PYTHONUNBUFFERED"] = "1"
     print("EVAL_PIP_START: running pip with the retained Python interpreter", flush=True)
