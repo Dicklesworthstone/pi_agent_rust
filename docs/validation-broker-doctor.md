@@ -39,6 +39,33 @@ remains a stop signal even when the corresponding doctor finding is a warning.
 Ordinary informational and warning findings do not become failures by themselves.
 The existing legacy check formats retain their original strict status semantics.
 
+## Storage and resource-plan evidence
+
+Empty error lists and `plan_error: null` are not enough to establish readiness.
+The native resource finding must include `recommended_budgets` with positive
+integer agent, tool, extension-lane, queue-depth, and RSS budgets. Its remote
+verification fanout must be an unsigned integer; zero remains valid for a
+disabled remote lane.
+
+The `tmpfs_headroom` payload must contain exactly one `CARGO_TARGET_DIR` row and
+one `TMPDIR` row, a positive integer `warn_available_kb`, and an absolute
+`expected_root`. Each row must report `exists`, `under_expected_root`, and
+`ready` as true, a null `problem`, and an unsigned `available_kb` at least as
+large as the reported minimum. Measurements are compared in KiB without a
+lossy float or byte conversion. Unknown measurements, missing or duplicate
+rows, and malformed fields cannot authorize new work or cached-result reuse.
+An explicit storage hazard or a below-minimum measurement remains blocking
+even if the report incorrectly carries a `pass` severity and empty failure list.
+
+Reported POSIX paths are compared by components, including on non-POSIX broker
+hosts. A shared string prefix is not containment; relative paths, parent
+traversal and NUL bytes are rejected. Redundant separators and `.` components
+are accepted. This is a consistency check against the report's declared root
+and minimum, not a second host probe or an independent storage policy. It does
+not resolve remote symlinks, authenticate the report, prove freshness, or bind
+the report to a particular future command's paths. Callers still own those
+provenance and request-equivalence checks. Consumer reports are unchanged.
+
 ## Reuse cannot override failed authority
 
 Required RCH local-fallback denial, degraded authoritative sources, and doctor
@@ -62,3 +89,5 @@ permission to skip DSR and the repository's required validation.
 Regression tests live beside the adapter in `src/validation_broker/doctor.rs`.
 They cover native serialization, scope separation, structured stop signals,
 malformed reports, corrupt JSONL slot stores, and guarded cache reuse.
+`tests/doctor_broker_native.rs` additionally passes real CLI JSON from isolated
+consumer and explicitly requested swarm runs through the public normalizer.

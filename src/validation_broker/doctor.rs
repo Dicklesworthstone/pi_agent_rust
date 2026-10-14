@@ -162,6 +162,133 @@ impl NativeDoctorEvidence {
             self.degraded_reasons
                 .push("doctor_swarm_resource_plan_unavailable".to_string());
         }
+        self.observe_resource_plan(data);
+        self.observe_headroom(data);
+    }
+
+    fn observe_resource_plan(&mut self, data: &Value) {
+        // A null error is not a plan. These are the nonzero core budgets the
+        // native producer emits. Remote fanout may legitimately be disabled.
+        let budgets = data.get("recommended_budgets");
+        for name in [
+            "agent_concurrency",
+            "tool_concurrency",
+            "extension_hostcall_lanes",
+            "max_queue_depth",
+            "max_rss_bytes",
+        ] {
+            if !budgets
+                .and_then(|budgets| budgets.get(name))
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+            {
+                self.degraded_reasons
+                    .push(format!("doctor_swarm_resource_budget_{name}_invalid"));
+            }
+        }
+        if budgets
+            .and_then(|budgets| budgets.get("rch_verification_fanout"))
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            self.degraded_reasons
+                .push("doctor_swarm_resource_budget_rch_verification_fanout_invalid".to_string());
+        }
+    }
+
+    fn observe_headroom(&mut self, data: &Value) {
+        let headroom = data.get("tmpfs_headroom");
+        let root = headroom
+            .and_then(|headroom| headroom.get("expected_root"))
+            .and_then(Value::as_str)
+            .filter(|root| reported_path_within_root(root, root));
+        let minimum = headroom
+            .and_then(|headroom| headroom.get("warn_available_kb"))
+            .and_then(Value::as_u64)
+            .filter(|minimum| *minimum > 0);
+        if root.is_none() || minimum.is_none() {
+            self.degraded_reasons
+                .push("doctor_swarm_headroom_policy_invalid".to_string());
+        }
+        let Some(paths) = headroom
+            .and_then(|headroom| headroom.get("paths"))
+            .and_then(Value::as_array)
+        else {
+            self.degraded_reasons
+                .push("doctor_swarm_headroom_paths_missing".to_string());
+            return;
+        };
+        let mut counts = [0_usize; 2];
+        for path in paths {
+            let (index, name) = match path.get("env_name").and_then(Value::as_str) {
+                Some("CARGO_TARGET_DIR") => (0, "CARGO_TARGET_DIR"),
+                Some("TMPDIR") => (1, "TMPDIR"),
+                _ => {
+                    self.degraded_reasons
+                        .push("doctor_swarm_headroom_env_invalid".to_string());
+                    continue;
+                }
+            };
+            counts[index] += 1;
+            self.observe_headroom_path(path, name, root, minimum);
+        }
+        for (name, count) in ["CARGO_TARGET_DIR", "TMPDIR"].into_iter().zip(counts) {
+            if count != 1 {
+                self.degraded_reasons.push(format!(
+                    "doctor_swarm_headroom_{name}_expected_once:found={count}"
+                ));
+            }
+        }
+    }
+
+    fn observe_headroom_path(
+        &mut self,
+        path: &Value,
+        name: &str,
+        root: Option<&str>,
+        minimum: Option<u64>,
+    ) {
+        for field in ["exists", "under_expected_root", "ready"] {
+            match path.get(field).and_then(Value::as_bool) {
+                Some(true) => {}
+                Some(false) => {
+                    self.has_failures = true;
+                    self.degraded_reasons
+                        .push(format!("doctor_swarm_headroom_{name}_{field}_false"));
+                }
+                None => self
+                    .degraded_reasons
+                    .push(format!("doctor_swarm_headroom_{name}_{field}_invalid")),
+            }
+        }
+        match (path.get("path").and_then(Value::as_str), root) {
+            (Some(path), Some(root)) if reported_path_within_root(path, root) => {}
+            _ => self
+                .degraded_reasons
+                .push(format!("doctor_swarm_headroom_{name}_path_invalid")),
+        }
+        match (path.get("available_kb").and_then(Value::as_u64), minimum) {
+            (Some(available), Some(minimum)) if available >= minimum => {}
+            (Some(_), Some(_)) => {
+                self.has_failures = true;
+                self.degraded_reasons
+                    .push(format!("doctor_swarm_headroom_{name}_below_minimum"));
+            }
+            _ => self
+                .degraded_reasons
+                .push(format!("doctor_swarm_headroom_{name}_measurement_invalid")),
+        }
+        match path.get("problem") {
+            Some(Value::Null) => {}
+            Some(Value::String(problem)) if !problem.trim().is_empty() => {
+                self.has_failures = true;
+                self.degraded_reasons
+                    .push(format!("doctor_swarm_headroom_{name}_problem_reported"));
+            }
+            _ => self
+                .degraded_reasons
+                .push(format!("doctor_swarm_headroom_{name}_problem_invalid")),
+        }
     }
 
     fn validate_summary(&mut self, report: &Value) {
@@ -190,6 +317,32 @@ impl NativeDoctorEvidence {
                 .push("doctor_overall_mismatch".to_string());
         }
     }
+}
+
+// Doctor's resource report uses POSIX scratch paths, possibly on a different
+// host. Compare components without local filesystem access or host-OS path
+// interpretation. This checks report consistency, not symlinks or provenance.
+fn reported_path_within_root(path: &str, root: &str) -> bool {
+    if !path.starts_with('/') || !root.starts_with('/') {
+        return false;
+    }
+    let has_invalid_component = |value: &str| {
+        value
+            .split('/')
+            .any(|component| component == ".." || component.contains('\0'))
+    };
+    if has_invalid_component(path) || has_invalid_component(root) {
+        return false;
+    }
+    let path = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+    let root = root
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+    !root.is_empty() && path.starts_with(&root)
 }
 
 #[cfg(test)]
@@ -280,7 +433,39 @@ mod tests {
                     "schema": RESOURCE_SCHEMA,
                     "critical_failures": [],
                     "source_errors": [],
-                    "plan_error": null
+                    "plan_error": null,
+                    "recommended_budgets": {
+                        "agent_concurrency": 2,
+                        "tool_concurrency": 4,
+                        "extension_hostcall_lanes": 2,
+                        "rch_verification_fanout": 0,
+                        "max_queue_depth": 8,
+                        "max_rss_bytes": 1_073_741_824
+                    },
+                    "tmpfs_headroom": {
+                        "expected_root": "/data/tmp/pi_agent_rust_cargo",
+                        "warn_available_kb": 10_485_760,
+                        "paths": [
+                            {
+                                "env_name": "CARGO_TARGET_DIR",
+                                "path": "/data/tmp/pi_agent_rust_cargo/test/target",
+                                "exists": true,
+                                "under_expected_root": true,
+                                "available_kb": 10_485_760,
+                                "ready": true,
+                                "problem": null
+                            },
+                            {
+                                "env_name": "TMPDIR",
+                                "path": "/data/tmp/pi_agent_rust_cargo/test/tmp",
+                                "exists": true,
+                                "under_expected_root": true,
+                                "available_kb": 10_485_760,
+                                "ready": true,
+                                "problem": null
+                            }
+                        ]
+                    }
                 })),
             ),
             finding(
@@ -616,5 +801,170 @@ mod tests {
         assert!(decision.no_claims.iter().any(|claim| {
             claim == "not_permission_to_skip_required_gates"
         }));
+    }
+
+    fn normalize_resource(data: Value) -> ValidationDoctorInput {
+        let mut findings = ready_findings();
+        findings[0].data = Some(data);
+        normalize_doctor_json(provenance(), &native_report(findings)).expect("native input")
+    }
+
+    fn ready_resource() -> Value {
+        ready_findings()[0].data.clone().expect("resource data")
+    }
+
+    fn assert_resource_blocks_new_work_and_reuse(data: Value) {
+        let doctor = normalize_resource(data);
+        assert!(doctor.health.is_degraded() || doctor.has_failures);
+        let mut inputs = inputs();
+        inputs.doctor = doctor;
+        let mut empty = reusable_store();
+        empty.leases.clear();
+        empty.latest_by_slot_id.clear();
+        assert_blocked_without_reuse(&decide(&inputs, &empty));
+        assert_blocked_without_reuse(&decide(&inputs, &reusable_store()));
+    }
+
+    #[test]
+    fn empty_error_lists_are_not_resource_evidence() {
+        // This was previously accepted as healthy despite containing no plan,
+        // target, temp directory or storage measurements at all.
+        assert_resource_blocks_new_work_and_reuse(json!({
+            "schema": RESOURCE_SCHEMA,
+            "critical_failures": [],
+            "source_errors": [],
+            "plan_error": null
+        }));
+    }
+
+    #[test]
+    fn headroom_measurement_overrides_a_misleading_ready_flag() {
+        for index in 0..2 {
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["paths"][index]["available_kb"] = json!(10_485_759);
+            assert!(normalize_resource(data.clone()).has_failures);
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+    }
+
+    #[test]
+    fn complete_headroom_at_the_threshold_and_disabled_remote_lane_are_valid() {
+        for available in [10_485_760_u64, 10_485_761, u64::MAX] {
+            let mut data = ready_resource();
+            for index in 0..2 {
+                data["tmpfs_headroom"]["paths"][index]["available_kb"] = json!(available);
+            }
+            let input = normalize_resource(data);
+            assert!(!input.health.is_degraded());
+            assert!(!input.has_failures);
+        }
+    }
+
+    #[test]
+    fn incomplete_or_duplicate_storage_paths_are_not_ready() {
+        let mut duplicate = ready_resource();
+        duplicate["tmpfs_headroom"]["paths"][1]["env_name"] = json!("CARGO_TARGET_DIR");
+        assert_resource_blocks_new_work_and_reuse(duplicate);
+        for replacement in [Value::Null, json!([]), json!([null])] {
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["paths"] = replacement;
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+        for index in 0..2 {
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["paths"]
+                .as_array_mut()
+                .expect("paths")
+                .remove(index);
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+    }
+
+    #[test]
+    fn explicit_storage_hazards_survive_empty_critical_failure_lists() {
+        for field in ["exists", "under_expected_root", "ready", "problem"] {
+            for index in 0..2 {
+                let mut data = ready_resource();
+                data["tmpfs_headroom"]["paths"][index][field] = if field == "problem" {
+                    json!("low_headroom")
+                } else {
+                    json!(false)
+                };
+                assert!(normalize_resource(data.clone()).has_failures);
+                assert_resource_blocks_new_work_and_reuse(data);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_evidence_requires_typed_measurements_flags_and_policy() {
+        for field in [
+            "available_kb", "exists", "under_expected_root", "ready", "problem", "path",
+        ] {
+            for replacement in [json!([]), json!({}), json!("invalid")] {
+                let mut data = ready_resource();
+                data["tmpfs_headroom"]["paths"][0][field] = replacement;
+                assert_resource_blocks_new_work_and_reuse(data);
+            }
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["paths"][0]
+                .as_object_mut()
+                .expect("path")
+                .remove(field);
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+        for replacement in [Value::Null, json!(0), json!(-1), json!("10485760"), json!(1.5)] {
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["warn_available_kb"] = replacement;
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+    }
+
+    #[test]
+    fn storage_paths_cannot_escape_or_merely_share_a_string_prefix() {
+        let root = "/data/tmp/pi_agent_rust_cargo";
+        assert!(reported_path_within_root(root, root));
+        assert!(reported_path_within_root(&format!("{root}/a/./tmp"), root));
+        assert!(reported_path_within_root(&format!("{root}//a/tmp"), root));
+        for path in [
+            "/tmp",
+            "relative/tmp",
+            "/data/tmp/pi_agent_rust_cargo_other/a/tmp",
+            "/data/tmp/pi_agent_rust_cargo/../other/tmp",
+            "/data/tmp/pi_agent_rust_cargo/a\0/tmp",
+        ] {
+            assert!(!reported_path_within_root(path, root));
+            let mut data = ready_resource();
+            data["tmpfs_headroom"]["paths"][0]["path"] = json!(path);
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_planned_budgets_block_admission() {
+        for replacement in [Value::Null, json!({}), json!([])] {
+            let mut data = ready_resource();
+            data["recommended_budgets"] = replacement;
+            assert_resource_blocks_new_work_and_reuse(data);
+        }
+        for field in [
+            "agent_concurrency",
+            "tool_concurrency",
+            "extension_hostcall_lanes",
+            "max_queue_depth",
+            "max_rss_bytes",
+            "rch_verification_fanout",
+        ] {
+            for replacement in [Value::Null, json!(-1), json!("2"), json!(1.5)] {
+                let mut data = ready_resource();
+                data["recommended_budgets"][field] = replacement;
+                assert_resource_blocks_new_work_and_reuse(data);
+            }
+            if field != "rch_verification_fanout" {
+                let mut data = ready_resource();
+                data["recommended_budgets"][field] = json!(0);
+                assert_resource_blocks_new_work_and_reuse(data);
+            }
+        }
     }
 }
