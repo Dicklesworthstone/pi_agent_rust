@@ -98,3 +98,39 @@ fn empty_owner_visits_are_not_retained_and_rebinding_clears_selection() {
     assert!(lock(&tool.session_owners).parked.is_empty());
     assert!(lock(&tool.session).is_none());
 }
+
+#[test]
+fn cancellation_during_post_admission_identity_wait_releases_the_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    let (tool, scope) = scoped(directory.path());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    scope.bind(Arc::new(move || {
+        let first = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                Some("owner-a".to_string())
+            } else {
+                std::future::pending::<Option<String>>().await
+            }
+        })
+    }));
+    let owner = AgentCx::for_request();
+    run(async {
+        let mut request = Box::pin(owner.with_current(tool.execute("waiting-owner", json!({"action":"sessions"}), None)));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        owner.set_cancel_requested(true);
+        let error = request.await.unwrap_err();
+        assert!(error.to_string().contains("DAP_CANCELLED"));
+        assert!(lock(&tool.session_owners).active.is_none());
+        assert!(lock(&tool.session).is_none());
+        // A new invocation reaches the operation lease after the old request
+        // fails; cancellation did not poison the registry or choose owner-b.
+        select(&scope, Some("owner-b".into()));
+        let fresh_owner = AgentCx::for_request();
+        let output = fresh_owner.with_current(tool.execute("fresh", json!({"action":"sessions"}), None)).await.unwrap();
+        assert_eq!(output.details.unwrap()["sessions"], json!([]));
+        assert_eq!(lock(&tool.session_owners).active.as_deref(), Some("owner-b"));
+    });
+}

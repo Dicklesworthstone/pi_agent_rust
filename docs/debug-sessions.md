@@ -48,6 +48,21 @@ Unavailable, blank or oversized identities fail with `DAP_SESSION_UNAVAILABLE`
 instead of falling back to a previous/global debugger. Identity strings are
 bounded to 1024 bytes and other conversation IDs are not included in results.
 
+Each identity lookup has a separate 30-second cooperative budget, including
+lookups performed while holding the operation lease. Session-lock contention
+remains a wait, not a fabricated missing identity. An unresolved lookup returns
+`DAP_SESSION_TIMEOUT`; owner cancellation returns `DAP_CANCELLED`. A 20 ms
+watch keeps pending lookups cancellable, and both conditions are checked again
+before accepting a ready result. Timeout/cancellation drops that resolver and
+releases admission without retargeting or terminating a retained debugger.
+
+An immediately ready resolver needs no timer. A pending resolver requires the
+request's timer capability; it is refused with `DAP_PERMISSION` when that
+capability is absent. Polling and synchronous resolver cleanup use the original
+request context. The wait creates no extra thread and cannot preempt a resolver
+that blocks synchronously inside a poll. This is an identity-lookup budget, not
+a new whole-debug-command deadline or cancellation of already admitted DAP work.
+
 These admission/publication checks are cooperative, not an atomic frontend
 transition lock or an active-request cancellation watchdog. An in-flight DAP
 workflow can finish on its originally selected adapter after the user switches.
@@ -68,9 +83,9 @@ construct appropriately rooted tools when changing workspaces. This feature is
 in-process conversation isolation, not a security sandbox, durable debugger
 checkpoint, multiple targets within one conversation, or cross-process sharing.
 
-Regression cases are in `src/debug/ownership/tests.rs` and
-`tests/debug_sessions.rs`. The latter runs the actual registry, public tool and
-DAP transport against the repository's deterministic Python protocol peer, not
+Regression cases are in `src/debug/ownership/tests.rs`, the identity-wait
+module and `tests/debug_sessions.rs`. The latter runs the actual registry,
+public tool and DAP transport against the repository's deterministic Python protocol peer, not
 a real language debugger. Python must be available; `PI_DEBUG_REQUIRE_PROTOCOL`
 makes its absence fail rather than skip. Run the repository's authoritative
 `dsr quality --tool pi_agent_rust` workflow for Rust acceptance. Authored source

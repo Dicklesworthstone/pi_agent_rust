@@ -12,6 +12,8 @@ use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use crate::jobs::JobSessionScope;
 
+mod identity;
+
 pub(super) const MAX_DEBUG_SESSIONS: usize = 4;
 const MAX_OWNER_BYTES: usize = 1024;
 
@@ -37,13 +39,7 @@ impl DebugTool {
     }
 
     pub(super) async fn debug_owner(&self, owner: &AgentCx) -> Result<String> {
-        owner.checkpoint()
-            .map_err(|_| tool_err("DAP_CANCELLED", "debug owner resolution cancelled"))?;
-        let id = self.session_scope.session_id().await.map_err(|_| {
-            tool_err("DAP_SESSION_UNAVAILABLE", "current agent session identity is unavailable")
-        })?;
-        owner.checkpoint()
-            .map_err(|_| tool_err("DAP_CANCELLED", "debug owner resolution cancelled"))?;
+        let id = identity::resolve(&self.session_scope, owner).await?;
         if id.len() > MAX_OWNER_BYTES {
             return Err(tool_err("DAP_SESSION_UNAVAILABLE", "agent session identity exceeds 1024 bytes"));
         }
@@ -93,7 +89,7 @@ impl DebugTool {
         if count >= MAX_DEBUG_SESSIONS {
             return Err(tool_err(
                 "DAP_SESSION_CAPACITY",
-                "four debugger sessions are retained by this tool; disconnect a target from its owning conversation before starting another",
+                "four debugger sessions are retained by this tool; disconnect or terminate a target from its owning conversation before starting another",
             ));
         }
         Ok(())
