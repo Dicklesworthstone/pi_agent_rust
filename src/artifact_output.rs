@@ -7,6 +7,7 @@
 //! into a replacement workspace or replace existing user files.
 
 use crate::error::{Error, Result};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -155,14 +156,70 @@ impl Drop for Stage<'_> {
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+/// Publish an in-memory artifact through the same bounded streaming path.
 pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
-    use std::io::Write as _;
-
     if bytes.is_empty() {
         return Err(error(tool, "refusing to publish an empty artifact"));
     }
+    let limit = u64::try_from(bytes.len())
+        .map_err(|_| error(tool, "artifact byte count is not representable"))?;
+    let mut source = bytes;
+    publish_from_reader(target, &mut source, limit, tool).map(|_| ())
+}
+
+fn check_owner(owner: &crate::agent_cx::AgentCx, tool: &str) -> Result<()> {
+    owner.checkpoint().map_err(|_| error(tool, "artifact publication cancelled"))
+}
+
+/// Copy at most `limit` bytes into private staging. Read one extra byte only
+/// to detect overflow; a partial source is never a successful artifact.
+fn copy_bounded(
+    source: &mut dyn Read,
+    destination: &mut dyn Write,
+    limit: u64,
+    owner: &crate::agent_cx::AgentCx,
+    tool: &str,
+) -> Result<u64> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        check_owner(owner, tool)?;
+        let wanted = usize::try_from(limit.saturating_sub(total).saturating_add(1))
+            .unwrap_or(buffer.len()).min(buffer.len());
+        let read = match source.read(&mut buffer[..wanted]) {
+            Ok(read) => read,
+            Err(failure) if failure.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(failure) => return Err(error(tool, format!("cannot read artifact source: {failure}"))),
+        };
+        check_owner(owner, tool)?;
+        if read == 0 {
+            if total == 0 { return Err(error(tool, "refusing to publish an empty artifact")); }
+            return Ok(total);
+        }
+        total = total.checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .filter(|total| *total <= limit)
+            .ok_or_else(|| error(tool, format!("artifact source exceeds {limit} bytes")))?;
+        destination.write_all(&buffer[..read])
+            .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
+    }
+}
+
+/// Publish a bounded reader without retaining the entire artifact in memory.
+///
+/// Uses the same private staging, descriptor confinement and atomic no-clobber
+/// commit as [`publish`]. EOF, size admission and sync precede publication.
+/// Cancellation is checked between chunks and before publication, not inside a
+/// blocking syscall; directories created along the way may remain on failure.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+pub fn publish_from_reader(
+    target: &OutputTarget,
+    source: &mut dyn Read,
+    max_bytes: u64,
+    tool: &str,
+) -> Result<u64> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    check_owner(&owner, tool)?;
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
     let mut directory = target
         .root_directory
@@ -242,9 +299,10 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
         name: stage_name.clone(),
     };
     let mut file = std::fs::File::from(stage_fd);
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
+    let bytes = copy_bounded(source, &mut file, max_bytes, &owner, tool)?;
+    file.sync_all()
         .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
+    check_owner(&owner, tool)?;
     rustix::fs::linkat(
         &directory,
         stage_name.as_str(),
@@ -258,15 +316,18 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
             "artifact destination exists or cannot be published without overwrite",
         )
     })?;
-    Ok(())
+    Ok(bytes)
 }
 
 #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
-pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
-    use std::io::Write as _;
-    if bytes.is_empty() {
-        return Err(error(tool, "refusing to publish an empty artifact"));
-    }
+pub fn publish_from_reader(
+    target: &OutputTarget,
+    source: &mut dyn Read,
+    max_bytes: u64,
+    tool: &str,
+) -> Result<u64> {
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    check_owner(&owner, tool)?;
     let parent = target
         .absolute
         .parent()
@@ -287,9 +348,8 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
     }
     let mut staged = tempfile::NamedTempFile::new_in(&canonical_parent)
         .map_err(|failure| error(tool, format!("cannot stage artifact: {failure}")))?;
-    staged
-        .write_all(bytes)
-        .and_then(|()| staged.as_file().sync_all())
+    let bytes = copy_bounded(source, &mut staged, max_bytes, &owner, tool)?;
+    staged.as_file().sync_all()
         .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
     let canonical_parent_after = std::fs::canonicalize(parent).map_err(|failure| {
         error(
@@ -302,18 +362,120 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
     {
         return Err(error(tool, "artifact directory changed before publication"));
     }
+    check_owner(&owner, tool)?;
     staged.persist_noclobber(&target.absolute).map_err(|_| {
         error(
             tool,
             "artifact destination exists or cannot be published without overwrite",
         )
     })?;
-    Ok(())
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_publication_preserves_large_binary_data_with_small_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("source.bin");
+        let block: Vec<u8> = (0..=255).collect();
+        let mut file = std::fs::File::create(&source_path).unwrap();
+        for _ in 0..8192 { file.write_all(&block).unwrap(); }
+        drop(file);
+        let target = resolve_new(root.path(), "nested/copied.bin", "test").unwrap();
+        let mut source = std::fs::File::open(&source_path).unwrap();
+        assert_eq!(publish_from_reader(&target, &mut source, 2 * 1024 * 1024, "test").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(std::fs::read(target.path()).unwrap(), std::fs::read(source_path).unwrap());
+    }
+
+    #[test]
+    fn overflow_and_empty_reader_leave_no_partial_destination_or_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        let mut source = std::io::Cursor::new(b"12345");
+        let failure = publish_from_reader(&target, &mut source, 4, "test").unwrap_err();
+        assert!(failure.to_string().contains("exceeds 4 bytes"));
+        assert_eq!(source.position(), 5);
+        assert!(!target.path().exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(publish_from_reader(&target, &mut std::io::empty(), 4, "test").is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(publish_from_reader(&target, &mut &b"1234"[..], 4, "test").unwrap(), 4);
+    }
+
+    #[test]
+    fn source_failure_after_progress_does_not_publish_a_prefix() {
+        struct Broken(bool);
+        impl Read for Broken {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 { return Err(std::io::Error::other("source failed")); }
+                self.0 = true;
+                buffer[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        let failure = publish_from_reader(&target, &mut Broken(false), 10, "test").unwrap_err();
+        assert!(failure.to_string().contains("source failed"));
+        assert!(!target.path().exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bounded_copy_handles_interrupted_reads_and_never_requests_large_buffers() {
+        struct Fragmented { interrupted: bool, remaining: usize }
+        impl Read for Fragmented {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= 64 * 1024);
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = self.remaining.min(13).min(buffer.len());
+                buffer[..count].fill(b'x');
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        let mut source = Fragmented { interrupted: false, remaining: 100_003 };
+        assert_eq!(publish_from_reader(&target, &mut source, 100_003, "test").unwrap(), 100_003);
+        assert_eq!(std::fs::read(target.path()).unwrap(), vec![b'x'; 100_003]);
+    }
+
+    #[test]
+    fn reader_cannot_cancel_its_owner_and_publish_a_late_success() {
+        struct Cancelling(crate::agent_cx::AgentCx);
+        impl Read for Cancelling {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set_cancel_requested(true);
+                buffer[0] = b'x';
+                Ok(1)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing();
+        let _current = owner.cx().clone().set_current_restricted();
+        let failure = publish_from_reader(&target, &mut Cancelling(owner.clone()), 10, "test").unwrap_err();
+        assert!(failure.to_string().contains("cancelled"));
+        assert!(!target.path().exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reader_publication_does_not_replace_a_raced_in_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "result.bin", "test").unwrap();
+        std::fs::write(target.path(), "keep").unwrap();
+        assert!(publish_from_reader(&target, &mut &b"new"[..], 3, "test").is_err());
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn lexical_escape_and_platform_separators_are_rejected() {
