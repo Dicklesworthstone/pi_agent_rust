@@ -1,12 +1,13 @@
 //! Registered debug adapters and target-aware launch arguments (bd-cv653.1.2).
-//! Built-in adapters: lldb-dap and debugpy over stdio, Delve over owned TCP.
+//! Built-in adapters: lldb-dap, GDB and debugpy over stdio, Delve over owned TCP.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-/// One trusted debug-adapter definition. Tool arguments select this ID, never
-/// an arbitrary executable. SDK hosts can override definitions explicitly.
+/// One debug-adapter definition. Tool arguments select a registered ID, or
+/// explicitly name a workspace adapterConfig plus ID; never a shell command.
+/// SDK hosts can override definitions explicitly.
 #[derive(Debug, Clone)]
 pub struct AdapterSpec {
     pub id: String,
@@ -54,6 +55,33 @@ fn resolved_executable(path: &Path) -> Option<String> {
     path.to_str().map(str::to_owned)
 }
 
+/// GDB implements DAP natively when built with Python support. Keep command
+/// discovery side-effect-free; the normal initialize exchange establishes
+/// protocol availability and reports a failure rather than falling back to MI.
+fn gdb_adapter() -> AdapterSpec {
+    let mut args = vec![
+        "--quiet".to_string(),
+        "--nx".to_string(),
+        "--interpreter=dap".to_string(),
+        "-iex".to_string(),
+        "set auto-load off".to_string(),
+        "-iex".to_string(),
+        "set startup-with-shell off".to_string(),
+    ];
+    // A byte-counted DAP frame cannot tolerate CRT newline translation.
+    // This requires a GDB release supporting --binary-output on Windows.
+    if cfg!(windows) {
+        args.push("--binary-output".to_string());
+    }
+    AdapterSpec {
+        id: "gdb".to_string(),
+        command_candidates: vec!["gdb".to_string(), "gdb.exe".to_string()],
+        adapter_args: args,
+        languages: vec!["rust", "c", "cpp", "binary"],
+        install_hint: "install Python-enabled GDB 16+ with the dap interpreter (17+ on Windows)".to_string(),
+    }
+}
+
 #[must_use]
 pub fn default_adapters() -> Vec<AdapterSpec> {
     let mut lldb_candidates = vec!["lldb-dap".to_string()];
@@ -79,6 +107,9 @@ pub fn default_adapters() -> Vec<AdapterSpec> {
             languages: vec!["rust", "c", "cpp", "binary"],
             install_hint: "install the LLVM toolchain (lldb-dap ships with lldb)".to_string(),
         },
+        // Preserve LLDB preference for existing callers; offer a real native
+        // backend when only GDB is installed. Explicit adapter="gdb" wins.
+        gdb_adapter(),
         AdapterSpec {
             id: "debugpy".to_string(),
             command_candidates: vec!["python3".to_string()],
@@ -202,6 +233,15 @@ pub fn launch_arguments(
             "mode": go_launch_mode(program),
             "stopOnEntry": true,
         }),
+        "gdb" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            // GDB's stopOnEntry means the dynamic loader's first instruction;
+            // the main-subprogram stop is useful for source-level agent work.
+            "stopOnEntry": false,
+            "stopAtBeginningOfMainSubprogram": true,
+        }),
         _ => serde_json::json!({
             "program": program.display().to_string(),
             "args": args,
@@ -220,6 +260,10 @@ pub fn attach_arguments(adapter: &AdapterSpec, pid: u32) -> Value {
         _ => serde_json::json!({ "pid": pid }),
     }
 }
+
+#[cfg(test)]
+#[path = "adapter_configuration_tests.rs"]
+mod configuration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -273,6 +317,23 @@ mod tests {
             attach_arguments(dlv, 4242),
             serde_json::json!({"processId":4242,"mode":"local"})
         );
+    }
+
+    #[test]
+    fn gdb_profile_is_native_dap_and_suppresses_implicit_startup_code() {
+        let adapter = select_adapter(None, Some("gdb"), &[]).unwrap();
+        assert!(adapter.adapter_args.iter().any(|arg| arg == "--interpreter=dap"));
+        assert!(adapter.adapter_args.iter().any(|arg| arg == "--nx"));
+        for command in ["set auto-load off", "set startup-with-shell off"] {
+            assert!(adapter.adapter_args.windows(2).any(|args| args[0] == "-iex" && args[1] == command));
+        }
+        assert_eq!(adapter.adapter_args.iter().any(|arg| arg == "--binary-output"), cfg!(windows));
+        let launch = launch_arguments(&adapter, Path::new("app"), &["a b".into(), "$(literal)".into()], Path::new("."));
+        assert_eq!(launch["args"], serde_json::json!(["a b", "$(literal)"]));
+        assert_eq!(launch["stopAtBeginningOfMainSubprogram"], true);
+        assert_eq!(launch["stopOnEntry"], false);
+        assert!(launch.get("console").is_none());
+        assert_eq!(attach_arguments(&adapter, 42), serde_json::json!({"pid":42}));
     }
 
     #[test]

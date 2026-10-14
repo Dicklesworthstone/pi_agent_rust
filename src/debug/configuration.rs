@@ -213,9 +213,16 @@ fn validate_definition(id: &str, definition: &Definition) -> Result<()> {
 }
 
 /// Keep the caller's stop policy independent of adapter-specific wire names.
-pub(super) fn set_stop_on_entry(_adapter: &str, arguments: &mut Value, stop: Option<bool>) {
+pub(super) fn set_stop_on_entry(adapter: &str, arguments: &mut Value, stop: Option<bool>) {
     if let Some(stop) = stop {
-        arguments["stopOnEntry"] = Value::Bool(stop);
+        if adapter == "gdb" && arguments.get("program").is_some() {
+            // Main-subprogram entry, not the ELF loader's first instruction.
+            // Explicit false must clear BOTH flags; never leave a hidden stop.
+            arguments["stopOnEntry"] = Value::Bool(false);
+            arguments["stopAtBeginningOfMainSubprogram"] = Value::Bool(stop);
+        } else {
+            arguments["stopOnEntry"] = Value::Bool(stop);
+        }
     }
 }
 
