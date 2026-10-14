@@ -29,6 +29,9 @@ const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 /// Default per-cell budget.
 const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
 
+/// Bound outstanding native console frames independently of capture storage.
+const JS_OUTPUT_QUEUE: usize = 8;
+
 struct PyKernel {
     child: ProcessGuard,
     stdin: ChildStdin,
@@ -178,10 +181,15 @@ impl EvalTool {
         }
     }
 
-    /// Run one JavaScript cell on the persistent QuickJS kernel. Bridge
-    /// requests re-enter pi tools exactly like the Python path.
+    /// Run one JavaScript cell on the persistent QuickJS kernel. Both native
+    /// console output and bridge requests are serviced by the owning host.
     #[allow(clippy::too_many_lines)]
-    async fn run_js_cell(&self, code: &str, timeout: Duration) -> Result<ToolOutput> {
+    async fn run_js_cell(
+        &self,
+        code: &str,
+        timeout: Duration,
+        capture: &mut output::Capture,
+    ) -> Result<ToolOutput> {
         let kernel = {
             let mut slot = self
                 .js
@@ -193,29 +201,58 @@ impl EvalTool {
         let mut kernel = if let Some(kernel) = kernel {
             kernel
         } else {
-            {
-                restarted = true;
-                js_kernel::JsKernel::spawn()
-                    .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
-            }
+            restarted = true;
+            js_kernel::JsKernel::spawn()
+                .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
         };
         let deadline = Instant::now() + timeout;
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel(JS_OUTPUT_QUEUE);
         let reply_rx = kernel
-            .submit(code.to_string(), deadline)
+            .submit_with_output(code.to_string(), deadline, Some(output_tx))
             .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
 
-        // Poll for the cell response, servicing bridge requests as they come.
-        let response = loop {
+        let mut response = loop {
+            owner.checkpoint().map_err(|_| Error::tool(
+                "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+            ))?;
+            let received = drain_js_console(&output_rx, capture)?;
+            capture.publish(false);
+            // User callbacks may cancel. Do not start a new bridge operation
+            // after such a callback just because native frames remain ready.
+            owner.checkpoint().map_err(|_| Error::tool(
+                "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+            ))?;
             if let Ok(bridge) = kernel.bridge.try_recv() {
-                let reply = self.run_bridge_call_parts(&bridge.tool, bridge.input).await;
+                // At most one queue's worth of frames can precede this bridge.
+                // Publish them before entering a potentially slow native tool.
+                drain_js_console(&output_rx, capture)?;
+                capture.publish(true);
+                owner.checkpoint().map_err(|_| Error::tool(
+                    "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                ))?;
+                let mut pending = Box::pin(self.run_bridge_call_parts(&bridge.tool, bridge.input));
+                let reply = loop {
+                    // An async JS timer can print while its tool request is in
+                    // flight. Keep draining instead of blocking that producer.
+                    drain_js_console(&output_rx, capture)?;
+                    capture.publish(false);
+                    owner.checkpoint().map_err(|_| Error::tool(
+                        "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                    ))?;
+                    let sleeper = Box::pin(asupersync::time::sleep(
+                        asupersync::time::wall_now(), Duration::from_millis(15),
+                    ));
+                    match futures::future::select(pending, sleeper).await {
+                        futures::future::Either::Left((reply, _)) => break reply,
+                        futures::future::Either::Right(((), operation)) => pending = operation,
+                    }
+                };
                 let _ = bridge.reply.send(reply);
-                continue;
             }
             match reply_rx.try_recv() {
                 Ok(response) => break response,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // The interrupt handler retires the timed-out realm;
-                    // allow cleanup slack, then declare the worker wedged.
                     if Instant::now() > deadline + Duration::from_secs(5) {
                         return Err(Error::tool(
                             "eval",
@@ -223,11 +260,12 @@ impl EvalTool {
                              discarded — state was lost, next cell starts fresh",
                         ));
                     }
+                    // Bound each drain batch and yield even under continuous
+                    // output/fast bridges so the whole-cell watchdog can run.
                     asupersync::time::sleep(
                         asupersync::time::wall_now(),
-                        Duration::from_millis(15),
-                    )
-                    .await;
+                        Duration::from_millis(if received == 0 { 15 } else { 1 }),
+                    ).await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return Err(Error::tool(
@@ -238,11 +276,17 @@ impl EvalTool {
                 }
             }
         };
+        // The native sink closes before this reply. Drain all remaining frames
+        // (bounded by queue capacity), then assemble console output only once.
+        drain_js_console(&output_rx, capture)?;
+        capture.finish_javascript(&mut response)?;
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
         // Reject the entire rich result before making this realm reusable.
         // On malformed output, dropping the owned kernel revokes its worker.
-        let output = display::javascript_response(response, restarted, cells_run)?;
+        let mut output = display::javascript_response(response, restarted, cells_run)?;
+        capture.annotate(&mut output);
+        capture.publish(true);
         {
             let mut slot = self
                 .js
@@ -250,7 +294,6 @@ impl EvalTool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = Some(kernel);
         }
-
         Ok(output)
     }
 
@@ -450,6 +493,25 @@ impl EvalTool {
     }
 }
 
+/// Consume no more than one bounded queue in a poll. Callback delivery stays
+/// outside this loop and outside every native mutex/QuickJS RefCell borrow.
+fn drain_js_console(
+    receiver: &std::sync::mpsc::Receiver<Value>,
+    capture: &mut output::Capture,
+) -> Result<usize> {
+    let mut received = 0;
+    for _ in 0..JS_OUTPUT_QUEUE {
+        match receiver.try_recv() {
+            Ok(frame) => {
+                capture.accept(&frame, 1)?;
+                received += 1;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    Ok(received)
+}
+
 /// Turn a kernel protocol response line into the tool output contract.
 fn format_cell_response(line: &str, restarted: bool, cells_run: u64) -> Result<ToolOutput> {
     display::python_response(line, restarted, cells_run)
@@ -474,7 +536,7 @@ impl Tool for EvalTool {
          state loss explicitly. Rich output: Python display(value, mime=...) \
          or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
          PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
-         Python stdout/stderr stream live; large console output retains a \
+         Both kernels stream stdout/stderr live; large console output retains a \
          labelled bounded head/tail rather than filling session memory."
     }
 

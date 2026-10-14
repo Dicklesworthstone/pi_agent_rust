@@ -1,4 +1,4 @@
-//! Per-invocation Python console capture and native ToolUpdate snapshots.
+//! Per-invocation console capture and native ToolUpdate snapshots for both kernels.
 //!
 //! Keep bounded UTF-8 head/tail data, not one String proportional to output.
 //! Updates replace the previous preview; the final formatter receives the
@@ -86,6 +86,7 @@ impl BoundedText {
 }
 
 pub(super) struct Capture {
+    kernel: &'static str,
     stdout: BoundedText,
     stderr: BoundedText,
     sequence: u64,
@@ -95,12 +96,13 @@ pub(super) struct Capture {
 }
 
 fn invalid(message: &str) -> Error {
-    Error::tool("eval", format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: Python kernel discarded"))
+    Error::tool("eval", format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: selected kernel discarded"))
 }
 
 impl Capture {
-    pub(super) fn new(on_update: Option<Update>) -> Self {
+    pub(super) fn new(kernel: &'static str, on_update: Option<Update>) -> Self {
         Self {
+            kernel,
             stdout: BoundedText::new(CAPTURE_BYTES),
             stderr: BoundedText::new(CAPTURE_BYTES),
             sequence: 0,
@@ -151,7 +153,7 @@ impl Capture {
         // No native mutex or RefCell borrow is held across caller code.
         callback(ToolUpdate {
             content: vec![ContentBlock::Text(TextContent::new(format!("{out}{err}")))],
-            details: Some(json!({"kernel":"python", "status":"running", "output":details})),
+            details: Some(json!({"kernel":self.kernel, "status":"running", "output":details})),
         });
         self.dirty = false;
         self.last_update = Some(now);
@@ -182,6 +184,17 @@ impl Capture {
         Ok(())
     }
 
+    /// The native sender closes before publishing the reply; the host drains
+    /// that invocation's channel first. No guest text is parsed as protocol.
+    pub(super) fn finish_javascript(&self, response: &mut super::js_kernel::JsCellResponse) -> Result<()> {
+        if !response.console.is_empty() {
+            return Err(invalid("JavaScript response duplicates streamed console output"));
+        }
+        response.console = self.stdout.render();
+        response.console.push_str(&self.stderr.render());
+        Ok(())
+    }
+
     pub(super) fn annotate(&self, output: &mut ToolOutput) {
         if self.sequence > 0 {
             if let Some(Value::Object(details)) = output.details.as_mut() {
@@ -190,13 +203,40 @@ impl Capture {
         }
     }
 
-    /// Keep Python's existing tool-Error convention while retaining a bounded
-    /// tail already received before timeout, cancellation, crash or bad frames.
+    fn partial_output(&self) -> Option<(String, Value)> {
+        if self.stdout.total == 0 && self.stderr.total == 0 { return None; }
+        let (out, out_omitted) = self.stdout.preview();
+        let (err, err_omitted) = self.stderr.preview();
+        let language = if self.kernel == "js" { "JavaScript" } else { "Python" };
+        Some((
+            format!("[Partial {language} output received before failure]\n{out}{err}"),
+            self.details(out_omitted, err_omitted, true),
+        ))
+    }
+
+    /// Keep each language's existing Error convention while retaining a
+    /// bounded tail received before timeout, cancellation, crash or bad frames.
     pub(super) fn with_error(&self, error: Error) -> Error {
-        if self.stdout.total == 0 && self.stderr.total == 0 { return error; }
-        let (out, _) = self.stdout.preview();
-        let (err, _) = self.stderr.preview();
-        Error::tool("eval", format!("{error}\n[Partial Python output received before failure]\n{out}{err}"))
+        let Some((partial, _)) = self.partial_output() else { return error; };
+        Error::tool("eval", format!("{error}\n{partial}"))
+    }
+
+    /// JavaScript watchdog failures are ToolOutput, not tool Error. Keep the
+    /// diagnostic first and describe the actual preview, not a larger capture
+    /// which is deliberately not copied into this partial failure response.
+    pub(super) fn append_partial(&self, output: &mut ToolOutput) {
+        if let Some((partial, metadata)) = self.partial_output() {
+            match output.content.first_mut() {
+                Some(ContentBlock::Text(text)) => {
+                    text.text.push('\n');
+                    text.text.push_str(&partial);
+                }
+                _ => output.content.push(ContentBlock::Text(TextContent::new(partial))),
+            }
+            if let Some(Value::Object(details)) = output.details.as_mut() {
+                details.insert("output".into(), metadata);
+            }
+        }
     }
 }
 
@@ -246,7 +286,7 @@ mod tests {
 
     #[test]
     fn invalid_stream_frames_do_not_mutate_the_capture() {
-        let mut capture = Capture::new(None);
+        let mut capture = Capture::new("python", None);
         for bad in [
             frame(9, 1, "stdout", "bad"), frame(7, 2, "stdout", "bad"),
             frame(7, 1, "unknown", "bad"), frame(7, 1, "stdout", &"x".repeat(CHUNK_BYTES + 1)),
@@ -265,7 +305,7 @@ mod tests {
     fn updates_are_coalesced_replacement_snapshots_not_repeated_deltas() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let mut capture = Capture::new(Some(Box::new(move |event| sink.lock().unwrap().push(event))));
+        let mut capture = Capture::new("python", Some(Box::new(move |event| sink.lock().unwrap().push(event))));
         let now = Instant::now();
         capture.accept(&frame(1, 1, "stdout", "first"), 1).unwrap();
         capture.publish_at(now, false);
@@ -282,7 +322,7 @@ mod tests {
 
     #[test]
     fn final_output_is_assembled_once_and_sequence_gaps_are_errors() {
-        let mut capture = Capture::new(None);
+        let mut capture = Capture::new("python", None);
         capture.accept(&frame(2, 1, "stdout", "out"), 2).unwrap();
         capture.accept(&frame(2, 2, "stderr", "err"), 2).unwrap();
         let mut response = json!({"stdout":"","stderr":"","outputSequence":1});
@@ -296,7 +336,7 @@ mod tests {
 
     #[test]
     fn previews_and_partial_errors_have_independent_small_bounds() {
-        let mut capture = Capture::new(None);
+        let mut capture = Capture::new("python", None);
         for sequence in 1..=30 {
             capture.accept(&frame(3, sequence, "stdout", &"界".repeat(10000)), 3).unwrap();
         }
@@ -456,5 +496,168 @@ mod tests {
         assert!(!output.is_error, "{}", text(&output.content));
         assert!(text(&output.content).contains("EVAL_OUTPUT_CLOSED"));
         assert!(!text(&output.content).contains("foreign-output"));
+    }
+
+    #[test]
+    fn javascript_partial_metadata_describes_the_rendered_preview_not_the_larger_capture() {
+        let mut capture = Capture::new("js", None);
+        capture.accept(&frame(1, 1, "stdout", &"x".repeat(40_000)), 1).unwrap();
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("EVAL_TIMEOUT: stopped"))],
+            details: Some(json!({"kernel":"js", "stateReset":true})),
+            is_error: true,
+        };
+        capture.append_partial(&mut output);
+        assert!(output.is_error);
+        let rendered = text(&output.content);
+        assert!(rendered.starts_with("EVAL_TIMEOUT"));
+        assert!(rendered.contains("Partial JavaScript"));
+        assert!(rendered.len() < PREVIEW_BYTES + 512);
+        let details = output.details.as_ref().unwrap();
+        assert_eq!(details["stateReset"], true);
+        assert_eq!(details["output"]["preview"], true);
+        assert_eq!(details["output"]["stdoutBytes"], 40_000);
+        assert_eq!(details["output"]["stdoutOmittedBytes"], 40_000 - PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn javascript_live_update_precedes_bridge_dispatch_and_final_result() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let gate = dir.path().join("js-progress-gate");
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&seen);
+        let callback = Box::new(move |event: ToolUpdate| {
+            assert_eq!(event.details.as_ref().unwrap()["kernel"], "js");
+            assert_ne!(std::thread::current().name(), Some("eval-js-kernel"));
+            if text(&event.content).contains("js-progress-marker") {
+                std::fs::write(&gate, "admitted").unwrap();
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let output = run(tool.execute("live-js", json!({"kernel":"js", "code":concat!(
+            "console.log('js-progress-marker'); ",
+            "if (!tool.read('js-progress-gate').includes('admitted')) throw new Error('no live update'); ",
+            "console.warn('js-warning'); 42"
+        )}), Some(callback))).unwrap();
+        assert!(!output.is_error, "{}", text(&output.content));
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+        let rendered = text(&output.content);
+        assert_eq!(rendered.matches("js-progress-marker").count(), 1);
+        assert_eq!(rendered.matches("js-warning").count(), 1);
+        assert!(rendered.trim().ends_with("42"));
+        assert_eq!(output.details.as_ref().unwrap()["output"]["stderrBytes"], 11);
+    }
+
+    #[test]
+    fn javascript_large_stream_has_exact_byte_counts_and_bounded_unicode_capture() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let output = run(tool.execute("large-js", json!({
+            "kernel":"js", "code":"console.log('BEGIN-' + '界'.repeat(500000) + '-END');"
+        }), None)).unwrap();
+        assert!(!output.is_error, "{}", text(&output.content));
+        let rendered = text(&output.content);
+        assert!(rendered.starts_with("BEGIN-"));
+        assert!(rendered.trim().ends_with("-END"));
+        assert!(rendered.contains("EVAL_OUTPUT_TRUNCATED"));
+        assert!(rendered.len() < CAPTURE_BYTES + 256);
+        assert!(!rendered.contains('\u{fffd}'));
+        let metadata = &output.details.as_ref().unwrap()["output"];
+        assert_eq!(metadata["stdoutBytes"], 1_500_011);
+        assert_eq!(metadata["stderrBytes"], 0);
+        assert_eq!(metadata["truncated"], true);
+        assert!(metadata["stdoutOmittedBytes"].as_u64().unwrap() > 900_000);
+    }
+
+    #[test]
+    fn javascript_stream_rich_display_and_ordinary_error_are_not_duplicated() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let output = run(tool.execute("mixed-js", json!({"kernel":"js", "code":concat!(
+            "globalThis.keep = 42; console.log('kept-once'); console.error('warning-once'); ",
+            "display({answer:42}); throw new Error('expected-failure');"
+        )}), None)).unwrap();
+        assert!(output.is_error);
+        let rendered = text(&output.content);
+        assert_eq!(rendered.matches("kept-once").count(), 1);
+        assert_eq!(rendered.matches("warning-once").count(), 1);
+        assert!(rendered.contains("expected-failure"));
+        let details = output.details.as_ref().unwrap();
+        assert_eq!(details["jsonOutputs"], json!([{"answer":42}]));
+        assert_eq!(details["output"]["stdoutBytes"], 10);
+        assert_eq!(details["output"]["stderrBytes"], 13);
+        let next = run(tool.execute("kept-js", json!({"kernel":"js", "code":"keep"}), None)).unwrap();
+        assert!(!next.is_error);
+        assert_eq!(text(&next.content).trim(), "42");
+    }
+
+    #[test]
+    fn javascript_timeout_keeps_received_console_and_retires_state() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let output = run(tool.execute("timeout-js", json!({
+            "kernel":"js", "timeout_secs":1,
+            "code":"globalThis.keep = 7; console.log('js-timeout-progress'); while (true) {}"
+        }), None)).unwrap();
+        assert!(output.is_error);
+        let rendered = text(&output.content);
+        assert!(rendered.contains("EVAL_TIMEOUT"), "{rendered}");
+        assert!(rendered.contains("js-timeout-progress"));
+        assert!(rendered.contains("EVAL_STATE_RESET"));
+        assert!(!rendered.contains("Partial Python"));
+        assert!(output.details.as_ref().unwrap()["output"]["stdoutBytes"].as_u64().unwrap() > 0);
+        let next = run(tool.execute("fresh-js", json!({"kernel":"js", "code":"typeof keep"}), None)).unwrap();
+        assert!(!next.is_error);
+        assert!(text(&next.content).contains("undefined"));
+    }
+
+    #[test]
+    fn javascript_callback_cancellation_stops_busy_output_with_partial_failure() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let owner = crate::agent_cx::AgentCx::for_testing();
+        let stop = owner.clone();
+        let callback = Box::new(move |_: ToolUpdate| { stop.set_cancel_requested(true); });
+        let started = Instant::now();
+        let output = run(owner.with_current(tool.execute("cancel-js", json!({
+            "kernel":"js", "timeout_secs":60,
+            "code":"globalThis.keep = 7; while (true) console.log('js-cancel-progress');"
+        }), Some(callback)))).unwrap();
+        assert!(output.is_error);
+        let rendered = text(&output.content);
+        assert!(rendered.contains("EVAL_CANCELLED"), "{rendered}");
+        assert!(rendered.contains("js-cancel-progress"));
+        assert!(rendered.contains("Partial JavaScript"));
+        assert_eq!(output.details.as_ref().unwrap()["stateReset"], true);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let next = run(tool.execute("fresh-js", json!({"kernel":"js", "code":"typeof keep"}), None)).unwrap();
+        assert!(!next.is_error);
+        assert!(text(&next.content).contains("undefined"));
+        assert_eq!(next.details.as_ref().unwrap()["cell"], 1);
+    }
+
+    #[test]
+    fn javascript_output_channels_do_not_deliver_stale_timer_output_to_later_cells() {
+        use crate::tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::eval::EvalTool::new(dir.path());
+        let first = run(tool.execute("first-js", json!({"kernel":"js", "code":
+            "setTimeout(() => console.log('foreign-output'), 50); console.log('first-only');"
+        }), None)).unwrap();
+        assert!(!first.is_error, "{}", text(&first.content));
+        let next = run(tool.execute("second-js", json!({"kernel":"js", "code":
+            "await sleep(100); console.log('second-only');"
+        }), None)).unwrap();
+        assert!(!next.is_error, "{}", text(&next.content));
+        assert!(text(&next.content).contains("second-only"));
+        assert!(!text(&next.content).contains("first-only"));
+        assert!(!text(&next.content).contains("foreign-output"));
+        assert_eq!(next.details.as_ref().unwrap()["output"]["stdoutBytes"], 12);
     }
 }

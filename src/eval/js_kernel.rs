@@ -4,10 +4,11 @@
 //! separate trust domain from the extension realm (`extensions_js`), with no
 //! module loader and no extension hostcalls. Cells evaluate as scripts (the
 //! completion value of the last statement returns, REPL-style), `console.*`
-//! output is captured per cell, globals persist across cells, and top-level
-//! promises are settled by pumping pending jobs. Per-cell timeouts use the
-//! QuickJS interrupt handler. A timeout discards the realm with an explicit
-//! state-loss diagnostic so stale promise continuations cannot run in a later cell.
+//! output streams through an invocation-owned bounded channel, globals persist
+//! across cells, and top-level promises settle by pumping pending jobs.
+//! Per-cell timeouts use the QuickJS interrupt handler. A timeout discards the
+//! realm with an explicit state-loss diagnostic so stale promise continuations
+//! cannot run in a later cell.
 //!
 //! The tool re-entry bridge mirrors the Python design: `tool.read(...)` etc.
 //! block the kernel thread on a channel round-trip that the host resolves
@@ -19,7 +20,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 mod async_host;
@@ -34,6 +35,7 @@ pub struct JsCellRequest {
     pub code: String,
     pub deadline: Instant,
     pub reply: Sender<JsCellResponse>,
+    pub output: Option<SyncSender<Value>>,
 }
 
 /// Cell outcome from the kernel thread.
@@ -77,12 +79,23 @@ impl JsKernel {
         })
     }
 
-    /// Submit a cell; the response arrives on the returned receiver. The
-    /// kernel thread exits when the sender side is dropped.
+    /// Raw kernel tests may collect bounded console output without a host.
+    #[cfg(test)]
     pub fn submit(
         &self,
         code: String,
         deadline: Instant,
+    ) -> Result<Receiver<JsCellResponse>, String> {
+        self.submit_with_output(code, deadline, None)
+    }
+
+    /// The output sender belongs to this request alone and closes before its
+    /// final reply. Revoking the kernel also interrupts blocked output delivery.
+    pub fn submit_with_output(
+        &self,
+        code: String,
+        deadline: Instant,
+        output: Option<SyncSender<Value>>,
     ) -> Result<Receiver<JsCellResponse>, String> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.requests
@@ -90,6 +103,7 @@ impl JsKernel {
                 code,
                 deadline,
                 reply: reply_tx,
+                output,
             })
             .map_err(|_| String::from("kernel thread gone"))?;
         Ok(reply_rx)
@@ -151,12 +165,12 @@ fn kernel_thread(
             return;
         };
         let mut rebuild = false;
-        while let Ok(request) = requests.recv() {
+        while let Ok(mut request) = requests.recv() {
             if stopped.load(Ordering::SeqCst) { return; }
             deadline.set(request.deadline, origin);
             host.begin(request.deadline);
             displays.begin();
-            console.borrow_mut().begin();
+            console.borrow_mut().begin(request.output.take());
             let mut response = run_cell(&context, &runtime, &request, &deadline, origin, &evaluator, &host, bridge_tx);
             response.displays = displays.finish();
             let console_result = console.borrow_mut().finish();
@@ -171,6 +185,10 @@ fn kernel_thread(
             }
             let expired = deadline.expired(origin);
             if stopped.load(Ordering::SeqCst) { return; }
+            if expired {
+                let detail = response.error.take().unwrap_or_default();
+                response.error = Some(format!("EVAL_TIMEOUT: JavaScript cell budget exhausted; {detail}"));
+            }
             // Cleanup uses captured built-ins only, not arbitrary guest code.
             deadline.clear();
             let cleanup_failed = context.with(|ctx| host.finish(&ctx)).is_err();

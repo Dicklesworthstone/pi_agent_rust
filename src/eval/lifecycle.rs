@@ -154,15 +154,15 @@ impl EvalTool {
             let slot = self.js.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.as_ref().map_or((1, true), |kernel| (kernel.cells_run.saturating_add(1), false))
         };
-        // The capture outlives the checked-out Python future: cancellation
-        // can retire its process without discarding already received output.
-        let mut capture = super::output::Capture::new(on_update);
+        // Capture outlives either checked-out kernel future: cancellation can
+        // retire the producer without discarding already received output.
+        let mut capture = super::output::Capture::new(cell.kernel.name(), on_update);
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
             Kernel::Python => wait_owned(&owner, Some(deadline), self.run_py_cell(&cell.code, timeout, &mut capture)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
-                wait_owned(&owner, Some(deadline), self.run_js_cell(code, timeout)).await
+                wait_owned(&owner, Some(deadline), self.run_js_cell(code, timeout, &mut capture)).await
             }
         };
         let outcome = match outcome {
@@ -178,17 +178,22 @@ impl EvalTool {
                 );
                 match cell.kernel {
                     Kernel::Python => Err(Error::tool("eval", message)),
-                    Kernel::Js => Ok(ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new(message))],
-                        details: Some(json!({
-                            "kernel":"js", "cell":js_cell, "restarted":js_restarted,
-                            "errorKind":stop.kind(), "stateReset":true,
-                        })),
-                        is_error: true,
-                    }),
+                    Kernel::Js => {
+                        let mut output = ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(message))],
+                            details: Some(json!({
+                                "kernel":"js", "cell":js_cell, "restarted":js_restarted,
+                                "errorKind":stop.kind(), "stateReset":true,
+                            })),
+                            is_error: true,
+                        };
+                        capture.append_partial(&mut output);
+                        Ok(output)
+                    }
                 }
             }
         };
+        capture.publish(true);
         let mut output = outcome.map_err(|error| {
             let error = capture.with_error(error);
             if cell.reset {
