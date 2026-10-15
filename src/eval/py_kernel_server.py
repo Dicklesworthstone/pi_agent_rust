@@ -95,6 +95,9 @@ _PROTOCOL_WRITE_LOCK = threading.RLock()
 _PACKAGE_ROOT = os.environ.pop("_PI_EVAL_PACKAGE_ROOT", None)
 _PACKAGE_LAYERS = []
 _MAX_PACKAGE_LAYERS = 32
+# Optional plotting libraries are imported only by user code. Respect an
+# explicit backend choice; otherwise do not require a display server.
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 
 def _send_frame(frame):
@@ -241,9 +244,116 @@ def _display_png(value):
         raise ValueError("EVAL_DISPLAY_PNG: missing PNG header or end marker")
     width = int.from_bytes(raw[16:20], "big")
     height = int.from_bytes(raw[20:24], "big")
-    if not 0 < width <= 16384 or not 0 < height <= 16384 or width * height > 16777216:
-        raise ValueError("EVAL_DISPLAY_PNG: dimensions exceed the display budget")
+    _display_dimensions(width, height)
     return encoded
+
+
+def _display_dimensions(width, height):
+    # Also runs before optional libraries allocate/encode a raster. Fractional
+    # figure pixels round up conservatively; NaN/inf fail the comparisons.
+    if (not (0 < width <= 16384 and 0 < height <= 16384)
+            or math.ceil(width) * math.ceil(height) > 16777216):
+        raise ValueError("EVAL_DISPLAY_PNG: dimensions exceed the display budget")
+
+
+class _DisplayPngBuffer(io.BytesIO):
+    """Bound encoded image storage before a writer can grow the byte buffer."""
+
+    def __init__(self, byte_budget):
+        super().__init__()
+        overhead = len(b'{"mimeType":"image/png","data":""}')
+        self.limit = max(0, (min(byte_budget, _MAX_DISPLAY_ITEM_BYTES) - overhead) // 4 * 3)
+
+    def write(self, data):
+        if self.tell() + memoryview(data).nbytes > self.limit:
+            raise ValueError("EVAL_DISPLAY_LIMIT: encoded PNG exceeds the remaining display budget")
+        return super().write(data)
+
+    def truncate(self, size=None):
+        if (self.tell() if size is None else size) > self.limit:
+            raise ValueError("EVAL_DISPLAY_LIMIT: encoded PNG exceeds the remaining display budget")
+        return super().truncate(size)
+
+
+def _loaded_instance(value, module_name, class_name):
+    module = sys.modules.get(module_name)
+    kind = getattr(module, class_name, None) if module is not None else None
+    return isinstance(kind, type) and isinstance(value, kind)
+
+
+def _scientific_representation(value, byte_budget):
+    # Consult modules already imported by the user. A plain cell does not load
+    # scientific packages, probe the network or install optional dependencies.
+    if _loaded_instance(value, "PIL.Image", "Image"):
+        _display_dimensions(*value.size)
+        with _DisplayPngBuffer(byte_budget) as target:
+            value.save(target, format="PNG")
+            return "image/png", target.getvalue()
+    if _loaded_instance(value, "matplotlib.figure", "Figure"):
+        width, height = value.get_size_inches() * value.dpi
+        _display_dimensions(width, height)
+        with _DisplayPngBuffer(byte_budget) as target:
+            # Ignore savefig DPI/tight-bbox defaults that could enlarge the
+            # raster beyond preflight. Agg renders without changing the user's
+            # chosen interactive canvas. Artist callbacks remain guest code.
+            value.savefig(target, format="PNG", dpi=value.dpi, backend="agg",
+                          bbox_inches=value.bbox_inches.frozen(), pad_inches=0)
+            return "image/png", target.getvalue()
+    table = value
+    series = _loaded_instance(value, "pandas", "Series")
+    if series:
+        table = value.to_frame()
+    if series or _loaded_instance(value, "pandas", "DataFrame"):
+        # A bounded text view preserves NaN/timestamps/index labels without
+        # pretending they are JSON or requiring optional HTML/tabulate engines.
+        text = table.to_string(max_rows=40, min_rows=20, max_cols=12,
+                               max_colwidth=80, show_dimensions=True)
+        return "text/plain", (
+            "Pandas preview (up to 40 rows, 12 columns; values up to 80 characters):\n" + text
+        )
+    return None
+
+
+_RICH_DISPLAY_MIMES = ("image/png", "application/json", "text/markdown", "text/plain")
+_PLAIN_DISPLAY_TYPES = (str, int, float, bool, type(None), list, tuple, dict)
+
+
+def _rich_representation(value, byte_budget):
+    """Ask a top-level object for one supported representation, never HTML.
+
+    Formatters are guest Python code, not a sandbox or a serializer for nested
+    objects. Exceptions propagate; invalid advertised data is not silently
+    replaced by a weaker representation. The ordinary frame validator remains
+    the only path from a formatter to the wire.
+    """
+    if type(value) in _PLAIN_DISPLAY_TYPES:
+        return None
+    scientific = _scientific_representation(value, byte_budget)
+    if scientific is not None:
+        return scientific
+    bundle_hook = getattr(value, "_repr_mimebundle_", None)
+    if callable(bundle_hook):
+        bundle = bundle_hook(include=list(_RICH_DISPLAY_MIMES), exclude=[])
+        if type(bundle) is tuple and len(bundle) == 2 and type(bundle[1]) is dict:
+            bundle = bundle[0]  # Notebook metadata is not a host instruction.
+        if bundle is not None:
+            if type(bundle) is not dict or len(bundle) > 32:
+                raise TypeError("EVAL_DISPLAY_BUNDLE: expected at most 32 MIME entries")
+            for mime in _RICH_DISPLAY_MIMES:
+                if mime in bundle and (bundle[mime] is not None or mime == "application/json"):
+                    return mime, bundle[mime]
+    for mime, name in (("image/png", "_repr_png_"),
+                       ("application/json", "_repr_json_"),
+                       ("text/markdown", "_repr_markdown_")):
+        hook = getattr(value, name, None)
+        if callable(hook):
+            data = hook()
+            if data is None:
+                continue  # A hook may explicitly decline this representation.
+            if type(data) is tuple and len(data) == 2 and type(data[1]) is dict:
+                data = data[0]
+            return mime, data
+    return None
 
 
 class _DisplaySink:
@@ -252,14 +362,41 @@ class _DisplaySink:
         self.bytes = 0
         self.active = True
         self.thread = threading.get_ident()
+        self.formatting = False
 
-    def append(self, value, mime):
-        if not self.active or threading.get_ident() != self.thread:
+    def check_available(self):
+        output = _OUTPUT_CONTEXT.get()
+        if (not self.active or threading.get_ident() != self.thread
+                or _DISPLAY_CONTEXT.get() is not self
+                or output is None or not output.active):
             raise RuntimeError("EVAL_DISPLAY_CLOSED: display belongs to an inactive cell")
+        if self.formatting:
+            raise RuntimeError("EVAL_DISPLAY_REENTRANT: a formatter cannot call display recursively")
         if len(self.frames) >= _MAX_DISPLAYS:
             raise ValueError("EVAL_DISPLAY_LIMIT: at most 32 displays per cell")
+
+    def append_result(self, value):
+        # Preserve ordinary REPL repr semantics, including large integers and
+        # containers. Only objects with rich representations become displays.
+        if type(value) in _PLAIN_DISPLAY_TYPES:
+            return False
+        return self.append(value, None, rich_only=True)
+
+    def append(self, value, mime, *, rich_only=False):
+        self.check_available()  # Refuse stale/threaded calls BEFORE guest hooks.
         if mime is None:
-            mime = "text/plain" if type(value) is str else "application/json"
+            self.formatting = True
+            try:
+                representation = _rich_representation(value, _MAX_DISPLAY_BYTES - self.bytes)
+            finally:
+                self.formatting = False
+            if representation is not None:
+                mime, value = representation
+            elif rich_only:
+                return False
+            else:
+                mime = "text/plain" if type(value) is str else "application/json"
+        self.check_available()
         if mime == "image/png":
             data = _display_png(value)
         elif mime in ("text/plain", "text/markdown"):
@@ -291,10 +428,16 @@ class _DisplaySink:
         # host compares that collection with the live prefix before reuse.
         self.frames.append(snapshot)
         self.bytes += size
+        return True
 
 
 def display(value, *, mime=None):
-    """Capture explicit JSON, text, Markdown or PNG output for this cell."""
+    """Capture JSON/text/PNG or a top-level object's supported rich output.
+
+    Explicit mime bypasses representation hooks and validates the supplied
+    value directly. Omitted mime permits synchronous notebook-style hooks;
+    HTML, SVG, external URLs and arbitrary object serialization stay disabled.
+    """
     sink = _DISPLAY_CONTEXT.get()
     if sink is None:
         raise RuntimeError("EVAL_DISPLAY_CLOSED: no active cell")
@@ -637,6 +780,8 @@ async def _execute_cell(code, displays, output):
         # awaitable that happens to be the final value (normal REPL semantics).
         if expression.co_flags & inspect.CO_COROUTINE:
             value = await value
+        if value is not None and displays.append_result(value):
+            return True, None, None
         return True, _result_text(value) if value is not None else None, None
     except ModuleNotFoundError:
         return False, None, _error_text() + (
