@@ -37,6 +37,69 @@ lifecycle commands, `handle_dialog`, uploads, downloads, and exports reject
 this option before connecting. Existing calls without the option are unchanged.
 The explicitly simulated backend cannot manufacture these diagnostics.
 
+## Network failures and redirects
+
+Add `"network": true` inside `diagnostics` to also observe request lifecycles:
+
+```json
+{
+  "action": "click",
+  "tab": "app",
+  "selector": "#save",
+  "diagnostics": {"network": true, "settle_ms": 1000},
+  "timeout_ms": 30000
+}
+```
+
+`Network.enable` runs on the same attached connection before the click. It does
+not intercept requests, disable caching, change cookies, fetch response bodies,
+or retry failures. This option defaults to false; ordinary console capture does
+not enable Network or retain unsolicited network events. Console capture remains
+enabled when network capture is requested.
+
+`details.diagnostics.network.requests` contains a bounded tail of request hops
+in observed start order. Each has a local `sequence`, sanitized URL, method,
+resource type, start timestamp and state. Responses add HTTP status, MIME type,
+protocol and cache/service-worker flags when supplied. Loading completion or
+failure adds elapsed milliseconds calculated from the browser's monotonic
+timestamps, optional encoded byte count or a bounded Chromium `net::ERR_*` code,
+blocked/CORS reason and cancellation flag. Unknown fields remain absent or null;
+no response size, time, status or successful completion is invented.
+
+**A completed HTTP 503 is not the same as a failed connection.** The former has
+`state: "completed"` and a response status; the latter has `state: "failed"`
+and, when supplied, an error code such as `net::ERR_CONNECTION_REFUSED`. These
+application/network failures are diagnostic data and do not change a successful
+click into a transport-level tool failure. Inspect the request records as well
+as the action result.
+
+Redirects reuse CDP request IDs but produce separate records linked with
+`redirect_from`. Each successor is independently checked against the main-frame
+and domain policy. A forbidden successor is omitted rather than inheriting the
+old hop's admission. A first-seen redirect reports `redirect_start_missing` when
+the preceding hop was not observed. Responses without an admitted start, wrong
+frame/URL responses, backward timestamps and ambiguous repeated starts cannot
+fabricate a new successful request. Invalid and filtered events are counted.
+
+Only admitted main-frame requests are retained. Child-frame and worker traffic,
+non-web URLs and requests whose starts predate this connection are not a complete
+network history. `complete_history` is always false. This is not a HAR export,
+body inspector, profiler, persistent request log, or network-idle detector.
+
+Network retention has its own `max_events`/64-KiB latest-hop budget and a maximum
+of 1024 remembered request identities per call. Eviction does not permit an old
+identity to be rebound. At the identity ceiling new IDs are refused and reported
+as `admission_stopped`, without interfering with the action. Pending or merely
+responded requests stay pending at window end; `pending_at_end` counts those still
+retained, not all browser traffic. `truncated`, dropped counts and field-shortening
+flags make incomplete output visible. URL path shortening is flagged after URL
+normalization and query/fragment removal.
+
+Request/response headers, cookies, post data, bodies, extra-info events, initiator
+objects and arbitrary network error prose are never copied into this report.
+URL queries/fragments are removed, not hashed. URL paths and console text can
+still contain application secrets; the existing opt-in warning applies.
+
 ## Results and failures
 
 `details.diagnostics` is structured `pi.browser.diagnostics.v1` data. The same
@@ -91,7 +154,11 @@ Capture state belongs to one operation. Socket closure retires its inspector
 handles and subscriptions. There is no background reader, cross-call console
 store, persistent subscription, disk archive, or automatic action replay.
 
-Unit regressions live in `src/browser/cdp/diagnostics.rs`. Native acceptance
+Unit regressions live in `src/browser/cdp/diagnostics.rs` and its `network` module.
+`tests/browser_diagnostics.rs` exercises the public tool against a bounded
+HTTP/WebSocket protocol peer: capture-before-action ordering, success/failure,
+passive observation, setup refusal, scope loss, network opt-out and post-action
+events. It is a protocol fixture, not a live Chromium test. Native acceptance
 requires the repository's authoritative command:
 
 ```text

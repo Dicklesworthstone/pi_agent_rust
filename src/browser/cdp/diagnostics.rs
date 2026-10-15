@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
+mod network;
+
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_CONTEXTS: usize = 64;
 const MAX_ARGUMENTS: usize = 8;
@@ -20,6 +22,7 @@ const MAX_FIELD_BYTES: usize = 2048;
 pub(super) struct Options {
     settle_ms: u64,
     max_events: usize,
+    network: bool,
 }
 
 impl Options {
@@ -36,7 +39,7 @@ impl Options {
         })?;
         if options
             .keys()
-            .any(|key| !matches!(key.as_str(), "settle_ms" | "max_events"))
+            .any(|key| !matches!(key.as_str(), "settle_ms" | "max_events" | "network"))
         {
             return Err(Error::tool("browser", "unknown diagnostics option"));
         }
@@ -56,9 +59,13 @@ impl Options {
         let settle_ms = integer("settle_ms", 250, 0, 10_000)?;
         let max_events = usize::try_from(integer("max_events", 100, 1, 200)?)
             .map_err(|_| Error::tool("browser", "invalid diagnostics event limit"))?;
+        let network = options.get("network").map_or(Ok(false), |value| {
+            value.as_bool().ok_or_else(|| Error::tool("browser", "diagnostics.network must be a boolean"))
+        })?;
         Ok(Some(Self {
             settle_ms,
             max_events,
+            network,
         }))
     }
 }
@@ -204,6 +211,7 @@ pub(super) struct Capture {
     phase: &'static str,
     action_started: bool,
     scope_lost: bool,
+    network: Option<network::Trace>,
 }
 
 impl Capture {
@@ -240,6 +248,7 @@ impl Capture {
             phase: "setup",
             action_started: false,
             scope_lost: false,
+            network: options.network.then(|| network::Trace::new(options.max_events)),
         })
     }
 
@@ -289,6 +298,9 @@ impl Capture {
     pub(super) fn observe(&mut self, event: &Value) {
         if event["sessionId"].as_str() != Some(self.session.as_str()) {
             return;
+        }
+        if !self.scope_lost && let Some(network) = self.network.as_mut() {
+            network.observe(event, &self.main_frame, self.allowlist.as_deref(), self.phase);
         }
         let params = &event["params"];
         match event["method"].as_str().unwrap_or_default() {
@@ -395,17 +407,23 @@ impl Capture {
     }
 
     fn report(self, completion: &str, action_succeeded: bool) -> Value {
-        json!({
+        let network = self.network.map(network::Trace::report);
+        let network_truncated = network.as_ref().is_some_and(|report| report["truncated"] == true);
+        let mut report = json!({
             "schema": "pi.browser.diagnostics.v1", "scope": "main_document",
             "action_started": self.action_started, "action_succeeded": action_succeeded,
             "completion": completion, "scope_lost": self.scope_lost,
-            "truncated": self.dropped > 0 || self.fields_truncated,
+            "truncated": self.dropped > 0 || self.fields_truncated || network_truncated,
             "fields_truncated": self.fields_truncated, "dropped_console_events": self.dropped,
             "filtered_console_events": self.filtered,
             "console_may_include_buffered": true,
             "settle_ms": self.options.settle_ms, "max_events": self.options.max_events,
             "console": self.logs.into_iter().map(|(record, _)| record).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(network) = network {
+            report["network"] = network;
+        }
+        report
     }
 }
 
@@ -425,6 +443,14 @@ pub(super) async fn start(
     cdp.diagnostics = Some(capture);
     cdp.command(owner, "Page.enable", json!({})).await?;
     cdp.command(owner, "Runtime.enable", json!({})).await?;
+    if options.network {
+        cdp.command(owner, "Network.enable", json!({
+            "maxTotalBufferSize": 65536, "maxResourceBufferSize": 16384, "maxPostDataSize": 0
+        })).await?;
+    }
+    if cdp.diagnostics.as_ref().is_some_and(|capture| capture.scope_lost) {
+        return Err(Error::tool("browser", "main-document scope changed during diagnostic setup; action was not started"));
+    }
     Ok(())
 }
 
@@ -520,7 +546,7 @@ mod tests {
 
     fn capture(max_events: usize) -> Capture {
         Capture::new(
-            Options { settle_ms: 0, max_events }, "page-session".into(),
+            Options { settle_ms: 0, max_events, network: false }, "page-session".into(),
             &json!({"id":"main-frame","url":"https://example.com/app"}),
             Some(&["example.com".to_string()]),
         ).unwrap()
@@ -556,6 +582,7 @@ mod tests {
             json!({"action":"diagnostics","tab":"app","diagnostics":{"settle_ms":10001}}),
             json!({"action":"diagnostics","tab":"app","diagnostics":{"settle_ms":1.5}}),
             json!({"action":"diagnostics","tab":"app","diagnostics":{"future":true}}),
+            json!({"action":"diagnostics","tab":"app","diagnostics":{"network":"true"}}),
         ] {
             assert!(validate(&args).is_err(), "{args}");
         }

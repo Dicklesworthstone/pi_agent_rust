@@ -161,7 +161,8 @@ impl Tool for BrowserTool {
          structured option selection and checked-state control, frame discovery and frame-scoped \
          inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
          Attach diagnostics to an action to capture console output and uncaught exceptions before \
-         and after it, or use action:diagnostics to observe an explicit tab without triggering work. \
+         and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
+         Use action:diagnostics to observe an explicit tab without triggering work. \
          start launches or attaches; status never launches; stop only stops a Pi-owned browser. \
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts."
     }
@@ -191,6 +192,7 @@ impl Tool for BrowserTool {
                     "type": "object", "additionalProperties": false,
                     "description": "Opt-in native console/exception capture around a main-document action, or options for action:diagnostics. Requires an explicit tab. Records only admitted main-world contexts; includes buffered console entries when Chromium supplies them. Object previews/getters are never read. Free-form console text can contain application secrets. Bounded latest records appear in details.diagnostics and text; failures remain errors and work is never replayed. Unsupported with frame, lifecycle, handle_dialog, uploads, downloads or exports. No persistent/background subscription.",
                     "properties": {
+                        "network": {"type":"boolean","default":false,"description":"Also capture admitted main-frame HTTP request hops, responses, redirects and loading failures on this connection. Query/fragment fields, headers, cookies and bodies are omitted; no interception, response-body fetch or network-idle guarantee. Pending requests remain pending at capture end. max_events also bounds a separate 64-KiB latest request tail."},
                         "settle_ms": {"type":"integer","minimum":0,"maximum":10000,"default":250,"description":"Fixed receive window after success; shares timeout_ms, never extends it. 0 stops at action completion. Not a network-idle guarantee."},
                         "max_events": {"type":"integer","minimum":1,"maximum":200,"default":100,"description":"Maximum latest console records, also bounded to 64 KiB; dropped records are counted."}
                     }
