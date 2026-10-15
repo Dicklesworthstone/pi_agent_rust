@@ -17,6 +17,7 @@ use std::process::{ChildStdin, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod bridge_io;
 mod display;
 mod js_kernel;
 mod lifecycle;
@@ -491,7 +492,10 @@ impl EvalTool {
                 transport::validate_bridge_owner(&parsed, id, line.len())?;
                 capture.publish(true);
                 session_guard.check_tool().await?;
-                let reply = self.run_bridge_call(bridge).await;
+                let reply = bridge_io::wait_python(
+                    &kernel.lines, id, deadline, capture, session_guard,
+                    self.run_bridge_call(bridge),
+                ).await?;
                 session_guard.check_tool().await?;
                 let line = json!({"bridge_result": reply}).to_string();
                 kernel
