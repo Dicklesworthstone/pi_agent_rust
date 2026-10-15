@@ -235,6 +235,7 @@ fn reject_gitlinks(records: &[u8]) -> Result<()> {
 pub(super) struct Snapshot {
     pub(super) baseline: String,
     scratch: Scratch,
+    checkout_mode: sparse::CheckoutMode,
 }
 
 impl Snapshot {
@@ -257,8 +258,10 @@ impl Snapshot {
         }
         let mut hook_setting = std::ffi::OsString::from("core.hooksPath=");
         hook_setting.push(self.scratch.root.join("hooks"));
+        self.checkout_mode.require_current(repo)?;
         run(
             command(repo)
+                .args(["-c", "core.sparseCheckout=false", "-c", "index.sparse=false"])
                 .arg("-c")
                 .arg(hook_setting)
                 .args(["worktree", "add", "-b", branch])
@@ -266,6 +269,8 @@ impl Snapshot {
                 .arg(&self.baseline),
             "create isolated checkout",
         )?;
+        self.checkout_mode.configure_child(path)?;
+        self.checkout_mode.require_current(repo)?;
         Ok(())
     }
 }
@@ -274,24 +279,7 @@ impl Snapshot {
 /// Seed from its index, not HEAD, so newly tracked ignored files and staged
 /// additions remain tracked. Refresh only the private index from the filesystem.
 pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
-    let sparse = command(repo)
-        .args(["config", "--bool", "core.sparseCheckout"])
-        .output()
-        .map_err(|error| {
-            failure(
-                "PI_ISO_SNAPSHOT",
-                &format!("Cannot inspect checkout mode: {error}"),
-            )
-        })?;
-    if sparse.status.success() && sparse.stdout.starts_with(b"true") {
-        return Err(failure(
-            "PI_ISO_SPARSE_UNSUPPORTED",
-            "Sparse checkouts require an explicit full checkout before isolation",
-        ));
-    }
-    if !sparse.status.success() && sparse.status.code() != Some(1) {
-        return Err(failure("PI_ISO_SNAPSHOT", "Cannot inspect checkout mode"));
-    }
+    let checkout_mode = sparse::CheckoutMode::read(repo)?;
     let head = object_id(&run(
         command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
         "resolve parent commit",
@@ -364,7 +352,8 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         ));
     }
     skipped.verify_source(repo, &scratch)?;
-    Ok(Snapshot { baseline, scratch })
+    checkout_mode.require_current(repo)?;
+    Ok(Snapshot { baseline, scratch, checkout_mode })
 }
 
 #[cfg(test)]

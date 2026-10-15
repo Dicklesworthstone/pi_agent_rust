@@ -15,9 +15,9 @@ fn repository() -> tempfile::TempDir {
 
 fn index_only(repo: &Path, name: &std::ffi::OsStr, mode: &str) -> String {
     let oid = object_id(&run(command(repo).args(["rev-parse", "HEAD:base.txt"]), "blob").unwrap()).unwrap();
-    let mut entry = std::ffi::OsString::from(format!("--cacheinfo={mode},{oid},"));
+    let mut entry = std::ffi::OsString::from(format!("{mode},{oid},"));
     entry.push(name);
-    run(command(repo).args(["update-index", "--add"]).arg(entry), "index-only fixture").unwrap();
+    run(command(repo).args(["update-index", "--add", "--cacheinfo"]).arg(entry), "index-only fixture").unwrap();
     run(command(repo).args(["update-index", "--skip-worktree", "--"]).arg(name), "skip fixture").unwrap();
     oid
 }
@@ -124,4 +124,150 @@ fn excluded_paths_do_not_follow_intermediate_symlinks() {
     std::os::unix::fs::symlink(other.path(), repo.path().join("link")).unwrap();
     assert!(absent(repo.path(), b"link/absent.txt").is_err());
     assert!(!absent(repo.path(), b"link").unwrap());
+}
+
+fn configure_sparse(repo: &Path, cone: bool, sparse_index: bool) {
+    run(command(repo).args(["config", "extensions.worktreeConfig", "true"]), "worktree config").unwrap();
+    for (key, value) in [
+        ("core.sparseCheckout", "true"),
+        ("core.sparseCheckoutCone", if cone { "true" } else { "false" }),
+        ("index.sparse", if sparse_index { "true" } else { "false" }),
+    ] {
+        run(command(repo).args(["config", "--worktree", key, value]), "sparse fixture mode").unwrap();
+    }
+    let info = repository_path(repo, "--absolute-git-dir").unwrap().join("info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(info.join("sparse-checkout"), if cone {
+        "/*\n!/*/\n/included/\n"
+    } else {
+        "/*\n!/excluded/\n"
+    }).unwrap();
+    if sparse_index {
+        // Rebuild the same staged tree without -u; no working files are removed.
+        let tree = object_id(&run(command(repo).arg("write-tree"), "staged tree").unwrap()).unwrap();
+        run(command(repo).args(["read-tree", "-m", &tree]), "compress fixture index").unwrap();
+        let entries = run(command(repo).args(["ls-files", "--sparse", "--stage", "-z"]), "check sparse index").unwrap();
+        assert!(entries.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"040000 ")));
+    }
+}
+
+#[test]
+fn sparse_sources_create_full_children_without_expanding_or_reconfiguring_the_parent() {
+    for (cone, sparse_index) in [(true, false), (false, false), (true, true)] {
+        let repo = repository();
+        index_only(repo.path(), std::ffi::OsStr::new("excluded/kept.txt"), "100644");
+        fs::write(repo.path().join("base.txt"), b"staged parent\n").unwrap();
+        run(command(repo.path()).args(["add", "--", "base.txt"]), "staged parent").unwrap();
+        configure_sparse(repo.path(), cone, sparse_index);
+        fs::write(repo.path().join("base.txt"), b"unstaged parent\n").unwrap();
+        let admin = repository_path(repo.path(), "--absolute-git-dir").unwrap();
+        let index = fs::read(admin.join("index")).unwrap();
+        let common = fs::read(admin.join("config")).unwrap();
+        let local = fs::read(admin.join("config.worktree")).unwrap();
+        let head = run(command(repo.path()).args(["rev-parse", "HEAD"]), "head").unwrap();
+        let snapshot = capture(repo.path(), "sparse-full").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        snapshot.checkout(repo.path(), &child, "sparse-full-child").unwrap();
+        assert_eq!(fs::read(child.join("excluded/kept.txt")).unwrap(), b"base\n");
+        assert_eq!(fs::read(child.join("base.txt")).unwrap(), b"unstaged parent\n");
+        assert!(run(command(&child).args(["status", "--porcelain"]), "child status").unwrap().is_empty());
+        assert!(!configured_bool(&child, "core.sparseCheckout").unwrap());
+        assert!(!configured_bool(&child, "index.sparse").unwrap());
+        assert_eq!(fs::read(admin.join("index")).unwrap(), index);
+        assert_eq!(fs::read(admin.join("config")).unwrap(), common);
+        assert_eq!(fs::read(admin.join("config.worktree")).unwrap(), local);
+        assert_eq!(run(command(repo.path()).args(["rev-parse", "HEAD"]), "head").unwrap(), head);
+        assert!(!repo.path().join("excluded").exists());
+        assert!(configured_bool(repo.path(), "core.sparseCheckout").unwrap());
+    }
+}
+
+#[test]
+fn linked_sparse_source_keeps_its_own_index_and_configuration() {
+    let repo = repository();
+    let outer = tempfile::tempdir().unwrap();
+    let source = outer.path().join("source");
+    run(command(repo.path()).args(["worktree", "add", "--no-checkout", "-b", "linked-source"])
+        .arg(&source).arg("HEAD"), "linked source").unwrap();
+    run(command(&source).args(["read-tree", "HEAD"]), "seed linked index").unwrap();
+    run(command(&source).args(["checkout-index", "--", "base.txt"]), "materialize base").unwrap();
+    index_only(&source, std::ffi::OsStr::new("excluded/kept.txt"), "100644");
+    configure_sparse(&source, true, true);
+    let source_admin = repository_path(&source, "--absolute-git-dir").unwrap();
+    let main_admin = repository_path(repo.path(), "--absolute-git-dir").unwrap();
+    let source_index = fs::read(source_admin.join("index")).unwrap();
+    let source_config = fs::read(source_admin.join("config.worktree")).unwrap();
+    let main_index = fs::read(main_admin.join("index")).unwrap();
+    let main_config = fs::read(main_admin.join("config")).unwrap();
+    let snapshot = capture(&source, "linked-sparse").unwrap();
+    let child = outer.path().join("child");
+    snapshot.checkout(&source, &child, "linked-sparse-child").unwrap();
+    assert_eq!(fs::read(child.join("excluded/kept.txt")).unwrap(), b"base\n");
+    assert_eq!(fs::read(source_admin.join("index")).unwrap(), source_index);
+    assert_eq!(fs::read(source_admin.join("config.worktree")).unwrap(), source_config);
+    assert_eq!(fs::read(main_admin.join("index")).unwrap(), main_index);
+    assert_eq!(fs::read(main_admin.join("config")).unwrap(), main_config);
+    assert!(configured_bool(&source, "core.sparseCheckout").unwrap());
+    assert!(!configured_bool(&child, "core.sparseCheckout").unwrap());
+}
+
+#[test]
+fn legacy_shared_sparse_config_and_mode_changes_are_refused_before_checkout() {
+    let repo = repository();
+    run(command(repo.path()).args(["config", "core.sparseCheckout", "true"]), "legacy config").unwrap();
+    assert!(CheckoutMode::read(repo.path()).unwrap_err().to_string().contains("PI_ISO_SPARSE_UNSUPPORTED"));
+    configure_sparse(repo.path(), true, false);
+    let snapshot = capture(repo.path(), "mode-change").unwrap();
+    run(command(repo.path()).args(["config", "--worktree", "core.sparseCheckout", "false"]), "change mode").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let child = directory.path().join("never-created");
+    assert!(snapshot.checkout(repo.path(), &child, "never-created").is_err());
+    assert!(!child.exists());
+}
+
+#[test]
+fn child_configuration_never_falls_back_to_shared_config_when_extension_is_missing() {
+    let repo = repository();
+    let config = repository_path(repo.path(), "--absolute-git-dir").unwrap().join("config");
+    let before = fs::read(&config).unwrap();
+    let mode = CheckoutMode { sparse: true, worktree_config: true };
+    assert!(mode.configure_child(repo.path()).is_err());
+    assert_eq!(fs::read(config).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn public_subagent_runs_with_excluded_files_and_applies_only_its_materialized_change() {
+    use crate::subagents::SubagentTool;
+    use crate::tools::Tool as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repository();
+    index_only(repo.path(), std::ffi::OsStr::new("excluded/kept.txt"), "100644");
+    configure_sparse(repo.path(), true, true);
+    let admin = repository_path(repo.path(), "--absolute-git-dir").unwrap();
+    let index = fs::read(admin.join("index")).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("child.sh");
+    fs::write(&binary, r#"#!/bin/sh
+set -eu
+test -f excluded/kept.txt
+printf 'delegated change\n' > base.txt
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"done"}]}]}'
+"#).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let tool = SubagentTool::with_paths(repo.path().to_path_buf(), directory.path().join("global"), binary);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 8).build().unwrap();
+    let output = runtime.block_on(tool.execute("sparse-task", serde_json::json!({
+        "agent":"task", "task":"update the included file", "isolation":"worktree", "isoApply":"apply",
+    }), None)).unwrap();
+    assert!(!output.is_error, "{output:?}");
+    let details = output.details.unwrap();
+    assert_eq!(details["results"][0]["iso"]["applied"], true);
+    let patch = details["results"][0]["iso"]["patch"].as_str().unwrap();
+    assert!(patch.contains("base.txt"));
+    assert!(!patch.contains("excluded/"));
+    assert_eq!(fs::read(repo.path().join("base.txt")).unwrap(), b"delegated change\n");
+    assert_eq!(fs::read(admin.join("index")).unwrap(), index);
+    assert!(!repo.path().join("excluded").exists());
 }

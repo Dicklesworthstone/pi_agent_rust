@@ -8,9 +8,80 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Component;
 
-use super::{File, Path, PathBuf, Result, Scratch, command, failure, fs, object_id, run};
+use super::{File, Path, PathBuf, Result, Scratch, command, failure, fs, object_id, repository_path, run};
 
 const MAX_SKIPPED_PATHS: usize = 65_536;
+
+/// Modern sparse checkouts use worktree-local configuration. Legacy shared
+/// sparse settings cannot safely be disabled for a child without changing the
+/// parent, so keep refusing that layout instead of migrating user config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CheckoutMode {
+    sparse: bool,
+    worktree_config: bool,
+}
+
+fn configured_bool(repo: &Path, key: &str) -> Result<bool> {
+    let output = command(repo).args(["config", "--bool", "--get", key])
+        .output().map_err(|_| invalid())?;
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    if !output.status.success() {
+        return Err(invalid());
+    }
+    match output.stdout.as_slice() {
+        b"true\n" | b"true\r\n" => Ok(true),
+        b"false\n" | b"false\r\n" => Ok(false),
+        _ => Err(invalid()),
+    }
+}
+
+impl CheckoutMode {
+    pub(super) fn read(repo: &Path) -> Result<Self> {
+        let mode = Self {
+            sparse: configured_bool(repo, "core.sparseCheckout")?,
+            worktree_config: configured_bool(repo, "extensions.worktreeConfig")?,
+        };
+        if mode.sparse && !mode.worktree_config {
+            return Err(failure(
+                "PI_ISO_SPARSE_UNSUPPORTED",
+                "Sparse isolation requires worktree-local configuration; use a modern git sparse-checkout setup or a separate full checkout. Shared source settings were not changed",
+            ));
+        }
+        Ok(mode)
+    }
+
+    pub(super) fn require_current(self, repo: &Path) -> Result<()> {
+        if Self::read(repo)? != self {
+            return Err(failure("PI_ISO_PARENT_CHANGED", "Checkout mode changed during isolation; any created child checkout is retained"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn configure_child(self, child: &Path) -> Result<()> {
+        if self.worktree_config {
+            // Without the extension, --worktree degrades to shared config.
+            // Target the child's exact config file instead, so a concurrent
+            // extension change cannot redirect our write to shared config.
+            if !configured_bool(child, "extensions.worktreeConfig")? {
+                return Err(failure("PI_ISO_PARENT_CHANGED", "Worktree-local configuration became unavailable; child retained without launching"));
+            }
+            let config = repository_path(child, "--absolute-git-dir")?.join("config.worktree");
+            for key in ["core.sparseCheckout", "index.sparse"] {
+                run(command(child).args(["config", "--file"]).arg(&config).args([key, "false"]),
+                    "configure the isolated child as a full checkout")?;
+            }
+        }
+        if configured_bool(child, "core.sparseCheckout")?
+            || (self.worktree_config && (!configured_bool(child, "extensions.worktreeConfig")?
+                || configured_bool(child, "index.sparse")?))
+        {
+            return Err(failure("PI_ISO_INDEX_STATE", "Child checkout is not full; child retained without launching"));
+        }
+        Ok(())
+    }
+}
 
 fn invalid() -> crate::error::Error {
     failure("PI_ISO_INDEX_STATE", "Cannot preserve bounded skip-worktree index state")
