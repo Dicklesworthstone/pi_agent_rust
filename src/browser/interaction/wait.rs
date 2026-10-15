@@ -15,6 +15,8 @@ use crate::browser::{output, required};
 use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
 
+pub(super) mod navigation;
+
 const PROBE: &str = include_str!("wait.js");
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -116,6 +118,9 @@ impl Condition {
 /// Reject ignored or malformed wait options before native connection/input.
 /// The boolean selects native-only behavior in the explicit fixture backend.
 pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
+    if args.get("navigation").is_some() {
+        return Err(usage());
+    }
     let configured = ["state", "text_match", "stable_ms"].iter()
         .any(|field| args.get(*field).is_some());
     if args.get("action").and_then(Value::as_str) != Some("wait_for") {
@@ -135,34 +140,42 @@ pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
     Ok(configured || args.get("text").is_some())
 }
 
-/// A same-document postcondition on a single admitted input operation. Field
+/// A postcondition on a single admitted input operation. Field
 /// shape, scope and budget are validated before input. Selector syntax and
 /// matching that require a live document are checked by the subsequent wait.
 pub(super) fn after_condition(args: &Value) -> Result<Option<Value>> {
     let Some(after) = args.get("wait_after") else {
         return Ok(None);
     };
-    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/type/fill/press and accepts only selector, state, text, text_match and stable_ms; tab/frame/deadline are inherited; dialog_response cannot be combined");
+    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/type/fill/press and accepts selector, state, text, text_match, stable_ms and explicit navigation; tab/frame/deadline are inherited; dialog_response cannot be combined");
     if !matches!(args.get("action").and_then(Value::as_str), Some("click" | "type" | "fill" | "press"))
         || args.get("dialog_response").is_some()
     {
         return Err(invalid());
     }
     let fields = after.as_object().ok_or_else(invalid)?;
-    if fields.keys().any(|key| !matches!(key.as_str(), "selector" | "state" | "text" | "text_match" | "stable_ms")) {
+    if fields.keys().any(|key| !matches!(key.as_str(), "selector" | "state" | "text" | "text_match" | "stable_ms" | "navigation")) {
         return Err(invalid());
     }
+    let navigates = navigation::validate(args, after)?;
     let mut condition = after.clone();
     condition["action"] = json!("wait_for");
-    Condition::parse(&condition)?;
+    if condition.get("selector").is_some() || !navigates {
+        Condition::parse(&condition)?;
+    } else if ["state", "text", "text_match", "stable_ms"].iter()
+        .any(|key| condition.get(*key).is_some())
+    {
+        return Err(invalid());
+    }
     Ok(Some(condition))
 }
 
 pub(in crate::browser) fn after_schema() -> Value {
     json!({
-        "type":"object","required":["selector"],"additionalProperties":false,
-        "description":"click/type/fill/press only: run the input once, then await this same-document condition on the original connection and timeout_ms. Inherits tab/frame; no independent deadline. Navigation fails, never retargets. Already-satisfied conditions are allowed; causality is not proven. A failed or timed-out wait does not undo or replay the action. Unsupported with dialog_response.",
+        "type":"object","anyOf":[{"required":["selector"]},{"required":["navigation"]}],"additionalProperties":false,
+        "description":"Run input once, then wait under its original connection, conversation and timeout. Default: same-document selector condition. Explicit navigation names an exact same-origin destination for a single unmodified left click or keypress on an explicit tab; optional selector/text then checks that destination. No extra time, replay or implicit dialog consent; causality is not proven.",
         "properties":{
+            "navigation":navigation::schema(),
             "selector":{"type":"string","minLength":1,"maxLength":65536},
             "state":{"type":"string","enum":["visible","hidden","attached","detached"],"default":"visible"},
             "text":{"type":"string","minLength":1,"maxLength":16384},
@@ -180,14 +193,18 @@ pub(super) fn after_result(mut action: ToolOutput, readiness: Result<ToolOutput>
         Ok(observed) if !observed.is_error => (json!({
             "satisfied":true,"observation":observed.details,
             "action_replayed":false,"causality_verified":false,
-        }), "Post-action wait satisfied on the original document. The action was not replayed; this observation does not prove that the action caused the state."),
+        }), "Post-action wait satisfied within the explicitly requested document scope. The action was not replayed; this observation does not prove that the action caused the state."),
         other => {
             action.is_error = true;
             // Never copy arbitrary page/protocol exception content into a new
             // report. Known categories retain actionable diagnosis only.
             let message = other.err().map(|error| error.to_string()).unwrap_or_default();
-            let kind = if message.contains("BROWSER_WAIT_STALE") {
+            let kind = if message.contains("BROWSER_WAIT_STALE") || message.contains("BROWSER_NAVIGATION_STALE") {
                 "document_changed"
+            } else if message.contains("BROWSER_NAVIGATION_SCOPE") {
+                "navigation_scope"
+            } else if message.contains("BROWSER_NAVIGATION_FAILED") {
+                "navigation_failed"
             } else if message.contains("BROWSER_SELECTOR_AMBIGUOUS") {
                 "ambiguous_selector"
             } else if message.contains("BROWSER_WAIT_LIMIT") {
@@ -314,9 +331,10 @@ pub(super) async fn execute(
     args: &Value,
 ) -> Result<ToolOutput> {
     let expected = document(owner, cdp).await?;
-    execute_pinned(owner, cdp, tab, refs, args, &expected).await
+    execute_pinned(owner, cdp, tab, refs, args, &expected, None).await
 }
 
+#[allow(clippy::too_many_arguments)] // One polling path, optionally constrained to a destination URL.
 pub(super) async fn execute_pinned(
     owner: &AgentCx,
     cdp: &mut Cdp,
@@ -324,6 +342,7 @@ pub(super) async fn execute_pinned(
     refs: Option<&References>,
     args: &Value,
     expected: &Document,
+    destination: Option<&navigation::Destination<'_>>,
 ) -> Result<ToolOutput> {
     let condition = Condition::parse(args)?;
     let selector = required(args, "selector")?;
@@ -332,12 +351,15 @@ pub(super) async fn execute_pinned(
     let mut samples = 0_u64;
     loop {
         check_document(owner, cdp, expected).await?;
+        if let Some(destination) = destination { destination.verify(owner, cdp).await?; }
         let id = resolve(owner, cdp, selector, refs).await?;
+        if let Some(destination) = destination { destination.verify(owner, cdp).await?; }
         let observed = match id {
             Some(id) => observe(owner, cdp, expected, id, &condition).await?,
             None => Observation::absent(condition.text.is_some()),
         };
         check_document(owner, cdp, expected).await?;
+        if let Some(destination) = destination { destination.verify(owner, cdp).await?; }
         samples = samples.saturating_add(1);
         let identity = if observed.attached { id } else { None };
         if stability.sample(identity, condition.matches(&observed), started.elapsed(), condition.stable) {

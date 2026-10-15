@@ -331,14 +331,18 @@ pub(super) async fn execute(
     let Some(condition) = wait::after_condition(args)? else {
         return execute_input(owner, cdp, tab, refs, args).await;
     };
-    // Pin before the trigger. A later navigation cannot authorize observing
-    // a replacement document, and waiting can never replay this invocation.
+    // Pin before the trigger. Only an explicit same-origin destination can
+    // authorize observing a replacement document; waiting never replays input.
     let expected = document(owner, cdp).await?;
+    let navigation = wait::navigation::prepare(owner, cdp, &condition, &expected).await?;
     let result = execute_input(owner, cdp, tab, refs, args).await?;
     if result.is_error {
         return Ok(result);
     }
-    let readiness = wait::execute_pinned(owner, cdp, tab, refs, &condition, &expected).await;
+    let readiness = match navigation {
+        Some(navigation) => navigation.finish(owner, cdp, tab, &condition).await,
+        None => wait::execute_pinned(owner, cdp, tab, refs, &condition, &expected, None).await,
+    };
     Ok(wait::after_result(result, readiness))
 }
 

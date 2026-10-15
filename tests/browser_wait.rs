@@ -154,6 +154,27 @@ fn invalid_postconditions_are_rejected_before_any_trigger_or_connection() {
 }
 
 #[test]
+fn navigation_preflight_requires_explicit_bounded_main_tab_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("not-a-CDP-endpoint");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let base = json!({"action":"click","tab":"app","selector":"#continue",
+        "wait_after":{"navigation":{"url":"https://app.example/done"}}});
+    runtime.block_on(async {
+        for (key, value) in [("frame",json!("child")), ("tab",Value::Null),
+            ("button",json!("right")), ("click_count",json!(2)), ("action",json!("type"))] {
+            let mut args = base.clone(); args[key] = value;
+            let error = tool.execute("navigation-preflight", args, None).await.unwrap_err().to_string();
+            assert!(error.contains("BROWSER_NAVIGATION_USAGE"), "{error}");
+            assert!(!error.contains("CDP endpoint"));
+        }
+        let fixture = BrowserTool::new(dir.path()).with_mock(true);
+        assert!(fixture.execute("navigation-native-only", base, None).await.is_err());
+    });
+    log("navigation-preflight", json!({"native_required":true,"invalid_before_connection":5}));
+}
+
+#[test]
 #[ignore = "requires sandbox-capable Chromium; select explicitly through DSR"]
 fn live_postconditions_wait_after_one_input_without_replaying_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -214,13 +235,34 @@ mod wire {
     use std::time::{Duration, Instant};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mode { Ready, Missing, Pending, Malformed, Navigate, Cancelled }
+    enum Mode {
+        Ready, Missing, Pending, Malformed, Navigate, Cancelled,
+        NavDocument, NavHistory, NavReload, NavUnchanged, NavOutside, NavError, NavMismatch, NavCancelled, NavDrift,
+    }
+
+    impl Mode {
+        fn navigation(self) -> bool {
+            matches!(self, Self::NavDocument | Self::NavHistory | Self::NavReload | Self::NavUnchanged |
+                Self::NavOutside | Self::NavError | Self::NavMismatch | Self::NavCancelled | Self::NavDrift)
+        }
+
+        fn frame(self, completed_input: bool) -> Value {
+            let changed = completed_input && self != Self::NavUnchanged;
+            let origin = if changed && self == Self::NavOutside { "https://other.example" } else { "https://app.example" };
+            let path = if !changed || self == Self::NavReload { "/start" } else { "/done" };
+            let loader = if changed && self != Self::NavHistory { "new" } else { "old" };
+            let mut frame = json!({"id":"main","loaderId":loader,"url":format!("{origin}{path}"),"securityOrigin":origin});
+            if self == Self::NavError && changed { frame["unreachableUrl"] = json!("https://app.example/done"); }
+            frame
+        }
+    }
 
     #[derive(Default)]
     struct Seen {
         methods: Vec<String>,
         inputs: Vec<String>,
         observations: usize,
+        readiness_reads: usize,
     }
 
     fn accept(listener: &TcpListener) -> TcpStream {
@@ -320,8 +362,14 @@ mod wire {
                 seen.methods.push(method.into());
                 let result = match method {
                     "Browser.setDownloadBehavior" | "Page.bringToFront" | "Runtime.releaseObject" => json!({}),
-                    "Target.getTargets" => json!({"targetInfos":[{"targetId":"page","type":"page","url":"about:blank","title":"Wait fixture"}]}),
+                    "Target.getTargets" => json!({"targetInfos":[{"targetId":"page","type":"page",
+                        "url":if mode.navigation() {"https://app.example/start"} else {"about:blank"},"title":"Wait fixture"}]}),
                     "Target.attachToTarget" => json!({"sessionId":"session"}),
+                    "Page.getFrameTree" if mode.navigation() => {
+                        let mut frame = mode.frame(seen.inputs.len() >= 2);
+                        if mode == Mode::NavDrift && seen.observations > 0 { frame["url"] = json!("https://app.example/elsewhere"); }
+                        json!({"frameTree":{"frame":frame}})
+                    }
                     "Page.getFrameTree" => json!({"frameTree":{"frame":{
                         "id":"main","loaderId":if mode == Mode::Navigate && !seen.inputs.is_empty() {"new"} else {"old"},"url":"about:blank"
                     }}}),
@@ -338,6 +386,21 @@ mod wire {
                     "Page.createIsolatedWorld" => json!({"executionContextId":7}),
                     "DOM.resolveNode" => json!({"object":{"objectId":format!("node-{}",params["backendNodeId"])}}),
                     "DOM.scrollIntoViewIfNeeded" => json!({}),
+                    "Runtime.evaluate" if mode.navigation() => {
+                        assert!(seen.inputs.len() >= 2, "destination probe must follow input");
+                        assert_eq!(params["contextId"], 7);
+                        assert!(params["expression"].as_str().unwrap().contains("domContentLoadedEventStart"));
+                        seen.readiness_reads += 1;
+                        if mode == Mode::NavCancelled {
+                            cancel.as_ref().unwrap().set_cancel_requested(true);
+                            continue;
+                        }
+                        let address = if mode == Mode::NavMismatch {json!("https://app.example/elsewhere")}
+                            else {mode.frame(true)["url"].clone()};
+                        json!({"result":{"type":"object","value":{"url":address,
+                            "state":if seen.readiness_reads < 3 {"interactive"} else {"complete"},
+                            "domContentLoaded":seen.readiness_reads >= 2,"load":seen.readiness_reads >= 3}}})
+                    }
                     "Runtime.callFunctionOn" => {
                         let options = &params["arguments"][0]["value"];
                         if options == "point" {
@@ -364,7 +427,7 @@ mod wire {
                             json!({"result":{"type":"object","value":value}})
                         }
                     }
-                    "Input.dispatchMouseEvent" => {
+                    "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" => {
                         seen.inputs.push(params["type"].as_str().unwrap().into());
                         json!({})
                     }
@@ -379,7 +442,7 @@ mod wire {
     }
 
     fn run(mode: Mode, args: Value) -> (pi::error::Result<pi::tools::ToolOutput>, Seen) {
-        let owner = (mode == Mode::Cancelled).then(pi::agent_cx::AgentCx::for_request);
+        let owner = matches!(mode, Mode::Cancelled | Mode::NavCancelled).then(pi::agent_cx::AgentCx::for_request);
         let (endpoint, worker) = peer(mode, owner.clone());
         let dir = tempfile::tempdir().unwrap();
         let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
@@ -389,7 +452,7 @@ mod wire {
         } else {
             runtime.block_on(tool.execute("wire-wait",args,None))
         };
-        if mode == Mode::Cancelled {
+        if matches!(mode, Mode::Cancelled | Mode::NavCancelled) {
             // A fresh caller can reacquire both existing ownership lanes and
             // release its retained namespace without another network request.
             let released = runtime.block_on(tool.execute("after-cancel",json!({"action":"release"}),None)).unwrap();
@@ -397,7 +460,7 @@ mod wire {
         }
         drop(tool);
         let seen = worker.join().unwrap();
-        log("wire-traffic",json!({"methods":seen.methods,"inputs":seen.inputs,"observations":seen.observations}));
+        log("wire-traffic",json!({"methods":seen.methods,"inputs":seen.inputs,"observations":seen.observations,"readiness_reads":seen.readiness_reads}));
         (result, seen)
     }
 
@@ -477,5 +540,130 @@ mod wire {
         assert_eq!(details["steps"][0]["details"]["wait_after"]["error_kind"],"document_changed");
         assert_eq!(seen.inputs,vec!["mousePressed","mouseReleased"]);
         assert_eq!(seen.observations,0);
+    }
+
+    fn navigation_call(address: &str, until: &str) -> Value {
+        json!({"action":"click","tab":"page","selector":"#trigger","timeout_ms":5000,
+            "wait_after":{"navigation":{"url":address,"wait_until":until}}})
+    }
+
+    #[test]
+    fn navigation_waits_for_events_then_checks_destination_dom_after_one_input() {
+        let mut args = navigation_call("https://app.example/done", "load");
+        args["wait_after"]["selector"] = json!("#ready");
+        args["wait_after"]["text"] = json!("Ready now");
+        let (result, seen) = run(Mode::NavDocument, args);
+        let result = result.unwrap();
+        assert!(!result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["dispatch_acknowledged"], true);
+        let observed = &details["wait_after"]["observation"];
+        assert_eq!(observed["navigation"]["same_document"], false);
+        assert_eq!(observed["navigation"]["http_success_verified"], false);
+        assert_eq!(observed["textMatched"], true);
+        assert_eq!(seen.readiness_reads, 3);
+        assert_eq!(seen.observations, 3);
+        assert_eq!(seen.inputs, vec!["mousePressed", "mouseReleased"]);
+    }
+
+    #[test]
+    fn history_transitions_and_reload_require_changed_evidence_not_existing_urls() {
+        for (mode, target, same) in [(Mode::NavHistory,"https://app.example/done",true),
+            (Mode::NavReload,"https://app.example/start",false)] {
+            let (result, seen) = run(mode, navigation_call(target, "commit"));
+            let result = result.unwrap();
+            assert!(!result.is_error);
+            assert_eq!(result.details.unwrap()["wait_after"]["observation"]["navigation"]["same_document"],same);
+            assert_eq!(seen.readiness_reads, 0, "commit does not inspect the destination DOM");
+            assert_eq!(seen.inputs.len(), 2);
+        }
+        let mut args = navigation_call("https://app.example/start", "commit");
+        args["timeout_ms"] = json!(1000);
+        let (result, seen) = run(Mode::NavUnchanged, args);
+        assert!(result.is_err());
+        assert_eq!(seen.inputs.len(), 2);
+        assert_eq!(seen.readiness_reads, 0);
+    }
+
+    #[test]
+    fn cross_origin_destination_is_rejected_before_input() {
+        let (result, seen) = run(Mode::NavDocument, navigation_call("https://other.example/done", "load"));
+        assert!(result.unwrap_err().to_string().contains("BROWSER_NAVIGATION_SCOPE"));
+        assert!(seen.inputs.is_empty());
+        assert_eq!(seen.readiness_reads, 0);
+        assert_eq!(seen.observations, 0);
+    }
+
+    #[test]
+    fn unrequested_origin_and_error_documents_do_not_get_dom_inspection() {
+        for (mode, kind) in [(Mode::NavOutside,"navigation_scope"), (Mode::NavError,"navigation_failed")] {
+            let (result, seen) = run(mode, navigation_call("https://app.example/done", "load"));
+            let result = result.unwrap();
+            assert!(result.is_error);
+            let details = result.details.unwrap();
+            assert_eq!(details["dispatch_acknowledged"], true);
+            assert_eq!(details["wait_after"]["error_kind"], kind);
+            assert_eq!(seen.readiness_reads, 0);
+            assert_eq!(seen.observations, 0);
+            assert_eq!(seen.inputs.len(), 2);
+        }
+    }
+
+    #[test]
+    fn domcontentloaded_does_not_accept_interactive_before_the_event() {
+        let (result, seen) = run(Mode::NavDocument, navigation_call("https://app.example/done", "domcontentloaded"));
+        assert!(!result.unwrap().is_error);
+        assert_eq!(seen.readiness_reads, 2);
+        assert_eq!(seen.inputs.len(), 2);
+    }
+
+    #[test]
+    fn navigation_world_mismatch_stops_the_batch_without_later_input() {
+        let (result, seen) = run(Mode::NavMismatch, json!({"action":"batch","timeout_ms":5000,"steps":[
+            {"call":navigation_call("https://app.example/done", "load")},
+            {"call":{"action":"click","tab":"page","selector":"#trigger"}}
+        ]}));
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["failed_step"], 0);
+        assert_eq!(details["attempted_steps"], 1);
+        assert_eq!(details["remaining_steps"], 1);
+        assert_eq!(details["steps"][0]["details"]["wait_after"]["error_kind"], "document_changed");
+        assert_eq!(seen.inputs.len(), 2);
+        assert_eq!(seen.readiness_reads, 1);
+        assert_eq!(seen.observations, 0);
+    }
+
+    #[test]
+    fn navigation_cancellation_releases_admission_without_replaying_input() {
+        let (result, seen) = run(Mode::NavCancelled, navigation_call("https://app.example/done", "load"));
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(seen.inputs.len(), 2);
+        assert_eq!(seen.readiness_reads, 1);
+        assert_eq!(seen.observations, 0);
+    }
+
+    #[test]
+    fn history_drift_during_destination_dom_wait_is_not_retained_as_readiness() {
+        let mut args = navigation_call("https://app.example/done", "commit");
+        args["wait_after"]["selector"] = json!("#ready");
+        let (result, seen) = run(Mode::NavDrift, args);
+        let result = result.unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.unwrap()["wait_after"]["error_kind"], "document_changed");
+        assert_eq!(seen.observations, 1, "do not sample DOM after observing URL drift");
+        assert_eq!(seen.inputs.len(), 2);
+    }
+
+    #[test]
+    fn keypress_navigation_keeps_one_native_key_pair() {
+        let mut args = navigation_call("https://app.example/done", "load");
+        args["action"] = json!("press"); args["key"] = json!("Enter");
+        args.as_object_mut().unwrap().remove("selector");
+        let (result, seen) = run(Mode::NavDocument, args);
+        assert!(!result.unwrap().is_error);
+        assert_eq!(seen.inputs, vec!["keyDown", "keyUp"]);
+        assert_eq!(seen.readiness_reads, 3);
     }
 }
