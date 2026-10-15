@@ -169,7 +169,9 @@ impl Tool for BrowserTool {
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
          Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused. \
          click accepts left/middle/right buttons, left double-clicks and modifier keys; sequences never replay after interruption. Dispatch acknowledgement does not verify the application's outcome. \
-         batch executes ordered native calls under one conversation lease and total deadline, preserving partial results and stopping at the first error without replay."
+         batch executes ordered native calls under one conversation lease and total deadline, preserving partial results and stopping at the first error without replay. \
+         wait_for supports visible/hidden/attached/detached, optional rendered text and a sampled stable_ms interval; waits pin the current document and never send input. \
+         click/type/fill/press may include wait_after to observe a same-document postcondition after that one input, without replay or a new timeout."
     }
 
     fn parameters(&self) -> Value {
@@ -191,7 +193,11 @@ impl Tool for BrowserTool {
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate; frame-scoped evaluation uses an isolated DOM world, not the page's JavaScript globals"},
                 "selector": {"type": "string", "description": "CSS or snapshot @eN; also text/, label/, placeholder/, testid/, alt/, title/ and role/button[name=\"Save\" exact]. Semantic selectors are case-sensitive, bounded to 16 KiB and require one matching element; text-like names normalize whitespace and match substrings, testid matches data-testid exactly. Role/label use Chromium accessible names, not field values. Semantic selectors work on click/type/fill/press/wait_for/select_option/set_checked/upload and frame-scoped scroll, not inspection/export/download actions. Frame references require the same tab and frame; scoped press/scroll require selector."},
-                "text": {"type": "string", "description": "Text for type/fill"},
+                "text": {"type": "string", "description": "Literal input for type/fill; wait_for optionally matches nonempty rendered text up to 16 KiB, without reading input/textarea values."},
+                "state": {"type":"string","enum":["visible","hidden","attached","detached"],"description":"wait_for only; default visible. hidden means absent or not rendered visibly. attached/detached test DOM connection. Non-visible states require CSS or a known snapshot reference; semantic lookup omits hidden nodes. Navigation fails rather than proving absence."},
+                "text_match": {"type":"string","enum":["contains","exact"],"description":"wait_for with text only; default contains. Case-sensitive normalized rendered DOM text; excludes input/textarea values and hidden descendants. Not regular expressions. Text requires visible or attached state."},
+                "stable_ms": {"type":"integer","minimum":0,"maximum":10000,"default":0,"description":"wait_for only. Require matching sampled observations on the same node (or absence) for this interval. A mismatch or replacement resets it; timeout_ms still bounds the whole call. Not continuous observation or a guarantee about the next action."},
+                "wait_after": interaction::wait::after_schema(),
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
                 "button": {"type":"string","enum":["left","middle","right"],"default":"left","description":"click only: native pointer button. Right opens native page context menus where supported; middle can open links in another tab. Existing tool approvals still apply."},
                 "click_count": {"type":"integer","enum":[1,2],"default":1,"description":"click only: 2 sends a native left double-click (two press/release pairs with increasing clickCount). Right/middle require 1. A changed document or detached original node stops remaining input; completed effects are not undone or retried."},
@@ -282,8 +288,9 @@ impl BrowserTool {
         let action = required(args, "action")?;
         let semantic_selector = interaction::selectors::validate_input(args)?;
         let configured_pointer = interaction::pointer::validate_input(args)?;
+        let configured_wait = interaction::wait::validate_input(args)?;
         if self.is_mock() {
-            if storage::is_action(action) || semantic_selector || configured_pointer || matches!(
+            if storage::is_action(action) || semantic_selector || configured_pointer || configured_wait || matches!(
                 action,
                 "start"
                     | "status"

@@ -8,13 +8,13 @@ use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 pub(super) mod forms;
 mod frame_input;
 pub(super) mod pointer;
 pub(super) mod selectors;
 pub(super) mod upload;
+pub(super) mod wait;
 
 const ELEMENT_FUNCTION: &str = include_str!("dom.js");
 const MAX_ELEMENTS: usize = 200;
@@ -321,8 +321,29 @@ async fn element_call(
     evaluation_value(&response?)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn execute(
+    owner: &AgentCx,
+    cdp: &mut Cdp,
+    tab: &str,
+    refs: Option<&References>,
+    args: &Value,
+) -> Result<ToolOutput> {
+    let Some(condition) = wait::after_condition(args)? else {
+        return execute_input(owner, cdp, tab, refs, args).await;
+    };
+    // Pin before the trigger. A later navigation cannot authorize observing
+    // a replacement document, and waiting can never replay this invocation.
+    let expected = document(owner, cdp).await?;
+    let result = execute_input(owner, cdp, tab, refs, args).await?;
+    if result.is_error {
+        return Ok(result);
+    }
+    let readiness = wait::execute_pinned(owner, cdp, tab, refs, &condition, &expected).await;
+    Ok(wait::after_result(result, readiness))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_input(
     owner: &AgentCx,
     cdp: &mut Cdp,
     tab: &str,
@@ -407,17 +428,7 @@ pub(super) async fn execute(
     }
     let selector = required(args, "selector")?;
     if action == "wait_for" {
-        loop {
-            if let Some(id) = resolve(owner, cdp, selector, refs).await?
-                && element_call(owner, cdp, id, "visible", json!({})).await? == true
-            {
-                return Ok(output(
-                    format!("Selector {selector} is visible in tab {tab}"),
-                    json!({"selector": selector, "found": true, "backend": "cdp"}),
-                ));
-            }
-            owner.time().sleep(Duration::from_millis(100)).await;
-        }
+        return wait::execute(owner, cdp, tab, refs, args).await;
     }
     let id = resolve(owner, cdp, selector, refs)
         .await?
