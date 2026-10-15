@@ -25,6 +25,7 @@ mod bundled;
 mod deadline;
 #[cfg(test)]
 mod deadline_tests;
+mod definition;
 mod execution;
 #[cfg(test)]
 mod execution_tests;
@@ -767,7 +768,7 @@ struct AgentDefinition {
     skills: Vec<PathBuf>,
     system_prompt: String,
     /// Default JSON Schema for the child's final output, from the definition's
-    /// single-line `output_schema:` frontmatter field (bd-cv653.5.1). A task's
+    /// `output_schema:` (or `output:`) frontmatter field. A task's
     /// `outputSchema` overrides it.
     output_schema: Option<Value>,
     source: AgentSource,
@@ -838,98 +839,28 @@ fn load_agent_dir(
             ),
         )
     })?;
-    let mut paths = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        })
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|error| {
+            Error::tool("subagent", format!("Cannot enumerate agent definitions: {error}"))
+        })?.path();
+        if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("md")) {
+            if paths.len() >= definition::MAX_DEFINITIONS {
+                return Err(Error::tool("subagent", "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory"));
+            }
+            paths.push(path);
+        }
+    }
     paths.sort();
+    let mut names = std::collections::BTreeSet::new();
     for path in paths {
-        let raw = std::fs::read_to_string(&path).map_err(|error| {
-            Error::tool(
-                "subagent",
-                format!("Cannot read agent definition {}: {error}", path.display()),
-            )
-        })?;
-        let (frontmatter, body) = parse_frontmatter(&raw);
-        let name = required_agent_field(&frontmatter, "name", &path)?;
-        let description = required_agent_field(&frontmatter, "description", &path)?;
-        let tools = frontmatter.get("tools").map(|value| split_csv(value));
-        let definition_dir = path.parent().unwrap_or(directory);
-        let skills = frontmatter
-            .get("skills")
-            .map(|value| {
-                split_csv(value)
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .map(|skill| {
-                        if skill.is_absolute() {
-                            skill
-                        } else {
-                            definition_dir.join(skill)
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let output_schema = frontmatter
-            .get("output_schema")
-            .map(|raw| {
-                serde_json::from_str::<Value>(raw).map_err(|error| {
-                    Error::tool(
-                        "subagent",
-                        format!(
-                            "Agent definition {} has an invalid output_schema (must be single-line JSON): {error}",
-                            path.display()
-                        ),
-                    )
-                })
-            })
-            .transpose()?;
-        agents.insert(
-            name.clone(),
-            AgentDefinition {
-                name,
-                description,
-                model: frontmatter.get("model").cloned(),
-                reasoning: frontmatter
-                    .get("reasoning")
-                    .or_else(|| frontmatter.get("thinking"))
-                    .cloned(),
-                tools,
-                skills,
-                system_prompt: body,
-                output_schema,
-                source,
-                file_path: path,
-            },
-        );
+        let agent = definition::read(&path, source)?;
+        if !names.insert(agent.name.clone()) {
+            return Err(Error::tool("subagent", "PI_AGENT_DEFINITION_DUPLICATE: two files declare the same agent name in one directory"));
+        }
+        agents.insert(agent.name.clone(), agent);
     }
     Ok(())
-}
-
-fn required_agent_field(
-    fields: &BTreeMap<String, String>,
-    field: &str,
-    path: &Path,
-) -> Result<String> {
-    fields
-        .get(field)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            Error::tool(
-                "subagent",
-                format!(
-                    "Agent definition {} requires frontmatter field {field:?}",
-                    path.display()
-                ),
-            )
-        })
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -939,44 +870,6 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn parse_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
-    let mut lines = raw.lines();
-    if !matches!(lines.next(), Some(first) if first.trim().eq("---")) {
-        return (BTreeMap::new(), raw.to_string());
-    }
-    let mut fields = BTreeMap::new();
-    let mut body = Vec::new();
-    let mut closed = false;
-    for line in lines.by_ref() {
-        if line.trim().eq("---") {
-            closed = true;
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once(':') {
-            let key = key.trim();
-            if !key.is_empty() {
-                fields.insert(
-                    key.to_string(),
-                    value
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
-                );
-            }
-        }
-    }
-    if !closed {
-        return (BTreeMap::new(), raw.to_string());
-    }
-    body.extend(lines);
-    (fields, body.join("\n"))
 }
 
 fn child_args(
@@ -998,6 +891,9 @@ fn child_args(
             .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
             .into(),
     ];
+    if agent.tools.as_ref().is_some_and(Vec::is_empty) {
+        args.push("--no-tools".into());
+    }
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
     // spec from settings > captured active parent > ambient configuration.
     if let Some(model) = &agent.model {
