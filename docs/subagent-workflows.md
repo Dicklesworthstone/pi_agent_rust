@@ -280,6 +280,141 @@ worktrees retain their existing limits; the 256 KiB request bound is not a
 whole-process memory or result-size guarantee. The new mode has its own
 structured details rather than the optional legacy compact text footer.
 
+## Data-driven fan-out
+
+`forEach` turns a validated discovery result into bounded native child tasks.
+The node's `call` remains a single authored policy; each item becomes a literal
+named value in the same `<workflow-inputs>` block used by `inputs`.
+
+```json
+{
+  "workflow": [
+    {
+      "id": "discover",
+      "call": {
+        "agent": "scout",
+        "task": "Find the packages affected by the requested change.",
+        "outputSchema": {
+          "type": "object", "required": ["packages"],
+          "properties": {"packages": {"type": "array", "items": {"type": "string"}}}
+        }
+      }
+    },
+    {
+      "id": "audit", "needs": ["discover"],
+      "forEach": {"from": "discover", "pointer": "/packages", "as": "package", "maxItems": 16},
+      "call": {"agent": "reviewer", "task": "Audit the assigned package for correctness."}
+    },
+    {
+      "id": "finish", "needs": ["audit"],
+      "call": {"agent": "reviewer", "task": "Inspect the final workspace after all package audits settle."}
+    }
+  ],
+  "concurrency": 4,
+  "timeoutSeconds": 300
+}
+```
+
+The source must be a direct `needs` predecessor with accepted, schema-validated
+data. `pointer` selects a JSON array; null, a missing value, or a non-array is
+an error, never an empty list. `as` is an unused input name and cannot replace
+one of the node's shared `inputs`. Each item retains its complete JSON type and
+literal contents; duplicate items are separate work, not silently deduplicated.
+The task, agent, model, tools, cwd, isolation, schema and deadline do not come
+from item data. Data remains untrusted model context, not a sandbox.
+
+`maxItems` is required, from 1 to 32. The sum of all declared maxima and ordinary
+calls must be at most 128 logical task instances, checked before any launch.
+This is a worst-case bound, even for branches that later are not selected.
+The native one-time schema-correction retry can start a replacement process per
+applicable instance; it does not obtain a new task or time allowance. The
+existing 32-node and 256 KiB request bounds remain unchanged.
+
+All expanded tasks across a wave share the requested concurrency limit, one
+captured baseline per root and authored-node/input-item patch acceptance order.
+This is not one independent pool per node. Every item prompt must fit the
+existing 64 KiB limit before **any** item from that node is queued. Excessive
+lists and late-item preparation errors skip the whole node without launching a
+prefix; independent nodes can continue. `when` is evaluated before expansion,
+so an unselected node never prepares item inputs or workspaces.
+
+An empty array completes the node with zero children. Otherwise every item
+must pass native acceptance for the node to be accepted. A rejected item,
+including a permissive schema warning, blocks dependants while preserving
+successful sibling results and any accepted edits. The ordinary wave barrier
+still applies; there is no rollback, early join, cancellation override or replay.
+
+Mapped nodes have `fanout.itemCount` and input-ordered `fanout.items`, each with
+`index`, acceptance `state`, real `hubId`, `nativeIsError` and native `result`.
+The container has no synthetic child identity or native result; item states and
+handles also appear in tool text. Native progress/hub/revival records retain
+each expanded prompt; terminal `result.task` retains the authored assignment.
+An empty node records its admitted wave but does not increment `wavesExecuted`
+unless that wave actually submitted native tasks. Per-item native output bounds
+still apply; the expansion cap is not a total result-memory guarantee.
+
+This is bounded fresh-child fan-out, not OMP's persistent Eval `workpool` API.
+
+### Typed fan-in and subsequent decisions
+
+Give a mapped node's call an `outputSchema` (or inherit its agent definition's
+schema) to validate **each worker result**. When every worker passes, the node's
+typed data is an array of those values in original item order. Downstream
+`inputs`, `when`, and `forEach` address that array through the same data path as
+ordinary nodes. The schema applies to each element, not to the assembled array.
+
+For example, these two nodes can follow the `discover` node above:
+
+```json
+[
+  {
+    "id": "audit", "needs": ["discover"],
+    "forEach": {"from": "discover", "pointer": "/packages", "as": "package", "maxItems": 16},
+    "call": {
+      "agent": "reviewer", "task": "Audit the assigned package and report its findings.",
+      "outputSchema": {
+        "type": "object", "required": ["package", "findings"],
+        "properties": {
+          "package": {"type": "string"},
+          "findings": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  },
+  {
+    "id": "summarize", "needs": ["audit"],
+    "inputs": {"reports": {"from": "audit", "pointer": ""}},
+    "call": {"agent": "reviewer", "task": "Summarize the supplied package audit reports."}
+  }
+]
+```
+
+Here `reports` is an array such as
+`[{"package":"core","findings":[]},{"package":"ui","findings":["..."]}]`.
+Empty pointer selects the entire array; `/0/findings` selects one item's field.
+Null elements, escaped keys, order and duplicate values remain intact. An empty
+map publishes the known empty array without inventing schema-validated child
+results. Any source used for a typed handoff still requires an effective item
+schema before the workflow launches, including an eventually empty source.
+
+The complete aggregate is bounded to **256 KiB of JSON-encoded data**, counted
+before copying. `fanout.data` is present only when available;
+`fanout.dataUnavailable` is null or explains `not_settled`, `rejected_item`,
+`unvalidated_item`, or `result_limit`. A failed or schema-free item cannot create
+a partial successful array. If all native tasks succeeded but the combined data
+is too large, the node remains accepted as work; its aggregate is unavailable,
+and a downstream data consumer skips with an explicit unavailable-data error.
+Individual native results remain intact in `fanout.items`; no data is silently
+truncated or reconstructed from their prose. Aggregate availability is also
+reported in the model-visible result text.
+
+The aggregate is an additional bounded snapshot in this invocation only, not a
+persistent cache. The stricter 64 KiB expanded-task limit still governs a later
+handoff, so an available aggregate may be too large to pass whole: select a
+smaller field explicitly. Nested maps keep the same graph-wide declared-call
+ceiling, global concurrency and original deadline. They cannot launch children
+early, suppress failed dependencies, or bypass selected-branch admission.
+
 ## Validation
 
 `src/subagents/workflow/tests.rs` contains graph/admission/result unit tests and
@@ -302,6 +437,11 @@ policy, mandatory data provenance, retained topological edges, native convergenc
 all-unselected versus mixed-failure outcomes, cancellation, missing branch inputs
 and an isolated joined task reading its predecessor's accepted changes while the
 parent index/HEAD stay unchanged. None of these Rust tests were executed here.
+
+`src/subagents/workflow/fanout/tests.rs` adds unit and native-child scenarios for
+discovered-item parallelism, full-list admission, global expansion bounds,
+conditional exclusion, worktree joins, typed reduction, further mapping,
+aggregate limits and cancellation. Its subprocess fixtures do not call a model.
 
 These Rust tests were authored, not executed in the implementation environment:
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was unavailable.

@@ -276,9 +276,6 @@ impl Plan {
             for from in node.inputs.iter().map(|input| input.from).chain(node.decision.source())
                 .chain(node.fanout.as_ref().map(|expansion| expansion.from))
             {
-                if self.nodes[from].fanout.is_some() {
-                    return Err(invalid("fan-out nodes may be dependencies, but typed aggregate input is not available"));
-                }
                 let source = &self.nodes[from].call;
                 let schema = source.output_schema.as_ref()
                     .or_else(|| agents.get(&source.agent).and_then(|agent| agent.output_schema.as_ref()));
@@ -486,6 +483,7 @@ impl Record {
 
     fn validated_data(&self) -> Option<&Value> {
         if self.state != State::Accepted { return None; }
+        if let Some(run) = &self.fanout { return run.validated_data(); }
         self.result.as_ref()
             .filter(|result| native_state(result) == State::Accepted && result.schema_valid == Some(true))
             .and_then(|result| result.data.as_ref())

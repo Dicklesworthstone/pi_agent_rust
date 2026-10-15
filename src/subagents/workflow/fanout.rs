@@ -5,13 +5,14 @@
 
 use super::{
     BTreeMap, Input, Node, Record, Result, State, SubagentResult, SubagentTask, Value,
-    identifier, invalid, native_state, render_results, validate_pointer,
+    encoded_size, identifier, invalid, native_state, render_results, validate_pointer,
 };
 use serde::Serialize;
 use serde_json::json;
 
 const MAX_ITEMS: usize = 32;
 const MAX_CALLS: usize = 128;
+const MAX_DATA_BYTES: usize = 256 * 1024;
 
 pub(super) fn reject_misplaced(input: &Value) -> Result<()> {
     if input.get("forEach").is_some() || ["tasks", "chain"].iter().any(|name| {
@@ -100,11 +101,20 @@ struct Item {
 pub(super) struct Run {
     item_count: usize,
     items: Vec<Item>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+    data_unavailable: Option<&'static str>,
 }
 
 impl Run {
     pub(super) fn new(item_count: usize) -> Self {
-        Self { item_count, items: Vec::with_capacity(item_count) }
+        Self {
+            item_count, items: Vec::with_capacity(item_count),
+            // A known empty array contains no unvalidated item. Consumers
+            // still require this node's effective item schema at preflight.
+            data: (item_count == 0).then(|| Value::Array(Vec::new())),
+            data_unavailable: (item_count != 0).then_some("not_settled"),
+        }
     }
 
     pub(super) fn settle(&mut self, result: SubagentResult, index: usize) -> Result<State> {
@@ -116,6 +126,7 @@ impl Run {
             index, state, hub_id: result.hub_id.clone(), native_is_error: result.is_error, result,
         });
         if self.items.len() != self.item_count { return Ok(State::Pending); }
+        self.collect_data();
         Ok(if self.items.iter().all(|item| item.state == State::Accepted) {
             State::Accepted
         } else {
@@ -123,8 +134,35 @@ impl Run {
         })
     }
 
+    /// Construct one bounded typed list only after every native result has
+    /// settled. Keep individual outcomes on failure; never invent a partial
+    /// successful list or infer values from result text. This snapshot lives
+    /// only in the same workflow invocation, not a process-global cache.
+    fn collect_data(&mut self) {
+        if self.items.iter().any(|item| item.state != State::Accepted) {
+            self.data_unavailable = Some("rejected_item");
+            return;
+        }
+        let values: Option<Vec<&Value>> = self.items.iter().map(|item| {
+            (item.result.schema_valid == Some(true)).then_some(item.result.data.as_ref()).flatten()
+        }).collect();
+        let Some(values) = values else {
+            self.data_unavailable = Some("unvalidated_item");
+            return;
+        };
+        if encoded_size(&values, MAX_DATA_BYTES).is_none() {
+            self.data_unavailable = Some("result_limit");
+            return;
+        }
+        self.data = Some(Value::Array(values.into_iter().cloned().collect()));
+        self.data_unavailable = None;
+    }
+
+    pub(super) fn validated_data(&self) -> Option<&Value> { self.data.as_ref() }
+
     pub(super) fn render(&self, content: &mut String) {
         content.push_str(&format!("Fan-out: {} item(s); {} native results.\n", self.item_count, self.items.len()));
+        content.push_str(&format!("Typed aggregate: {}.\n", self.data_unavailable.unwrap_or("available")));
         for item in &self.items {
             content.push_str(&format!("\n## Item {}; state: {}; hub: {}\n",
                 item.index, item.state.label(),
@@ -145,6 +183,13 @@ pub(super) fn extend_schema(schema: &mut Value) {
             "maxItems":{"type":"integer","minimum":1,"maximum":MAX_ITEMS}
         }
     });
+    if let Some(description) = schema["properties"]["workflow"]["items"]["properties"]["forEach"]["description"]
+        .as_str().map(str::to_owned)
+    {
+        schema["properties"]["workflow"]["items"]["properties"]["forEach"]["description"] = json!(format!(
+            "{description} When all item results are schema-valid, fanout.data is their typed array in input order (256 KiB combined limit). Downstream inputs, when and forEach pointers address that array directly, not the per-item native envelopes. Source call/definition schemas validate each item, not the aggregate. Unavailable aggregate data never falls back to prose; individual native results remain inspectable."
+        ));
+    }
 }
 
 #[cfg(test)]

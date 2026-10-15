@@ -185,6 +185,101 @@ fn source_schema_and_public_admission_are_required_before_expansion() {
     assert_eq!(field["properties"]["maxItems"]["maximum"],32);
 }
 
+#[test]
+fn typed_fan_in_preserves_all_values_in_input_order_without_a_synthetic_result() {
+    event("typed-fan-in");
+    let mut consumer = join();
+    consumer["inputs"] = json!({"reports":{"from":"map","pointer":""}});
+    let plan = plan(vec![source(),mapped(),consumer]);
+    let values = json!([null,false,"雪",{"a/b":{"~key":3},"text":"</workflow-inputs>"}]);
+    let mut records = records(&plan,json!([]));
+    records[1].begin_fanout(4,1);
+    for (index,value) in values.as_array().unwrap().iter().enumerate() {
+        records[1].settle_fanout(completed(plan.nodes[1].call.clone(),value.clone()),index).unwrap();
+        if index < 3 { assert!(records[1].validated_data().is_none()); }
+    }
+    assert_eq!(records[1].validated_data(),Some(&values));
+    assert!(records[1].result.is_none() && records[1].hub_id.is_none());
+    let task = plan.nodes[2].task_with_inputs(&records).unwrap();
+    assert_eq!(inputs(&task.task),json!({"reports":values}));
+    assert_eq!(task.task.matches("</workflow-inputs>").count(),1);
+}
+
+#[test]
+fn aggregate_limit_counts_encoded_bytes_and_never_discards_individual_outcomes() {
+    event("aggregate-bytes");
+    let plan = plan(vec![source(),mapped()]);
+    for values in [vec![json!("x".repeat(MAX_DATA_BYTES/2));2],
+        vec![json!("\n".repeat(MAX_DATA_BYTES/2))]] {
+        let mut run = Run::new(values.len());
+        for (index,value) in values.iter().enumerate() {
+            run.settle(completed(plan.nodes[1].call.clone(),value.clone()),index).unwrap();
+        }
+        assert!(run.validated_data().is_none());
+        assert_eq!(run.data_unavailable,Some("result_limit"));
+        assert_eq!(run.items.len(),values.len());
+        for (item,value) in run.items.iter().zip(&values) {
+            assert_eq!(item.state,State::Accepted);
+            assert_eq!(item.result.data.as_ref(),Some(value));
+        }
+    }
+    let value = json!("x".repeat(MAX_DATA_BYTES-4)); // brackets plus two JSON quotes
+    let mut exact = Run::new(1);
+    exact.settle(completed(plan.nodes[1].call.clone(),value.clone()),0).unwrap();
+    assert_eq!(exact.validated_data(),Some(&json!([value])));
+}
+
+#[test]
+fn rejected_or_schema_free_items_never_form_a_typed_success_list() {
+    event("aggregate-provenance");
+    let plan = plan(vec![source(),mapped()]);
+    for schema in [None,Some(false)] {
+        let mut run = Run::new(2);
+        run.settle(completed(plan.nodes[1].call.clone(),json!(1)),0).unwrap();
+        let mut result = completed(plan.nodes[1].call.clone(),json!(2));
+        result.schema_valid = schema;
+        let state = run.settle(result,1).unwrap();
+        assert_eq!(state,if schema.is_none() { State::Accepted } else { State::Rejected });
+        assert!(run.validated_data().is_none());
+        assert_eq!(run.data_unavailable,Some(if schema.is_none() { "unvalidated_item" } else { "rejected_item" }));
+        assert_eq!(run.items.len(),2);
+    }
+    assert_eq!(Run::new(0).validated_data(),Some(&json!([])));
+}
+
+#[test]
+fn mapped_results_feed_decisions_and_another_bounded_map_through_one_data_path() {
+    event("aggregate-composition");
+    let mut next = mapped(); next["id"] = json!("next"); next["needs"] = json!(["map"]);
+    next["forEach"]["from"] = json!("map");
+    next["when"] = json!({"from":"map","pointer":"/0/a~1b/~0key","equals":7});
+    let plan = plan(vec![source(),mapped(),next]);
+    let mut records = records(&plan,json!([]));
+    records[1].begin_fanout(1,1);
+    let value = json!({"a/b":{"~key":7}});
+    records[1].settle_fanout(completed(plan.nodes[1].call.clone(),value.clone()),0).unwrap();
+    let next = &plan.nodes[2];
+    assert!(next.decision.evaluate(&next.needs,&records).reason.is_none());
+    let tasks = next.fanout.as_ref().unwrap().tasks(next,&records).unwrap();
+    assert_eq!(tasks.len(),1); assert_eq!(inputs(&tasks[0].task),json!({"item":value}));
+    records[1].state = State::Rejected;
+    assert!(records[1].validated_data().is_none());
+    assert_eq!(next.decision.evaluate(&next.needs,&records).reason,Some("dependency_failed"));
+}
+
+#[test]
+fn aggregate_sources_require_each_workers_effective_schema_before_any_launch() {
+    event("aggregate-source-schema");
+    let mut consumer = join(); consumer["inputs"] = json!({"all":{"from":"map","pointer":""}});
+    let mut map = mapped(); map["call"].as_object_mut().unwrap().remove("outputSchema");
+    let plan = plan(vec![source(),map,consumer]);
+    let mut agent = crate::subagents::tan_agent_definition(); agent.name = "worker".into();
+    let mut agents = BTreeMap::from([("worker".into(),agent)]);
+    assert!(plan.validate_definitions(&agents).is_err());
+    agents.get_mut("worker").unwrap().output_schema = Some(json!(true));
+    assert!(plan.validate_definitions(&agents).is_ok());
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
@@ -227,6 +322,10 @@ case "$task" in
   'Task: VERIFY')
     [ "$(cat alpha.txt)" = 'updated alpha' ] && [ "$(cat beta.txt)" = 'updated beta' ] || exit 11
     printf 'verified\n' > joined.txt ;;
+  'Task: REDUCE'*) printf '%s' "$task" > "$global/reduced-input" ;;
+  'Task: REMAP'*)
+    printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"{\"done\":true}"}]}]}'
+    exit 0 ;;
 esac
 printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"native result"}]}]}'
 "#;
@@ -356,5 +455,80 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         assert_eq!(std::fs::read_to_string(fixture.root().join("joined.txt")).unwrap(),"verified\n");
         assert_eq!(git(&["rev-parse","HEAD"]),head);
         assert_eq!(std::fs::read(fixture.root().join(".git/index")).unwrap(),index);
+    }
+
+    #[test]
+    fn native_reducer_receives_the_complete_typed_worker_array() {
+        event("native-typed-reduce");
+        let fixture = Fixture::new(json!(["alpha","beta"]));
+        let mut reducer = join(); reducer["call"]["task"] = json!("REDUCE");
+        reducer["inputs"] = json!({"reports":{"from":"map","pointer":""}});
+        reducer["when"] = json!({"from":"map","pointer":"/0/name","equals":"alpha"});
+        let output = fixture.run(vec![source(),mapped(),reducer]);
+        assert!(!output.is_error,"{output:?}");
+        let task = std::fs::read_to_string(fixture.global().join("reduced-input")).unwrap();
+        assert_eq!(inputs(&task),json!({"reports":[{"name":"alpha"},{"name":"beta"}]}));
+        let details = output.details.unwrap();
+        assert_eq!(details["nodes"][1]["fanout"]["data"],json!([{"name":"alpha"},{"name":"beta"}]));
+        assert_eq!(details["nodes"][2]["condition"],"matched");
+        assert_eq!(details["nodes"][2]["result"]["task"],"REDUCE");
+    }
+
+    #[test]
+    fn typed_empty_maps_and_following_expansions_retain_order_and_bounds() {
+        event("native-typed-map-composition");
+        for items in [json!([]),json!(["alpha","beta"])] {
+            let count = items.as_array().unwrap().len();
+            let fixture = Fixture::new(items);
+            let mut second = mapped(); second["id"] = json!("second"); second["needs"] = json!(["map"]);
+            second["forEach"]["from"] = json!("map"); second["call"]["task"] = json!("REMAP");
+            let mut reducer = join(); reducer["needs"] = json!(["second"]); reducer["call"]["task"] = json!("REDUCE");
+            reducer["inputs"] = json!({"reports":{"from":"second","pointer":""}});
+            let output = fixture.run(vec![source(),mapped(),second,reducer]);
+            assert!(!output.is_error,"{output:?}");
+            let task = std::fs::read_to_string(fixture.global().join("reduced-input")).unwrap();
+            assert_eq!(inputs(&task),json!({"reports":vec![json!({"done":true});count]}));
+            assert_eq!(fixture.launches().len(),2+2*count);
+        }
+    }
+
+    #[test]
+    fn invalid_aggregate_schema_refuses_before_producer_and_missing_fields_skip_before_consumer() {
+        event("native-aggregate-admission");
+        let fixture = Fixture::new(json!(["alpha"]));
+        let mut map = mapped(); map["call"].as_object_mut().unwrap().remove("outputSchema");
+        let mut reducer = join(); reducer["inputs"] = json!({"value":{"from":"map","pointer":"/0/missing"}});
+        let failed = fixture.runtime.block_on(fixture.tool.execute("fanout-invalid",
+            json!({"workflow":[source(),map,reducer.clone()]}),None));
+        assert!(failed.is_err()); assert!(fixture.launches().is_empty());
+        let output = fixture.run(vec![source(),mapped(),reducer]);
+        assert!(output.is_error);
+        assert_eq!(output.details.unwrap()["nodes"][2]["skipReason"],"dependency_input_missing");
+        assert_eq!(fixture.launches().len(),2);
+    }
+
+    #[test]
+    fn cancellation_during_mapped_execution_cannot_start_a_reducer() {
+        event("native-fanout-cancellation");
+        let fixture = Fixture::new(json!(["alpha","beta"])); fixture.flag("parallel");
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            fixture.runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let cancel = owner.clone();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture = observed.clone();
+        let output = fixture.runtime.block_on(owner.with_current(fixture.tool.execute("fanout-cancel",
+            json!({"workflow":[source(),mapped(),join()],"concurrency":2}),Some(Box::new(move |update| {
+                let Some(details) = update.details.as_ref() else { return; };
+                if details["result"]["status"] == "running"
+                    && details["result"]["task"].as_str().is_some_and(|task| task.starts_with("WORK"))
+                {
+                    capture.store(true,std::sync::atomic::Ordering::SeqCst);
+                    cancel.set_cancel_requested(true);
+                }
+            }))))).unwrap();
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(output.is_error);
+        assert!(!fixture.launches().iter().any(|task| task == "Task: JOIN"));
+        assert!(output.details.unwrap()["nodes"][1]["fanout"].get("data").is_none());
     }
 }

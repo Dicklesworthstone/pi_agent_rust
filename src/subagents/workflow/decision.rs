@@ -1,7 +1,9 @@
 //! Typed branch selection over settled native results. This does not approve
 //! tools, interpret guest code, or turn invalid/missing evidence into a verdict.
 
-use super::{BTreeMap, Record, Result, State, SubagentStatus, Value, encoded_size, identifier, invalid, validate_pointer};
+use super::{BTreeMap, Record, Result, State, Value, encoded_size, identifier, invalid, validate_pointer};
+#[cfg(test)]
+use super::SubagentStatus;
 use serde_json::json;
 
 const MAX_CONDITION_BYTES: usize = 16 * 1024;
@@ -103,11 +105,7 @@ impl Policy {
         // optional; this is not an any-success race or failure-recovery path.
         let Some(condition) = &self.when else { return Admission::ready(None); };
         let data = records.get(condition.from)
-            .filter(|record| record.state == State::Accepted)
-            .and_then(|record| record.result.as_ref())
-            .filter(|result| !result.is_error && matches!(result.status, SubagentStatus::Completed)
-                && result.schema_valid == Some(true))
-            .and_then(|result| result.data.as_ref());
+            .and_then(Record::validated_data);
         let failure = |reason| {
             let mut admission = Admission::stopped(reason, vec![condition.from], false);
             admission.condition = Some(reason);
