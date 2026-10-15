@@ -31,6 +31,15 @@ pub(super) struct Document {
 pub(super) struct References {
     document: Option<Document>,
     nodes: BTreeMap<String, u64>,
+    observation: Option<ax_state::SnapshotMemory>,
+}
+
+impl References {
+    fn observation_for(&self, document: &Document) -> Option<&ax_state::SnapshotMemory> {
+        (self.document.as_ref() == Some(document))
+            .then_some(self.observation.as_ref())
+            .flatten()
+    }
 }
 
 async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
@@ -67,6 +76,7 @@ async fn collect_elements(
     let mut refs = References {
         document: Some(doc.clone()),
         nodes: BTreeMap::new(),
+        observation: None,
     };
     let mut elements = Vec::new();
     let mut states = BTreeMap::new();
@@ -155,7 +165,7 @@ pub(super) async fn snapshot(
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::tool("browser", "accessibility tree has no nodes"))?;
-    let CollectedSnapshot { elements, references: refs, states, truncated } =
+    let CollectedSnapshot { elements, references: mut refs, states, truncated } =
         collect_elements(owner, cdp, nodes, previous, &doc, next_ref).await?;
     let metadata = cdp
         .evaluate(owner, "({url: location.href, title: document.title})")
@@ -168,6 +178,11 @@ pub(super) async fn snapshot(
     }
     let url = required(&metadata, "url")?.to_owned();
     let title = required(&metadata, "title")?.to_owned();
+    let observation = ax_state::SnapshotMemory::capture(&elements, &states, &url, &title, truncated);
+    let changes = observation.compare(previous.and_then(|refs| refs.observation_for(&doc)));
+    // The caller installs these references only after snapshot succeeds.
+    // Failed collection/navigation cannot advance the retained baseline.
+    refs.observation = Some(observation);
     let lines = elements
         .iter()
         .map(|e| {
@@ -183,7 +198,8 @@ pub(super) async fn snapshot(
         .collect::<Vec<_>>()
         .join("\n");
     let summary = format!(
-        "Page Snapshot for [{tab}] {title:?}:\n{lines}{}",
+        "Page Snapshot for [{tab}] {title:?}:\n{}{lines}{}",
+        changes.summary(),
         if truncated {
             "\n[Snapshot truncated]"
         } else {
@@ -205,6 +221,7 @@ pub(super) async fn snapshot(
         "snapshot": snapshot, "truncated": truncated, "backend": "cdp",
         "reference_scope": reference_scope, "frame_id": doc.frame,
         "element_states": states, "state_schema": "pi.browser.ax-state.v1",
+        "snapshot_changes": changes,
     });
     if include_tree {
         // Return the actual accessibility tree, bounded independently of the
@@ -609,6 +626,19 @@ async fn press(owner: &AgentCx, cdp: &mut Cdp, key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_comparisons_require_the_same_document_incarnation() {
+        let document = Document { frame: "main".into(), loader: "old".into() };
+        let references = References {
+            document: Some(document.clone()), nodes: BTreeMap::new(),
+            observation: Some(ax_state::SnapshotMemory::capture(&[], &BTreeMap::new(), "", "", false)),
+        };
+        assert!(references.observation_for(&document).is_some());
+        assert!(references.observation_for(&Document { loader: "new".into(), ..document.clone() }).is_none());
+        assert!(references.observation_for(&Document { frame: "other".into(), ..document }).is_none());
+        assert!(References::default().observation_for(&Document { frame: "main".into(), loader: "old".into() }).is_none());
+    }
 
     #[test]
     fn key_chords_preserve_modifiers_without_inserting_shortcut_text() {

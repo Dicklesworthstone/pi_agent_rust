@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const MAX_PROPERTIES: usize = 64;
 
@@ -149,6 +150,114 @@ impl Observation {
     }
 }
 
+/// Only digests and bounded reference IDs survive to the next observation.
+/// No earlier accessible names, state values or page URLs are replayed.
+#[derive(Debug)]
+pub(super) struct SnapshotMemory {
+    rows: BTreeMap<String, [u8; 32]>,
+    order: Vec<String>,
+    metadata: [u8; 32],
+    coverage_limited: bool,
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value);
+}
+
+impl SnapshotMemory {
+    pub(super) fn capture(
+        elements: &[super::BrowserElementRef],
+        states: &BTreeMap<String, Observation>,
+        url: &str,
+        title: &str,
+        truncated: bool,
+    ) -> Self {
+        let mut rows = BTreeMap::new();
+        let mut order = Vec::new();
+        let mut coverage_limited = truncated || elements.len() > super::MAX_ELEMENTS;
+        for element in elements.iter().take(super::MAX_ELEMENTS) {
+            let mut hash = Sha256::new();
+            for field in [&element.tag, &element.role, &element.text] {
+                hash_field(&mut hash, field.as_bytes());
+            }
+            if let Some(state) = states.get(&element.ref_id) {
+                hash.update([u8::from(state.incomplete)]);
+                coverage_limited |= state.incomplete;
+                for (name, value) in &state.states {
+                    hash_field(&mut hash, name.as_bytes());
+                    hash_field(&mut hash, value.to_string().as_bytes());
+                }
+            } else {
+                hash.update([2]);
+                coverage_limited = true;
+            }
+            order.push(element.ref_id.clone());
+            rows.insert(element.ref_id.clone(), hash.finalize().into());
+        }
+        let mut metadata = Sha256::new();
+        hash_field(&mut metadata, url.as_bytes());
+        hash_field(&mut metadata, title.as_bytes());
+        Self { rows, order, metadata: metadata.finalize().into(), coverage_limited }
+    }
+
+    pub(super) fn compare(&self, previous: Option<&Self>) -> Changes {
+        let mut changes = Changes {
+            schema: "pi.browser.snapshot-changes.v1",
+            compared: previous.is_some(),
+            newly_observed: Vec::new(), changed: Vec::new(), no_longer_observed: Vec::new(),
+            unchanged_count: 0,
+            order_changed: previous.map(|old| old.order != self.order),
+            metadata_changed: previous.map(|old| old.metadata != self.metadata),
+            coverage_limited: self.coverage_limited || previous.is_some_and(|old| old.coverage_limited),
+        };
+        for reference in &self.order {
+            match previous.and_then(|old| old.rows.get(reference)) {
+                None => changes.newly_observed.push(reference.clone()),
+                Some(old) if self.rows.get(reference) == Some(old) => changes.unchanged_count += 1,
+                Some(_) => changes.changed.push(reference.clone()),
+            }
+        }
+        if let Some(previous) = previous {
+            for reference in &previous.order {
+                if !self.rows.contains_key(reference) {
+                    changes.no_longer_observed.push(reference.clone());
+                }
+            }
+        }
+        changes
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct Changes {
+    schema: &'static str,
+    compared: bool,
+    newly_observed: Vec<String>,
+    changed: Vec<String>,
+    no_longer_observed: Vec<String>,
+    unchanged_count: usize,
+    order_changed: Option<bool>,
+    metadata_changed: Option<bool>,
+    coverage_limited: bool,
+}
+
+impl Changes {
+    pub(super) fn summary(&self) -> String {
+        if !self.compared {
+            return "Snapshot changes: new baseline for this retained document; no earlier observation compared.\n".to_string();
+        }
+        format!(
+            "Snapshot changes: new [{}]; changed [{}]; no longer observed [{}]; {} unchanged.{}{}{}\n",
+            self.newly_observed.join(", "), self.changed.join(", "),
+            self.no_longer_observed.join(", "), self.unchanged_count,
+            if self.order_changed == Some(true) { " Observation order changed." } else { "" },
+            if self.metadata_changed == Some(true) { " Page URL/title changed." } else { "" },
+            if self.coverage_limited { " Comparison coverage is limited." } else { "" },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +372,70 @@ mod tests {
         assert_eq!(state.suffix(), " [checked=true, selected=false]");
         assert!(!state.states.contains_key("disabled"));
         assert_eq!(Observation::default().suffix(), "");
+    }
+
+    fn memory(rows: &[(&str, &str, bool)], truncated: bool) -> SnapshotMemory {
+        let elements: Vec<_> = rows.iter().map(|(reference, text, _)| super::super::BrowserElementRef {
+            ref_id: (*reference).to_string(), tag: "input".into(), role: "checkbox".into(),
+            text: (*text).to_string(), selector: (*reference).to_string(),
+        }).collect();
+        let states = rows.iter().map(|(reference, _, checked)| ((*reference).to_string(),
+            project(&json!({"properties":[entry("checked", "tristate", json!(if *checked { "true" } else { "false" }))]}))
+        )).collect();
+        SnapshotMemory::capture(&elements, &states, "https://example.test", "Test", truncated)
+    }
+
+    #[test]
+    fn comparisons_report_state_and_label_changes_without_replaying_old_content() {
+        let old = memory(&[("@e1", "PRIVATE-OLD-NAME", false), ("@e2", "B", false)], false);
+        let current = memory(&[("@e1", "A", false), ("@e2", "B", true), ("@e3", "C", false)], false);
+        let delta = current.compare(Some(&old));
+        assert_eq!(delta.changed, vec!["@e1", "@e2"]);
+        assert_eq!(delta.newly_observed, vec!["@e3"]);
+        assert_eq!(delta.unchanged_count, 0);
+        assert!(!serde_json::to_string(&delta).unwrap().contains("PRIVATE"));
+        assert!(!format!("{old:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn baseline_reorder_and_metadata_changes_are_explicit() {
+        let old = memory(&[("@e1", "A", false), ("@e2", "B", true)], false);
+        let mut current = memory(&[("@e2", "B", true), ("@e1", "A", false)], false);
+        let baseline = old.compare(None);
+        assert!(!baseline.compared);
+        assert_eq!(baseline.order_changed, None);
+        assert_eq!(baseline.metadata_changed, None);
+        let delta = current.compare(Some(&old));
+        assert_eq!(delta.order_changed, Some(true));
+        assert_eq!(delta.metadata_changed, Some(false));
+        assert_eq!(delta.unchanged_count, 2);
+        assert!(delta.changed.is_empty());
+        current.metadata[0] ^= 1;
+        assert_eq!(current.compare(Some(&old)).metadata_changed, Some(true));
+    }
+
+    #[test]
+    fn omissions_from_truncated_inventory_are_not_claimed_as_dom_removals() {
+        let old = memory(&[("@e1", "A", false), ("@e2", "B", true)], false);
+        let current = memory(&[("@e1", "A", false)], true);
+        let delta = current.compare(Some(&old));
+        assert_eq!(delta.no_longer_observed, vec!["@e2"]);
+        assert!(delta.coverage_limited);
+        assert_eq!(delta.unchanged_count, 1);
+        assert!(delta.summary().contains("no longer observed"));
+        assert!(!delta.summary().contains("removed"));
+        assert!(old.compare(Some(&current)).coverage_limited);
+    }
+
+    #[test]
+    fn snapshot_memory_caps_rows_and_marks_missing_state_projection() {
+        let elements = vec![super::super::BrowserElementRef {
+            ref_id: "@e1".into(), tag: "input".into(), role: "textbox".into(),
+            text: "Bounded".into(), selector: "@e1".into(),
+        }; super::super::MAX_ELEMENTS + 1];
+        let observed = SnapshotMemory::capture(&elements, &BTreeMap::new(), "", "", false);
+        assert!(observed.coverage_limited);
+        assert!(observed.order.len() <= super::super::MAX_ELEMENTS);
+        assert!(observed.rows.len() <= super::super::MAX_ELEMENTS);
     }
 }

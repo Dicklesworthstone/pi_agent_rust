@@ -79,3 +79,44 @@ shapes for native and ARIA controls, including numeric busy. That probe is not
 Rust-host execution. The implementation environment lacks `dsr`; compilation,
 formatting, Clippy and Rust tests require `dsr quality --tool pi_agent_rust` and
 remain unexecuted here.
+
+## Snapshot-to-snapshot changes
+
+Every native snapshot also reports `details.snapshot_changes`, schema
+`pi.browser.snapshot-changes.v1`, and a textual change summary. The ordinary
+full snapshot still follows it; this is not a compressed-output or fewer-CDP-
+requests claim. Its baseline is the previous successful native snapshot retained for
+that conversation, tab and document/frame. Navigation to a new loader/frame,
+first observation, release or reference-cache eviction produces `compared:false`.
+A collection/navigation failure does not replace the earlier baseline. An
+interruption after native completion but before outer result publication can
+already have advanced it; this is not an acknowledged-delivery checkpoint.
+
+A compared result contains ordered `newly_observed`, `changed`, and
+`no_longer_observed` reference lists plus `unchanged_count`. A change means a
+reported tag, role, bounded accessible name or projected state differs. This
+also detects removal of a previously reported property. `order_changed` tracks
+inventory ordering; `metadata_changed` tracks page URL/title independently of
+control state. Both are null for a fresh baseline.
+
+Only bounded reference IDs and in-memory SHA-256 fingerprints are retained for
+comparison, not prior names, state values or URLs. Only IDs and change counts
+are emitted: a previous payload is never replayed into the next observation.
+This state shares existing conversation/frame ownership and cache lifetime;
+no global registry or durable snapshot archive is added.
+
+`coverage_limited` is true if either inventory was truncated or a supported
+state projection was incomplete. Even when false, the comparison covers only
+the compact, supported observation—not the entire DOM, editable values or all
+ARIA attributes. A reference that is no longer observed might be hidden,
+ignored, beyond the inventory cap or gone. It is NOT proof of DOM removal.
+Changes between samples can be missed, including changes that revert before
+the next snapshot. References may be used only while their native document
+remains valid, and observed state never overrides the input safety checks.
+
+Five additional unit regressions cover comparison identity, state/name changes,
+ordering, baseline resets, bounded retention and incomplete coverage. Two public
+HTTP/WebSocket-peer workflows cover the production snapshot path, actual result
+shapes, stable references and failure/navigation handling without extra protocol
+calls. A separate ignored real-Chromium checkbox lane is also authored. These
+Rust tests remain unexecuted; protocol fixtures are not live browser evidence.
