@@ -1,6 +1,6 @@
 # Native browser batches
 
-`browser` accepts `action: "batch"` to execute a literal sequence of ordinary
+`browser` accepts `action: "batch"` to execute an explicit sequence of ordinary
 browser calls under one conversation-owned execution lease and total deadline.
 This enables multi-step automation without returning to the model between every
 native call. It is a Rust-native subset of OMP's scripted browser workflow idea,
@@ -23,8 +23,9 @@ not OMP's Eval `browser.run` API or a new guest-code interpreter.
 ## Execution and ownership
 
 Steps run in order in the same retained browser namespace. Each `call` has the
-ordinary browser action's arguments; there is no implicit interpolation, variable
-binding, retry, parallel execution or model-generated continuation. Omitted tabs
+ordinary browser action's arguments; there is no implicit interpolation, retry,
+parallel execution or model-generated continuation. Explicit `bind` maps can copy
+earlier results into selected inputs, as described below. Omitted tabs
 retain normal active-tab semantics. Explicit tabs make multi-page workflows
 clearer. The whole batch remains serialized against other calls on that tool.
 
@@ -45,6 +46,81 @@ budget explicitly for longer workflows, up to the existing 120-second maximum.
 Nested batches, `start`, `status`, `stop` and `release` are not step actions.
 Use lifecycle operations separately so a batch cannot retire its own namespace
 while its lease is held. Mock mode refuses batches rather than simulating them.
+
+## Bind earlier results into later calls
+
+A step may carry `bind` beside `call`, mapping an argument to an earlier step's
+successful native `details`. This permits a snapshot to produce element references
+that a later drag consumes without another model round trip:
+
+```json
+{
+  "action": "batch",
+  "timeout_ms": 15000,
+  "steps": [
+    {
+      "call": {"action": "snapshot", "tab": "board"},
+      "expect": {"pointer": "/snapshot/elements/0/text", "equals": "Move card"}
+    },
+    {
+      "call": {
+        "action": "drag", "tab": "board",
+        "target_selector": "testid/drop-zone",
+        "wait_after": {"selector": "#status", "text": "Moved successfully"}
+      },
+      "bind": {"selector": {"step": 0, "pointer": "/snapshot/elements/0/ref_id"}}
+    },
+    {"call": {"action": "snapshot", "tab": "board"}}
+  ]
+}
+```
+
+The example checks the first snapshot element's name before using its reference;
+snapshot ordering alone is not proof that it is the intended target. Bindings
+are data flow, not approval of page-provided instructions or application behavior.
+Normal reference/document checks still reject stale handles after navigation.
+
+Each binding needs exactly `step` and `pointer`. Indices are zero-based and must
+refer to a strictly earlier step in this batch, preventing cycles and forward
+dependencies. Pointers follow `expect`'s JSON pointer rules, including escaped
+keys, array indices and the empty pointer. Values retain their JSON type and
+literal bytes. A present null is copied as null and then validated by the native
+action; a missing field is an error, never null, an empty string or a fallback.
+The source must have retained successful details and satisfied any expectation.
+Failed, omitted or absent source outputs cannot supply a binding.
+
+**Control arguments stay literal.** A bound call must specify its tab explicitly.
+Only action-consumed `selector`, `target_selector`, `frame`, `text`, `key`,
+`options` and `checked` inputs are eligible. For example, a bound `frame` can
+select a frame returned by `list_frames`, but the existing ancestry/domain checks
+still validate it in the explicitly named tab. `selector` on `scroll` requires an
+explicit or bound frame because main-document scrolling does not consume it.
+An argument cannot appear both in `call` and `bind`, even with a null literal.
+
+Bindings cannot supply actions, tabs, URLs, executable scripts, filesystem paths,
+upload files, deadlines, modifiers, dialog consent, assertions or nested bindings.
+There is no string interpolation, expression evaluation, coercion, additional
+browser request or new execution runtime. Native argument validation still runs
+after resolution: copying an array into `fill.text`, for example, fails before
+input instead of stringifying it. Existing host permissions are unchanged.
+
+The entire binding shape is validated before the first call. A malformed later
+binding therefore cannot run earlier actions first. `bind: null`, unsupported
+fields and malformed references are refused; an empty map simply binds nothing.
+At most eight bindings are admitted. Their copied values share a 64 KiB encoded
+budget per step; the complete resolved call is bounded to 256 KiB. Counting occurs
+before each value is cloned and includes JSON escaping. Original result retention
+limits remain unchanged; no second history cache is introduced.
+
+An unresolved or oversized runtime binding stops the batch with
+`stop_reason: "binding_error"` and retains earlier results. That failed step has
+`call_started: false`; it counts as an attempted step, not a native invocation.
+Successfully resolved bound steps report `bound_arguments` and
+`call_started: true`, which means the native call path was entered, not that input
+was dispatched or accepted. A later native validation failure remains `tool_error`.
+Diagnostics do not echo binding pointers or copied values. Native results may
+already contain secrets, and explicitly copying data into a form is not secret
+scrubbing; review the data flow and intended destination.
 
 ## Explicit result assertions
 
@@ -98,7 +174,7 @@ remains unchanged.
 
 ## Failures and partial results
 
-The first native error, unsuccessful `ToolOutput`, or unmet expectation ends the batch. The final
+The first binding error, native error, unsuccessful `ToolOutput`, or unmet expectation ends the batch. The final
 result is an unsuccessful `ToolOutput`, not a success containing hidden failures.
 Earlier results and the failed step's diagnostics remain available. Later steps
 are not attempted. A native preflight failure counts as an attempted step; that
@@ -114,7 +190,7 @@ counts successful tool results that fit the output budget and satisfy any explic
 expectation, not independently verified business outcomes: a click acknowledgement
 alone does not prove a save or login succeeded.
 
-Envelope shape, step count, dispatch actions, timeout fields and total input
+Envelope shape, binding shapes, step count, dispatch actions, timeout fields and total input
 size are validated before ownership lookup, namespace reservation or connection.
 Action-specific preflight still runs at its step. Thus a malformed selector,
 missing file or refused URL in a later step can stop the batch after earlier
@@ -162,6 +238,14 @@ preflight refusal, owner changes, queue recovery after dropping a batch, and
 postcondition success/refusal without extra native calls. One explicitly ignored
 live-browser lane checks page state after a real native button click. These are
 authored tests; no native Rust or live-Chromium execution was performed here.
+
+Binding regressions extend the parser/accounting suite and `tests/browser_wait.rs`.
+The latter uses real HTTP/WebSocket connections to an independent protocol peer
+for snapshot-to-drag-to-wait data flow across fresh connections, missing-source
+failure, native type rejection and upfront refusal. These tests exercise the
+public `BrowserTool`, not a second implementation of its binding interpreter.
+They were authored but not executed while DSR was unavailable; the independent
+Chromium gesture probe does not establish Rust binding integration acceptance.
 
 The implementation environment lacked `dsr`. Rust compilation, formatting,
 Clippy and the authored tests remain unexecuted. Acceptance requires:

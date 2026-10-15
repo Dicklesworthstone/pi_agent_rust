@@ -238,6 +238,9 @@ mod wire {
     enum Mode {
         Ready, Missing, Pending, Malformed, Navigate, Cancelled,
         NavDocument, NavHistory, NavReload, NavUnchanged, NavOutside, NavError, NavMismatch, NavCancelled, NavDrift,
+        Gesture, GestureSourceGone, GestureTargetMoved, GestureNavigate, GesturePressError,
+        GestureMoveError, GestureReleaseError, GestureCancelled, GestureAfterMalformed,
+        Bindings, BindingMissing, BindingType,
     }
 
     impl Mode {
@@ -259,8 +262,10 @@ mod wire {
 
     #[derive(Default)]
     struct Seen {
+        connections: usize,
         methods: Vec<String>,
         inputs: Vec<String>,
+        pointer_events: Vec<Value>,
         observations: usize,
         readiness_reads: usize,
     }
@@ -339,13 +344,22 @@ mod wire {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let worker = thread::spawn(move || {
-            let mut http = accept(&listener);
+        let worker = thread::spawn(move || serve_connections(&listener, mode, cancel));
+        (format!("http://{address}"), worker)
+    }
+
+    fn serve_connections(listener: &TcpListener, mode: Mode, cancel: Option<pi::agent_cx::AgentCx>) -> Seen {
+        let address = listener.local_addr().unwrap();
+        let mut seen = Seen::default();
+        // Dependent batches retain browser state, not the CDP connection.
+        // Exercise fresh discovery/attachments with one deterministic peer.
+        let mut serve_connection = || {
+            let mut http = accept(listener);
             assert!(headers(&mut http).starts_with("GET /json/version "));
             let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/wait-fixture")}).to_string();
             write!(http, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             drop(http);
-            let mut socket = accept(&listener);
+            let mut socket = accept(listener);
             let request_headers = headers(&mut socket);
             assert!(request_headers.starts_with("GET /devtools/browser/wait-fixture "));
             let key = request_headers.lines().find_map(|line| {
@@ -354,14 +368,14 @@ mod wire {
             }).unwrap();
             let key = asupersync::net::websocket::compute_accept_key(key);
             write!(socket,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {key}\r\n\r\n").unwrap();
-            let mut seen = Seen::default();
+            seen.connections += 1;
             while let Some(request) = request(&mut socket) {
                 assert!(seen.methods.len() < 2048, "unbounded wait protocol loop");
                 let method = request["method"].as_str().unwrap();
                 let params = &request["params"];
                 seen.methods.push(method.into());
                 let result = match method {
-                    "Browser.setDownloadBehavior" | "Page.bringToFront" | "Runtime.releaseObject" => json!({}),
+                    "Browser.setDownloadBehavior" | "Page.bringToFront" | "Runtime.releaseObject" | "Input.cancelDragging" => json!({}),
                     "Target.getTargets" => json!({"targetInfos":[{"targetId":"page","type":"page",
                         "url":if mode.navigation() {"https://app.example/start"} else {"about:blank"},"title":"Wait fixture"}]}),
                     "Target.attachToTarget" => json!({"sessionId":"session"}),
@@ -371,18 +385,28 @@ mod wire {
                         json!({"frameTree":{"frame":frame}})
                     }
                     "Page.getFrameTree" => json!({"frameTree":{"frame":{
-                        "id":"main","loaderId":if mode == Mode::Navigate && !seen.inputs.is_empty() {"new"} else {"old"},"url":"about:blank"
+                        "id":"main","loaderId":if (mode == Mode::Navigate && !seen.inputs.is_empty()) ||
+                            (mode == Mode::GestureNavigate && seen.inputs.iter().any(|input|input == "mousePressed")) {"new"} else {"old"},"url":"about:blank"
                     }}}),
                     "DOM.getDocument" => json!({"root":{"nodeId":1}}),
                     "DOM.querySelector" => {
                         let id = match params["selector"].as_str() {
                             Some("#trigger") => 10,
+                            Some("#drop") => 30,
                             Some("#ready") => if mode == Mode::Missing { 0 } else { 20 },
                             _ => panic!("unexpected fixture selector"),
                         };
                         json!({"nodeId":id})
                     }
-                    "DOM.describeNode" => json!({"node":{"backendNodeId":params["nodeId"],"localName":"div","nodeName":"DIV"}}),
+                    "DOM.describeNode" => json!({"node":{"backendNodeId":params.get("backendNodeId").unwrap_or(&params["nodeId"]),"localName":"div","nodeName":"DIV"}}),
+                    "Accessibility.getFullAXTree" => {
+                        assert!(matches!(mode, Mode::Bindings | Mode::BindingMissing | Mode::BindingType));
+                        json!({"nodes":[
+                            {"nodeId":"source","backendDOMNodeId":10,"role":{"value":"button"},"name":{"value":"Source"}},
+                            {"nodeId":"drop","backendDOMNodeId":30,"role":{"value":"button"},"name":{"value":"Destination"}},
+                            {"nodeId":"ready","backendDOMNodeId":20,"role":{"value":"status"},"name":{"value":"Ready"}}
+                        ]})
+                    }
                     "Page.createIsolatedWorld" => json!({"executionContextId":7}),
                     "DOM.resolveNode" => json!({"object":{"objectId":format!("node-{}",params["backendNodeId"])}}),
                     "DOM.scrollIntoViewIfNeeded" => json!({}),
@@ -401,10 +425,23 @@ mod wire {
                             "state":if seen.readiness_reads < 3 {"interactive"} else {"complete"},
                             "domContentLoaded":seen.readiness_reads >= 2,"load":seen.readiness_reads >= 3}}})
                     }
+                    "Runtime.evaluate" => {
+                        assert!(matches!(mode, Mode::Bindings | Mode::BindingMissing | Mode::BindingType));
+                        assert_eq!(params["expression"], "({url: location.href, title: document.title})");
+                        json!({"result":{"type":"object","value":{"url":"about:blank","title":"Wait fixture"}}})
+                    }
                     "Runtime.callFunctionOn" => {
                         let options = &params["arguments"][0]["value"];
                         if options == "point" {
-                            json!({"result":{"type":"object","value":{"x":20,"y":30}}})
+                            let x = if params["objectId"] == "node-30" { 140 } else { 20 };
+                            json!({"result":{"type":"object","value":{"x":x,"y":30}}})
+                        } else if options == "gesture_alive" {
+                            if mode == Mode::GestureSourceGone && seen.inputs.iter().any(|input|input == "mousePressed") {
+                                json!({"exceptionDetails":{"text":"PRIVATE-CANARY"}})
+                            } else { json!({"result":{"type":"boolean","value":true}}) }
+                        } else if options == "gesture_bounds" {
+                            let drift = if mode == Mode::GestureTargetMoved && seen.inputs.iter().any(|input|input == "mousePressed") {10} else {0};
+                            json!({"result":{"type":"object","value":{"left":120+drift,"top":10,"right":160+drift,"bottom":50}}})
                         } else {
                             assert!(options.is_object());
                             assert!(options["exact"].is_boolean());
@@ -418,7 +455,7 @@ mod wire {
                                 continue;
                             }
                             let visible = mode != Mode::Pending && seen.observations >= 3;
-                            let value = if mode == Mode::Malformed {
+                            let value = if matches!(mode, Mode::Malformed | Mode::GestureAfterMalformed) {
                                 json!({"attached":false,"visible":true,"textMatches":null})
                             } else {
                                 json!({"attached":true,"visible":visible,
@@ -429,6 +466,20 @@ mod wire {
                     }
                     "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" => {
                         seen.inputs.push(params["type"].as_str().unwrap().into());
+                        if method == "Input.dispatchMouseEvent" {
+                            seen.pointer_events.push(params.clone());
+                            let fail = (mode == Mode::GesturePressError && params["type"] == "mousePressed") ||
+                                (mode == Mode::GestureReleaseError && params["type"] == "mouseReleased") ||
+                                (mode == Mode::GestureMoveError && params["type"] == "mouseMoved" && params["buttons"] == 1);
+                            if fail {
+                                if !reply(&mut socket, &json!({"id":request["id"],"sessionId":request["sessionId"],"error":{"message":"PRIVATE-CANARY"}})) { break; }
+                                continue;
+                            }
+                            if mode == Mode::GestureCancelled && params["type"] == "mouseMoved" && params["buttons"] == 1 {
+                                cancel.as_ref().unwrap().set_cancel_requested(true);
+                                continue;
+                            }
+                        }
                         json!({})
                     }
                     _ => panic!("unhandled native wait method {method}"),
@@ -436,13 +487,14 @@ mod wire {
                 let response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":result});
                 if !reply(&mut socket, &response) { break; }
             }
-            seen
-        });
-        (format!("http://{address}"), worker)
+        };
+        let connection_count = if mode == Mode::Bindings { 3 } else { 1 };
+        for _ in 0..connection_count { serve_connection(); }
+        seen
     }
 
     fn run(mode: Mode, args: Value) -> (pi::error::Result<pi::tools::ToolOutput>, Seen) {
-        let owner = matches!(mode, Mode::Cancelled | Mode::NavCancelled).then(pi::agent_cx::AgentCx::for_request);
+        let owner = matches!(mode, Mode::Cancelled | Mode::NavCancelled | Mode::GestureCancelled).then(pi::agent_cx::AgentCx::for_request);
         let (endpoint, worker) = peer(mode, owner.clone());
         let dir = tempfile::tempdir().unwrap();
         let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
@@ -452,7 +504,7 @@ mod wire {
         } else {
             runtime.block_on(tool.execute("wire-wait",args,None))
         };
-        if matches!(mode, Mode::Cancelled | Mode::NavCancelled) {
+        if matches!(mode, Mode::Cancelled | Mode::NavCancelled | Mode::GestureCancelled) {
             // A fresh caller can reacquire both existing ownership lanes and
             // release its retained namespace without another network request.
             let released = runtime.block_on(tool.execute("after-cancel",json!({"action":"release"}),None)).unwrap();
@@ -460,7 +512,7 @@ mod wire {
         }
         drop(tool);
         let seen = worker.join().unwrap();
-        log("wire-traffic",json!({"methods":seen.methods,"inputs":seen.inputs,"observations":seen.observations,"readiness_reads":seen.readiness_reads}));
+        log("wire-traffic",json!({"connections":seen.connections,"methods":seen.methods,"inputs":seen.inputs,"observations":seen.observations,"readiness_reads":seen.readiness_reads}));
         (result, seen)
     }
 
@@ -702,5 +754,214 @@ mod wire {
         assert!(!result.unwrap().is_error);
         assert_eq!(seen.inputs, vec!["keyDown", "keyUp"]);
         assert_eq!(seen.readiness_reads, 3);
+    }
+
+    fn drag_call() -> Value {
+        json!({"action":"drag","tab":"page","selector":"#trigger","target_selector":"#drop",
+            "drag_steps":3,"duration_ms":0,"modifiers":["Shift"],"timeout_ms":5000})
+    }
+
+    #[test]
+    fn native_hover_opens_no_click_pair_and_can_wait_for_its_dom_result() {
+        let (result, seen) = run(Mode::Gesture, json!({"action":"hover","tab":"page",
+            "selector":"#trigger","wait_after":{"selector":"#ready","text":"Ready now"}}));
+        let result = result.unwrap();
+        assert!(!result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["dispatch_acknowledged"], true);
+        assert_eq!(details["input_method"], "native-pointer");
+        assert_eq!(details["wait_after"]["satisfied"], true);
+        assert_eq!(seen.inputs, vec!["mouseMoved"]);
+        assert_eq!(seen.pointer_events[0]["buttons"], 0);
+        assert_eq!(seen.pointer_events[0]["button"], "none");
+        assert_eq!(seen.observations, 3);
+    }
+
+    #[test]
+    fn native_drag_keeps_one_press_and_original_coordinates_through_postcondition() {
+        let mut args = drag_call();
+        args["wait_after"] = json!({"selector":"#ready","text":"Ready now"});
+        let (result, seen) = run(Mode::Gesture, args);
+        let result = result.unwrap();
+        assert!(!result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["dispatch_acknowledged"], true);
+        assert_eq!(details["delivery_verified"], false);
+        assert_eq!(details["action_replayed"], false);
+        assert_eq!(details["gesture"]["moves_acknowledged"], 5);
+        assert_eq!(details["gesture"]["release_acknowledged"], true);
+        assert_eq!(details["wait_after"]["satisfied"], true);
+        assert_eq!(seen.inputs, vec!["mouseMoved","mousePressed","mouseMoved","mouseMoved",
+            "mouseMoved","mouseMoved","mouseReleased"]);
+        assert_eq!(seen.pointer_events.iter().map(|event|event["x"].as_f64().unwrap()).collect::<Vec<_>>(),
+            vec![20.0,20.0,60.0,100.0,140.0,140.0,140.0]);
+        assert!(seen.pointer_events[1..6].iter().all(|event|event["button"] == "left" && event["buttons"] == 1));
+        assert!(seen.pointer_events.iter().all(|event|event["modifiers"] == 8));
+        assert_eq!(seen.pointer_events.last().unwrap()["buttons"], 0);
+        assert!(!seen.methods.iter().any(|method|method == "Input.cancelDragging"));
+    }
+
+    #[test]
+    fn observed_drag_failures_cancel_then_release_once_without_retargeting_or_payload_leaks() {
+        for mode in [Mode::GestureSourceGone,Mode::GestureTargetMoved,Mode::GestureNavigate,
+            Mode::GesturePressError,Mode::GestureMoveError] {
+            let (result, seen) = run(mode, drag_call());
+            let result = result.unwrap();
+            assert!(result.is_error);
+            assert!(!serde_json::to_string(&result).unwrap().contains("PRIVATE-CANARY"));
+            let details = result.details.unwrap();
+            assert_eq!(details["dispatch_acknowledged"], false);
+            assert_eq!(details["gesture"]["cancel_attempted"], true);
+            assert_eq!(details["gesture"]["cancel_acknowledged"], true);
+            assert_eq!(details["gesture"]["release_acknowledged"], true);
+            assert_eq!(details["gesture"]["press_acknowledged"], mode != Mode::GesturePressError);
+            assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mousePressed").count(), 1);
+            assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mouseReleased").count(), 1);
+            assert_eq!(seen.methods.iter().filter(|method|method.as_str() == "Input.cancelDragging").count(), 1);
+            let last = seen.pointer_events.last().unwrap();
+            assert_eq!(last["type"], "mouseReleased");
+            assert_eq!(last["x"].as_f64().unwrap(), if mode == Mode::GestureMoveError {60.0} else {20.0});
+            let cancel = seen.methods.iter().position(|method|method == "Input.cancelDragging").unwrap();
+            assert_eq!(seen.methods[cancel+1], "Input.dispatchMouseEvent");
+        }
+    }
+
+    #[test]
+    fn a_failed_release_acknowledgement_does_not_send_another_release_or_press() {
+        let (result, seen) = run(Mode::GestureReleaseError, drag_call());
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["gesture"]["release_attempted"], true);
+        assert_eq!(details["gesture"]["release_acknowledged"], false);
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mousePressed").count(), 1);
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mouseReleased").count(), 1);
+        assert!(!seen.methods.iter().any(|method|method == "Input.cancelDragging"));
+    }
+
+    #[test]
+    fn cancelled_drag_drops_its_native_connection_and_releases_the_conversation_lane() {
+        let (result, seen) = run(Mode::GestureCancelled, drag_call());
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mousePressed").count(), 1);
+        assert_eq!(seen.pointer_events.iter().filter(|event|event["type"] == "mouseMoved" && event["buttons"] == 1).count(), 1);
+        // run() also proves a fresh release caller can reacquire admission.
+        // Cleanup can be prevented by cancellation; do not claim it happened.
+    }
+
+    #[test]
+    fn a_failed_drag_stops_the_native_batch_with_its_acknowledged_progress_retained() {
+        let (result, seen) = run(Mode::GestureSourceGone, json!({"action":"batch","timeout_ms":5000,"steps":[
+            {"call":drag_call()}, {"call":{"action":"click","tab":"page","selector":"#trigger"}}
+        ]}));
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["completed_steps"], 0);
+        assert_eq!(details["attempted_steps"], 1);
+        assert_eq!(details["remaining_steps"], 1);
+        assert_eq!(details["steps"][0]["details"]["gesture"]["press_acknowledged"], true);
+        assert_eq!(seen.inputs, vec!["mouseMoved","mousePressed","mouseReleased"]);
+    }
+
+    #[test]
+    fn drag_postcondition_failure_preserves_the_finished_gesture_without_replay() {
+        let mut args = drag_call();
+        args["wait_after"] = json!({"selector":"#ready"});
+        let (result, seen) = run(Mode::GestureAfterMalformed, args);
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["dispatch_acknowledged"], true);
+        assert_eq!(details["gesture"]["release_acknowledged"], true);
+        assert_eq!(details["wait_after"]["satisfied"], false);
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mousePressed").count(), 1);
+        assert_eq!(seen.observations, 1);
+    }
+
+    #[test]
+    fn snapshot_result_bindings_drive_original_drag_references_and_later_readiness() {
+        let (result, seen) = run(Mode::Bindings, json!({"action":"batch","timeout_ms":10000,"steps":[
+            {"call":{"action":"snapshot","tab":"page"}},
+            {"call":{"action":"drag","tab":"page","drag_steps":3,"duration_ms":0},"bind":{
+                "selector":{"step":0,"pointer":"/snapshot/elements/0/ref_id"},
+                "target_selector":{"step":0,"pointer":"/snapshot/elements/1/ref_id"}
+            }},
+            {"call":{"action":"wait_for","tab":"page","text":"Ready now"},"bind":{
+                "selector":{"step":0,"pointer":"/snapshot/elements/2/ref_id"}
+            },"expect":{"pointer":"/matched","equals":true}}
+        ]}));
+        let result = result.unwrap();
+        assert!(!result.is_error, "{}", serde_json::to_string(&result).unwrap());
+        let details = result.details.unwrap();
+        assert_eq!(details["completed_steps"], 3);
+        assert_eq!(details["steps"][1]["bound_arguments"], 2);
+        assert_eq!(details["steps"][1]["details"]["gesture"]["release_acknowledged"], true);
+        assert_eq!(details["steps"][2]["details"]["selector"], details["steps"][0]["details"]["snapshot"]["elements"][2]["ref_id"]);
+        assert_eq!(details["steps"][2]["expectation"], "passed");
+        assert_eq!(seen.connections, 3);
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mousePressed").count(), 1);
+        assert_eq!(seen.inputs.iter().filter(|kind|kind.as_str() == "mouseReleased").count(), 1);
+        assert_eq!(seen.observations, 3);
+        assert!(!seen.methods.iter().any(|method|method == "DOM.querySelector"), "bound refs must use the retained snapshot, not replacement CSS lookups");
+    }
+
+    #[test]
+    fn missing_result_binding_stops_before_connection_and_keeps_the_original_snapshot() {
+        let (result, seen) = run(Mode::BindingMissing, json!({"action":"batch","steps":[
+            {"call":{"action":"snapshot","tab":"page"}},
+            {"call":{"action":"hover","tab":"page"},"bind":{"selector":{"step":0,"pointer":"/PRIVATE-CANARY"}}},
+            {"call":{"action":"click","tab":"page","selector":"#trigger"}}
+        ]}));
+        let result = result.unwrap();
+        assert!(result.is_error);
+        assert!(!serde_json::to_string(&result).unwrap().contains("PRIVATE-CANARY"));
+        let details = result.details.unwrap();
+        assert_eq!(details["stop_reason"], "binding_error");
+        assert_eq!(details["completed_steps"], 1);
+        assert_eq!(details["failed_step"], 1);
+        assert_eq!(details["remaining_steps"], 1);
+        assert_eq!(details["steps"][1]["call_started"], false);
+        assert_eq!(details["steps"][0]["details"]["snapshot"]["elements"].as_array().unwrap().len(), 3);
+        assert_eq!(seen.connections, 1);
+        assert!(seen.inputs.is_empty());
+    }
+
+    #[test]
+    fn bound_values_still_pass_native_type_validation_without_coercion_or_input() {
+        let (result, seen) = run(Mode::BindingType, json!({"action":"batch","steps":[
+            {"call":{"action":"snapshot","tab":"page"}},
+            {"call":{"action":"fill","tab":"page","selector":"#trigger"},"bind":{
+                "text":{"step":0,"pointer":"/snapshot/elements"}
+            }},
+            {"call":{"action":"click","tab":"page","selector":"#trigger"}}
+        ]}));
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["stop_reason"], "tool_error");
+        assert_eq!(details["steps"][1]["bound_arguments"], 1);
+        assert_eq!(details["steps"][1]["call_started"], true);
+        assert_eq!(details["completed_steps"], 1);
+        assert_eq!(seen.connections, 1, "native argument validation must precede its connection");
+        assert!(seen.inputs.is_empty());
+    }
+
+    #[test]
+    fn invalid_later_binding_is_rejected_before_the_first_native_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("not-a-CDP-endpoint");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for bind in [json!({"selector":{"step":2,"pointer":"/x"}}),
+            json!({"script":{"step":0,"pointer":"/x"}}), Value::Null] {
+            let args = json!({"action":"batch","steps":[
+                {"call":{"action":"snapshot","tab":"page"}},
+                {"call":{"action":"click","tab":"page"},"bind":bind}
+            ]});
+            let failure = runtime.block_on(tool.execute("binding-preflight", args, None)).unwrap_err().to_string();
+            log("binding-preflight", json!({"failure":failure}));
+            assert!(failure.contains("BROWSER_BATCH_"));
+            assert!(!failure.contains("CDP endpoint"));
+        }
     }
 }
