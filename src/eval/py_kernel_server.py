@@ -79,8 +79,9 @@ _REAL_STDIN = os.fdopen(os.dup(0), "r", encoding="utf-8")
 os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
 sys.stdin = sys.__stdin__ = os.fdopen(0, "r", encoding="utf-8")
 _BRIDGE_CALL = 0
-_BRIDGE_BUSY = False
-_KERNEL_THREAD = threading.get_ident()
+_BRIDGE_EXCHANGE = threading.Lock()
+_MAX_BRIDGE_REQUEST_BYTES = 1024 * 1024
+_MAX_BRIDGE_REPLY_BYTES = 16 * 1024 * 1024
 _CELL_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_CELL_LOOP)
 _CELL_CONTEXT = contextvars.copy_context()
@@ -118,6 +119,8 @@ class _CellOutput:
         self.cell_id = cell_id
         self.sequence = 0
         self.active = True
+        self.thread = threading.get_ident()
+        self.bridge_error = None
 
     def write(self, name, text):
         if not self.active or _OUTPUT_CONTEXT.get() is not self:
@@ -590,47 +593,80 @@ class ToolBridgeError(RuntimeError):
     pass
 
 
-def _bridge_owner():
-    # A task can outlive its cell even in the same retained event loop. Its
-    # ContextVars must not grant host I/O under the next cell's Rust lease.
-    # Copied worker contexts may print, but cannot compete for protocol stdin.
-    output = _OUTPUT_CONTEXT.get()
-    if output is None or not output.active:
-        raise ToolBridgeError("EVAL_BRIDGE_CLOSED: tool call belongs to an inactive cell")
-    if threading.get_ident() != _KERNEL_THREAD:
-        raise ToolBridgeError("EVAL_BRIDGE_THREAD: call tools on the owning cell's event-loop thread")
-    return output
-
-
 def _bridge_call(tool_name, tool_input):
-    global _BRIDGE_CALL, _BRIDGE_BUSY
-    _bridge_owner()
-    if _BRIDGE_BUSY:
-        raise ToolBridgeError("EVAL_BRIDGE_BUSY: another tool exchange already owns protocol stdin")
-    # Guard serialization too: a dict subclass can execute guest code while
-    # being encoded. Re-entry must fail before emitting a second request.
-    _BRIDGE_BUSY = True
-    try:
-        return _bridge_exchange(tool_name, tool_input)
-    finally:
-        _BRIDGE_BUSY = False
-
-
-def _bridge_exchange(tool_name, tool_input):
     global _BRIDGE_CALL
-    _BRIDGE_CALL += 1
-    call_id = _BRIDGE_CALL
-    _send_frame({"bridge": {"call": call_id, "tool": tool_name, "input": tool_input}})
-    line = _REAL_STDIN.readline()
-    if not line:
-        raise ToolBridgeError("bridge closed")
-    reply = json.loads(line)
-    result = reply.get("bridge_result", {})
-    if result.get("call") != call_id:
-        raise ToolBridgeError("bridge call id mismatch")
-    if not result.get("ok", False):
-        raise ToolBridgeError(result.get("error", "tool call failed"))
-    return result.get("content", "")
+    owner = _OUTPUT_CONTEXT.get()
+    # ContextVars travel with retained tasks. A later cell's main thread is
+    # not authority to borrow that cell's tool budget or consume its stdin.
+    if owner is None or not owner.active:
+        raise ToolBridgeError("EVAL_BRIDGE_CLOSED: tool call belongs to an inactive cell")
+    if owner.thread != threading.get_ident():
+        raise ToolBridgeError("EVAL_BRIDGE_THREAD: tool calls must run on the cell thread")
+    if owner.bridge_error is not None:
+        raise ToolBridgeError(owner.bridge_error)
+    if type(tool_name) is not str or not tool_name or type(tool_input) is not dict:
+        raise TypeError("EVAL_BRIDGE_INPUT: expected a tool name and JSON-object arguments")
+    if len(tool_name) > 128:
+        raise ValueError("EVAL_BRIDGE_LIMIT: tool name exceeds 128 characters")
+    # This is a cooperative kernel contract, not a sandbox against code that
+    # deliberately accesses private globals/fds. Validate before serialization
+    # so custom objects cannot re-enter the protocol from an encoder callback.
+    _display_json_shape(tool_input)
+    if not _BRIDGE_EXCHANGE.acquire(blocking=False):
+        raise ToolBridgeError("EVAL_BRIDGE_BUSY: another tool exchange is in progress")
+    try:
+        call_id = _BRIDGE_CALL + 1
+        frame = {"id": owner.cell_id, "bridge": {
+            "call": call_id, "tool": tool_name, "input": tool_input,
+        }}
+        # Stop serialization at the byte budget rather than constructing an
+        # arbitrarily large aggregate of individually valid argument strings.
+        chunks = []
+        size = 1  # newline
+        encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        for chunk in encoder.iterencode(frame):
+            size += len(chunk.encode("utf-8"))
+            if size > _MAX_BRIDGE_REQUEST_BYTES:
+                raise ValueError("EVAL_BRIDGE_LIMIT: tool request exceeds 1 MiB")
+            chunks.append(chunk)
+        encoded = "".join(chunks) + "\n"
+        _BRIDGE_CALL = call_id
+        try:
+            # Send the admitted immutable snapshot, never re-serialize mutable
+            # guest arguments after their size check.
+            with _PROTOCOL_WRITE_LOCK:
+                _REAL_STDOUT.write(encoded)
+                _REAL_STDOUT.flush()
+            # Bound even an unterminated or corrupt host reply. The character
+            # cap bounds TextIO buffering; enforce the UTF-8 byte cap as well.
+            line = _REAL_STDIN.readline(_MAX_BRIDGE_REPLY_BYTES + 1)
+            if (not line.endswith("\n")
+                    or len(line.encode("utf-8")) > _MAX_BRIDGE_REPLY_BYTES):
+                raise ValueError("missing, incomplete or oversized tool reply")
+            reply = json.loads(line)
+            if type(reply) is not dict or set(reply) != {"bridge_result"}:
+                raise ValueError("unexpected tool reply envelope")
+            result = reply["bridge_result"]
+            if (type(result) is not dict or type(result.get("call")) is not int
+                    or result["call"] != call_id or type(result.get("ok")) is not bool):
+                raise ValueError("tool reply identity or status mismatch")
+            field = "content" if result["ok"] else "error"
+            if type(result.get(field)) is not str:
+                raise ValueError("tool reply must contain text")
+        except BaseException as error:
+            # An interrupted or invalid exchange may have left a reply on
+            # stdin. Never reuse that channel, even if user code catches this
+            # exception. The native host rejects bridgeError on the final
+            # response and retires the process before another request.
+            owner.bridge_error = "EVAL_BRIDGE_PROTOCOL: tool exchange did not complete; kernel must be reset"
+            raise ToolBridgeError(owner.bridge_error) from error
+        if not result["ok"]:
+            # A well-addressed tool refusal is an ordinary guest error, not
+            # corruption. It does not discard variables or poison later calls.
+            raise ToolBridgeError(result["error"])
+        return result["content"]
+    finally:
+        _BRIDGE_EXCHANGE.release()
 
 
 class _PiTools:
@@ -971,6 +1007,8 @@ async def _execute_cell(code, displays, output):
             plot_error = _error_text()
         if plot_error is not None:
             error = (error or "") + "\nEVAL_PLOT_OUTPUT: plot finalization failed\n" + plot_error
+        if output.bridge_error is not None:
+            error = (error or "") + "\n" + output.bridge_error
         return error is None, result if error is None else None, error
     finally:
         # Child tasks retain this particular sink. Once the cell ends they
@@ -1001,7 +1039,7 @@ def run_cell(code, cell_id):
             output.active = False
             sequence = output.sequence
         sys.stdout, sys.stderr = old_out, old_err
-    return ok, result, error, displays.frames, sequence
+    return ok, result, error, displays.frames, sequence, output.bridge_error
 
 
 def main():
@@ -1014,7 +1052,7 @@ def main():
             continue
         try:
             request = json.loads(line)
-            ok, result, error, displays, sequence = run_cell(request.get("code", ""), request.get("id"))
+            ok, result, error, displays, sequence, bridge_error = run_cell(request.get("code", ""), request.get("id"))
             response = {
                 "id": request.get("id"),
                 "ok": ok,
@@ -1023,6 +1061,8 @@ def main():
                 "displays": displays,
                 "outputSequence": sequence,
             }
+            if bridge_error is not None:
+                response["bridgeError"] = bridge_error
             if ok:
                 response["result"] = result
             else:

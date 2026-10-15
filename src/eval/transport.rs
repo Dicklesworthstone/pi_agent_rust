@@ -70,6 +70,12 @@ pub(super) fn validate_response(frame: &Value, expected_id: u64) -> Result<()> {
     if frame.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Err(invalid("response belongs to a different cell"));
     }
+    // The Python receiver cannot safely resume after an interrupted or
+    // malformed bridge exchange: unread reply bytes may remain on its stdin.
+    // Guest code catching that exception must not make the channel reusable.
+    if frame.get("bridgeError").is_some() {
+        return Err(invalid("EVAL_BRIDGE_PROTOCOL: incomplete tool exchange"));
+    }
     let ok = frame.get("ok").and_then(Value::as_bool)
         .ok_or_else(|| invalid("response status must be boolean"))?;
     if !frame.get("stdout").is_some_and(Value::is_string)
@@ -152,6 +158,21 @@ mod tests {
             json!({"bridge":{"call":1,"tool":"read","input":{}},"ok":true}),
         ] {
             assert!(validate_bridge(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn poisoned_bridge_retires_even_an_apparently_successful_cell() {
+        for marker in [json!("incomplete"), Value::Null, json!(false)] {
+            for ok in [true, false] {
+                let response = json!({
+                    "id":7, "ok":ok, "stdout":"", "stderr":"",
+                    "result":"42", "error":"caught", "bridgeError":marker,
+                });
+                let error = validate_response(&response, 7).unwrap_err().to_string();
+                assert!(error.contains("EVAL_BRIDGE_PROTOCOL"));
+                assert!(error.contains("EVAL_STATE_RESET"));
+            }
         }
     }
 
