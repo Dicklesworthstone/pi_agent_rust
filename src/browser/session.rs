@@ -107,6 +107,40 @@ impl Sessions {
         Ok(())
     }
 
+    /// Keep the same native future across checks. During a contended identity
+    /// lookup, suspend its polling rather than continuing to dispatch browser
+    /// commands with unconfirmed ownership. A mismatch drops it permanently.
+    /// Already-sent remote commands and page scripts are not rolled back.
+    async fn run_owned<F: Future>(
+        &self,
+        expected: &str,
+        budget: &Budget,
+        future: F,
+    ) -> Result<F::Output> {
+        let mut operation = Box::pin(budget.owner.with_current(future));
+        loop {
+            self.require_identity(expected, budget).await?;
+            budget.checkpoint()?;
+            if let Poll::Ready(result) = futures::poll!(operation.as_mut()) {
+                budget.checkpoint()?;
+                return Ok(result);
+            }
+            if !budget.owner.capabilities().time {
+                return Err(error("BROWSER_SESSION_PERMISSION: active ownership observation requires timer capability"));
+            }
+            let wait = budget.deadline.saturating_duration_since(Instant::now()).min(POLL_INTERVAL);
+            let time = budget.owner.time();
+            let sleeper = Box::pin(time.sleep(wait));
+            match futures::future::select(operation, sleeper).await {
+                futures::future::Either::Left((result, _)) => {
+                    budget.checkpoint()?;
+                    return Ok(result);
+                }
+                futures::future::Either::Right(((), pending)) => operation = pending,
+            }
+        }
+    }
+
     pub(super) async fn execute(&self, tool: &BrowserTool, args: &Value) -> Result<ToolOutput> {
         let action = required(args, "action")?;
         let budget = Budget::new(args, action)?;
@@ -135,7 +169,7 @@ impl Sessions {
         // by assuming an error means no side effect. Explicit release retires it.
         let retain = !matches!(action, "status" | "stop");
         let (namespace, reused) = self.select(&id, retain)?;
-        let result = budget.wait(tool.execute_in_namespace(&namespace, args)).await?;
+        let result = self.run_owned(&id, &budget, tool.execute_in_namespace(&namespace, args)).await?;
         // Stop belongs to the captured owner even if the frontend switched
         // during its execution. Do not postpone bookkeeping past that check.
         let stopped = action == "stop" && result.as_ref().is_ok_and(|value| !value.is_error);

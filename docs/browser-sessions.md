@@ -67,8 +67,25 @@ A call captures the live identity before waiting for a tool-wide asynchronous
 execution lease and rechecks it after admission and before result publication.
 Queued work never follows a later conversation switch. Backend effects always
 belong to the original namespace, including effects completed before a mismatch
-is detected. These boundary checks are not a live mid-operation identity watch,
-an atomic lock with frontend switching, or rollback of browser/network effects.
+is detected. Active native work also rechecks identity while pending, including
+quiet WebSocket reads, launch, downloads and diagnostic settle windows. An
+observed switch or unavailable identity permanently retires that invocation's
+future and connection; no action is replayed or rebound to the new conversation.
+The original retained namespace remains available when switching back. Startup
+that has not yet been adopted still drops through its existing process guard.
+
+While an identity lookup is pending, the original browser future is not polled:
+session-lock contention is an asynchronous wait, not permission to dispatch more
+commands or an invented missing-session identity. Once observed, failure remains
+failure even if the frontend switches back before the error is returned.
+
+This is cooperative observation, not an atomic lock with frontend switching.
+An A-to-B-to-A transition entirely between observations is not detectable. A
+single synchronous poll can issue multiple commands or block before yielding.
+Closing the CDP connection prevents further local dispatch, but does not prove
+that already-sent JavaScript, network requests, page timers or downloads stopped.
+Completed effects and exported files are not rolled back. Hosts must still
+route the final response/error to its originating conversation.
 
 The existing `timeout_ms` budget now also covers identity resolution and queue
 wait, not just native startup/connection/action work. Its defaults remain 30,000
@@ -100,7 +117,12 @@ execution or approval authority.
 Namespace routing, release, capacity and queue regressions are in
 `src/browser/session/tests.rs`. Explicit mock cases test namespace plumbing, not
 Chromium behavior; idle lifecycle cases exercise the native public path without
-launching. Runtime acceptance requires the repository's DSR quality entrypoint:
+launching. `src/browser/session/tests/native.rs` exercises actual BrowserTool
+HTTP/WebSocket transport against a bounded protocol peer: independent named tabs,
+restoration, release, active switching, missing identity, cancellation and dropped
+futures. The peer is not Chromium. An ignored opt-in lane also exercises two
+actual managed Chromium profiles and verifies that stopping one preserves the
+other. Runtime acceptance requires the repository's DSR quality entrypoint:
 
 ```sh
 dsr quality --tool pi_agent_rust

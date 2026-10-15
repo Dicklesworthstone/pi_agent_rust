@@ -2,6 +2,8 @@ use super::*;
 use crate::tools::{Tool, ToolRegistry};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod native;
+
 fn run<F: Future>(future: F) -> F::Output {
     asupersync::runtime::RuntimeBuilder::current_thread()
         .blocking_threads(1, 8)
@@ -231,5 +233,64 @@ fn queue_wait_uses_the_same_deadline_and_never_acquires_a_namespace_after_timeou
         drop(lease);
         assert!(tool.sessions.namespaces.lock().unwrap().is_empty());
         assert!(tool.sessions.execution.try_lock().is_some());
+    });
+}
+
+#[test]
+fn active_ownership_failure_is_latched_and_drops_the_original_future() {
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let sessions = Sessions::default();
+    select(&sessions.scope, "owner-a");
+    let dropped = Arc::new(AtomicBool::new(false));
+    run(async {
+        let budget = Budget::new(&json!({"timeout_ms":1000}), "evaluate").unwrap();
+        let guard = Dropped(Arc::clone(&dropped));
+        let future = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        };
+        let mut active = Box::pin(sessions.run_owned("owner-a", &budget, future));
+        assert!(futures::poll!(active.as_mut()).is_pending());
+        let restore = sessions.scope.clone();
+        sessions.scope.bind(Arc::new(move || {
+            // Return the observed B even though the next lookup will see A.
+            select(&restore, "owner-a");
+            Box::pin(async { Some("owner-b".into()) })
+        }));
+        let failure = active.await.unwrap_err();
+        assert!(failure.to_string().contains("BROWSER_SESSION_CHANGED"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(sessions.identity(&budget).await.unwrap(), "owner-a");
+    });
+}
+
+#[test]
+fn active_backend_is_not_polled_while_live_identity_is_unresolved() {
+    let sessions = Sessions::default();
+    select(&sessions.scope, "owner-a");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&polls);
+    run(async {
+        let budget = Budget::new(&json!({"timeout_ms":60}), "evaluate").unwrap();
+        let backend = futures::future::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Poll::<()>::Pending
+        });
+        let mut active = Box::pin(sessions.run_owned("owner-a", &budget, backend));
+        assert!(futures::poll!(active.as_mut()).is_pending());
+        let at_lookup = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::clone(&at_lookup);
+        let poll_count = Arc::clone(&polls);
+        sessions.scope.bind(Arc::new(move || {
+            capture.store(poll_count.load(Ordering::SeqCst), Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }));
+        let error = active.await.unwrap_err();
+        assert!(error.to_string().contains("BROWSER_SESSION_TIMEOUT"));
+        assert!(at_lookup.load(Ordering::SeqCst) > 0);
+        assert_eq!(polls.load(Ordering::SeqCst), at_lookup.load(Ordering::SeqCst));
     });
 }
