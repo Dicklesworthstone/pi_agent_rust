@@ -3,10 +3,13 @@
 //! `agent://` lists this parent's children. `agent://<id>` reads an accepted
 //! output (or explicit lifecycle status), and `agent://<id>/findings/0/path`
 //! projects JSON without reparsing prose or trusting provisional transcripts.
-//! Document, Git, conflict and SSH schemes retain their existing contracts.
+//! `skill://<name>/<path>` reads supporting files or directory inventories;
+//! bare skill names continue to read their instructions. Document, Git,
+//! conflict and SSH schemes retain their existing contracts.
 
 pub(crate) mod agent;
 mod documents;
+mod skills;
 
 pub use documents::{
     ConflictRegion, ResolveOptions, ResolvedDoc, SSH_HOSTKEY_REMEDIATION, SshFailureKind,
@@ -45,6 +48,9 @@ fn agent_reference(path: &str) -> Result<Option<&str>> {
 /// projections distinguish pending, rejected, unavailable and missing data.
 /// Resolution never silently falls back to the filesystem.
 pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    if let Some(reference) = path.strip_prefix("skill://") {
+        return skills::resolve(reference, cwd);
+    }
     match agent_reference(path)? {
         Some(reference) => agent::resolve(reference),
         None => documents::resolve(path, cwd),
@@ -56,6 +62,9 @@ pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
 /// # Errors
 /// See [`resolve`]. Overrides do not grant access to another parent's agents.
 pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<ResolvedDoc> {
+    if let Some(reference) = path.strip_prefix("skill://") {
+        return skills::resolve(reference, cwd);
+    }
     match agent_reference(path)? {
         Some(reference) => agent::resolve(reference),
         None => documents::resolve_with(path, cwd, options),
