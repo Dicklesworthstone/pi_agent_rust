@@ -3,8 +3,9 @@
 //! QuickJS owns linking, cycles, live bindings and evaluation caching. This
 //! adapter owns file admission and the current cell's authority. JavaScript
 //! and TypeScript modules share one linker/cache; TypeScript is lowered to
-//! JavaScript before QuickJS sees it. No packages, virtual modules, native
-//! libraries, remote URLs or implicit extension search.
+//! JavaScript before QuickJS sees it. JSON imports require type: "json" and
+//! export parsed data through a host-defined module, never executable source.
+//! No packages, native libraries, remote URLs or implicit extension search.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -21,6 +22,7 @@ use rquickjs::{Ctx, Exception, Module};
 use crate::agent_cx::AgentCx;
 use crate::eval::lifecycle::source;
 
+mod data;
 mod typescript;
 
 const MAX_PATH_BYTES: usize = 4096;
@@ -34,6 +36,7 @@ type Admission<T> = std::result::Result<T, String>;
 enum ModuleLanguage {
     JavaScript,
     TypeScript,
+    Json,
 }
 
 struct Active {
@@ -134,7 +137,7 @@ impl ModuleFiles {
             || module_language(Path::new(name)).is_none()
         {
             return Err(
-                "EVAL_MODULE_SPECIFIER: use an explicit relative .js, .mjs, .ts, or .mts path without URL/query/fragment syntax"
+                "EVAL_MODULE_SPECIFIER: use an explicit relative .js, .mjs, .ts, .mts, or .json path without URL/query/fragment syntax"
                     .into(),
             );
         }
@@ -155,9 +158,17 @@ impl ModuleFiles {
         self.0.borrow().check()?;
         if !resolved.starts_with(&root) || module_language(&resolved).is_none() {
             return Err(
-                "EVAL_MODULE_PATH: module must be a .js, .mjs, .ts, or .mts file inside the workspace"
+                "EVAL_MODULE_PATH: module must be a .js, .mjs, .ts, .mts, or .json file inside the workspace"
                     .into(),
             );
+        }
+        // Canonical aliases may share a JavaScript/TypeScript module, but
+        // cannot turn a declared data import into executable source (or vice
+        // versa), even when QuickJS already cached the canonical target.
+        if (module_language(Path::new(name)) == Some(ModuleLanguage::Json))
+            != (module_language(&resolved) == Some(ModuleLanguage::Json))
+        {
+            return Err("EVAL_MODULE_TYPE: module alias changes its data/code type".into());
         }
         let resolved = resolved
             .to_str()
@@ -235,14 +246,34 @@ fn module_language(path: &Path) -> Option<ModuleLanguage> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("js" | "mjs") => Some(ModuleLanguage::JavaScript),
         Some("ts" | "mts") => Some(ModuleLanguage::TypeScript),
+        Some("json") => Some(ModuleLanguage::Json),
         _ => None,
     }
 }
 
-fn reject_attributes(
+fn validate_attributes(
     ctx: &Ctx<'_>,
+    name: &str,
     attributes: Option<ImportAttributes<'_>>,
 ) -> rquickjs::Result<()> {
+    if module_language(Path::new(name)) == Some(ModuleLanguage::Json) {
+        let valid = if let Some(attributes) = attributes {
+            let mut keys = attributes.keys();
+            keys.next().transpose()?.as_deref() == Some("type")
+                && keys.next().is_none()
+                && attributes.get_type()?.as_deref() == Some("json")
+        } else {
+            false
+        };
+        return if valid {
+            Ok(())
+        } else {
+            Err(Exception::throw_message(
+                ctx,
+                "EVAL_MODULE_ATTRIBUTES: JSON imports require exactly with { type: 'json' }",
+            ))
+        };
+    }
     if attributes.is_some_and(|attributes| attributes.keys().next().is_some()) {
         return Err(Exception::throw_message(
             ctx,
@@ -260,7 +291,7 @@ impl Resolver for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        reject_attributes(ctx, attributes)?;
+        validate_attributes(ctx, name, attributes)?;
         self.resolve_path(base, name)
             .map_err(|error| Exception::throw_message(ctx, &error))
     }
@@ -273,13 +304,19 @@ impl Loader for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
-        reject_attributes(ctx, attributes)?;
+        validate_attributes(ctx, name, attributes)?;
         let source = self
             .read_module(name)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         // Linking can recursively invoke our callbacks. Do not retain a
         // RefCell borrow (or any open file) across the engine boundary.
-        let module = Module::declare(ctx.clone(), name, source.code)?;
+        let module = if module_language(Path::new(name)) == Some(ModuleLanguage::Json) {
+            data::declare_json(ctx, name, &source.code)?
+        } else {
+            Module::declare(ctx.clone(), name, source.code)?
+        };
+        self.0.borrow().check()
+            .map_err(|error| Exception::throw_message(ctx, &error))?;
         let url = url::Url::from_file_path(name).map_err(|()| {
             Exception::throw_message(
                 ctx,
@@ -293,6 +330,9 @@ impl Loader for ModuleFiles {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod data_tests;
 
 #[cfg(test)]
 mod typescript_tests {
