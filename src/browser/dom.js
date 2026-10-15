@@ -58,6 +58,12 @@ function piBrowserElement(action, options) {
         })),
     };
   }
+  if (action === "gesture_alive") {
+    // Drag sources may hide/move after dragstart. They must still be the
+    // original connected node under an available composed ancestry.
+    if (unavailable(this)) throw new Error("Gesture source is disabled or inert");
+    return true;
+  }
   const style = getComputedStyle(this);
   const rect = this.getBoundingClientRect();
   const visible =
@@ -75,12 +81,15 @@ function piBrowserElement(action, options) {
   if (unavailable(this)) {
     throw new Error("Element is disabled or inert");
   }
-  if (action === "point") {
+  if (action === "point" || action === "gesture_bounds") {
     const left = Math.max(0, rect.left);
     const top = Math.max(0, rect.top);
     const right = Math.min(innerWidth, rect.right);
     const bottom = Math.min(innerHeight, rect.bottom);
     if (right <= left || bottom <= top) throw new Error("Element is outside the viewport");
+    // During motion the dragged node/preview can cover the destination. Bounds
+    // checks retain geometry; the final drop still requires the normal hit test.
+    if (action === "gesture_bounds") return { left, top, right, bottom };
     const x = (left + right) / 2;
     const y = (top + bottom) / 2;
     let hit = document.elementFromPoint(x, y);

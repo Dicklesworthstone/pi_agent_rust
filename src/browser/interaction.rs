@@ -385,6 +385,9 @@ async fn execute_input(
     args: &Value,
 ) -> Result<ToolOutput> {
     let action = required(args, "action")?;
+    if pointer::is_gesture(action) {
+        return pointer::gesture(owner, cdp, tab, refs, args).await;
+    }
     let scoped = cdp.frame_selected();
     if scoped && matches!(action, "press" | "type" | "fill" | "click" | "scroll") {
         cdp.command(owner, "Page.bringToFront", json!({})).await?;

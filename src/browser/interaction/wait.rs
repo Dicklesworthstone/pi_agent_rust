@@ -147,8 +147,8 @@ pub(super) fn after_condition(args: &Value) -> Result<Option<Value>> {
     let Some(after) = args.get("wait_after") else {
         return Ok(None);
     };
-    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/hover/type/fill/press and accepts selector, state, text, text_match, stable_ms and explicit navigation; tab/frame/deadline are inherited; dialog_response cannot be combined");
-    if !matches!(args.get("action").and_then(Value::as_str), Some("click" | "hover" | "type" | "fill" | "press"))
+    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/type/fill/press/hover/drag and accepts selector, state, text, text_match, stable_ms and explicit navigation; tab/frame/deadline are inherited; dialog_response cannot be combined");
+    if !matches!(args.get("action").and_then(Value::as_str), Some("click" | "type" | "fill" | "press" | "hover" | "drag"))
         || args.get("dialog_response").is_some()
     {
         return Err(invalid());
@@ -173,7 +173,7 @@ pub(super) fn after_condition(args: &Value) -> Result<Option<Value>> {
 pub(in crate::browser) fn after_schema() -> Value {
     json!({
         "type":"object","anyOf":[{"required":["selector"]},{"required":["navigation"]}],"additionalProperties":false,
-        "description":"Run input once, then wait under its original connection, conversation and timeout. Default: same-document selector condition. Explicit navigation names an exact same-origin destination for a single unmodified left click or keypress on an explicit tab; optional selector/text then checks that destination. No extra time, replay or implicit dialog consent; causality is not proven.",
+        "description":"Run click/type/fill/press/hover/drag once, then wait under its original connection, conversation and timeout. Default: same-document selector condition. Hover/drag accept only that same-document form. Explicit navigation names an exact same-origin destination for a single unmodified left click or keypress on an explicit tab; optional selector/text then checks that destination. No extra time, replay or implicit dialog consent; causality is not proven.",
         "properties":{
             "navigation":navigation::schema(),
             "selector":{"type":"string","minLength":1,"maxLength":65536},

@@ -136,7 +136,7 @@ pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or_default();
     if !matches!(
         action,
-        "click" | "hover" | "type" | "fill" | "press" | "wait_for" | "select_option" | "set_checked" | "upload"
+        "click" | "hover" | "drag" | "type" | "fill" | "press" | "wait_for" | "select_option" | "set_checked" | "upload"
     ) && !(action == "scroll" && args.get("frame").is_some())
     {
         return Err(error(
