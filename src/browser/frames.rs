@@ -273,8 +273,8 @@ impl Scope {
             .is_some_and(|(root, selected)| root.session != selected.session)
     }
 
-    /// Pointer actions use project_pointer before dispatch. File transfer,
-    /// navigation, exports and dialogs still have no frame-scoped contract.
+    /// Pointer actions use project_pointer before dispatch. Uploads use the
+    /// owning DOM session; downloads, navigation, exports and dialogs remain unscoped.
     pub(super) fn admit_action(&self, action: &str) -> Result<()> {
         if self.is_remote()
             && !matches!(
@@ -288,6 +288,7 @@ impl Scope {
                     | "fill"
                     | "type"
                     | "press"
+                    | "upload"
             )
             && !forms::is_action(action)
         {
@@ -393,20 +394,21 @@ pub(super) fn validate(args: &Value) -> Result<()> {
             | "press"
             | "scroll"
             | "wait_for"
+            | "upload"
     ) && !forms::is_action(action)
     {
         return Err(error(
-            "frame selection is supported by inspection, evaluation and input actions only",
+            "frame selection is supported by inspection, evaluation, input and uploads only",
         ));
     }
-    if matches!(action, "press" | "scroll")
+    if matches!(action, "press" | "scroll" | "upload")
         && args
             .get("selector")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
     {
         return Err(error(
-            "frame-scoped press and scroll require an explicit selector",
+            "frame-scoped press, scroll and upload require an explicit selector",
         ));
     }
     if args.get("dialog_response").is_some() {
@@ -507,6 +509,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uploads_require_an_explicit_tab_and_keep_dom_calls_on_the_owned_renderer() {
+        let (tree, targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        assert!(scope.admit_action("upload").is_ok());
+        assert_eq!(scope.command_session("DOM.setFileInputFiles").unwrap(), "nested-session");
+        assert!(validate(&json!({"action":"upload","tab":"work","frame":"child","selector":"#file"})).is_ok());
+        assert!(validate(&json!({"action":"upload","tab":"work","frame":"child"})).is_err());
+        assert!(validate(&json!({"action":"upload","frame":"child"})).is_err());
+        assert!(validate(&json!({"action":"upload","tab":"work","frame":null})).is_err());
+        assert!(validate(&json!({"action":"upload","tab":"work","frame":"child","dialog_response":{}})).is_err());
+    }
+
     fn scoped_remote_tree() -> (Tree, Targets) {
         let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
         let mut targets = Targets::default();
@@ -575,7 +590,7 @@ mod tests {
         ] {
             assert!(scope.admit_action(action).is_ok());
         }
-        for action in ["upload", "download", "goto", "handle_dialog"] {
+        for action in ["download", "goto", "handle_dialog"] {
             assert!(scope.admit_action(action).is_err());
         }
         let local = Scope::pin(&tree, "child", &targets).unwrap();
@@ -872,7 +887,6 @@ mod tests {
             "close",
             "list_tabs",
             "list_frames",
-            "upload",
             "download",
             "screenshot",
             "print_pdf",
@@ -893,7 +907,7 @@ mod tests {
 
     #[test]
     fn frame_key_and_wheel_actions_cannot_target_ambient_focus_or_the_main_viewport() {
-        for action in ["press", "scroll"] {
+        for action in ["press", "scroll", "upload"] {
             let mut args = json!({"action":action,"tab":"work","frame":"child"});
             assert!(validate(&args).is_err());
             args["selector"] = json!("");

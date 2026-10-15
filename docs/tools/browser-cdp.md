@@ -165,14 +165,16 @@ Use an actual returned frame ID in place of `FRAME_ID` below:
 {"action":"scroll","tab":"work","frame":"FRAME_ID","selector":".results","delta_y":400}
 {"action":"wait_for","tab":"work","frame":"FRAME_ID","selector":".result","timeout_ms":10000}
 {"action":"evaluate","tab":"work","frame":"FRAME_ID","script":"({title: document.title, count: document.forms.length})"}
+{"action":"upload","tab":"work","frame":"FRAME_ID","selector":"input[type=file]","files":["reports/result.csv"]}
 ```
 
 An explicit `tab` is required whenever `frame` is supplied. The frame option is
 per-call: it is never a persistent switch that could silently redirect a later
 operation. Both same-process and nested out-of-process frames support `snapshot`,
-`ax_tree`, `evaluate`, `click`, `type`, `fill`, `press`, `scroll` and `wait_for`.
-Scoped keypress and wheel actions require an explicit selector instead of using
-ambient focus or the main viewport. Native input actions bring the selected page
+`ax_tree`, `evaluate`, `click`, `type`, `fill`, `press`, `scroll`, `wait_for` and `upload`.
+Scoped keypress, wheel and upload actions require an explicit selector instead of
+using ambient focus, the main viewport or an implicitly selected file control.
+Native input actions bring the selected page
 to the front. Keyboard/text actions focus the requested control in its renderer
 and check focus before native input dispatch to the page.
 
@@ -222,7 +224,7 @@ cancellation or failure cannot roll back effects already dispatched. The
 operation's socket owns all its renderer attachments and drops them on exit.
 
 Frame-scoped evaluation has DOM access in an isolated world, not access to the
-page's JavaScript global variables. Frame options on uploads, downloads, exports,
+page's JavaScript global variables. Frame options on downloads, exports,
 navigation, tab/lifecycle actions or dialog responses are rejected before
 connection or launch. Those existing operations remain main-document or tab-level
 operations. Chromium errors never authorize a fallback to the main frame.
@@ -233,9 +235,12 @@ operations. Chromium errors never authorize a fallback to the main frame.
 {"action":"upload","selector":"input[type=file]","files":["reports/result.csv"]}
 {"action":"upload","selector":"@e12","files":["images/first.png","images/second.png"]}
 {"action":"upload","selector":"input[type=file]","files":[]}
+{"action":"upload","tab":"work","frame":"FRAME_ID","selector":"input[type=file]","files":["reports/result.csv"]}
 ```
 
-The selector must identify an enabled ordinary file input in the main frame.
+The selector must identify an enabled ordinary file input in the main document
+or the explicitly selected frame, including a local child inside a remote renderer.
+An explicit frame always requires `tab` and `selector`; it never redirects a later call.
 Hidden file inputs are supported because many sites hide them behind styled
 buttons. Multiple inputs require the element's `multiple` attribute. Directory
 upload controls are rejected. An empty list clears the selection through the
@@ -257,8 +262,14 @@ paths, and Pi verifies the resulting FileList's names and byte sizes.
 **Selecting files exposes them to page scripts immediately.** It is not a
 preview or a promise to wait for a separate submit button. The tool itself does
 not click submit, but the page may automatically read or transmit the files.
-The current document URL is rechecked against the allowlist before local reads
-and before selection; document changes and unexpected selections fail.
+The exact selected document and its policy are rechecked after lookup, before
+local reads, after staging and before selection. The original backend node's type,
+availability and file-count constraints are inspected again after staging; the
+selector is not resolved a second time. Ancestor navigation or renderer changes
+fail rather than authorizing the renderer's root or a replacement control.
+Scoped `about:srcdoc` inherits the already-validated ancestor policy. Selection
+is verified on the same document and node, and results include `frame_id`.
+These checks are not atomic with page scripts and do not roll back exposure.
 
 Copies are retained before sending the CDP selection command, including when
 cancellation races its acknowledgement. Browser File objects can read them in
@@ -269,6 +280,18 @@ that may still be in use. Finish pending transfers before stopping the managed
 browser or dropping the tool to release copies. Attached-browser users must
 finish such transfers before ending the Pi tool session as well.
 
+### Frame-upload validation status
+
+Nine Rust test functions were added across document/preflight checks, public
+HTTP/WebSocket upload scenarios and an explicitly ignored live Chromium scenario.
+They were authored but not executed: `dsr quality --tool pi_agent_rust` was
+attempted and returned command not found (exit 127). Compilation, formatting,
+Clippy, Rust tests and the public live-browser scenario remain unverified.
+A separate Chromium 144.0.7559.96 protocol/helper probe passed 22 checks for local,
+remote and remote-local file inputs, literal bytes, equal filenames, clearing,
+disabled controls and parent preservation. It observed an actual remote renderer,
+but did not execute the Rust adapter. Its root-container browser used
+`--no-sandbox` and `--site-per-process`; production launch flags are unchanged.
 
 ## Capture a browser download
 

@@ -566,6 +566,14 @@ fn upload_prefix() -> Script {
         "file_input",
         &json!([{ "name":"previous.txt", "size":3 }]),
     ));
+    // Recheck ownership before local reads and again after private staging.
+    script.push(frame_reply("https://example.com/"));
+    script.push(frame_reply("https://example.com/"));
+    // The same backend node must still be an admissible file control.
+    script.extend(file_control_script(
+        "file_input",
+        &json!([{ "name":"previous.txt", "size":3 }]),
+    ));
     script.push(frame_reply("https://example.com/"));
     script
 }
