@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
+mod restore;
+
 const SCHEMA: &str = "pi.browser.storage-state.v1";
 const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COOKIES: usize = 256;
@@ -25,7 +27,7 @@ fn error(message: &'static str) -> Error {
 }
 
 pub(super) fn is_action(action: &str) -> bool {
-    action == "save_state"
+    matches!(action, "save_state" | "restore_state")
 }
 
 /// Keep the schema beside its implementation so an unsupported action cannot
@@ -34,10 +36,10 @@ pub(super) fn parameters(mut schema: Value) -> Value {
     schema["properties"]["action"]["enum"]
         .as_array_mut()
         .expect("browser action enum")
-        .push(json!("save_state"));
+        .extend([json!("save_state"), json!("restore_state")]);
     schema["properties"]["state_path"] = json!({
         "type":"string", "maxLength":4096,
-        "description":"save_state: required new workspace-relative .json file. Saves the explicit tab's HTTP(S) origin localStorage and matching unpartitioned cookies, including HttpOnly cookies, from a Pi-owned browser only. Contains plaintext credentials: keep private, never commit or share. Existing files are never overwritten. Cookie values are never returned inline. No frame, diagnostics or automatic login; partitioned cookies, IndexedDB and sessionStorage are not supported."
+        "description":"save_state/restore_state: required workspace-relative .json file and explicit tab, Unix native backend only. Save creates a private file with that HTTP(S) origin's localStorage and matching unpartitioned cookies, including HttpOnly cookies. Restore reads a private singly linked regular file, requires the same origin including scheme/port, merges saved cookies/keys without clearing unrelated state, and verifies retained values. Files contain plaintext credentials: never commit or share. Save never overwrites files. No inline credential values, frames, diagnostics, batch steps, attached profiles or automatic launch/navigation/login. Partitioned/same-party cookies, IndexedDB and sessionStorage are unsupported. Restore failure may leave partial effects; no automatic retry or rollback."
     });
     schema
 }
@@ -105,7 +107,9 @@ impl Document {
     fn from_frame(frame: &Value, allowlist: Option<&[String]>) -> Result<Self> {
         let frame_id = required(frame, "id")?;
         let loader = required(frame, "loaderId")?;
-        if frame_id.is_empty() || frame_id.len() > 256 || loader.is_empty() || loader.len() > 256 {
+        if frame_id.is_empty() || frame_id.len() > 256 || loader.is_empty() || loader.len() > 256
+            || frame_id.chars().any(char::is_control) || loader.chars().any(char::is_control)
+        {
             return Err(error("BROWSER_STATE_DOCUMENT: no stable main-document identity"));
         }
         let raw_url = required(frame, "url")?;
@@ -116,15 +120,12 @@ impl Document {
         if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
-            || frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
         {
             return Err(error("BROWSER_STATE_ORIGIN: storage requires a nonopaque HTTP(S) document without URL credentials"));
         }
         let origin = url.origin().ascii_serialization();
-        if let Some(security_origin) = frame.get("securityOrigin").and_then(Value::as_str)
-            && security_origin != origin
-        {
-            return Err(error("BROWSER_STATE_ORIGIN: document security origin does not match its URL"));
+        if frame.get("securityOrigin").and_then(Value::as_str) != Some(origin.as_str()) {
+            return Err(error("BROWSER_STATE_ORIGIN: document security origin is missing, opaque or does not match its URL"));
         }
         Ok(Self {
             frame: frame_id.to_owned(),
@@ -180,7 +181,7 @@ impl Cookie {
         if self.name.len() > MAX_KEY_BYTES
             || self.name.chars().any(char::is_control)
             || self.value.len() > MAX_VALUE_BYTES
-            || self.value.contains(['\0', '\r', '\n'])
+            || self.value.chars().any(|value| matches!(value, '\0' | '\r' | '\n'))
             || self.domain.len() > 253
             || self.path.len() > MAX_KEY_BYTES
             || !self.path.starts_with('/')
@@ -204,13 +205,14 @@ impl Cookie {
 }
 
 fn domain_matches(domain: &str, host: &str) -> bool {
+    let domain_cookie = domain.starts_with('.');
     let domain = domain.strip_prefix('.').unwrap_or(domain);
     if domain.is_empty() || domain.starts_with('.') || domain.chars().any(char::is_control) {
         return false;
     }
     match (url::Host::parse(domain), url::Host::parse(host)) {
         (Ok(url::Host::Domain(domain)), Ok(url::Host::Domain(host))) => {
-            host == domain || host.ends_with(&format!(".{domain}"))
+            host == domain || (domain_cookie && host.ends_with(&format!(".{domain}")))
         }
         (Ok(domain), Ok(host)) => domain == host,
         _ => false,
@@ -231,6 +233,22 @@ struct State {
     origin: String,
     cookies: Vec<Cookie>,
     local_storage: Vec<StorageEntry>,
+}
+
+/// Limit serialization itself, not just the completed allocation. Escaping can
+/// expand credential strings substantially even when each input field is small.
+struct StateBuffer(Vec<u8>);
+
+impl std::io::Write for StateBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_STATE_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("state byte limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 impl State {
@@ -261,12 +279,10 @@ impl State {
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
-        let bytes = serde_json::to_vec(self)
-            .map_err(|_| error("BROWSER_STATE_INVALID: state could not be serialized"))?;
-        if bytes.len() > MAX_STATE_BYTES {
-            return Err(error("BROWSER_STATE_LIMIT: serialized state exceeds 2 MiB"));
-        }
-        Ok(bytes)
+        let mut buffer = StateBuffer(Vec::new());
+        serde_json::to_writer(&mut buffer, self)
+            .map_err(|_| error("BROWSER_STATE_LIMIT: state serialization failed or exceeds 2 MiB"))?;
+        Ok(buffer.0)
     }
 }
 
@@ -344,9 +360,14 @@ pub(super) async fn execute(
 ) -> Result<ToolOutput> {
     validate(args)?;
     checkpoint(owner)?;
+    if required(args, "action")? == "restore_state" {
+        return restore::execute(owner, cdp, cwd, tab, allowlist, args).await;
+    }
     let target = crate::artifact_output::resolve_new(cwd, required(args, "state_path")?, "browser")?;
     let document = Document::capture(owner, cdp, allowlist).await?;
-    let response = cdp.browser_command(owner, "Storage.getCookies", json!({})).await
+    // Page-scoped Storage commands use the attached target's storage partition,
+    // not a possibly unrelated default browser context.
+    let response = cdp.command(owner, "Storage.getCookies", json!({})).await
         .map_err(|_| error("BROWSER_STATE_COOKIE: browser cookie capture failed; no state file was published"))?;
     let cookies = cookies_from_response(&response, &document)?;
     document.check(owner, cdp, allowlist).await?;
@@ -377,7 +398,8 @@ mod tests {
     use super::*;
 
     fn document(url: &str) -> Document {
-        Document::from_frame(&json!({"id":"frame", "loaderId":"loader", "url":url}), None).unwrap()
+        let origin = url::Url::parse(url).unwrap().origin().ascii_serialization();
+        Document::from_frame(&json!({"id":"frame", "loaderId":"loader", "url":url, "securityOrigin":origin}), None).unwrap()
     }
 
     fn cookie(domain: &str, secure: bool, session: bool) -> Value {
@@ -550,5 +572,22 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), root.path().join("linked")).unwrap();
         assert!(crate::artifact_output::resolve_new(root.path(), "linked/state.json", "browser").is_err());
+    }
+
+    #[test]
+    fn host_only_cookies_are_not_captured_for_a_child_host() {
+        assert!(!domain_matches("example.com", "app.example.com"));
+        let captured = cookies_from_response(&json!({"cookies":[cookie("example.com", true, true), cookie(".example.com", true, true)]}), &document("https://app.example.com")).unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].domain, ".example.com");
+    }
+
+    #[test]
+    fn state_requires_explicit_browser_security_origin_evidence() {
+        for origin in [None, Some(Value::Null), Some(json!("://")), Some(json!(42))] {
+            let mut frame = json!({"id":"f", "loaderId":"l", "url":"https://example.com/"});
+            if let Some(origin) = origin { frame["securityOrigin"] = origin; }
+            assert!(Document::from_frame(&frame, None).is_err());
+        }
     }
 }
