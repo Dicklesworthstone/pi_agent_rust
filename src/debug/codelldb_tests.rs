@@ -1,7 +1,7 @@
 //! CodeLLDB profile and public DebugTool regressions. The Python peer tests
 //! exercise Rust dispatch/framing, not actual LLDB. Real LLDB is opt-in below.
 
-use super::{AdapterSpec, attach_arguments, default_adapters, launch_arguments, select_adapter};
+use super::{attach_arguments, default_adapters, launch_arguments, select_adapter};
 use serde_json::json;
 use std::path::Path;
 
@@ -31,7 +31,7 @@ fn codelldb_profile_uses_stdio_and_no_unavailable_terminal_host() {
 #[cfg(unix)]
 mod native {
     use super::*;
-    use crate::debug::DebugTool;
+    use crate::debug::{DebugTool, adapters::AdapterSpec};
     use crate::error::Result;
     use crate::tools::Tool;
     use serde_json::Value;
@@ -149,6 +149,27 @@ mod native {
         drop(tool);
         reaped(root.path());
         event("configured", "verified");
+    }
+
+    #[test]
+    fn imported_tcp_arguments_fail_before_starting_the_configured_adapter() {
+        event("transport_refusal", "start");
+        let root = tempfile::tempdir().unwrap();
+        let Some(adapter) = fixture(root.path()) else { return; };
+        let tool = DebugTool::new(root.path(), None);
+        let runtime = runtime();
+        for extra in [vec!["--port", "0"], vec!["--connect=5000"], vec!["--multi-session"]] {
+            let mut args = adapter.adapter_args.clone();
+            args.extend(extra.into_iter().map(str::to_owned));
+            std::fs::write(root.path().join("dap.json"), serde_json::to_vec(&json!({"adapters":{"codelldb":{
+                "command":adapter.command_candidates[0],"args":args,"connectMode":"stdio"
+            }}})).unwrap()).unwrap();
+            let error = call(&tool, &runtime, json!({"action":"launch","adapter":"codelldb","adapterConfig":"dap.json","program":"program"})).unwrap_err();
+            assert!(error.to_string().contains("DAP_UNSUPPORTED"));
+            assert!(!root.path().join("adapter.pid").exists());
+            assert_eq!(call(&tool, &runtime, json!({"action":"sessions"})).unwrap()["sessions"], json!([]));
+        }
+        event("transport_refusal", "verified");
     }
 
     #[test]

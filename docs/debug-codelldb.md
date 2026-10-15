@@ -48,16 +48,26 @@ selection. An incompatible installed executable fails the ordinary initialize
 exchange; Pi does not silently fall back after a selected adapter fails.
 
 Unlike OMP's older `--port 0` profile, this integration requires native stdio
-support. Do not configure `--port` or `--connect`; those switches select another
-transport. Adapter arguments replace the default argv and are executable
-configuration, not a sandbox. CodeLLDB and its target retain their normal
-process authority and ambient environment.
+support. CodeLLDB `adapterConfig` definitions reject `--port`, `--connect`,
+`--multi-session`, their `=value` forms and the `--` argument terminator before
+spawn, even when `connectMode` says `stdio`. Those arguments would otherwise
+start an incompatible transport or lifecycle while Pi reads the stdio pipes.
+Literal `--liblldb` arguments remain supported. Unrelated custom adapter IDs
+and trusted SDK `with_adapters` definitions are unchanged; SDK hosts remain
+responsible for supplying argv matching the native transport.
+
+Adapter arguments replace the default argv and are executable configuration,
+not a sandbox. CodeLLDB and its target retain their normal process authority
+and ambient environment.
 
 ## Validation
 
-Six tests in `src/debug/codelldb_tests.rs` cover the native profile, four
-public-tool protocol workflows and one opt-in actual CodeLLDB workflow. The
-protocol peer is deterministic Python, not an LLDB implementation. The live
+Seven tests in `src/debug/codelldb_tests.rs` cover the native profile, five
+public-tool protocol workflows and one opt-in actual CodeLLDB workflow. Two
+additional configuration tests cover transport-argument rejection, command-only
+inheritance and preservation of unrelated custom definitions. The public
+rejection case checks that no adapter process starts and no session is retained.
+The protocol peer is deterministic Python, not an LLDB implementation. The live
 lane compiles a tiny C program, hits a source breakpoint, inspects 40, steps to
 42 and requests termination. A DSR host needs `cc`, CodeLLDB and debugging
 permissions to run it:

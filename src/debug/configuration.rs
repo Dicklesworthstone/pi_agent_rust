@@ -200,6 +200,17 @@ fn validate_definition(id: &str, definition: &Definition) -> Result<()> {
     }) {
         return Err(tool_err("DAP_UNSUPPORTED", "configured adapters use stdio; only the built-in Delve profile supports owned TCP"));
     }
+    // OMP's older CodeLLDB definition supplies --port 0. Merely declaring
+    // connectMode=stdio does not undo that argv choice: fail before spawn,
+    // rather than hanging the native reader on a TCP server's stdout.
+    if id == "codelldb" && definition.args.as_ref().is_some_and(|args| {
+        args.iter().any(|arg| arg == "--" || matches!(
+            arg.split('=').next().unwrap_or(arg),
+            "--port" | "--connect" | "--multi-session"
+        ))
+    }) {
+        return Err(tool_err("DAP_UNSUPPORTED", "CodeLLDB uses native stdio; remove port, connect and multi-session arguments from adapterConfig"));
+    }
     for defaults in [&definition.launch_defaults, &definition.attach_defaults] {
         if defaults.len() > 128 || defaults.keys().any(|key| matches!(key.as_str(),
             "program" | "args" | "cwd" | "pid" | "processId" | "mode" | "output"
@@ -334,6 +345,33 @@ mod tests {
         assert!(selected(directory.path(), "custom").is_err());
         write_config(directory.path(), json!({"adapters":{"custom":{"command":"adapter","args":["bad\u{0000}arg"]}}}));
         assert!(selected(directory.path(), "custom").is_err());
+    }
+
+    #[test]
+    fn codelldb_rejects_tcp_mode_arguments_even_when_config_claims_stdio() {
+        logged("codelldb_transport_arguments");
+        let directory = tempfile::tempdir().unwrap();
+        for argument in ["--port", "--port=0", "--connect", "--connect=5000", "--multi-session", "--multi-session=true", "--"] {
+            write_config(directory.path(), json!({"adapters":{"codelldb":{
+                "command":"adapter", "args":[argument], "connectMode":"stdio"
+            }}}));
+            let error = selected(directory.path(), "codelldb").err().unwrap();
+            assert!(error.to_string().contains("DAP_UNSUPPORTED"));
+        }
+    }
+
+    #[test]
+    fn codelldb_command_only_override_keeps_native_stdio_and_custom_ids_are_not_restricted() {
+        logged("codelldb_profile_inheritance");
+        let directory = tempfile::tempdir().unwrap();
+        write_config(directory.path(), json!({"adapters":{"codelldb":{"command":"./adapter"}}}));
+        assert!(selected(directory.path(), "codelldb").unwrap().adapter.adapter_args.is_empty());
+        write_config(directory.path(), json!({"adapters":{"codelldb":{
+            "command":"adapter", "args":["--liblldb","/opt/LLDB library"]
+        }}}));
+        assert_eq!(selected(directory.path(), "codelldb").unwrap().adapter.adapter_args, ["--liblldb", "/opt/LLDB library"]);
+        write_config(directory.path(), json!({"adapters":{"custom":{"command":"adapter","args":["--port","0"]}}}));
+        assert_eq!(selected(directory.path(), "custom").unwrap().adapter.adapter_args, ["--port", "0"]);
     }
 
     #[cfg(unix)]
