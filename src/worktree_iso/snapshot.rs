@@ -11,6 +11,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod sparse;
+
 const MAX_INDEX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Git revision syntax that peels `HEAD` to a commit object, rejecting a tag or
@@ -156,11 +158,19 @@ impl Scratch {
         let mut command = command(repo);
         command
             .env("GIT_INDEX_FILE", self.root.join("index"))
-            .args(["-c", "core.splitIndex=false", "-c", "core.ignorestat=false"]);
+            .args([
+                "-c", "core.splitIndex=false", "-c", "core.ignorestat=false",
+                "-c", "core.sparseCheckout=false", "-c", "index.sparse=false",
+            ]);
         command
     }
 
     fn entries(&self, mut command: Command, name: &str) -> Result<Vec<u8>> {
+        command.args(["ls-files", "--stage", "--full-name", "-z"]);
+        self.records(command, name)
+    }
+
+    fn records(&self, mut command: Command, name: &str) -> Result<Vec<u8>> {
         let path = self.root.join(name);
         let file = File::create(&path).map_err(|error| {
             failure(
@@ -169,9 +179,7 @@ impl Scratch {
             )
         })?;
         run(
-            command
-                .args(["ls-files", "--stage", "--full-name", "-z"])
-                .stdout(file),
+            command.stdout(file),
             "read index records",
         )?;
         let mut bytes = Vec::new();
@@ -199,7 +207,10 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // Remove only our known scratch files, not arbitrary descendants.
-        for name in ["index", "index.lock", "parent", "verify", "materialized"] {
+        for name in [
+            "index", "index.lock", "parent", "verify", "materialized",
+            "flags", "verify-flags", "skip",
+        ] {
             let _ = fs::remove_file(self.root.join(name));
         }
         let _ = fs::remove_dir(self.root.join("hooks"));
@@ -288,6 +299,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
     let scratch = Scratch::new(repo)?;
     let parent_entries = scratch.entries(command(repo), "parent")?;
     reject_gitlinks(&parent_entries)?;
+    let skipped = sparse::Skipped::capture(repo, &scratch, &parent_entries)?;
     run(
         scratch.command(repo).args(["read-tree", "--empty"]),
         "initialize private index",
@@ -305,11 +317,14 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
             .stdin(input),
         "seed private index",
     )?;
+    skipped.prepare(repo, &scratch)?;
     run(
         scratch.command(repo).args(["add", "--all", "--", "."]),
         "snapshot working files",
     )?;
-    reject_gitlinks(&scratch.entries(scratch.command(repo), "materialized")?)?;
+    let materialized = scratch.entries(scratch.command(repo), "materialized")?;
+    reject_gitlinks(&materialized)?;
+    skipped.verify_materialized(&materialized)?;
     let tree = object_id(&run(
         scratch.command(repo).arg("write-tree"),
         "write snapshot tree",
@@ -348,6 +363,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
             "Parent HEAD or index changed while capturing isolation; retry the delegation",
         ));
     }
+    skipped.verify_source(repo, &scratch)?;
     Ok(Snapshot { baseline, scratch })
 }
 
