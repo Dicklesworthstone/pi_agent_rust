@@ -22,6 +22,7 @@ use crate::tools::ToolOutput;
 
 mod decision;
 mod fanout;
+mod selected_inputs;
 
 const MAX_NODES: usize = 32;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -68,7 +69,7 @@ struct Node {
 
 struct Input {
     name: String,
-    from: usize,
+    from: selected_inputs::Source,
     pointer: String,
 }
 
@@ -84,11 +85,10 @@ fn parse_inputs(
     for (name, reference) in fields {
         identifier(&Value::String(name.clone()))?;
         let reference = reference.as_object().filter(|fields| fields.len() == 2
-            && fields.contains_key("from") && fields.contains_key("pointer"))
-            .ok_or_else(|| invalid("each input requires exactly from and pointer"))?;
-        let from = ids.get(identifier(&reference["from"])?).copied()
-            .filter(|index| needs.contains(index))
-            .ok_or_else(|| invalid("inputs may reference only explicitly named direct dependencies"))?;
+            && fields.contains_key("pointer")
+            && (fields.contains_key("from") || fields.contains_key("fromSelected")))
+            .ok_or_else(|| invalid("each input requires pointer and exactly one of from or fromSelected"))?;
+        let from = selected_inputs::Source::parse(reference, ids, needs)?;
         let pointer = reference["pointer"].as_str()
             .ok_or_else(|| invalid("input pointer must be a JSON pointer string"))?;
         validate_pointer(pointer)?;
@@ -131,9 +131,7 @@ impl Node {
         if self.inputs.is_empty() && item.is_none() { return Ok(self.call.clone()); }
         let mut values = BTreeMap::new();
         for input in &self.inputs {
-            let result = records.get(input.from)
-                .and_then(Record::validated_data)
-                .ok_or("dependency_data_unavailable")?;
+            let result = input.from.data(records)?;
             let value = result.pointer(&input.pointer).ok_or("dependency_input_missing")?;
             values.insert(input.name.as_str(), value);
         }
@@ -254,6 +252,7 @@ impl Plan {
             };
             let call = parse_call(&entry["call"])?;
             let inputs = parse_inputs(fields.get("inputs"), &ids, &needs)?;
+            selected_inputs::validate_join(entry, &inputs)?;
             let decision = decision::Policy::parse(entry, &ids, &needs)?;
             let fanout = fanout::Expansion::parse(fields.get("forEach"), &ids, &needs, &inputs)?;
             nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs, decision, fanout });
@@ -273,7 +272,7 @@ impl Plan {
             }
         }
         for node in &self.nodes {
-            for from in node.inputs.iter().map(|input| input.from).chain(node.decision.source())
+            for from in node.inputs.iter().flat_map(|input| input.from.indices().iter().copied()).chain(node.decision.source())
                 .chain(node.fanout.as_ref().map(|expansion| expansion.from))
             {
                 let source = &self.nodes[from].call;
@@ -339,7 +338,7 @@ impl Plan {
                     }
                     Err(reason) => {
                         let sources: BTreeSet<_> = node.inputs.iter()
-                            .map(|input| input.from)
+                            .flat_map(|input| input.from.indices().iter().copied())
                             .chain(node.fanout.as_ref().map(|expansion| expansion.from))
                             .map(|from| self.nodes[from].id.clone()).collect();
                         records[index].skip(reason, sources.into_iter().collect());
@@ -580,6 +579,7 @@ pub(super) fn schema(mut schema: Value) -> Value {
     });
     decision::extend_schema(&mut schema);
     fanout::extend_schema(&mut schema);
+    selected_inputs::extend_schema(&mut schema);
     schema
 }
 
