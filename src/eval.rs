@@ -13,7 +13,7 @@ use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutp
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ mod display;
 mod js_kernel;
 mod lifecycle;
 mod output;
+mod python_runtime;
 mod session;
 mod transport;
 
@@ -42,6 +43,7 @@ struct PyKernel {
     lines: std::sync::Mutex<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
     next_id: u64,
     cells_run: u64,
+    runtime: python_runtime::Resolved,
     // Retired after the process tree, including on reset/eviction/failure.
     // Also holds the bootstrap script so Windows command-line limits cannot
     // be exceeded as the embedded kernel grows.
@@ -49,7 +51,7 @@ struct PyKernel {
 }
 
 impl PyKernel {
-    fn spawn(python_path: &str, cwd: &Path) -> Result<Self> {
+    fn spawn(runtime: python_runtime::Resolved, cwd: &Path) -> Result<Self> {
         let packages = tempfile::Builder::new()
             .prefix("pi-eval-python-")
             .tempdir()
@@ -57,7 +59,7 @@ impl PyKernel {
         let script = packages.path().join("kernel.py");
         std::fs::write(&script, PY_KERNEL_SERVER)
             .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
-        let mut command = Command::new(python_path);
+        let mut command = runtime.command();
         command
             // Keep -c's workspace import semantics; only the large bootstrap
             // moves to owned storage, not the kernel's default sys.path.
@@ -80,8 +82,9 @@ impl PyKernel {
                     Error::tool(
                         "eval",
                         format!(
-                            "EVAL_PY_MISSING: `{python_path}` not found. Install Python 3 \
-                             or set PI_EVAL_PYTHON."
+                            "EVAL_PY_MISSING: selected interpreter {:?} disappeared. \
+                             No fallback after selection; retry explicitly or set PI_EVAL_PYTHON.",
+                            runtime.executable
                         ),
                     )
                 } else {
@@ -104,6 +107,7 @@ impl PyKernel {
             lines: std::sync::Mutex::new(rx),
             next_id: 1,
             cells_run: 0,
+            runtime,
             _packages: packages,
         };
         std::thread::Builder::new()
@@ -182,7 +186,8 @@ impl Drop for PyKernel {
 
 pub struct EvalTool {
     cwd: PathBuf,
-    python_path: String,
+    python_path: std::ffi::OsString,
+    python_environment: python_runtime::Environment,
     kernel: Mutex<Option<PyKernel>>,
     js: Mutex<Option<js_kernel::JsKernel>>,
     // Registry snapshots share this resolver. The active slots above belong
@@ -196,11 +201,11 @@ pub struct EvalTool {
 
 impl EvalTool {
     pub fn new(cwd: &Path) -> Self {
-        let python_path =
-            std::env::var("PI_EVAL_PYTHON").unwrap_or_else(|_| String::from("python3"));
+        let (python_path, python_environment) = python_runtime::Environment::capture();
         Self {
             cwd: cwd.to_path_buf(),
             python_path,
+            python_environment,
             kernel: Mutex::new(None),
             js: Mutex::new(None),
             session_scope: crate::jobs::JobSessionScope::default(),
@@ -377,6 +382,7 @@ impl EvalTool {
         capture: &mut output::Capture,
         session_guard: &session::CellSession,
     ) -> Result<ToolOutput> {
+        let deadline = Instant::now() + timeout;
         // Take the kernel out (or spawn) so the mutex is not held across await.
         let taken = self
             .kernel
@@ -386,10 +392,20 @@ impl EvalTool {
         let mut restarted = taken.is_none();
         let mut kernel = match taken {
             Some(kernel) => kernel,
-            None => PyKernel::spawn(&self.python_path, &self.cwd)?,
+            None => self.spawn_python(deadline, session_guard).await?,
         };
 
-        let mut id = kernel.next_id;
+        // An observed idle exit can be replaced before request delivery. A
+        // write failure is ambiguous and must never replay application code.
+        if kernel.child.try_wait_child()
+            .map_err(|error| Error::tool("eval", format!("EVAL_IO: {error}")))?.is_some()
+        {
+            kernel.kill();
+            kernel = self.spawn_python(deadline, session_guard).await?;
+            restarted = true;
+        }
+
+        let id = kernel.next_id;
         kernel.next_id += 1;
         let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs}).to_string();
         if kernel
@@ -398,24 +414,12 @@ impl EvalTool {
             .and_then(|()| kernel.stdin.flush())
             .is_err()
         {
-            // Kernel died between cells: restart once, transparently-but-loudly.
             kernel.kill();
-            let mut fresh = PyKernel::spawn(&self.python_path, &self.cwd)?;
-            id = fresh.next_id;
-            fresh.next_id += 1;
-            let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs}).to_string();
-            fresh
-                .stdin
-                .write_all(format!("{request}\n").as_bytes())
-                .and_then(|()| fresh.stdin.flush())
-                .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
-            kernel = fresh;
-            restarted = true;
+            return Err(Error::tool("eval", "EVAL_IO: Python request delivery was uncertain; EVAL_STATE_RESET: kernel discarded. The cell was not replayed."));
         }
 
         // Read lines until the final cell response; bridge requests re-enter
         // pi tools mid-cell and their results resume the kernel.
-        let deadline = Instant::now() + timeout;
         let (final_line, soft_timed_out) = loop {
             // A continuously readable stream may not yield Pending to the
             // enclosing watchdog. Observe its captured owner here too.
@@ -512,6 +516,7 @@ impl EvalTool {
         // malformed protocol result discards this connection, not just its
         // bad frame, and cannot partially publish a successful tool result.
         let mut output = format_cell_response(&final_line, restarted, cells_run)?;
+        kernel.runtime.annotate(&mut output);
         if soft_timed_out && let Some(Value::Object(details)) = output.details.as_mut() {
             details.insert("errorKind".into(), json!("soft_timeout"));
             details.insert("softTimeout".into(), json!(true));
@@ -531,6 +536,11 @@ impl EvalTool {
         }
 
         Ok(output)
+    }
+
+    async fn spawn_python(&self, deadline: Instant, session: &session::CellSession) -> Result<PyKernel> {
+        let runtime = self.python_environment.resolve(&self.python_path, &self.cwd, deadline, session).await?;
+        PyKernel::spawn(runtime, &self.cwd)
     }
 
     /// Execute one whitelisted bridge call through the SAME tool
@@ -589,6 +599,9 @@ impl Tool for EvalTool {
          state loss explicitly. POSIX Python may set soft_timeout_secs below \
          timeout_secs to attempt interruption while retaining variables. The \
          hard deadline remains unchanged; unsafe or wedged kernels are discarded. \
+         Python discovers active and project virtual environments before PATH; \
+         PI_EVAL_PYTHON explicitly selects an interpreter. Selection is retained \
+         with the kernel and reported in pythonRuntime result details. \
          Rich output: Python display(value, mime=...) \
          or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
          PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
@@ -986,7 +999,7 @@ mod tests {
     fn missing_python_is_named_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tool = EvalTool::new(dir.path());
-        tool.python_path = String::from("/nonexistent/python-binary");
+        tool.python_path = "/nonexistent/python-binary".into();
         let err = run_cell_sync(&tool, "1").expect_err("should fail");
         assert!(err.to_string().contains("EVAL_PY_MISSING"), "err: {err}");
     }
