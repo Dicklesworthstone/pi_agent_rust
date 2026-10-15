@@ -62,8 +62,8 @@ fn result_accounting_counts_json_escapes_and_preserves_exact_native_content() {
     assert_eq!(encoded_size(&native, size), Some(size));
     assert_eq!(encoded_size(&native, size - 1), None);
     let mut report = Report::new(size);
-    assert!(report.record(0, "evaluate", Ok(native.clone())));
-    assert!(!report.record(1, "evaluate", Ok(native.clone())));
+    assert!(report.record(0, "evaluate", Ok(native.clone()), None));
+    assert!(!report.record(1, "evaluate", Ok(native.clone()), None));
     let output = report.finish(3);
     assert!(output.is_error);
     let details = output.details.unwrap();
@@ -83,7 +83,7 @@ fn structured_tool_errors_are_not_promoted_to_success_or_discarded() {
         Ok(ToolOutput { content: vec![text("failed action")], details: Some(json!({"diagnostics":{"events":[]}})), is_error:true }),
     ] {
         let mut report = Report::new(4096);
-        assert!(!report.record(0, "evaluate", failure));
+        assert!(!report.record(0, "evaluate", failure, None));
         let output = report.finish(2);
         assert!(output.is_error);
         let details = output.details.unwrap();
@@ -93,4 +93,95 @@ fn structured_tool_errors_are_not_promoted_to_success_or_discarded() {
         assert_eq!(details["remaining_steps"], 1);
         assert_eq!(details["stop_reason"], "tool_error");
     }
+}
+
+#[test]
+fn expectations_reject_ambiguous_or_malformed_inputs_without_silently_disabling_them() {
+    for invalid in [
+        Value::Null,
+        json!(false),
+        json!({"pointer":"/result"}),
+        json!({"pointer":"/result","equals":true,"exists":true}),
+        json!({"pointer":"/result","exists":"true"}),
+        json!({"pointer":"return true","equals":true}),
+        json!({"pointer":"#/result","equals":true}),
+        json!({"pointer":"/bad~2escape","equals":true}),
+        json!({"pointer":"/bad~","equals":true}),
+        json!({"pointer":"/control\n","equals":true}),
+        json!({"pointer":"/a".repeat(33),"equals":true}),
+        json!({"pointer":format!("/{}", "a".repeat(1024)),"equals":true}),
+        json!({"pointer":"/result","equals":"secret".repeat(MAX_EXPECT_BYTES)}),
+        json!({"pointer":"/result","equals":true,"unknown":0}),
+    ] {
+        assert!(Expectation::parse(&invalid).is_err());
+        let input = json!({"action":"batch","steps":[
+            {"call":{"action":"open","url":"about:blank"}},
+            {"call":{"action":"evaluate","script":"42"},"expect":invalid}
+        ]});
+        assert!(Plan::parse(&input).is_err());
+    }
+    let misplaced = batch(vec![json!({"action":"evaluate","expect":{"pointer":"/result","equals":true}})]);
+    assert!(Plan::parse(&misplaced).is_err());
+    assert!(Plan::parse(&json!({"action":"evaluate","expect":{"pointer":"/result","equals":true}})).is_err());
+    let input = json!({"action":"batch","steps":[
+        {"call":{"action":"evaluate","script":"null"},"expect":{"pointer":"/result","equals":null}}
+    ]});
+    assert!(Plan::parse(&input).unwrap().unwrap().steps[0].expect.is_some());
+}
+
+#[test]
+fn expectation_matching_preserves_json_types_pointer_escapes_and_missing_vs_null() {
+    let details = json!({"result":{"a/b":{"~key":[false,null,"雪"]},"":7}});
+    for (condition, matched) in [
+        (json!({"pointer":"/result/a~1b/~0key/0","equals":false}), true),
+        (json!({"pointer":"/result/a~1b/~0key/0","equals":0}), false),
+        (json!({"pointer":"/result/a~1b/~0key/1","equals":null}), true),
+        (json!({"pointer":"/result/a~1b/~0key/2","equals":"雪"}), true),
+        (json!({"pointer":"/result/a~1b/~0key/1","exists":true}), true),
+        (json!({"pointer":"/result/a~1b/~0key/1","exists":false}), false),
+        (json!({"pointer":"/result/a~1b/~0key/9","exists":false}), true),
+        (json!({"pointer":"/result/a~1b/~0key/9","equals":null}), false),
+        (json!({"pointer":"/result/","equals":7}), true),
+        (json!({"pointer":"/result/a~1b/~0key/00","equals":false}), false),
+        (json!({"pointer":"","equals":details}), true),
+    ] {
+        assert_eq!(Expectation::parse(&condition).unwrap().matches(Some(&details)), matched);
+    }
+    let null = Expectation::parse(&json!({"pointer":"","equals":null})).unwrap();
+    assert!(null.matches(Some(&Value::Null)));
+    assert!(!null.matches(None));
+}
+
+#[test]
+fn expectation_failure_preserves_native_results_but_never_promotes_a_tool_error() {
+    let required = Expectation::parse(&json!({"pointer":"/result","equals":"EXPECTED-PRIVATE-CANARY"})).unwrap();
+    let result = ToolOutput {
+        content: vec![text("observed")], details: Some(json!({"result":"different"})), is_error:false,
+    };
+    let mut report = Report::new(4096);
+    assert!(!report.record(0, "evaluate", Ok(result), Some(&required)));
+    let output = report.finish(2);
+    assert!(output.is_error);
+    assert!(!serde_json::to_string(&output).unwrap().contains("EXPECTED-PRIVATE-CANARY"));
+    let details = output.details.unwrap();
+    assert_eq!(details["stop_reason"], "expectation_failed");
+    assert_eq!(details["completed_steps"], 0);
+    assert_eq!(details["steps"][0]["tool_is_error"], false);
+    assert_eq!(details["steps"][0]["expectation"], "failed");
+    assert_eq!(details["steps"][0]["details"]["result"], "different");
+
+    let absent = Expectation::parse(&json!({"pointer":"/result","exists":false})).unwrap();
+    let mut report = Report::new(4096);
+    assert!(!report.record(0, "evaluate", Err(Error::tool("browser", "failed")), Some(&absent)));
+    let output = report.finish(2);
+    assert!(output.is_error);
+    let details = output.details.unwrap();
+    assert_eq!(details["stop_reason"], "tool_error");
+    assert_eq!(details["steps"][0]["expectation"], "not_checked");
+
+    let mut report = Report::new(1);
+    assert!(!report.record(0, "evaluate", Ok(ToolOutput {
+        content:vec![text("large")], details:Some(json!({"result":true})), is_error:false,
+    }), Some(&absent)));
+    assert_eq!(report.finish(2).details.unwrap()["steps"][0]["expectation"], "not_checked");
 }

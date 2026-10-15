@@ -46,9 +46,59 @@ Nested batches, `start`, `status`, `stop` and `release` are not step actions.
 Use lifecycle operations separately so a batch cannot retire its own namespace
 while its lease is held. Mock mode refuses batches rather than simulating them.
 
+## Explicit result assertions
+
+A step may carry `expect` beside `call`. It checks the **native step's details**
+after a successful result, before admitting the next action:
+
+```json
+{
+  "action": "batch",
+  "steps": [
+    {"call": {"action": "click", "tab": "app", "selector": "#save"}},
+    {
+      "call": {"action": "evaluate", "tab": "app", "script": "document.querySelector('#status').textContent"},
+      "expect": {"pointer": "/result", "equals": "Saved"}
+    },
+    {"call": {"action": "screenshot", "tab": "app", "output_path": "saved.png"}}
+  ]
+}
+```
+
+Here the screenshot step runs only if the evaluation returned the string `Saved`.
+If saving is asynchronous, use an explicit waiting step or await the desired
+state in `evaluate`; `expect` itself does not poll, wait, retry or run JavaScript.
+It compares only structured data already returned by the native action. It is
+not a page-wide assertion or independent certification of application behavior.
+
+An expectation needs a JSON `pointer` and **exactly one** of `equals` or `exists`.
+Equality compares JSON values without string/boolean/number coercion. An explicit
+`equals: null` matches a present null, never an absent field. `exists: true`
+includes present null; `exists: false` requires no value at that pointer.
+Empty pointer selects the complete native `details`; `/result` selects an
+evaluation value; `~1` escapes a slash in a key and `~0` escapes a tilde. Array
+indices use canonical decimal notation. URI-fragment pointers and malformed
+tilde escapes are refused, not interpreted as scripts or regular expressions.
+
+Every expectation is validated during batch-envelope preflight, including
+expectations on later steps. A supplied `expect: null`, unknown fields, both
+conditions, or a non-boolean `exists` is an error rather than silently disabling
+the check. Place it on the step wrapper, not inside `call` or on an ordinary
+browser invocation. Each expectation is bounded to 16 KiB encoded, and its
+pointer to 1024 bytes and 32 segments.
+
+A mismatch preserves the successful native output but marks that step and batch
+unsuccessful with `stop_reason: "expectation_failed"`. Later steps do not run.
+Per-step metadata distinguishes `tool_is_error` from `expectation`, whose values
+are `passed`, `failed`, `not_checked`, or null when no condition was supplied.
+Failed native calls and omitted outputs never satisfy an assertion, including
+an assertion that a field is absent. Assertion diagnostics report the step and
+outcome without echoing the expected value or pointer; native result disclosure
+remains unchanged.
+
 ## Failures and partial results
 
-The first native error or unsuccessful `ToolOutput` ends the batch. The final
+The first native error, unsuccessful `ToolOutput`, or unmet expectation ends the batch. The final
 result is an unsuccessful `ToolOutput`, not a success containing hidden failures.
 Earlier results and the failed step's diagnostics remain available. Later steps
 are not attempted. A native preflight failure counts as an attempted step; that
@@ -60,8 +110,9 @@ count does not claim a command was sent or a remote side effect happened.
 `content_range: [start, end]` into the final tool result's content blocks.
 Original text and image blocks are retained without lossy string conversion.
 The summary and per-step headings are additional text blocks. `completed_steps`
-counts successful tool results that fit the output budget, not verified business
-outcomes: a click acknowledgement alone does not prove a save or login succeeded.
+counts successful tool results that fit the output budget and satisfy any explicit
+expectation, not independently verified business outcomes: a click acknowledgement
+alone does not prove a save or login succeeded.
 
 Envelope shape, step count, dispatch actions, timeout fields and total input
 size are validated before ownership lookup, namespace reservation or connection.
@@ -107,8 +158,10 @@ Parser, accounting and deadline regressions live in
 `src/browser/session/batch/tests.rs`. Public native workflows in
 `src/browser/session/tests/native/batch.rs` reuse the existing HTTP/WebSocket
 protocol peer to cover ordered execution, error preservation, output limits,
-preflight refusal, owner changes, and queue recovery after dropping a batch.
-They are authored tests, not evidence of actual Chromium behavior.
+preflight refusal, owner changes, queue recovery after dropping a batch, and
+postcondition success/refusal without extra native calls. One explicitly ignored
+live-browser lane checks page state after a real native button click. These are
+authored tests; no native Rust or live-Chromium execution was performed here.
 
 The implementation environment lacked `dsr`. Rust compilation, formatting,
 Clippy and the authored tests remain unexecuted. Acceptance requires:
