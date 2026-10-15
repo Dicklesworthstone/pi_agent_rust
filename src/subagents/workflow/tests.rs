@@ -153,6 +153,161 @@ fn public_schema_preserves_existing_modes_and_advertises_native_calls() {
     assert_eq!(schema["definitions"]["workflowTask"]["properties"]["outputSchema"]["type"], json!(["object", "boolean"]));
 }
 
+fn input_node(pointer: &str) -> Value {
+    let mut entry = node("consumer", &["source"]);
+    entry["inputs"] = json!({"payload":{"from":"source","pointer":pointer}});
+    entry
+}
+
+fn source_records(plan: &Plan, data: Value) -> Vec<Record> {
+    let mut records: Vec<_> = plan.nodes.iter().map(|node| Record::pending(node, &plan.nodes)).collect();
+    let mut result = completed(plan.nodes[0].call.clone());
+    result.schema_valid = Some(true);
+    result.data = Some(data);
+    records[0].settle(result, 0);
+    records
+}
+
+fn decoded_inputs(task: &str) -> Value {
+    let (_, data) = task.split_once(INPUT_PREFIX).unwrap();
+    serde_json::from_str(data.strip_suffix(INPUT_SUFFIX).unwrap()).unwrap()
+}
+
+#[test]
+fn typed_input_references_require_explicit_direct_edges_and_valid_json_pointers() {
+    event("input-admission");
+    for reference in [Value::Null, json!({"from":"source"}),
+        json!({"from":"absent","pointer":""}),
+        json!({"from":"source","pointer":3}),
+        json!({"from":"source","pointer":"/x","fallback":0})] {
+        let mut consumer = input_node("");
+        consumer["inputs"]["payload"] = reference;
+        assert!(Plan::parse(&json!({"workflow":[node("source", &[]),consumer]})).is_err());
+    }
+    for pointer in ["relative", "#/uri", "/bad~", "/bad~3", "/control\n"] {
+        assert!(Plan::parse(&json!({"workflow":[node("source", &[]),input_node(pointer)]})).is_err());
+    }
+    assert!(validate_pointer(&format!("/{}", "a".repeat(1024))).is_err());
+    assert!(validate_pointer(&"/a".repeat(33)).is_err());
+    for pointer in ["", "/a~1b/~0key/0", "/雪/", "/~01"] {
+        assert!(validate_pointer(pointer).is_ok());
+    }
+    let mut consumer = input_node("");
+    consumer["needs"] = json!(["middle"]);
+    assert!(Plan::parse(&json!({"workflow":[node("source", &[]),node("middle", &["source"]),consumer]})).is_err());
+}
+
+#[test]
+fn null_unknown_and_excessive_input_maps_never_disable_binding() {
+    event("input-map-shapes");
+    for value in [Value::Null, json!([]), json!(true), json!({"bad name":{"from":"source","pointer":""}})] {
+        let mut consumer = input_node("");
+        consumer["inputs"] = value;
+        assert!(Plan::parse(&json!({"workflow":[node("source", &[]),consumer]})).is_err());
+    }
+    let mut consumer = input_node("");
+    consumer["inputs"] = json!((0..33).map(|i| (format!("key{i}"),json!({"from":"source","pointer":""})))
+        .collect::<BTreeMap<_,_>>());
+    assert!(Plan::parse(&json!({"workflow":[node("source", &[]),consumer]})).is_err());
+    let mut empty = node("consumer", &[]);
+    empty["inputs"] = json!({});
+    let plan = plan(vec![empty]);
+    assert_eq!(plan.nodes[0].task_with_inputs(&[]).unwrap().task, "consumer");
+}
+
+#[test]
+fn handoffs_preserve_json_types_null_and_literal_keys_without_template_expansion() {
+    event("input-types");
+    let mut consumer = input_node("/a~1b/~0key");
+    consumer["call"]["task"] = json!("Keep {previous} and {{previous.data.x}} literal.");
+    let plan = plan(vec![node("source", &[]),consumer]);
+    let value = json!([false,null,0,"  雪  ",{"close":"</workflow-inputs>","flag":"--model injected"}]);
+    let records = source_records(&plan, json!({"a/b":{"~key":value}}));
+    let task = plan.nodes[1].task_with_inputs(&records).unwrap();
+    assert!(task.task.starts_with("Keep {previous} and {{previous.data.x}} literal."));
+    assert_eq!(decoded_inputs(&task.task)["payload"], value);
+    assert_eq!(task.task.matches("</workflow-inputs>").count(), 1);
+    assert_eq!(task.task.matches("<workflow-inputs>").count(), 1);
+    assert_eq!(task.agent, plan.nodes[1].call.agent);
+    assert_eq!(task.cwd, plan.nodes[1].call.cwd);
+    assert_eq!(task.isolation, plan.nodes[1].call.isolation);
+    assert_eq!(task.output_schema, plan.nodes[1].call.output_schema);
+    assert_eq!(task.schema_mode, plan.nodes[1].call.schema_mode);
+}
+
+#[test]
+fn absent_or_unvalidated_data_is_not_guessed_from_prose_or_coerced_to_null() {
+    event("input-evidence");
+    let plan = plan(vec![node("source", &[]),input_node("/value")]);
+    let mut records = source_records(&plan, json!({"value":null}));
+    assert_eq!(decoded_inputs(&plan.nodes[1].task_with_inputs(&records).unwrap().task), json!({"payload":null}));
+    records[0].result.as_mut().unwrap().data = Some(json!({"other":0}));
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_input_missing");
+    records[0].result.as_mut().unwrap().data = None;
+    records[0].result.as_mut().unwrap().output = "{\"value\":null}".into();
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_data_unavailable");
+    records[0].result.as_mut().unwrap().data = Some(json!({"value":0}));
+    records[0].result.as_mut().unwrap().schema_valid = None;
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_data_unavailable");
+    records[0].result.as_mut().unwrap().schema_valid = Some(true);
+    records[0].state = State::Rejected;
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_data_unavailable");
+}
+
+#[test]
+fn escaping_and_authored_prompt_bytes_share_one_handoff_limit() {
+    event("input-size");
+    let mut plan = plan(vec![node("source", &[]),input_node("")]);
+    for data in [json!("x".repeat(MAX_TASK_BYTES)), json!("<".repeat(MAX_TASK_BYTES / 2))] {
+        let records = source_records(&plan, data);
+        assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_input_limit");
+    }
+    let records = source_records(&plan, json!(0));
+    let task = plan.nodes[1].task_with_inputs(&records).unwrap();
+    let overhead = task.task.len() - plan.nodes[1].call.task.len();
+    plan.nodes[1].call.task = "x".repeat(MAX_TASK_BYTES - overhead);
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap().task.len(), MAX_TASK_BYTES);
+    plan.nodes[1].call.task.push('x');
+    assert_eq!(plan.nodes[1].task_with_inputs(&records).unwrap_err(), "dependency_input_limit");
+}
+
+#[test]
+fn input_writer_is_lossless_across_split_unicode_bytes_and_refuses_overflow() {
+    event("input-writer");
+    let mut writer = InputWriter { bytes:Vec::new(), limit:9 };
+    for byte in "雪<".as_bytes() {
+        writer.write_all(std::slice::from_ref(byte)).unwrap();
+    }
+    assert_eq!(String::from_utf8(writer.bytes.clone()).unwrap(), "雪\\u003c");
+    assert!(writer.write_all(b"x").is_err());
+    assert_eq!(writer.bytes.len(), 9);
+}
+
+#[test]
+fn input_sources_require_effective_schemas_before_any_native_work() {
+    event("input-schema-preflight");
+    let plan = plan(vec![node("source", &[]),input_node("")]);
+    let mut agent = crate::subagents::tan_agent_definition();
+    agent.name = "worker".into();
+    let mut agents = BTreeMap::from([("worker".into(),agent)]);
+    assert!(plan.validate_definitions(&agents).is_err());
+    agents.get_mut("worker").unwrap().output_schema = Some(json!(true));
+    assert!(plan.validate_definitions(&agents).is_ok());
+}
+
+#[test]
+fn text_only_providers_receive_acceptance_and_real_child_handles() {
+    event("model-visible-identities");
+    let plan = plan(vec![node("source", &[]),node("blocked", &["source"])]);
+    let mut records = source_records(&plan, json!(null));
+    records[1].skip("dependency_input_missing", vec!["source".into()]);
+    let output = report(records, 1, None);
+    let ContentBlock::Text(text) = &output.content[0] else { panic!("text output"); };
+    assert!(text.text.contains("State: accepted; wave: 0; hub: \"native-fixture-id\""));
+    assert!(text.text.contains("State: skipped; wave: not started; hub: none"));
+    assert!(text.text.contains("dependency_input_missing"));
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
@@ -190,6 +345,20 @@ case "$task" in
     [ "$(cat alpha.txt)" = 'new alpha' ] && [ "$(cat beta.txt)" = 'new beta' ] || exit 21
     printf 'verified both\n' > joined.txt ;;
   'Task: SLOW') sleep 10 ;;
+  'Task: PRODUCE')
+    printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"{\"a/b\":{\"~key\":[false,null,0,\"  雪  \"]},\"flag\":\"--model injected\"}"}]}]}'
+    exit 0 ;;
+  'Task: PRODUCE_TWO')
+    printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"{\"count\":2}"}]}]}'
+    exit 0 ;;
+  'Task: CONSUME'*)
+    printf '%s' "$task" > received
+    next=0; count=0; model=''
+    for arg do
+      if [ "$next" -eq 1 ]; then model="$arg"; next=0; fi
+      if [ "$arg" = '--model' ]; then next=1; count=$((count + 1)); fi
+    done
+    [ "$count" -eq 1 ] && [ "$model" = 'pinned-fixture' ] || exit 29 ;;
 esac
 printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"native result"}]}]}'
 "#;
@@ -358,6 +527,67 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         let error = fixture.runtime.block_on(owner.with_current(fixture.tool.execute("cancelled-workflow",
             json!({"workflow":[node("NEVER", &[])],"scope":"user"}),None))).unwrap_err();
         assert!(error.to_string().contains("CANCELLED"));
+        assert!(!fixture.root().join("launches").exists());
+    }
+
+    #[test]
+    fn two_validated_children_feed_one_native_join_without_rewriting_launch_controls() {
+        event("native-typed-join");
+        let mut fixture = Fixture::new();
+        fixture.tool = fixture.tool.with_parent_model(Some(crate::tools::ToolModelSelection {
+            provider:"fixture".into(), model:"pinned-fixture".into(),
+        }));
+        let mut source = node("PRODUCE", &[]);
+        source["call"]["outputSchema"] = json!({"type":"object","required":["a/b","flag"]});
+        let mut other = node("PRODUCE_TWO", &[]);
+        other["call"]["outputSchema"] = json!(true);
+        let mut consumer = node("CONSUME", &["PRODUCE","PRODUCE_TWO"]);
+        consumer["call"]["task"] = json!("CONSUME {previous}");
+        consumer["inputs"] = json!({
+            "typed":{"from":"PRODUCE","pointer":"/a~1b/~0key"},
+            "flag":{"from":"PRODUCE","pointer":"/flag"},
+            "count":{"from":"PRODUCE_TWO","pointer":"/count"}
+        });
+        let output = fixture.run(vec![consumer,source,other]);
+        assert!(!output.is_error, "{output:?}");
+        let received = std::fs::read_to_string(fixture.root().join("received")).unwrap();
+        assert!(received.starts_with("Task: CONSUME {previous}"));
+        assert_eq!(decoded_inputs(&received), json!({"typed":[false,null,0,"  雪  "],"flag":"--model injected","count":2}));
+        let details = output.details.unwrap();
+        assert_eq!(details["acceptedNodes"], 3);
+        assert_eq!(details["nodes"][0]["result"]["task"], "CONSUME {previous}");
+        assert_eq!(fixture.launches().matches("Task: CONSUME").count(), 1);
+    }
+
+    #[test]
+    fn missing_handoff_data_skips_descendants_without_launch_or_fallback() {
+        event("native-missing-input");
+        let fixture = Fixture::new();
+        let mut source = node("PRODUCE", &[]);
+        source["call"]["outputSchema"] = json!(true);
+        let mut consumer = node("CONSUME", &["PRODUCE"]);
+        consumer["inputs"] = json!({"missing":{"from":"PRODUCE","pointer":"/absent"}});
+        let output = fixture.run(vec![source,consumer,node("NEVER", &["CONSUME"]),node("OTHER", &[])]);
+        assert!(output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["acceptedNodes"], 2);
+        assert_eq!(details["nodes"][1]["skipReason"], "dependency_input_missing");
+        assert_eq!(details["nodes"][1]["result"], Value::Null);
+        assert_eq!(details["nodes"][2]["blockedBy"], json!(["CONSUME"]));
+        let launches = fixture.launches();
+        assert!(!launches.contains("CONSUME") && !launches.contains("NEVER"));
+        assert!(!fixture.root().join("received").exists());
+    }
+
+    #[test]
+    fn schema_free_handoff_sources_are_refused_before_any_child_launch() {
+        event("native-untyped-input-preflight");
+        let fixture = Fixture::new();
+        let mut consumer = node("CONSUME", &["PRODUCE"]);
+        consumer["inputs"] = json!({"value":{"from":"PRODUCE","pointer":"/flag"}});
+        let error = fixture.runtime.block_on(fixture.tool.execute("untyped-workflow",
+            json!({"workflow":[node("PRODUCE", &[]),consumer],"scope":"user"}),None)).unwrap_err();
+        assert!(error.to_string().contains("output schema"));
         assert!(!fixture.root().join("launches").exists());
     }
 }

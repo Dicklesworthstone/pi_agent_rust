@@ -73,6 +73,82 @@ schema compilation also finish before the first child. Native filesystem
 conditions are still checked at execution; this is not a transactional dry run.
 Mixed modes and unknown fields are refused rather than silently ignored.
 
+## Typed handoffs between predecessors and dependants
+
+Add `inputs` beside a node's `call` to pass selected schema-validated results
+into that child's task. Each named input has a `from` node ID and a JSON
+`pointer` into that node's accepted `data`, not into its entire native result:
+
+```json
+{
+  "workflow": [
+    {
+      "id": "inspect",
+      "call": {
+        "agent": "scout", "task": "Identify the files relevant to the assigned change.",
+        "outputSchema": {
+          "type": "object", "required": ["files"],
+          "properties": {"files": {"type": "array", "items": {"type": "string"}}}
+        }
+      }
+    },
+    {
+      "id": "implement", "needs": ["inspect"],
+      "inputs": {"files": {"from": "inspect", "pointer": "/files"}},
+      "call": {
+        "agent": "task", "task": "Implement the assigned change using the supplied file findings.",
+        "isolation": "worktree", "isoApply": "apply"
+      }
+    },
+    {
+      "id": "review", "needs": ["implement"],
+      "call": {"agent": "reviewer", "task": "Review the accepted implementation."}
+    }
+  ]
+}
+```
+
+A join may select inputs from multiple predecessors. Every source must also
+appear directly in `needs`, even when it is already a transitive ancestor.
+Forward references work. A source must declare `outputSchema` on its call or
+inherit a schema from its agent definition; this is checked before any child
+launch. A boolean JSON Schema is valid too. Schema-free prose is never guessed
+into structured data. Existing native schema validation and corrective retries
+remain authoritative.
+
+Pointers preserve literal keys and JSON types: `/a~1b/~0key/0` selects element
+zero beneath keys `a/b` and `~key`. Empty pointer selects complete `data`,
+including a scalar or null. Missing data is not null and has no fallback. There
+is no dotted-path shorthand, template language, script execution or coercion.
+Input names use the node-ID character rule, with at most 32 inputs per node;
+pointers are at most 1,024 UTF-8 bytes and 32 segments. Unknown fields, null
+input maps, invalid escapes and indirect/unknown source references are errors.
+
+The native child receives its literal authored task followed by a
+`<workflow-inputs>` JSON data block. Values are serialized, not interpolated
+as source, CLI arguments or task templates. `<` is escaped while serializing
+so data cannot forge the closing delimiter. Existing `{previous}` or other
+placeholder-like text stays literal in workflow tasks and input values.
+The complete expanded task, including framing and escaped JSON, is bounded
+to 64 KiB; counting occurs before copying data, and the serialization sink
+enforces the expansion bound. Results are borrowed from this invocation's
+accepted records rather than loaded from a process-global cache.
+
+Input binding never changes the selected agent, model, tools, cwd, isolation,
+output schema or deadline. This is data provenance and framing, **not a
+prompt-injection sandbox**: values still become model context, and a child can
+act on that context within its ordinary host policy. Native progress, hub and
+revival records may contain the actual expanded prompt. The terminal workflow
+node's `result.task` remains the authored assignment to avoid repeating the
+input payload there; ordinary result output/data disclosure is unchanged.
+
+If data is unavailable, missing at the pointer or too large, that node is
+skipped **before** its native invocation with `dependency_data_unavailable`,
+`dependency_input_missing` or `dependency_input_limit`. `blockedBy` lists its
+selected input sources. Descendants skip normally; independent branches can
+continue. The source result remains available for inspection, and the failed
+handoff is not silently retried or replaced with raw child output.
+
 ## Failure and result semantics
 
 Results use `pi.subagent.workflow.v1` with nodes in authored order. Every node
@@ -80,6 +156,10 @@ has `id`, `needs`, `state`, zero-based `wave` when attempted, `hubId`,
 `nativeIsError`, and its complete native `result`. Skipped nodes have no child
 result or synthetic hub entry; `skipReason` and `blockedBy` explain why they
 were not launched. Counts distinguish accepted, rejected and skipped nodes.
+Node acceptance states, wave numbers and real hub IDs also appear in result
+text, because model providers do not generally transmit arbitrary tool details.
+The parent can use those handles with the existing hub/agent URL surfaces
+without deriving child identity from generated prose.
 
 A predecessor is accepted only after native completion, with no native error
 and no failed schema validation. Even `schemaMode: permissive` invalid output
@@ -102,8 +182,11 @@ structured details rather than the optional legacy compact text footer.
 `src/subagents/workflow/tests.rs` contains graph/admission/result unit tests and
 Unix native-child fixtures for real parallel barriers, fork/join ordering,
 dependency failures, permissive-schema rejection, original deadlines,
-cancellation, and accepted edits flowing into downstream worktrees. Fixtures
-speak the native process protocol without contacting a model.
+cancellation, and accepted edits flowing into downstream worktrees. Typed
+handoff regressions cover escaping, exact JSON values, direct-edge admission,
+combined byte limits, schema provenance, multi-source child input, native
+launch-control preservation and pre-launch skips. Fixtures speak the native
+process protocol without contacting a model.
 
 These Rust tests were authored, not executed in the implementation environment:
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was unavailable.
