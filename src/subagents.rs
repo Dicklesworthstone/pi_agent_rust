@@ -31,6 +31,7 @@ mod execution;
 mod execution_tests;
 mod protocol;
 mod workspace;
+mod workflow;
 
 use deadline::Deadline;
 use execution::ChildRunner;
@@ -448,11 +449,14 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        concat!(
+            "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
+            " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback."
+        )
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        workflow::schema(json!({
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
@@ -484,7 +488,7 @@ impl Tool for SubagentTool {
                 }
             },
             "additionalProperties": false
-        })
+        }))
     }
 
     async fn execute(
@@ -511,6 +515,9 @@ impl Tool for SubagentTool {
                 "subagent",
                 "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
+        }
+        if let Some(plan) = workflow::Plan::parse(&input)? {
+            return plan.execute(self, on_update.map(Arc::from)).await;
         }
         workspace::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
