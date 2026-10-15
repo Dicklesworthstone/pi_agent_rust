@@ -198,9 +198,9 @@ A non-match marks the branch `not_selected`; descendants requiring it are also
 not selected. No child, hub entry, input expansion or worktree capture occurs for
 these nodes. Intentional nonselection alone does not fail the workflow. Rejected,
 cancelled, schema-invalid or unavailable dependencies still block as errors, even
-when another prerequisite was intentionally not selected. A downstream task that
-needs **both** alternative branches will therefore not run; dependencies retain
-their all-required semantics.
+when another prerequisite was intentionally not selected. By default, a downstream
+task requiring **both** alternative branches will not run. An explicit selected
+join, described below, allows those alternatives to converge.
 
 The node's `condition` field and text show `matched`, `not_matched`,
 `condition_value_missing` or `condition_data_unavailable` when evaluated. Expected
@@ -214,6 +214,43 @@ This is agent-result routing, **not human approval or new tool authority**. The
 selected child still needs its ordinary host permissions. A gate does not undo
 earlier changes; put review before the mutation it is intended to control. All
 evaluation shares the original workflow deadline and acceptance barriers.
+
+### Converging selected branches
+
+Set `join: "selected"` on a node that must continue after whichever alternative
+actually ran. For example, append this node to the review/repair/report workflow:
+
+```json
+{
+  "id": "finish",
+  "needs": ["repair", "report"],
+  "join": "selected",
+  "call": {"agent": "reviewer", "task": "Inspect the final accepted workspace and summarize the outcome."}
+}
+```
+
+The default `join: "all"` still requires every predecessor to be accepted.
+`selected` requires **at least one accepted predecessor**, with every other
+predecessor intentionally `not_selected`. Any rejected, error-skipped or pending
+predecessor blocks the join. An accepted sibling cannot hide failed execution,
+invalid JSON, a missing input, cancellation or a worktree conflict. If all
+predecessors were not selected, the join is also `not_selected` with
+`skipReason: "no_selected_dependencies"`; no child is invented for it.
+
+This is not an any-success race: all declared edges remain in the topological
+graph, and the existing wave/patch-acceptance barrier is unchanged. Multiple
+selected branches must **all** be accepted before the join runs. A joined worktree
+captures its baseline after accepted predecessors settle, so it sees their
+applied changes. `keep` and `drop` retain their ordinary non-writeback semantics.
+
+An explicitly supplied `join` requires nonempty `needs`. Null, unknown values and
+policy on a single/parallel/chain delegation are refused. The join only changes
+dependency admission: `when` and `inputs` still require their exact schema-valid
+source data. Selecting data from an unselected alternative is an error, not null,
+an omitted input or substitution from another branch. Put shared data in a
+predecessor that always runs, or bind known selected inputs within each branch.
+The original timeout and cancellation checks still gate the converged task;
+joining never starts a fresh request or retries either branch.
 
 ## Failure and result semantics
 
@@ -233,8 +270,8 @@ is retained as a native warning but rejected as dependency evidence. Failed,
 operator-killed, cancelled or schema-invalid nodes block their descendants;
 an independent branch may continue. `stopReason` reports a request interruption
 observed between waves. The tool result is unsuccessful if any node is rejected
-or skipped for an error, not merely `not_selected`. Native progress events remain native events; terminal workflow
-records provide graph IDs and hub IDs for correlation.
+or skipped for an error, not merely `not_selected`. Native progress events remain
+native events; terminal workflow records provide graph IDs and hub IDs for correlation.
 
 Completed effects are **not rolled back** when a later node fails. Worktree
 conflicts remain inspectable native failures, never forced. No workflow-level
@@ -259,6 +296,12 @@ failure-precedence and nonexecution-report checks, plus native-child workflows
 for conditional repair/report selection, unavailable verdicts, upfront refusal
 and excluding a branch before input/workspace preparation. These tests are
 authored, not executed in the implementation environment.
+
+The same suite also covers the full two-predecessor state matrix, malformed join
+policy, mandatory data provenance, retained topological edges, native convergence,
+all-unselected versus mixed-failure outcomes, cancellation, missing branch inputs
+and an isolated joined task reading its predecessor's accepted changes while the
+parent index/HEAD stay unchanged. None of these Rust tests were executed here.
 
 These Rust tests were authored, not executed in the implementation environment:
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was unavailable.

@@ -174,6 +174,80 @@ fn effective_schema_is_required_even_when_expected_value_will_not_match() {
         json!(["from","pointer","equals"]));
 }
 
+fn join_node(id: &str, needs: &[&str]) -> Value {
+    let mut value = node(id,needs);
+    value["join"] = json!("selected");
+    value
+}
+
+#[test]
+fn selected_join_truth_table_never_treats_a_failed_or_pending_branch_as_optional() {
+    event("join-state-matrix");
+    let plan = plan(vec![source(),node("other",&[]),join_node("join",&["source","other"]),
+        node("all",&["source","other"])]);
+    let states = [State::Accepted,State::NotSelected,State::Rejected,State::Skipped,State::Pending];
+    for left in states {
+        for right in states {
+            let mut records = records(&plan,json!({}));
+            records[0].state = left;
+            records[1].state = right;
+            let selected = plan.nodes[2].decision.evaluate(&[0,1],&records);
+            let all = plan.nodes[3].decision.evaluate(&[0,1],&records);
+            let failed = [left,right].iter().any(|state| matches!(state,State::Rejected|State::Skipped|State::Pending));
+            let both_excluded = left == State::NotSelected && right == State::NotSelected;
+            assert_eq!(selected.reason.is_none(),!failed && !both_excluded,"{left:?} {right:?}");
+            assert_eq!(all.reason.is_none(),left == State::Accepted && right == State::Accepted);
+            assert_eq!(selected.not_selected,both_excluded);
+            if failed { assert_eq!(selected.reason,Some("dependency_failed")); }
+            if both_excluded { assert_eq!(selected.reason,Some("no_selected_dependencies")); }
+        }
+    }
+}
+
+#[test]
+fn selected_join_preflight_rejects_invalid_roots_and_misplaced_policy() {
+    event("join-admission");
+    for value in [Value::Null,json!(true),json!("any"),json!("ALL"),json!([])] {
+        let mut dependent = join_node("join",&["source"]);
+        dependent["join"] = value;
+        assert!(Plan::parse(&json!({"workflow":[source(),dependent]})).is_err());
+    }
+    for mode in ["all","selected"] {
+        let mut root = node("root",&[]);
+        root["join"] = json!(mode);
+        assert!(Plan::parse(&json!({"workflow":[root]})).is_err());
+    }
+    for request in [json!({"agent":"worker","task":"x","join":"selected"}),
+        json!({"tasks":[{"agent":"worker","task":"x","join":"selected"}]}),
+        json!({"chain":[{"agent":"worker","task":"x","join":"selected"}]})] {
+        assert!(Plan::parse(&request).is_err());
+    }
+    let schema = crate::subagents::SubagentTool::new(std::path::Path::new(".")).parameters();
+    assert_eq!(schema["properties"]["workflow"]["items"]["properties"]["join"]["enum"],json!(["all","selected"]));
+}
+
+#[test]
+fn selected_join_does_not_fabricate_data_for_an_excluded_condition_or_input() {
+    event("join-data-provenance");
+    let mut dependent = join_node("join",&["source","excluded"]);
+    dependent["when"] = json!({"from":"excluded","pointer":"","equals":null});
+    let plan = plan(vec![source(),node("excluded",&[]),dependent]);
+    let mut records = records(&plan,json!({}));
+    records[1].state = State::NotSelected;
+    let admission = plan.nodes[2].decision.evaluate(&[0,1],&records);
+    assert_eq!(admission.reason,Some("condition_data_unavailable"));
+    assert!(!admission.not_selected);
+}
+
+#[test]
+fn selected_join_keeps_all_topological_edges_including_later_alternative_branches() {
+    event("join-wave-barrier");
+    let plan = plan(vec![join_node("join",&["fast","slow"]),source(),
+        node("fast",&["source"]),node("middle",&["source"]),node("slow",&["middle"])]);
+    assert_eq!(plan.waves,vec![vec![1],vec![2,3],vec![4],vec![0]]);
+    assert_eq!(plan.nodes[0].needs,vec![2,4]);
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
@@ -193,6 +267,7 @@ case "$task" in
   'Task: invalid'*) answer='not JSON' ;;
   'Task: broken') exit 7 ;;
   'Task: repair') printf 'repaired\n' > repaired.txt; answer='"done"' ;;
+  'Task: verify_repaired') [ "$(cat repaired.txt)" = 'repaired' ] || exit 23; printf 'verified\n' > joined.txt; answer='"done"' ;;
   *) answer='"done"' ;;
 esac
 printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":'"$(printf '%s' "$answer" | sed 's/\\/\\\\/g;s/"/\\"/g;s/^/"/;s/$/"/')"'}]}]}'
@@ -297,5 +372,113 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         assert_eq!(output.details.unwrap()["nodes"][1]["state"],"not_selected");
         assert_eq!(fixture.launches(),"Task: source\n");
         assert!(!fixture.dir.path().join("workspace/nonexistent-child-workspace").exists());
+    }
+
+    #[test]
+    fn selected_join_converges_after_the_chosen_native_branch_without_launching_the_other() {
+        event("native-branch-convergence");
+        let fixture = Fixture::new();
+        let mut join = join_node("summary",&["accept","repair"]);
+        join["call"]["task"] = json!("verify_repaired");
+        let output = fixture.execute(vec![join,source(),branch("accept",json!("approve")),
+            branch("repair",json!("repair"))]).unwrap();
+        assert!(!output.is_error,"{output:?}");
+        let details = output.details.unwrap();
+        assert_eq!(details["acceptedNodes"],3);
+        assert_eq!(details["notSelectedNodes"],1);
+        assert_eq!(details["nodes"][0]["state"],"accepted");
+        assert_eq!(details["nodes"][0]["wave"],2);
+        assert_eq!(fixture.launches(),"Task: source\nTask: repair\nTask: verify_repaired\n");
+    }
+
+    #[test]
+    fn all_excluded_join_stays_unselected_but_mixed_failure_is_an_error() {
+        event("native-join-failure-modes");
+        let fixture = Fixture::new();
+        let output = fixture.execute(vec![source(),branch("left",json!("left")),
+            branch("right",json!("right")),join_node("never",&["left","right"])]).unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.details.unwrap()["nodes"][3]["skipReason"],"no_selected_dependencies");
+        assert_eq!(fixture.launches(),"Task: source\n");
+        let failed = Fixture::new();
+        let output = failed.execute(vec![source(),branch("excluded",json!("approve")),
+            node("broken",&["source"]),join_node("never",&["source","excluded","broken"])]).unwrap();
+        assert!(output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["nodes"][3]["skipReason"],"dependency_failed");
+        assert_eq!(details["nodes"][3]["blockedBy"],json!(["broken"]));
+        assert!(!failed.launches().contains("never"));
+    }
+
+    #[test]
+    fn selected_join_retains_required_input_checks_instead_of_omitting_absent_values() {
+        event("native-join-input-refusal");
+        let fixture = Fixture::new();
+        let mut excluded = branch("excluded",json!("approve"));
+        excluded["call"]["outputSchema"] = json!(true);
+        let mut join = join_node("never",&["source","excluded"]);
+        join["inputs"] = json!({"data":{"from":"excluded","pointer":""}});
+        let output = fixture.execute(vec![source(),excluded,join]).unwrap();
+        assert!(output.is_error);
+        assert_eq!(output.details.unwrap()["nodes"][2]["skipReason"],"dependency_data_unavailable");
+        assert_eq!(fixture.launches(),"Task: source\n");
+    }
+
+    #[test]
+    fn selected_join_obeys_cancellation_after_the_predecessor_settles() {
+        event("native-join-cancellation");
+        let fixture = Fixture::new();
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let cancel = owner.clone();
+        let output = fixture.runtime.block_on(owner.with_current(fixture.tool.execute("cancel-join",
+            json!({"workflow":[source(),join_node("never",&["source"])],"scope":"user"}),
+            Some(Box::new(move |update| {
+                if update.details.as_ref().is_some_and(|details| details["result"]["status"] == "completed") {
+                    cancel.set_cancel_requested(true);
+                }
+            }))
+        ))).unwrap();
+        assert!(output.is_error);
+        assert!(!fixture.launches().contains("never"));
+        assert_eq!(output.details.unwrap()["stopReason"],"cancelled");
+    }
+
+    #[test]
+    fn converged_worktree_sees_accepted_branch_edits_without_changing_parent_index() {
+        event("native-join-worktree-acceptance");
+        let mut fixture = Fixture::new();
+        fixture.tool = fixture.tool.with_timeout(Duration::from_secs(30));
+        let root = fixture.dir.path().join("workspace");
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git").current_dir(&root).args(args).output().unwrap();
+            assert!(result.status.success(),"git {args:?}: {}",String::from_utf8_lossy(&result.stderr));
+            result.stdout
+        };
+        git(&["init","-q"]);
+        git(&["config","user.name","Decision Fixture"]);
+        git(&["config","user.email","decision@example.invalid"]);
+        git(&["config","commit.gpgsign","false"]);
+        std::fs::write(root.join(".gitignore"),"launches\n").unwrap();
+        std::fs::write(root.join("repaired.txt"),"not yet\n").unwrap();
+        git(&["add","."]);
+        git(&["commit","-qm","fixture"]);
+        let head = git(&["rev-parse","HEAD"]);
+        let index = std::fs::read(root.join(".git/index")).unwrap();
+        let mut repair = branch("repair",json!("repair"));
+        repair["call"]["isolation"] = json!("worktree");
+        repair["call"]["isoApply"] = json!("apply");
+        let mut joined = join_node("joined",&["repair","excluded"]);
+        joined["call"]["task"] = json!("verify_repaired");
+        joined["call"]["isolation"] = json!("worktree");
+        joined["call"]["isoApply"] = json!("apply");
+        let output = fixture.execute(vec![joined,source(),repair,branch("excluded",json!("approve"))]).unwrap();
+        assert!(!output.is_error,"{output:?}");
+        assert_eq!(std::fs::read(root.join("repaired.txt")).unwrap(),b"repaired\n");
+        assert_eq!(std::fs::read(root.join("joined.txt")).unwrap(),b"verified\n");
+        assert_eq!(git(&["rev-parse","HEAD"]),head);
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),index);
+        let details = output.details.unwrap();
+        assert_eq!(details["nodes"][0]["state"],"accepted");
+        assert_eq!(details["nodes"][3]["result"],Value::Null);
     }
 }

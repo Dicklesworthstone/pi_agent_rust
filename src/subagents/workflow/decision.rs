@@ -6,7 +6,7 @@ use serde_json::json;
 
 const MAX_CONDITION_BYTES: usize = 16 * 1024;
 
-pub(super) fn is_field(key: &str) -> bool { key == "when" }
+pub(super) fn is_field(key: &str) -> bool { matches!(key, "when" | "join") }
 
 pub(super) fn reject_misplaced(input: &Value) -> Result<()> {
     let has_policy = |value: &Value| value.as_object()
@@ -22,7 +22,11 @@ pub(super) fn reject_misplaced(input: &Value) -> Result<()> {
 
 pub(super) struct Policy {
     when: Option<Condition>,
+    join: Join,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Join { All, Selected }
 
 struct Condition {
     from: usize,
@@ -49,6 +53,17 @@ impl Admission {
 
 impl Policy {
     pub(super) fn parse(entry: &Value, ids: &BTreeMap<String, usize>, needs: &[usize]) -> Result<Self> {
+        let join = match entry.get("join") {
+            None => Join::All,
+            Some(value) => {
+                if needs.is_empty() { return Err(invalid("join requires at least one explicit dependency")); }
+                match value.as_str() {
+                    Some("all") => Join::All,
+                    Some("selected") => Join::Selected,
+                    _ => return Err(invalid("join must be all or selected; failed dependencies are never optional")),
+                }
+            }
+        };
         let when = entry.get("when").map(|value| {
             if encoded_size(value, MAX_CONDITION_BYTES).is_none() {
                 return Err(invalid("when exceeds its 16 KiB encoded limit"));
@@ -63,7 +78,7 @@ impl Policy {
             validate_pointer(pointer)?;
             Ok(Condition { from, pointer: pointer.to_owned(), equals: fields["equals"].clone() })
         }).transpose()?;
-        Ok(Self { when })
+        Ok(Self { when, join })
     }
 
     /// The caller checks this source's effective schema during full-graph
@@ -79,9 +94,13 @@ impl Policy {
         if !failed.is_empty() { return Admission::stopped("dependency_failed", failed, false); }
         let excluded: Vec<_> = needs.iter().copied()
             .filter(|&index| records[index].state == State::NotSelected).collect();
-        if !excluded.is_empty() {
-            return Admission::stopped("dependency_not_selected", excluded, true);
+        if !excluded.is_empty() && (self.join == Join::All || excluded.len() == needs.len()) {
+            let reason = if self.join == Join::Selected { "no_selected_dependencies" } else { "dependency_not_selected" };
+            return Admission::stopped(reason, excluded, true);
         }
+        // Selected joins wait for the ordinary complete-wave barrier and need
+        // at least one accepted predecessor. Only intentional nonselection is
+        // optional; this is not an any-success race or failure-recovery path.
         let Some(condition) = &self.when else { return Admission::ready(None); };
         let data = records.get(condition.from)
             .filter(|record| record.state == State::Accepted)
@@ -109,12 +128,16 @@ impl Policy {
 pub(super) fn extend_schema(schema: &mut Value) {
     schema["properties"]["workflow"]["items"]["properties"]["when"] = json!({
         "type":"object", "additionalProperties":false, "required":["from","pointer","equals"],
-        "description":"Run this node only when a direct needs predecessor's accepted schema-validated data matches a literal equals value at pointer. Source requires outputSchema or an agent-definition schema. JSON types and null are preserved; missing data is an error, not a false condition. A mismatch marks this branch and its dependants not_selected without launching them or failing the workflow. Other dependency failures still block it. Conditions are checked before input expansion or workspace capture, under the original deadline. At most 16 KiB encoded; no script, coercion, polling, retries, or tool-approval authority. Expected and observed values are not echoed in decision diagnostics.",
+        "description":"Run this node only when a direct needs predecessor's accepted schema-validated data matches a literal equals value at pointer. Source requires outputSchema or an agent-definition schema. JSON types and null are preserved; missing data is an error, not a false condition. A mismatch marks this branch not_selected without launching it or failing the workflow. All-required dependants are also not selected; explicit selected joins can converge branches. Dependency failures still block it. Conditions are checked before input expansion or workspace capture, under the original deadline. At most 16 KiB encoded; no script, coercion, polling, retries, or tool-approval authority. Compared values are not echoed in decision diagnostics.",
         "properties":{
             "from":{"type":"string","minLength":1,"maxLength":64},
             "pointer":{"type":"string","maxLength":1024},
             "equals":{}
         }
+    });
+    schema["properties"]["workflow"]["items"]["properties"]["join"] = json!({
+        "type":"string", "enum":["all","selected"], "default":"all",
+        "description":"Dependency admission, requiring nonempty needs when supplied. all requires every predecessor accepted. selected waits for all predecessors to settle, requires at least one accepted, and permits only intentional not_selected alternatives. Any rejected, error-skipped or unfinished predecessor still blocks the node; all-unselected prerequisites leave this node not_selected too. This is not any-success, early dispatch or recovery. Existing typed inputs and when still require their exact accepted source data; no absent-branch fallback. Native workspace acceptance, deadline and tool permissions remain unchanged."
     });
 }
 
