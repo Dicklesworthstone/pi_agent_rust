@@ -92,6 +92,40 @@ contracts are otherwise unchanged. There is no global managed venv or package
 installation added by discovery; `%pip install --managed` retains its existing
 kernel-local generation storage.
 
+## Independent SDK selection
+
+SDK callers can select a runtime per EvalTool without changing the process-wide
+environment. `EvalTool::new_with_python` overrides `PI_EVAL_PYTHON` for only the
+new instance, including when that environment variable is empty or invalid:
+
+```rust
+use pi::eval::EvalTool;
+use std::path::Path;
+
+let workspace = Path::new("/work/project");
+let interpreter = workspace.join(if cfg!(windows) {
+    ".venv/Scripts/python.exe"
+} else {
+    ".venv/bin/python"
+});
+let tool = EvalTool::new_with_python(workspace, interpreter)?;
+```
+
+The constructor returns an error for invalid selection syntax or bounds, but
+does not launch a process or require that executable to exist yet. The first
+Python cell still probes the selected runtime under the normal native owner,
+conversation lease, and hard deadline. A bare executable name uses the captured
+absolute PATH directories; literal paths and `~/` use the same rules as the
+environment override. This does not execute a shell or infer activation-prefix
+variables from an explicit path.
+
+Two instances can use different environments in the same workspace, with
+independent variables, kernel admission, resets, and runtime metadata. Reset,
+crash recovery, and session restoration do not fall back from that explicit
+selection to a project or system interpreter. Changing process-wide
+`PI_EVAL_PYTHON` later does not reconfigure an already constructed instance.
+JavaScript and existing `EvalTool::new` automatic discovery are unchanged.
+
 ## Validation
 
 `src/eval/python_runtime/tests.rs` contains native unit and public EvalTool
@@ -103,3 +137,7 @@ but not executed in the implementation environment. The required
 Compilation, Rust formatting, Clippy, native-host runtime and Windows acceptance
 remain unverified. Standalone real Python environment checks validate the
 probe/venv assumptions only; they do not execute the Rust resolver.
+
+Three additional Rust regressions exercise the explicit SDK constructor, two
+real venvs used concurrently in one workspace, independent reset, and crash
+recovery without interpreter fallback. They are likewise authored, not executed.

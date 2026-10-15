@@ -17,6 +17,42 @@ const PROBE_BUDGET: Duration = Duration::from_secs(2);
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(8);
 const PROBE: &str = "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 78)";
 
+impl super::EvalTool {
+    /// Construct an independent eval instance with an explicit Python runtime.
+    ///
+    /// Unlike a process-wide `PI_EVAL_PYTHON` change, this selection applies
+    /// only to this tool and its retained session kernels. Other environment
+    /// inputs are captured as usual. A bare name uses the captured absolute
+    /// PATH directories; a relative path is workspace-relative; `~/` expands.
+    /// No shell is involved. A failed explicit selection never falls back to
+    /// a different runtime. JavaScript behavior is unchanged.
+    ///
+    /// Construction validates path syntax and bounds, but does not spawn a
+    /// process or require the interpreter to exist yet. The first Python cell
+    /// performs the normal owned probe under its original hard deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EVAL_PY_INPUT` for empty/NUL-containing selections, unsupported
+    /// drive-relative paths, unavailable home expansion, or discovery limits.
+    pub fn new_with_python(
+        cwd: &Path,
+        interpreter: impl Into<OsString>,
+    ) -> Result<Self> {
+        let interpreter = interpreter.into();
+        if interpreter.is_empty() {
+            return Err(input_error("explicit SDK interpreter cannot be empty"));
+        }
+        let mut tool = Self::new(cwd);
+        // This explicit constructor overrides the process setting, including
+        // an invalid empty setting, without mutating the process environment.
+        tool.python_environment.empty_override = false;
+        tool.python_environment.candidates(&interpreter, cwd)?;
+        tool.python_path = interpreter;
+        Ok(tool)
+    }
+}
+
 /// Capture host selection inputs once, like PI_EVAL_PYTHON itself. Filesystem
 /// candidates are checked on each fresh spawn, not cached across namespaces.
 #[derive(Clone, Debug)]

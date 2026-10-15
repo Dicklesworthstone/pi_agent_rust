@@ -192,7 +192,7 @@ fn active_environment_wins_and_explicit_failure_does_not_run_the_cell() {
     let output = run(tool.execute("active", json!({"code":"import pi_runtime_fixture; pi_runtime_fixture.value"}), None)).unwrap();
     assert!(!output.is_error, "{}", text(&output));
     assert_eq!(output.details.as_ref().unwrap()["pythonRuntime"]["source"], "active-venv");
-    assert_eq!(text(&output).trim(), "2");
+    assert_eq!(text(&output).trim(), "(kernel started)\n2");
     let mut explicit = configured(cwd, &python);
     explicit.python_path = cwd.join("missing-python").into_os_string();
     let error = run(explicit.execute("no-fallback", json!({"code":"open('must-not-exist', 'w').write('ran')"}), None)).unwrap_err();
@@ -224,4 +224,79 @@ fn non_utf8_interpreter_paths_are_not_lossily_retargeted() {
     let plan = env.candidates(&name, dir.path()).unwrap();
     assert_eq!(plan[0].executable, dir.path().join(&name));
     assert_eq!(plan[0].command().get_program(), dir.path().join(name).as_os_str());
+}
+
+#[test]
+fn sdk_constructor_validates_without_spawn_or_global_environment_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = std::env::var_os("PI_EVAL_PYTHON");
+    for requested in [OsString::new(), OsString::from("./invalid\0python")] {
+        let error = match EvalTool::new_with_python(dir.path(), requested) {
+            Ok(_) => panic!("invalid interpreter accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("EVAL_PY_INPUT"));
+    }
+    let missing = dir.path().join("not-created-yet");
+    let tool = EvalTool::new_with_python(dir.path(), missing.clone()).unwrap();
+    assert_eq!(tool.python_path, missing.as_os_str());
+    assert!(tool.kernel.lock().unwrap().is_none());
+    assert!(tool.js.lock().unwrap().is_none());
+    assert!(!missing.exists());
+    assert_eq!(std::env::var_os("PI_EVAL_PYTHON"), before);
+}
+
+#[test]
+fn sdk_instances_use_different_explicit_environments_in_the_same_workspace() {
+    let Some(python) = python() else { return; };
+    let dir = tempfile::tempdir().unwrap();
+    let first_python = make_venv(&python, &dir.path().join("first environment"), 11);
+    let second_python = make_venv(&python, &dir.path().join("second environment"), 22);
+    let first = EvalTool::new_with_python(dir.path(), first_python.clone()).unwrap();
+    let second = EvalTool::new_with_python(dir.path(), second_python.clone()).unwrap();
+    run(async {
+        let seed = json!({"code":"import pi_runtime_fixture; saved = pi_runtime_fixture.value; saved"});
+        let (a, b) = futures::join!(
+            first.execute("first", seed.clone(), None),
+            second.execute("second", seed, None),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert!(!a.is_error, "{}", text(&a));
+        assert!(!b.is_error, "{}", text(&b));
+        assert_eq!(text(&a).trim(), "(kernel started)\n11");
+        assert_eq!(text(&b).trim(), "(kernel started)\n22");
+        for (output, executable) in [(&a, &first_python), (&b, &second_python)] {
+            assert_eq!(output.details.as_ref().unwrap()["pythonRuntime"]["source"], "explicit");
+            assert_eq!(output.details.as_ref().unwrap()["pythonRuntime"]["executable"], executable.to_string_lossy().as_ref());
+        }
+        let reset = first.execute("reset-first", json!({"reset":true,"code":"'saved' in globals()"}), None).await.unwrap();
+        assert!(!reset.is_error, "{}", text(&reset));
+        assert!(text(&reset).contains("False"));
+        let retained = second.execute("retained-second", json!({"code":"saved"}), None).await.unwrap();
+        assert!(!retained.is_error, "{}", text(&retained));
+        assert_eq!(text(&retained).trim(), "22");
+        assert_eq!(retained.details.as_ref().unwrap()["cell"], 2);
+    });
+}
+
+#[test]
+fn sdk_selection_survives_a_crash_without_falling_back_to_project_python() {
+    let Some(python) = python() else { return; };
+    let dir = tempfile::tempdir().unwrap();
+    make_venv(&python, &dir.path().join(".venv"), 99);
+    let selected = make_venv(&python, &dir.path().join("selected"), 7);
+    let tool = EvalTool::new_with_python(dir.path(), selected.clone()).unwrap();
+    run(async {
+        let seeded = tool.execute("seed", json!({"code":"import pi_runtime_fixture; saved = pi_runtime_fixture.value; saved"}), None).await.unwrap();
+        assert!(!seeded.is_error, "{}", text(&seeded));
+        assert_eq!(text(&seeded).trim(), "(kernel started)\n7");
+        let error = tool.execute("crash", json!({"code":"import os; os._exit(23)"}), None).await.unwrap_err();
+        assert!(error.to_string().contains("EVAL_KERNEL_CRASH"));
+        let next = tool.execute("fresh", json!({"code":"import pi_runtime_fixture; ('saved' in globals(), pi_runtime_fixture.value)"}), None).await.unwrap();
+        assert!(!next.is_error, "{}", text(&next));
+        assert_eq!(text(&next).trim(), "(kernel started)\n(False, 7)");
+        assert_eq!(next.details.as_ref().unwrap()["pythonRuntime"]["executable"], selected.to_string_lossy().as_ref());
+        assert_eq!(next.details.as_ref().unwrap()["cell"], 1);
+    });
 }
