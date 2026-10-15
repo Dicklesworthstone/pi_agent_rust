@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub(super) mod forms;
 mod frame_input;
+pub(super) mod selectors;
 pub(super) mod upload;
 
 const ELEMENT_FUNCTION: &str = include_str!("dom.js");
@@ -230,6 +231,9 @@ async fn resolve(
                 "unknown or expired element reference; take a new snapshot",
             )
         });
+    }
+    if let Some(locator) = selectors::parse(selector)? {
+        return selectors::resolve(owner, cdp, &locator).await;
     }
     if cdp.frame_selected() {
         return frame_input::resolve(owner, cdp, selector).await;

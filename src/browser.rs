@@ -164,7 +164,8 @@ impl Tool for BrowserTool {
          and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
          Use action:diagnostics to observe an explicit tab without triggering work. \
          start launches or attaches; status never launches; stop only stops a Pi-owned browser. \
-         Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts."
+         Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
+         Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused."
     }
 
     fn parameters(&self) -> Value {
@@ -185,7 +186,7 @@ impl Tool for BrowserTool {
                           "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll, wait_for, select_option or set_checked to that frame for this call only, including nested out-of-process frames. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Cross-process click/scroll project through embedding content quads and verify ancestor hit tests before native page input; occluded, invalid or pinch-zoomed geometry is rejected. Frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate; frame-scoped evaluation uses an isolated DOM world, not the page's JavaScript globals"},
-                "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1. Frame references require the same tab and frame; frame-scoped press/scroll require a selector."},
+                "selector": {"type": "string", "description": "CSS or snapshot @eN; also text/, label/, placeholder/, testid/, alt/, title/ and role/button[name=\"Save\" exact]. Semantic selectors are case-sensitive, bounded to 16 KiB and require one matching element; text-like names normalize whitespace and match substrings, testid matches data-testid exactly. Role/label use Chromium accessible names, not field values. Semantic selectors work on click/type/fill/press/wait_for/select_option/set_checked/upload and frame-scoped scroll, not inspection/export/download actions. Frame references require the same tab and frame; scoped press/scroll require selector."},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
                 "diagnostics": {
@@ -254,8 +255,9 @@ impl Tool for BrowserTool {
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let action = required(&args, "action")?;
+        let semantic_selector = interaction::selectors::validate_input(&args)?;
         if self.is_mock() {
-            if matches!(
+            if semantic_selector || matches!(
                 action,
                 "start"
                     | "status"
