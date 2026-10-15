@@ -1,5 +1,6 @@
 //! Registered debug adapters and target-aware launch arguments (bd-cv653.1.2).
-//! Built-in adapters: lldb-dap, GDB and debugpy over stdio, Delve over owned TCP.
+//! Built-in adapters: lldb-dap, GDB, CodeLLDB and debugpy over stdio,
+//! Delve over owned TCP.
 
 use std::path::Path;
 
@@ -110,6 +111,15 @@ pub fn default_adapters() -> Vec<AdapterSpec> {
         // Preserve LLDB preference for existing callers; offer a real native
         // backend when only GDB is installed. Explicit adapter="gdb" wins.
         gdb_adapter(),
+        AdapterSpec {
+            id: "codelldb".to_string(),
+            command_candidates: vec!["codelldb".to_string(), "codelldb.exe".to_string()],
+            // CodeLLDB 1.12.3 uses framed stdio when neither --port nor
+            // --connect is supplied. Reuse the existing owned transport.
+            adapter_args: vec![],
+            languages: vec!["rust", "c", "cpp", "binary"],
+            install_hint: "install CodeLLDB 1.12.3 with native stdio support; put its adapter on PATH or select its command with adapterConfig".to_string(),
+        },
         AdapterSpec {
             id: "debugpy".to_string(),
             command_candidates: vec!["python3".to_string()],
@@ -242,6 +252,15 @@ pub fn launch_arguments(
             "stopOnEntry": false,
             "stopAtBeginningOfMainSubprogram": true,
         }),
+        "codelldb" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            // Native CodeLLDB defaults to a terminal. This client has not
+            // granted its runInTerminal path, so keep output on DAP events.
+            "terminal": "console",
+            "stopOnEntry": true,
+        }),
         _ => serde_json::json!({
             "program": program.display().to_string(),
             "args": args,
@@ -264,6 +283,9 @@ pub fn attach_arguments(adapter: &AdapterSpec, pid: u32) -> Value {
 #[cfg(test)]
 #[path = "adapter_configuration_tests.rs"]
 mod configuration_tests;
+#[cfg(test)]
+#[path = "codelldb_tests.rs"]
+mod codelldb_tests;
 
 #[cfg(test)]
 mod tests {
