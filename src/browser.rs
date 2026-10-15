@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 mod cdp;
 mod dialog;
@@ -23,6 +22,7 @@ mod interaction;
 mod launch;
 mod mock;
 mod policy;
+mod session;
 
 pub use launch::BrowserLaunchOptions;
 
@@ -70,9 +70,7 @@ pub struct BrowserSettings {
 pub struct BrowserTool {
     cwd: PathBuf,
     mock_mode: Option<bool>,
-    mock_state: Mutex<mock::State>,
-    /// An owned guard keeps the serialized CDP/managed-process lifetime Send.
-    live_state: Arc<asupersync::sync::Mutex<cdp::Session>>,
+    sessions: session::Sessions,
     cdp_endpoint: Option<String>,
     launch_options: Option<BrowserLaunchOptions>,
     domain_allowlist: Option<Vec<String>>,
@@ -83,8 +81,7 @@ impl BrowserTool {
         Self {
             cwd: cwd.to_path_buf(),
             mock_mode: None,
-            mock_state: Mutex::new(mock::State::default()),
-            live_state: Arc::new(asupersync::sync::Mutex::new(cdp::Session::default())),
+            sessions: session::Sessions::default(),
             cdp_endpoint: None,
             launch_options: None,
             domain_allowlist: None,
@@ -164,6 +161,9 @@ impl Tool for BrowserTool {
          and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
          Use action:diagnostics to observe an explicit tab without triggering work. \
          start launches or attaches; status never launches; stop only stops a Pi-owned browser. \
+         Browser state is conversation-owned; switching back reuses its tabs. release discards only \
+         this conversation's browser state and requests owned-process cleanup, never stopping an \
+         externally attached browser. Four namespaces are retained without automatic eviction. \
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
          Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused."
     }
@@ -178,8 +178,8 @@ impl Tool for BrowserTool {
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "list_frames", "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
                              "scroll", "wait_for", "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
-                             "handle_dialog", "diagnostics"],
-                    "description": "Browser action; ordinary actions lazily start the managed browser"
+                             "handle_dialog", "diagnostics", "release"],
+                    "description": "Browser action; ordinary actions lazily start the managed browser. release accepts only action and timeout_ms: discard this conversation's state and request owned-browser cleanup; attached pages/processes remain open."
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
                 "frame": {"type": "string", "maxLength": 256,
@@ -248,14 +248,30 @@ impl Tool for BrowserTool {
             .union(ToolEffects::process())
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.sessions.bind(scope);
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
         args: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let action = required(&args, "action")?;
-        let semantic_selector = interaction::selectors::validate_input(&args)?;
+        self.sessions.execute(self, &args).await
+    }
+}
+
+impl BrowserTool {
+    /// The session owner chooses the namespace, never an argument from the model.
+    /// Keep all backend validation, deadlines and process ownership in the native path.
+    async fn execute_in_namespace(
+        &self,
+        namespace: &session::Namespace,
+        args: &Value,
+    ) -> Result<ToolOutput> {
+        let action = required(args, "action")?;
+        let semantic_selector = interaction::selectors::validate_input(args)?;
         if self.is_mock() {
             if semantic_selector || matches!(
                 action,
@@ -279,19 +295,19 @@ impl Tool for BrowserTool {
                     "browser lifecycle, frames, structured forms, file uploads, dialogs and page exports require the native backend",
                 ));
             }
-            return self
+            return namespace
                 .mock_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute(&self.cwd, self.domain_allowlist.as_deref(), &args);
+                .execute(&self.cwd, self.domain_allowlist.as_deref(), args);
         }
         cdp::execute(
-            &self.live_state,
+            &namespace.live_state,
             self.cdp_endpoint.as_deref(),
             self.launch_options.as_ref(),
             &self.cwd,
             self.domain_allowlist.as_deref(),
-            &args,
+            args,
         )
         .await
     }
