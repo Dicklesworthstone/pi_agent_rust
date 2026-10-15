@@ -1,4 +1,4 @@
-//! Opt-in, disk-backed archives of every admitted console frame.
+//! Opt-in, disk-backed console and complete native cell-result archives.
 //!
 //! No final path is exposed until the complete spool has been synced and
 //! published through the existing confined create-only artifact writer.
@@ -8,6 +8,7 @@ use crate::artifact_output::{self, OutputTarget};
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::ToolOutput;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -16,7 +17,10 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const END_RESERVE: u64 = 4096;
-const SCHEMA: &str = "pi.eval.console_artifact.v1";
+const SCHEMA: &str = "pi.eval.output_artifact.v1";
+
+#[cfg(test)]
+mod result_tests;
 
 fn error(code: &str, message: impl std::fmt::Display) -> Error {
     Error::tool("eval", format!("{code}: {message}"))
@@ -30,6 +34,7 @@ pub(in crate::eval) struct Archive {
     sequence: u64,
     stdout_bytes: u64,
     stderr_bytes: u64,
+    result_written: bool,
     failed: bool,
     limit: u64,
 }
@@ -47,7 +52,7 @@ impl Archive {
 
     pub(in crate::eval) async fn prepare(cwd: PathBuf, path: String, kernel: &'static str) -> Result<Self> {
         let owner = AgentCx::for_current_or_request();
-        asupersync::runtime::spawn_blocking_io(move || {
+        asupersync::runtime::spawn_blocking(move || {
             let _current = owner.cx().clone().set_current_restricted();
             Self::prepare_sync(&cwd, &path, kernel, owner)
         }).await
@@ -64,34 +69,43 @@ impl Archive {
         let mut archive = Self {
             target, spool: BufWriter::with_capacity(64 * 1024, file), owner,
             bytes: 0, sequence: 0, stdout_bytes: 0, stderr_bytes: 0,
-            failed: false, limit: MAX_BYTES,
+            result_written: false, failed: false, limit: MAX_BYTES,
         };
         archive.write_record(&json!({"schema":SCHEMA, "kind":"start", "kernel":kernel}), false)?;
         Ok(archive)
     }
 
-    fn write_record(&mut self, record: &Value, ending: bool) -> Result<()> {
-        if self.failed { return Err(error("EVAL_ARTIFACT_INCOMPLETE", "console archive has already failed")); }
-        self.owner.checkpoint().map_err(|_| error("EVAL_CANCELLED", "console archive cancelled"))?;
-        // Caller admits console frames before this point (at most 64 KiB of
-        // text). Only one escaped JSON frame is allocated, never the transcript.
-        let mut encoded = serde_json::to_vec(record).map_err(|failure| error("EVAL_ARTIFACT_IO", failure))?;
-        encoded.push(b'\n');
+    fn write_record<T: Serialize + ?Sized>(&mut self, record: &T, ending: bool) -> Result<()> {
+        if self.failed { return Err(error("EVAL_ARTIFACT_INCOMPLETE", "output archive has already failed")); }
         let limit = if ending { self.limit } else { self.limit.saturating_sub(END_RESERVE) };
-        let next = self.bytes.checked_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
-        let Some(next) = next.filter(|bytes| *bytes <= limit) else {
-            self.failed = true;
-            return Err(error("EVAL_ARTIFACT_LIMIT", "console archive exceeds its 64 MiB encoded budget"));
+        // Serialize directly into the bounded spool. Rich images, large final
+        // expressions and JSON escaping must not allocate another full result
+        // before discovering that its encoded representation exceeds the cap.
+        let mut writer = RecordWriter {
+            spool: &mut self.spool, bytes: &mut self.bytes, owner: &self.owner,
+            limit, exceeded: false,
         };
-        if let Err(failure) = self.spool.write_all(&encoded) {
+        let encoded = serde_json::to_writer(&mut writer, record)
+            .map_err(std::io::Error::other)
+            .and_then(|()| writer.write_all(b"\n"));
+        if let Err(failure) = encoded {
             self.failed = true;
+            if self.owner.checkpoint().is_err() {
+                return Err(error("EVAL_CANCELLED", "output archive cancelled"));
+            }
+            if writer.exceeded {
+                return Err(error("EVAL_ARTIFACT_LIMIT", "output archive exceeds its 64 MiB encoded budget"));
+            }
             return Err(error("EVAL_ARTIFACT_IO", failure));
         }
-        self.bytes = next;
         Ok(())
     }
 
     pub(super) fn record(&mut self, stream: &Value) -> Result<()> {
+        if self.result_written {
+            self.failed = true;
+            return Err(error("EVAL_ARTIFACT_INCOMPLETE", "console frame arrived after the completed result"));
+        }
         self.write_record(stream, false)?;
         self.sequence = stream["sequence"].as_u64().unwrap_or(self.sequence);
         let bytes = stream["text"].as_str().map_or(0, str::len) as u64;
@@ -103,11 +117,22 @@ impl Archive {
         Ok(())
     }
 
+    fn record_result(&mut self, output: &ToolOutput) -> Result<()> {
+        if self.result_written {
+            self.failed = true;
+            return Err(error("EVAL_ARTIFACT_INCOMPLETE", "duplicate completed cell result"));
+        }
+        self.write_record(&ResultRecord { kind: "result", output }, false)?;
+        self.result_written = true;
+        Ok(())
+    }
+
     fn publish_sync(mut self, execution_failed: bool) -> Result<Value> {
         self.write_record(&json!({
             "kind":"end", "sequence":self.sequence,
             "status":if execution_failed { "error" } else { "success" },
             "stdoutBytes":self.stdout_bytes, "stderrBytes":self.stderr_bytes,
+            "resultIncluded":self.result_written,
         }), true)?;
         self.spool.flush().map_err(|failure| error("EVAL_ARTIFACT_IO", failure))?;
         self.spool.seek(SeekFrom::Start(0)).map_err(|failure| error("EVAL_ARTIFACT_IO", failure))?;
@@ -120,17 +145,53 @@ impl Archive {
         Ok(json!({
             "schema":SCHEMA, "status":"written", "format":"jsonl",
             "path":self.target.path(), "bytes":bytes, "sha256":digest,
-            "complete":true,
+            "complete":true, "resultIncluded":self.result_written,
         }))
     }
 
-    pub(super) async fn publish(self, execution_failed: bool) -> Result<Value> {
+    async fn publish(mut self, output: ToolOutput) -> (Result<Value>, ToolOutput) {
         let owner = self.owner.clone();
-        asupersync::runtime::spawn_blocking_io(move || {
+        asupersync::runtime::spawn_blocking(move || {
             let _current = owner.cx().clone().set_current_restricted();
-            self.publish_sync(execution_failed)
+            let receipt = self.record_result(&output)
+                .and_then(|()| self.publish_sync(output.is_error));
+            // Move, do not clone, the native result across the blocking work.
+            // A failed archive never erases the already-completed cell output.
+            (receipt, output)
         }).await
     }
+}
+
+#[derive(Serialize)]
+struct ResultRecord<'a> {
+    kind: &'static str,
+    output: &'a ToolOutput,
+}
+
+struct RecordWriter<'a> {
+    spool: &'a mut BufWriter<File>,
+    bytes: &'a mut u64,
+    owner: &'a AgentCx,
+    limit: u64,
+    exceeded: bool,
+}
+
+impl Write for RecordWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.owner.checkpoint().map_err(|_| {
+            std::io::Error::other("output archive cancelled")
+        })?;
+        let amount = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let Some(next) = self.bytes.checked_add(amount).filter(|next| *next <= self.limit) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("output archive byte limit"));
+        };
+        self.spool.write_all(bytes)?;
+        *self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { self.spool.flush() }
 }
 
 struct HashingReader<'a> {
@@ -152,7 +213,7 @@ impl super::Capture {
     }
 
     /// A completed backend result may be an ordinary code exception; archive
-    /// that complete console with an error trailer. A stopped/incomplete run
+    /// its complete native output with an error trailer. A stopped/incomplete run
     /// must never acquire a misleading complete-file receipt.
     pub(in crate::eval) async fn finish_archive(&mut self, output: &mut ToolOutput, interrupted: bool) {
         let Some(archive) = self.archive.take() else { return; };
@@ -160,12 +221,22 @@ impl super::Capture {
         let owner = archive.owner.clone();
         let (metadata, notice) = if interrupted {
             (json!({"schema":SCHEMA, "status":"not_published", "complete":false}),
-             "EVAL_ARTIFACT_NOT_PUBLISHED: console archive is incomplete after interruption".to_string())
+             "EVAL_ARTIFACT_NOT_PUBLISHED: output archive is incomplete after interruption".to_string())
         } else {
-            match archive.publish(execution_failed).await {
+            // Exclude the receipt/notice that will be added after publication.
+            // The archived result is exactly the native result at this boundary,
+            // including rich content, structured details and its error flag.
+            let completed = ToolOutput {
+                content: std::mem::take(&mut output.content),
+                details: output.details.take(),
+                is_error: output.is_error,
+            };
+            let (receipt, completed) = archive.publish(completed).await;
+            *output = completed;
+            match receipt {
                 Ok(receipt) => {
                     let path = receipt["path"].as_str().unwrap_or_default();
-                    let mut notice = format!("Console archive saved to {} (JSONL; complete received stdout/stderr frames)",
+                    let mut notice = format!("Output archive saved to {} (JSONL; complete received console frames and native cell result, including rich displays)",
                         serde_json::to_string(path).unwrap_or_default());
                     // Publication is a commit point, not something a dropped
                     // or cancelled caller can roll back. Retain its actual
@@ -180,7 +251,7 @@ impl super::Capture {
                     output.is_error = true;
                     (json!({"schema":SCHEMA, "status":"failed", "complete":false,
                         "executionFailed":execution_failed, "error":failure.to_string()}),
-                     format!("{failure}; requested console archive was not published; completed cell effects were not rolled back"))
+                     format!("{failure}; requested output archive was not published; completed cell effects were not rolled back"))
                 }
             }
         };
@@ -280,7 +351,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["kind"], "start");
         assert_eq!(rows[1], json!({"kind":"end", "sequence":0, "status":"success",
-            "stdoutBytes":0, "stderrBytes":0}));
+            "stdoutBytes":0, "stderrBytes":0, "resultIncluded":false}));
         assert_eq!(receipt["complete"], true);
         assert_eq!(receipt["bytes"], std::fs::metadata(dir.path().join("quiet.jsonl")).unwrap().len());
     }

@@ -142,9 +142,9 @@ fn python_large_live_json_is_omitted_honestly_but_final_data_is_complete() {
 }
 
 #[test]
-fn python_rich_stream_leaves_console_archive_schema_and_sequence_unchanged() {
+fn python_rich_stream_archives_results_without_changing_console_sequence() {
     if !python_available() { return; }
-    let harness = TestHarness::new("python_rich_stream_leaves_console_archive_schema_and_sequence_unchanged");
+    let harness = TestHarness::new("python_rich_stream_archives_results_without_changing_console_sequence");
     let root = harness.temp_path(".");
     let tool = EvalTool::new(&root);
     let out = run(tool.execute("archive", json!({
@@ -156,9 +156,15 @@ fn python_rich_stream_leaves_console_archive_schema_and_sequence_unchanged() {
     assert_eq!(out.details.as_ref().unwrap()["displayStream"]["complete"], true);
     let rows: Vec<Value> = std::fs::read_to_string(root.join("console.jsonl")).unwrap()
         .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert_eq!(rows[0]["schema"], "pi.eval.console_artifact.v1");
-    let frames = &rows[1..rows.len()-1];
+    assert_eq!(rows[0]["schema"], "pi.eval.output_artifact.v1");
+    let frames: Vec<_> = rows.iter().filter(|row| row.get("name").is_some()).collect();
     assert_eq!(frames.len(), 4);
+    assert_eq!(rows.len(), frames.len() + 3);
+    let result = &rows[rows.len() - 2];
+    assert_eq!(result["kind"], "result");
+    assert_eq!(result["output"]["details"]["jsonOutputs"], json!([{"answer":42}]));
+    assert_eq!(result["output"]["isError"], true);
+    assert!(result["output"]["details"].get("outputArtifact").is_none());
     for (index, frame) in frames.iter().enumerate() {
         assert_eq!(frame["name"], "stdout");
         assert_eq!(frame["sequence"], index + 1);
@@ -287,9 +293,15 @@ fn javascript_live_displays_preserve_console_archives_and_ordinary_error_state()
     assert_eq!(out.details.as_ref().unwrap()["jsonOutputs"], json!([{"answer":42}]));
     let rows: Vec<Value> = std::fs::read_to_string(root.join("console.jsonl")).unwrap()
         .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert_eq!(rows[0]["schema"], "pi.eval.console_artifact.v1");
-    let frames = &rows[1..rows.len()-1];
+    assert_eq!(rows[0]["schema"], "pi.eval.output_artifact.v1");
+    let frames: Vec<_> = rows.iter().filter(|row| row.get("name").is_some()).collect();
     assert_eq!(frames.len(), 2);
+    assert_eq!(rows.len(), frames.len() + 3);
+    let result = &rows[rows.len() - 2];
+    assert_eq!(result["kind"], "result");
+    assert_eq!(result["output"]["details"]["jsonOutputs"], json!([{"answer":42}]));
+    assert_eq!(result["output"]["isError"], true);
+    assert!(result["output"]["details"].get("outputArtifact").is_none());
     for (index, frame) in frames.iter().enumerate() {
         assert_eq!(frame["sequence"], index + 1);
         assert!(frame.get("display").is_none());
