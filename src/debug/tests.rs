@@ -149,6 +149,70 @@ fn capture(tool: &DebugTool, runtime: &asupersync::runtime::Runtime) -> Vec<Valu
 
 #[cfg(unix)]
 #[test]
+fn explicit_cwd_controls_target_breakpoints_adapter_process_and_launch_wire() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "normal") else {
+        return;
+    };
+    let nested = temp.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("program.py"), "value = 2\n").unwrap();
+    let runtime = runtime();
+    run(
+        &tool,
+        &runtime,
+        json!({
+            "action":"launch",
+            "program":"program.py",
+            "cwd":"nested",
+            "adapter":"protocol-fixture",
+            "initialBreakpoints":[{"file":"program.py","line":10}]
+        }),
+    )
+    .unwrap();
+    let wire = capture(&tool, &runtime);
+    let launch = wire.iter().find(|entry| entry["command"] == "launch").unwrap();
+    assert_eq!(
+        launch["arguments"]["program"],
+        nested.join("program.py").canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(
+        launch["arguments"]["cwd"],
+        nested.canonicalize().unwrap().display().to_string()
+    );
+    let set = wire
+        .iter()
+        .find(|entry| entry["command"] == "setBreakpoints")
+        .unwrap();
+    assert_eq!(
+        set["arguments"]["source"]["path"],
+        nested.join("program.py").canonicalize().unwrap().display().to_string()
+    );
+    run(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    assert!(
+        nested.join("disconnect.json").is_file(),
+        "adapter process did not inherit the explicit cwd"
+    );
+}
+
+#[test]
+fn cwd_is_not_silently_ignored_on_other_actions() {
+    for input in [
+        json!({"action":"threads","cwd":"."}),
+        json!({"action":"launch","program":"x","cwd":""}),
+        json!({"action":"attach","pid":1,"cwd":"bad\u{0000}cwd"}),
+    ] {
+        assert!(
+            serde_json::from_value::<DebugInput>(input)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn breakpoint_workflow_preserves_all_families_and_removes_individual_entries() {
     let temp = tempfile::tempdir().unwrap();

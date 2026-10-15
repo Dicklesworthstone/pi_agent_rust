@@ -84,6 +84,33 @@ impl DebugTool {
         })
     }
 
+    fn resolve_working_directory(&self, requested: Option<&str>) -> Result<PathBuf> {
+        let candidate = requested.map_or_else(
+            || self.cwd.clone(),
+            |value| {
+                let path = Path::new(value);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.cwd.join(path)
+                }
+            },
+        );
+        let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+            tool_err(
+                "DAP_CWD",
+                format!("cannot resolve debug working directory: {error}"),
+            )
+        })?;
+        if !resolved.is_dir() {
+            return Err(tool_err(
+                "DAP_CWD",
+                "debug working directory must resolve to a directory",
+            ));
+        }
+        Ok(resolved)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_start(&self, input: &DebugInput) -> Result<ToolOutput> {
         if lock(&self.session).is_some() {
@@ -96,9 +123,10 @@ impl DebugTool {
         if input.remote.port.is_some() {
             return self.run_remote_start(input).await;
         }
+        let working_directory = self.resolve_working_directory(input.cwd.as_deref())?;
         let program = if input.action == "launch" {
             let name = input.required("program", input.program.as_deref())?;
-            let path = std::fs::canonicalize(self.cwd.join(name)).map_err(|error| {
+            let path = std::fs::canonicalize(working_directory.join(name)).map_err(|error| {
                 tool_err(
                     "DAP_TARGET_MISSING",
                     format!("cannot resolve launch target: {error}"),
@@ -119,7 +147,7 @@ impl DebugTool {
             None
         };
         let initial = breakpoints::initial(
-            &self.cwd,
+            &working_directory,
             input.initial_breakpoints.as_deref().unwrap_or(&[]),
         )?;
         let requested = input
@@ -173,10 +201,18 @@ impl DebugTool {
                     adapter,
                     p,
                     input.args.as_deref().unwrap_or(&[]),
-                    &self.cwd,
+                    &working_directory,
                 )
             },
         );
+        if input.cwd.is_some() {
+            arguments["cwd"] = json!(working_directory.to_str().ok_or_else(|| {
+                tool_err(
+                    "DAP_CWD",
+                    "debug working directory must be representable as UTF-8",
+                )
+            })?);
+        }
         selected.apply_defaults(&input.action, &mut arguments);
         configuration::set_stop_on_entry(&adapter.id, &mut arguments, input.stop_on_entry);
         if let Some(mode) = &input.go_mode {
@@ -231,12 +267,12 @@ impl DebugTool {
         }
         let go_mode = (adapter.id == "dlv" && program.is_some()).then(|| arguments["mode"].clone());
         let transport = if adapter.id == "dlv" {
-            dap::DapTransport::spawn_delve(&command, &adapter.adapter_args, &[], &self.cwd).await?
+            dap::DapTransport::spawn_delve(&command, &adapter.adapter_args, &[], &working_directory).await?
         } else {
-            dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &self.cwd)?
+            dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &working_directory)?
         };
         let session = if terminal {
-            DapSession::begin_with_terminal(transport, &self.cwd).await?
+            DapSession::begin_with_terminal(transport, &working_directory).await?
         } else {
             DapSession::begin(transport).await?
         }.with_launch_artifacts(artifacts);
@@ -804,6 +840,7 @@ struct DebugInput {
     args: Option<Vec<String>>,
     adapter: Option<String>,
     adapter_config: Option<String>,
+    cwd: Option<String>,
     go_mode: Option<String>,
     startup_timeout_ms: Option<u64>,
     pid: Option<u32>,
@@ -876,6 +913,17 @@ impl DebugInput {
             &self.action,
             self.remote.port.is_some(),
         )?;
+        if self.cwd.as_ref().is_some_and(|cwd| {
+            !matches!(self.action.as_str(), "launch" | "attach")
+                || cwd.is_empty()
+                || cwd.len() > 4096
+                || cwd.contains('\0')
+        }) {
+            return Err(tool_err(
+                "DAP_USAGE",
+                "cwd is launch/attach-only, nonempty, NUL-free and at most 4096 UTF-8 bytes",
+            ));
+        }
         if self.run_in_terminal.is_some() && self.action != "launch" {
             return Err(tool_err("DAP_USAGE", "runInTerminal is local-launch-only"));
         }
@@ -1010,6 +1058,7 @@ impl Tool for DebugTool {
                 "args":{"type":"array","items":{"type":"string"}},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
                 "adapterConfig":{"type":"string","maxLength":4096,"description":"Explicit workspace-relative dap.json with an adapters map; requires adapter ID. Local launch/pid-attach only. Executes the selected configured command; never auto-loaded."},
+                "cwd":{"type":"string","maxLength":4096,"description":"Launch/attach working directory. Relative paths resolve from the session workspace; launch program and initial breakpoint paths resolve from this directory."},
                 "goMode":{"type":"string","enum":["debug","test","exec"]},
                 "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":120_000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
