@@ -16,6 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+mod diagnostics;
+
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 const MAX_DOWNLOAD_RECORDS: usize = 128;
@@ -125,6 +127,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     frames::validate(args)?;
     dialog::validate_action(args)?;
     dialog::Expected::from_args(args, allowlist)?;
+    diagnostics::validate(args)?;
     match action {
         "start" | "status" | "stop" => {
             if args.as_object().is_some_and(|object| {
@@ -148,7 +151,8 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "evaluate" => {
             required(args, "script")?;
         }
-        "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree" => {}
+        "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree"
+        | "diagnostics" => {}
         "click" | "wait_for" => {
             required(args, "selector")?;
         }
@@ -252,7 +256,8 @@ pub(super) async fn execute(
         }
         let mut cdp = connected.ok_or_else(|| Error::tool("browser", "browser is not running"))?;
         cdp.timeout_ms = timeout_ms;
-        state.execute(&owner, &mut cdp, cwd, allowlist, args).await
+        let result = state.execute(&owner, &mut cdp, cwd, allowlist, args).await;
+        diagnostics::finish(&owner, &mut cdp, result).await
     };
     let cancelled = async {
         let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
@@ -291,6 +296,7 @@ pub(super) struct Cdp {
     downloads: BTreeMap<String, DownloadRecord>,
     timeout_ms: u64,
     dialog: dialog::State,
+    diagnostics: Option<diagnostics::Capture>,
 }
 
 impl Cdp {
@@ -345,6 +351,7 @@ impl Cdp {
             downloads: BTreeMap::new(),
             timeout_ms: 30_000,
             dialog: dialog::State::default(),
+            diagnostics: None,
         })
     }
 
@@ -361,6 +368,9 @@ impl Cdp {
                         .map_err(|e| Error::tool("browser", format!("invalid CDP JSON: {e}")))?;
                     if !value.is_object() {
                         return Err(Error::tool("browser", "CDP message must be an object"));
+                    }
+                    if let Some(capture) = self.diagnostics.as_mut() {
+                        capture.observe(&value);
                     }
                     if value["method"] == "Page.lifecycleEvent"
                         && matches!(
@@ -1030,13 +1040,21 @@ impl Session {
             cdp.frame_scope = Some(scope);
         }
         let reference_key = (target.clone(), frame.unwrap_or_default().to_owned());
+        diagnostics::start(owner, cdp, args, allowlist).await?;
         if let Some(expected) = dialog::Expected::from_args(args, allowlist)? {
             // An already-open dialog surfaced by Page.enable is not consent
             // for a future action. Arm only after enabling has completed.
             cdp.command(owner, "Page.enable", json!({})).await?;
             cdp.dialog.arm(expected);
         }
+        if let Some(capture) = cdp.diagnostics.as_mut() {
+            capture.begin_action();
+        }
         let result = match action {
+            "diagnostics" => Ok(output(
+                format!("Observing diagnostics for tab {tab}"),
+                json!({"tab": tab, "backend": "cdp"}),
+            )),
             // No Runtime.evaluate or DOM query: a modal dialog can suspend
             // page JavaScript. Target metadata already passed the URL guard.
             "handle_dialog" => dialog::execute(owner, cdp, &tab, args).await,

@@ -160,6 +160,8 @@ impl Tool for BrowserTool {
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
          structured option selection and checked-state control, frame discovery and frame-scoped \
          inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
+         Attach diagnostics to an action to capture console output and uncaught exceptions before \
+         and after it, or use action:diagnostics to observe an explicit tab without triggering work. \
          start launches or attaches; status never launches; stop only stops a Pi-owned browser. \
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts."
     }
@@ -174,7 +176,7 @@ impl Tool for BrowserTool {
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "list_frames", "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
                              "scroll", "wait_for", "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
-                             "handle_dialog"],
+                             "handle_dialog", "diagnostics"],
                     "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
@@ -185,6 +187,14 @@ impl Tool for BrowserTool {
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1. Frame references require the same tab and frame; frame-scoped press/scroll require a selector."},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
+                "diagnostics": {
+                    "type": "object", "additionalProperties": false,
+                    "description": "Opt-in native console/exception capture around a main-document action, or options for action:diagnostics. Requires an explicit tab. Records only admitted main-world contexts; includes buffered console entries when Chromium supplies them. Object previews/getters are never read. Free-form console text can contain application secrets. Bounded latest records appear in details.diagnostics and text; failures remain errors and work is never replayed. Unsupported with frame, lifecycle, handle_dialog, uploads, downloads or exports. No persistent/background subscription.",
+                    "properties": {
+                        "settle_ms": {"type":"integer","minimum":0,"maximum":10000,"default":250,"description":"Fixed receive window after success; shares timeout_ms, never extends it. 0 stops at action completion. Not a network-idle guarantee."},
+                        "max_events": {"type":"integer","minimum":1,"maximum":200,"default":100,"description":"Maximum latest console records, also bounded to 64 KiB; dropped records are counted."}
+                    }
+                },
                 "checked": {"type":"boolean", "description":"set_checked: required desired state for a native checkbox/radio input. Already-matching state is a no-op; otherwise uses one native click and verifies the same node. Cannot uncheck a selected radio; choose another in its group. Mixed/indeterminate and custom ARIA controls are rejected. Requires selector; no implicit dialog consent or retry."},
                 "options": {
                     "type": "array", "maxItems": 100,
@@ -253,10 +263,12 @@ impl Tool for BrowserTool {
                     | "download"
                     | "print_pdf"
                     | "handle_dialog"
+                    | "diagnostics"
             ) || interaction::forms::is_action(action)
                 || args.get("frame").is_some()
                 || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()
+                || args.get("diagnostics").is_some()
             {
                 return Err(Error::tool(
                     "browser",
