@@ -288,8 +288,9 @@ async fn capture_download(
         cdp.pump_event(owner).await?;
     }
     let start = start.ok_or_else(|| error("click produced no download event"))?;
-    policy::check_navigation(&start.url, req.allowlist)
-        .map_err(|_| error("download URL is blocked by browser URL policy"))?;
+    // Resource URLs have a separate contract from navigation: client-side
+    // exports may be Blob/data resources in this already-admitted document.
+    policy::download_url(&start.url, req.allowlist)?;
 
     let mut final_record = None;
     for _ in 0..MAX_WAIT_EVENTS {
@@ -417,6 +418,7 @@ pub(super) async fn execute(
         {
             return Err(error("download changed before publication; no artifact was published"));
         }
+        let resource = policy::download_url(&start.url, allowlist)?;
         owner
             .checkpoint()
             .map_err(|_| error("download cancelled before publication"))?;
@@ -426,13 +428,14 @@ pub(super) async fn execute(
             format!(
                 "Downloaded {} bytes from {} to {}",
                 bytes.len(),
-                start.url,
+                resource.display_url,
                 target.path().display()
             ),
             json!({
                 "action":"download","tab":tab,"selector":selector,
                 "saved_path":target.path().display().to_string(),
-                "url":start.url,"suggested_filename":start.suggested_filename,
+                "url":resource.display_url,"url_kind":resource.kind,
+                "url_redacted":resource.redacted,"suggested_filename":start.suggested_filename,
                 "size_bytes":bytes.len(),"received_bytes":progress.received_bytes,
                 "frame_id":source.frame_id,"backend":"cdp"
             }),
