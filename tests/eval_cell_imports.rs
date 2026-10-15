@@ -82,3 +82,49 @@ fn percent_load_javascript_imports_keep_the_real_importer_directory() {
         assert_eq!(text(&reused).trim(), "42");
     });
 }
+
+#[test]
+fn typed_setup_files_compose_static_code_and_data_imports_in_the_retained_realm() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("analysis")).unwrap();
+    std::fs::write(dir.path().join("analysis/rows.json"), "[{\"n\":17},{\"n\":25}]").unwrap();
+    std::fs::write(dir.path().join("analysis/template.md"), "# Result\n{{total}}\n").unwrap();
+    std::fs::write(dir.path().join("analysis/math.ts"),
+        "globalThis.helperLoads=(globalThis.helperLoads||0)+1; export function sum(rows: {n:number}[]): number {return rows.reduce((n,row)=>n+row.n,0)}").unwrap();
+    std::fs::write(dir.path().join("analysis/setup.ts"), r#"
+        import rows from './rows.json' with {type:'json'};
+        import template from './template.md' with {type:'text'};
+        import {sum} from './math.ts';
+        import type {NotNeededAtRuntime} from './never-created.ts';
+        interface Report { total: number; text: string }
+        await sleep(1);
+        const report: Report = {total:sum(rows),text:template.replace('{{total}}',String(sum(rows)))};
+        display(report);
+        report.total
+    "#).unwrap();
+    let tool = EvalTool::new(dir.path());
+    run(async {
+        let loaded = tool.execute("typed-load", json!({"kernel":"js","code":"%load analysis/setup.ts"}), None).await.unwrap();
+        assert!(!loaded.is_error, "{}", text(&loaded));
+        assert_eq!(loaded.details.as_ref().unwrap()["jsonOutputs"], json!([{"total":42,"text":"# Result\n42\n"}]));
+        let reused = tool.execute("typed-reuse", json!({"kernel":"js","code":"[report.total,sum(rows),helperLoads]"}), None).await.unwrap();
+        assert!(!reused.is_error, "{}", text(&reused));
+        assert_eq!(text(&reused).trim(), "[42,42,1]");
+    });
+}
+
+#[test]
+fn malformed_loaded_typescript_executes_neither_prefix_nor_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("effect.ts"), "globalThis.dependencyRan=true;").unwrap();
+    std::fs::write(dir.path().join("bad.ts"),
+        "globalThis.bodyRan=true; import './effect.ts'; const bad: = 42;").unwrap();
+    let tool = EvalTool::new(dir.path());
+    run(async {
+        let rejected = tool.execute("bad-load", json!({"kernel":"js","code":"%load bad.ts"}), None).await;
+        assert!(match &rejected { Err(_) => true, Ok(output) => output.is_error });
+        let probe = tool.execute("after-bad-load", json!({"kernel":"js","code":"[typeof bodyRan,typeof dependencyRan]"}), None).await.unwrap();
+        assert!(!probe.is_error, "{}", text(&probe));
+        assert_eq!(text(&probe).trim(), "[\"undefined\",\"undefined\"]");
+    });
+}

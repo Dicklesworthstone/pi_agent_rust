@@ -150,3 +150,28 @@ fn native_loader_still_refuses_remote_and_out_of_workspace_imports() {
     }
     assert_eq!(succeeds(&kernel, "typeof escaped").result.as_deref(), Some("\"undefined\""));
 }
+
+#[test]
+fn imported_then_alias_does_not_intercept_internal_promise_fulfillment() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("functions.mjs"),
+        "export function callback(){globalThis.calls=(globalThis.calls||0)+1; return 42;}").unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    let result = succeeds(&kernel, "import {callback as then} from './functions.mjs'; [typeof calls,then()]");
+    assert_eq!(result.result.as_deref(), Some("[\"undefined\",42]"));
+    assert_eq!(succeeds(&kernel, "calls").result.as_deref(), Some("1"));
+}
+
+#[test]
+fn guest_prototype_hooks_do_not_run_during_binding_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("value.mjs"), "export const value=42;").unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    succeeds(&kernel, "Object.prototype.then=function(){globalThis.hookRan=true; throw 'unexpected thenable'}; 1");
+    let imported = cell(&kernel, "import {value} from './value.mjs'; value");
+    // Restore before reporting any failure so a prototype hook cannot mask it.
+    succeeds(&kernel, "delete Object.prototype.then; 1");
+    assert!(imported.ok, "{:?}", imported.error);
+    assert_eq!(imported.result.as_deref(), Some("42"));
+    assert_eq!(succeeds(&kernel, "typeof hookRan").result.as_deref(), Some("\"undefined\""));
+}

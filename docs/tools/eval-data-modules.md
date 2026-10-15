@@ -17,8 +17,10 @@ import settings from './settings.json' with { type: 'json' };
 export const threshold = settings.threshold;
 ```
 
-Static import declarations belong in a module file. An eval cell is still a
-persistent script; use the awaited dynamic-import form in the first example.
+Static import declarations also work in cells and `%load` JS/TS scripts using
+the retained-script semantics in `eval-cell-imports.md`: named/default imports
+are binding snapshots, namespace imports retain live module access. Exports
+remain module-file syntax. The awaited dynamic-import form still works unchanged.
 Paths are explicit relative filesystem paths, rooted at the original workspace
 for a cell and at the importing file for a transitive module. URLs, packages,
 implicit extensions and paths outside the workspace remain unsupported.

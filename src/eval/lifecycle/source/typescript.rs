@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use swc_common::{FileName, Globals, Mark, SourceMap, Span, Spanned, GLOBALS};
 use swc_common::{comments::SingleThreadedComments, sync::Lrc};
-use swc_ecma_ast::{Decorator, MetaPropExpr, MetaPropKind, ModuleItem, Program, Script, TsExportAssignment, TsImportEqualsDecl, TsType};
+use swc_ecma_ast::{Decorator, MetaPropExpr, MetaPropKind, ModuleDecl, ModuleItem, Program, Script, TsExportAssignment, TsImportEqualsDecl, TsType};
 use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_transforms_base::{fixer::fixer, hygiene::hygiene, resolver};
@@ -70,8 +70,9 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
         Default::default(), StringInput::from(&*file), Some(&comments),
     );
     let mut parser = Parser::new_from(lexer);
-    // Parse with top-level-await grammar. Script entry cells retain their
-    // native no-static-import contract; actual imported modules retain ESM.
+    // Keep imports in module grammar while erasing types. The retained-script
+    // evaluator lowers the remaining value imports through its native loader;
+    // actual imported modules keep their full ESM semantics.
     let module = parser.parse_module()
         .map_err(|error| at(&cm, path, error.span(), format_args!("{:?}", error.kind())))?;
     if let Some(error) = parser.take_errors().into_iter().next() {
@@ -79,6 +80,19 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
     }
     let program = match kind {
         Kind::Module => Program::Module(module),
+        Kind::Script if module.body.iter().any(|item| {
+            matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_)))
+        }) => {
+            for item in &module.body {
+                if let ModuleItem::ModuleDecl(declaration) = item
+                    && !matches!(declaration, ModuleDecl::Import(_))
+                {
+                    return Err(at(&cm, path, declaration.span(),
+                        "exports require an imported module file, not a %load script"));
+                }
+            }
+            Program::Module(module)
+        }
         Kind::Script => {
             let mut statements = Vec::with_capacity(module.body.len());
             for item in module.body {
@@ -86,7 +100,7 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
                     ModuleItem::Stmt(statement) => statements.push(statement),
                     ModuleItem::ModuleDecl(declaration) => {
                         return Err(at(&cm, path, declaration.span(),
-                            "static imports/exports require await import('./file.ts'), not a %load script"));
+                            "exports require an imported module file, not a %load script"));
                     }
                 }
             }
@@ -110,6 +124,9 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
             verbatim_module_syntax: true,
             native_class_properties: true,
             ts_enum_is_mutable: true,
+            // Erasing a type-only import must not synthesize export {} in a
+            // retained script. Genuine imported modules retain that marker.
+            no_empty_export: kind == Kind::Script,
             ..Default::default()
         };
         let program = program
@@ -218,8 +235,6 @@ mod tests {
     #[test]
     fn unsupported_script_module_syntax_and_transforms_are_rejected_before_execution() {
         for source in [
-            "import { unused } from './never.js'; 42",
-            "import type { Shape } from './types.ts'; 42",
             "export const answer: number = 42",
             "export {}; 42",
             "import answer = require('./never.js'); 42",
@@ -231,6 +246,45 @@ mod tests {
         for path in ["input.d.ts", "input.D.TS", "input.tsx", "input.mts", "input.cts"] {
             assert!(prepare(Path::new(path), "42".into()).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn loaded_scripts_preserve_unused_value_imports_for_native_evaluation() {
+        let code = transpile(r"
+            import { unused } from './side-effect.ts';
+            import type { Missing } from './missing.ts';
+            const answer: number = 42;
+            answer
+        ");
+        assert!(code.contains("./side-effect.ts"));
+        assert!(!code.contains("./missing.ts"));
+        assert!(!code.contains("export"));
+        assert!(code.contains("const answer = 42"));
+    }
+
+    #[test]
+    fn erased_type_only_imports_do_not_load_files_or_leave_module_markers() {
+        let code = transpile("import type {Missing} from './never-created.ts'; const answer: number=42; answer");
+        assert!(!code.contains("import"));
+        assert!(!code.contains("export"));
+        let runtime = rquickjs::Runtime::new().unwrap();
+        let context = rquickjs::Context::full(&runtime).unwrap();
+        context.with(|ctx| assert_eq!(ctx.eval::<i32, _>(code.as_bytes()).unwrap(), 42));
+    }
+
+    #[test]
+    fn loaded_imports_keep_attributes_but_do_not_authorize_exports_or_import_meta() {
+        let code = transpile("import rows from './rows.json' with {type:'json'}; import template from './template.md' with {type:'text'}; const value: number=rows.length; value");
+        assert!(code.contains("./rows.json"));
+        assert!(code.contains("./template.md"));
+        assert_eq!(code.matches("with {").count(), 2);
+        for source in [
+            "import './one.ts'; export const answer=42;",
+            "import './one.ts'; export {};",
+            "import './one.ts'; const origin=import.meta.url;",
+            "import './one.ts'; import answer=require('./two.ts');",
+            "import './one.ts'; const broken: = 1;",
+        ] { assert!(prepare(Path::new("input.ts"), source.into()).is_err(), "{source}"); }
     }
 
     #[test]

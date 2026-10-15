@@ -129,16 +129,19 @@ impl Plan {
         let mut prefix = String::new();
         append(&mut prefix, ";")?;
         if !self.names.is_empty() {
-            append(&mut prefix, "const {")?;
+            append(&mut prefix, "const {bindings:{")?;
             append(&mut prefix, &self.pattern)?;
-            append(&mut prefix, "}=")?;
+            append(&mut prefix, "}}=")?;
         }
         append(&mut prefix, "await(async()=>{")?;
         append(&mut prefix, &self.calls)?;
         if !self.names.is_empty() {
-            append(&mut prefix, "return {")?;
+            // An imported local named `then` must not turn this internal
+            // transfer into a thenable. Null prototypes also prevent a guest
+            // Object.prototype.then from intercepting promise fulfillment.
+            append(&mut prefix, "return {__proto__:null,bindings:{__proto__:null,")?;
             append(&mut prefix, &self.values)?;
-            append(&mut prefix, "};")?;
+            append(&mut prefix, "}};")?;
         }
         append(&mut prefix, "})();")?;
         Ok(prefix)

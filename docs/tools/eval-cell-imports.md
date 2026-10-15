@@ -1,7 +1,7 @@
 # Static imports in retained JavaScript cells
 
 Native JavaScript eval accepts ordinary static-import declarations in a cell
-or a `%load` JavaScript script. These declarations use the existing workspace
+or a `%load` JavaScript/TypeScript script. These declarations use the existing workspace
 module loader; no package manager, additional runtime or network loader is added.
 
 ```json
@@ -63,6 +63,36 @@ uninitialized after failure, just like a failed awaited `const` initializer.
 Inspect the result and reset deliberately when needed; there is no automatic
 replay of the cell, a dependency, or a runtime-thrown SyntaxError.
 
+## Reusable typed setup files
+
+`%load analysis/setup.ts` now accepts imports as well as TypeScript declarations:
+
+```typescript
+import rows from './rows.json' with { type: 'json' };
+import { summarize } from './stats.ts';
+import type { Report } from './types.ts';
+
+const report: Report = summarize(rows);
+display(report);
+report
+```
+
+The existing SWC compiler erases types before the same retained-script import
+preparation runs. Explicit type-only imports never load a file, and removing
+them does not leave a synthetic empty export. Value imports remain even when
+their bindings are used only in annotations, because their modules can have
+side effects. The compiler does not fetch dependencies or perform type checking.
+
+The setup file's real path remains the import origin. Its ordinary declarations
+and imported bindings remain available to later cells. Exports and `import.meta`
+are still rejected for `%load` scripts, including scripts that contain imports.
+Use `import * as analysis from './analysis/report.mts'` to load an actual typed
+module with exports. Declaration files, CommonJS TypeScript and TSX remain
+unsupported. A malformed typed script is rejected before its body or imports
+execute; errors in subsequently loaded dependencies retain the partial-effects
+rules above. Reloading a setup file does not bypass retained lexical-name or
+dependency-cache rules.
+
 ## Limits and validation
 
 Preparation accepts at most 4 MiB of source/generated output, 128 static import
@@ -73,6 +103,8 @@ original cell deadline rather than made preemptible by a new worker.
 
 Regression coverage exercises parsing, hoisting, all binding forms, attributes,
 retained state, native module caching, failures and public EvalTool workflows.
+Typed-script cases exercise code/data composition, type-only erasure, unused
+value dependencies, persistent declarations and refusal before execution.
 The implementation environment lacked `dsr`. These Rust tests are authored,
 not executed; compilation, formatting, Clippy and runtime acceptance require:
 
