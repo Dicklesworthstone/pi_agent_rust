@@ -22,6 +22,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(mode: &str) -> Option<Self> {
+        Self::with_second(mode, None)
+    }
+
+    fn with_second(mode: &str, secondary: Option<&str>) -> Option<Self> {
         let python = ["python3", "python"].into_iter().find(|program| {
             Command::new(program).arg("--version").stdout(Stdio::null())
                 .stderr(Stdio::null()).status().is_ok_and(|status| status.success())
@@ -45,22 +49,34 @@ impl Fixture {
         std::fs::write(root.join(".refactor-root"), "").unwrap();
         let script = root.join("directory_peer.py");
         std::fs::write(&script, include_str!("test_server.py")).unwrap();
-        let config = Config {
-            lsp: Some(LspSettings {
-                servers: Some(HashMap::from([("directory-fixture".to_string(), LspServerSettings {
-                    command: Some(python.to_string()),
-                    args: Some(vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string()]),
-                    extensions: Some(vec![".refactor".to_string()]),
-                    languages: Some(vec!["plaintext".to_string()]),
-                    root_markers: Some(vec![".refactor-root".to_string()]),
-                    ..Default::default()
-                })])),
+        let mut servers = HashMap::from([("directory-fixture".to_string(), LspServerSettings {
+            command: Some(python.to_string()),
+            args: Some(vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string()]),
+            extensions: Some(vec![".refactor".to_string()]),
+            languages: Some(vec!["plaintext".to_string()]),
+            root_markers: Some(vec![".refactor-root".to_string()]),
+            ..Default::default()
+        })]);
+        if let Some(mode) = secondary {
+            for path in ["old/secondary.other", "imports.other"] {
+                std::fs::write(root.join(path), "old\n").unwrap();
+            }
+            std::fs::write(root.join("shared.refactor"), "abcdef\n").unwrap();
+            servers.insert("secondary-fixture".to_string(), LspServerSettings {
+                command: Some(python.to_string()),
+                args: Some(vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string(), "secondary".to_string()]),
+                extensions: Some(vec![".other".to_string()]),
+                languages: Some(vec!["plaintext".to_string()]),
+                root_markers: Some(vec![".refactor-root".to_string()]),
                 ..Default::default()
-            }),
+            });
+        }
+        let config = Config {
+            lsp: Some(LspSettings { servers: Some(servers), ..Default::default() }),
             ..Default::default()
         };
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        eprintln!("{}", json!({"case":mode,"event":"directory_protocol_start","movedFiles":3}));
+        eprintln!("{}", json!({"case":mode,"secondary":secondary,"event":"directory_protocol_start","movedFiles":if secondary.is_some() {4} else {3}}));
         Some(Self { tool: LspTool::new(&root, Some(&config)), runtime, root, _temp: temp })
     }
 
@@ -76,10 +92,18 @@ impl Fixture {
     fn flush(&self) {
         self.run(json!({"action":"request","file":"imports.refactor",
             "method":"fixture/barrier","timeout":5})).unwrap();
+        if self.root.join("imports.other").exists() {
+            self.run(json!({"action":"request","file":"imports.other",
+                "method":"fixture/barrier","timeout":5})).unwrap();
+        }
     }
 
     fn requests(&self, method: &str) -> Vec<Value> {
-        std::fs::read_to_string(self.root.join("requests.jsonl")).unwrap_or_default()
+        self.peer_requests("requests.jsonl", method)
+    }
+
+    fn peer_requests(&self, log: &str, method: &str) -> Vec<Value> {
+        std::fs::read_to_string(self.root.join(log)).unwrap_or_default()
             .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|message| message["method"] == method).collect()
     }
@@ -175,18 +199,12 @@ fn folder_and_file_registrations_are_independent_and_unregistered_moves_are_expl
 }
 
 #[test]
-fn mixed_servers_and_nested_roots_are_rejected_before_startup() {
-    for nested_root in [false, true] {
-        let Some(fixture) = Fixture::new("normal") else { return };
-        if nested_root {
-            std::fs::write(fixture.root.join("old/sub/.refactor-root"), "").unwrap();
-        } else {
-            std::fs::write(fixture.root.join("old/other.rs"), "fn main() {}\n").unwrap();
-        }
-        assert!(fixture.rename(false).is_err());
-        fixture.unchanged();
-        assert!(!fixture.root.join("requests.jsonl").exists());
-    }
+fn nested_roots_are_rejected_before_startup() {
+    let Some(fixture) = Fixture::new("normal") else { return };
+    std::fs::write(fixture.root.join("old/sub/.refactor-root"), "").unwrap();
+    assert!(fixture.rename(false).is_err());
+    fixture.unchanged();
+    assert!(!fixture.root.join("requests.jsonl").exists());
 }
 
 #[test]
@@ -207,4 +225,45 @@ fn request_budget_expires_without_a_move() {
     assert!(result.is_err());
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
     fixture.unchanged();
+}
+
+#[test]
+fn multiple_languages_share_one_move_and_post_commit_notifications() {
+    let Some(fixture) = Fixture::with_second("normal", Some("normal")) else { return };
+    let details = fixture.rename(false).unwrap().details.unwrap();
+    assert_eq!(details["serverCount"], 2);
+    assert_eq!(details["filesMoved"], 4);
+    assert_eq!(details["willRenamePairs"], 3);
+    assert_eq!(details["serverNotifications"].as_array().unwrap().len(), 2);
+    fixture.flush();
+    for name in ["lib.refactor", "secondary.other"] {
+        assert_eq!(std::fs::read(fixture.root.join("nested/new").join(name)).unwrap(), b"new\n");
+    }
+    for log in ["notification.json", "secondary-notification.json"] {
+        let value: Value = serde_json::from_slice(&std::fs::read(fixture.root.join(log)).unwrap()).unwrap();
+        assert_eq!(value["oldExists"], false);
+        assert_eq!(value["imports"], "new\n");
+        assert_eq!(value["otherImports"], "new\n");
+    }
+    assert_eq!(fixture.requests("workspace/willRenameFiles").len(), 1);
+    assert_eq!(fixture.peer_requests("secondary-requests.jsonl", "workspace/willRenameFiles").len(), 1);
+    eprintln!("{}", json!({"case":"multi_language_commit","event":"verified","servers":2,"moves":1}));
+}
+
+#[test]
+fn independent_duplicate_edits_apply_once_and_conflicts_apply_nothing() {
+    let Some(fixture) = Fixture::with_second("shared", Some("shared")) else { return };
+    let details = fixture.rename(false).unwrap().details.unwrap();
+    assert_eq!(details["deduplicatedEdits"], 1);
+    assert_eq!(std::fs::read(fixture.root.join("shared.refactor")).unwrap(), b"Xbcdef\n");
+    let Some(fixture) = Fixture::with_second("shared", Some("conflict")) else { return };
+    let error = fixture.rename(false).unwrap_err();
+    assert!(error.to_string().contains("LSP_RENAME_CONFLICT"), "{error}");
+    fixture.unchanged();
+    assert_eq!(std::fs::read(fixture.root.join("imports.other")).unwrap(), b"old\n");
+    assert_eq!(std::fs::read(fixture.root.join("shared.refactor")).unwrap(), b"abcdef\n");
+    fixture.flush();
+    assert!(fixture.requests("workspace/didRenameFiles").is_empty());
+    assert!(fixture.peer_requests("secondary-requests.jsonl", "workspace/didRenameFiles").is_empty());
+    eprintln!("{}", json!({"case":"multi_language_conflict","event":"verified","writes":0}));
 }

@@ -10,6 +10,9 @@ import time
 
 ROOT = pathlib.Path.cwd()
 MODE = sys.argv[1]
+SECONDARY = len(sys.argv) > 2 and sys.argv[2] == "secondary"
+PREFIX = "secondary-" if SECONDARY else ""
+EXTENSION = "other" if SECONDARY else "refactor"
 MAX_FRAME = 2 * 1024 * 1024
 
 
@@ -52,7 +55,7 @@ def replacement():
 
 
 while (message := receive()) is not None:
-    with (ROOT / "requests.jsonl").open("a", encoding="utf-8") as log:
+    with (ROOT / f"{PREFIX}requests.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(message) + "\n")
     method = message.get("method")
     if method == "workspace/didRenameFiles":
@@ -62,20 +65,21 @@ while (message := receive()) is not None:
             "newExists": new.is_dir(),
             "newText": (new / "lib.refactor").read_text(encoding="utf-8"),
             "imports": (ROOT / "imports.refactor").read_text(encoding="utf-8"),
+            "otherImports": (ROOT / "imports.other").read_text(encoding="utf-8") if (ROOT / "imports.other").exists() else None,
             "binary": list((new / "asset.bin").read_bytes()),
             "emptyDirectory": (new / "empty").is_dir(),
             "pairs": message["params"]["files"],
         }
-        (ROOT / "notification.json").write_text(json.dumps(evidence), encoding="utf-8")
+        (ROOT / f"{PREFIX}notification.json").write_text(json.dumps(evidence), encoding="utf-8")
     if "id" not in message:
         continue
     result = None
     if method == "initialize":
         capabilities = {"textDocumentSync": 1}
         if MODE != "unregistered":
-            will = registration("folder", "**/old") if MODE == "folder" else registration("file", "**/*.refactor")
+            will = registration("folder", "**/old") if MODE == "folder" else registration("file", f"**/*.{EXTENSION}")
             capabilities["workspace"] = {"fileOperations": {
-                "willRename": will, "didRename": registration("file", "**/*.refactor")}}
+                "willRename": will, "didRename": registration("file", f"**/*.{EXTENSION}")}}
         result = {"capabilities": capabilities}
     elif method == "workspace/willRenameFiles":
         if MODE == "error":
@@ -84,7 +88,8 @@ while (message := receive()) is not None:
             continue
         if MODE == "timeout":
             time.sleep(5)
-        paths = [ROOT / "old/lib.refactor", ROOT / "old/sub/use.refactor", ROOT / "imports.refactor"]
+        paths = ([ROOT / "old/secondary.other", ROOT / "imports.other"] if SECONDARY else
+                 [ROOT / "old/lib.refactor", ROOT / "old/sub/use.refactor", ROOT / "imports.refactor"])
         result = {"changes": {path.as_uri(): replacement() for path in paths}}
         if MODE == "invalid":
             result["changes"][paths[-1].as_uri()][0]["range"]["end"]["line"] = 999
@@ -92,4 +97,8 @@ while (message := receive()) is not None:
             result["changes"][(ROOT.parent / "outside.refactor").as_uri()] = replacement()
         elif MODE == "drift":
             (ROOT / "old/asset.bin").write_bytes(b"external")
+        elif MODE in ("shared", "conflict"):
+            result["changes"][(ROOT / "shared.refactor").as_uri()] = [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "Y" if MODE == "conflict" else "X"}]
     send({"jsonrpc": "2.0", "id": message["id"], "result": result})
