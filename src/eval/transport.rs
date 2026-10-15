@@ -66,6 +66,33 @@ pub(super) fn validate_bridge(frame: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Admit a native effect only for this cell and an unambiguous bounded frame.
+/// IDs are assigned before async queueing, not in dispatch order; synchronous
+/// helpers may interleave, so monotonically ordered delivery is not required.
+pub(super) fn validate_bridge_owner(
+    frame: &Value,
+    expected_id: u64,
+    frame_bytes: usize,
+) -> Result<()> {
+    validate_bridge(frame)?;
+    if frame_bytes >= 1024 * 1024 {
+        return Err(invalid("EVAL_BRIDGE_LIMIT: tool request exceeds 1 MiB"));
+    }
+    if frame.get("id").and_then(Value::as_u64) != Some(expected_id) {
+        return Err(invalid("bridge belongs to a different cell"));
+    }
+    if frame.as_object().is_none_or(|object| object.len() != 2)
+        || frame["bridge"].as_object().is_none_or(|object| object.len() != 3)
+    {
+        return Err(invalid("ambiguous bridge envelope"));
+    }
+    let bridge = &frame["bridge"];
+    if bridge["tool"].as_str().is_none_or(|name| name.chars().count() > 128) {
+        return Err(invalid("EVAL_BRIDGE_LIMIT: tool name exceeds 128 characters"));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_response(frame: &Value, expected_id: u64) -> Result<()> {
     if frame.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Err(invalid("response belongs to a different cell"));
@@ -76,8 +103,17 @@ pub(super) fn validate_response(frame: &Value, expected_id: u64) -> Result<()> {
     if frame.get("bridgeError").is_some() {
         return Err(invalid("EVAL_BRIDGE_PROTOCOL: incomplete tool exchange"));
     }
+    if frame.get("kernelError").is_some() {
+        return Err(invalid("EVAL_KERNEL_INCOMPLETE: cell did not settle safely"));
+    }
     let ok = frame.get("ok").and_then(Value::as_bool)
         .ok_or_else(|| invalid("response status must be boolean"))?;
+    if let Some(value) = frame.get("softTimeout") {
+        let expired = value.as_bool().ok_or_else(|| invalid("soft timeout status must be boolean"))?;
+        if expired && ok {
+            return Err(invalid("soft timeout cannot report success"));
+        }
+    }
     if !frame.get("stdout").is_some_and(Value::is_string)
         || !frame.get("stderr").is_some_and(Value::is_string)
         || frame.get("bridge").is_some()
@@ -173,6 +209,43 @@ mod tests {
                 assert!(error.contains("EVAL_BRIDGE_PROTOCOL"));
                 assert!(error.contains("EVAL_STATE_RESET"));
             }
+        }
+    }
+
+    #[test]
+    fn bridge_effect_admission_requires_current_cell_and_exact_envelope() {
+        let frame = json!({"id":7,"bridge":{"call":9,"tool":"read","input":{"path":"x"}}});
+        assert!(validate_bridge_owner(&frame, 7, 90).is_ok());
+        for (id, size) in [(8,90), (7,1024*1024)] {
+            assert!(validate_bridge_owner(&frame, id, size).is_err());
+        }
+        for (key, value) in [("id", json!(true)), ("stream", json!({})), ("softTimeout", json!(true))] {
+            let mut bad = frame.clone();
+            bad[key] = value;
+            assert!(validate_bridge_owner(&bad, 7, 90).is_err());
+        }
+        let mut bad = frame;
+        bad["bridge"]["extra"] = Value::Null;
+        assert!(validate_bridge_owner(&bad, 7, 90).is_err());
+    }
+
+    #[test]
+    fn soft_timeout_and_unsettled_root_metadata_fail_closed() {
+        let response = json!({"id":1,"ok":false,"stdout":"","stderr":"","error":"soft timeout","softTimeout":true});
+        assert!(validate_response(&response, 1).is_ok());
+        for marker in [Value::Null, json!(false), json!("pending root")] {
+            let mut bad = response.clone();
+            bad["kernelError"] = marker;
+            assert!(validate_response(&bad, 1).unwrap_err().to_string().contains("EVAL_KERNEL_INCOMPLETE"));
+        }
+        let mut success = response.clone();
+        success["ok"] = json!(true);
+        success["result"] = Value::Null;
+        assert!(validate_response(&success, 1).is_err());
+        for marker in [Value::Null, json!(1), json!("true")] {
+            let mut bad = response.clone();
+            bad["softTimeout"] = marker;
+            assert!(validate_response(&bad, 1).is_err());
         }
     }
 

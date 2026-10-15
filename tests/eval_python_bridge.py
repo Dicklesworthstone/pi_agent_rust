@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ class Kernel:
             [sys.executable, "-u", str(SERVER)], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", bufsize=1,
+            start_new_session=(os.name == "posix"),
         )
         self.frames = queue.Queue()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -46,9 +48,9 @@ class Kernel:
         self.process.stdin.write(json.dumps(frame, ensure_ascii=False) + "\n")
         self.process.stdin.flush()
 
-    def cell(self, code, reply=None):
+    def cell(self, code, reply=None, **options):
         self.next_id += 1
-        self.send({"id": self.next_id, "code": code})
+        self.send({"id": self.next_id, "code": code, **options})
         streams = []
         while True:
             try:
@@ -73,7 +75,13 @@ class Kernel:
                 return frame, streams
 
     def close(self):
-        self.process.kill()
+        try:
+            if os.name == "posix" and self.process.returncode is None:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            elif os.name != "posix":
+                self.process.kill()
+        except ProcessLookupError:
+            pass
         self.process.wait(timeout=5)
         self.reader.join(timeout=5)
         self.process.stdin.close()

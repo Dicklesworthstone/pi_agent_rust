@@ -40,6 +40,7 @@ struct Cell {
     #[serde(default)]
     kernel: Kernel,
     timeout_secs: Option<u64>,
+    soft_timeout_secs: Option<u64>,
     #[serde(default)]
     reset: bool,
 }
@@ -163,6 +164,14 @@ impl EvalTool {
                 .unwrap_or(DEFAULT_CELL_TIMEOUT_SECS)
                 .clamp(1, 600),
         );
+        if let Some(soft) = cell.soft_timeout_secs {
+            if !cfg!(unix) || !matches!(cell.kernel, Kernel::Python) {
+                return Err(Error::tool("eval", "EVAL_INPUT: soft_timeout_secs requires POSIX Python"));
+            }
+            if soft == 0 || soft >= timeout.as_secs() {
+                return Err(Error::tool("eval", "EVAL_INPUT: soft_timeout_secs must be positive and below timeout_secs"));
+            }
+        }
         let owner = AgentCx::for_current_or_request();
         // Bind on first poll, before queueing. Never redirect an old request
         // or reset into whichever session happens to be current on admission.
@@ -213,7 +222,7 @@ impl EvalTool {
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
             Kernel::Python => wait_in_session(&owner, deadline, &session_guard,
-                self.run_py_cell(&cell.code, timeout, &mut capture, &session_guard)).await,
+                self.run_py_cell(&cell.code, timeout, cell.soft_timeout_secs, &mut capture, &session_guard)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
                 let filename = prepared.as_ref().map(|file| file.path.as_str());

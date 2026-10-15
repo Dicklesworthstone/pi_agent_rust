@@ -373,6 +373,7 @@ impl EvalTool {
         &self,
         code: &str,
         timeout: Duration,
+        soft_timeout_secs: Option<u64>,
         capture: &mut output::Capture,
         session_guard: &session::CellSession,
     ) -> Result<ToolOutput> {
@@ -390,7 +391,7 @@ impl EvalTool {
 
         let mut id = kernel.next_id;
         kernel.next_id += 1;
-        let request = json!({"id": id, "code": code}).to_string();
+        let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs}).to_string();
         if kernel
             .stdin
             .write_all(format!("{request}\n").as_bytes())
@@ -402,7 +403,7 @@ impl EvalTool {
             let mut fresh = PyKernel::spawn(&self.python_path, &self.cwd)?;
             id = fresh.next_id;
             fresh.next_id += 1;
-            let request = json!({"id": id, "code": code}).to_string();
+            let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs}).to_string();
             fresh
                 .stdin
                 .write_all(format!("{request}\n").as_bytes())
@@ -415,7 +416,7 @@ impl EvalTool {
         // Read lines until the final cell response; bridge requests re-enter
         // pi tools mid-cell and their results resume the kernel.
         let deadline = Instant::now() + timeout;
-        let final_line = loop {
+        let (final_line, soft_timed_out) = loop {
             // A continuously readable stream may not yield Pending to the
             // enclosing watchdog. Observe its captured owner here too.
             crate::agent_cx::AgentCx::for_current_or_request().checkpoint().map_err(|_| {
@@ -483,7 +484,7 @@ impl EvalTool {
                 continue;
             }
             if let Some(bridge) = parsed.get("bridge") {
-                transport::validate_bridge(&parsed)?;
+                transport::validate_bridge_owner(&parsed, id, line.len())?;
                 capture.publish(true);
                 session_guard.check_tool().await?;
                 let reply = self.run_bridge_call(bridge).await;
@@ -497,8 +498,12 @@ impl EvalTool {
                 continue;
             }
             transport::validate_response(&parsed, id)?;
+            let soft_timed_out = parsed.get("softTimeout").and_then(Value::as_bool).unwrap_or(false);
+            if soft_timed_out && soft_timeout_secs.is_none() {
+                return Err(Error::tool("eval", "EVAL_PROTOCOL: unsolicited soft timeout; EVAL_STATE_RESET: Python kernel discarded"));
+            }
             capture.finish_response(&mut parsed)?;
-            break serde_json::to_string(&parsed)?;
+            break (serde_json::to_string(&parsed)?, soft_timed_out);
         };
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
@@ -507,6 +512,11 @@ impl EvalTool {
         // malformed protocol result discards this connection, not just its
         // bad frame, and cannot partially publish a successful tool result.
         let mut output = format_cell_response(&final_line, restarted, cells_run)?;
+        if soft_timed_out && let Some(Value::Object(details)) = output.details.as_mut() {
+            details.insert("errorKind".into(), json!("soft_timeout"));
+            details.insert("softTimeout".into(), json!(true));
+            details.insert("stateReset".into(), json!(false));
+        }
         capture.annotate(&mut output);
         session_guard.check_tool().await?;
         capture.publish(true);
@@ -576,7 +586,10 @@ impl Tool for EvalTool {
          one at a time within this session and return the final expression. \
          Set reset=true to discard the selected language's state before this \
          cell; the other language is unaffected. Timeouts or crashes report \
-         state loss explicitly. Rich output: Python display(value, mime=...) \
+         state loss explicitly. POSIX Python may set soft_timeout_secs below \
+         timeout_secs to attempt interruption while retaining variables. The \
+         hard deadline remains unchanged; unsafe or wedged kernels are discarded. \
+         Rich output: Python display(value, mime=...) \
          or JS display(value, mimeType) returns JSON, text, Markdown or PNG. \
          PNG input is bytes/base64 (JS Uint8Array/base64), never a path or URL. \
          Both kernels stream stdout/stderr live; large console output retains a \
@@ -608,6 +621,12 @@ impl Tool for EvalTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Active cell budget in seconds (default 30, clamped to 1–600); excludes waiting for another cell"
+                },
+                "soft_timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 599,
+                    "description": "Optional POSIX Python soft deadline, strictly below timeout_secs. Attempts to retain state after interruption; does not extend the hard deadline. Reserves SIGALRM; interrupted tool exchanges still discard the kernel."
                 },
                 "reset": {
                     "type": "boolean",

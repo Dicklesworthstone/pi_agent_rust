@@ -9,7 +9,8 @@ does not expand tool permissions or add subagent, mutation, or network tools.
 
 A bridge call requires its originating cell's live context on that cell's
 thread. Awaited tasks created within the current cell can use the bridge;
-`asyncio.gather` still serializes complete request/reply exchanges. Saving a
+`asyncio.gather` still serializes complete request/reply exchanges while the
+asyncio loop remains responsive during awaited replies. Saving a
 helper such as `read = tool.read` is supported: calling it normally in a later
 cell uses that later caller's context.
 
@@ -50,11 +51,12 @@ the existing host's partial-output reporting; no output is replayed.
 
 ## Interruption boundary
 
-User cancellation and host deadlines still discard the selected Python kernel.
-This change establishes the ownership and fail-closed channel behavior needed
-before adding state-preserving interruption; it does not claim that recovery
-is implemented. An interrupted tool exchange cannot be declared safe merely
-because Python caught an exception.
+User cancellation and hard host deadlines still discard the selected Python
+kernel. POSIX Python may opt into an earlier `soft_timeout_secs` to retain state
+after a clean computation interruption; see [soft deadlines](eval-soft-timeout.md).
+Soft expiry during an active tool exchange still requires retirement, after
+the owned reply drains within the unchanged hard deadline. An interrupted
+exchange cannot be declared safe merely because Python caught an exception.
 
 ## Validation
 

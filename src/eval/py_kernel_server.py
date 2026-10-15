@@ -60,10 +60,12 @@ from pathlib import Path
 import queue
 import shlex
 import shutil
+import signal
 import stat
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import weakref
 
@@ -110,6 +112,7 @@ _PROTOCOL_WRITE_LOCK = threading.RLock()
 _PACKAGE_ROOT = os.environ.pop("_PI_EVAL_PACKAGE_ROOT", None)
 _PACKAGE_LAYERS = []
 _MAX_PACKAGE_LAYERS = 32
+_SOFT_DEADLINE = None
 # Optional plotting libraries are imported only by user code. Respect an
 # explicit backend choice; otherwise do not require a display server.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -131,6 +134,11 @@ class _CellOutput:
         self.active = True
         self.thread = threading.get_ident()
         self.bridge_error = None
+        self.soft_timed_out = False
+        self.kernel_error = None
+        self.package_operation = False
+        self.bridge_interrupted = False
+        self.finalized = False
         self.bridge_open = True
         self.bridge_tasks = set()
 
@@ -618,6 +626,8 @@ def _bridge_owner():
         raise ToolBridgeError(output.bridge_error)
     if _BRIDGE_FAILURE is not None:
         raise ToolBridgeError(_BRIDGE_FAILURE)
+    if output.soft_timed_out:
+        raise ToolBridgeError("EVAL_SOFT_TIMEOUT: host tool calls are revoked after the soft deadline")
     return output
 
 
@@ -1040,6 +1050,12 @@ async def _install_managed_packages(arguments):
 
 
 async def _install_python_packages(arguments, *, environment=None):
+    owner = _OUTPUT_CONTEXT.get()
+    if owner is not None:
+        # A soft stop may interrupt subprocess creation or asynchronous pump
+        # cleanup. Never infer that all installer descendants settled just
+        # because the root Python task returned; the host must retire its tree.
+        owner.package_operation = True
     if arguments and arguments[0] == "--managed":
         return await _install_managed_packages(arguments[1:])
     # -I prevents a workspace pip.py/PYTHONPATH from replacing the installer.
@@ -1094,6 +1110,80 @@ async def _install_python_packages(arguments, *, environment=None):
     print("EVAL_PIP_DONE: pip completed; import caches refreshed, existing modules retained", flush=True)
 
 
+class _SoftTimeout(BaseException):
+    """A soft stop is not an ordinary application error to silently ignore."""
+
+
+def _soft_alarm(_signum, _frame):
+    budget = _SOFT_DEADLINE
+    # This dispatcher stays installed after opt-in. An already pending alarm
+    # must never terminate the idle kernel or interrupt the next cell early.
+    if (budget is None or not budget.active or budget.output.soft_timed_out
+            or time.monotonic() < budget.deadline):
+        return
+    budget.output.soft_timed_out = True
+    exchanging = _BRIDGE_BUSY or _BRIDGE_READER is not None
+    if exchanging:
+        # Do not inject an exception between sending a request and owning its
+        # reader, or bypass the async reader's cancellation/drain loop. The
+        # host's hard deadline still bounds an unresponsive native exchange.
+        budget.output.bridge_interrupted = True
+    if budget.task is not None and not budget.task.done():
+        # Wake a selector blocked in top-level await. Never leave the root
+        # coroutine pending merely because a signal arrived between tasks.
+        _CELL_LOOP.call_soon_threadsafe(budget.task.cancel)
+    if _OUTPUT_CONTEXT.get() is budget.output and not exchanging:
+        # Synchronous Python (including time.sleep) needs an exception; a
+        # queued asyncio cancellation alone cannot stop a busy Python loop.
+        # Do not inject it into an unrelated retained task's context.
+        raise _SoftTimeout("EVAL_SOFT_TIMEOUT: cell soft deadline exceeded")
+
+
+class _SoftDeadline:
+    def __init__(self, seconds, output):
+        self.seconds = seconds
+        self.output = output
+        self.task = None
+        self.active = False
+        self.deadline = 0.0
+
+    def start(self):
+        global _SOFT_DEADLINE
+        if type(self.seconds) is not int or not 1 <= self.seconds <= 599:
+            raise ValueError("EVAL_INPUT: softTimeoutSecs must be an integer from 1 through 599")
+        if not all(hasattr(signal, name) for name in (
+                "SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")):
+            raise RuntimeError("EVAL_SOFT_TIMEOUT_UNAVAILABLE: this interpreter has no POSIX interval timer")
+        if (signal.getsignal(signal.SIGALRM) not in (signal.SIG_DFL, signal.SIG_IGN, _soft_alarm)
+                or any(signal.getitimer(signal.ITIMER_REAL))):
+            raise RuntimeError("EVAL_SOFT_TIMEOUT_BUSY: an existing SIGALRM handler or timer owns the signal")
+        if (hasattr(signal, "pthread_sigmask")
+                and signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, [])):
+            raise RuntimeError("EVAL_SOFT_TIMEOUT_BLOCKED: SIGALRM is blocked on the kernel thread")
+        if _SOFT_DEADLINE is not None:
+            raise RuntimeError("EVAL_SOFT_TIMEOUT_BUSY: another cell owns the soft deadline")
+        # Reserve only an unused signal. Do not cancel a caller's timer or
+        # replace a custom handler. The kernel-owned dispatcher ignores late
+        # delivery between cells and verifies the next cell's own deadline.
+        signal.signal(signal.SIGALRM, _soft_alarm)
+        self.deadline = time.monotonic() + self.seconds
+        self.active = True
+        _SOFT_DEADLINE = self
+        try:
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        except BaseException:
+            self.active = False
+            _SOFT_DEADLINE = None
+            raise
+
+    def close(self):
+        global _SOFT_DEADLINE
+        if self.active:
+            self.active = False
+            _SOFT_DEADLINE = None
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+
 async def _evaluate_cell(code, displays):
     install = _pip_arguments(code)
     if install is not None:
@@ -1128,8 +1218,11 @@ async def _execute_cell(code, displays, output):
     display_token = _DISPLAY_CONTEXT.set(displays)
     output_token = _OUTPUT_CONTEXT.set(output)
     result = error = None
+    completed = False
     try:
         try:
+            if output.soft_timed_out:
+                raise _SoftTimeout("EVAL_SOFT_TIMEOUT: cell soft deadline exceeded before execution")
             result = await _evaluate_cell(code, displays)
         except ModuleNotFoundError:
             error = _error_text() + (
@@ -1151,6 +1244,7 @@ async def _execute_cell(code, displays, output):
             plot_error = _error_text()
         if plot_error is not None:
             error = (error or "") + "\nEVAL_PLOT_OUTPUT: plot finalization failed\n" + plot_error
+        completed = True
         return error is None, result if error is None else None, error
     finally:
         # Child tasks retain this particular sink. Once the cell ends they
@@ -1161,22 +1255,50 @@ async def _execute_cell(code, displays, output):
         # Each run_until_complete creates a task; keep the cell's context
         # rather than silently resetting ContextVars to the host's context.
         _CELL_CONTEXT = contextvars.copy_context()
+        output.finalized = completed
 
 
-def run_cell(code, cell_id):
+def run_cell(code, cell_id, soft_timeout_secs=None):
     displays = _DisplaySink()
     output = _CellOutput(cell_id)
     stdout = _CellStream(output, "stdout")
     stderr = _CellStream(output, "stderr")
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = stdout, stderr
+    budget = _SoftDeadline(soft_timeout_secs, output) if soft_timeout_secs is not None else None
+    task = None
     try:
+        # Preflight the optional timer before creating a runnable coroutine.
+        # A refused timer must not leave unstarted code queued for a later cell.
+        if budget is not None:
+            budget.start()
+        execution = _execute_cell(code, displays, output)
+        try:
+            task = _CELL_CONTEXT.run(_CELL_LOOP.create_task, execution)
+        except BaseException:
+            execution.close()
+            raise
+        if budget is not None:
+            budget.task = task
         ok, result, error = _CELL_CONTEXT.run(
-            _CELL_LOOP.run_until_complete, _execute_cell(code, displays, output)
+            _CELL_LOOP.run_until_complete, task
         )
     except BaseException:  # noqa: BLE001 - full traceback back to the host
         ok, result, error = False, None, _error_text()
     finally:
+        if budget is not None:
+            try:
+                if budget.active and time.monotonic() >= budget.deadline:
+                    output.soft_timed_out = True
+                budget.close()
+            except BaseException:
+                output.kernel_error = "EVAL_KERNEL_INCOMPLETE: soft timer cleanup failed"
+        if task is not None and (not task.done() or not output.finalized):
+            # A root task that escaped run_until_complete cannot be reused on
+            # the next request. Native validation retires this process rather
+            # than running old code under the next cell's authority.
+            task.cancel()
+            output.kernel_error = "EVAL_KERNEL_INCOMPLETE: root cell task or finalization did not settle"
         if _BRIDGE_BUSY or _BRIDGE_READER is not None:
             # An unexpected event-loop stop can bypass coroutine cleanup.
             # Drain the sole reader before retiring this process, never let
@@ -1189,9 +1311,23 @@ def run_cell(code, cell_id):
             output.active = False
             sequence = output.sequence
         sys.stdout, sys.stderr = old_out, old_err
+    if output.soft_timed_out:
+        ok, result = False, None
+        error = (error or "") + (
+            "\nEVAL_SOFT_TIMEOUT: cell interrupted; completed mutations are not rolled back. "
+            "The host retains state only after validating complete output and a settled cell.\n"
+        )
+        if output.package_operation:
+            output.kernel_error = "EVAL_KERNEL_INCOMPLETE: soft-timed-out package operation requires process-tree retirement"
+        if output.bridge_interrupted:
+            output.kernel_error = "EVAL_KERNEL_INCOMPLETE: soft deadline expired during a tool exchange; reply drained, process-tree retirement required"
+    if output.kernel_error is not None:
+        ok, result = False, None
+        error = (error or "") + "\n" + output.kernel_error
     if _BRIDGE_FAILURE is not None:
         ok, result, error = False, None, (error or "") + "\n" + _BRIDGE_FAILURE
-    return ok, result, error, displays.frames, sequence, output.bridge_error or _BRIDGE_FAILURE
+        output.bridge_error = output.bridge_error or _BRIDGE_FAILURE
+    return ok, result, error, displays.frames, sequence, output
 
 
 def main():
@@ -1204,7 +1340,9 @@ def main():
             continue
         try:
             request = json.loads(line)
-            ok, result, error, displays, sequence, bridge_error = run_cell(request.get("code", ""), request.get("id"))
+            ok, result, error, displays, sequence, output = run_cell(
+                request.get("code", ""), request.get("id"), request.get("softTimeoutSecs")
+            )
             response = {
                 "id": request.get("id"),
                 "ok": ok,
@@ -1213,8 +1351,12 @@ def main():
                 "displays": displays,
                 "outputSequence": sequence,
             }
-            if bridge_error is not None:
-                response["bridgeError"] = bridge_error
+            if output.bridge_error is not None:
+                response["bridgeError"] = output.bridge_error
+            if output.kernel_error is not None:
+                response["kernelError"] = output.kernel_error
+            if output.soft_timed_out:
+                response["softTimeout"] = True
             if ok:
                 response["result"] = result
             else:
@@ -1222,8 +1364,9 @@ def main():
         except Exception as exc:  # noqa: BLE001 - protocol-level failure
             response = {"id": None, "ok": False, "stdout": "", "stderr": "", "error": str(exc)}
         _send_frame(response)
-        if _BRIDGE_FAILURE is not None:
-            # Never reinterpret remaining reply bytes as the next cell.
+        if _BRIDGE_FAILURE is not None or response.get("kernelError") is not None:
+            # Never reinterpret reply bytes or resume an unsettled root as
+            # the next cell. Native ownership still retires the process tree.
             break
 
 
