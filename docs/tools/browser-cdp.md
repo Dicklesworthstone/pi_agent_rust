@@ -166,15 +166,16 @@ Use an actual returned frame ID in place of `FRAME_ID` below:
 {"action":"wait_for","tab":"work","frame":"FRAME_ID","selector":".result","timeout_ms":10000}
 {"action":"evaluate","tab":"work","frame":"FRAME_ID","script":"({title: document.title, count: document.forms.length})"}
 {"action":"upload","tab":"work","frame":"FRAME_ID","selector":"input[type=file]","files":["reports/result.csv"]}
+{"action":"download","tab":"work","frame":"FRAME_ID","selector":"a.export","output_path":"downloads/report.csv"}
 ```
 
 An explicit `tab` is required whenever `frame` is supplied. The frame option is
 per-call: it is never a persistent switch that could silently redirect a later
 operation. Both same-process and nested out-of-process frames support `snapshot`,
-`ax_tree`, `evaluate`, `click`, `type`, `fill`, `press`, `scroll`, `wait_for` and `upload`.
-Scoped keypress, wheel and upload actions require an explicit selector instead of
-using ambient focus, the main viewport or an implicitly selected file control.
-Native input actions bring the selected page
+`ax_tree`, `evaluate`, `click`, `type`, `fill`, `press`, `scroll`, `wait_for`,
+`upload` and `download`. Scoped keypress, wheel and file-transfer actions require
+an explicit selector instead of using ambient focus, the main viewport or an
+implicitly selected control. Native input actions bring the selected page
 to the front. Keyboard/text actions focus the requested control in its renderer
 and check focus before native input dispatch to the page.
 
@@ -224,10 +225,10 @@ cancellation or failure cannot roll back effects already dispatched. The
 operation's socket owns all its renderer attachments and drops them on exit.
 
 Frame-scoped evaluation has DOM access in an isolated world, not access to the
-page's JavaScript global variables. Frame options on downloads, exports,
-navigation, tab/lifecycle actions or dialog responses are rejected before
-connection or launch. Those existing operations remain main-document or tab-level
-operations. Chromium errors never authorize a fallback to the main frame.
+page's JavaScript global variables. Frame options on exports, navigation,
+tab/lifecycle actions or dialog responses are rejected before connection or
+launch. Those existing operations remain main-document or tab-level operations.
+Chromium errors never authorize a fallback to the main frame.
 
 ## Select real files for upload
 
@@ -298,29 +299,90 @@ but did not execute the Rust adapter. Its root-container browser used
 ```json
 {"action":"download","selector":"a.export","output_path":"downloads/report.csv"}
 {"action":"download","selector":"@e8"}
+{"action":"download","tab":"work","frame":"FRAME_ID","selector":"a.export","output_path":"downloads/frame-report.csv"}
 ```
 
 `download` temporarily enables Chromium's `allowAndName` behavior in a private
-directory, performs one native click through the same selector/reference path as
-`click`, correlates the resulting `Browser.downloadWillBegin` and
-`Browser.downloadProgress` events, and waits for completion. Multiple transfers
-from one click fail rather than choosing one silently. The final download URL is
-checked against `domainAllowlist` before publication.
+directory, performs one native left click through the existing pointer path,
+and waits for one completed transfer. CSS selectors and snapshot references are
+supported; semantic selectors and click modifiers are not accepted by this action.
+The optional `frame` requires an explicit `tab` and `selector`, including for a
+local child inside a remote renderer or nested remote renderer chains. Omission
+selects the main document. Frame download triggers use the same native coordinate
+projection and ancestor hit tests as other scoped clicks, never JavaScript clicks.
+
+Pi pins the initiating frame ID, loader ID and URL before enabling capture.
+`Browser.downloadWillBegin.frameId` must match that exact frame; another tab,
+parent, child or sibling does not qualify merely because it downloaded the same
+URL. The selected document and, for scoped calls, its complete ancestry and
+renderer incarnations must remain unchanged through completion and publication.
+Navigation is an error, not an instruction to accept a replacement document.
+The download URL must pass `domainAllowlist` independently of the source page;
+`blob:`, `data:` and other non-HTTP(S) download URLs remain unsupported.
+
+The complete set of newly observed transfers is checked during progress and
+again after restoring `deny`. Multiple transfers, including a second transfer
+observed during cleanup, cause refusal rather than choosing one silently.
+Already-observed transfers before the capture window are neither candidates nor
+cancellation targets. A new transfer observed before starting the click path
+prevents that click. Source-frame matching and timing are correlation, not proof
+that a particular page handler caused a download: page scripts can run between
+protocol commands. No input is automatically retried.
+
+A transfer's source frame, URL and suggested filename cannot change after its
+first event. Exact duplicate start notifications do not reset progress. Progress
+is validated before changing retained state, received-byte counts cannot retreat,
+and terminal states cannot reopen or change byte counts. Invalid events latch a
+failure across best-effort helper cleanup, so a discarded cleanup error cannot
+become permission to publish later. Total-byte estimates may change while the
+transfer is in progress; exact duplicate terminal notifications are accepted.
 
 Captured transfers are limited to 100 MiB using both Chromium progress and the
 actual completed file size. A canceled, missing, symbolic, oversized, or
-byte-count-mismatched file is rejected. With no `output_path`, the suggested
-filename is sanitized and published under `downloads/`; supplied paths must be
-workspace-relative and use the same descriptor-pinned create-only publisher as
-screenshots/media artifacts. Existing files and symlinked ancestors are never
-overwritten or followed.
+byte-count-mismatched file is rejected. Zero reported bytes must match an actually
+empty file. With no `output_path`, the suggested filename is sanitized and
+published under `downloads/`; supplied paths must be workspace-relative and use
+the same descriptor-pinned create-only publisher as screenshots/media artifacts.
+Existing files and symlinked ancestors are never overwritten or followed.
+Results include `saved_path`, `size_bytes`, `received_bytes`, `url`,
+`suggested_filename` and the verified source `frame_id`.
 
-After a normal download attempt Pi restores browser download behavior to
-`deny` before publishing the artifact. If cancellation interrupts that cleanup,
-the session records the policy as uninitialized and the next operation reapplies
-`deny` before proceeding. This prevents cancellation from leaving a persistent
-unmanaged download directory. Download capture does not inspect file contents or
-assert they are safe to execute/open.
+After a normal attempt Pi restores download behavior to `deny` before publishing.
+An error during capture enablement also enters this cleanup path: a lost or failed
+acknowledgement does not prove the policy was unchanged. On ordinary failure it
+attempts cancellation of transfers first observed in this capture window without
+replaying the click. Cleanup shares the original deadline and cancellation. If
+outer cancellation interrupts cleanup, the session leaves its policy marker
+uninitialized and the next operation reapplies `deny`; this is not immediate
+rollback of network, page or browser effects. No failed capture publishes a file.
+Download capture does not inspect file contents or assert they are safe to open.
+
+Download policy remains Chromium default-browser-context-wide, not per frame.
+Use a dedicated browser without unrelated simultaneous downloads. A frame selector
+does not create an isolated browser context, and non-default/incognito context
+capture is not implemented by this workflow. `domainAllowlist` is an access guard,
+not a subresource/network sandbox.
+
+### Source-bound download validation status
+
+The source/transfer guard and frame-download increments add 15 Rust test functions:
+seven state/document regressions, one frame-admission regression and seven public
+preflight/transport test functions in `tests/browser_downloads.rs`. The transport
+cases cover main documents, same-process children, remote roots, local children
+inside remote renderers and two remote boundaries. They check literal binary
+bytes, single-node lookup, one native click pair, policy restoration before
+publication, duplicate notifications, zero-byte files, unrelated or late transfers,
+changed identities, poisoned cleanup, navigation, failed enablement/press/reset,
+file-integrity failures and existing destinations. They are fixtures for the Rust
+adapter, not a simulated browser substituted into production.
+
+These tests were authored but not executed. The required
+`dsr quality --tool pi_agent_rust` command was attempted and returned command not
+found (exit 127). Compilation, rustfmt, Clippy, Rust tests and the public browser
+workflow remain unverified. An independent Chromium 144.0.7559.96 experiment did
+not establish the intended remote iframe and therefore supplied no live download
+validation. That standalone root-container experiment used `--no-sandbox` and
+`--site-per-process`; production launch flags were unchanged. No Beads were closed.
 
 ## Screenshots and PDF exports
 

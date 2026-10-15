@@ -45,13 +45,14 @@ fn lexical_output_path(path: &str) -> Result<()> {
 }
 
 pub(super) fn validate(args: &Value) -> Result<()> {
+    super::frames::validate(args)?;
     let object = args
         .as_object()
         .ok_or_else(|| error("download arguments must be an object"))?;
     for field in object.keys() {
         if !matches!(
             field.as_str(),
-            "action" | "tab" | "selector" | "output_path" | "timeout_ms"
+            "action" | "tab" | "frame" | "selector" | "output_path" | "timeout_ms"
         ) {
             return Err(error(format!("unsupported download parameter: {field}")));
         }
@@ -502,8 +503,12 @@ mod tests {
     #[test]
     fn parameters_and_filenames_fail_closed() {
         assert!(validate(&json!({"action":"download","selector":"#link"})).is_ok());
+        assert!(validate(&json!({"action":"download","tab":"app","frame":"child","selector":"#link"})).is_ok());
         for args in [
             json!({"action":"download"}),
+            json!({"action":"download","frame":"child","selector":"#link"}),
+            json!({"action":"download","tab":"app","frame":null,"selector":"#link"}),
+            json!({"action":"download","tab":"app","frame":"child","selector":"#link","dialog_response":{}}),
             json!({"action":"download","selector":"#x","files":[]}),
             json!({"action":"download","selector":"#x","output_path":"../escape.bin"}),
             json!({"action":"download","selector":"#x","output_path":"/tmp/escape.bin"}),

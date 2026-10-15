@@ -273,8 +273,8 @@ impl Scope {
             .is_some_and(|(root, selected)| root.session != selected.session)
     }
 
-    /// Pointer actions use project_pointer before dispatch. Uploads use the
-    /// owning DOM session; downloads, navigation, exports and dialogs remain unscoped.
+    /// Pointer actions, including download triggers, use project_pointer.
+    /// Transfers retain the selected document; navigation, exports and dialogs remain unscoped.
     pub(super) fn admit_action(&self, action: &str) -> Result<()> {
         if self.is_remote()
             && !matches!(
@@ -289,6 +289,7 @@ impl Scope {
                     | "type"
                     | "press"
                     | "upload"
+                    | "download"
             )
             && !forms::is_action(action)
         {
@@ -395,20 +396,21 @@ pub(super) fn validate(args: &Value) -> Result<()> {
             | "scroll"
             | "wait_for"
             | "upload"
+            | "download"
     ) && !forms::is_action(action)
     {
         return Err(error(
-            "frame selection is supported by inspection, evaluation, input and uploads only",
+            "frame selection is supported by inspection, evaluation, input and file transfers only",
         ));
     }
-    if matches!(action, "press" | "scroll" | "upload")
+    if matches!(action, "press" | "scroll" | "upload" | "download")
         && args
             .get("selector")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
     {
         return Err(error(
-            "frame-scoped press, scroll and upload require an explicit selector",
+            "frame-scoped press, scroll, upload and download require an explicit selector",
         ));
     }
     if args.get("dialog_response").is_some() {
@@ -522,6 +524,23 @@ mod tests {
         assert!(validate(&json!({"action":"upload","tab":"work","frame":"child","dialog_response":{}})).is_err());
     }
 
+    #[test]
+    fn downloads_keep_explicit_frame_authority_and_native_page_input_routing() {
+        let (tree, targets) = scoped_remote_tree();
+        let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
+        assert!(scope.admit_action("download").is_ok());
+        assert_eq!(scope.command_session("DOM.resolveNode").unwrap(), "nested-session");
+        assert_eq!(scope.command_session("Input.dispatchMouseEvent").unwrap(), "page");
+        assert!(validate(&json!({"action":"download","tab":"work","frame":"remote-nested","selector":"#link"})).is_ok());
+        for args in [
+            json!({"action":"download","frame":"remote-nested","selector":"#link"}),
+            json!({"action":"download","tab":"work","frame":"remote-nested"}),
+            json!({"action":"download","tab":"work","frame":"remote-nested","selector":"#link","dialog_response":{}}),
+        ] {
+            assert!(validate(&args).is_err());
+        }
+    }
+
     fn scoped_remote_tree() -> (Tree, Targets) {
         let mut tree = Tree::parse_in_session(&tree(), "page").unwrap();
         let mut targets = Targets::default();
@@ -586,11 +605,11 @@ mod tests {
         }
         for action in [
             "snapshot", "ax_tree", "evaluate", "wait_for", "fill", "type", "press", "click",
-            "scroll",
+            "scroll", "download",
         ] {
             assert!(scope.admit_action(action).is_ok());
         }
-        for action in ["download", "goto", "handle_dialog"] {
+        for action in ["print_pdf", "goto", "handle_dialog"] {
             assert!(scope.admit_action(action).is_err());
         }
         let local = Scope::pin(&tree, "child", &targets).unwrap();
@@ -872,7 +891,7 @@ mod tests {
     fn frame_selection_is_explicit_and_never_ignored_by_unsupported_actions() {
         for action in [
             "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press", "scroll",
-            "wait_for",
+            "wait_for", "download",
         ] {
             assert!(
                 validate(
@@ -887,7 +906,7 @@ mod tests {
             "close",
             "list_tabs",
             "list_frames",
-            "download",
+            "hover",
             "screenshot",
             "print_pdf",
             "stop",
@@ -907,7 +926,7 @@ mod tests {
 
     #[test]
     fn frame_key_and_wheel_actions_cannot_target_ambient_focus_or_the_main_viewport() {
-        for action in ["press", "scroll", "upload"] {
+        for action in ["press", "scroll", "upload", "download"] {
             let mut args = json!({"action":action,"tab":"work","frame":"child"});
             assert!(validate(&args).is_err());
             args["selector"] = json!("");
