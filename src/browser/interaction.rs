@@ -9,6 +9,7 @@ use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod ax_state;
 pub(super) mod forms;
 mod frame_input;
 pub(super) mod pointer;
@@ -40,6 +41,13 @@ async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
     })
 }
 
+struct CollectedSnapshot {
+    elements: Vec<BrowserElementRef>,
+    references: References,
+    states: BTreeMap<String, ax_state::Observation>,
+    truncated: bool,
+}
+
 /// Walks the accessibility tree, describes each element and assigns stable
 /// `@eN` references, reusing names from `previous` while the document is
 /// unchanged. Returns the compact element inventory plus whether it hit the
@@ -51,7 +59,7 @@ async fn collect_elements(
     previous: Option<&References>,
     doc: &Document,
     next_ref: &mut u64,
-) -> Result<(Vec<BrowserElementRef>, References, bool)> {
+) -> Result<CollectedSnapshot> {
     let old_ids: BTreeMap<u64, &String> = previous
         .filter(|refs| refs.document.as_ref() == Some(doc))
         .map(|refs| refs.nodes.iter().map(|(name, id)| (*id, name)).collect())
@@ -61,6 +69,7 @@ async fn collect_elements(
         nodes: BTreeMap::new(),
     };
     let mut elements = Vec::new();
+    let mut states = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut truncated = false;
     for node in nodes {
@@ -106,6 +115,7 @@ async fn collect_elements(
             format!("@e{}", *next_ref)
         };
         refs.nodes.insert(id.clone(), backend_id);
+        states.insert(id.clone(), ax_state::project(node));
         // Accessible names are useful context. Do not copy editable values or
         // password contents into the transcript as a side effect of inspection.
         let text = node["name"]["value"]
@@ -122,7 +132,7 @@ async fn collect_elements(
             selector: id,
         });
     }
-    Ok((elements, refs, truncated))
+    Ok(CollectedSnapshot { elements, references: refs, states, truncated })
 }
 
 pub(super) async fn snapshot(
@@ -145,7 +155,7 @@ pub(super) async fn snapshot(
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::tool("browser", "accessibility tree has no nodes"))?;
-    let (elements, refs, truncated) =
+    let CollectedSnapshot { elements, references: refs, states, truncated } =
         collect_elements(owner, cdp, nodes, previous, &doc, next_ref).await?;
     let metadata = cdp
         .evaluate(owner, "({url: location.href, title: document.title})")
@@ -162,11 +172,12 @@ pub(super) async fn snapshot(
         .iter()
         .map(|e| {
             format!(
-                "- [{}] <{}> (role: {}) {}",
+                "- [{}] <{}> (role: {}) {}{}",
                 e.ref_id,
                 e.tag,
                 e.role,
-                json!(e.text)
+                json!(e.text),
+                states.get(&e.ref_id).map(ax_state::Observation::suffix).unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
@@ -193,6 +204,7 @@ pub(super) async fn snapshot(
     let mut details = json!({
         "snapshot": snapshot, "truncated": truncated, "backend": "cdp",
         "reference_scope": reference_scope, "frame_id": doc.frame,
+        "element_states": states, "state_schema": "pi.browser.ax-state.v1",
     });
     if include_tree {
         // Return the actual accessibility tree, bounded independently of the
@@ -200,7 +212,8 @@ pub(super) async fn snapshot(
         let tree: Vec<_> = nodes.iter().take(MAX_AX_NODES).map(|node| json!({
             "nodeId": node["nodeId"], "parentId": node["parentId"], "childIds": node["childIds"],
             "role": node["role"], "name": node["name"], "ignored": node["ignored"],
-            "backendDOMNodeId": node["backendDOMNodeId"]
+            "backendDOMNodeId": node["backendDOMNodeId"],
+            "state_observation": ax_state::project(node)
         })).collect();
         details["ax_tree"] = json!({"nodes": tree, "truncated": nodes.len() > MAX_AX_NODES});
     }
