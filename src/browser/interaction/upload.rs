@@ -1,7 +1,7 @@
 //! Real file-input selection from bounded private copies of workspace files.
 //! Copies stay owned by the session: browser File objects may read them later.
 
-use super::{Document, References, document, element_call, resolve};
+use super::{Document, References, element_call, resolve};
 use crate::agent_cx::AgentCx;
 use crate::browser::cdp::Cdp;
 use crate::browser::{output, policy, required};
@@ -47,7 +47,7 @@ pub(in crate::browser) fn validate(args: &Value) -> Result<Vec<PathBuf>> {
     for field in object.keys() {
         if !matches!(
             field.as_str(),
-            "action" | "tab" | "selector" | "files" | "timeout_ms"
+            "action" | "tab" | "frame" | "selector" | "files" | "timeout_ms"
         ) {
             return Err(error(format!("unsupported upload parameter: {field}")));
         }
@@ -121,6 +121,9 @@ impl Store {
             .ok_or_else(|| error("upload selector did not match a file input"))?;
         let control = element_call(owner, cdp, node, "file_input", json!({})).await?;
         check_control(&control, paths.len())?;
+        // Lookup and control inspection may themselves yield to navigation.
+        // Refuse before staging, not only after local files have been copied.
+        unchanged_document(owner, cdp, allowlist, &before).await?;
         let staged = if paths.is_empty() {
             None
         } else {
@@ -131,11 +134,12 @@ impl Store {
                 MAX_SESSION_BYTES.saturating_sub(self.bytes),
             )?)
         };
-        if allowed_document(owner, cdp, allowlist).await? != before {
-            return Err(error(
-                "page navigated while preparing upload; take a new snapshot",
-            ));
-        }
+        unchanged_document(owner, cdp, allowlist, &before).await?;
+        // Preparing private copies can take time. Revalidate the same backend
+        // node rather than resolving a selector that could name a replacement.
+        let control = element_call(owner, cdp, node, "file_input", json!({})).await?;
+        check_control(&control, paths.len())?;
+        unchanged_document(owner, cdp, allowlist, &before).await?;
         owner
             .checkpoint()
             .map_err(|_| error("upload cancelled before file selection"))?;
@@ -169,7 +173,7 @@ impl Store {
                 "file input did not retain the requested names and sizes; the page may have replaced the selection",
             ));
         }
-        if document(owner, cdp).await? != before {
+        if allowed_document(owner, cdp, allowlist).await? != before {
             return Err(error(
                 "page navigated during file selection; file data may already have been consumed",
             ));
@@ -182,6 +186,7 @@ impl Store {
             json!({
                 "action": "upload", "selector": selector, "files": expected,
                 "file_count": paths.len(), "staged_session_bytes": self.bytes,
+                "frame_id": before.frame,
                 "backend": "cdp", "submit_button_clicked": false
             }),
         ))
@@ -193,13 +198,49 @@ async fn allowed_document(
     cdp: &mut Cdp,
     allowlist: Option<&[String]>,
 ) -> Result<Document> {
-    let tree = cdp.command(owner, "Page.getFrameTree", json!({})).await?;
-    let frame = &tree["frameTree"]["frame"];
-    policy::check_navigation(required(frame, "url")?, allowlist)?;
+    // Page.getFrameTree on the owning renderer describes its local root, not
+    // necessarily the selected (same-process) descendant. frame_document also
+    // checks every pinned ancestor and renderer incarnation for scoped calls.
+    let frame = cdp.frame_document(owner).await?;
+    admit_document(&frame, cdp.frame_selected(), allowlist)
+}
+
+fn admit_document(
+    frame: &Value,
+    scoped: bool,
+    allowlist: Option<&[String]>,
+) -> Result<Document> {
+    let url = required(frame, "url")?;
+    // A scoped srcdoc inherits the embedding document's authority, already
+    // checked by frame_document. Never apply that exception to an unscoped root.
+    if !scoped || url != "about:srcdoc" {
+        policy::check_navigation(url, allowlist)?;
+    }
+    let id = |key: &str| -> Result<String> {
+        frame[key]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+            .map(str::to_owned)
+            .ok_or_else(|| error("upload document has an invalid identity"))
+    };
     Ok(Document {
-        frame: required(frame, "id")?.into(),
-        loader: required(frame, "loaderId")?.into(),
+        frame: id("id")?,
+        loader: id("loaderId")?,
     })
+}
+
+async fn unchanged_document(
+    owner: &AgentCx,
+    cdp: &mut Cdp,
+    allowlist: Option<&[String]>,
+    expected: &Document,
+) -> Result<()> {
+    if allowed_document(owner, cdp, allowlist).await? != *expected {
+        return Err(error(
+            "page navigated while preparing upload; take a new snapshot",
+        ));
+    }
+    Ok(())
 }
 
 fn check_control(control: &Value, count: usize) -> Result<()> {
@@ -352,6 +393,48 @@ fn open_source(_cwd: &Path, _relative: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_upload_arguments_keep_path_limits_and_reject_implicit_dialog_consent() {
+        let args = json!({"action":"upload","tab":"work","frame":"child",
+            "selector":"#file","files":["documents/report.txt"]});
+        assert_eq!(validate(&args).unwrap(), [PathBuf::from("documents/report.txt")]);
+        for field in ["dialog_response", "diagnostics", "url", "wait_after"] {
+            let mut invalid = args.clone();
+            invalid[field] = json!({});
+            assert!(validate(&invalid).is_err(), "{field}");
+        }
+        for files in [json!(["../private"]), json!(["/private"]), json!(vec!["x"; 11])] {
+            let mut invalid = args.clone();
+            invalid["files"] = files;
+            assert!(validate(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn scoped_srcdoc_uses_inherited_admission_not_an_unscoped_root_exception() {
+        let srcdoc = json!({"id":"child","loaderId":"child-loader","url":"about:srcdoc"});
+        assert_eq!(admit_document(&srcdoc, true, Some(&[])).unwrap(), Document {
+            frame: "child".into(), loader: "child-loader".into(),
+        });
+        assert!(admit_document(&srcdoc, false, Some(&[])).is_err());
+        let rules = vec!["example.com".to_owned()];
+        let blocked = json!({"id":"child","loaderId":"child-loader","url":"https://blocked.test/file"});
+        assert!(admit_document(&blocked, true, Some(&rules)).is_err());
+    }
+
+    #[test]
+    fn uploads_require_complete_bounded_document_identity() {
+        let frame = json!({"id":"child","loaderId":"child-loader","url":"about:blank"});
+        assert!(admit_document(&frame, false, None).is_ok());
+        for key in ["id", "loaderId"] {
+            for value in [Value::Null, json!(""), json!("x".repeat(257)), json!("bad\nidentity")] {
+                let mut invalid = frame.clone();
+                invalid[key] = value;
+                assert!(admit_document(&invalid, true, None).is_err());
+            }
+        }
+    }
 
     #[test]
     fn file_paths_and_control_cardinality_fail_closed() {
