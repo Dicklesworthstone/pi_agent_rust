@@ -8,6 +8,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
+mod batch;
+
 struct Step {
     method: &'static str,
     params: Value,

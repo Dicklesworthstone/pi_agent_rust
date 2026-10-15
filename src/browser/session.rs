@@ -18,6 +18,8 @@ use crate::error::{Error, Result};
 use crate::jobs::JobSessionScope;
 use crate::tools::ToolOutput;
 
+pub(super) mod batch;
+
 const CAPACITY: usize = 4;
 const MAX_OWNER_BYTES: usize = 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -144,6 +146,10 @@ impl Sessions {
     pub(super) async fn execute(&self, tool: &BrowserTool, args: &Value) -> Result<ToolOutput> {
         let action = required(args, "action")?;
         let budget = Budget::new(args, action)?;
+        let batch = batch::Plan::parse(args)?;
+        if batch.is_some() && tool.is_mock() {
+            return Err(error("BROWSER_BATCH_NATIVE_REQUIRED: batches require the native browser backend"));
+        }
         if action == "release" {
             validate_release(args)?;
         }
@@ -169,7 +175,11 @@ impl Sessions {
         // by assuming an error means no side effect. Explicit release retires it.
         let retain = !matches!(action, "status" | "stop");
         let (namespace, reused) = self.select(&id, retain)?;
-        let result = self.run_owned(&id, &budget, tool.execute_in_namespace(&namespace, args)).await?;
+        let result = if let Some(batch) = batch {
+            batch.execute(self, &id, &budget, tool, &namespace).await
+        } else {
+            self.run_owned(&id, &budget, tool.execute_in_namespace(&namespace, args)).await?
+        };
         // Stop belongs to the captured owner even if the frontend switched
         // during its execution. Do not postpone bookkeeping past that check.
         let stopped = action == "stop" && result.as_ref().is_ok_and(|value| !value.is_error);

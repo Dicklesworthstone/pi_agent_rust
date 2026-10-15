@@ -166,11 +166,12 @@ impl Tool for BrowserTool {
          externally attached browser. Four namespaces are retained without automatic eviction. \
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
          Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused. \
-         click accepts left/middle/right buttons, left double-clicks and modifier keys; sequences never replay after interruption. Dispatch acknowledgement does not verify the application's outcome."
+         click accepts left/middle/right buttons, left double-clicks and modifier keys; sequences never replay after interruption. Dispatch acknowledgement does not verify the application's outcome. \
+         batch executes ordered native calls under one conversation lease and total deadline, preserving partial results and stopping at the first error without replay."
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "required": ["action"],
             "properties": {
@@ -242,7 +243,9 @@ impl Tool for BrowserTool {
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120_000,
                                "description": "Whole-operation deadline, including launch, connection and lock wait"}
             }
-        })
+        });
+        session::batch::extend_schema(&mut schema);
+        schema
     }
 
     fn effects(&self) -> ToolEffects {
