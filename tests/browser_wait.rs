@@ -499,6 +499,43 @@ mod wire {
     }
 
     #[test]
+    fn hover_postcondition_uses_one_button_free_move_and_the_existing_wait_lane() {
+        let (result, seen) = run(Mode::Ready,json!({"action":"hover","tab":"page","selector":"#trigger",
+            "wait_after":{"selector":"#ready","text":"Ready now"},"timeout_ms":5000}));
+        let result = result.unwrap();
+        assert!(!result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["action"],"hover");
+        assert_eq!(details["wait_after"]["satisfied"],true);
+        assert_eq!(seen.inputs,vec!["mouseMoved"]);
+        assert_eq!(seen.observations,3);
+    }
+
+    #[test]
+    fn hover_navigation_failure_retains_input_and_stops_the_native_batch() {
+        let (result, seen) = run(Mode::Navigate,json!({"action":"batch","steps":[
+            {"call":{"action":"hover","tab":"page","selector":"#trigger","wait_after":{"selector":"#ready"}}},
+            {"call":{"action":"click","tab":"page","selector":"#trigger"}}
+        ],"timeout_ms":5000}));
+        let result = result.unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["attempted_steps"],1);
+        assert_eq!(details["steps"][0]["details"]["dispatch_acknowledged"],true);
+        assert_eq!(details["steps"][0]["details"]["wait_after"]["error_kind"],"document_changed");
+        assert_eq!(seen.inputs,vec!["mouseMoved"]);
+        assert_eq!(seen.observations,0);
+    }
+
+    #[test]
+    fn cancelled_hover_postcondition_releases_admission_without_repeating_input() {
+        let (result, seen) = run(Mode::Cancelled,json!({"action":"hover","tab":"page","selector":"#trigger",
+            "wait_after":{"selector":"#ready"},"timeout_ms":5000}));
+        assert!(result.is_err());
+        assert_eq!(seen.inputs,vec!["mouseMoved"]);
+    }
+
+    #[test]
     fn native_timeout_and_navigation_do_not_replay_completed_input() {
         let (result, seen) = run(Mode::Pending,json!({"action":"click","tab":"page","selector":"#trigger",
             "wait_after":{"selector":"#ready"},"timeout_ms":2000}));

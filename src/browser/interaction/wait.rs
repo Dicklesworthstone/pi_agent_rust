@@ -147,8 +147,8 @@ pub(super) fn after_condition(args: &Value) -> Result<Option<Value>> {
     let Some(after) = args.get("wait_after") else {
         return Ok(None);
     };
-    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/type/fill/press and accepts selector, state, text, text_match, stable_ms and explicit navigation; tab/frame/deadline are inherited; dialog_response cannot be combined");
-    if !matches!(args.get("action").and_then(Value::as_str), Some("click" | "type" | "fill" | "press"))
+    let invalid = || error("BROWSER_WAIT_AFTER_USAGE: wait_after requires click/hover/type/fill/press and accepts selector, state, text, text_match, stable_ms and explicit navigation; tab/frame/deadline are inherited; dialog_response cannot be combined");
+    if !matches!(args.get("action").and_then(Value::as_str), Some("click" | "hover" | "type" | "fill" | "press"))
         || args.get("dialog_response").is_some()
     {
         return Err(invalid());

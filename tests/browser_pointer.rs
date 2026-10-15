@@ -57,6 +57,65 @@ fn explicit_pointer_sequences_are_described_and_never_simulated() {
     event("schema-and-mock", "pass");
 }
 
+#[test]
+fn hover_schema_mock_refusal_and_preflight_are_connected_to_the_public_tool() {
+    event("hover-public", "start");
+    let dir = tempfile::tempdir().unwrap();
+    let native = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("invalid-endpoint");
+    let mock = BrowserTool::new(dir.path()).with_mock(true);
+    let schema = native.parameters();
+    assert!(schema["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("hover")));
+    assert!(schema["properties"]["steps"]["items"]["properties"]["call"]["properties"]["action"]["enum"]
+        .as_array().unwrap().contains(&json!("hover")));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        for args in [json!({"action":"hover","selector":"#menu"}),
+            json!({"action":"hover","tab":"app","selector":"#menu","button":"left"}),
+            json!({"action":"hover","tab":"app","selector":"#menu","frame":"child"}),
+            json!({"action":"hover","tab":"app","selector":"#menu","wait_after":{"navigation":{"url":"https://app.example/next"}}})] {
+            let error = native.execute("hover-preflight", args, None).await.unwrap_err().to_string();
+            assert!(!error.contains("CDP endpoint"), "{error}");
+        }
+        let error = mock.execute("hover-mock", json!({"action":"hover","tab":"app","selector":"#menu"}), None)
+            .await.unwrap_err().to_string();
+        assert!(error.contains("native backend"));
+    });
+    event("hover-public", "pass");
+}
+
+#[test]
+#[ignore = "requires sandbox-capable Chromium; select explicitly in the DSR browser lane"]
+fn live_hover_reveals_css_menu_with_trusted_events_without_clicking() {
+    event("hover-live", "start");
+    let dir = tempfile::tempdir().unwrap();
+    let tool = live_tool(dir.path());
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        call(&tool, json!({"action":"open","tab":"hover","url":"about:blank"})).await;
+        call(&tool, json!({"action":"evaluate","tab":"hover","script":r#"
+            (()=>{
+                document.body.innerHTML='<style>#menu{position:absolute;left:200px;top:150px;padding:25px}#panel{display:none}#menu:hover #panel{display:block}</style><div id="menu" data-testid="menu">Menu<div id="panel">Ready now</div></div>';
+                window.moves=[];window.clicks=0;
+                menu.addEventListener('pointerover',e=>moves.push({trusted:e.isTrusted,buttons:e.buttons,shift:e.shiftKey}));
+                menu.addEventListener('click',()=>clicks++);return true;
+            })()
+        "#})).await;
+        let result = call(&tool, json!({"action":"hover","tab":"hover","selector":"testid/menu",
+            "modifiers":["Shift"],"wait_after":{"selector":"#panel","text":"Ready now","stable_ms":100}})).await;
+        assert_eq!(result["action"], "hover");
+        assert_eq!(result["dispatch_acknowledged"], true);
+        assert_eq!(result["delivery_verified"], false);
+        assert_eq!(result["wait_after"]["satisfied"], true);
+        let state = call(&tool, json!({"action":"evaluate","tab":"hover","script":"({moves,clicks})"})).await;
+        assert_eq!(state["result"]["clicks"], 0);
+        let moves = state["result"]["moves"].as_array().unwrap();
+        assert!(!moves.is_empty());
+        assert!(moves.iter().all(|event| event["trusted"] == true && event["buttons"] == 0 && event["shift"] == true));
+        call(&tool, json!({"action":"stop"})).await;
+    });
+    event("hover-live", "pass");
+}
+
 fn live_tool(cwd: &std::path::Path) -> BrowserTool {
     BrowserTool::new(cwd).with_mock(false).with_launch_options(BrowserLaunchOptions {
         executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),

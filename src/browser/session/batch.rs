@@ -21,7 +21,7 @@ const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPECT_BYTES: usize = 16 * 1024;
 const ACTIONS: &[&str] = &[
     "open", "goto", "close", "list_tabs", "list_frames", "snapshot", "ax_tree",
-    "evaluate", "click", "type", "fill", "press", "scroll", "wait_for",
+    "evaluate", "click", "hover", "type", "fill", "press", "scroll", "wait_for",
     "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
     "handle_dialog", "diagnostics",
 ];

@@ -105,6 +105,20 @@ impl Options {
 /// Public preflight precedes launch, connection and the explicit mock backend.
 /// Pointer options on any other action are errors, never silently ignored.
 pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
+    if args.get("action").and_then(Value::as_str) == Some("hover") {
+        let fields = args.as_object().ok_or_else(hover_usage)?;
+        if fields.keys().any(|key| !matches!(key.as_str(),
+            "action" | "tab" | "selector" | "modifiers" | "timeout_ms" | "wait_after"
+        )) || args.get("tab").and_then(Value::as_str)
+            .is_none_or(|tab| tab.is_empty() || tab.len() > 256)
+            || args.get("selector").and_then(Value::as_str)
+                .is_none_or(|selector| selector.is_empty() || selector.len() > 64 * 1024 || selector.contains('\0'))
+        {
+            return Err(hover_usage());
+        }
+        Options::parse(args)?;
+        return Ok(true);
+    }
     let explicit = ["button", "click_count", "modifiers"]
         .iter().any(|name| args.get(*name).is_some());
     if explicit {
@@ -114,6 +128,45 @@ pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
         Options::parse(args)?;
     }
     Ok(explicit)
+}
+
+fn hover_usage() -> Error {
+    Error::tool("browser", "BROWSER_HOVER_USAGE: hover requires an explicit tab and selector; optional modifiers, timeout_ms and same-document wait_after only; frames and button presses are not supported")
+}
+
+/// A real pointer move can reveal CSS menus and trigger trusted pointer/mouse
+/// enter handlers. It does not press a button, synthesize a DOM event, or retry.
+pub(super) async fn hover(
+    owner: &AgentCx,
+    cdp: &mut Cdp,
+    tab: &str,
+    id: u64,
+    args: &Value,
+) -> Result<ToolOutput> {
+    validate_input(args)?;
+    if cdp.frame_selected() {
+        return Err(hover_usage());
+    }
+    let options = Options::parse(args)?;
+    let expected = document(owner, cdp).await?;
+    cdp.command(owner, "Page.bringToFront", json!({})).await?;
+    verify_document(owner, cdp, &expected).await?;
+    let (x, y) = point(owner, cdp, id).await?;
+    verify_document(owner, cdp, &expected).await?;
+    cdp.command(owner, "Input.dispatchMouseEvent", hover_event(x, y, options.modifiers)).await?;
+    // Do not resolve the selector again after page handlers have run. Optional
+    // wait_after inspects the outcome without replaying this pointer movement.
+    Ok(output(
+        format!("Dispatched native hover in tab {tab}; application outcome is not verified"),
+        json!({"action":"hover", "tab":tab, "selector":required(args, "selector")?,
+            "backend":"cdp", "input_method":"native-pointer", "modifier_mask":options.modifiers,
+            "dispatch_acknowledged":true, "delivery_verified":false}),
+    ))
+}
+
+fn hover_event(x: f64, y: f64, modifiers: u8) -> Value {
+    json!({"type":"mouseMoved", "x":x, "y":y,
+        "button":"none", "buttons":0, "modifiers":modifiers})
 }
 
 async fn verify_document(owner: &AgentCx, cdp: &mut Cdp, expected: &Document) -> Result<()> {
@@ -209,6 +262,34 @@ mod tests {
 
     fn log(case: &str) {
         eprintln!("{}", json!({"suite":"browser_pointer","case":case,"phase":"start"}));
+    }
+
+    #[test]
+    fn hover_admission_is_explicit_and_never_accepts_ignored_input_or_frame_authority() {
+        log("hover-admission");
+        let args = json!({"action":"hover", "tab":"app", "selector":"role/button[name=\"Menu\" exact]", "modifiers":["Shift"]});
+        assert!(validate_input(&args).unwrap());
+        for field in ["frame", "button", "click_count", "text", "dialog_response", "diagnostics"] {
+            let mut invalid = args.clone();
+            invalid[field] = json!("PRIVATE-CANARY");
+            let failure = validate_input(&invalid).unwrap_err().to_string();
+            assert!(failure.contains("BROWSER_HOVER_USAGE"));
+            assert!(!failure.contains("PRIVATE-CANARY"));
+        }
+        for invalid in [json!({"action":"hover","selector":"#menu"}),
+            json!({"action":"hover","tab":"app","selector":""}),
+            json!({"action":"hover","tab":"app","selector":"#menu","modifiers":["Shift","Shift"]})] {
+            assert!(validate_input(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn hover_events_have_no_pressed_buttons_or_click_count() {
+        log("hover-events");
+        assert_eq!(hover_event(12.5, 48.0, 8), json!({
+            "type":"mouseMoved", "x":12.5, "y":48.0, "button":"none", "buttons":0, "modifiers":8
+        }));
+        assert!(hover_event(0.0, 0.0, 0).get("clickCount").is_none());
     }
 
     #[test]

@@ -445,6 +445,7 @@ async fn execute_input(
     .await?;
     match action {
         "click" => pointer::click(owner, cdp, tab, id, args).await,
+        "hover" => pointer::hover(owner, cdp, tab, id, args).await,
         "type" | "fill" => {
             let text = required(args, "text")?;
             element_call(owner, cdp, id, "edit", json!({"replace": action == "fill"})).await?;

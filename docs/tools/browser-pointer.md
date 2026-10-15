@@ -58,3 +58,42 @@ interruption, disabled/inert targets and frame-scoped double-clicks. An independ
 Chromium probe executes the exact DOM helper and CDP event format; it is not a
 Rust-host or cross-platform test. Native acceptance requires
 `dsr quality --tool pi_agent_rust`; no Cargo/Actions substitute is claimed.
+
+## Native hover and menu readiness
+
+`hover` moves the real pointer without pressing any button. Unlike dispatching
+JavaScript mouse events, it can reveal CSS `:hover` menus and produces native
+pointer/mouse events. An explicit main-document `tab` and `selector` are required;
+CSS, current snapshot references and semantic selectors all use the shared
+resolver. Frame selection, button/count options, dialogs and diagnostic capture
+are not supported on this action and are rejected before connection.
+
+```json
+{
+  "action": "hover",
+  "tab": "app",
+  "selector": "testid/account-menu",
+  "wait_after": {
+    "selector": "#account-panel",
+    "state": "visible",
+    "stable_ms": 200
+  }
+}
+```
+
+The tab is brought forward, the original node is scrolled into view and its
+unobstructed point is checked before one button-free move. `modifiers` has the
+same nonsticky meanings as click. Existing visibility, disabled/inert and
+composed-tree checks still apply. The pointer remains at its resulting location;
+there is no automatic move-away that would close the newly revealed menu.
+
+A same-document `wait_after` can wait for the menu or tooltip without a second
+hover, a new timeout, or a repeated input. Explicit navigation conditions remain
+unsupported for hover. Batches accept hover and stop on a failed postcondition,
+retaining its acknowledged movement. Movement acknowledgement is not delivery or
+application-success proof; the existing `delivery_verified:false` contract holds.
+
+Native preflight and real-transport regressions cover dispatch, menu waiting,
+interrupted ownership and batch stop; the explicitly ignored Chromium case
+checks CSS visibility and trusted button-free events. Authored Rust tests require
+`dsr quality --tool pi_agent_rust`; no runtime acceptance is implied by their presence.

@@ -154,7 +154,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         }
         "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree"
         | "diagnostics" => {}
-        "click" | "wait_for" => {
+        "click" | "hover" | "wait_for" => {
             required(args, "selector")?;
         }
         "type" | "fill" => {
@@ -1101,7 +1101,7 @@ impl Session {
                 self.references.insert(reference_key.clone(), references);
                 Ok(result)
             }
-            "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
+            "click" | "hover" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
                 interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
                     .await
             }
