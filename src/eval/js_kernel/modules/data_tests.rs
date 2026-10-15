@@ -160,3 +160,139 @@ fn aliases_cannot_cross_workspace_or_data_code_boundaries() {
         assert!(files.resolve_path("eval_script", name).is_err(), "accepted {name}");
     }
 }
+
+#[test]
+fn text_defaults_preserve_exact_content_without_guest_constructors_or_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "\u{feff}# Heading\r\n雪\0'\"` ${globalThis.executed = true}\n<script>globalThis.executed = true</script>\n";
+    std::fs::write(dir.path().join("template.md"), source).unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    let result = value(&kernel, r#"
+        globalThis.originalString = String;
+        String = () => { globalThis.usedString = true; throw new Error('guest String'); };
+        globalThis.asset = (await import('./template.md', {with:{type:'text'}})).default;
+        String = originalString; [asset, typeof executed, typeof usedString]
+    "#);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!([source, "undefined", "undefined"]));
+    assert_eq!(value(&kernel, "Object.keys(await import('./template.md', {with:{type:'text'}}))"), "[\"default\"]");
+}
+
+#[test]
+fn supported_text_suffixes_are_inert_data_and_unknown_suffixes_remain_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    for (index, extension) in ["txt", "md", "csv", "tsv", "svg", "html", "css", "xml",
+        "yaml", "yml", "toml", "jsonl", "ndjson"].iter().enumerate()
+    {
+        let name = format!("asset.{extension}");
+        let data = format!("not necessarily valid {extension}; globalThis.executed = true; #{index}");
+        std::fs::write(dir.path().join(&name), &data).unwrap();
+        let result = value(&kernel, &format!("(await import('./{name}', {{with:{{type:'text'}}}})).default"));
+        assert_eq!(serde_json::from_str::<String>(&result).unwrap(), data);
+    }
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    assert_eq!(value(&kernel, "(await import('./empty.txt', {with:{type:'text'}})).default"), "\"\"");
+    for name in ["unknown.bin", "extensionless", "code.cjs"] {
+        std::fs::write(dir.path().join(name), "data").unwrap();
+        let result = cell(&kernel, &format!("await import('./{name}', {{with:{{type:'text'}}}})"));
+        assert!(!result.ok, "accepted {name}");
+    }
+    assert_eq!(value(&kernel, "typeof executed"), "\"undefined\"");
+}
+
+#[test]
+fn text_attributes_remain_mandatory_after_cache_and_transitive_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("asset.txt"), "retained").unwrap();
+    std::fs::write(dir.path().join("facade.mjs"),
+        "import asset from './asset.txt' with {type:'text'}; export {asset};").unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    assert_eq!(value(&kernel, "(await import('./facade.mjs')).asset"), "\"retained\"");
+    value(&kernel, "globalThis.assetModule = await import('./asset.txt', {with:{type:'text'}}); assetModule.default");
+    std::fs::write(dir.path().join("asset.txt"), "edited").unwrap();
+    assert_eq!(value(&kernel, "globalThis.sameAsset = await import('././asset.txt', {with:{type:'text'}}); [assetModule === sameAsset, sameAsset.default]"),
+        "[true,\"retained\"]");
+    for code in [
+        "await import('./asset.txt')",
+        "await import('./asset.txt', {with:{}})",
+        "await import('./asset.txt', {with:{type:'json'}})",
+        "await import('./asset.txt', {with:{type:'text', extra:'no'}})",
+        "await import('./facade.mjs', {with:{type:'text'}})",
+    ] {
+        let result = cell(&kernel, code);
+        assert!(!result.ok, "accepted {code}");
+        assert!(result.error.unwrap().contains("EVAL_MODULE_ATTRIBUTES"));
+    }
+    let fresh = JsKernel::spawn_in(dir.path()).unwrap();
+    assert_eq!(value(&fresh, "(await import('./asset.txt', {with:{type:'text'}})).default"), "\"edited\"");
+}
+
+#[test]
+fn text_file_failures_and_shared_source_budget_never_return_partial_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("asset.txt");
+    let source = "\u{feff}text\r\n";
+    std::fs::write(&path, source).unwrap();
+    let files = files(dir.path());
+    let name = files.resolve_path("eval_script", "./asset.txt").unwrap();
+    files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - source.len();
+    assert_eq!(files.read_module(&name).unwrap().code, source);
+    assert_eq!(files.0.borrow().source_bytes, MAX_SOURCE_BYTES);
+    assert!(files.read_module(&name).err().unwrap().contains("LIMIT"));
+    files.0.borrow_mut().source_bytes = 0;
+    std::fs::write(&path, [0xff, 0xfe]).unwrap();
+    assert!(files.read_module(&name).err().unwrap().contains("ENCODING"));
+    std::fs::File::create(&path).unwrap().set_len(2 * 1024 * 1024 + 1).unwrap();
+    assert!(files.read_module(&name).err().unwrap().contains("LIMIT"));
+    std::fs::create_dir(dir.path().join("directory.txt")).unwrap();
+    let directory = files.resolve_path("eval_script", "./directory.txt").unwrap();
+    assert!(files.read_module(&directory).err().unwrap().contains("PATH"));
+    assert_eq!(files.0.borrow().source_bytes, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn text_aliases_and_special_files_obey_the_shared_data_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("text.txt"), "42").unwrap();
+    std::fs::write(root.join("data.json"), "42").unwrap();
+    std::fs::write(root.join("code.mjs"), "export default 42;").unwrap();
+    std::fs::write(dir.path().join("outside.txt"), "outside").unwrap();
+    for (target, alias) in [("text.txt","alias.md"), ("text.txt","alias.json"),
+        ("text.txt","alias.mjs"), ("data.json","data.txt"), ("code.mjs","code.txt"),
+        ("../outside.txt","escape.txt")]
+    {
+        std::os::unix::fs::symlink(target, root.join(alias)).unwrap();
+    }
+    let files = files(&root);
+    assert_eq!(files.resolve_path("eval_script", "./text.txt").unwrap(),
+        files.resolve_path("eval_script", "./alias.md").unwrap());
+    for name in ["./alias.json", "./alias.mjs", "./data.txt", "./code.txt", "./escape.txt"] {
+        assert!(files.resolve_path("eval_script", name).is_err(), "accepted {name}");
+    }
+    rustix::fs::mkfifoat(rustix::fs::CWD, root.join("pipe.txt"),
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).unwrap();
+    let name = files.resolve_path("eval_script", "./pipe.txt").unwrap();
+    assert!(files.read_module(&name).err().unwrap().contains("PATH"));
+}
+
+#[test]
+fn cached_text_resolution_requires_the_current_cells_io_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("asset.txt"), "retained").unwrap();
+    let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    assert_eq!(value(&kernel, "(await import('./asset.txt', {with:{type:'text'}})).default"), "\"retained\"");
+    let receiver = {
+        let owner = AgentCx::for_testing();
+        let _guard = owner.cx().clone().set_current_restricted();
+        kernel.submit("await import('./asset.txt', {with:{type:'text'}})".into(),
+            Instant::now() + Duration::from_secs(5)).unwrap()
+    };
+    let result = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!result.ok);
+    assert!(result.error.unwrap().contains("EVAL_MODULE_DENIED"));
+    assert_eq!(value(&kernel, "(await import('./asset.txt', {with:{type:'text'}})).default"), "\"retained\"");
+}

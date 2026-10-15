@@ -1,4 +1,4 @@
-//! Shared bounded file admission for JavaScript/TypeScript scripts and ES modules.
+//! Shared bounded file admission for scripts, ES modules and text assets.
 
 use crate::error::{Error, Result};
 use std::io::Read as _;
@@ -66,6 +66,19 @@ pub(super) async fn load(cwd: PathBuf, path: PathBuf) -> Result<Source> {
 // Callers own authority and cancellation admission. Module reads run on the
 // existing dedicated kernel thread, not on an async executor worker.
 pub(in crate::eval) fn load_sync(cwd: &Path, path: &Path) -> Result<Source> {
+    let mut source = load_verbatim_sync(cwd, path)?;
+    // Script/JSON encoding normalization is separate from text-asset reads.
+    // A leading BOM must not displace a script's hashbang, but must remain
+    // ordinary string data when the same reader serves a text module.
+    if source.code.starts_with('\u{feff}') {
+        source.code.replace_range(..'\u{feff}'.len_utf8(), "");
+    }
+    Ok(source)
+}
+
+/// The same bounded reader without script encoding normalization. No new
+/// trust or path policy: callers still supply the current cell's authority.
+pub(in crate::eval) fn load_verbatim_sync(cwd: &Path, path: &Path) -> Result<Source> {
     let root = std::fs::canonicalize(cwd).map_err(|error| failure("PATH", error))?;
     let requested = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
     let path = std::fs::canonicalize(requested).map_err(|error| failure("PATH", error))?;
@@ -96,10 +109,7 @@ pub(in crate::eval) fn load_sync(cwd: &Path, path: &Path) -> Result<Source> {
     if bytes.len() as u64 > MAX_SCRIPT_BYTES {
         return Err(failure("LIMIT", "script exceeds 2 MiB"));
     }
-    let code = String::from_utf8(bytes).map_err(|_| failure("ENCODING", "JavaScript source must be UTF-8"))?;
-    // A UTF-8 BOM is an encoding signature. Removing it also allows a
-    // following hashbang to occupy the first position expected by QuickJS.
-    let code = code.strip_prefix('\u{feff}').map_or_else(|| code.clone(), str::to_owned);
+    let code = String::from_utf8(bytes).map_err(|_| failure("ENCODING", "source must be UTF-8"))?;
     let path = path.to_str().ok_or_else(|| failure("PATH", "script path must be UTF-8"))?.to_owned();
     Ok(Source { code, path })
 }
@@ -133,6 +143,16 @@ fn same_snapshot(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_assets_preserve_bom_crlf_and_nul_without_changing_script_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        let text = "\u{feff}first\r\n雪\0last\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(load_verbatim_sync(dir.path(), &path).unwrap().code, text);
+        assert_eq!(load_sync(dir.path(), &path).unwrap().code, text.trim_start_matches('\u{feff}'));
+    }
 
     #[test]
     fn paths_are_literals_not_commands() {

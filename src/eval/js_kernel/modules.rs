@@ -3,8 +3,8 @@
 //! QuickJS owns linking, cycles, live bindings and evaluation caching. This
 //! adapter owns file admission and the current cell's authority. JavaScript
 //! and TypeScript modules share one linker/cache; TypeScript is lowered to
-//! JavaScript before QuickJS sees it. JSON imports require type: "json" and
-//! export parsed data through a host-defined module, never executable source.
+//! JavaScript before QuickJS sees it. JSON and text imports require their
+//! explicit type and export native values, never executable source.
 //! No packages, native libraries, remote URLs or implicit extension search.
 
 use std::cell::RefCell;
@@ -37,6 +37,17 @@ enum ModuleLanguage {
     JavaScript,
     TypeScript,
     Json,
+    Text,
+}
+
+impl ModuleLanguage {
+    const fn data_type(self) -> Option<&'static str> {
+        match self {
+            Self::Json => Some("json"),
+            Self::Text => Some("text"),
+            Self::JavaScript | Self::TypeScript => None,
+        }
+    }
 }
 
 struct Active {
@@ -137,7 +148,7 @@ impl ModuleFiles {
             || module_language(Path::new(name)).is_none()
         {
             return Err(
-                "EVAL_MODULE_SPECIFIER: use an explicit relative .js, .mjs, .ts, .mts, or .json path without URL/query/fragment syntax"
+                "EVAL_MODULE_SPECIFIER: use an explicit relative JS/TS, JSON or supported text-asset path without URL/query/fragment syntax"
                     .into(),
             );
         }
@@ -158,15 +169,15 @@ impl ModuleFiles {
         self.0.borrow().check()?;
         if !resolved.starts_with(&root) || module_language(&resolved).is_none() {
             return Err(
-                "EVAL_MODULE_PATH: module must be a .js, .mjs, .ts, .mts, or .json file inside the workspace"
+                "EVAL_MODULE_PATH: module must be a supported code or data file inside the workspace"
                     .into(),
             );
         }
         // Canonical aliases may share a JavaScript/TypeScript module, but
         // cannot turn a declared data import into executable source (or vice
         // versa), even when QuickJS already cached the canonical target.
-        if (module_language(Path::new(name)) == Some(ModuleLanguage::Json))
-            != (module_language(&resolved) == Some(ModuleLanguage::Json))
+        if module_language(Path::new(name)).and_then(ModuleLanguage::data_type)
+            != module_language(&resolved).and_then(ModuleLanguage::data_type)
         {
             return Err("EVAL_MODULE_TYPE: module alias changes its data/code type".into());
         }
@@ -203,8 +214,12 @@ impl ModuleFiles {
             state.declarations += 1;
         }
         let root = self.root()?;
-        let mut source = source::load_sync(&root, Path::new(name))
-            .map_err(|error| format!("EVAL_MODULE_READ: {error}"))?;
+        let loaded = if module_language(Path::new(name)) == Some(ModuleLanguage::Text) {
+            source::load_verbatim_sync(&root, Path::new(name))
+        } else {
+            source::load_sync(&root, Path::new(name))
+        };
+        let mut source = loaded.map_err(|error| format!("EVAL_MODULE_READ: {error}"))?;
         {
             let state = self.0.borrow();
             state.check()?;
@@ -247,6 +262,8 @@ fn module_language(path: &Path) -> Option<ModuleLanguage> {
         Some("js" | "mjs") => Some(ModuleLanguage::JavaScript),
         Some("ts" | "mts") => Some(ModuleLanguage::TypeScript),
         Some("json") => Some(ModuleLanguage::Json),
+        Some("txt" | "md" | "csv" | "tsv" | "svg" | "html" | "css" | "xml"
+            | "yaml" | "yml" | "toml" | "jsonl" | "ndjson") => Some(ModuleLanguage::Text),
         _ => None,
     }
 }
@@ -256,12 +273,12 @@ fn validate_attributes(
     name: &str,
     attributes: Option<ImportAttributes<'_>>,
 ) -> rquickjs::Result<()> {
-    if module_language(Path::new(name)) == Some(ModuleLanguage::Json) {
+    if let Some(kind) = module_language(Path::new(name)).and_then(ModuleLanguage::data_type) {
         let valid = if let Some(attributes) = attributes {
             let mut keys = attributes.keys();
             keys.next().transpose()?.as_deref() == Some("type")
                 && keys.next().is_none()
-                && attributes.get_type()?.as_deref() == Some("json")
+                && attributes.get_type()?.as_deref() == Some(kind)
         } else {
             false
         };
@@ -270,7 +287,7 @@ fn validate_attributes(
         } else {
             Err(Exception::throw_message(
                 ctx,
-                "EVAL_MODULE_ATTRIBUTES: JSON imports require exactly with { type: 'json' }",
+                &format!("EVAL_MODULE_ATTRIBUTES: data imports require exactly with {{ type: '{kind}' }}"),
             ))
         };
     }
@@ -310,10 +327,10 @@ impl Loader for ModuleFiles {
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         // Linking can recursively invoke our callbacks. Do not retain a
         // RefCell borrow (or any open file) across the engine boundary.
-        let module = if module_language(Path::new(name)) == Some(ModuleLanguage::Json) {
-            data::declare_json(ctx, name, &source.code)?
-        } else {
-            Module::declare(ctx.clone(), name, source.code)?
+        let module = match module_language(Path::new(name)) {
+            Some(ModuleLanguage::Json) => data::declare_json(ctx, name, &source.code)?,
+            Some(ModuleLanguage::Text) => data::declare_text(ctx, name, &source.code)?,
+            _ => Module::declare(ctx.clone(), name, source.code)?,
         };
         self.0.borrow().check()
             .map_err(|error| Exception::throw_message(ctx, &error))?;

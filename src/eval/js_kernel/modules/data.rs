@@ -2,8 +2,9 @@
 //!
 //! Parse using QuickJS's native JSON entrypoint, not a guest-replaceable
 //! JSON.parse, generated JavaScript, object-literal evaluation or a host-wide
-//! data registry. Native module metadata holds the parsed value only until
-//! module evaluation transfers it to its default export.
+//! data registry. Text assets become length-delimited native strings, retaining
+//! their BOM, CRLF and embedded NUL. Native module metadata holds each value
+//! only until module evaluation transfers it to its default export.
 
 use rquickjs::module::{Declarations, Declared, Exports, ModuleDef};
 use rquickjs::{Ctx, Exception, Module, Undefined, Value};
@@ -22,7 +23,7 @@ impl ModuleDef for DataModule {
     fn evaluate<'js>(ctx: &Ctx<'js>, exports: &Exports<'js>) -> rquickjs::Result<()> {
         let metadata = exports.module().meta()?;
         let value: Value<'js> = metadata.get(DATA_SLOT)?;
-        // JSON cannot represent undefined; a missing initialization must fail,
+        // Neither JSON nor a text string is undefined; initialization must fail,
         // not publish a default value from a partially declared module.
         if value.is_undefined() {
             return Err(Exception::throw_message(ctx, "EVAL_MODULE_DATA: module data unavailable"));
@@ -81,6 +82,25 @@ pub(super) fn declare_json<'js>(
         }
         Exception::throw_message(ctx, "EVAL_MODULE_JSON: file is not valid JSON")
     })?;
+    declare_value(ctx, name, value)
+}
+
+pub(super) fn declare_text<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    source: &str,
+) -> rquickjs::Result<Module<'js, Declared>> {
+    // No source interpolation or guest String constructor. Arbitrary UTF-8
+    // text, including script-looking content, remains inert string data.
+    let value = rquickjs::String::from_str(ctx.clone(), source)?.into_value();
+    declare_value(ctx, name, value)
+}
+
+fn declare_value<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    value: Value<'js>,
+) -> rquickjs::Result<Module<'js, Declared>> {
     let module = Module::declare_def::<DataModule, _>(ctx.clone(), name)?;
     module.meta()?.set(DATA_SLOT, value)?;
     Ok(module)

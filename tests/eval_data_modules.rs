@@ -69,3 +69,23 @@ fn imported_json_can_be_analyzed_and_streamed_as_native_structured_display() {
     assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"], json!([{"sum":42}]));
     assert!(text(&output).contains('2'));
 }
+
+#[test]
+fn typed_analysis_composes_json_and_text_assets_without_another_tool_call() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("analysis")).unwrap();
+    std::fs::write(dir.path().join("rows.json"), "[{\"n\":17},{\"n\":25}]").unwrap();
+    std::fs::write(dir.path().join("analysis/template.md"), "# Total\r\n{{total}}\n").unwrap();
+    std::fs::write(dir.path().join("analysis/report.mts"), r#"
+        import rows from '../rows.json' with {type:'json'};
+        import template from './template.md' with {type:'text'};
+        export const total: number = rows.reduce((sum: number, row: {n: number}) => sum + row.n, 0);
+        export const report: string = template.replace('{{total}}', String(total));
+    "#).unwrap();
+    let tool = EvalTool::new(dir.path());
+    let out = run(tool.execute("report", json!({"kernel":"js","code":
+        "const report = await import('./analysis/report.mts'); display({total:report.total, report:report.report}); report.total"
+    }), None)).unwrap();
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(out.details.as_ref().unwrap()["jsonOutputs"], json!([{"total":42,"report":"# Total\r\n42\n"}]));
+}
