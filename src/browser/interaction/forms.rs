@@ -26,6 +26,8 @@ pub(in crate::browser) fn is_action(action: &str) -> bool {
 
 /// Run before connection/launch. Unknown fields are refused, not silently
 /// ignored (especially dialog consent and options intended for another action).
+/// Common diagnostics options are validated by CDP preflight before connection,
+/// like tab/frame/timeout; form helpers never forward them into page arguments.
 pub(in crate::browser) fn validate(args: &Value) -> Result<()> {
     let object = args
         .as_object()
@@ -35,7 +37,7 @@ pub(in crate::browser) fn validate(args: &Value) -> Result<()> {
         || object.keys().any(|key| {
             !(matches!(
                 key.as_str(),
-                "action" | "tab" | "frame" | "selector" | "timeout_ms"
+                "action" | "tab" | "frame" | "selector" | "timeout_ms" | "diagnostics"
             ) || action == "select_option" && key == "options"
                 || action == "set_checked" && key == "checked")
         })
@@ -553,6 +555,19 @@ mod tests {
         for selector in [Value::Null, json!(""), json!(3)] {
             let mut value = args(json!([]));
             value["selector"] = selector;
+            assert!(validate(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnostics_compose_without_admitting_other_foreign_form_fields() {
+        for mut value in [
+            json!({"action":"select_option","tab":"app","selector":"#choice","options":[]}),
+            json!({"action":"set_checked","tab":"app","selector":"#c","checked":true}),
+        ] {
+            value["diagnostics"] = json!({"network":true,"settle_ms":100});
+            assert!(validate(&value).is_ok());
+            value["dialog_response"] = json!({"accept":true});
             assert!(validate(&value).is_err());
         }
     }

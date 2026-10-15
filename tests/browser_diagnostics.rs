@@ -80,7 +80,9 @@ fn write_frame(socket: &mut TcpStream, value: &Value) {
 fn reply(socket: &mut TcpStream, method: &str, result: Value) -> Value {
     let request = read_frame(socket);
     assert_eq!(request["method"], method);
-    if method.starts_with("Page.") || method.starts_with("Runtime.") || method.starts_with("Network.") {
+    if method.starts_with("Page.") || method.starts_with("Runtime.")
+        || method.starts_with("Network.") || method.starts_with("DOM.")
+    {
         assert_eq!(request["sessionId"], "session");
     }
     write_frame(socket, &json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}));
@@ -92,7 +94,73 @@ fn event(socket: &mut TcpStream, method: &str, params: Value) {
 }
 
 #[derive(Clone, Copy)]
-enum Scenario { Success, ActionError, Passive, NetworkRefused, ScopeLost, ConsoleOnly, Settled }
+enum Scenario {
+    Success, ActionError, Passive, NetworkRefused, ScopeLost, ConsoleOnly, Settled,
+    Checked, Select,
+}
+
+fn form_document(socket: &mut TcpStream) {
+    reply(socket, "Page.getFrameTree", json!({"frameTree":{"frame":{
+        "id":"main","loaderId":"loader","url":"https://example.com/app"
+    }}}));
+}
+
+fn form_action(socket: &mut TcpStream, scenario: Scenario) {
+    // Drive the ordinary DOM resolution and pinned-document form helper,
+    // including its second validation after diagnostics have already started.
+    form_document(socket);
+    reply(socket, "DOM.getDocument", json!({"root":{"nodeId":1}}));
+    let query = reply(socket, "DOM.querySelector", json!({"nodeId":7}));
+    assert_eq!(query["params"]["selector"], "#control");
+    reply(socket, "DOM.describeNode", json!({"node":{"backendNodeId":77}}));
+    let calls = if matches!(scenario, Scenario::Checked) {
+        vec![("form_checked", Value::Null, json!({
+            "kind":"checkbox","checked":true,"indeterminate":false
+        }))]
+    } else {
+        let selected = json!([{"index":0,"value":"literal 雪","label":"Choice"}]);
+        vec![
+            ("form_select", json!([{"value":"literal 雪"}]), json!({
+                "multiple":false,"selected":selected.clone(),"changed":true
+            })),
+            ("form_selection", Value::Null, json!({"multiple":false,"selected":selected})),
+        ]
+    };
+    for (action, arguments, value) in calls {
+        form_document(socket);
+        let world = reply(socket, "Page.createIsolatedWorld", json!({"executionContextId":3}));
+        assert_eq!(world["params"]["frameId"], "main");
+        event(socket, "Runtime.executionContextCreated", json!({"context":{
+            "id":3,"origin":"https://example.com","auxData":{"frameId":"main","isDefault":false}
+        }}));
+        form_document(socket);
+        let resolved = reply(socket, "DOM.resolveNode", json!({"object":{"objectId":"control-object"}}));
+        assert_eq!(resolved["params"]["backendNodeId"], 77);
+        assert_eq!(resolved["params"]["executionContextId"], 3);
+        form_document(socket);
+        let call = read_frame(socket);
+        assert_eq!(call["method"], "Runtime.callFunctionOn");
+        assert_eq!(call["sessionId"], "session");
+        assert_eq!(call["params"]["objectId"], "control-object");
+        assert_eq!(call["params"]["arguments"], json!([{"value":action},{"value":arguments}]));
+        assert_eq!(call["params"]["userGesture"], false);
+        for (context, message) in [(1, action), (3, "PRIVATE-ISOLATED")] {
+            event(socket, "Runtime.consoleAPICalled", json!({
+                "executionContextId":context,"type":"log","args":[{"type":"string","value":message}]
+            }));
+        }
+        if action == "form_select" {
+            event(socket, "Network.requestWillBeSent", json!({
+                "requestId":"form-request","frameId":"main","documentURL":"https://example.com/app",
+                "timestamp":1,"type":"Fetch","request":{"url":"https://example.com/selection?PRIVATE","method":"POST","postData":"PRIVATE"}
+            }));
+        }
+        write_frame(socket, &json!({"id":call["id"],"sessionId":"session","result":{"result":{"type":"object","value":value}}}));
+        form_document(socket);
+        let released = reply(socket, "Runtime.releaseObject", json!({}));
+        assert_eq!(released["params"]["objectId"], "control-object");
+    }
+}
 
 fn peer(scenario: Scenario) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -147,7 +215,9 @@ fn peer(scenario: Scenario) -> (String, thread::JoinHandle<()>) {
             write_frame(&mut socket, &json!({"id":network["id"],"sessionId":"session","result":{}}));
         }
         }
-        if !matches!(scenario, Scenario::Passive | Scenario::NetworkRefused | Scenario::ScopeLost) {
+        if matches!(scenario, Scenario::Checked | Scenario::Select) {
+            form_action(&mut socket, scenario);
+        } else if !matches!(scenario, Scenario::Passive | Scenario::NetworkRefused | Scenario::ScopeLost) {
             let request = read_frame(&mut socket);
             assert_eq!(request["method"], "Runtime.evaluate");
             assert_eq!(request["params"]["expression"], "triggerOnce()");
@@ -212,6 +282,15 @@ fn run(scenario: Scenario) -> pi::tools::ToolOutput {
     }
     if matches!(scenario, Scenario::Settled) {
         args["diagnostics"]["settle_ms"] = json!(100);
+    }
+    if matches!(scenario, Scenario::Checked | Scenario::Select) {
+        args = json!({"action":"set_checked","tab":"page","selector":"#control","checked":true,
+            "diagnostics":{"network":true,"settle_ms":0},"timeout_ms":5000});
+        if matches!(scenario, Scenario::Select) {
+            args["action"] = json!("select_option");
+            args.as_object_mut().unwrap().remove("checked");
+            args["options"] = json!([{"value":"literal 雪"}]);
+        }
     }
     let result = runtime.block_on(tool.execute("browser-diagnostics", args, None)).unwrap();
     handle.join().unwrap();
@@ -285,4 +364,58 @@ fn fixed_settle_window_receives_events_after_the_action_reply() {
     assert_eq!(report["completion"], "window_elapsed");
     assert_eq!(report["console"].as_array().unwrap().len(), 3);
     assert_eq!(report["console"][2]["phase"], "settle");
+}
+
+#[test]
+fn checkbox_diagnostics_pass_both_validators_without_toggling_an_already_checked_control() {
+    let result = run(Scenario::Checked);
+    assert!(!result.is_error);
+    let details = result.details.as_ref().unwrap();
+    assert_eq!(details["checked"], true);
+    assert_eq!(details["changed"], false);
+    assert_eq!(details["diagnostics"]["action_succeeded"], true);
+    assert_eq!(details["diagnostics"]["console"][1]["arguments"][0]["value"], "form_checked");
+    assert!(!details.to_string().contains("PRIVATE"));
+}
+
+#[test]
+fn selection_diagnostics_preserve_literal_options_and_independent_postcondition_verification() {
+    let result = run(Scenario::Select);
+    assert!(!result.is_error);
+    let details = result.details.as_ref().unwrap();
+    assert_eq!(details["changed"], true);
+    assert_eq!(details["selected"][0]["value"], "literal 雪");
+    let report = &details["diagnostics"];
+    assert_eq!(report["console"].as_array().unwrap().len(), 3);
+    assert_eq!(report["console"][1]["arguments"][0]["value"], "form_select");
+    assert_eq!(report["console"][2]["arguments"][0]["value"], "form_selection");
+    assert_eq!(report["network"]["requests"][0]["url"], "https://example.com/selection");
+    assert_eq!(report["network"]["pending_at_end"], 1);
+    assert!(!report.to_string().contains("PRIVATE"));
+}
+
+#[test]
+fn malformed_capture_and_foreign_form_options_fail_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false)
+        .with_cdp_endpoint(format!("http://{}", listener.local_addr().unwrap()));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    for (case, extra, expected_error) in [
+        ("bad-capture", json!({"diagnostics":{"network":"true"}}), "diagnostics.network must be a boolean"),
+        ("foreign-form-field", json!({"diagnostics":{},"script":"PRIVATE"}), "BROWSER_FORM_INVALID"),
+        ("implicit-dialog-consent", json!({"diagnostics":{},"accept":true}), "BROWSER_DIALOG_INVALID"),
+        ("scoped-capture", json!({"diagnostics":{},"frame":"child"}), "diagnostics require a main-document"),
+        ("missing-explicit-tab", json!({"diagnostics":{},"tab":null}), "diagnostics require an explicit valid tab"),
+    ] {
+        let mut args = json!({"action":"set_checked","tab":"page","selector":"#control",
+            "checked":true,"timeout_ms":100});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let error = runtime.block_on(tool.execute(case, args, None)).unwrap_err().to_string();
+        assert!(!error.contains("PRIVATE"));
+        assert!(error.contains(expected_error), "{error}");
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        eprintln!("{}", json!({"schema":"pi.test.browser-diagnostics.v1","case":case,"connected":false}));
+    }
 }
