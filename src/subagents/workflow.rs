@@ -20,6 +20,8 @@ use crate::agent_cx::AgentCx;
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::ToolOutput;
 
+mod decision;
+
 const MAX_NODES: usize = 32;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_TASK_BYTES: usize = 64 * 1024;
@@ -59,6 +61,7 @@ struct Node {
     needs: Vec<usize>,
     call: SubagentTask,
     inputs: Vec<Input>,
+    decision: decision::Policy,
 }
 
 struct Input {
@@ -175,7 +178,10 @@ impl Plan {
     /// discovery, snapshot I/O or launch. Forward references are permitted;
     /// cycles, duplicate edges and mixed request modes are not.
     pub(super) fn parse(input: &Value) -> Result<Option<Self>> {
-        let Some(raw) = input.get("workflow") else { return Ok(None); };
+        let Some(raw) = input.get("workflow") else {
+            decision::reject_misplaced(input)?;
+            return Ok(None);
+        };
         if encoded_size(input, MAX_REQUEST_BYTES).is_none() {
             return Err(invalid("workflow request exceeds 256 KiB"));
         }
@@ -211,8 +217,9 @@ impl Plan {
         let mut nodes = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let fields = entry.as_object().ok_or_else(|| invalid("each node must be an object"))?;
-            if fields.keys().any(|key| !matches!(key.as_str(), "id" | "needs" | "call" | "inputs")) {
-                return Err(invalid("node accepts only id, needs, call and inputs"));
+            if fields.keys().any(|key| !matches!(key.as_str(), "id" | "needs" | "call" | "inputs")
+                && !decision::is_field(key)) {
+                return Err(invalid("node contains unsupported workflow fields"));
             }
             let needs = match fields.get("needs") {
                 None => Vec::new(),
@@ -234,7 +241,8 @@ impl Plan {
             };
             let call = parse_call(&entry["call"])?;
             let inputs = parse_inputs(fields.get("inputs"), &ids, &needs)?;
-            nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs });
+            let decision = decision::Policy::parse(entry, &ids, &needs)?;
+            nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs, decision });
         }
         let waves = layers(&nodes)?;
         Ok(Some(Self { nodes, waves, concurrency, timeout_seconds, scope }))
@@ -250,12 +258,12 @@ impl Plan {
             }
         }
         for node in &self.nodes {
-            for input in &node.inputs {
-                let source = &self.nodes[input.from].call;
+            for from in node.inputs.iter().map(|input| input.from).chain(node.decision.source()) {
+                let source = &self.nodes[from].call;
                 let schema = source.output_schema.as_ref()
                     .or_else(|| agents.get(&source.agent).and_then(|agent| agent.output_schema.as_ref()));
                 if schema.is_none() {
-                    return Err(invalid("every input source requires an output schema on its call or agent definition"));
+                    return Err(invalid("every input or condition source requires an output schema on its call or agent definition"));
                 }
             }
         }
@@ -289,23 +297,25 @@ impl Plan {
             let mut admitted = Vec::new();
             let mut tasks = Vec::new();
             for &index in indices {
-                let blocked: Vec<_> = self.nodes[index].needs.iter()
-                    .filter(|&&dependency| records[dependency].state != State::Accepted)
-                    .map(|&dependency| self.nodes[dependency].id.clone()).collect();
-                if blocked.is_empty() {
-                    match self.nodes[index].task_with_inputs(&records) {
-                        Ok(task) => {
-                            admitted.push(index);
-                            tasks.push(task);
-                        }
-                        Err(reason) => {
-                            let sources: BTreeSet<_> = self.nodes[index].inputs.iter()
-                                .map(|input| self.nodes[input.from].id.clone()).collect();
-                            records[index].skip(reason, sources.into_iter().collect());
-                        }
+                let node = &self.nodes[index];
+                let admission = node.decision.evaluate(&node.needs, &records);
+                records[index].condition = admission.condition;
+                if let Some(reason) = admission.reason {
+                    let blocked = admission.sources.iter().map(|&source| self.nodes[source].id.clone()).collect();
+                    records[index].skip(reason, blocked);
+                    if admission.not_selected { records[index].state = State::NotSelected; }
+                    continue;
+                }
+                match node.task_with_inputs(&records) {
+                    Ok(task) => {
+                        admitted.push(index);
+                        tasks.push(task);
                     }
-                } else {
-                    records[index].skip("dependency_failed", blocked);
+                    Err(reason) => {
+                        let sources: BTreeSet<_> = node.inputs.iter()
+                            .map(|input| self.nodes[input.from].id.clone()).collect();
+                        records[index].skip(reason, sources.into_iter().collect());
+                    }
                 }
             }
             if admitted.is_empty() { continue; }
@@ -383,7 +393,7 @@ fn check_authority(owner: &AgentCx) -> Result<()> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum State { Pending, Accepted, Rejected, Skipped }
+enum State { Pending, Accepted, Rejected, Skipped, NotSelected }
 
 impl State {
     const fn label(self) -> &'static str {
@@ -392,6 +402,7 @@ impl State {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
             Self::Skipped => "skipped",
+            Self::NotSelected => "not_selected",
         }
     }
 }
@@ -405,6 +416,8 @@ struct Record {
     wave: Option<usize>,
     skip_reason: Option<&'static str>,
     blocked_by: Vec<String>,
+    /// Host comparison outcome only; never echo expected or actual values.
+    condition: Option<&'static str>,
     hub_id: Option<String>,
     native_is_error: Option<bool>,
     result: Option<SubagentResult>,
@@ -415,7 +428,7 @@ impl Record {
         Self {
             id: node.id.clone(), needs: node.needs.iter().map(|&index| nodes[index].id.clone()).collect(),
             state: State::Pending, wave: None, skip_reason: None, blocked_by: Vec::new(),
-            hub_id: None, native_is_error: None, result: None,
+            condition: None, hub_id: None, native_is_error: None, result: None,
         }
     }
 
@@ -442,8 +455,9 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
     let accepted = records.iter().filter(|record| record.state == State::Accepted).count();
     let rejected = records.iter().filter(|record| record.state == State::Rejected).count();
     let skipped = records.iter().filter(|record| record.state == State::Skipped).count();
+    let not_selected = records.iter().filter(|record| record.state == State::NotSelected).count();
     let mut content = format!(
-        "Subagent workflow: {accepted} accepted, {rejected} rejected, {skipped} skipped. Completed effects are not rolled back; nodes were not automatically replayed."
+        "Subagent workflow: {accepted} accepted, {rejected} rejected, {skipped} skipped, {not_selected} not selected. Completed effects are not rolled back; nodes were not automatically replayed."
     );
     for record in &records {
         content.push_str(&format!("\n\n# Workflow node {}\n", record.id));
@@ -454,6 +468,9 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
             record.state.label(),
             record.wave.map_or_else(|| "not started".into(), |wave| wave.to_string()),
             record.hub_id.as_ref().map_or_else(|| "none".into(), |id| json!(id).to_string())));
+        if let Some(condition) = record.condition {
+            content.push_str(&format!("Condition: {condition}.\n"));
+        }
         if let Some(result) = &record.result {
             content.push_str(&render_results(std::slice::from_ref(result)));
         } else {
@@ -467,6 +484,7 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
             "schema":"pi.subagent.workflow.v1", "mode":"workflow",
             "sessionIsolation":"ephemeral_no_session", "totalNodes":records.len(),
             "acceptedNodes":accepted, "rejectedNodes":rejected, "skippedNodes":skipped,
+            "notSelectedNodes":not_selected,
             "wavesExecuted":waves, "stopReason":stop, "nodes":records,
         })),
         is_error: rejected != 0 || skipped != 0 || stop.is_some(),
@@ -500,6 +518,7 @@ pub(super) fn schema(mut schema: Value) -> Value {
                 "pointer":{"type":"string", "maxLength":1024}
             }}
     });
+    decision::extend_schema(&mut schema);
     schema
 }
 

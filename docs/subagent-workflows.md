@@ -149,6 +149,72 @@ selected input sources. Descendants skip normally; independent branches can
 continue. The source result remains available for inspection, and the failed
 handoff is not silently retried or replaced with raw child output.
 
+## Typed decision gates
+
+A schema-valid reviewer result can still say not to proceed. Add `when` beside
+`call` to make the next native task depend on that actual decision:
+
+```json
+{
+  "workflow": [
+    {
+      "id": "review",
+      "call": {
+        "agent": "reviewer", "task": "Choose approve or repair for the proposed implementation.",
+        "outputSchema": {
+          "type": "object", "required": ["verdict"],
+          "properties": {"verdict": {"enum": ["approve", "repair"]}}
+        }
+      }
+    },
+    {
+      "id": "repair", "needs": ["review"],
+      "when": {"from": "review", "pointer": "/verdict", "equals": "repair"},
+      "call": {
+        "agent": "task", "task": "Repair the implementation identified in the review.",
+        "isolation": "worktree", "isoApply": "apply"
+      }
+    },
+    {
+      "id": "report", "needs": ["review"],
+      "when": {"from": "review", "pointer": "/verdict", "equals": "approve"},
+      "call": {"agent": "scout", "task": "Summarize the accepted implementation."}
+    }
+  ]
+}
+```
+
+`when` requires exactly `from`, `pointer` and a literal `equals` value. Its source
+must be a direct `needs` predecessor with an effective output schema; all agents,
+schemas and gate shapes are validated before any child launch, including branches
+that will not be chosen. Comparisons use the predecessor's accepted, validated
+`data`, never prose or a provisional stream. JSON values are not coerced: false,
+zero and the string `"0"` differ. Empty pointer selects all data; escaped keys and
+null use the same pointer rules as inputs. A missing value is an error, **not** a
+false condition. Conditions are at most 16 KiB encoded, pointers at most 1,024
+bytes/32 segments. There are no expressions, regexes, negation or implicit defaults.
+
+A non-match marks the branch `not_selected`; descendants requiring it are also
+not selected. No child, hub entry, input expansion or worktree capture occurs for
+these nodes. Intentional nonselection alone does not fail the workflow. Rejected,
+cancelled, schema-invalid or unavailable dependencies still block as errors, even
+when another prerequisite was intentionally not selected. A downstream task that
+needs **both** alternative branches will therefore not run; dependencies retain
+their all-required semantics.
+
+The node's `condition` field and text show `matched`, `not_matched`,
+`condition_value_missing` or `condition_data_unavailable` when evaluated. Expected
+and actual values are not repeated in decision diagnostics; ordinary source
+results may still expose their data. Nonexecuted nodes retain null result/hub/wave
+fields. `notSelectedNodes` counts intentional exclusions separately from errors in
+`skippedNodes`. If no condition matches, no branch runs: selection is not an
+exhaustiveness guarantee. Use a constrained producer schema for known alternatives.
+
+This is agent-result routing, **not human approval or new tool authority**. The
+selected child still needs its ordinary host permissions. A gate does not undo
+earlier changes; put review before the mutation it is intended to control. All
+evaluation shares the original workflow deadline and acceptance barriers.
+
 ## Failure and result semantics
 
 Results use `pi.subagent.workflow.v1` with nodes in authored order. Every node
@@ -167,7 +233,7 @@ is retained as a native warning but rejected as dependency evidence. Failed,
 operator-killed, cancelled or schema-invalid nodes block their descendants;
 an independent branch may continue. `stopReason` reports a request interruption
 observed between waves. The tool result is unsuccessful if any node is rejected
-or skipped. Native progress events remain native events; terminal workflow
+or skipped for an error, not merely `not_selected`. Native progress events remain native events; terminal workflow
 records provide graph IDs and hub IDs for correlation.
 
 Completed effects are **not rolled back** when a later node fails. Worktree
@@ -187,6 +253,12 @@ handoff regressions cover escaping, exact JSON values, direct-edge admission,
 combined byte limits, schema provenance, multi-source child input, native
 launch-control preservation and pre-launch skips. Fixtures speak the native
 process protocol without contacting a model.
+
+`src/subagents/workflow/decision/tests.rs` adds typed comparison, invalid-evidence,
+failure-precedence and nonexecution-report checks, plus native-child workflows
+for conditional repair/report selection, unavailable verdicts, upfront refusal
+and excluding a branch before input/workspace preparation. These tests are
+authored, not executed in the implementation environment.
 
 These Rust tests were authored, not executed in the implementation environment:
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was unavailable.
