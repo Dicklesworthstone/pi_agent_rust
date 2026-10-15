@@ -21,6 +21,7 @@ use crate::model::{ContentBlock, TextContent};
 use crate::tools::ToolOutput;
 
 mod decision;
+mod fanout;
 
 const MAX_NODES: usize = 32;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -62,6 +63,7 @@ struct Node {
     call: SubagentTask,
     inputs: Vec<Input>,
     decision: decision::Policy,
+    fanout: Option<fanout::Expansion>,
 }
 
 struct Input {
@@ -118,17 +120,27 @@ impl Node {
     /// Bind only schema-validated data, never provisional output or native
     /// launch controls. Borrow results while encoding; keep no second cache.
     fn task_with_inputs(&self, records: &[Record]) -> std::result::Result<SubagentTask, &'static str> {
-        if self.inputs.is_empty() { return Ok(self.call.clone()); }
+        self.task_with_item(records, None)
+    }
+
+    fn task_with_item(
+        &self,
+        records: &[Record],
+        item: Option<(&str, &Value)>,
+    ) -> std::result::Result<SubagentTask, &'static str> {
+        if self.inputs.is_empty() && item.is_none() { return Ok(self.call.clone()); }
         let mut values = BTreeMap::new();
         for input in &self.inputs {
             let result = records.get(input.from)
-                .filter(|record| record.state == State::Accepted)
-                .and_then(|record| record.result.as_ref())
-                .filter(|result| result.schema_valid == Some(true))
-                .and_then(|result| result.data.as_ref())
+                .and_then(Record::validated_data)
                 .ok_or("dependency_data_unavailable")?;
             let value = result.pointer(&input.pointer).ok_or("dependency_input_missing")?;
             values.insert(input.name.as_str(), value);
+        }
+        if let Some((name, value)) = item
+            && values.insert(name, value).is_some()
+        {
+            return Err("fanout_input_collision");
         }
         let limit = MAX_TASK_BYTES.saturating_sub(self.call.task.len())
             .saturating_sub(INPUT_PREFIX.len() + INPUT_SUFFIX.len());
@@ -180,6 +192,7 @@ impl Plan {
     pub(super) fn parse(input: &Value) -> Result<Option<Self>> {
         let Some(raw) = input.get("workflow") else {
             decision::reject_misplaced(input)?;
+            fanout::reject_misplaced(input)?;
             return Ok(None);
         };
         if encoded_size(input, MAX_REQUEST_BYTES).is_none() {
@@ -217,7 +230,7 @@ impl Plan {
         let mut nodes = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let fields = entry.as_object().ok_or_else(|| invalid("each node must be an object"))?;
-            if fields.keys().any(|key| !matches!(key.as_str(), "id" | "needs" | "call" | "inputs")
+            if fields.keys().any(|key| !matches!(key.as_str(), "id" | "needs" | "call" | "inputs" | "forEach")
                 && !decision::is_field(key)) {
                 return Err(invalid("node contains unsupported workflow fields"));
             }
@@ -242,8 +255,10 @@ impl Plan {
             let call = parse_call(&entry["call"])?;
             let inputs = parse_inputs(fields.get("inputs"), &ids, &needs)?;
             let decision = decision::Policy::parse(entry, &ids, &needs)?;
-            nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs, decision });
+            let fanout = fanout::Expansion::parse(fields.get("forEach"), &ids, &needs, &inputs)?;
+            nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs, decision, fanout });
         }
+        fanout::validate_budget(&nodes)?;
         let waves = layers(&nodes)?;
         Ok(Some(Self { nodes, waves, concurrency, timeout_seconds, scope }))
     }
@@ -258,12 +273,17 @@ impl Plan {
             }
         }
         for node in &self.nodes {
-            for from in node.inputs.iter().map(|input| input.from).chain(node.decision.source()) {
+            for from in node.inputs.iter().map(|input| input.from).chain(node.decision.source())
+                .chain(node.fanout.as_ref().map(|expansion| expansion.from))
+            {
+                if self.nodes[from].fanout.is_some() {
+                    return Err(invalid("fan-out nodes may be dependencies, but typed aggregate input is not available"));
+                }
                 let source = &self.nodes[from].call;
                 let schema = source.output_schema.as_ref()
                     .or_else(|| agents.get(&source.agent).and_then(|agent| agent.output_schema.as_ref()));
                 if schema.is_none() {
-                    return Err(invalid("every input or condition source requires an output schema on its call or agent definition"));
+                    return Err(invalid("every input, condition or forEach source requires an output schema on its call or agent definition"));
                 }
             }
         }
@@ -306,14 +326,25 @@ impl Plan {
                     if admission.not_selected { records[index].state = State::NotSelected; }
                     continue;
                 }
-                match node.task_with_inputs(&records) {
-                    Ok(task) => {
-                        admitted.push(index);
-                        tasks.push(task);
+                let prepared = match &node.fanout {
+                    Some(expansion) => expansion.tasks(node, &records),
+                    None => node.task_with_inputs(&records).map(|task| vec![task]),
+                };
+                match prepared {
+                    Ok(prepared) => {
+                        if node.fanout.is_some() {
+                            records[index].begin_fanout(prepared.len(), wave);
+                        }
+                        for (item, task) in prepared.into_iter().enumerate() {
+                            admitted.push((index, node.fanout.as_ref().map(|_| item)));
+                            tasks.push(task);
+                        }
                     }
                     Err(reason) => {
                         let sources: BTreeSet<_> = node.inputs.iter()
-                            .map(|input| self.nodes[input.from].id.clone()).collect();
+                            .map(|input| input.from)
+                            .chain(node.fanout.as_ref().map(|expansion| expansion.from))
+                            .map(|from| self.nodes[from].id.clone()).collect();
                         records[index].skip(reason, sources.into_iter().collect());
                     }
                 }
@@ -327,12 +358,15 @@ impl Plan {
                 return Err(Error::tool("subagent", "PI_WORKFLOW_INTERNAL: native runner returned an incomplete wave; effects may have occurred"));
             }
             waves_run += 1;
-            for (index, mut result) in admitted.into_iter().zip(results) {
+            for ((index, item), mut result) in admitted.into_iter().zip(results) {
                 // The node report keeps the authored assignment, not a second
                 // copy of predecessor data. Native hub/revival state retains
                 // the actual child prompt, including its exact input context.
                 result.task = self.nodes[index].call.task.clone();
-                records[index].settle(result, wave);
+                match item {
+                    Some(item) => records[index].settle_fanout(result, item)?,
+                    None => records[index].settle(result, wave),
+                }
             }
         }
         for record in &mut records {
@@ -421,6 +455,8 @@ struct Record {
     hub_id: Option<String>,
     native_is_error: Option<bool>,
     result: Option<SubagentResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fanout: Option<fanout::Run>,
 }
 
 impl Record {
@@ -428,7 +464,7 @@ impl Record {
         Self {
             id: node.id.clone(), needs: node.needs.iter().map(|&index| nodes[index].id.clone()).collect(),
             state: State::Pending, wave: None, skip_reason: None, blocked_by: Vec::new(),
-            condition: None, hub_id: None, native_is_error: None, result: None,
+            condition: None, hub_id: None, native_is_error: None, result: None, fanout: None,
         }
     }
 
@@ -441,14 +477,38 @@ impl Record {
     fn settle(&mut self, result: SubagentResult, wave: usize) {
         // A permissive schema warning is not trustworthy predecessor evidence.
         // Native acceptance still controls actual worktree disposition.
-        self.state = if !result.is_error && matches!(result.status, SubagentStatus::Completed)
-            && result.schema_valid != Some(false)
-        { State::Accepted } else { State::Rejected };
+        self.state = native_state(&result);
         self.wave = Some(wave);
         self.hub_id = result.hub_id.clone();
         self.native_is_error = Some(result.is_error);
         self.result = Some(result);
     }
+
+    fn validated_data(&self) -> Option<&Value> {
+        if self.state != State::Accepted { return None; }
+        self.result.as_ref()
+            .filter(|result| native_state(result) == State::Accepted && result.schema_valid == Some(true))
+            .and_then(|result| result.data.as_ref())
+    }
+
+    fn begin_fanout(&mut self, count: usize, wave: usize) {
+        self.fanout = Some(fanout::Run::new(count));
+        self.wave = Some(wave);
+        // An empty validated list completes without inventing a native child.
+        self.state = if count == 0 { State::Accepted } else { State::Pending };
+    }
+
+    fn settle_fanout(&mut self, result: SubagentResult, item: usize) -> Result<()> {
+        let run = self.fanout.as_mut().ok_or_else(|| invalid("missing fan-out run"))?;
+        self.state = run.settle(result, item)?;
+        Ok(())
+    }
+}
+
+fn native_state(result: &SubagentResult) -> State {
+    if !result.is_error && matches!(result.status, SubagentStatus::Completed)
+        && result.schema_valid != Some(false)
+    { State::Accepted } else { State::Rejected }
 }
 
 fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> ToolOutput {
@@ -473,6 +533,8 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
         }
         if let Some(result) = &record.result {
             content.push_str(&render_results(std::slice::from_ref(result)));
+        } else if let Some(run) = &record.fanout {
+            run.render(&mut content);
         } else {
             content.push_str(&format!("Not run: {}. Blocked by: {}.",
                 record.skip_reason.unwrap_or("not_scheduled"), record.blocked_by.join(", ")));
@@ -519,6 +581,7 @@ pub(super) fn schema(mut schema: Value) -> Value {
             }}
     });
     decision::extend_schema(&mut schema);
+    fanout::extend_schema(&mut schema);
     schema
 }
 
