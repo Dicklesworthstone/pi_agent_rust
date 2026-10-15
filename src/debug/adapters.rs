@@ -135,6 +135,62 @@ pub fn default_adapters() -> Vec<AdapterSpec> {
             install_hint: "install with: go install github.com/go-delve/delve/cmd/dlv@latest"
                 .to_string(),
         },
+        AdapterSpec {
+            id: "netcoredbg".to_string(),
+            command_candidates: vec!["netcoredbg".to_string(), "netcoredbg.exe".to_string()],
+            adapter_args: vec!["--interpreter=vscode".to_string()],
+            languages: vec!["csharp", "fsharp"],
+            install_hint: "install netcoredbg and place it on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "kotlin-debug-adapter".to_string(),
+            command_candidates: vec!["kotlin-debug-adapter".to_string(), "kotlin-debug-adapter.exe".to_string()],
+            adapter_args: vec![],
+            languages: vec!["kotlin"],
+            install_hint: "install kotlin-debug-adapter and place it on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "rdbg".to_string(),
+            command_candidates: vec!["rdbg".to_string(), "rdbg.exe".to_string()],
+            adapter_args: vec!["--open".to_string(), "--command".to_string(), "--".to_string()],
+            languages: vec!["ruby"],
+            install_hint: "install the Ruby debug gem (rdbg) and place it on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "php-debug-adapter".to_string(),
+            command_candidates: vec!["php-debug-adapter".to_string(), "php-debug-adapter.exe".to_string()],
+            adapter_args: vec![],
+            languages: vec!["php"],
+            install_hint: "install php-debug-adapter and place it on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "bash-debug-adapter".to_string(),
+            command_candidates: vec!["bash-debug-adapter".to_string(), "bash-debug-adapter.exe".to_string()],
+            adapter_args: vec![],
+            languages: vec!["bash", "shell"],
+            install_hint: "install bash-debug-adapter and bashdb, then place them on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "dart-debug-adapter".to_string(),
+            command_candidates: vec!["dart".to_string(), "dart.exe".to_string()],
+            adapter_args: vec!["debug_adapter".to_string()],
+            languages: vec!["dart"],
+            install_hint: "install the Dart SDK and place dart on PATH".to_string(),
+        },
+        AdapterSpec {
+            id: "flutter-debug-adapter".to_string(),
+            command_candidates: vec!["dart".to_string(), "dart.exe".to_string()],
+            adapter_args: vec!["debug_adapter".to_string(), "--flutter-sdk-path".to_string(), "".to_string()],
+            languages: vec!["flutter"],
+            install_hint: "install the Dart and Flutter SDKs; configure the Flutter SDK path when required".to_string(),
+        },
+        AdapterSpec {
+            id: "elixir-ls-debugger".to_string(),
+            command_candidates: vec!["elixir-ls-debugger".to_string(), "elixir-ls-debugger.bat".to_string()],
+            adapter_args: vec![],
+            languages: vec!["elixir"],
+            install_hint: "install ElixirLS and place elixir-ls-debugger on PATH".to_string(),
+        },
     ]
 }
 
@@ -143,6 +199,13 @@ pub enum TargetKind {
     NativeBinary,
     Python,
     Go,
+    DotNet,
+    Kotlin,
+    Ruby,
+    Php,
+    Shell,
+    Dart,
+    Elixir,
 }
 
 /// Local package directories are meaningful Go targets, not native binaries.
@@ -170,6 +233,13 @@ pub fn classify_target(target: &Path) -> TargetKind {
     match target.extension().and_then(|extension| extension.to_str()) {
         Some("py") => TargetKind::Python,
         Some("go") => TargetKind::Go,
+        Some("cs" | "csx" | "fs" | "fsx") => TargetKind::DotNet,
+        Some("kt" | "kts") => TargetKind::Kotlin,
+        Some("rb" | "rake" | "gemspec") => TargetKind::Ruby,
+        Some("php" | "phtml") => TargetKind::Php,
+        Some("sh" | "bash") => TargetKind::Shell,
+        Some("dart") => TargetKind::Dart,
+        Some("ex" | "exs" | "heex" | "eex") => TargetKind::Elixir,
         _ => TargetKind::NativeBinary,
     }
 }
@@ -201,6 +271,13 @@ pub fn select_adapter(
     let language = match target.map_or(TargetKind::NativeBinary, classify_target) {
         TargetKind::Python => "python",
         TargetKind::Go => "go",
+        TargetKind::DotNet => "csharp",
+        TargetKind::Kotlin => "kotlin",
+        TargetKind::Ruby => "ruby",
+        TargetKind::Php => "php",
+        TargetKind::Shell => "shell",
+        TargetKind::Dart => "dart",
+        TargetKind::Elixir => "elixir",
         TargetKind::NativeBinary => "binary",
     };
     available
@@ -252,6 +329,34 @@ pub fn launch_arguments(
             "stopOnEntry": false,
             "stopAtBeginningOfMainSubprogram": true,
         }),
+        "netcoredbg" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            "stopAtEntry": true,
+        }),
+        "rdbg" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            "type": "rdbg",
+        }),
+        "bash-debug-adapter" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            "type": "bashdb",
+            "pathBashdb": "bashdb",
+            "pathBash": "bash",
+        }),
+        "elixir-ls-debugger" => serde_json::json!({
+            "program": program.display().to_string(),
+            "args": args,
+            "cwd": cwd.display().to_string(),
+            "type": "mix_task",
+            "task": "run",
+            "stopOnEntry": true,
+        }),
         "codelldb" => serde_json::json!({
             "program": program.display().to_string(),
             "args": args,
@@ -295,10 +400,67 @@ mod tests {
     fn classify_by_extension() {
         assert_eq!(classify_target(Path::new("app.py")), TargetKind::Python);
         assert_eq!(classify_target(Path::new("main.go")), TargetKind::Go);
+        assert_eq!(classify_target(Path::new("app.cs")), TargetKind::DotNet);
+        assert_eq!(classify_target(Path::new("build.kts")), TargetKind::Kotlin);
+        assert_eq!(classify_target(Path::new("task.rake")), TargetKind::Ruby);
+        assert_eq!(classify_target(Path::new("index.php")), TargetKind::Php);
+        assert_eq!(classify_target(Path::new("setup.sh")), TargetKind::Shell);
+        assert_eq!(classify_target(Path::new("main.dart")), TargetKind::Dart);
+        assert_eq!(classify_target(Path::new("app.exs")), TargetKind::Elixir);
         assert_eq!(
             classify_target(Path::new("/bin/true")),
             TargetKind::NativeBinary
         );
+    }
+
+    #[test]
+    fn omp_stdio_catalog_profiles_are_registered_with_expected_argv() {
+        let adapters = default_adapters();
+        let by_id = |id: &str| adapters.iter().find(|adapter| adapter.id == id).unwrap();
+        assert_eq!(by_id("netcoredbg").adapter_args, ["--interpreter=vscode"]);
+        assert_eq!(by_id("rdbg").adapter_args, ["--open", "--command", "--"]);
+        assert_eq!(by_id("dart-debug-adapter").adapter_args, ["debug_adapter"]);
+        assert_eq!(
+            by_id("flutter-debug-adapter").adapter_args,
+            ["debug_adapter", "--flutter-sdk-path", ""]
+        );
+        for id in [
+            "kotlin-debug-adapter",
+            "php-debug-adapter",
+            "bash-debug-adapter",
+            "elixir-ls-debugger",
+        ] {
+            assert!(by_id(id).adapter_args.is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn new_language_targets_select_matching_available_profile() {
+        let executable = std::env::current_exe().unwrap().display().to_string();
+        let cases = [
+            ("app.cs", "netcoredbg", "csharp"),
+            ("build.kts", "kotlin-debug-adapter", "kotlin"),
+            ("app.rb", "rdbg", "ruby"),
+            ("index.php", "php-debug-adapter", "php"),
+            ("setup.sh", "bash-debug-adapter", "shell"),
+            ("main.dart", "dart-debug-adapter", "dart"),
+            ("app.exs", "elixir-ls-debugger", "elixir"),
+        ];
+        for (target, id, language) in cases {
+            let override_adapter = AdapterSpec {
+                id: id.to_string(),
+                command_candidates: vec![executable.clone()],
+                adapter_args: vec![],
+                languages: vec![language],
+                install_hint: "test".to_string(),
+            };
+            assert_eq!(
+                select_adapter(Some(Path::new(target)), None, &[override_adapter])
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
     }
 
     #[test]
