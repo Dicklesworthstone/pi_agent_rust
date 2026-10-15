@@ -51,6 +51,27 @@ enum Fault {
     ChangedTerminal, ChangedIdentity, PoisonedRelease, Navigated, BlockedSource,
     BlockedAncestor, EnableFailure, ResetFailure, PressFailure, ByteMismatch,
     ZeroMismatch, Empty, MissingFile, ExistingDestination,
+    Blob, Data, DataPercent, DataEmpty, Signed, BlockedBlob, OpaqueBlob,
+    BlockedHttp, MalformedData, ForeignData, LateData, ReboundData,
+    DataOversize, DataByteMismatch, BlankData,
+}
+
+fn resource_url(fault: Fault) -> String {
+    match fault {
+        Fault::Blob => "blob:https://example.com/PRIVATE-CANARY".into(),
+        Fault::Data | Fault::ForeignData | Fault::LateData | Fault::ReboundData
+        | Fault::DataByteMismatch | Fault::BlankData =>
+            "data:application/octet-stream;base64,ZmlsZQD/IQ==".into(),
+        Fault::DataPercent => "data:application/octet-stream,file%00%ff!".into(),
+        Fault::DataEmpty => "data:,".into(),
+        Fault::Signed => "https://example.com/export.bin?token=PRIVATE-CANARY#secret".into(),
+        Fault::BlockedBlob => "blob:https://blocked.test/PRIVATE-CANARY".into(),
+        Fault::OpaqueBlob => "blob:null/PRIVATE-CANARY".into(),
+        Fault::BlockedHttp => "https://blocked.test/export?token=PRIVATE-CANARY".into(),
+        Fault::MalformedData => "data:PRIVATE-CANARY".into(),
+        Fault::DataOversize => format!("data:,PRIVATE-CANARY{}", "x".repeat(64 * 1024)),
+        _ => "https://example.com/export.bin".into(),
+    }
 }
 
 #[derive(Default, Debug)]
@@ -124,9 +145,14 @@ fn write_frame(socket: &mut TcpStream, value: &Value) {
     let bytes = serde_json::to_vec(value).unwrap();
     let mut frame = vec![0x81];
     if bytes.len() < 126 { frame.push(u8::try_from(bytes.len()).unwrap()); }
-    else {
+    else if let Ok(size) = u16::try_from(bytes.len()) {
         frame.push(126);
-        frame.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&size.to_be_bytes());
+    } else {
+        // Exercise the existing event-URL cap without overflowing the fixture's
+        // own 16-bit frame encoder before the Rust adapter sees the event.
+        frame.push(127);
+        frame.extend_from_slice(&u64::try_from(bytes.len()).unwrap().to_be_bytes());
     }
     frame.extend(bytes);
     socket.write_all(&frame).unwrap();
@@ -159,6 +185,7 @@ fn frame_tree(session: &str, fault: Fault, reset: bool) -> Value {
     let tree = match session {
         "page" => {
             let url = if fault == Fault::BlockedSource { "https://blocked.test/PRIVATE-CANARY" }
+                else if fault == Fault::BlankData { "about:blank" }
                 else { "https://example.com/root" };
             let mut root = node("main", None, url);
             if fault == Fault::Navigated && reset { root["frame"]["loaderId"] = json!("replacement"); }
@@ -213,6 +240,13 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
                                 changed["params"]["url"] = json!("https://blocked.test/PRIVATE-CANARY");
                                 write_frame(socket, &changed);
                             }
+                            Fault::LateData | Fault::ReboundData => {
+                                let guid = if fault == Fault::LateData { "late-job" } else { "job" };
+                                let mut changed = start(guid, scene.frame());
+                                // Same display projection, different original resource.
+                                changed["params"]["url"] = json!("data:text/plain,PRIVATE-CANARY");
+                                write_frame(socket, &changed);
+                            }
                             _ => {}
                         }
                         failed = fault == Fault::ResetFailure;
@@ -231,8 +265,9 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
             "Target.getTargets" => {
                 assert!(session.is_empty());
                 write_frame(socket, &start("existing", "other-page-frame"));
+                let source_url = if fault == Fault::BlankData { "about:blank" } else { "https://example.com/root" };
                 json!({"targetInfos":[
-                    {"type":"page","targetId":"page-1","url":"https://example.com/root"},
+                    {"type":"page","targetId":"page-1","url":source_url},
                     {"type":"page","targetId":"other-page","url":"https://example.com/root"}
                 ]})
             }
@@ -363,14 +398,20 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
                 } else {
                     assert_eq!(params["type"], "mouseReleased"); assert_eq!(params["buttons"], 0);
                     observed.releases += 1; assert_eq!(observed.releases, 1);
-                    let bytes = if fault == Fault::Empty { &[][..] } else { PAYLOAD };
+                    let bytes = if matches!(fault, Fault::Empty | Fault::DataEmpty) { &[][..] } else { PAYLOAD };
                     if fault != Fault::MissingFile {
                         std::fs::write(observed.directory.as_ref().unwrap().join("job"), bytes).unwrap();
                     }
-                    let frame = if fault == Fault::ForeignFrame { "unrelated-frame" } else { scene.frame() };
-                    write_frame(socket, &start("job", frame));
+                    let frame = if matches!(fault, Fault::ForeignFrame | Fault::ForeignData) { "unrelated-frame" } else { scene.frame() };
+                    let mut beginning = start("job", frame);
+                    beginning["params"]["url"] = json!(resource_url(fault));
+                    write_frame(socket, &beginning);
                     if fault == Fault::Duplicate { write_frame(socket, &start("job", frame)); }
-                    let size = match fault { Fault::ByteMismatch => 6, Fault::ZeroMismatch | Fault::Empty => 0, _ => 7 };
+                    let size = match fault {
+                        Fault::ByteMismatch | Fault::DataByteMismatch => 6,
+                        Fault::ZeroMismatch | Fault::Empty | Fault::DataEmpty => 0,
+                        _ => 7,
+                    };
                     if fault == Fault::SecondDuringProgress {
                         write_frame(socket, &progress("job", "inProgress", 4)); deferred = true;
                     } else {
@@ -427,8 +468,9 @@ fn run(scene: Scene, fault: Fault) -> (Result<ToolOutput>, Observed, Option<Vec<
     let path = dir.path().join("result.bin");
     if fault == Fault::ExistingDestination { std::fs::write(&path, b"original").unwrap(); }
     let (endpoint, handle) = peer(scene, fault, path.clone());
+    let allowlist = if fault == Fault::BlankData { Vec::new() } else { vec!["example.com".into()] };
     let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint)
-        .with_domain_allowlist(Some(vec!["example.com".into()]));
+        .with_domain_allowlist(Some(allowlist));
     let mut args = json!({"action":"download","tab":"page-1","selector":"#export","output_path":"result.bin","timeout_ms":10000});
     if !matches!(scene, Scene::Main) { args["frame"] = json!(scene.frame()); }
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
@@ -457,6 +499,86 @@ fn public_downloads_preserve_bytes_across_local_and_nested_renderer_documents() 
         assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
         assert!(observed.cancelled.is_empty());
     }
+}
+
+#[test]
+fn generated_downloads_preserve_bytes_but_never_return_payloads_or_handles() {
+    for scene in [Scene::Main, Scene::Local, Scene::Remote, Scene::Inside, Scene::Nested] {
+        for fault in [Fault::Blob, Fault::Data, Fault::DataPercent, Fault::DataEmpty, Fault::Signed] {
+            let (result, observed, bytes) = run(scene, fault);
+            let result = result.unwrap();
+            assert!(!result.is_error);
+            let text = serde_json::to_string(&result.content).unwrap();
+            let details = result.details.unwrap();
+            let (kind, url) = match fault {
+                Fault::Blob => ("blob", "blob:https://example.com/[redacted]"),
+                Fault::Signed => ("https", "https://example.com/export.bin"),
+                _ => ("data", "data:[redacted]"),
+            };
+            assert_eq!(details["url_kind"], kind);
+            assert_eq!(details["url"], url);
+            assert_eq!(details["url_redacted"], true);
+            assert_eq!(details["frame_id"], scene.frame());
+            let expected = if fault == Fault::DataEmpty { &[][..] } else { PAYLOAD };
+            assert_eq!(bytes.as_deref(), Some(expected));
+            assert_eq!(details["size_bytes"].as_u64(), Some(expected.len() as u64));
+            for serialized in [text, details.to_string()] {
+                assert!(!serialized.contains("PRIVATE-CANARY"));
+                assert!(!serialized.contains("ZmlsZQD/IQ=="));
+                assert!(!serialized.contains("file%00%ff!"));
+            }
+            assert_eq!((observed.presses, observed.releases, observed.queries), (1,1,1));
+            assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
+            assert!(observed.cancelled.is_empty());
+        }
+    }
+}
+
+#[test]
+fn offline_blank_documents_can_export_literal_data_without_network_permission() {
+    let (result, observed, bytes) = run(Scene::Main, Fault::BlankData);
+    assert_eq!(result.unwrap().details.unwrap()["url"], "data:[redacted]");
+    assert_eq!(bytes.as_deref(), Some(PAYLOAD));
+    assert_eq!((observed.presses, observed.releases), (1,1));
+    assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
+}
+
+#[test]
+fn generated_resource_policy_refusals_do_not_publish_or_echo_the_resource() {
+    for fault in [Fault::BlockedBlob, Fault::OpaqueBlob, Fault::BlockedHttp, Fault::MalformedData] {
+        let (result, observed, bytes) = run(Scene::Nested, fault);
+        let failure = result.unwrap_err().to_string();
+        assert!(failure.contains("BROWSER_DOWNLOAD_URL"));
+        assert!(!failure.contains("PRIVATE-CANARY"));
+        assert!(bytes.is_none());
+        assert_eq!((observed.presses, observed.releases), (1,1));
+        assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
+        assert_eq!(observed.cancelled, ["job"]);
+    }
+}
+
+#[test]
+fn generated_downloads_keep_source_transfer_and_byte_integrity_guards() {
+    for fault in [Fault::ForeignData, Fault::LateData, Fault::ReboundData, Fault::DataByteMismatch] {
+        let (result, observed, bytes) = run(Scene::Nested, fault);
+        let failure = result.unwrap_err().to_string();
+        assert!(!failure.contains("PRIVATE-CANARY"));
+        assert!(bytes.is_none());
+        assert_eq!((observed.presses, observed.releases), (1,1));
+        assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
+        assert!(observed.cancelled.iter().any(|guid| guid == "job"));
+    }
+}
+
+#[test]
+fn oversized_data_events_fail_before_publication_without_echoing_inline_bytes() {
+    let (result, observed, bytes) = run(Scene::Main, Fault::DataOversize);
+    let failure = result.unwrap_err().to_string();
+    assert!(failure.contains("download"));
+    assert!(!failure.contains("PRIVATE-CANARY"));
+    assert!(bytes.is_none());
+    assert_eq!((observed.presses, observed.releases), (1,1));
+    assert_eq!(observed.policies, ["deny","allowAndName","deny"]);
 }
 
 #[test]

@@ -159,6 +159,7 @@ impl Tool for BrowserTool {
          structured option selection and checked-state control, frame discovery and frame-scoped \
          inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
          download clicks once and captures one source-frame-matched transfer up to 100 MiB into a new workspace file; optional frame requires explicit tab and selector. Extra transfers, changed documents and invalid progress fail without publication or replay. \
+         Generated data: exports and blob: exports with an allowed HTTP(S) creator are supported under the same source checks. Download URLs are capped at 64 KiB; payloads, Blob handles and query/fragment fields are redacted in results. Opaque blob:null origins remain unsupported. \
          Storage-state actions require an explicit tab and private workspace state_path; files contain plaintext credentials, never returned inline. \
          Attach diagnostics to an action to capture console output and uncaught exceptions before \
          and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
@@ -246,7 +247,7 @@ impl Tool for BrowserTool {
                 },
                 "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
                           "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. Optional frame requires an explicit tab and targets that exact file input. At most 20 MiB per call and 64 MiB retained per conversation; selected files are exposed immediately to page scripts."},
-                "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten. download accepts CSS or snapshot selector and an optional explicit frame, captures at most 100 MiB, restores deny before publication and reports the source frame_id."},
+                "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten. download accepts CSS or snapshot selector and an optional explicit frame, captures at most 100 MiB, restores deny before publication and reports the source frame_id. HTTP(S), bounded data: and HTTP(S)-creator blob: resources are supported; results expose a redacted url plus url_kind and url_redacted, not inline resource bytes or Blob handles."},
                 "full_page": {"type": "boolean", "description": "screenshot: capture beyond the viewport (default false)"},
                 "landscape": {"type": "boolean", "description": "print_pdf: landscape paper orientation (default false)"},
                 "print_background": {"type": "boolean", "description": "print_pdf: include background graphics (default true)"},

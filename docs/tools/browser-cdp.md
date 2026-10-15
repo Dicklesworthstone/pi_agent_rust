@@ -317,8 +317,9 @@ parent, child or sibling does not qualify merely because it downloaded the same
 URL. The selected document and, for scoped calls, its complete ancestry and
 renderer incarnations must remain unchanged through completion and publication.
 Navigation is an error, not an instruction to accept a replacement document.
-The download URL must pass `domainAllowlist` independently of the source page;
-`blob:`, `data:` and other non-HTTP(S) download URLs remain unsupported.
+HTTP(S) download hosts must pass `domainAllowlist` independently of the source
+page. Client-generated `blob:` and `data:` exports use the resource-specific
+admission described below; navigation and CDP endpoint permissions are unchanged.
 
 The complete set of newly observed transfers is checked during progress and
 again after restoring `deny`. Multiple transfers, including a second transfer
@@ -344,8 +345,8 @@ empty file. With no `output_path`, the suggested filename is sanitized and
 published under `downloads/`; supplied paths must be workspace-relative and use
 the same descriptor-pinned create-only publisher as screenshots/media artifacts.
 Existing files and symlinked ancestors are never overwritten or followed.
-Results include `saved_path`, `size_bytes`, `received_bytes`, `url`,
-`suggested_filename` and the verified source `frame_id`.
+Results include `saved_path`, `size_bytes`, `received_bytes`, a safe display `url`,
+`url_kind`, `url_redacted`, `suggested_filename` and the verified source `frame_id`.
 
 After a normal attempt Pi restores download behavior to `deny` before publishing.
 An error during capture enablement also enters this cleanup path: a lost or failed
@@ -362,6 +363,63 @@ Use a dedicated browser without unrelated simultaneous downloads. A frame select
 does not create an isolated browser context, and non-default/incognito context
 capture is not implemented by this workflow. `domainAllowlist` is an access guard,
 not a subresource/network sandbox.
+
+### Client-generated exports and URL redaction
+
+The same `download` call works when an export link or its click handler creates
+a Blob or data resource. The model selects the original control, not a replacement
+resource URL. Chromium produces the bytes; Pi does not fetch the URL itself,
+decode a second payload copy, synthesize a download event or relax source checks.
+
+For `blob:`, the embedded creator URL must use HTTP(S), have a nonempty handle,
+and pass the existing exact/wildcard/IDNA host policy without URL credentials.
+The creator need not be the initiating document, but both must independently be
+admitted. Opaque `blob:null/...`, nested/non-HTTP creator schemes and Blob URLs
+with query strings remain unsupported. A revoked or otherwise failed Blob
+transfer is an error, not permission to substitute another URL.
+
+For `data:`, the URL must have its metadata/payload comma separator. There is no
+remote resource host to authorize; the pinned initiating document and all scoped
+ancestors still pass their ordinary policy. Thus an allowed `about:blank` page
+can export literal data even with an empty network-host allowlist. This does not
+permit navigation to data URLs or downloading resources from a blocked source.
+
+All browser-reported resource URLs remain bounded to 64 KiB of UTF-8, with no
+control characters or surrounding whitespace. The existing 100 MiB completed-byte
+limit is independent; large client-side exports should use Blob resources rather
+than oversized inline data URLs. Unsupported resources fail with a redacted
+`BROWSER_DOWNLOAD_URL` diagnostic after the browser has reported the transfer.
+
+The original URL remains private to immutable transfer correlation. A changed
+raw URL is rejected even when both versions would display the same redacted text.
+Success text and `details.url` instead contain:
+
+- HTTP(S): the parsed URL without query or fragment.
+- Blob: `blob:<creator-origin>/[redacted]`, without the object handle.
+- Data: `data:[redacted]`, without MIME parameters or payload.
+
+`url_kind` is `http`, `https`, `blob` or `data`; `url_redacted` records whether the
+display differs from the original. Normalization can also set that flag. This is
+URL projection, not a general secret sanitizer: HTTP paths, suggested filenames,
+page content and the saved file may still contain application-sensitive data.
+
+This increment adds ten authored Rust tests: five policy tests and five public
+transport test functions. The transport cases retain real loopback I/O, binary
+file publication, native-input counts and restoration checks while covering
+client-generated resources, offline blank sources, creator refusal, payload
+redaction, late/rebound resources, foreign frames, byte mismatches and URL limits.
+They were not compiled or executed: the required DSR command was attempted and
+returned command not found (exit 127).
+
+A separate offline Chromium 144.0.7559.96 probe passed twelve data-download cases:
+base64, percent-encoded binary/Unicode and empty payloads in the main document,
+a local child, an observed out-of-process srcdoc renderer and its local child.
+Each case checked a trusted native click, exact source-frame event, unchanged
+document, completed byte count and literal saved bytes. It did not execute the
+Rust adapter or validate HTTP-origin Blob transfers. An initial HTTP fixture
+failed because this environment's managed browser policy blocks HTTP navigation;
+the policy was left unchanged. Probe-only `--no-sandbox` and `--site-per-process`
+did not change production launch flags. No DSR or Rust test pass is claimed.
 
 ### Source-bound download validation status
 
