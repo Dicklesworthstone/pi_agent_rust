@@ -4,7 +4,10 @@
 //! There is no detached listener, per-connection thread, proxy, or HTTP server.
 //! A child receives one opaque credential through its environment. It can
 //! inspect its parent roster, read its own inbox, and send to its parent or
-//! live peers. Process control and transcript access stay with the parent.
+//! live peers. Result reads share this transport and the parent's accepted
+//! output resolver. Process control and transcript access stay with the parent.
+
+pub(crate) mod results;
 
 use super::{AgentHubRegistry, BusMessage, ChildEntry, ChildStatus, registry};
 use crate::agent_cx::AgentCx;
@@ -84,6 +87,16 @@ struct WireRequest {
     version: u8,
     token: String,
     request: Request,
+}
+
+// Separate envelopes keep the established messaging API unchanged. A frame
+// cannot combine a messaging operation with a result read (both deny unknown
+// fields); result reads carry no caller-supplied sender or filesystem path.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Incoming {
+    Message(WireRequest),
+    Result(results::WireRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -387,7 +400,7 @@ impl Connection {
         }
     }
 
-    fn set_response(&mut self, response: &WireResponse) {
+    fn set_response(&mut self, response: &impl Serialize) {
         let encoded = serde_json::to_vec(response)
             .ok()
             .filter(|bytes| bytes.len() < MAX_RESPONSE_BYTES)
@@ -431,17 +444,22 @@ impl Connection {
                             {
                                 return false;
                             }
-                            let request = serde_json::from_slice::<WireRequest>(&self.input[..end]);
-                            let response = match request {
-                                Ok(request) => {
-                                    dispatch_authenticated(sender, token, request, owner)
+                            match serde_json::from_slice::<Incoming>(&self.input[..end]) {
+                                Ok(Incoming::Result(request)) => {
+                                    let response = results::dispatch_authenticated(
+                                        sender, token, request, owner,
+                                    );
+                                    self.set_response(&results::WireResponse::from(response));
                                 }
-                                Err(_) => Err(ipc_error("PROTOCOL", "invalid request frame")),
-                            };
-                            self.set_response(&match response {
-                                Ok(reply) => WireResponse::Ok(reply),
-                                Err(error) => WireResponse::Error(error.to_string()),
-                            });
+                                Ok(Incoming::Message(request)) => {
+                                    let response = dispatch_authenticated(sender, token, request, owner);
+                                    self.set_response(&match response {
+                                        Ok(reply) => WireResponse::Ok(reply),
+                                        Err(error) => WireResponse::Error(error.to_string()),
+                                    });
+                                }
+                                Err(_) => self.refuse("PROTOCOL", "invalid request frame"),
+                            }
                             break;
                         }
                     }
@@ -450,6 +468,11 @@ impl Connection {
                     Err(_) => return false,
                 }
             }
+        }
+        // Resolution may perform bounded decoding/redaction. Do not begin
+        // publishing an answer after its channel deadline or cancellation.
+        if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
+            return false;
         }
         if let Some(output) = &self.output {
             for _ in 0..IO_CHUNKS_PER_POLL {
@@ -800,6 +823,7 @@ mod tests {
         let (_owner, owned) = self::channel();
         let address = owned.address;
         drop(owned);
+        assert!(channel.listener.is_none());
         assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
     }
 

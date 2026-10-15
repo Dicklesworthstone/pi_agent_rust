@@ -41,6 +41,23 @@ fn agent_reference(path: &str) -> Result<Option<&str>> {
     }
 }
 
+fn resolve_agent(reference: &str) -> Result<ResolvedDoc> {
+    if crate::agent_hub::ipc::inherited_channel_present() {
+        // A partial, expired or invalid parent channel never falls back to
+        // a different local hub with potentially colliding child display IDs.
+        crate::agent_hub::ipc::results::resolve_from_env(reference)
+    } else {
+        agent::resolve(reference)
+    }
+}
+
+/// Parent-side result dispatch must not forward into a grandparent channel.
+/// The caller has already authenticated its live child; ordinary acceptance,
+/// JSON projection, retention and redaction remain owned by the local resolver.
+pub(crate) fn resolve_local_agent(reference: &str) -> Result<ResolvedDoc> {
+    agent::resolve(reference)
+}
+
 /// Resolve a scheme into a paginatable virtual document.
 ///
 /// # Errors
@@ -52,7 +69,7 @@ pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
         return skills::resolve(reference, cwd);
     }
     match agent_reference(path)? {
-        Some(reference) => agent::resolve(reference),
+        Some(reference) => resolve_agent(reference),
         None => documents::resolve(path, cwd),
     }
 }
@@ -66,7 +83,7 @@ pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<
         return skills::resolve(reference, cwd);
     }
     match agent_reference(path)? {
-        Some(reference) => agent::resolve(reference),
+        Some(reference) => resolve_agent(reference),
         None => documents::resolve_with(path, cwd, options),
     }
 }
