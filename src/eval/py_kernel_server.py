@@ -79,6 +79,8 @@ _REAL_STDIN = os.fdopen(os.dup(0), "r", encoding="utf-8")
 os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
 sys.stdin = sys.__stdin__ = os.fdopen(0, "r", encoding="utf-8")
 _BRIDGE_CALL = 0
+_BRIDGE_BUSY = False
+_KERNEL_THREAD = threading.get_ident()
 _CELL_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_CELL_LOOP)
 _CELL_CONTEXT = contextvars.copy_context()
@@ -588,7 +590,33 @@ class ToolBridgeError(RuntimeError):
     pass
 
 
+def _bridge_owner():
+    # A task can outlive its cell even in the same retained event loop. Its
+    # ContextVars must not grant host I/O under the next cell's Rust lease.
+    # Copied worker contexts may print, but cannot compete for protocol stdin.
+    output = _OUTPUT_CONTEXT.get()
+    if output is None or not output.active:
+        raise ToolBridgeError("EVAL_BRIDGE_CLOSED: tool call belongs to an inactive cell")
+    if threading.get_ident() != _KERNEL_THREAD:
+        raise ToolBridgeError("EVAL_BRIDGE_THREAD: call tools on the owning cell's event-loop thread")
+    return output
+
+
 def _bridge_call(tool_name, tool_input):
+    global _BRIDGE_CALL, _BRIDGE_BUSY
+    _bridge_owner()
+    if _BRIDGE_BUSY:
+        raise ToolBridgeError("EVAL_BRIDGE_BUSY: another tool exchange already owns protocol stdin")
+    # Guard serialization too: a dict subclass can execute guest code while
+    # being encoded. Re-entry must fail before emitting a second request.
+    _BRIDGE_BUSY = True
+    try:
+        return _bridge_exchange(tool_name, tool_input)
+    finally:
+        _BRIDGE_BUSY = False
+
+
+def _bridge_exchange(tool_name, tool_input):
     global _BRIDGE_CALL
     _BRIDGE_CALL += 1
     call_id = _BRIDGE_CALL
