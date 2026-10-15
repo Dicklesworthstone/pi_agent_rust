@@ -46,6 +46,7 @@ import asyncio
 import base64
 import codecs
 import contextvars
+import functools
 import importlib
 import inspect
 import io
@@ -60,6 +61,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import weakref
 
 NAMESPACE = {"__name__": "__main__"}
 # Protocol-channel protection: the host treats every stdout line as protocol,
@@ -363,6 +365,55 @@ class _DisplaySink:
         self.active = True
         self.thread = threading.get_ident()
         self.formatting = False
+        self.plot_managers = []
+        self.displayed_figures = []
+        self.finishing_plots = False
+
+    def admit_plot(self):
+        self.check_available()
+        if self.finishing_plots:
+            raise RuntimeError("EVAL_PLOT_REENTRANT: cannot create figures during cell finalization")
+        # Closed figures do not consume slots forever in a plotting loop.
+        self.plot_managers = [ref for ref in self.plot_managers
+                              if _registered_plot(ref())]
+        if len(self.plot_managers) >= _MAX_DISPLAYS:
+            raise ValueError("EVAL_DISPLAY_LIMIT: at most 32 open cell-owned figures")
+
+    def finish_plots(self):
+        # Never scan global pyplot state: only managers created in this live
+        # cell can be auto-published or closed. Weak references retain neither
+        # figures nor prior cell sinks after pyplot/user references disappear.
+        failure = None
+        self.finishing_plots = True
+        try:
+            for reference in self.plot_managers:
+                manager = reference()
+                registry = _registered_plot(manager)
+                if registry is None:
+                    continue
+                figure = manager.canvas.figure
+                try:
+                    if not any(ref() is figure for ref in self.displayed_figures):
+                        self.append(figure, None)
+                except BaseException:
+                    if failure is None:
+                        failure = _error_text()
+                finally:
+                    # Close by identity, not reused figure number. Even an
+                    # oversized or failing figure must not silently accumulate
+                    # in pyplot or be retried as a later cell's result. A user
+                    # variable referencing the Figure remains usable.
+                    try:
+                        if _registered_plot(manager) is registry:
+                            registry.destroy(manager)
+                    except BaseException:
+                        if failure is None:
+                            failure = _error_text()
+        finally:
+            self.finishing_plots = False
+            self.plot_managers.clear()
+            self.displayed_figures.clear()
+        return failure
 
     def check_available(self):
         output = _OUTPUT_CONTEXT.get()
@@ -384,6 +435,7 @@ class _DisplaySink:
 
     def append(self, value, mime, *, rich_only=False):
         self.check_available()  # Refuse stale/threaded calls BEFORE guest hooks.
+        original = value
         if mime is None:
             self.formatting = True
             try:
@@ -428,6 +480,8 @@ class _DisplaySink:
         # host compares that collection with the live prefix before reuse.
         self.frames.append(snapshot)
         self.bytes += size
+        if _loaded_instance(original, "matplotlib.figure", "Figure"):
+            self.displayed_figures.append(weakref.ref(original))
         return True
 
 
@@ -445,6 +499,89 @@ def display(value, *, mime=None):
 
 
 NAMESPACE["display"] = display
+
+
+def _registered_plot(manager):
+    if manager is None:
+        return None
+    helpers = sys.modules.get("matplotlib._pylab_helpers")
+    registry = getattr(helpers, "Gcf", None)
+    if registry is not None and registry.figs.get(manager.num) is manager:
+        return registry
+    return None
+
+
+def _observe_plot_managers(module):
+    """Attach ownership at creation, not by guessing from process-global IDs."""
+    manager_type = getattr(module, "FigureManagerBase", None)
+    if manager_type is None:
+        return
+    original = manager_type.__init__
+    if getattr(original, "_pi_eval_owned", False):
+        return
+
+    @functools.wraps(original)
+    def initialize(manager, canvas, num, *args, **kwargs):
+        owner = _DISPLAY_CONTEXT.get()
+        matplotlib = sys.modules.get("matplotlib")
+        # Leave deliberately selected non-Agg/interactive backends alone.
+        # They can still use the explicit display(Figure) PNG adapter.
+        if (owner is not None and matplotlib is not None
+                and str(matplotlib.get_backend()).casefold() == "agg"):
+            owner.admit_plot()  # Refuse stale/threaded creation before effects.
+        else:
+            owner = None
+        original(manager, canvas, num, *args, **kwargs)
+        if owner is not None:
+            owner.plot_managers.append(weakref.ref(manager))
+
+    initialize._pi_eval_owned = True
+    manager_type.__init__ = initialize
+
+
+class _PlotImportLoader:
+    """Observe one optional module while preserving its real loader."""
+
+    def __init__(self, loader):
+        self.loader = loader
+
+    def create_module(self, spec):
+        return self.loader.create_module(spec)
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+        _observe_plot_managers(module)
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+
+class _PlotImportFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "matplotlib.backend_bases":
+            return None
+        # Delegate in the original finder order, including custom loaders;
+        # never replace __import__ or eagerly import scientific packages.
+        following = False
+        for finder in tuple(sys.meta_path):
+            if finder is self:
+                following = True
+            elif following:
+                find_spec = getattr(finder, "find_spec", None)
+                if find_spec is None:
+                    continue
+                spec = find_spec(fullname, path, target)
+                if spec is not None:
+                    if (spec.loader is not None
+                            and hasattr(spec.loader, "create_module")
+                            and hasattr(spec.loader, "exec_module")):
+                        spec.loader = _PlotImportLoader(spec.loader)
+                    return spec
+        return None
+
+
+_observe_plot_managers(sys.modules.get("matplotlib.backend_bases"))
+sys.meta_path.insert(0, _PlotImportFinder())
 
 
 class ToolBridgeError(RuntimeError):
@@ -752,45 +889,61 @@ async def _install_python_packages(arguments, *, environment=None):
     print("EVAL_PIP_DONE: pip completed; import caches refreshed, existing modules retained", flush=True)
 
 
+async def _evaluate_cell(code, displays):
+    install = _pip_arguments(code)
+    if install is not None:
+        await _install_python_packages(install)
+        return None
+    source, filename, script_dir = _prepare_cell(code)
+    body, expression = _compile_cell(source, filename)
+    if script_dir is not None:
+        # Only mutate execution metadata after the whole script compiles.
+        # Keep it for later calls to functions defined by this script.
+        NAMESPACE["__file__"] = filename
+        if script_dir in sys.path:
+            sys.path.remove(script_dir)
+        sys.path.insert(0, script_dir)
+    value = eval(body, NAMESPACE)  # noqa: S307 - intentional cell execution
+    if body.co_flags & inspect.CO_COROUTINE:
+        await value
+    if expression is None:
+        return None
+    value = eval(expression, NAMESPACE)  # noqa: S307
+    # Only await compiler-generated top-level-await code, not an arbitrary
+    # awaitable that happens to be the final value (normal REPL semantics).
+    if expression.co_flags & inspect.CO_COROUTINE:
+        value = await value
+    if value is not None and displays.append_result(value):
+        return None
+    return _result_text(value) if value is not None else None
+
+
 async def _execute_cell(code, displays, output):
     global _CELL_CONTEXT
     display_token = _DISPLAY_CONTEXT.set(displays)
     output_token = _OUTPUT_CONTEXT.set(output)
+    result = error = None
     try:
-        install = _pip_arguments(code)
-        if install is not None:
-            await _install_python_packages(install)
-            return True, None, None
-        source, filename, script_dir = _prepare_cell(code)
-        body, expression = _compile_cell(source, filename)
-        if script_dir is not None:
-            # Only mutate execution metadata after the whole script compiles.
-            # Keep it for later calls to functions defined by this script.
-            NAMESPACE["__file__"] = filename
-            if script_dir in sys.path:
-                sys.path.remove(script_dir)
-            sys.path.insert(0, script_dir)
-        value = eval(body, NAMESPACE)  # noqa: S307 - intentional cell execution
-        if body.co_flags & inspect.CO_COROUTINE:
-            await value
-        if expression is None:
-            return True, None, None
-        value = eval(expression, NAMESPACE)  # noqa: S307
-        # Only await compiler-generated top-level-await code, not an arbitrary
-        # awaitable that happens to be the final value (normal REPL semantics).
-        if expression.co_flags & inspect.CO_COROUTINE:
-            value = await value
-        if value is not None and displays.append_result(value):
-            return True, None, None
-        return True, _result_text(value) if value is not None else None, None
-    except ModuleNotFoundError:
-        return False, None, _error_text() + (
-            "\nEVAL_PACKAGE_HINT: use a separate `%pip install <distribution>` cell "
-            "for this interpreter. Distribution and import names may differ "
-            "(for example, pillow provides PIL). Nothing was installed automatically.\n"
-        )
-    except BaseException:  # noqa: BLE001 - SystemExit must not stop the loop
-        return False, None, _error_text()
+        try:
+            result = await _evaluate_cell(code, displays)
+        except ModuleNotFoundError:
+            error = _error_text() + (
+                "\nEVAL_PACKAGE_HINT: use a separate `%pip install <distribution>` cell "
+                "for this interpreter. Distribution and import names may differ "
+                "(for example, pillow provides PIL). Nothing was installed automatically.\n"
+            )
+        except BaseException:  # noqa: BLE001 - SystemExit must not stop the loop
+            error = _error_text()
+        # This still runs under the creating cell's output identity and host
+        # deadline. A failed body retains its plot output, but no render error
+        # can turn the original failure into success or erase its diagnostic.
+        try:
+            plot_error = displays.finish_plots()
+        except BaseException:
+            plot_error = _error_text()
+        if plot_error is not None:
+            error = (error or "") + "\nEVAL_PLOT_OUTPUT: plot finalization failed\n" + plot_error
+        return error is None, result if error is None else None, error
     finally:
         # Child tasks retain this particular sink. Once the cell ends they
         # cannot publish late output into a later cell's display collection.

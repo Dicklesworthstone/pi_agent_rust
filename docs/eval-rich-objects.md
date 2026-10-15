@@ -54,6 +54,47 @@ JSON containers still reject unsupported nested objects instead of invoking
 custom serializers. `display(image, mime="image/png")` requires encoded PNG
 bytes/base64; omit `mime` to render the image object.
 
+## Automatic pyplot output
+
+Ordinary Agg-backed pyplot code now produces image output at cell completion:
+
+```python
+import matplotlib.pyplot as plt
+
+figure, axes = plt.subplots(figsize=(6, 4), dpi=100)
+axes.plot([0, 1, 2], [0, 1, 0])
+axes.set_title("No explicit display call required")
+plt.show()
+```
+
+`plt.show()` is optional. Automatic capture runs after the final expression,
+not at the `show()` call, and does not start a GUI loop. Remaining figures
+created by that cell are emitted in creation order through the same bounded
+display sink. Figures already explicitly displayed or returned as the rich
+final result are closed without emitting a duplicate. Closing removes pyplot
+registry ownership, not the Python object: a saved `figure` variable can still
+be edited and explicitly displayed in a later cell.
+
+Ownership is attached when an Agg figure manager is created, including when
+Matplotlib is imported dynamically. No scientific packages are eagerly
+imported; the observer delegates the original module loader. Closed-cell and
+context-copied worker-thread creation is refused. Unattributed process-global
+figures are neither auto-published nor closed. A retained figure modified in
+a later cell requires explicit `display(figure)`; it is not silently adopted.
+Direct `matplotlib.figure.Figure()` objects without a pyplot manager likewise
+use explicit display or the rich final expression. Non-Agg backend selection
+is respected and does not enable automatic capture or closure.
+
+At most 32 cell-owned figures may remain open; closing one during the cell
+frees its tracking slot. Automatic images share the ordinary display count,
+byte and raster bounds. A failed cell still finalizes its owned plots, retaining
+the original error. A rendering failure makes an otherwise successful cell
+fail, while prior output and healthy sibling figures remain available. Owned
+managers are closed even when their render is refused; none are silently
+replayed in a later cell. Plot callbacks cannot recursively create figures
+during rendering/finalization. Host cancellation may terminate the process
+before Python cleanup; kernel/process ownership remains with the host.
+
 ## Streaming and ownership
 
 Each accepted object enters the existing sequenced live-display channel and
@@ -74,9 +115,8 @@ refused explicitly. Reset, cancellation and session ownership remain host-owned.
 Formatters and plotting callbacks are ordinary guest Python code. Their CPU,
 intermediate allocations, library caches and filesystem effects are not
 sandboxed by output limits. The existing host timeout still applies. Automatic
-end-of-cell figure scanning is deliberately not added: unrelated retained tasks
-must not publish process-global figures as the current cell's output. Use
-`display(figure)` or return that figure explicitly. Figures are not auto-closed.
+output is ownership-scoped, not a process-global scan. Matplotlib itself still
+has process-global current-figure state; this is not a plotting sandbox.
 HTML, SVG, JPEG, Plotly-specific MIME types, animations and interactive widgets
 are not added by this change. No full OMP equivalence is claimed.
 
@@ -92,5 +132,5 @@ substitute for Rust-host or frontend acceptance.
 retained results, failure preservation, stale-task refusal and native PNG
 content. Run the authoritative project lane with
 `dsr quality --tool pi_agent_rust`. The development session ran the Python probes;
-DSR was absent (exit 127), so the five authored Rust tests, compilation, Clippy
+DSR was absent (exit 127), so the seven authored Rust tests, compilation, Clippy
 and Rust formatting were not executed.

@@ -538,6 +538,228 @@ raise RuntimeError('after the image')
         self.png(result["displays"][0], (2, 3))
         self.png(self.good("picture")[0]["displays"][0], (2, 3))
 
+    def test_pyplot_without_explicit_display_emits_and_closes_owned_figures(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import matplotlib.pyplot as plt
+figure, axes = plt.subplots(figsize=(2, 1), dpi=40)
+axes.plot([0, 1, 2], [0, 1, 0])
+axes.set_title('automatic')
+""")
+        self.assertEqual(len(result["displays"]), 1)
+        self.png(result["displays"][0], (80, 40))
+        later, _ = self.good("assert plt.get_fignums() == []; len(figure.axes)")
+        self.assertEqual(later["result"], "1")
+        self.assertEqual(later["displays"], [])
+
+    def test_pyplot_show_and_reused_numbers_keep_creation_order(self):
+        self.need("matplotlib", "PIL")
+        for iteration in range(3):
+            result, _ = self.good("""
+import matplotlib.pyplot as plt
+first = plt.figure(1, figsize=(2, 1), dpi=40)
+second = plt.figure(2, figsize=(3, 1), dpi=40)
+first.subplots().plot([0, 1], [1, 0])
+second.subplots().plot([0, 1], [0, 1])
+plt.show()
+""")
+            self.assertEqual(len(result["displays"]), 2, iteration)
+            self.png(result["displays"][0], (80, 40))
+            self.png(result["displays"][1], (120, 40))
+            self.assertEqual(self.good("plt.get_fignums()")[0]["result"], "[]")
+
+    def test_explicit_and_final_figures_are_closed_without_auto_duplicates(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import matplotlib.pyplot as plt
+first = plt.figure(figsize=(2, 1), dpi=40)
+second = plt.figure(figsize=(3, 1), dpi=40)
+display(first)
+second
+""")
+        self.assertIsNone(result["result"])
+        self.assertEqual(len(result["displays"]), 2)
+        self.png(result["displays"][0], (80, 40))
+        self.png(result["displays"][1], (120, 40))
+        self.assertEqual(self.good("plt.get_fignums()")[0]["result"], "[]")
+        # The Python Figure survives registry cleanup and can be edited later.
+        later, _ = self.good("first.subplots().plot([1, 2]); display(first)")
+        self.assertEqual(len(later["displays"]), 1)
+        self.png(later["displays"][0], (80, 40))
+
+    def test_closed_and_replaced_figure_number_is_not_captured_twice(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import matplotlib.pyplot as plt
+old = plt.figure(7, figsize=(2, 1), dpi=40)
+plt.close(old)
+replacement = plt.figure(7, figsize=(3, 1), dpi=40)
+""")
+        self.assertEqual(len(result["displays"]), 1)
+        self.png(result["displays"][0], (120, 40))
+        self.assertEqual(self.good("plt.get_fignums()")[0]["result"], "[]")
+
+    def test_failed_body_still_emits_plot_without_masking_original_error(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.bad("""
+import matplotlib.pyplot as plt
+kept = 42
+figure = plt.figure(figsize=(2, 1), dpi=40)
+figure.subplots().plot([0, 1], [0, 1])
+raise RuntimeError('ORIGINAL_CELL_FAILURE')
+""", "ORIGINAL_CELL_FAILURE")
+        self.png(result["displays"][0], (80, 40))
+        later, _ = self.good("assert plt.get_fignums() == []; kept")
+        self.assertEqual(later["result"], "42")
+        self.assertEqual(later["displays"], [])
+
+    def test_plot_failure_closes_owned_figures_and_preserves_healthy_siblings(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.bad("""
+import matplotlib.pyplot as plt
+oversized = plt.figure(figsize=(200, 1), dpi=100)
+healthy = plt.figure(figsize=(2, 1), dpi=40)
+display({'accepted': True})
+raise RuntimeError('BODY_FAILED_TOO')
+""", "BODY_FAILED_TOO")
+        self.assertIn("EVAL_PLOT_OUTPUT", result["error"])
+        self.assertIn("dimensions exceed", result["error"])
+        self.assertEqual(result["displays"][0]["data"], {"accepted": True})
+        self.assertEqual(len(result["displays"]), 2)
+        self.png(result["displays"][1], (80, 40))
+        later, _ = self.good("""
+assert plt.get_fignums() == []
+oversized.set_size_inches(1, 1)
+display(oversized)
+""")
+        self.png(later["displays"][0], (100, 100))
+
+    def test_stale_task_cannot_register_plot_in_later_cell(self):
+        self.need("matplotlib", "PIL")
+        self.good("""
+import asyncio
+import matplotlib.pyplot as plt
+ready = asyncio.Event()
+async def old():
+    await ready.wait()
+    try:
+        plt.figure(99)
+    except RuntimeError as error:
+        return str(error)
+    return 'unexpected success'
+pending = asyncio.create_task(old())
+await asyncio.sleep(0)
+""")
+        result, _ = self.good("""
+ready.set()
+assert 'EVAL_DISPLAY_CLOSED' in await pending
+assert plt.get_fignums() == []
+figure = plt.figure(figsize=(2, 1), dpi=40)
+""")
+        self.assertEqual(len(result["displays"]), 1)
+        self.png(result["displays"][0], (80, 40))
+
+    def test_copied_thread_cannot_register_a_current_cell_plot(self):
+        self.need("matplotlib")
+        result, _ = self.good("""
+import asyncio
+import matplotlib.pyplot as plt
+try:
+    await asyncio.to_thread(plt.figure)
+except RuntimeError as error:
+    assert 'EVAL_DISPLAY_CLOSED' in str(error)
+else:
+    raise AssertionError('cross-thread plot creation was accepted')
+assert plt.get_fignums() == []
+""")
+        self.assertEqual(result["displays"], [])
+
+    def test_unowned_process_global_plot_is_neither_published_nor_closed(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import contextvars
+import matplotlib.pyplot as plt
+foreign = contextvars.Context().run(plt.figure, 99, figsize=(3, 1), dpi=40)
+owned = plt.figure(1, figsize=(2, 1), dpi=40)
+""")
+        self.assertEqual(len(result["displays"]), 1)
+        self.png(result["displays"][0], (80, 40))
+        later, _ = self.good("assert plt.get_fignums() == [99]")
+        self.assertEqual(later["displays"], [])
+        adopted, _ = self.good("display(foreign); plt.close(foreign)")
+        self.png(adopted["displays"][0], (120, 40))
+
+    def test_dynamic_import_and_close_loops_do_not_exhaust_tracking(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import importlib
+plt = importlib.import_module('matplotlib.pyplot')
+for index in range(40):
+    temporary = plt.figure(figsize=(1, 1), dpi=20)
+    plt.close(temporary)
+figure = plt.figure(figsize=(2, 1), dpi=40)
+""")
+        self.assertEqual(len(result["displays"]), 1)
+        self.png(result["displays"][0], (80, 40))
+
+    def test_automatic_plots_use_shared_display_count_and_cleanup_on_refusal(self):
+        self.need("matplotlib")
+        result, _ = self.bad("""
+import matplotlib.pyplot as plt
+figure = plt.figure(figsize=(1, 1), dpi=20)
+for index in range(32):
+    display(index)
+""", "EVAL_DISPLAY_LIMIT")
+        self.assertEqual(len(result["displays"]), 32)
+        self.assertEqual(self.good("plt.get_fignums()")[0]["result"], "[]")
+
+    def test_non_agg_backend_is_not_automatically_captured_or_closed(self):
+        self.need("matplotlib", "PIL")
+        result, _ = self.good("""
+import matplotlib
+matplotlib.use('svg')
+import matplotlib.pyplot as plt
+figure = plt.figure(figsize=(2, 1), dpi=40)
+""")
+        self.assertEqual(result["displays"], [])
+        later, _ = self.good("""
+assert matplotlib.get_backend().casefold() == 'svg'
+assert plt.fignum_exists(figure.number)
+display(figure)
+assert matplotlib.get_backend().casefold() == 'svg'
+plt.close(figure)
+""")
+        self.png(later["displays"][0], (80, 40))
+
+    def test_plot_draw_callback_cannot_create_unbounded_finalization_figures(self):
+        self.need("matplotlib")
+        result, _ = self.bad("""
+import matplotlib.pyplot as plt
+figure = plt.figure(figsize=(2, 1), dpi=40)
+def recurse(event):
+    plt.figure()
+connection = figure.canvas.mpl_connect('draw_event', recurse)
+""", "EVAL_DISPLAY_REENTRANT")
+        self.assertEqual(result["displays"], [])
+        later, _ = self.good("""
+assert plt.get_fignums() == []
+figure.canvas.mpl_disconnect(connection)
+display(figure)
+""")
+        self.assertEqual(len(later["displays"]), 1)
+
+    def test_open_figure_limit_fails_before_registering_an_extra_manager(self):
+        self.need("matplotlib")
+        result, _ = self.bad("""
+import matplotlib.pyplot as plt
+plt.rcParams['figure.max_open_warning'] = 0
+for index in range(33):
+    plt.figure(index + 1, figsize=(1, 1), dpi=20)
+""", "at most 32 open cell-owned figures")
+        self.assertEqual(len(result["displays"]), 32)
+        later, _ = self.good("assert plt.get_fignums() == []")
+        self.assertEqual(later["displays"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -32,6 +32,25 @@ fn available() -> bool {
     found
 }
 
+fn matplotlib_available() -> bool {
+    if !available() {
+        return false;
+    }
+    let python = std::env::var("PI_EVAL_PYTHON").unwrap_or_else(|_| "python3".into());
+    let found = std::process::Command::new(python)
+        .args(["-c", "import matplotlib.pyplot"])
+        .env("MPLBACKEND", "Agg")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !found {
+        eprintln!("Skipping automatic pyplot workflow: optional Matplotlib unavailable");
+    }
+    found
+}
+
 fn text(output: &ToolOutput) -> String {
     output.content.iter().filter_map(|block| match block {
         ContentBlock::Text(text) => Some(text.text.as_str()),
@@ -213,4 +232,67 @@ Picture()
     assert_eq!(details["displays"][0]["width"], 2);
     assert_eq!(details["displays"][0]["height"], 1);
     assert!(!details.to_string().contains(&images[0].data));
+}
+
+#[test]
+fn automatic_pyplot_output_reaches_native_images_and_retains_closed_figure() {
+    if !matplotlib_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tool = EvalTool::new(dir.path());
+    run(async {
+        let first = cell(
+            &tool,
+            r#"
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+figure, axes = plt.subplots(figsize=(2, 1), dpi=40)
+axes.plot([0, 1], [1, 0])
+plt.show()
+"#,
+        )
+        .await;
+        assert!(!first.is_error, "{}", text(&first));
+        assert_eq!(first.content.iter().filter(|block| matches!(block, ContentBlock::Image(_))).count(), 1);
+        assert_eq!(first.details.as_ref().unwrap()["displays"][0]["width"], 80);
+        let retained = cell(
+            &tool,
+            "assert plt.get_fignums() == []; axes.set_title('edited'); figure",
+        )
+        .await;
+        assert!(!retained.is_error, "{}", text(&retained));
+        assert_eq!(retained.details.as_ref().unwrap()["restarted"], false);
+        assert_eq!(retained.content.iter().filter(|block| matches!(block, ContentBlock::Image(_))).count(), 1);
+    });
+}
+
+#[test]
+fn failed_python_cell_keeps_automatic_plot_and_cleans_its_manager() {
+    if !matplotlib_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tool = EvalTool::new(dir.path());
+    run(async {
+        let failed = cell(
+            &tool,
+            r#"
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+figure = plt.figure(figsize=(2, 1), dpi=40)
+raise RuntimeError('original plotting cell failed')
+"#,
+        )
+        .await;
+        assert!(failed.is_error);
+        assert!(text(&failed).contains("original plotting cell failed"));
+        assert!(failed.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+        let later = cell(&tool, "assert plt.get_fignums() == []; 42").await;
+        assert!(!later.is_error, "{}", text(&later));
+        assert_eq!(text(&later).trim(), "42");
+        assert!(!later.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+    });
 }
