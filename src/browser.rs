@@ -165,7 +165,8 @@ impl Tool for BrowserTool {
          this conversation's browser state and requests owned-process cleanup, never stopping an \
          externally attached browser. Four namespaces are retained without automatic eviction. \
          Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
-         Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused."
+         Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused. \
+         click accepts left/middle/right buttons, left double-clicks and modifier keys; sequences never replay after interruption. Dispatch acknowledgement does not verify the application's outcome."
     }
 
     fn parameters(&self) -> Value {
@@ -189,6 +190,9 @@ impl Tool for BrowserTool {
                 "selector": {"type": "string", "description": "CSS or snapshot @eN; also text/, label/, placeholder/, testid/, alt/, title/ and role/button[name=\"Save\" exact]. Semantic selectors are case-sensitive, bounded to 16 KiB and require one matching element; text-like names normalize whitespace and match substrings, testid matches data-testid exactly. Role/label use Chromium accessible names, not field values. Semantic selectors work on click/type/fill/press/wait_for/select_option/set_checked/upload and frame-scoped scroll, not inspection/export/download actions. Frame references require the same tab and frame; scoped press/scroll require selector."},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
+                "button": {"type":"string","enum":["left","middle","right"],"default":"left","description":"click only: native pointer button. Right opens native page context menus where supported; middle can open links in another tab. Existing tool approvals still apply."},
+                "click_count": {"type":"integer","enum":[1,2],"default":1,"description":"click only: 2 sends a native left double-click (two press/release pairs with increasing clickCount). Right/middle require 1. A changed document or detached original node stops remaining input; completed effects are not undone or retried."},
+                "modifiers": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","enum":["Alt","Control","Meta","Shift"]},"description":"click only: modifier flags on each native pointer event, not sticky keyboard presses. Distinct names only. Defaults to []."},
                 "diagnostics": {
                     "type": "object", "additionalProperties": false,
                     "description": "Opt-in native console/exception capture around a main-document action, or options for action:diagnostics. Requires an explicit tab. Records only admitted main-world contexts; includes buffered console entries when Chromium supplies them. Object previews/getters are never read. Free-form console text can contain application secrets. Bounded latest records appear in details.diagnostics and text; failures remain errors and work is never replayed. Unsupported with frame, lifecycle, handle_dialog, uploads, downloads or exports. No persistent/background subscription.",
@@ -272,8 +276,9 @@ impl BrowserTool {
     ) -> Result<ToolOutput> {
         let action = required(args, "action")?;
         let semantic_selector = interaction::selectors::validate_input(args)?;
+        let configured_pointer = interaction::pointer::validate_input(args)?;
         if self.is_mock() {
-            if semantic_selector || matches!(
+            if semantic_selector || configured_pointer || matches!(
                 action,
                 "start"
                     | "status"

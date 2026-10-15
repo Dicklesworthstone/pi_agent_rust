@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub(super) mod forms;
 mod frame_input;
+pub(super) mod pointer;
 pub(super) mod selectors;
 pub(super) mod upload;
 
@@ -428,33 +429,7 @@ pub(super) async fn execute(
     )
     .await?;
     match action {
-        "click" => {
-            let (x, y) = if scoped {
-                frame_input::click_point(owner, cdp, id).await?
-            } else {
-                let point = element_call(owner, cdp, id, "point", json!({})).await?;
-                let x = point["x"]
-                    .as_f64()
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| {
-                        Error::tool("browser", "element has no clickable x coordinate")
-                    })?;
-                let y = point["y"]
-                    .as_f64()
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| {
-                        Error::tool("browser", "element has no clickable y coordinate")
-                    })?;
-                (x, y)
-            };
-            for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
-                cdp.command(owner, "Input.dispatchMouseEvent", json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1})).await?;
-            }
-            Ok(output(
-                format!("Clicked element {selector} in tab {tab}"),
-                json!({"action": action, "selector": selector, "tab": tab, "backend": "cdp"}),
-            ))
-        }
+        "click" => pointer::click(owner, cdp, tab, id, args).await,
         "type" | "fill" => {
             let text = required(args, "text")?;
             element_call(owner, cdp, id, "edit", json!({"replace": action == "fill"})).await?;
