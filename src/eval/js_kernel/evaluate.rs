@@ -8,6 +8,8 @@
 
 use rquickjs::{Ctx, Function, Persistent, Value};
 
+mod imports;
+
 pub(super) struct Evaluator {
     // Capture the intrinsic before the first cell. A cell replacing the global
     // Function must not turn our parse-only probe into arbitrary execution.
@@ -52,6 +54,14 @@ impl Evaluator {
             }
             Err(error) => return Err(error),
         };
+        // Lower only before the first evaluation. A runtime SyntaxError must
+        // never cause a second execution of a cell or its dependencies.
+        let prepared = if needs_async {
+            imports::prepare(code).map_err(|error| rquickjs::Exception::throw_message(ctx, error))?
+        } else {
+            None
+        };
+        let code = prepared.as_deref().unwrap_or(code);
         let mut options = rquickjs::context::EvalOptions::default();
         options.promise = needs_async;
         // Preserve the real origin for stacks and dynamic imports, including
