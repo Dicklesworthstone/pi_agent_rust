@@ -47,19 +47,36 @@ peer messaging. Sending messages remains on the unchanged messaging envelope.
 
 ## Bounds and execution model
 
-The first implementation accepts complete result documents up to 128 KiB of
-encoded JSON, including metadata and escaping. Larger documents fail with
-`PI_HUB_IPC_RESULT_LIMIT`; request a smaller structured field. It never returns
-a silently truncated JSON value. The existing `read` line offset and limit
-apply after the complete virtual document arrives. The reference is bounded to
-4096 bytes; the inherited transport retains its 64 KiB request and 256 KiB
-response-frame ceilings.
+Result documents may occupy up to 2 MiB of encoded JSON, including metadata
+and escaping. Small results (up to 128 KiB) use one complete reply. Larger
+results stream in UTF-8-safe pages containing at most 16 KiB of content each,
+on the same authenticated connection. Metadata is capped at 32 KiB encoded
+and appears only in the first page. The reference remains bounded to 4096
+bytes; the transport retains its 64 KiB request and 256 KiB per-frame ceilings.
+Oversized documents or metadata fail with `PI_HUB_IPC_RESULT_LIMIT`.
+
+One request freezes one already-redacted result document. Pages do not repeat
+the result lookup, decoding or redaction, and they do not gain fresh time
+budgets. A connection owns its snapshot and releases it on completion,
+disconnect, revocation or timeout. There is no global transfer cache or cursor
+that another child can reuse. At most the existing eight admitted connections
+per child can retain such snapshots; the page buffer is separately bounded.
+
+The receiver checks offsets, total length, reference identity, first-page
+metadata and a SHA-256 fingerprint over the complete document. Reordered,
+duplicated, corrupt, incomplete, or inconsistently terminated streams fail;
+an error never becomes a partial JSON result. The fingerprint checks content
+consistency, not reader authorization, which remains the channel's job.
+Only a complete, verified virtual document reaches `read` line offset/limit
+pagination. Root-process local result retention limits are unchanged.
 
 The existing URL router is synchronous. Its result-channel client therefore
 uses nonblocking local TCP with short bounded idle waits, not a nested async
 runtime or a detached helper thread. One monotonic budget, at most five seconds
 and capped by the caller's inherited deadline, covers connect/write/read.
 Cancellation is checked throughout, including before returning the document.
+The parent also rechecks the bound reader's live process identity while
+publishing a result stream. All pages share the original read budget.
 Connection setup is capped at 100 ms and restricted to the validated IPv4
 loopback address; no DNS, proxy or remote host is involved. An unsuccessful
 request is not automatically replayed. A slow parent can time out; parent-side
@@ -70,9 +87,13 @@ local result locking/decoding retains its existing cooperative behavior.
 The result-channel tests cover closed envelopes, credential refusal, process
 revocation, JSON-escaped size limits, fragmented UTF-8 responses, mismatch and
 incomplete-response rejection, and pre-connect cancellation/deadline checks.
-A Unix native-chain fixture launches a real Rust test subprocess that invokes
+Unix native-chain fixtures launch a real Rust test subprocess that invokes
 the public `ReadTool` through its inherited parent channel, checks pagination,
 and verifies missing-field errors after a previous native worker was accepted.
+The larger fixture passes an approximately 160 KiB UTF-8 result through the
+same real worker and `ReadTool` path. Additional stream tests cover exact
+reconstruction, UTF-8 boundaries, corrupt fingerprints, invalid offsets and
+headers, early completion, truncated sockets and reader revocation.
 The subprocess helper is intentionally ignored except when launched by that
 fixture; no parent-process environment mutation is used.
 

@@ -76,7 +76,7 @@ fn document_limit_counts_json_escaping_and_preserves_complete_payloads() {
     assert!(reference_valid(&"r".repeat(MAX_REFERENCE_BYTES + 1)).is_err());
 }
 
-fn serve(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<()>) {
+pub(super) fn serve(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
@@ -140,7 +140,7 @@ fn mismatched_oversized_and_incomplete_responses_are_not_documents() {
     event("bad-result-response");
     let error = request_response(WireResponse::Ok(document("different-peer/value", "wrong result"))).unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_PROTOCOL"));
-    let error = request_response(WireResponse::Ok(document("peer-1/value", &"x".repeat(MAX_DOCUMENT_BYTES)))).unwrap_err();
+    let error = request_response(WireResponse::Ok(document("peer-1/value", &"x".repeat(MAX_COMPLETE_BYTES)))).unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_RESULT_LIMIT"));
     let (address, handle) = serve(b"{\"status\":\"ok\"".to_vec());
     let owner = AgentCx::for_testing_with_io();
@@ -196,6 +196,8 @@ fn native_reader_process() {
     assert!(text.contains("beta") && !text.contains("alpha") && !text.contains("gamma"));
     let missing = crate::url_router::resolve(&format!("agent://{id}/missing"), &root).unwrap_err();
     assert!(missing.to_string().contains("PI_URL_AGENT_FIELD_NOT_FOUND"));
+    let full = crate::url_router::resolve(&format!("agent://{id}/answer"), &root).unwrap();
+    assert_eq!(full.content, std::fs::read_to_string(root.join("expected-answer.txt")).unwrap());
     let event = json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
         "content":[{"type":"text","text":"accepted peer result read through native channel"}]}]});
     std::fs::write(root.join("reader-result.jsonl"), format!("{event}\n")).unwrap();
@@ -204,6 +206,19 @@ fn native_reader_process() {
 #[cfg(unix)]
 #[test]
 fn native_chain_reads_accepted_sibling_result() {
+    run_native_chain("alpha\nbeta\ngamma");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_chain_reads_large_sibling_result_without_reopening_or_truncation() {
+    let answer = format!("alpha\nbeta\ngamma\n{}", "雪🙂x".repeat(20_000));
+    assert!(answer.len() > MAX_COMPLETE_BYTES);
+    run_native_chain(&answer);
+}
+
+#[cfg(unix)]
+fn run_native_chain(answer: &str) {
     use crate::subagents::SubagentTool;
     use crate::tools::Tool;
     use std::os::unix::fs::PermissionsExt;
@@ -213,6 +228,10 @@ fn native_chain_reads_accepted_sibling_result() {
     let global = dir.path().join("global");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(global.join("agents")).unwrap();
+    std::fs::write(root.join("expected-answer.txt"), answer).unwrap();
+    let terminal = json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
+        "content":[{"type":"text","text":json!({"answer":answer}).to_string()}]}]});
+    std::fs::write(root.join("seed-result.jsonl"), format!("{terminal}\n")).unwrap();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let seed = format!("seed{suffix}");
     let reader = format!("reader{suffix}");
@@ -231,7 +250,7 @@ set -eu
 for arg do task="$arg"; done
 case "$task" in
   'Task: SEED')
-    printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","stopReason":"stop","content":[{{"type":"text","text":"{{\"answer\":\"alpha\\nbeta\\ngamma\"}}"}}]}}]}}'
+    cat seed-result.jsonl
     ;;
   *)
     PI_RESULT_READER_FIXTURE={root} PI_RESULT_READER_SEED='{seed}' {executable} --exact agent_hub::ipc::results::tests::native_reader_process --ignored --nocapture > reader-harness.log 2>&1

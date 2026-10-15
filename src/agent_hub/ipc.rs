@@ -387,6 +387,7 @@ struct Connection {
     output: Option<Vec<u8>>,
     written: usize,
     deadline: Instant,
+    result_stream: Option<results::Transfer>,
 }
 
 impl Connection {
@@ -397,6 +398,7 @@ impl Connection {
             output: None,
             written: 0,
             deadline: Instant::now() + EXCHANGE_TIMEOUT,
+            result_stream: None,
         }
     }
 
@@ -412,15 +414,34 @@ impl Connection {
         let mut encoded = encoded;
         encoded.push(b'\n');
         self.output = Some(encoded);
+        self.written = 0;
     }
 
     fn refuse(&mut self, code: &str, message: &str) {
         self.set_response(&WireResponse::Error(ipc_error(code, message).to_string()));
     }
 
+    fn advance_result(&mut self) -> bool {
+        let Some(stream) = self.result_stream.as_mut() else { return false; };
+        match stream.next_response() {
+            Ok(Some(response)) => self.set_response(&response),
+            Ok(None) => return false,
+            Err(error) => {
+                self.result_stream = None;
+                self.set_response(&results::WireResponse::Error(error.to_string()));
+            }
+        }
+        true
+    }
+
     #[allow(clippy::option_if_let_else)]
     fn poll(&mut self, sender: &str, token: &str, owner: &AgentCx, deadline: Instant) -> bool {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
+            return false;
+        }
+        // The identity is connection-owned, not supplied by a page cursor.
+        // Mid-frame revocation closes the socket; the client discards partials.
+        if self.result_stream.as_ref().is_some_and(|stream| stream.check_reader().is_err()) {
             return false;
         }
         if self.output.is_none() {
@@ -449,7 +470,13 @@ impl Connection {
                                     let response = results::dispatch_authenticated(
                                         sender, token, request, owner,
                                     );
-                                    self.set_response(&results::WireResponse::from(response));
+                                    match response {
+                                        Ok(stream) => {
+                                            self.result_stream = Some(stream);
+                                            if !self.advance_result() { return false; }
+                                        }
+                                        Err(error) => self.set_response(&results::WireResponse::Error(error.to_string())),
+                                    }
                                 }
                                 Ok(Incoming::Message(request)) => {
                                     let response = dispatch_authenticated(sender, token, request, owner);
@@ -474,14 +501,16 @@ impl Connection {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
             return false;
         }
-        if let Some(output) = &self.output {
-            for _ in 0..IO_CHUNKS_PER_POLL {
-                let end = self.written.saturating_add(4096).min(output.len());
+        for _ in 0..IO_CHUNKS_PER_POLL {
+            if let Some(output) = &self.output {
+                let total = output.len();
+                let end = self.written.saturating_add(4096).min(total);
                 match self.socket.write(&output[self.written..end]) {
                     Ok(0) => return false,
                     Ok(count) => {
                         self.written += count;
-                        if self.written == output.len() {
+                        if self.written == total {
+                            if self.advance_result() { continue; }
                             let _ = self.socket.shutdown(Shutdown::Both);
                             return false;
                         }

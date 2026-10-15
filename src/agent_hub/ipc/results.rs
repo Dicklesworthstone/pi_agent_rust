@@ -16,11 +16,15 @@ use serde_json::Value;
 use super::{EXCHANGE_TIMEOUT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, VERSION, inherited_endpoint, ipc_error, matches_token, registry};
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::{AgentHubRegistry, ChildStatus};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::url_router::{ResolvedDoc, URL_ROUTER_SCHEMA};
 
+mod stream;
+pub(super) use stream::Transfer;
+
 const MAX_REFERENCE_BYTES: usize = 4096;
-const MAX_DOCUMENT_BYTES: usize = 128 * 1024;
+const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMPLETE_BYTES: usize = 128 * 1024;
 const IDLE_POLL: Duration = Duration::from_millis(2);
 const CONNECT_LIMIT: Duration = Duration::from_millis(100);
 
@@ -42,7 +46,7 @@ pub(super) struct WireRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Document {
+pub(crate) struct Document {
     reference: String,
     content: String,
     content_type: String,
@@ -65,18 +69,10 @@ impl Document {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", content = "payload", rename_all = "camelCase")]
-pub(super) enum WireResponse {
+pub(crate) enum WireResponse {
     Ok(Document),
+    Page(stream::Page),
     Error(String),
-}
-
-impl From<Result<Document>> for WireResponse {
-    fn from(result: Result<Document>) -> Self {
-        match result {
-            Ok(document) => Self::Ok(document),
-            Err(error) => Self::Error(error.to_string()),
-        }
-    }
 }
 
 fn reference_valid(reference: &str) -> Result<()> {
@@ -115,7 +111,7 @@ pub(super) fn dispatch_authenticated(
     token: &str,
     request: WireRequest,
     owner: &AgentCx,
-) -> Result<Document> {
+) -> Result<Transfer> {
     if request.version != VERSION || !matches_token(token, &request.token) {
         return Err(ipc_error("AUTH", "invalid result-read credential or protocol version"));
     }
@@ -138,24 +134,16 @@ pub(super) fn dispatch_authenticated(
         content_type: resolved.content_type,
         metadata,
     };
-    enforce_document_limit(&document)?;
-    Ok(document)
+    let transfer = Transfer::new(document, sender, identity)?;
+    check_owner(owner)?;
+    transfer.check_reader()?;
+    Ok(transfer)
 }
 
 fn enforce_document_limit(document: &Document) -> Result<()> {
-    struct Counter(usize);
-    impl io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > MAX_DOCUMENT_BYTES.saturating_sub(self.0) {
-                return Err(io::Error::other("result document limit"));
-            }
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
-    }
-    serde_json::to_writer(&mut Counter(0), document)
-        .map_err(|_| ipc_error("RESULT_LIMIT", "agent result exceeds 128 KiB encoded; select a smaller JSON field"))
+    stream::encoded_size(document, MAX_DOCUMENT_BYTES)
+        .map(|_| ())
+        .ok_or_else(|| ipc_error("RESULT_LIMIT", "agent result exceeds 2 MiB encoded; select a smaller JSON field"))
 }
 
 /// Resolve from the configured immediate parent, never a local fallback.
@@ -224,6 +212,7 @@ fn resolve_at(
         .map_err(|_| ipc_error("UNAVAILABLE", "cannot configure parent result channel"))?;
     let mut written = 0;
     let mut response = Vec::new();
+    let mut collector = stream::Collector::new(reference);
     loop {
         remaining(owner, deadline)?;
         let mut progressed = false;
@@ -244,24 +233,21 @@ fn resolve_at(
                     return Err(ipc_error("LIMIT", "parent result response exceeds the frame limit"));
                 }
                 response.extend_from_slice(&chunk[..count]);
-                if let Some(end) = response.iter().position(|byte| *byte == b'\n') {
+                while let Some(end) = response.iter().position(|byte| *byte == b'\n') {
                     remaining(owner, deadline)?;
-                    if end + 1 != response.len() || written != frame.len() {
+                    if written != frame.len() {
                         return Err(ipc_error("PROTOCOL", "invalid result response framing"));
                     }
-                    let response: WireResponse = serde_json::from_slice(&response[..end])
+                    let message: WireResponse = serde_json::from_slice(&response[..end])
                         .map_err(|_| ipc_error("PROTOCOL", "parent returned an invalid result document"))?;
-                    return match response {
-                        WireResponse::Error(error) => Err(Error::tool("read", error)),
-                        WireResponse::Ok(document) => {
-                            if document.reference != reference || !document.metadata.is_object() {
-                                return Err(ipc_error("PROTOCOL", "parent returned a mismatched result document"));
-                            }
-                            enforce_document_limit(&document)?;
-                            remaining(owner, deadline)?;
-                            Ok(document.into_resolved())
+                    response.drain(..=end);
+                    if let Some(document) = collector.push(message)? {
+                        if !response.is_empty() {
+                            return Err(ipc_error("PROTOCOL", "trailing data after the completed agent result"));
                         }
-                    };
+                        remaining(owner, deadline)?;
+                        return Ok(document.into_resolved());
+                    }
                 }
             }
             Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
