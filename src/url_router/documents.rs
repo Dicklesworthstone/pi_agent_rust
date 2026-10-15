@@ -1,0 +1,2025 @@
+//! Internal URL scheme router (bd-cv653.6.3).
+//!
+//! FS-shaped tools resolve internal schemes into virtual documents with
+//! the same shape as local reads: `read skill://name` returns the skill
+//! file; `read conflict://1 @theirs` resolves a merge conflict by writing
+//! one selector; `read ssh://host/path` cats a remote path.
+//!
+//! v1 schemes: `skill://`, `prompt://`, `local://`, `conflict://`,
+//! `pr://` / `issue://` (+ `pr://.../diff/N`), `ssh://`. Blocked on
+//! dependencies and documented in module docs only: `agent://` (needs the
+//! bd-cv653.5.3 child registry), `vault://` (needs the bd-cv653.7.9
+//! placeholder vault). Unknown schemes error with the registered list —
+//! resolution NEVER silently falls back to the filesystem.
+//!
+//! `ssh://` workspace surface (bd-cv653.6.5): reads are open to any
+//! reachable host; writes/edits require the host in `~/.ssh/config` or
+//! `PI_SSH_ALLOWED_HOSTS`; auth is BatchMode-only (never interactive);
+//! host keys use accept-new-then-strict with hard failure + remediation on
+//! change; writes stage atomically (mktemp + rename, permissions preserved
+//! via `cp -p`); edits verify the original bytes after upload under a remote
+//! Pi write lock before replacing the file; transfers resume from existing
+//! target prefixes and verify
+//! final sizes. Heavy remote trees are better served by an explicit SSHFS
+//! mount (`sshfs host:path mnt`) — documented degradation: pi then sees a
+//! local FS with network latency and no atomic-replace guarantees across
+//! the mount, so prefer the scheme tools for correctness-critical edits.
+//!
+
+use std::io::{Seek as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::error::{Error, Result};
+
+/// Tool-result schema tag for scheme resolutions.
+pub const URL_ROUTER_SCHEMA: &str = "pi.url_router.v1";
+
+/// ssh cat cap (a remote read should never be unbounded).
+const SSH_MAX_BYTES: usize = 1024 * 1024;
+
+/// A resolved virtual document.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedDoc {
+    pub schema: String,
+    pub scheme: String,
+    pub reference: String,
+    pub content: String,
+    pub content_type: String,
+    pub metadata: serde_json::Value,
+    /// True when line selectors (:50-200, offset/limit) apply.
+    pub line_addressable: bool,
+}
+
+/// Registered v1 schemes (for error messages).
+const SCHEMES: &[&str] = &["skill", "prompt", "local", "conflict", "pr", "issue", "ssh"];
+
+/// Parse `scheme://rest` into (scheme, rest).
+fn split_scheme(path: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = path.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some((scheme, rest))
+}
+
+/// True when a path is scheme-shaped (`x://...`).
+///
+/// Routes through the router (which errors on unknown schemes with the
+/// registered list — never a silent filesystem fallback). `file://` stays
+/// on the filesystem.
+#[must_use]
+pub fn has_scheme(path: &str) -> bool {
+    split_scheme(path).is_some_and(|(scheme, _)| scheme != "file")
+}
+
+/// Resolution-time overrides (tests stub the gh backend through these).
+#[derive(Debug, Clone, Default)]
+pub struct ResolveOptions {
+    /// `gh` binary override (the github stub path in tests).
+    pub gh_binary: Option<String>,
+}
+
+/// Resolve a scheme path into a virtual document with default options.
+///
+/// # Errors
+/// Unknown scheme → error listing registered schemes; unresolvable ref →
+/// named error with a hint. Never falls back to the filesystem.
+pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    resolve_with(path, cwd, &ResolveOptions::default())
+}
+
+/// Resolve with explicit overrides.
+///
+/// # Errors
+/// See [`resolve`].
+pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<ResolvedDoc> {
+    let Some((scheme, rest)) = split_scheme(path) else {
+        return Err(Error::tool(
+            "read",
+            format!("PI_URL_NO_SCHEME: '{path}' is not a scheme URL"),
+        ));
+    };
+    match scheme {
+        "skill" => resolve_skill(rest, cwd),
+        "prompt" => resolve_prompt(rest, cwd),
+        "local" => resolve_local(rest),
+        "conflict" => resolve_conflict(rest, cwd),
+        "pr" | "issue" => resolve_github(scheme, rest, cwd, options),
+        "ssh" => resolve_ssh(rest),
+        other => Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNKNOWN_SCHEME: unknown scheme '{other}://'. Registered schemes: {}",
+                SCHEMES
+                    .iter()
+                    .map(|s| format!("{s}://"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+fn doc(
+    scheme: &str,
+    reference: &str,
+    content: String,
+    content_type: &str,
+    metadata: serde_json::Value,
+) -> ResolvedDoc {
+    ResolvedDoc {
+        schema: URL_ROUTER_SCHEMA.to_string(),
+        scheme: scheme.to_string(),
+        reference: reference.to_string(),
+        content,
+        content_type: content_type.to_string(),
+        metadata,
+        line_addressable: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// skill:// and prompt:// via the resources loader
+// ---------------------------------------------------------------------------
+
+fn diagnostic_matches_named_resource(
+    diagnostic: &crate::resources::ResourceDiagnostic,
+    name: &str,
+    roots: &[PathBuf],
+) -> bool {
+    if diagnostic.kind != crate::resources::DiagnosticKind::Warning
+        || diagnostic.collision.is_some()
+    {
+        return false;
+    }
+    let path = &diagnostic.path;
+    let file_stem_matches = path.file_stem().and_then(|part| part.to_str()) == Some(name);
+    let skill_parent_matches = path.file_name().and_then(|part| part.to_str()) == Some("SKILL.md")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str())
+            == Some(name);
+    file_stem_matches || skill_parent_matches || roots.iter().any(|root| path == root)
+}
+
+fn resource_diagnostic_error(
+    resource_kind: &str,
+    name: &str,
+    diagnostic: &crate::resources::ResourceDiagnostic,
+) -> Error {
+    Error::tool(
+        "read",
+        format!(
+            "PI_URL_RESOURCE_INVALID: {resource_kind} '{name}' could not be loaded from '{}': {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        ),
+    )
+}
+
+fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    let agent_dir = crate::config::Config::global_dir();
+    let roots = [
+        cwd.join(crate::config::Config::project_dir())
+            .join("skills"),
+        agent_dir.join("skills"),
+    ];
+    let skills = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir,
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+    let Some(skill) = skills.skills.iter().find(|skill| skill.name == name) else {
+        if let Some(diagnostic) = skills
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic_matches_named_resource(diagnostic, name, &roots))
+        {
+            return Err(resource_diagnostic_error("skill", name, diagnostic));
+        }
+        let known: Vec<&str> = skills.skills.iter().map(|s| s.name.as_str()).collect();
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: no skill named '{name}'. Available: {}",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
+        ));
+    };
+    resolve_skill_document(name, skill)
+}
+
+fn resolve_skill_document(name: &str, skill: &crate::resources::Skill) -> Result<ResolvedDoc> {
+    let content = crate::resources::read_resource_file_bounded(&skill.file_path, "Skill").map_err(
+        |error| {
+            Error::tool(
+                "read",
+                format!("PI_URL_RESOURCE_INVALID: failed to read skill '{name}': {error}"),
+            )
+        },
+    )?;
+    Ok(doc(
+        "skill",
+        name,
+        content,
+        "text/markdown",
+        serde_json::json!({
+            "path": skill.file_path.display().to_string(),
+            "source": skill.source,
+            "description": skill.description,
+        }),
+    ))
+}
+
+fn resolve_prompt(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    let agent_dir = crate::config::Config::global_dir();
+    let roots = [
+        cwd.join(crate::config::Config::project_dir())
+            .join("prompts"),
+        agent_dir.join("prompts"),
+    ];
+    let result = crate::resources::load_prompt_templates_with_diagnostics(
+        crate::resources::LoadPromptTemplatesOptions {
+            cwd: cwd.to_path_buf(),
+            agent_dir,
+            prompt_paths: Vec::new(),
+            include_defaults: true,
+        },
+    );
+    let Some(template) = result
+        .templates
+        .iter()
+        .find(|template| template.name == name)
+    else {
+        if let Some(diagnostic) = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic_matches_named_resource(diagnostic, name, &roots))
+        {
+            return Err(resource_diagnostic_error(
+                "prompt template",
+                name,
+                diagnostic,
+            ));
+        }
+        let known: Vec<&str> = result
+            .templates
+            .iter()
+            .map(|template| template.name.as_str())
+            .collect();
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: no prompt template named '{name}'. Available: {}",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
+        ));
+    };
+    Ok(doc(
+        "prompt",
+        name,
+        template.content.clone(),
+        "text/markdown",
+        serde_json::json!({
+            "path": template.file_path.display().to_string(),
+            "description": template.description,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// local:// session scratch documents
+// ---------------------------------------------------------------------------
+
+fn scratch_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static STORE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    &STORE
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn resolve_local(name: &str) -> Result<ResolvedDoc> {
+    let store = scratch_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(content) = store.get(name) else {
+        let known: Vec<&String> = store.keys().collect();
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: no local scratch document '{name}'. Present: {}",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ));
+    };
+    Ok(doc(
+        "local",
+        name,
+        content.clone(),
+        "text/plain",
+        serde_json::json!({ "scratch": true }),
+    ))
+}
+
+/// Write a local:// scratch document (session-scoped).
+///
+/// # Errors
+/// Named validation error for empty names.
+pub fn write_local(name: &str, content: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::validation(
+            "local:// scratch name must be non-empty".to_string(),
+        ));
+    }
+    scratch_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_string(), content.to_string());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// conflict:// merge-conflict regions
+// ---------------------------------------------------------------------------
+
+/// One parsed conflict region.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictRegion {
+    pub index: usize,
+    pub file: String,
+    pub ours_label: String,
+    pub theirs_label: String,
+    pub ours: String,
+    pub theirs: String,
+    pub base: String,
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| Error::tool("read", format!("Failed to run git: {e}")))?;
+    if !output.status.success() {
+        return Err(Error::tool(
+            "read",
+            format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parse all <<<<<<< regions in one file (2-way markers; base from
+/// diff3-style ||||||| section when present).
+fn parse_conflicts(file: &Path, relative: &str, start_index: usize) -> Vec<ConflictRegion> {
+    let Ok(content) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let mut regions = Vec::new();
+    let mut ours_label = String::new();
+    let mut ours = String::new();
+    let mut theirs = String::new();
+    let mut base = String::new();
+    let mut section: Option<&str> = None;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("<<<<<<<") {
+            ours_label = rest.trim().to_string();
+            section = Some("ours");
+            ours.clear();
+            theirs.clear();
+            base.clear();
+            continue;
+        }
+        if line.starts_with("|||||||") && section == Some("ours") {
+            section = Some("base");
+            continue;
+        }
+        if line.starts_with("=======") && matches!(section, Some("ours" | "base")) {
+            section = Some("theirs");
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(">>>>>>>")
+            && section == Some("theirs")
+        {
+            regions.push(ConflictRegion {
+                index: start_index + regions.len(),
+                file: relative.to_string(),
+                ours_label: std::mem::take(&mut ours_label),
+                theirs_label: rest.trim().to_string(),
+                ours: std::mem::take(&mut ours),
+                theirs: std::mem::take(&mut theirs),
+                base: std::mem::take(&mut base),
+            });
+            section = None;
+            continue;
+        }
+        match section {
+            Some("ours") => {
+                ours.push_str(line);
+                ours.push('\n');
+            }
+            Some("base") => {
+                base.push_str(line);
+                base.push('\n');
+            }
+            Some("theirs") => {
+                theirs.push_str(line);
+                theirs.push('\n');
+            }
+            _ => {}
+        }
+    }
+    regions
+}
+
+/// List all conflict regions across the repo's unmerged files.
+pub fn conflict_regions(cwd: &Path) -> Result<Vec<ConflictRegion>> {
+    let listing = git_output(cwd, &["diff", "--name-only", "--diff-filter=U"])?;
+    let mut regions = Vec::new();
+    for relative in listing.lines().filter(|line| !line.is_empty()) {
+        let file = cwd.join(relative);
+        let parsed = parse_conflicts(&file, relative, regions.len());
+        regions.extend(parsed);
+    }
+    Ok(regions)
+}
+
+fn resolve_conflict(rest: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    let regions = conflict_regions(cwd)?;
+    if regions.is_empty() {
+        return Err(Error::tool(
+            "read",
+            "PI_URL_UNRESOLVABLE: no merge conflicts in this repo".to_string(),
+        ));
+    }
+    let (index_part, selector) = rest.split_once(' ').map_or((rest, "full"), |(idx, sel)| {
+        (idx, sel.trim_start_matches('@'))
+    });
+    if index_part == "*" {
+        let rendered = regions
+            .iter()
+            .map(|region| {
+                format!(
+                    "### conflict {} in {} (ours: {}, theirs: {})\n--- ours ---\n{}--- theirs ---\n{}",
+                    region.index, region.file, region.ours_label, region.theirs_label, region.ours, region.theirs
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(doc(
+            "conflict",
+            "*",
+            rendered,
+            "text/plain",
+            serde_json::json!({ "count": regions.len() }),
+        ));
+    }
+    let index: usize = index_part.parse().map_err(|_| {
+        Error::validation(format!(
+            "conflict:// index must be a number or '*', got '{index_part}'"
+        ))
+    })?;
+    let Some(region) = regions.iter().find(|region| region.index == index) else {
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: no conflict region {index} (have {})",
+                regions.len()
+            ),
+        ));
+    };
+    let (content, which) = match selector {
+        "ours" => (region.ours.clone(), "ours"),
+        "theirs" => (region.theirs.clone(), "theirs"),
+        "base" => (region.base.clone(), "base"),
+        _ => (
+            format!(
+                "### conflict {} in {} (ours: {}, theirs: {})\n--- ours ---\n{}--- base ---\n{}--- theirs ---\n{}",
+                region.index,
+                region.file,
+                region.ours_label,
+                region.theirs_label,
+                region.ours,
+                region.base,
+                region.theirs
+            ),
+            "full",
+        ),
+    };
+    Ok(doc(
+        "conflict",
+        rest,
+        content,
+        "text/plain",
+        serde_json::to_value(region)?,
+    ))
+    .map(|mut doc| {
+        doc.metadata["selector"] = serde_json::Value::String(which.to_string()); // ubs:ignore Value index assignment never panics
+        doc
+    })
+}
+
+/// Resolve a conflict by writing one side into the file.
+///
+/// # Errors
+/// `PI_URL_UNRESOLVABLE` for unknown regions; IO failures.
+pub fn write_conflict_resolution(cwd: &Path, index: usize, side: &str) -> Result<ConflictRegion> {
+    let regions = conflict_regions(cwd)?;
+    let Some(region) = regions.iter().find(|region| region.index == index) else {
+        return Err(Error::tool(
+            "write",
+            format!(
+                "PI_URL_UNRESOLVABLE: no conflict region {index} (have {})",
+                regions.len()
+            ),
+        ));
+    };
+    let chosen = match side {
+        "ours" => &region.ours,
+        "theirs" => &region.theirs,
+        "base" => &region.base,
+        other => {
+            return Err(Error::validation(format!(
+                "conflict resolution side must be ours, theirs, or base; got '{other}'"
+            )));
+        }
+    };
+    let file = cwd.join(&region.file);
+    let content = std::fs::read_to_string(&file)
+        .map_err(|e| Error::tool("write", format!("Failed to read {}: {e}", region.file)))?;
+    let mut out = String::with_capacity(content.len());
+    let mut skipping = false;
+    let mut in_target = false;
+    let mut occurrence = regions
+        .iter()
+        .filter(|r| r.file == region.file && r.index <= index)
+        .count()
+        .saturating_sub(1);
+    for line in content.lines() {
+        if line.starts_with("<<<<<<<") {
+            skipping = true;
+            in_target = occurrence == 0;
+            if in_target {
+                out.push_str(chosen);
+            }
+            occurrence = occurrence.saturating_sub(1);
+            continue;
+        }
+        if line.starts_with(">>>>>>>") && skipping {
+            skipping = false;
+            in_target = false;
+            continue;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        } else if in_target {
+            continue;
+        }
+        let _ = in_target;
+    }
+    std::fs::write(&file, out)
+        .map_err(|e| Error::tool("write", format!("Failed to write {}: {e}", region.file)))?;
+    Ok(region.clone())
+}
+
+// ---------------------------------------------------------------------------
+// pr:// / issue:// via the gh CLI (same backend as the github tool)
+// ---------------------------------------------------------------------------
+
+fn parse_repo_number(rest: &str) -> Result<(Option<String>, String, Option<String>)> {
+    // Forms: N | owner/repo/N | owner/repo/N/diff | N/diff
+    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err(Error::validation(format!(
+            "pr/issue reference must be <n> or <owner/repo/n>, got '{rest}'"
+        )));
+    }
+    let (number_index, repo) = if parts.len() >= 3 {
+        (2, Some(format!("{}/{}", parts[0], parts[1])))
+    } else {
+        (0, None)
+    };
+    let number = parts
+        .get(number_index)
+        .or_else(|| parts.first())
+        .ok_or_else(|| Error::validation(format!("missing issue/PR number in '{rest}'")))?
+        .to_string();
+    if number.parse::<u64>().is_err() {
+        return Err(Error::validation(format!(
+            "issue/PR number must be numeric, got '{number}'"
+        )));
+    }
+    let sub = parts.get(number_index + 1).map(|s| (*s).to_string());
+    Ok((repo, number, sub))
+}
+
+fn resolve_github(
+    scheme: &str,
+    rest: &str,
+    cwd: &Path,
+    options: &ResolveOptions,
+) -> Result<ResolvedDoc> {
+    let (repo, number, sub) = parse_repo_number(rest)?;
+    let mut args: Vec<String> = if sub.as_deref() == Some("diff") && scheme == "pr" {
+        vec!["pr".to_string(), "diff".to_string(), number.clone()]
+    } else {
+        vec![scheme.to_string(), "view".to_string(), number.clone()]
+    };
+    if let Some(repo) = &repo {
+        args.push("--repo".to_string());
+        args.push(repo.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let gh = options.gh_binary.as_deref().unwrap_or("gh");
+    let output = std::process::Command::new(gh)
+        .args(&arg_refs)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| {
+            Error::tool(
+                "read",
+                format!("PI_URL_BACKEND: failed to run gh (install gh CLI): {e}"),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: gh {} failed: {}",
+                arg_refs.join(" "),
+                stderr.trim()
+            ),
+        ));
+    }
+    let content = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(doc(
+        scheme,
+        rest,
+        content,
+        "text/plain",
+        serde_json::json!({
+            "repo": repo,
+            "number": number,
+            "sub": sub,
+            "backend": "gh",
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// ssh://host/path (read-only cat, size-capped)
+// ---------------------------------------------------------------------------
+
+/// A parsed `ssh://host/path` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub path: String,
+}
+
+fn parse_ssh_reference(rest: &str) -> Result<SshTarget> {
+    let (host, tail) = rest.split_once('/').ok_or_else(|| {
+        Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        ))
+    })?;
+    if host.is_empty() || tail.is_empty() {
+        return Err(Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        )));
+    }
+    if host.starts_with('-') || host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(Error::validation(format!(
+            "PI_SSH_HOST_INVALID: ssh host must not begin with '-' or contain whitespace/control characters: {host:?}"
+        )));
+    }
+
+    let remote_path = format!("/{tail}");
+    if remote_path.split('/').any(|segment| segment == "..") {
+        return Err(Error::validation(format!(
+            "PI_SSH_TRAVERSAL: ssh:// paths must not contain '..' segments: '{rest}'"
+        )));
+    }
+    Ok(SshTarget {
+        host: host.to_string(),
+        path: remote_path,
+    })
+}
+
+fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
+    // split_once consumes the separator, so re-anchor to an absolute path:
+    // `ssh://host/var/www` must cat `/var/www`, not `~/var/www`.
+    let target = parse_ssh_reference(rest)?;
+    let output = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(ssh_capped_read_script(&target.path))
+        .output()
+        .map_err(|e| Error::tool("read", format!("PI_URL_BACKEND: failed to run ssh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::tool(
+            "read",
+            format!(
+                "PI_URL_UNRESOLVABLE: ssh {} cat '{}' failed: {}",
+                target.host,
+                target.path,
+                stderr.trim()
+            ),
+        ));
+    }
+    let content = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(doc(
+        "ssh",
+        rest,
+        content,
+        "text/plain",
+        serde_json::json!({
+            "host": target.host,
+            "path": target.path,
+            "cappedAt": SSH_MAX_BYTES,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// ssh://host/path writes (bd-cv653.6.5): confined hosts, batch-mode auth,
+// accept-new-then-strict host keys, atomic remote staging.
+// ---------------------------------------------------------------------------
+
+/// Parse and validate an `ssh://host/path` URL for a write-side tool.
+///
+/// Rejects non-ssh schemes, empty components, option-shaped or whitespace/
+/// control-bearing hosts, and any `..` path segment so remote staging can
+/// never escape the intended directory or reinterpret a host as an ssh option.
+///
+/// # Errors
+/// Named `PI_SSH_*` validation errors.
+pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
+    let Some(("ssh", rest)) = split_scheme(url) else {
+        return Err(Error::validation(format!(
+            "PI_SSH_TARGET: '{url}' is not an ssh://host/path URL"
+        )));
+    };
+    parse_ssh_reference(rest)
+}
+
+/// Literal host tokens from ssh_config text. Wildcard (`*`, `?`) and
+/// negation (`!host`) patterns never authorize a specific host.
+fn ssh_config_literal_hosts(config_text: &str) -> Vec<String> {
+    config_text
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            if !tokens.next()?.eq_ignore_ascii_case("host") {
+                return None;
+            }
+            Some(
+                tokens
+                    .filter(|pattern| {
+                        !pattern.is_empty()
+                            && !pattern.contains(['*', '?'])
+                            && !pattern.starts_with('!')
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+/// Confinement decision given config text and an explicit allowlist string
+/// (`PI_SSH_ALLOWED_HOSTS`, comma-separated). Pure so tests stay offline.
+fn ssh_host_allowed_with(
+    host: &str,
+    config_text: Option<&str>,
+    env_allowlist: Option<&str>,
+) -> bool {
+    if let Some(env) = env_allowlist
+        && env
+            .split(',')
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(host))
+    {
+        return true;
+    }
+    config_text.is_some_and(|text| {
+        ssh_config_literal_hosts(text)
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(host))
+    })
+}
+
+/// The hosts `ssh://` writes are allowed to (what [`ssh_host_allowed`]
+/// accepts), sorted and deduplicated, for `/ssh`.
+#[must_use]
+pub fn ssh_write_allowed_hosts() -> Vec<String> {
+    let config_path = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".ssh").join("config"),
+        |home| PathBuf::from(home).join(".ssh").join("config"),
+    );
+    let config = std::fs::read_to_string(config_path).ok();
+    let env = std::env::var("PI_SSH_ALLOWED_HOSTS").ok();
+    ssh_write_allowed_hosts_with(config.as_deref(), env.as_deref())
+}
+
+fn ssh_write_allowed_hosts_with(
+    config_text: Option<&str>,
+    env_allowlist: Option<&str>,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = env_allowlist
+        .into_iter()
+        .flat_map(|env| env.split(','))
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .chain(
+            config_text
+                .map(ssh_config_literal_hosts)
+                .unwrap_or_default(),
+        )
+        .collect();
+    hosts.sort_by_key(|host| host.to_ascii_lowercase());
+    hosts.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    hosts
+}
+
+/// Reads are open (any reachable host); **writes** require the host to be
+/// listed literally in `~/.ssh/config` or in `PI_SSH_ALLOWED_HOSTS`.
+pub fn ssh_host_allowed(host: &str) -> bool {
+    let config_path = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".ssh").join("config"),
+        |home| PathBuf::from(home).join(".ssh").join("config"),
+    );
+    let config = std::fs::read_to_string(config_path).ok();
+    let env = std::env::var("PI_SSH_ALLOWED_HOSTS").ok();
+    ssh_host_allowed_with(host, config.as_deref(), env.as_deref())
+}
+
+/// Shared ssh invocation flags.
+///
+/// Disallows interactive auth (BatchMode), bounds connect, and enforces
+/// accept-new-then-strict host keys — a *changed* key still hard-fails and is
+/// classified by [`classify_ssh_failure`].
+///
+/// `PI_SSH_CLIENT_CONFIG_FILE` (optional) appends `-F <path>` so fixture
+/// and live lanes can pin port/user/identity/known_hosts without touching
+/// production behavior (unset by default).
+#[must_use]
+pub fn ssh_command_flags() -> Vec<String> {
+    let mut flags: Vec<String> = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    if let Ok(config) = std::env::var("PI_SSH_CLIENT_CONFIG_FILE")
+        && !config.is_empty()
+    {
+        flags.push("-F".to_string());
+        flags.push(config);
+    }
+    flags
+}
+
+/// Remediation surfaced when a cached host key no longer matches.
+pub const SSH_HOSTKEY_REMEDIATION: &str = "The remote host key differs from the cached entry in ~/.ssh/known_hosts. Verify the change out-of-band; if legitimate, remove the stale entry with `ssh-keygen -R <host>` and retry. Pi refuses to proceed automatically.";
+
+/// Failure taxonomy for ssh stderr text (host-key FSM per bd-cv653.6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureKind {
+    /// Cached key mismatch — always a hard failure with remediation.
+    HostKeyChanged,
+    /// Batch-mode auth rejected (no interactive retry exists).
+    AuthFailed,
+    /// ConnectTimeout elapsed.
+    ConnectTimeout,
+    Other,
+}
+
+#[must_use]
+pub fn classify_ssh_failure(stderr: &str) -> SshFailureKind {
+    let lowered = stderr.to_ascii_lowercase();
+    if lowered.contains("remote host identification has changed")
+        || lowered.contains("host key verification failed")
+        || lowered.contains("offending ecdsa")
+        || lowered.contains("offending ed25519")
+        || lowered.contains("offending rsa")
+    {
+        SshFailureKind::HostKeyChanged
+    } else if lowered.contains("permission denied") {
+        SshFailureKind::AuthFailed
+    } else if lowered.contains("connection timed out") || lowered.contains("timed out") {
+        SshFailureKind::ConnectTimeout
+    } else {
+        SshFailureKind::Other
+    }
+}
+
+/// Quote a single argument for consumption by the *remote* POSIX shell.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn ssh_capped_read_script(remote_path: &str) -> String {
+    format!("head -c {SSH_MAX_BYTES} -- {}", sh_quote(remote_path))
+}
+
+/// POSIX sh snippet writing stdin into `remote_path` atomically.
+///
+/// Uses mktemp in the target directory to keep rename(2) on one filesystem, and
+/// when the target already exists it is copied to the staging file with `cp -p`
+/// FIRST — preserving mode/owner/timestamps portably (GNU chmod's
+/// `--reference` does not exist on BSD/macOS remotes). The EXIT trap
+/// removes the staging file if anything aborts before the rename.
+#[must_use]
+pub fn remote_atomic_write_script(remote_path: &str) -> String {
+    remote_write_script(remote_path, None)
+}
+
+/// Serialize Pi writers and optionally check the original file immediately
+/// before publishing. The digest never puts original file contents in argv.
+/// Other applications need not honor this lock, so this is an optimistic
+/// content check, not a filesystem compare-and-swap against arbitrary writers.
+fn remote_write_script(remote_path: &str, original: Option<&[u8]>) -> String {
+    let quoted = sh_quote(remote_path);
+    // The lock already lives in the destination directory. Hashing only its
+    // entry name makes /dir/file, /dir/./file and directory symlink aliases
+    // acquire the same lock in that physical directory.
+    let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let lock_id = crate::package_manager::hex_encode(&Sha256::digest(name.as_bytes()));
+    let regular_file_guard = if original.is_some() {
+        format!(
+            "if [ ! -f {quoted} ] || [ -L {quoted} ]; then \
+             printf '%s\\n' 'PI_SSH_EDIT_CONFLICT: remote file changed after it was read; re-read before retrying.' >&2; exit 73; fi; "
+        )
+    } else {
+        String::new()
+    };
+    let guard = original.map_or_else(String::new, |original| {
+        let expected = crate::package_manager::hex_encode(&Sha256::digest(original));
+        format!(
+            "{regular_file_guard}\
+             pi_hash() {{ \
+             if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < {quoted}) || return 1; \
+             elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < {quoted}) || return 1; \
+             elif command -v sha256 >/dev/null 2>&1; then h=$(sha256 -q < {quoted}) || return 1; \
+             else return 1; fi; printf '%s\\n' \"${{h%% *}}\"; }}; \
+             if ! actual=$(pi_hash); then \
+             printf '%s\\n' 'PI_SSH_HASH_FAILED: cannot verify remote content; install sha256sum, shasum, or sha256 and retry.' >&2; exit 74; fi; \
+             if [ \"$actual\" != '{expected}' ]; then \
+             printf '%s\\n' 'PI_SSH_EDIT_CONFLICT: remote file changed after it was read; re-read before retrying.' >&2; exit 73; fi; "
+        )
+    });
+    format!(
+        "set -eu; d=$(dirname -- {quoted}); l=\"$d/.pi-ssh-lock-{lock_id}\"; \
+         if ! mkdir -- \"$l\" 2>/dev/null; then \
+         printf '%s\\n' \"PI_SSH_WRITE_BUSY: cannot acquire remote write lock $l; another write may be active.\" >&2; exit 75; fi; \
+         t=; trap 'if [ -n \"$t\" ]; then rm -f -- \"$t\"; fi; rmdir -- \"$l\"' EXIT; \
+         trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         t=$(mktemp \"$d/.pi-ssh-write.XXXXXX\"); \
+         {regular_file_guard}if [ -e {quoted} ]; then cp -p -- {quoted} \"$t\"; fi; cat > \"$t\"; \
+         {guard}mv -f -- \"$t\" {quoted}"
+    )
+}
+
+/// Atomically write `content` to `ssh://host/path`.
+///
+/// Pipeline: parse/validate target → host confinement → spawn ssh with
+/// batch-mode + accept-new flags → stream content over stdin into a remote
+/// mktemp staging file → rename over the target.
+///
+/// # Errors
+/// `PI_SSH_HOST_NOT_ALLOWED` (confinement), `PI_SSH_HOSTKEY_CHANGED`
+/// (with [`SSH_HOSTKEY_REMEDIATION`]), `PI_SSH_AUTH_FAILED`,
+/// `PI_SSH_TIMEOUT`, `PI_SSH_WRITE_FAILED`, `PI_SSH_WRITE_BUSY`.
+pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value> {
+    ssh_write_document_inner(url, content, None)
+}
+
+/// Replace a remote text document only while its original bytes still match.
+///
+/// Both the replacement and the content check run under the same remote Pi
+/// write lock. The check happens after payload transfer, immediately before
+/// rename, and includes the complete original bytes (including BOM and line
+/// endings). A conflicting edit preserves the newer remote file. A missing,
+/// non-regular, or symbolic-link destination is also refused.
+///
+/// This does not lock out applications that ignore Pi's lock. Such an
+/// application can still race the final check and rename.
+///
+/// # Errors
+/// The write-side SSH errors, plus `PI_SSH_EDIT_CONFLICT`,
+/// `PI_SSH_WRITE_BUSY`, and `PI_SSH_HASH_FAILED`. No unguarded retry is made.
+pub fn ssh_replace_document(
+    url: &str,
+    original: &[u8],
+    content: &str,
+) -> Result<serde_json::Value> {
+    ssh_write_document_inner(url, content, Some(original))
+}
+
+fn ssh_write_document_inner(
+    url: &str,
+    content: &str,
+    original: Option<&[u8]>,
+) -> Result<serde_json::Value> {
+    let target = parse_ssh_target(url)?;
+    if !ssh_host_allowed(&target.host) {
+        return Err(Error::tool(
+            "write",
+            format!(
+                "PI_SSH_HOST_NOT_ALLOWED: host '{}' is not authorized for writes. \
+                 Add it literally to ~/.ssh/config (Host block) or PI_SSH_ALLOWED_HOSTS.",
+                target.host
+            ),
+        ));
+    }
+    let script = remote_write_script(&target.path, original);
+    let mut child = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
+    // A remote refusal can close stdin before a large payload finishes. Reap
+    // the process and read its named diagnostic even when that write breaks.
+    let streamed = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::tool("write", "PI_SSH_BACKEND: missing ssh stdin"))
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(content.as_bytes())
+                .and_then(|()| stdin.flush())
+                .map_err(|e| {
+                    Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}"))
+                })
+        });
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: waiting on ssh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        for (code, marker) in [
+            (73, "PI_SSH_EDIT_CONFLICT"),
+            (74, "PI_SSH_HASH_FAILED"),
+            (75, "PI_SSH_WRITE_BUSY"),
+        ] {
+            if output.status.code() == Some(code) && stderr.contains(marker) {
+                return Err(Error::tool(
+                    "write",
+                    format!(
+                        "{marker}: ssh {} write '{}': {}",
+                        target.host,
+                        target.path,
+                        stderr.trim()
+                    ),
+                ));
+            }
+        }
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})",
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::AuthFailed => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_AUTH_FAILED: batch-mode authentication rejected for '{}' (no interactive prompts over ssh://). ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::ConnectTimeout => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::Other => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_WRITE_FAILED: ssh {host} write '{path}' failed: {stderr}",
+                    host = target.host,
+                    path = target.path,
+                    stderr = stderr.trim()
+                ),
+            ),
+        });
+    }
+    streamed?;
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "host": target.host,
+        "path": target.path,
+        "bytes": content.len(),
+        "atomic": true,
+        "contentGuarded": original.is_some(),
+    }))
+}
+
+/// Fetch the FULL remote file content for edit flows (bd-cv653.6.5).
+///
+/// Request at most `max_bytes + 1` bytes so a huge remote file cannot force a
+/// complete transfer. The extra byte distinguishes an exact-limit file from
+/// an oversized one. Oversized files return a named error, never a truncated
+/// document that an editor could mistake for complete source.
+///
+/// # Errors
+/// `PI_SSH_TARGET`/`PI_SSH_TRAVERSAL` (parse), `PI_SSH_HOSTKEY_CHANGED`,
+/// `PI_SSH_AUTH_FAILED`, `PI_SSH_TIMEOUT`, `PI_SSH_READ_FAILED`,
+/// `PI_SSH_TOO_LARGE`.
+pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let target = parse_ssh_target(url)?;
+    let script = remote_edit_read_script(&target.path, max_bytes)?;
+    let output = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(script)
+        .output()
+        .map_err(|e| Error::tool("edit", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})",
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::AuthFailed => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_AUTH_FAILED: batch-mode authentication rejected for '{}'. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::ConnectTimeout => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::Other => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_READ_FAILED: ssh {host} cat '{path}' failed: {stderr}",
+                    host = target.host,
+                    path = target.path,
+                    stderr = stderr.trim()
+                ),
+            ),
+        });
+    }
+    if output.stdout.len() as u64 > max_bytes {
+        return Err(Error::tool(
+            "edit",
+            format!("PI_SSH_TOO_LARGE: remote file exceeds the {max_bytes}-byte edit limit."),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn remote_edit_read_script(remote_path: &str, max_bytes: u64) -> Result<String> {
+    let transfer_limit = max_bytes.checked_add(1).ok_or_else(|| {
+        Error::validation("PI_SSH_READ_LIMIT: edit byte limit must leave room for an overflow byte")
+    })?;
+    Ok(format!(
+        "head -c {transfer_limit} -- {}",
+        sh_quote(remote_path)
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// ssh:// transfers with resume (bd-cv653.6.5 acceptance #2)
+// ---------------------------------------------------------------------------
+
+/// One side of a `ssh_transfer` operation.
+#[derive(Debug, Clone)]
+pub enum TransferEndpoint {
+    Local(PathBuf),
+    Remote(SshTarget),
+}
+
+/// Parse a transfer spec: a filesystem path or an `ssh://host/path` URL.
+///
+/// # Errors
+/// Non-ssh schemes are named errors — never a silent fallback.
+pub fn parse_transfer_endpoint(spec: &str) -> Result<TransferEndpoint> {
+    match split_scheme(spec) {
+        Some(("ssh", _)) => Ok(TransferEndpoint::Remote(parse_ssh_target(spec)?)),
+        Some((scheme, _)) => Err(Error::validation(format!(
+            "PI_SSH_TRANSFER_SCHEME: unsupported scheme '{scheme}://' for transfer (use a local path or ssh://host/path)"
+        ))),
+        None => Ok(TransferEndpoint::Local(PathBuf::from(spec))),
+    }
+}
+
+/// Resume offset for a partially transferred target.
+///
+/// Returns 0 when absent/empty, the partial size when it is a strict prefix of
+/// the source, and a named conflict when the partial is LARGER than the source
+/// (nothing to resume).
+///
+/// # Errors
+/// `PI_SSH_TRANSFER_SIZE_CONFLICT`.
+pub fn resume_offset(partial: u64, total: u64) -> Result<u64> {
+    match partial.cmp(&total) {
+        std::cmp::Ordering::Greater => Err(Error::validation(format!(
+            "PI_SSH_TRANSFER_SIZE_CONFLICT: partial target ({partial} bytes) is larger than source ({total} bytes); refusing to truncate silently"
+        ))),
+        std::cmp::Ordering::Equal => Err(Error::validation(
+            "PI_SSH_TRANSFER_SIZE_CONFLICT: target already matches source size; nothing to transfer",
+        )),
+        std::cmp::Ordering::Less => Ok(partial),
+    }
+}
+
+fn local_file_size(path: &Path) -> Result<u64> {
+    std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| Error::tool("transfer", format!("local stat {}: {e}", path.display())))
+}
+
+/// Remote size probe: GNU first (`stat -c %s`), BSD/macOS fallback
+/// (`stat -f %z`). A missing file reads as size 0 so fresh targets resume
+/// from zero instead of erroring.
+fn remote_size(target: &SshTarget) -> Result<u64> {
+    let quoted = sh_quote(&target.path);
+    let output = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(format!(
+            "stat -c %s -- {quoted} 2>/dev/null || stat -f %z -- {quoted} 2>/dev/null || echo 0"
+        ))
+        .output()
+        .map_err(|e| {
+            Error::tool(
+                "transfer",
+                format!("PI_SSH_BACKEND: failed to run ssh: {e}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_READ_FAILED: size probe for {host}:{path} failed: {stderr}",
+                host = target.host,
+                path = target.path,
+                stderr = String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<u64>().map_err(|_| {
+        Error::tool(
+            "transfer",
+            format!("PI_SSH_READ_FAILED: unparsable size probe output '{text}'"),
+        )
+    })
+}
+
+/// Transfer a file between a local path and `ssh://host/path`, either direction.
+///
+/// Resumes from whatever prefix already exists at the target
+/// (partial-upload/upload-interruption semantics). Completion is verified
+/// by comparing final sizes on both sides.
+///
+/// # Errors
+/// `PI_SSH_TRANSFER_*` taxonomy plus the shared ssh failure kinds.
+pub fn ssh_transfer(source: &str, dest: &str) -> Result<serde_json::Value> {
+    let src = parse_transfer_endpoint(source)?;
+    let dst = parse_transfer_endpoint(dest)?;
+    match (src, dst) {
+        (TransferEndpoint::Local(local), TransferEndpoint::Remote(remote)) => {
+            transfer_push(&local, &remote)
+        }
+        (TransferEndpoint::Remote(remote), TransferEndpoint::Local(local)) => {
+            transfer_pull(&remote, &local)
+        }
+        (TransferEndpoint::Local(_), TransferEndpoint::Local(_)) => Err(Error::validation(
+            "PI_SSH_TRANSFER_SCHEME: both endpoints are local; copy locally",
+        )),
+        (TransferEndpoint::Remote(_), TransferEndpoint::Remote(_)) => Err(Error::validation(
+            "PI_SSH_TRANSFER_SCHEME: remote-to-remote relay is not supported in v1",
+        )),
+    }
+}
+
+fn transfer_push(local: &Path, remote: &SshTarget) -> Result<serde_json::Value> {
+    let total = local_file_size(local)?;
+    let resumed_from = resume_offset(remote_size(remote)?, total)?;
+    if total > resumed_from {
+        let mut src = std::fs::File::open(local)
+            .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
+        src.seek(std::io::SeekFrom::Start(resumed_from))
+            .map_err(|e| Error::tool("transfer", format!("seek {resumed_from}: {e}")))?;
+        let script = format!("cat >> {}", sh_quote(&remote.path));
+        let mut child = std::process::Command::new("ssh")
+            .args(ssh_command_flags())
+            .arg(&remote.host)
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::tool("transfer", "missing ssh stdin"))?;
+            std::io::copy(&mut src, &mut stdin)
+                .map_err(|e| Error::tool("transfer", format!("stream payload: {e}")))?;
+        }
+        wait_transfer_child(
+            child,
+            &format!("{host}:{path}", host = remote.host, path = remote.path),
+        )?;
+    }
+    let final_size = remote_size(remote)?;
+    if final_size != total {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_VERIFY_FAILED: post-transfer size mismatch (remote {final_size}, source {total})"
+            ),
+        ));
+    }
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "direction": "push",
+        "bytesTotal": total,
+        "resumedFrom": resumed_from,
+        "verified": true,
+    }))
+}
+
+fn transfer_pull(remote: &SshTarget, local: &Path) -> Result<serde_json::Value> {
+    let total = remote_size(remote)?;
+    let existing = std::fs::metadata(local).map_or(0, |m| m.len());
+    let resumed_from = resume_offset(existing, total)?;
+    if total > resumed_from {
+        // POSIX `tail -c +N file` emits from byte N (1-based) onward — the
+        // portable way to stream a remote suffix without GNU dd flags.
+        let script = format!(
+            "tail -c +{} -- {}",
+            resumed_from + 1,
+            sh_quote(&remote.path)
+        );
+        let mut child = std::process::Command::new("ssh")
+            .args(ssh_command_flags())
+            .arg(&remote.host)
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
+        {
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::tool("transfer", "missing ssh stdout"))?;
+            let mut dst = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(local)
+                .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
+            std::io::copy(&mut stdout, &mut dst)
+                .map_err(|e| Error::tool("transfer", format!("stream payload: {e}")))?;
+        }
+        wait_transfer_child(
+            child,
+            &format!("{host}:{path}", host = remote.host, path = remote.path),
+        )?;
+    }
+    let final_size = local_file_size(local)?;
+    if final_size != total {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_VERIFY_FAILED: post-transfer size mismatch (local {final_size}, source {total})"
+            ),
+        ));
+    }
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "direction": "pull",
+        "bytesTotal": total,
+        "resumedFrom": resumed_from,
+        "verified": true,
+    }))
+}
+
+fn wait_transfer_child(child: std::process::Child, what: &str) -> Result<()> {
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: wait: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "transfer",
+                format!("PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION}"),
+            ),
+            SshFailureKind::AuthFailed => {
+                Error::tool("transfer", format!("PI_SSH_AUTH_FAILED: {stderr}"))
+            }
+            _ => Error::tool(
+                "transfer",
+                format!("PI_SSH_WRITE_FAILED: transfer to {what} failed: {stderr}"),
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_repo_with_conflict(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pi-url-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("f.txt"), "line\n").expect("write"); // ubs:ignore test fixture
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+        // Branch A edits, branch B edits the same line → conflict on merge.
+        git(&["checkout", "-b", "side"]);
+        std::fs::write(dir.join("f.txt"), "side\n").expect("side"); // ubs:ignore test fixture
+        git(&["commit", "-am", "side"]);
+        git(&["checkout", "main"]);
+        std::fs::write(dir.join("f.txt"), "main\n").expect("main"); // ubs:ignore test fixture
+        git(&["commit", "-am", "main"]);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["merge", "side"])
+            .output()
+            .expect("merge");
+        assert!(!out.status.success(), "merge must conflict");
+        dir
+    }
+
+    #[test]
+    fn unknown_scheme_lists_registered() {
+        let err = resolve("foo://bar", Path::new(".")).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("PI_URL_UNKNOWN_SCHEME"), "{text}");
+        assert!(text.contains("skill://"), "{text}");
+    }
+
+    #[test]
+    fn resource_schemes_resolve_against_the_supplied_cwd() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project_dir = root.path().join(crate::config::Config::project_dir());
+        let skill_dir = project_dir.join("skills/router-cwd-skill");
+        let prompt_dir = project_dir.join("prompts");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        let prompt_path = prompt_dir.join("router-cwd-prompt.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: router-cwd-skill\ndescription: cwd routing probe\n---\nproject skill\n",
+        )
+        .expect("write project skill");
+        std::fs::write(&prompt_path, "project prompt\n").expect("write project prompt");
+
+        let skill = resolve("skill://router-cwd-skill", root.path()).expect("resolve skill");
+        assert!(skill.content.contains("project skill"));
+        let expected_skill_path = skill_path.display().to_string();
+        assert_eq!(
+            skill.metadata["path"].as_str(),
+            Some(expected_skill_path.as_str())
+        );
+        let prompt = resolve("prompt://router-cwd-prompt", root.path()).expect("resolve prompt");
+        assert_eq!(prompt.content, "project prompt\n");
+        let expected_prompt_path = prompt_path.display().to_string();
+        assert_eq!(
+            prompt.metadata["path"].as_str(),
+            Some(expected_prompt_path.as_str())
+        );
+    }
+
+    #[test]
+    fn resource_schemes_preserve_matching_load_diagnostics() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project_dir = root.path().join(crate::config::Config::project_dir());
+        let skill_dir = project_dir.join("skills/broken-router-skill");
+        let prompt_dir = project_dir.join("prompts");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        let prompt_path = prompt_dir.join("broken-router-prompt.md");
+        std::fs::write(&skill_path, [0xff, 0xfe]).expect("write invalid skill");
+        std::fs::write(&prompt_path, [0xff, 0xfe]).expect("write invalid prompt");
+
+        for (url, offending_path) in [
+            ("skill://broken-router-skill", &skill_path),
+            ("prompt://broken-router-prompt", &prompt_path),
+        ] {
+            let error = resolve(url, root.path()).expect_err("invalid resource must fail");
+            let message = error.to_string();
+            assert!(message.contains("PI_URL_RESOURCE_INVALID"), "{message}");
+            assert!(message.contains("not valid UTF-8"), "{message}");
+            assert!(
+                message.contains(&offending_path.display().to_string()),
+                "{message}"
+            );
+            assert!(!message.contains("no skill named"), "{message}");
+            assert!(!message.contains("no prompt template named"), "{message}");
+        }
+    }
+
+    #[test]
+    fn skill_document_reread_enforces_the_resource_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let skill_path = root.path().join("SKILL.md");
+        let file = std::fs::File::create(&skill_path).expect("create skill");
+        file.set_len((crate::theme::MAX_RESOURCE_FILE_BYTES + 1) as u64)
+            .expect("extend skill");
+        let skill = crate::resources::Skill {
+            name: "reread-limit".to_string(),
+            description: "reread limit probe".to_string(),
+            file_path: skill_path,
+            base_dir: root.path().to_path_buf(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let error = resolve_skill_document("reread-limit", &skill)
+            .expect_err("skill:// reread must reject plus-one source");
+        assert!(
+            error.to_string().contains(&format!(
+                "{}-byte resource limit",
+                crate::theme::MAX_RESOURCE_FILE_BYTES
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn conflict_regions_parse_and_select() {
+        let repo = init_repo_with_conflict("parse");
+        let regions = conflict_regions(&repo).expect("regions");
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0]; // ubs:ignore length asserted above
+        assert_eq!(region.file, "f.txt");
+        assert!(region.ours.contains("main"));
+        assert!(region.theirs.contains("side"));
+
+        let doc = resolve("conflict://0", &repo).expect("full doc");
+        assert!(doc.content.contains("--- ours ---"));
+        let doc = resolve("conflict://0 @theirs", &repo).expect("theirs doc");
+        assert_eq!(doc.content.trim(), "side");
+        let doc = resolve("conflict://*", &repo).expect("bulk");
+        assert!(doc.content.contains("conflict 0"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn write_conflict_resolution_picks_a_side() {
+        let repo = init_repo_with_conflict("resolve");
+        let region = write_conflict_resolution(&repo, 0, "theirs").expect("resolve");
+        assert_eq!(region.file, "f.txt");
+        let content = std::fs::read_to_string(repo.join("f.txt")).expect("read");
+        assert_eq!(content.trim(), "side");
+        assert!(!content.contains("<<<<<<<"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn local_scratch_roundtrip() {
+        write_local("note", "scratch payload").expect("write");
+        let doc = resolve("local://note", Path::new(".")).expect("read");
+        assert_eq!(doc.content, "scratch payload");
+        let err = resolve("local://missing", Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("PI_URL_UNRESOLVABLE"));
+    }
+
+    #[test]
+    fn github_reference_parsing() {
+        let (repo, number, sub) = parse_repo_number("1428").expect("bare");
+        assert_eq!(repo, None);
+        assert_eq!(number, "1428");
+        assert_eq!(sub, None);
+        let (repo, number, sub) = parse_repo_number("owner/repo/1428/diff").expect("full");
+        assert_eq!(repo.as_deref(), Some("owner/repo"));
+        assert_eq!(number, "1428");
+        assert_eq!(sub.as_deref(), Some("diff"));
+        assert!(parse_repo_number("notanumber").is_err());
+    }
+    #[test]
+    fn parse_ssh_target_validates() {
+        let ok = parse_ssh_target("ssh://yto/var/www/app.js").expect("ok");
+        assert_eq!(ok.host, "yto");
+        assert_eq!(ok.path, "/var/www/app.js");
+        assert!(parse_ssh_target("file:///etc/hosts").is_err());
+        assert!(parse_ssh_target("ssh://hostonly").is_err());
+        assert!(parse_ssh_target("ssh://h/").is_err());
+        assert!(parse_ssh_target("ssh://h/a/../b").is_err());
+
+        for invalid in [
+            "ssh://-oProxyCommand=id/tmp/file",
+            "ssh://bad host/tmp/file",
+            "ssh://bad\thost/tmp/file",
+            "ssh://bad\nhost/tmp/file",
+            "ssh://bad\0host/tmp/file",
+        ] {
+            let error = parse_ssh_target(invalid).expect_err("unsafe host token must fail closed");
+            assert!(
+                error.to_string().contains("PI_SSH_HOST_INVALID"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+            let rest = invalid
+                .strip_prefix("ssh://")
+                .expect("test target has ssh scheme");
+            let read_error = resolve_ssh(rest).expect_err("unsafe read host must fail before ssh");
+            assert!(
+                read_error.to_string().contains("PI_SSH_HOST_INVALID"),
+                "unexpected read error for {invalid:?}: {read_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_capped_read_script_quotes_one_remote_path_argument() {
+        let script = ssh_capped_read_script("/tmp/it's; $(touch /tmp/pwned)");
+        assert_eq!(
+            script,
+            format!("head -c {SSH_MAX_BYTES} -- '/tmp/it'\\''s; $(touch /tmp/pwned)'")
+        );
+    }
+
+    #[test]
+    fn ssh_config_literal_hosts_skips_patterns() {
+        let hosts = ssh_config_literal_hosts(
+            "Host yto fmd\n  HostName 1.2.3.4\nhost css\nHost *\nHost !blocked\n",
+        );
+        assert_eq!(hosts, ["yto", "fmd", "css"]); // ubs:ignore length asserted
+    }
+
+    #[test]
+    fn ssh_host_confinement_sources() {
+        let config = Some("Host yto\n");
+        assert!(ssh_host_allowed_with("yto", config, None));
+        assert!(ssh_host_allowed_with("YTO", config, None)); // case-insensitive
+        assert!(!ssh_host_allowed_with("evil", config, None));
+        assert!(ssh_host_allowed_with("csd", None, Some("a, csd ,b")));
+        assert!(!ssh_host_allowed_with("x", Some("Host *\n"), None));
+    }
+
+    /// `/ssh` lists exactly what the write gate accepts: env entries and
+    /// literal config hosts, sorted, case-insensitively deduplicated (the
+    /// first spelling seen, env before config, is the one shown).
+    #[test]
+    fn ssh_write_allowed_hosts_merges_sources() {
+        let hosts = ssh_write_allowed_hosts_with(
+            Some("Host yto build\nHost *\nHost !blocked\n"),
+            Some(" csd, YTO ,,"),
+        );
+        assert_eq!(hosts, ["build", "csd", "YTO"]); // ubs:ignore length asserted
+        assert!(ssh_write_allowed_hosts_with(None, None).is_empty());
+    }
+
+    #[test]
+    fn ssh_flags_force_batch_and_accept_new() {
+        let flags = ssh_command_flags();
+        assert!(flags.iter().any(|flag| flag == "BatchMode=yes"));
+        assert!(
+            flags
+                .iter()
+                .any(|flag| flag == "StrictHostKeyChecking=accept-new")
+        );
+    }
+
+    #[test]
+    fn remote_write_script_stages_atomically() {
+        let script = remote_atomic_write_script("/var/www/app.conf");
+        assert!(script.contains("mktemp \"$d/.pi-ssh-write.XXXXXX\""));
+        assert!(script.contains("mv -f -- \"$t\" '/var/www/app.conf'"));
+        assert!(script.contains("cp -p -- '/var/www/app.conf'"));
+        assert!(script.contains("rmdir -- \"$l\"' EXIT"));
+        // Quote escaping survives embedded single quotes.
+        let tricky = remote_atomic_write_script("/tmp/it's");
+        assert!(tricky.contains("'\\''"), "{tricky}");
+    }
+
+    #[cfg(unix)]
+    fn run_remote_script(script: &str, payload: &[u8]) -> std::process::Output {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("remote shell fixture");
+        let streamed = child
+            .stdin
+            .take()
+            .expect("fixture stdin")
+            .write_all(payload);
+        let output = child.wait_with_output().expect("remote shell output");
+        if output.status.success() {
+            streamed.expect("complete fixture payload");
+        }
+        output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_preserves_bytes_permissions_and_literal_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("it's; $(unused)\nfile.txt");
+        let original = b"\xef\xbb\xbfalpha\r\nbeta\r\n";
+        std::fs::write(&target, original).expect("original");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("original permissions");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let replacement = b"\xef\xbb\xbfALPHA\r\nbeta\r\n";
+        let output = run_remote_script(&script, replacement);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_rejects_changes_outside_the_edited_region() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"alpha\r\nbeta\r\n";
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        for changed in [b"alpha\r\nBETA\r\n".as_slice(), b"alpha\nbeta\n"] {
+            std::fs::write(&target, changed).expect("concurrent remote edit");
+            let output = run_remote_script(&script, b"ALPHA\r\nbeta\r\n");
+            assert_eq!(output.status.code(), Some(73), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("PI_SSH_EDIT_CONFLICT"));
+            assert_eq!(std::fs::read(&target).unwrap(), changed);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_checks_after_payload_transfer() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"original\n";
+        std::fs::write(&target, original).expect("original");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("remote shell");
+        let mut input = child.stdin.take().expect("payload pipe");
+        // More than the pipe capacity forces the remote staging reader to run.
+        // Keeping stdin open holds it before the publication check, with no
+        // timing assumptions or sleeps.
+        input
+            .write_all(&vec![b'x'; 2 * 1024 * 1024])
+            .expect("payload");
+        std::fs::write(&target, b"external edit during upload\n").expect("remote change");
+        drop(input);
+        let output = child.wait_with_output().expect("remote output");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"external edit during upload\n"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_write_lock_serializes_competing_edits_and_survives_refusal() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("document.txt");
+        let original = b"original\n";
+        std::fs::write(&target, original).expect("original");
+        let script = remote_write_script(target.to_str().unwrap(), Some(original));
+        let mut first = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("first remote writer");
+        let mut input = first.stdin.take().expect("first stdin");
+        let replacement = vec![b'x'; 2 * 1024 * 1024];
+        input.write_all(&replacement).expect("first upload");
+
+        let competing = run_remote_script(&script, b"other edit\n");
+        assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        // A rejected contender must not remove the first writer's lock.
+        let unconditional = remote_atomic_write_script(target.to_str().unwrap());
+        let competing = run_remote_script(&unconditional, b"other write\n");
+        assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).expect("directory alias");
+        for path in [
+            format!("{}/./document.txt", root.path().display()),
+            alias.join("document.txt").to_str().unwrap().to_string(),
+        ] {
+            let aliased = remote_write_script(&path, Some(original));
+            let competing = run_remote_script(&aliased, b"aliased edit\n");
+            assert_eq!(competing.status.code(), Some(75), "{competing:?}");
+        }
+
+        drop(input);
+        let output = first.wait_with_output().expect("first output");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        let stale_retry = run_remote_script(&script, b"stale edit\n");
+        assert_eq!(stale_retry.status.code(), Some(73), "{stale_retry:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_does_not_recreate_missing_files_or_replace_symlinks() {
+        let root = tempfile::tempdir().expect("fixture");
+        let missing = root.path().join("missing.txt");
+        let script = remote_write_script(missing.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(!missing.exists());
+
+        let target = root.path().join("target.txt");
+        let link = root.path().join("link.txt");
+        std::fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let script = remote_write_script(link.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_remote_write_refuses_a_fifo_before_copying_it() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("replaced-with-fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("FIFO fixture");
+        assert!(status.success());
+        let script = remote_write_script(target.to_str().unwrap(), Some(b"original"));
+        let output = run_remote_script(&script, b"replacement");
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn remote_edit_reads_include_one_overflow_byte_without_transferring_whole_file() {
+        let root = tempfile::tempdir().expect("fixture");
+        let target = root.path().join("large file's data");
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        std::fs::write(&target, &bytes).unwrap();
+        for limit in [0, 128, bytes.len() as u64] {
+            let script = remote_edit_read_script(target.to_str().unwrap(), limit).unwrap();
+            let output = run_remote_script(&script, &[]);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout.len(), bytes.len().min(limit as usize + 1));
+        }
+        assert!(remote_edit_read_script(target.to_str().unwrap(), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn ssh_failures_classify() {
+        assert_eq!(
+            classify_ssh_failure("@@@@@@\r\nRemote host identification has changed."),
+            SshFailureKind::HostKeyChanged
+        );
+        assert_eq!(
+            classify_ssh_failure("Permission denied (publickey)."),
+            SshFailureKind::AuthFailed
+        );
+        assert_eq!(
+            classify_ssh_failure("Connection timed out"),
+            SshFailureKind::ConnectTimeout
+        );
+        assert_eq!(
+            classify_ssh_failure("bash: x: command not found"),
+            SshFailureKind::Other
+        );
+    }
+
+    #[test]
+    fn ssh_fetch_rejects_bad_targets_before_spawning() {
+        // Parse/validation happens before any process spawn, so these are
+        // offline-safe assertions of the guard rails.
+        assert!(ssh_fetch_document("file:///etc/hosts", 1024).is_err());
+        assert!(ssh_fetch_document("ssh://h/a/../b", 1024).is_err());
+    }
+
+    #[test]
+    fn transfer_endpoints_parse() {
+        assert!(matches!(
+            parse_transfer_endpoint("/tmp/a.bin"),
+            Ok(TransferEndpoint::Local(_))
+        ));
+        assert!(matches!(
+            parse_transfer_endpoint("ssh://yto/var/x"),
+            Ok(TransferEndpoint::Remote(_))
+        ));
+        assert!(parse_transfer_endpoint("file:///x").is_err());
+    }
+
+    #[test]
+    fn resume_offset_semantics() {
+        assert_eq!(resume_offset(0, 100).expect("fresh"), 0);
+        assert_eq!(resume_offset(40, 100).expect("partial"), 40);
+        let oversize = resume_offset(120, 100).unwrap_err();
+        assert!(oversize.to_string().contains("SIZE_CONFLICT"));
+        let done = resume_offset(100, 100).unwrap_err();
+        assert!(done.to_string().contains("nothing to transfer"));
+    }
+}

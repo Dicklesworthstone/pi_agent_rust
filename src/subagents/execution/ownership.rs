@@ -103,6 +103,47 @@ fn settle_in(hub: &Mutex<AgentHubRegistry>, id: &str, status: ChildStatus) {
     hub.finish_native_execution(id);
 }
 
+/// Retain only a result whose owning lease actually performs settlement.
+/// An operator kill or poisoned registry must not publish a late success.
+fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentResult) {
+    let status = match result.status {
+        SubagentStatus::Cancelled => ChildStatus::Cancelled,
+        SubagentStatus::Completed if !result.is_error => ChildStatus::Done,
+        _ => ChildStatus::Failed,
+    };
+    let entry = {
+        let mut hub = match hub.lock() {
+            Ok(hub) => hub,
+            Err(poisoned) => {
+                let mut hub = poisoned.into_inner();
+                hub.settle(id, status);
+                hub.finish_native_execution(id);
+                return;
+            }
+        };
+        let owns_settlement = hub.get(id).is_some_and(|entry| !entry.status.settled());
+        hub.settle(id, status);
+        hub.finish_native_execution(id);
+        if owns_settlement {
+            hub.get(id)
+        } else {
+            None
+        }
+    };
+    // Result serialization and retention never run with the hub lock held.
+    // This path is reached after schema acceptance and worktree disposition,
+    // unlike transcript append, process reap, and cancellation-only Drop.
+    if let Some(entry) = entry {
+        crate::url_router::agent::publish(
+            &entry,
+            &result.output,
+            result.data.as_ref(),
+            result.schema_valid,
+            result.error.as_deref(),
+        );
+    }
+}
+
 /// Independent of process ownership: cancellation can drop a future before
 /// spawn or after process exit but before result acceptance and writeback.
 pub(super) struct HubLease {
@@ -172,12 +213,7 @@ impl HubLease {
 
     pub(super) fn settle(&mut self, result: &SubagentResult) {
         if let Some(id) = self.id.take() {
-            let status = match result.status {
-                SubagentStatus::Cancelled => ChildStatus::Cancelled,
-                SubagentStatus::Completed if !result.is_error => ChildStatus::Done,
-                _ => ChildStatus::Failed,
-            };
-            settle_in(registry(), &id, status);
+            settle_result_in(registry(), &id, result);
         }
     }
 }
@@ -431,6 +467,13 @@ mod tests {
                 registry().lock().unwrap().get(id).unwrap().status,
                 ChildStatus::Killed
             );
+            let url = format!("agent://{id}/ok");
+            assert!(
+                crate::url_router::resolve(&url, &result.cwd)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_URL_AGENT_OUTPUT_REJECTED")
+            );
             if let Some(pid) = result.pid {
                 let status = std::process::Command::new("kill")
                     .args(["-0", &pid.to_string()])
@@ -440,6 +483,57 @@ mod tests {
                     .unwrap();
                 assert!(!status.success(), "child was not reaped");
             }
+        }
+
+        #[test]
+        fn accepted_native_result_is_projectable_through_the_read_tool() {
+            use crate::tools::Tool as _;
+
+            let text = json!({"findings":[{"path":"src/main.rs"}], "report":"first\nsecond"})
+                .to_string();
+            let frame = json!({
+                "type":"agent_end",
+                "messages":[{
+                    "role":"assistant", "stopReason":"stop",
+                    "content":[{"type":"text", "text":text}]
+                }]
+            });
+            let (dir, runner) = fixture(&format!("printf '%s\\n' '{frame}'"));
+            let agents =
+                BTreeMap::from([("tan".to_string(), crate::subagents::tan_agent_definition())]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(runner.run_one(&agents, task(true), None, None));
+            assert!(!result.is_error, "{:?}", result.error);
+            assert_eq!(result.schema_valid, Some(true));
+            let id = result.hub_id.as_deref().unwrap();
+            let reader = crate::tools::ReadTool::new(dir.path());
+            let output = runtime
+                .block_on(reader.execute(
+                    "agent-result-read",
+                    json!({"path":format!("agent://{id}/findings/0/path")}),
+                    None,
+                ))
+                .unwrap();
+            assert!(!output.is_error);
+            assert!(output.content.iter().any(|block| matches!(
+                block, crate::model::ContentBlock::Text(text) if text.text.contains("src/main.rs")
+            )));
+            let page = runtime
+                .block_on(reader.execute(
+                    "agent-result-page",
+                    json!({"path":format!("agent://{id}/report"), "offset":2, "limit":1}),
+                    None,
+                ))
+                .unwrap();
+            assert!(!page.is_error);
+            assert!(page.content.iter().any(|block| matches!(
+                block, crate::model::ContentBlock::Text(text) if text.text.contains("second")
+            )));
+            assert!(!page.content.iter().any(|block| matches!(
+                block, crate::model::ContentBlock::Text(text) if text.text.contains("first")
+            )));
         }
 
         #[test]
