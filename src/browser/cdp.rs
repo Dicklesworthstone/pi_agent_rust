@@ -23,9 +23,10 @@ const MAX_EVENTS: usize = 8192;
 const MAX_DOWNLOAD_RECORDS: usize = 128;
 const MAX_REFERENCE_DOCUMENTS: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct DownloadRecord {
     pub(super) guid: String,
+    pub(super) frame_id: String,
     pub(super) url: String,
     pub(super) suggested_filename: String,
     pub(super) state: String,
@@ -45,13 +46,10 @@ fn downloads_since_in(
         .collect()
 }
 
-/// Apply one `Browser.download*` CDP event to a download table.
-///
-/// Free function rather than a `Cdp` method because it touches nothing else:
-/// no socket, no session, no page state. `Cdp::record_download_event` is a
-/// one-line delegation to it, and the test below drives a bare `BTreeMap`,
-/// which is what it was already trying to do — it just needed a
-/// `WebSocket<TcpStream>` for the struct field it never reads.
+/// Validate each event completely before changing retained state. A repeated
+/// start may acknowledge the same transfer, never replace its source or reset
+/// terminal progress. The connection also latches errors so best-effort cleanup
+/// cannot hide a malformed event from the eventual publication gate.
 fn record_download_event_into(
     downloads: &mut BTreeMap<String, DownloadRecord>,
     value: &Value,
@@ -60,17 +58,36 @@ fn record_download_event_into(
     if method == "Browser.downloadWillBegin" {
         let params = &value["params"];
         let guid = required(params, "guid")?;
+        let frame_id = required(params, "frameId")?;
         let url = required(params, "url")?;
         let suggested = required(params, "suggestedFilename")?;
-        if guid.len() > 128
+        if guid.is_empty()
+            || guid.len() > 128
             || guid.chars().any(char::is_control)
+            || frame_id.is_empty()
+            || frame_id.len() > 256
+            || frame_id.chars().any(char::is_control)
+            || url.is_empty()
             || url.len() > 64 * 1024
+            || url.chars().any(char::is_control)
             || suggested.len() > 4096
             || suggested.chars().any(char::is_control)
         {
             return Err(Error::tool("browser", "invalid bounded download metadata"));
         }
-        if !downloads.contains_key(guid) && downloads.len() >= MAX_DOWNLOAD_RECORDS {
+        if let Some(existing) = downloads.get(guid) {
+            if existing.frame_id == frame_id
+                && existing.url == url
+                && existing.suggested_filename == suggested
+            {
+                return Ok(());
+            }
+            return Err(Error::tool(
+                "browser",
+                "download identity changed after its initial event",
+            ));
+        }
+        if downloads.len() >= MAX_DOWNLOAD_RECORDS {
             return Err(Error::tool(
                 "browser",
                 "too many browser downloads are being tracked",
@@ -80,6 +97,7 @@ fn record_download_event_into(
             guid.to_owned(),
             DownloadRecord {
                 guid: guid.to_owned(),
+                frame_id: frame_id.to_owned(),
                 url: url.to_owned(),
                 suggested_filename: suggested.to_owned(),
                 state: "inProgress".into(),
@@ -101,10 +119,27 @@ fn record_download_event_into(
                     .filter(|value| value.is_finite() && *value >= 0.0)
                     .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
             };
+            let received = number("receivedBytes")?;
+            let total = number("totalBytes")?;
+            // totalBytes is an estimate and may change (including from zero).
+            // Received bytes must not retreat, and terminal events are final.
+            if received < record.received_bytes
+                || (record.state != "inProgress"
+                    && (record.state != state
+                        || (record.received_bytes - received).abs() > 0.0
+                        || (record.total_bytes - total).abs() > 0.0))
+            {
+                return Err(Error::tool(
+                    "browser",
+                    "download progress regressed or changed after termination",
+                ));
+            }
             state.clone_into(&mut record.state);
-            record.received_bytes = number("receivedBytes")?;
-            record.total_bytes = number("totalBytes")?;
+            record.received_bytes = received;
+            record.total_bytes = total;
         }
+        // A progress event without a start on this connection is not a new
+        // downloadable artifact. It may belong to a pre-existing browser job.
     }
     Ok(())
 }
@@ -299,6 +334,7 @@ pub(super) struct Cdp {
     pub(super) frame_targets: frames::Targets,
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
+    download_failure: bool,
     timeout_ms: u64,
     dialog: dialog::State,
     diagnostics: Option<diagnostics::Capture>,
@@ -354,6 +390,7 @@ impl Cdp {
             frame_targets: frames::Targets::default(),
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
+            download_failure: false,
             timeout_ms: 30_000,
             dialog: dialog::State::default(),
             diagnostics: None,
@@ -662,8 +699,20 @@ impl Cdp {
         self.downloads.get(guid).cloned()
     }
 
+    pub(super) fn check_download_events(&self) -> Result<()> {
+        if self.download_failure {
+            return Err(Error::tool(
+                "browser",
+                "download event validation failed; no artifact may be published",
+            ));
+        }
+        Ok(())
+    }
+
     fn record_download_event(&mut self, value: &Value) -> Result<()> {
-        record_download_event_into(&mut self.downloads, value)
+        let result = record_download_event_into(&mut self.downloads, value);
+        self.download_failure |= result.is_err();
+        result
     }
 
     pub(super) const fn frame_selected(&self) -> bool {
@@ -1314,6 +1363,7 @@ mod tests {
             "old".to_string(),
             DownloadRecord {
                 guid: "old".into(),
+                frame_id: "old-frame".into(),
                 url: "https://example.com/old".into(),
                 suggested_filename: "old.bin".into(),
                 state: "completed".into(),
@@ -1327,7 +1377,7 @@ mod tests {
         record_download_event_into(
             &mut downloads,
             &json!({"method":"Browser.downloadWillBegin","params":{
-                "guid":"new","url":"https://example.com/file","suggestedFilename":"file.bin"
+                "guid":"new","frameId":"frame-1","url":"https://example.com/file","suggestedFilename":"file.bin"
             }}),
         )
         .unwrap();
@@ -1342,5 +1392,111 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].state, "completed");
         assert_eq!(fresh[0].received_bytes, 7.0);
+        assert_eq!(fresh[0].frame_id, "frame-1");
+    }
+
+    fn download_start(guid: &str) -> Value {
+        json!({"method":"Browser.downloadWillBegin","params":{
+            "guid":guid,"frameId":"frame-1","url":"https://example.com/file","suggestedFilename":"file.bin"
+        }})
+    }
+
+    fn download_progress(state: &str, received: f64, total: f64) -> Value {
+        json!({"method":"Browser.downloadProgress","params":{
+            "guid":"job","state":state,"receivedBytes":received,"totalBytes":total
+        }})
+    }
+
+    #[test]
+    fn repeated_download_starts_preserve_source_and_terminal_progress() {
+        let mut downloads = BTreeMap::new();
+        let start = download_start("job");
+        record_download_event_into(&mut downloads, &start).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        let saved = downloads.clone();
+        record_download_event_into(&mut downloads, &start).unwrap();
+        assert_eq!(downloads, saved);
+        for field in ["frameId", "url", "suggestedFilename"] {
+            let mut changed = start.clone();
+            changed["params"][field] = json!("PRIVATE-CANARY");
+            let error = record_download_event_into(&mut downloads, &changed).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+            assert_eq!(downloads, saved);
+        }
+    }
+
+    #[test]
+    fn invalid_download_progress_cannot_partially_complete_a_record() {
+        let mut downloads = BTreeMap::new();
+        record_download_event_into(&mut downloads, &download_start("job")).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 4.0, 0.0)).unwrap();
+        let saved = downloads.clone();
+        for invalid in [
+            download_progress("completed", 7.0, f64::NAN),
+            download_progress("completed", -1.0, 7.0),
+            download_progress("completed", 3.0, 7.0),
+            download_progress("unknown", 7.0, 7.0),
+        ] {
+            assert!(record_download_event_into(&mut downloads, &invalid).is_err());
+            assert_eq!(downloads, saved);
+        }
+        // An unknown total becoming known is ordinary progress, not a reset.
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 5.0, 10.0)).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        assert_eq!(downloads["job"].state, "completed");
+    }
+
+    #[test]
+    fn terminal_downloads_cannot_resurrect_or_change_byte_counts() {
+        for terminal in ["completed", "canceled"] {
+            let mut downloads = BTreeMap::new();
+            record_download_event_into(&mut downloads, &download_start("job")).unwrap();
+            let event = download_progress(terminal, 7.0, 9.0);
+            record_download_event_into(&mut downloads, &event).unwrap();
+            let saved = downloads.clone();
+            record_download_event_into(&mut downloads, &event).unwrap();
+            for invalid in [
+                download_progress("inProgress", 7.0, 9.0),
+                download_progress(terminal, 8.0, 9.0),
+                download_progress(terminal, 7.0, 10.0),
+                download_progress(if terminal == "completed" { "canceled" } else { "completed" }, 7.0, 9.0),
+            ] {
+                assert!(record_download_event_into(&mut downloads, &invalid).is_err());
+                assert_eq!(downloads, saved);
+            }
+        }
+    }
+
+    #[test]
+    fn download_metadata_requires_bounded_source_identity_without_leaking_it() {
+        for (field, value) in [
+            ("frameId", Value::Null),
+            ("frameId", json!("")),
+            ("frameId", json!("f".repeat(257))),
+            ("frameId", json!("PRIVATE-CANARY\n")),
+            ("guid", json!("")),
+            ("url", json!("")),
+            ("url", json!("https://example.com/PRIVATE-CANARY\n")),
+        ] {
+            let mut event = download_start("job");
+            event["params"][field] = value;
+            let mut downloads = BTreeMap::new();
+            let error = record_download_event_into(&mut downloads, &event).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+            assert!(downloads.is_empty());
+        }
+    }
+
+    #[test]
+    fn download_record_budget_allows_duplicates_not_extra_transfer_identities() {
+        let mut downloads = BTreeMap::new();
+        for i in 0..MAX_DOWNLOAD_RECORDS {
+            record_download_event_into(&mut downloads, &download_start(&format!("job-{i}"))).unwrap();
+        }
+        record_download_event_into(&mut downloads, &download_start("job-0")).unwrap();
+        assert!(record_download_event_into(&mut downloads, &download_start("overflow")).is_err());
+        assert_eq!(downloads.len(), MAX_DOWNLOAD_RECORDS);
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        assert!(!downloads.contains_key("job"));
     }
 }
