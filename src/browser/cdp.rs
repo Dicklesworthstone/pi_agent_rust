@@ -3,7 +3,7 @@
 
 use super::{
     BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch,
-    output, policy, required,
+    output, policy, required, storage,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -141,6 +141,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
                 ));
             }
         }
+        action if storage::is_action(action) => storage::validate(args)?,
         action if interaction::forms::is_action(action) => interaction::forms::validate(args)?,
         "upload" => {
             interaction::upload::validate(args)?;
@@ -217,6 +218,7 @@ pub(super) async fn execute(
 ) -> Result<ToolOutput> {
     let timeout_ms = validate(args, allowlist)?;
     let connection = launch::Connection::resolve(endpoint_override, launch_options)?;
+    storage::validate_connection(args, &connection)?;
     let owner = AgentCx::for_current_or_request();
     let caps = owner.capabilities();
     if !caps.io || !caps.time || !caps.entropy {
@@ -864,6 +866,12 @@ impl Session {
                             "no owned browser is running; handling a dialog never launches a browser",
                         ));
                     }
+                    if storage::is_action(action) {
+                        return Err(Error::tool(
+                            "browser",
+                            "BROWSER_STATE_NOT_RUNNING: open the intended origin in a Pi-owned browser before saving or restoring state",
+                        ));
+                    }
                     startup = Some(launch::ManagedBrowser::launch(owner, cwd, options).await?);
                 }
                 let browser = self
@@ -1051,6 +1059,9 @@ impl Session {
             capture.begin_action();
         }
         let result = match action {
+            action if storage::is_action(action) => {
+                storage::execute(owner, cdp, cwd, &tab, allowlist, args).await
+            }
             "diagnostics" => Ok(output(
                 format!("Observing diagnostics for tab {tab}"),
                 json!({"tab": tab, "backend": "cdp"}),

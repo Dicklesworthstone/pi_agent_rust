@@ -23,6 +23,7 @@ mod launch;
 mod mock;
 mod policy;
 mod session;
+mod storage;
 
 pub use launch::BrowserLaunchOptions;
 
@@ -157,6 +158,7 @@ impl Tool for BrowserTool {
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
          structured option selection and checked-state control, frame discovery and frame-scoped \
          inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
+         Storage-state actions require an explicit tab and private workspace state_path; files contain plaintext credentials, never returned inline. \
          Attach diagnostics to an action to capture console output and uncaught exceptions before \
          and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
          Use action:diagnostics to observe an explicit tab without triggering work. \
@@ -245,7 +247,7 @@ impl Tool for BrowserTool {
             }
         });
         session::batch::extend_schema(&mut schema);
-        schema
+        storage::parameters(schema)
     }
 
     fn effects(&self) -> ToolEffects {
@@ -281,7 +283,7 @@ impl BrowserTool {
         let semantic_selector = interaction::selectors::validate_input(args)?;
         let configured_pointer = interaction::pointer::validate_input(args)?;
         if self.is_mock() {
-            if semantic_selector || configured_pointer || matches!(
+            if storage::is_action(action) || semantic_selector || configured_pointer || matches!(
                 action,
                 "start"
                     | "status"
@@ -300,7 +302,7 @@ impl BrowserTool {
             {
                 return Err(Error::tool(
                     "browser",
-                    "browser lifecycle, frames, structured forms, file uploads, dialogs and page exports require the native backend",
+                    "browser lifecycle, storage state, frames, structured forms, file uploads, dialogs and page exports require the native backend",
                 ));
             }
             return namespace
