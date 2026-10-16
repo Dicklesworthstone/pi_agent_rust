@@ -125,6 +125,7 @@ impl Source {
     }
 
     async fn read(owner: &AgentCx, cdp: &mut Cdp, allowlist: Option<&[String]>) -> Result<Self> {
+        cdp.check_download_context(owner).await?;
         let frame = cdp.frame_document(owner).await?;
         Self::parse(&frame, cdp.frame_selected(), allowlist)
     }
@@ -339,7 +340,7 @@ async fn cancel_new(owner: &AgentCx, cdp: &mut Cdp, before: &BTreeSet<String>) {
     // bounded by the original operation's deadline/cancellation and map limit.
     for record in cdp.downloads_since(before) {
         let _ = cdp
-            .browser_command(owner, "Browser.cancelDownload", json!({"guid":record.guid}))
+            .download_command(owner, "Browser.cancelDownload", json!({"guid":record.guid}))
             .await;
     }
 }
@@ -384,7 +385,7 @@ pub(super) async fn execute(
     let capture = async {
         // Include enablement in the cleanup scope: an error reply or transport
         // failure need not mean Chromium rejected the policy change.
-        cdp.browser_command(
+        cdp.download_command(
             owner,
             "Browser.setDownloadBehavior",
             json!({
@@ -398,11 +399,11 @@ pub(super) async fn execute(
     }
     .await;
 
-    // Ordinary errors attempt to return to deny. If outer cancellation drops
-    // this future, Session leaves its policy marker false so the next operation
-    // re-applies deny before doing anything else.
+    // Ordinary errors attempt to return to deny in the same browser context.
+    // If cancellation drops this future, Session retains that original context
+    // and restores its policy before any subsequent browser action.
     let reset = cdp
-        .browser_command(
+        .download_command(
             owner,
             "Browser.setDownloadBehavior",
             json!({"behavior":"deny","eventsEnabled":true}),
@@ -437,7 +438,8 @@ pub(super) async fn execute(
                 "url":resource.display_url,"url_kind":resource.kind,
                 "url_redacted":resource.redacted,"suggested_filename":start.suggested_filename,
                 "size_bytes":bytes.len(),"received_bytes":progress.received_bytes,
-                "frame_id":source.frame_id,"backend":"cdp"
+                "frame_id":source.frame_id,"backend":"cdp",
+                "browser_context":cdp.download_context_metadata()
             }),
         ))
     }

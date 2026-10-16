@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+mod contexts;
 mod diagnostics;
 
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -155,6 +156,7 @@ pub(super) struct Session {
     browser: Option<launch::ManagedBrowser>,
     uploads: interaction::upload::Store,
     downloads_denied: bool,
+    pending_download_context: Option<contexts::Context>,
 }
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
@@ -331,6 +333,7 @@ pub(super) struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     frame_scope: Option<frames::Scope>,
+    context_binding: Option<contexts::Binding>,
     pub(super) frame_targets: frames::Targets,
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
@@ -387,6 +390,7 @@ impl Cdp {
             next_id: 0,
             session_id: None,
             frame_scope: None,
+            context_binding: None,
             frame_targets: frames::Targets::default(),
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
@@ -613,6 +617,34 @@ impl Cdp {
         params: Value,
     ) -> Result<Value> {
         self.call(owner, method, params, false).await
+    }
+
+    fn current_download_context(&self) -> contexts::Context {
+        self.context_binding.as_ref().map_or(contexts::Context::Default, |binding| {
+            binding.context.clone()
+        })
+    }
+
+    pub(super) fn download_context_metadata(&self) -> Value {
+        self.current_download_context().metadata()
+    }
+
+    pub(super) async fn check_download_context(&mut self, owner: &AgentCx) -> Result<()> {
+        if let Some(binding) = self.context_binding.clone() {
+            binding.check(owner, self).await?;
+        }
+        Ok(())
+    }
+
+    /// Policy and cancellation use the original page's browser context, not
+    /// its DOM renderer session. Cleanup never falls back to another profile.
+    pub(super) async fn download_command(
+        &mut self,
+        owner: &AgentCx,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.current_download_context().command(owner, self, method, params).await
     }
 
     pub(super) fn page_session_id(&self) -> Result<&str> {
@@ -856,6 +888,7 @@ impl Session {
         self.active = None;
         self.endpoint = None;
         self.downloads_denied = false;
+        self.pending_download_context = None;
         // Never reuse element IDs across process lifetimes. Upload copies are
         // retained separately: pending File objects can outlive a tab/navigation.
     }
@@ -937,11 +970,26 @@ impl Session {
                 )
             }
         };
+        if self.pending_download_context.is_some()
+            && self.endpoint.as_deref() != Some(endpoint.as_str())
+        {
+            return Err(Error::tool(
+                "browser",
+                "BROWSER_CONTEXT_RECOVERY_ENDPOINT: recover the pending download policy on its original endpoint before switching browsers",
+            ));
+        }
         // Adopt startup only after discovery AND WebSocket identity/handshake
         // succeed. Failure or cancellation before then drops the local process.
         let mut cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
         if self.endpoint.as_deref() != Some(endpoint.as_str()) {
             self.clear_pages();
+        }
+        if let Some(context) = self.pending_download_context.clone() {
+            context.restore(owner, &mut cdp).await?;
+            self.pending_download_context = None;
+            if context == contexts::Context::Default {
+                self.downloads_denied = true;
+            }
         }
         if !self.downloads_denied {
             cdp.browser_command(
@@ -1079,6 +1127,9 @@ impl Session {
                 .ok_or_else(|| Error::tool("browser", "target has no current URL"))?;
             policy::check_navigation(current, allowlist)?;
         }
+        if let Some(info) = pages.get(&target) {
+            cdp.context_binding = contexts::select(owner, cdp, info).await?;
+        }
         let attached = cdp
             .call(
                 owner,
@@ -1180,10 +1231,11 @@ impl Session {
                     .await
             }
             "download" => {
-                // Mark false before allowing a transfer. If cancellation drops
-                // the future before deny is restored, the next call re-applies
-                // deny in connect() before any new browser action.
+                // Persist the original context before allowing a transfer. If
+                // cancellation drops cleanup, connect restores that context
+                // before any subsequent action, even on a different tab.
                 self.downloads_denied = false;
+                self.pending_download_context = Some(cdp.current_download_context());
                 let result = download::execute(
                     owner,
                     cdp,
@@ -1196,6 +1248,7 @@ impl Session {
                 .await;
                 if result.is_ok() {
                     self.downloads_denied = true;
+                    self.pending_download_context = None;
                 }
                 result
             }
