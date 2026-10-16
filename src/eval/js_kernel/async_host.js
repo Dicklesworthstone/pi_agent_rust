@@ -9,6 +9,8 @@
     const finite = Number.isFinite;
     const integer = Number.isInteger;
     const stringify = JSON.stringify;
+    const parse = JSON.parse;
+    const hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     const timers = new Map();
     const calls = new Map();
     const timerSet = timers.set.bind(timers);
@@ -41,13 +43,17 @@
     globalThis.setInterval = (callback, delay = 0, ...args) => addTimer(true, callback, delay, ...args);
     globalThis.clearInterval = clearTimer;
     globalThis.sleep = (delay = 0) => new PromiseType(resolve => timeout(resolve, delay));
-    globalThis.tool.call = (name, args = {}) => new PromiseType((resolve, reject) => {
+    const callTool = (name, args, structured) => new PromiseType((resolve, reject) => {
         if (typeof name !== 'string' || args === null || typeof args !== 'object' || isArray(args)) {
-            throw new TypeErrorType('tool.call requires a tool name and object arguments');
+            throw new TypeErrorType('tool.call/tool.result requires a tool name and object arguments');
         }
-        const id = enqueue(name, stringify(args));
-        callSet(id, {resolve, reject});
+        const id = structured
+            ? enqueue('__pi_tool_result', stringify({name, args}))
+            : enqueue(name, stringify(args));
+        callSet(id, {resolve, reject, structured});
     });
+    globalThis.tool.call = (name, args = {}) => callTool(name, args, false);
+    globalThis.tool.result = (name, args = {}) => callTool(name, args, true);
     return {
         dispatch(id, timer, flag, content) {
             if (timer) {
@@ -58,8 +64,24 @@
                 const call = callGet(id);
                 callDelete(id);
                 if (call) {
-                    if (flag) call.resolve(content);
-                    else call.reject(new ErrorType(content));
+                    if (!flag) {
+                        call.reject(new ErrorType(content));
+                    } else if (!call.structured) {
+                        call.resolve(content);
+                    } else {
+                        try {
+                            const result = parse(content);
+                            if (result === null || typeof result !== 'object' || isArray(result)
+                                || result.schema !== 'pi.eval.tool_result.v1'
+                                || !isArray(result.content) || !hasOwn(result, 'details')
+                                || typeof result.isError !== 'boolean') {
+                                throw new ErrorType('EVAL_BRIDGE_PROTOCOL: invalid structured tool result');
+                            }
+                            call.resolve(result);
+                        } catch (_) {
+                            call.reject(new ErrorType('EVAL_BRIDGE_PROTOCOL: invalid structured tool result'));
+                        }
+                    }
                 }
             }
         },

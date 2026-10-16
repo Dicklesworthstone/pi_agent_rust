@@ -8,6 +8,7 @@
 //! for the other. Both retain the host's read-only tool bridge policy.
 
 use crate::error::{Error, Result};
+#[cfg(test)]
 use crate::model::ContentBlock;
 use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod bridge_io;
+mod bridge_result;
 mod display;
 mod isolation;
 mod js_kernel;
@@ -351,7 +353,10 @@ impl EvalTool {
         tool_name: &str,
         input: Value,
     ) -> std::result::Result<String, String> {
-        let tool: Box<dyn Tool> = match tool_name {
+        // Result projection is an operation on the existing bridge, not a
+        // second dispatch path or authority to call additional tools.
+        let request = bridge_result::Request::parse(tool_name, input)?;
+        let tool: Box<dyn Tool> = match request.name.as_str() {
             "read" => Box::new(crate::tools::ReadTool::new(&self.cwd)),
             "grep" => Box::new(crate::tools::GrepTool::new(&self.cwd)),
             "find" => Box::new(crate::tools::FindTool::new(&self.cwd)),
@@ -362,16 +367,9 @@ impl EvalTool {
                 ));
             }
         };
-        match tool.execute("eval-bridge", input, None).await {
-            Ok(output) => {
-                let mut text = String::new();
-                for block in &output.content {
-                    if let ContentBlock::Text(t) = block {
-                        text.push_str(&t.text);
-                    }
-                }
-                if output.is_error { Err(text) } else { Ok(text) }
-            }
+        match tool.execute("eval-bridge", request.args, None).await {
+            Ok(output) if request.structured => bridge_result::structured(&output),
+            Ok(output) => bridge_result::text(&output),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -618,7 +616,10 @@ impl Tool for EvalTool {
          complete received console frames on disk (64 MiB encoded limit). \
          JavaScript can await import('./helper.js') for local .js/.mjs ES modules \
          inside this workspace; imports in %load scripts resolve beside the script. \
-         Module state is cached until reset. No package, network or Node imports."
+         Module state is cached until reset. No package, network or Node imports. \
+         JavaScript await tool.result(name, args) returns native content blocks, \
+         details and isError without flattening images or metadata. It uses the \
+         same read/grep/find/ls bridge as tool.call; no additional tools are enabled."
     }
 
     fn parameters(&self) -> Value {
