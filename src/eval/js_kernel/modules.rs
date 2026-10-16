@@ -5,7 +5,8 @@
 //! and TypeScript modules share one linker/cache; TypeScript is lowered to
 //! JavaScript before QuickJS sees it. JSON and text imports require their
 //! explicit type and export native values, never executable source.
-//! No packages, native libraries, remote URLs or implicit extension search.
+//! Workspace-installed ESM packages share that boundary. No native libraries,
+//! remote URLs, package installation or implicit file-extension search.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -23,6 +24,7 @@ use crate::agent_cx::AgentCx;
 use crate::eval::lifecycle::source;
 
 mod data;
+mod packages;
 mod typescript;
 
 const MAX_PATH_BYTES: usize = 4096;
@@ -64,6 +66,7 @@ struct State {
     approved: BTreeSet<String>,
     declarations: usize,
     source_bytes: usize,
+    packages: packages::Catalog,
 }
 
 impl State {
@@ -98,6 +101,7 @@ impl ModuleFiles {
             approved: BTreeSet::new(),
             declarations: 0,
             source_bytes: 0,
+            packages: packages::Catalog::default(),
         })))
     }
 
@@ -140,15 +144,14 @@ impl ModuleFiles {
             }
             active.resolutions += 1;
         }
-        // This is a filesystem specifier, not a URL decoder or package name.
-        // Requiring explicit relative spelling also rules out drive-relative
-        // paths, UNC endpoints and every protocol on Windows and Unix alike.
+        let relative = name.starts_with("./") || name.starts_with("../");
+        // Package spelling has its own strict admission. Neither route is a
+        // URL decoder, external directory search or implicit package installer.
         if !valid_spelling(name)
-            || !(name.starts_with("./") || name.starts_with("../"))
-            || module_language(Path::new(name)).is_none()
+            || relative && module_language(Path::new(name)).is_none()
         {
             return Err(
-                "EVAL_MODULE_SPECIFIER: use an explicit relative JS/TS, JSON or supported text-asset path without URL/query/fragment syntax"
+                "EVAL_MODULE_SPECIFIER: use an explicit relative module path or workspace-installed ESM package without URL/query/fragment syntax"
                     .into(),
             );
         }
@@ -164,9 +167,16 @@ impl ModuleFiles {
         let parent = base_path
             .parent()
             .ok_or("EVAL_MODULE_BASE: importer has no directory")?;
-        let resolved = std::fs::canonicalize(parent.join(name))
+        let (requested, package_root) = if relative { (parent.join(name), None) } else {
+            let (path, package_root) = packages::resolve(self, &root, parent, name)?;
+            (path, Some(package_root))
+        };
+        let resolved = std::fs::canonicalize(&requested)
             .map_err(|error| format!("EVAL_MODULE_PATH: module unavailable: {error}"))?;
         self.0.borrow().check()?;
+        if package_root.as_ref().is_some_and(|root| !resolved.starts_with(root)) {
+            return Err("EVAL_PACKAGE_PATH: exported target changed outside its package directory".into());
+        }
         if !resolved.starts_with(&root) || module_language(&resolved).is_none() {
             return Err(
                 "EVAL_MODULE_PATH: module must be a supported code or data file inside the workspace"
@@ -176,11 +186,12 @@ impl ModuleFiles {
         // Canonical aliases may share a JavaScript/TypeScript module, but
         // cannot turn a declared data import into executable source (or vice
         // versa), even when QuickJS already cached the canonical target.
-        if module_language(Path::new(name)).and_then(ModuleLanguage::data_type)
+        if module_language(&requested).and_then(ModuleLanguage::data_type)
             != module_language(&resolved).and_then(ModuleLanguage::data_type)
         {
             return Err("EVAL_MODULE_TYPE: module alias changes its data/code type".into());
         }
+        packages::validate_javascript(self, &root, &resolved)?;
         let resolved = resolved
             .to_str()
             .filter(|path| path.len() <= MAX_PATH_BYTES && !path.chars().any(char::is_control))
@@ -308,9 +319,12 @@ impl Resolver for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        validate_attributes(ctx, name, attributes)?;
-        self.resolve_path(base, name)
-            .map_err(|error| Exception::throw_message(ctx, &error))
+        let resolved = self.resolve_path(base, name)
+            .map_err(|error| Exception::throw_message(ctx, &error))?;
+        // A package subpath can export data without a suffix in its public
+        // name. Validate the actual target, including on cached resolution.
+        validate_attributes(ctx, &resolved, attributes)?;
+        Ok(resolved)
     }
 }
 
