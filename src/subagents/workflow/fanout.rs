@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 
 const MAX_ITEMS: usize = 32;
+const MAX_BATCH_SIZE: usize = 128;
 const MAX_CALLS: usize = 128;
 const MAX_DATA_BYTES: usize = 256 * 1024;
 
@@ -29,6 +30,7 @@ pub(super) struct Expansion {
     pointer: String,
     name: String,
     max_items: usize,
+    batch_size: Option<usize>,
 }
 
 impl Expansion {
@@ -39,9 +41,10 @@ impl Expansion {
         inputs: &[Input],
     ) -> Result<Option<Self>> {
         let Some(value) = value else { return Ok(None); };
-        let fields = value.as_object().filter(|fields| fields.len() == 4
-            && ["from", "pointer", "as", "maxItems"].iter().all(|key| fields.contains_key(*key)))
-            .ok_or_else(|| invalid("forEach requires exactly from, pointer, as and maxItems"))?;
+        let fields = value.as_object().filter(|fields|
+            ["from", "pointer", "as", "maxItems"].iter().all(|key| fields.contains_key(*key))
+            && fields.keys().all(|key| matches!(key.as_str(), "from" | "pointer" | "as" | "maxItems" | "batchSize")))
+            .ok_or_else(|| invalid("forEach requires from, pointer, as and maxItems, with optional batchSize"))?;
         let from = ids.get(identifier(&fields["from"])?).copied()
             .filter(|index| needs.contains(index))
             .ok_or_else(|| invalid("forEach must reference an explicit direct dependency"))?;
@@ -56,7 +59,12 @@ impl Expansion {
             .filter(|count| (1..=MAX_ITEMS as u64).contains(count))
             .and_then(|count| usize::try_from(count).ok())
             .ok_or_else(|| invalid("forEach maxItems must be an explicit integer from 1 to 32"))?;
-        Ok(Some(Self { from, pointer: pointer.to_owned(), name: name.to_owned(), max_items }))
+        let batch_size = fields.get("batchSize").map(|value| {
+            value.as_u64().filter(|size| (1..=MAX_BATCH_SIZE as u64).contains(size))
+                .and_then(|size| usize::try_from(size).ok())
+                .ok_or_else(|| invalid("forEach batchSize must be an integer from 1 to 128; omit it for scalar items"))
+        }).transpose()?;
+        Ok(Some(Self { from, pointer: pointer.to_owned(), name: name.to_owned(), max_items, batch_size }))
     }
 
     pub(super) fn tasks(
@@ -68,12 +76,36 @@ impl Expansion {
             .ok_or("dependency_data_unavailable")?;
         let selected = data.pointer(&self.pointer).ok_or("fanout_input_missing")?;
         let items = selected.as_array().ok_or("fanout_input_not_array")?;
-        if items.len() > self.max_items { return Err("fanout_item_limit"); }
+        // maxItems remains the declared native-call ceiling. Explicit batches
+        // can carry more source values without admitting more child processes.
+        let capacity = self.max_items.checked_mul(self.batch_size.unwrap_or(1))
+            .ok_or("fanout_item_limit")?;
+        if items.len() > capacity { return Err("fanout_item_limit"); }
         // Do not truncate a discovered work list, partially queue its prefix,
         // interpolate values as commands, or allocate a second copy of it.
         // A failure on the last item drops only these unlaunched task values.
+        if let Some(size) = self.batch_size {
+            let total = items.len();
+            return items.chunks(size).enumerate().map(|(index, items)| {
+                // The borrowed envelope is counted before making a JSON copy.
+                // The common input writer then checks the complete prompt,
+                // shared inputs and escaped framing, not only this batch.
+                let batch = Batch { offset: index * size, total, items };
+                encoded_size(&batch, super::MAX_TASK_BYTES).ok_or("dependency_input_limit")?;
+                let value = serde_json::to_value(batch).map_err(|_| "dependency_data_unavailable")?;
+                node.task_with_item(records, Some((&self.name, &value)))
+            }).collect();
+        }
         items.iter().map(|item| node.task_with_item(records, Some((&self.name, item)))).collect()
     }
+}
+
+/// One explicitly requested batch. These fields are data, never child flags.
+#[derive(Serialize)]
+struct Batch<'a> {
+    offset: usize,
+    total: usize,
+    items: &'a [Value],
 }
 
 pub(super) fn validate_budget(nodes: &[Node]) -> Result<()> {
@@ -180,7 +212,9 @@ pub(super) fn extend_schema(schema: &mut Value) {
             "from":{"type":"string","minLength":1,"maxLength":64},
             "pointer":{"type":"string","maxLength":1024},
             "as":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
-            "maxItems":{"type":"integer","minimum":1,"maximum":MAX_ITEMS}
+            "maxItems":{"type":"integer","minimum":1,"maximum":MAX_ITEMS},
+            "batchSize":{"type":"integer","minimum":1,"maximum":MAX_BATCH_SIZE,
+                "description":"Explicit batching: bind {offset,total,items} under as instead of one scalar item. Each native child receives at most batchSize consecutive source values, in original order; the last batch may be shorter. maxItems then caps native batches, so the source may contain at most maxItems*batchSize values (4096 at the largest settings), while the workflow still admits at most 128 native task instances. An explicit 1 also uses the batch envelope; omission preserves scalar input. All complete prompts must fit before any batch starts. outputSchema validates each child's whole batch result, and fanout.data remains one result per batch, not flattened or guessed per-item yields. No worker reuse, new deadline, retries, extra concurrency or authority."}
         }
     });
     if let Some(description) = schema["properties"]["workflow"]["items"]["properties"]["forEach"]["description"]
@@ -194,3 +228,6 @@ pub(super) fn extend_schema(schema: &mut Value) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod batch_tests;
