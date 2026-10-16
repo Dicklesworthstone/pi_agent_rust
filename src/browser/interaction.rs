@@ -14,6 +14,7 @@ pub(super) mod forms;
 mod frame_input;
 pub(super) mod pointer;
 pub(super) mod selectors;
+mod text_input;
 pub(super) mod upload;
 pub(super) mod wait;
 
@@ -388,31 +389,12 @@ async fn execute_input(
     if pointer::is_gesture(action) {
         return pointer::gesture(owner, cdp, tab, refs, args).await;
     }
-    let scoped = cdp.frame_selected();
-    if scoped && matches!(action, "press" | "type" | "fill" | "click" | "scroll") {
-        cdp.command(owner, "Page.bringToFront", json!({})).await?;
+    if matches!(action, "press" | "type" | "fill") {
+        return text_input::execute(owner, cdp, tab, refs, args).await;
     }
-    if action == "press" {
-        if let Some(selector) = args.get("selector").and_then(Value::as_str) {
-            let id = resolve(owner, cdp, selector, refs)
-                .await?
-                .ok_or_else(|| Error::tool("browser", "selector did not match an element"))?;
-            element_call(owner, cdp, id, "focus", json!({})).await?;
-            if scoped {
-                frame_input::ensure_focus(owner, cdp, id).await?;
-            }
-        } else if scoped {
-            return Err(Error::tool(
-                "browser",
-                "frame-scoped keypress requires a selector",
-            ));
-        }
-        let key = required(args, "key")?;
-        press(owner, cdp, key).await?;
-        return Ok(output(
-            format!("Dispatched keypress {key} in tab {tab}"),
-            json!({"action": action, "key": key, "tab": tab, "backend": "cdp"}),
-        ));
+    let scoped = cdp.frame_selected();
+    if scoped && matches!(action, "click" | "scroll") {
+        cdp.command(owner, "Page.bringToFront", json!({})).await?;
     }
     if action == "scroll" {
         let x = delta(args, "delta_x", 0.0)?;
@@ -479,35 +461,6 @@ async fn execute_input(
     match action {
         "click" => pointer::click(owner, cdp, tab, id, args).await,
         "hover" => pointer::hover(owner, cdp, tab, id, args).await,
-        "type" | "fill" => {
-            let text = required(args, "text")?;
-            element_call(owner, cdp, id, "edit", json!({"replace": action == "fill"})).await?;
-            if scoped {
-                frame_input::ensure_focus(owner, cdp, id).await?;
-            }
-            if text.is_empty() && action == "fill" {
-                press(owner, cdp, "Backspace").await?;
-            } else if !text.is_empty() {
-                cdp.command(owner, "Input.insertText", json!({"text": text}))
-                    .await?;
-            }
-            if scoped {
-                document(owner, cdp).await?;
-            }
-            if action == "fill"
-                && element_call(owner, cdp, id, "verify_fill", json!({"text": text})).await? != true
-            {
-                return Err(Error::tool(
-                    "browser",
-                    "field did not retain the requested text; the page may have rejected or transformed the input",
-                ));
-            }
-            let count = text.chars().count();
-            Ok(output(
-                format!("Dispatched text input to {selector} in tab {tab} ({count} chars)"),
-                json!({"action": action, "selector": selector, "char_count": count, "backend": "cdp"}),
-            ))
-        }
         _ => Err(Error::tool(
             "browser",
             format!("unsupported input action: {action}"),
@@ -609,21 +562,6 @@ pub(super) fn key_event(key: &str) -> Result<Value> {
         event["commands"] = json!(["selectAll"]);
     }
     Ok(event)
-}
-
-async fn press(owner: &AgentCx, cdp: &mut Cdp, key: &str) -> Result<()> {
-    let mut event = key_event(key)?;
-    event["type"] = json!("keyDown");
-    cdp.command(owner, "Input.dispatchKeyEvent", event.clone())
-        .await?;
-    let object = event
-        .as_object_mut()
-        .ok_or_else(|| Error::tool("browser", "invalid key event"))?;
-    object.remove("text");
-    object.remove("commands");
-    event["type"] = json!("keyUp");
-    cdp.command(owner, "Input.dispatchKeyEvent", event).await?;
-    Ok(())
 }
 
 #[cfg(test)]
