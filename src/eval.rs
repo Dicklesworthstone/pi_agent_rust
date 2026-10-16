@@ -14,11 +14,12 @@ use serde_json::{Value, json};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod bridge_io;
 mod display;
+mod isolation;
 mod js_kernel;
 mod lifecycle;
 mod output;
@@ -201,7 +202,7 @@ pub struct EvalTool {
     retained_sessions: Mutex<session::RetainedSessions>,
     // Slot mutexes protect storage, not execution: each runner takes its
     // kernel out across awaits. Keep this lease until it returns or drops.
-    execution: futures::lock::Mutex<()>,
+    execution: Arc<futures::lock::Mutex<()>>,
 }
 
 impl EvalTool {
@@ -215,7 +216,7 @@ impl EvalTool {
             js: Mutex::new(None),
             session_scope: crate::jobs::JobSessionScope::default(),
             retained_sessions: Mutex::new(session::RetainedSessions::default()),
-            execution: futures::lock::Mutex::new(()),
+            execution: Arc::new(futures::lock::Mutex::new(())),
         }
     }
 
@@ -594,6 +595,8 @@ impl Tool for EvalTool {
     fn description(&self) -> &str {
         "Run a Python or JavaScript cell in a persistent kernel. Cells execute \
          one at a time within this session and return the final expression. \
+         Set kernel_mode=per_call for a fresh private kernel, retired after \
+         this call without reading or resetting either session kernel. \
          Set reset=true to discard the selected language's state before this \
          cell; the other language is unaffected. Timeouts or crashes report \
          state loss explicitly. POSIX Python may set soft_timeout_secs below \
@@ -631,6 +634,12 @@ impl Tool for EvalTool {
                     "enum": ["python", "js"],
                     "description": "Kernel to use (default python)"
                 },
+                "kernel_mode": {
+                    "type": "string",
+                    "enum": ["session", "per_call"],
+                    "default": "session",
+                    "description": "session retains interpreter state; per_call starts fresh and retires it after the call. Neither mode isolates filesystem/process effects."
+                },
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Active cell budget in seconds (default 30, clamped to 1–600); excludes waiting for another cell"
@@ -661,7 +670,7 @@ impl Tool for EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_cell(input, on_update).await
+        self.execute_with_mode(input, on_update).await
     }
 
     fn effects(&self) -> ToolEffects {
@@ -940,9 +949,9 @@ mod tests {
     #[test]
     fn js_bridge_read_and_whitelist_denial() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let tool = EvalTool::new(dir.path());
         std::fs::write(dir.path().join("data.txt"), "js-bridge-payload-88\n")
             .expect("write fixture");
-        let tool = EvalTool::new(dir.path());
         let out = run_js_cell_sync(
             &tool,
             "const c = tool.read('data.txt'); c.includes('js-bridge-payload-88')",
