@@ -14,6 +14,9 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "browser_downloads/contexts.rs"]
+mod contexts;
+
 const PAYLOAD: &[u8] = b"file\0\xff!";
 
 #[derive(Clone, Copy, Debug)]
@@ -205,8 +208,18 @@ fn frame_tree(session: &str, fault: Fault, reset: bool) -> Value {
     json!({"frameTree":tree})
 }
 
-#[allow(clippy::too_many_lines)]
 fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path::Path) -> Observed {
+    serve_with_context(socket, scene, fault, output, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_with_context(
+    socket: &mut TcpStream,
+    scene: Scene,
+    fault: Fault,
+    output: &std::path::Path,
+    mut context: Option<&mut contexts::Peer>,
+) -> Observed {
     let mut observed = Observed::default();
     let mut configured = BTreeSet::new();
     for _ in 0..2000 {
@@ -216,7 +229,16 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
         let params = &request["params"];
         let mut failed = false;
         let mut deferred = false;
-        let result = match method {
+        let contextual = context.as_deref_mut()
+            .and_then(|peer| peer.reply(&request, &observed, socket));
+        if context.as_deref().is_some_and(contexts::Peer::withholding) {
+            assert!(read_frame(socket).is_none(), "deadline must close the pending connection without replay");
+            return observed;
+        }
+        let result = if let Some((result, failure)) = contextual {
+            failed = failure;
+            result
+        } else { match method {
             "Browser.setDownloadBehavior" => {
                 assert!(session.is_empty());
                 assert_eq!(params["eventsEnabled"], true);
@@ -425,7 +447,7 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
                 json!({})
             }
             _ => panic!("unexpected download command: {method}"),
-        };
+        }};
         let mut response = if failed {
             json!({"id":request["id"],"error":{"code":-32000,"message":"fixture command failed"}})
         } else { json!({"id":request["id"],"result":result}) };
@@ -439,24 +461,29 @@ fn serve(socket: &mut TcpStream, scene: Scene, fault: Fault, output: &std::path:
     panic!("download fixture command budget exhausted")
 }
 
+fn open_connection(listener: &TcpListener, address: std::net::SocketAddr) -> TcpStream {
+    let mut discovery = accept(listener);
+    assert!(headers(&mut discovery).starts_with("GET /json/version "));
+    let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/downloads")}).to_string();
+    write!(discovery, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    drop(discovery);
+    let mut socket = accept(listener);
+    let request = headers(&mut socket);
+    let key = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
+    }).unwrap();
+    let accept = asupersync::net::websocket::compute_accept_key(key);
+    write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
+    socket
+}
+
 fn peer(scene: Scene, fault: Fault, output: PathBuf) -> (String, thread::JoinHandle<Observed>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
-        let mut discovery = accept(&listener);
-        assert!(headers(&mut discovery).starts_with("GET /json/version "));
-        let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/downloads")}).to_string();
-        write!(discovery, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        drop(discovery);
-        let mut socket = accept(&listener);
-        let request = headers(&mut socket);
-        let key = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-        }).unwrap();
-        let accept = asupersync::net::websocket::compute_accept_key(key);
-        write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
+        let mut socket = open_connection(&listener, address);
         serve(&mut socket, scene, fault, &output)
     });
     (format!("http://{address}"), handle)

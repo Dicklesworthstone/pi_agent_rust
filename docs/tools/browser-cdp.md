@@ -116,8 +116,9 @@ closes the real target. Active means the tool's selected tab, not desktop focus.
 Navigation waits for the matching document's DOMContentLoaded/load lifecycle
 event. Downloads and navigation errors are not reported as successfully loaded
 pages. Browser downloads are denied by default for each established tool
-session so an ordinary click/evaluate/keypress cannot silently write an unmanaged
-file. Use the explicit `download` action below to capture one transfer.
+session; selecting a tab in an admitted CDP-created context also applies denial
+to that context before attachment/input. Use the explicit `download` action below
+to capture one transfer. These policies are context-wide, not network isolation.
 
 `snapshot` produces up to 200 accessibility-backed element references.
 `ax_tree` also returns up to 1,000 actual accessibility nodes with truncation
@@ -346,23 +347,106 @@ published under `downloads/`; supplied paths must be workspace-relative and use
 the same descriptor-pinned create-only publisher as screenshots/media artifacts.
 Existing files and symlinked ancestors are never overwritten or followed.
 Results include `saved_path`, `size_bytes`, `received_bytes`, a safe display `url`,
-`url_kind`, `url_redacted`, `suggested_filename` and the verified source `frame_id`.
+`url_kind`, `url_redacted`, `suggested_filename`, the verified source `frame_id`
+and the derived `browser_context` described below.
 
 After a normal attempt Pi restores download behavior to `deny` before publishing.
 An error during capture enablement also enters this cleanup path: a lost or failed
 acknowledgement does not prove the policy was unchanged. On ordinary failure it
 attempts cancellation of transfers first observed in this capture window without
 replaying the click. Cleanup shares the original deadline and cancellation. If
-outer cancellation interrupts cleanup, the session leaves its policy marker
-uninitialized and the next operation reapplies `deny`; this is not immediate
-rollback of network, page or browser effects. No failed capture publishes a file.
+outer cancellation interrupts cleanup, the session retains the original context
+for recovery on the next connected operation. This is not immediate rollback of
+network, page or browser effects. No failed capture publishes a file.
 Download capture does not inspect file contents or assert they are safe to open.
 
-Download policy remains Chromium default-browser-context-wide, not per frame.
-Use a dedicated browser without unrelated simultaneous downloads. A frame selector
-does not create an isolated browser context, and non-default/incognito context
-capture is not implemented by this workflow. `domainAllowlist` is an access guard,
-not a subresource/network sandbox.
+Download policy is browser-context-wide, not per frame or per tab. Existing tabs
+in an admitted CDP-created context are supported as described below. Use a
+dedicated browser without unrelated simultaneous downloads in the same context;
+`domainAllowlist` remains an access guard, not a subresource/network sandbox.
+
+### Existing browser contexts and interrupted-capture recovery
+
+The ordinary `tab` selection also supports a page in an existing context created
+through `Target.createBrowserContext`. Use its page target ID from `list_tabs`:
+
+```json
+{"action":"list_tabs"}
+{"action":"download","tab":"PAGE_TARGET_ID","selector":"#export","output_path":"downloads/context-report.csv"}
+```
+
+Replace `PAGE_TARGET_ID` with an actual returned page ID. No context ID is supplied
+by the model. The selected target's `browserContextId` is checked against the
+bounded `Target.getBrowserContexts` inventory, and target/context identity is
+rechecked alongside the source-document checks through publication. Malformed,
+unlisted or changed context identities fail rather than redirecting the call.
+The existing absent-context-field protocol form retains default semantics.
+
+An admitted named context receives `deny` before attachment and input, in addition
+to the existing default-context initialization. Capture enablement, reset and
+cancellation then carry the same named context ID. A named policy error is never
+retried against the default profile or another named context. Frame-scoped
+transfers still use the page's context even when DOM operations use a different
+renderer session. The 100 MiB limit, file-integrity checks, URL policy, native
+input projection and create-only publisher are unchanged.
+
+Some Chromium versions report an ordinary default-profile ID in target metadata
+but neither list it as a CDP-created context nor accept it in browser download
+commands. Pi uses `defaultBrowserContextId` when the inventory supplies it.
+Otherwise, for an unclassified target, it creates one hidden, background
+`about:blank` target with no context override, reads its default identity and
+closes that probe target. The probe belongs to the operation's CDP connection;
+disconnection also ends its lifetime. It does not navigate or close a user tab.
+Failure to establish or close the probe is an error, not permission to assume
+that an arbitrary unlisted profile is the default. The probe can be observed by
+other debugging clients even though it has no visible tab.
+
+Results contain `browser_context: {"kind":"default"}` or
+`browser_context: {"kind":"named","id":"..."}`. These are browser context
+identifiers, distinct from numerical JavaScript execution-context IDs.
+This increment does not create or dispose user browser contexts, create new tabs
+inside a selected context, or change storage-state access. A new `open` tab name
+still creates a default-context tab. Manually created incognito/profile contexts
+not exposed as CDP-created contexts remain unsupported; no failed selection
+falls back to a personal or unrelated browser profile.
+
+Before enabling a capture, the owning session retains its original context as a
+pending recovery obligation. Following an error or interrupted cleanup, the next
+connected call restores denial there before listing/selecting a different tab or
+performing other browser work. A failed inventory or reset retains the obligation
+and blocks the later action. An original CDP-created context that is no longer
+in the inventory is treated as disposed; recovery is not redirected elsewhere.
+Changing the endpoint while recovery is pending is refused before a new connection.
+Stopping a Pi-owned browser destroys its contexts and clears their retained state.
+
+Recovery is best effort under each call's existing deadline, not a background
+worker or an immediate rollback. Releasing a namespace or dropping an attached
+tool cannot asynchronously restore a remote policy after its connection is gone;
+the externally attached browser remains the operator's responsibility. Pages can
+continue running while no tool call is active. Different clients sharing the
+same context can still change its policy. No file contents or application effects
+are made transactional by the context checks.
+
+Five unit tests and ten public HTTP/WebSocket test functions were authored for
+this increment. The public cases reuse the existing download peer and include
+nested frame captures, reported/probed default identity, unknown/malformed
+contexts, changed ownership, named-policy errors, a withheld reset acknowledgement,
+recovery across repeated connections, failed recovery retention, disposed contexts
+and endpoint-switch refusal. They were not compiled or executed: the required
+`dsr quality --tool pi_agent_rust` attempt returned command not found (exit 127).
+Rust compilation, rustfmt, Clippy, native adapter and cross-platform acceptance
+remain unverified.
+
+A separate offline Chromium 144.0.7559.96 protocol probe passed 23 cases: eighteen
+literal binary/Unicode/empty downloads across the default context and two named
+contexts, in main documents and local children; a negative control proving that
+default-only enablement does not capture a denied named-context download;
+independent named-context policy, reconnect denial, hidden-target disconnect
+cleanup and disposed-context inventory. Each successful transfer checked trusted
+native input, exact source frame, unchanged document, byte count and saved bytes.
+This did not execute the Rust adapter or validate remote-renderer context captures.
+The root-container probe used `--no-sandbox`; production flags and managed browser
+policies were unchanged. No DSR pass or Bead closure is claimed.
 
 ### Client-generated exports and URL redaction
 
