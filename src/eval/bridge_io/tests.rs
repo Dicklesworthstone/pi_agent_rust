@@ -200,8 +200,8 @@ answer, _ = await asyncio.gather(work(), progress())
 assert 'native payload' in answer
 42
 "#;
-        writeln!(kernel.stdin, "{}", json!({"id":1,"code":code})).unwrap();
-        kernel.stdin.flush().unwrap();
+        writeln!(kernel.stdin.as_mut().unwrap(), "{}", json!({"id":1,"code":code})).unwrap();
+        kernel.stdin.as_mut().unwrap().flush().unwrap();
         let line = kernel.next_line(deadline, &mut capture, &session).await.unwrap().unwrap();
         let bridge: Value = serde_json::from_str(&line).unwrap();
         transport::validate_bridge_owner(&bridge, 1, line.len()).unwrap();
@@ -211,8 +211,8 @@ assert 'native payload' in answer
         };
         let reply = wait_python(&kernel.lines, 1, deadline, &mut capture, &session, pending).await.unwrap();
         assert_eq!(reply["ok"], true);
-        writeln!(kernel.stdin, "{}", json!({"bridge_result":reply})).unwrap();
-        kernel.stdin.flush().unwrap();
+        writeln!(kernel.stdin.as_mut().unwrap(), "{}", json!({"bridge_result":reply})).unwrap();
+        kernel.stdin.as_mut().unwrap().flush().unwrap();
         let mut final_frame: Value = loop {
             let line = kernel.next_line(deadline, &mut capture, &session).await.unwrap().unwrap();
             let frame: Value = serde_json::from_str(&line).unwrap();

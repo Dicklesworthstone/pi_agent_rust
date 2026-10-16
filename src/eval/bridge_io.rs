@@ -14,6 +14,8 @@ use super::{output::Capture, session::CellSession};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 
+pub(super) mod delivery;
+
 const DRAIN_FRAMES: usize = 8;
 const DRAIN_TARGET_BYTES: usize = 256 * 1024;
 const IDLE_POLL: Duration = Duration::from_millis(15);
@@ -91,6 +93,8 @@ pub(super) async fn wait_python<F: Future>(
         session.check_tool().await?;
         checkpoint(&owner, deadline)?;
         drain(lines, id, capture, &owner, deadline)?;
+        session.check_tool().await?;
+        checkpoint(&owner, deadline)?;
         capture.publish(false);
         // Callbacks can cancel or switch conversations. Neither native
         // dispatch nor its reply may use authority from before that callback.

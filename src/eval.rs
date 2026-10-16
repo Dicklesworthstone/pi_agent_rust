@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::model::ContentBlock;
 use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Stdio};
 use std::sync::Mutex;
@@ -37,7 +37,9 @@ const JS_OUTPUT_QUEUE: usize = 8;
 
 struct PyKernel {
     child: ProcessGuard,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
+    // One response may arrive before the input writer receipt is scheduled.
+    pending_line: Option<String>,
     /// Lines from the kernel's stdout, streamed by a dedicated reader thread
     /// (a cell may emit several bridge-request lines before its final
     /// response). Disconnection is EOF; protocol read failures are explicit.
@@ -104,7 +106,8 @@ impl PyKernel {
         // must close the Job/process group and reap the kernel as well.
         let kernel = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
+            pending_line: None,
             lines: std::sync::Mutex::new(rx),
             next_id: 1,
             cells_run: 0,
@@ -148,6 +151,7 @@ impl PyKernel {
         loop {
             session_guard.check_tool().await?;
             capture.publish(false);
+            if let Some(line) = self.pending_line.take() { return Ok(Some(line)); }
             let received = self
                 .lines
                 .lock()
@@ -408,16 +412,10 @@ impl EvalTool {
 
         let id = kernel.next_id;
         kernel.next_id += 1;
-        let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs}).to_string();
-        if kernel
-            .stdin
-            .write_all(format!("{request}\n").as_bytes())
-            .and_then(|()| kernel.stdin.flush())
-            .is_err()
-        {
-            kernel.kill();
-            return Err(Error::tool("eval", "EVAL_IO: Python request delivery was uncertain; EVAL_STATE_RESET: kernel discarded. The cell was not replayed."));
-        }
+        let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs});
+        bridge_io::delivery::send_python(
+            &mut kernel, id, deadline, capture, session_guard, &request,
+        ).await?;
 
         // Read lines until the final cell response; bridge requests re-enter
         // pi tools mid-cell and their results resume the kernel.
@@ -497,12 +495,10 @@ impl EvalTool {
                     self.run_bridge_call(bridge),
                 ).await?;
                 session_guard.check_tool().await?;
-                let line = json!({"bridge_result": reply}).to_string();
-                kernel
-                    .stdin
-                    .write_all(format!("{line}\n").as_bytes())
-                    .and_then(|()| kernel.stdin.flush())
-                    .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
+                bridge_io::delivery::send_python(
+                    &mut kernel, id, deadline, capture, session_guard,
+                    &json!({"bridge_result": reply}),
+                ).await?;
                 continue;
             }
             transport::validate_response(&parsed, id)?;
