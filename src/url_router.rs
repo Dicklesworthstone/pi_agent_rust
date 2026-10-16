@@ -8,17 +8,20 @@
 //! conflict and SSH schemes retain their existing contracts.
 
 pub(crate) mod agent;
+mod conflicts;
 mod documents;
 mod skills;
 
 pub use documents::{
     ConflictRegion, ResolveOptions, ResolvedDoc, SSH_HOSTKEY_REMEDIATION, SshFailureKind,
-    SshTarget, TransferEndpoint, URL_ROUTER_SCHEMA, classify_ssh_failure, conflict_regions,
+    SshTarget, TransferEndpoint, URL_ROUTER_SCHEMA, classify_ssh_failure,
     has_scheme, parse_ssh_target, parse_transfer_endpoint, remote_atomic_write_script,
     resume_offset, ssh_command_flags, ssh_fetch_document, ssh_host_allowed,
     ssh_replace_document, ssh_transfer, ssh_write_allowed_hosts, ssh_write_document,
-    write_conflict_resolution, write_local,
+    write_local,
 };
+
+pub use conflicts::{conflict_regions, write_conflict_resolution};
 
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -65,6 +68,9 @@ pub(crate) fn resolve_local_agent(reference: &str) -> Result<ResolvedDoc> {
 /// projections distinguish pending, rejected, unavailable and missing data.
 /// Resolution never silently falls back to the filesystem.
 pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
+    if let Some(reference) = path.strip_prefix("conflict://") {
+        return conflicts::resolve(reference, cwd);
+    }
     if let Some(reference) = path.strip_prefix("skill://") {
         return skills::resolve(reference, cwd);
     }
@@ -79,6 +85,9 @@ pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
 /// # Errors
 /// See [`resolve`]. Overrides do not grant access to another parent's agents.
 pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<ResolvedDoc> {
+    if let Some(reference) = path.strip_prefix("conflict://") {
+        return conflicts::resolve(reference, cwd);
+    }
     if let Some(reference) = path.strip_prefix("skill://") {
         return skills::resolve(reference, cwd);
     }
