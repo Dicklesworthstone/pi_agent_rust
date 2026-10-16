@@ -1,8 +1,8 @@
 //! Model-visible rich output and structured SDK results from eval cells.
 //!
 //! Explicit MIME frames are data, never host instructions or paths. Admit
-//! the entire bounded collection before publishing native content. PNG checks
-//! inspect only its envelope/dimensions; no raster decode or validity claim.
+//! the entire bounded collection before publishing native content. Image checks
+//! inspect only envelopes/dimensions; no raster decode or validity claim.
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
 use crate::tools::ToolOutput;
+
+mod images;
 
 pub(super) const MAX_DISPLAYS: usize = 32;
 pub(super) const MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
@@ -109,9 +111,13 @@ fn collect(response: &Value) -> Result<Displays> {
                 let text = data.as_str().ok_or_else(|| invalid("text display data must be a string"))?;
                 ContentBlock::Text(TextContent::new(text))
             }
-            "image/png" => {
-                let encoded = data.as_str().ok_or_else(|| invalid("PNG display data must be base64 text"))?;
-                let (width, height) = png_dimensions(encoded)?;
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
+                let encoded = data.as_str().ok_or_else(|| invalid("image display data must be base64 text"))?;
+                let (width, height) = if mime == "image/png" {
+                    png_dimensions(encoded)?
+                } else {
+                    images::dimensions(encoded, mime)?
+                };
                 descriptor["width"] = json!(width);
                 descriptor["height"] = json!(height);
                 ContentBlock::Image(ImageContent { data: encoded.to_string(), mime_type: mime.to_string() })

@@ -25,11 +25,11 @@
     const maxBytes = 2 * 1024 * 1024;
 
     const fail = message => { throw new ErrorType(message); };
-    const invalid = () => fail("EVAL_DISPLAY_INVALID: explicit JSON data, text or PNG bytes/base64 required");
+    const invalid = () => fail("EVAL_DISPLAY_INVALID: explicit JSON data, text or image bytes/base64 required");
     const limit = () => fail("EVAL_DISPLAY_LIMIT: rich output exceeds its byte or structure budget");
     const codeAt = (text, index) => apply(charCode, text, [index]);
 
-    function pngData(value) {
+    function imageData(value) {
         if (typeof value === "string") return value;
         if (!isView(value) || apply(typedName, value, []) !== "Uint8Array") return invalid();
         const length = apply(typedLength, value, []);
@@ -46,9 +46,11 @@
     }
 
     return function display(value, mimeType = "application/json") {
+        const image = mimeType === "image/png" || mimeType === "image/jpeg"
+            || mimeType === "image/gif" || mimeType === "image/webp";
         if (mimeType !== "application/json" && mimeType !== "text/plain"
-            && mimeType !== "text/markdown" && mimeType !== "image/png") return invalid();
-        if (mimeType === "image/png") value = pngData(value);
+            && mimeType !== "text/markdown" && !image) return invalid();
+        if (image) value = imageData(value);
         if (mimeType !== "application/json" && typeof value !== "string") return invalid();
         let output = "", bytes = 0, nodes = 0;
         const ancestors = new SetType();
