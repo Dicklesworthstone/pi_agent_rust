@@ -1,6 +1,6 @@
 use super::*;
 
-const BLOCK: &str = "<<<<<<< ours\nours 😀\n||||||| base\nbase\n=======\ntheirs 雪\n>>>>>>> theirs\n";
+pub(super) const BLOCK: &str = "<<<<<<< ours\nours 😀\n||||||| base\nbase\n=======\ntheirs 雪\n>>>>>>> theirs\n";
 
 fn event(case: &str) {
     eprintln!("{}", json!({"suite":"conflict_resolution","case":case,"phase":"start"}));
@@ -12,7 +12,7 @@ fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn fixture(name: &str, content: &str) -> tempfile::TempDir {
+pub(super) fn fixture(name: &str, content: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q", "-b", "main"]);

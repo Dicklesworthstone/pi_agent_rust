@@ -21,7 +21,10 @@ pub use documents::{
     write_local,
 };
 
-pub use conflicts::{conflict_regions, write_conflict_resolution};
+pub use conflicts::{
+    ConflictChoice, ConflictResolution, apply_conflict_choices, conflict_regions,
+    write_conflict_resolution,
+};
 
 use crate::error::{Error, Result};
 use std::path::Path;

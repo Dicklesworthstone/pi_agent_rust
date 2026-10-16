@@ -18,6 +18,9 @@ use crate::lsp::text::{Range, TextEdit, content_hash_for_drift, offset_to_positi
 
 mod io;
 mod parser;
+mod selection;
+
+pub use selection::{ConflictChoice, ConflictResolution, apply_conflict_choices};
 
 const MAX_FILES: usize = 256;
 const MAX_REGIONS: usize = 1024;
@@ -158,18 +161,26 @@ impl Snapshot {
     }
 
     fn apply(&self, choices: &[(usize, &str)]) -> Result<Vec<ConflictRegion>> {
+        let replacements = choices.iter().map(|&(index, side)| {
+            let located = self.location(index)?;
+            let text = located.region.chosen(&self.files[located.file].text, side)?;
+            Ok((index, text))
+        }).collect::<Result<Vec<_>>>()?;
+        self.apply_replacements(&replacements)
+    }
+
+    fn apply_replacements(&self, choices: &[(usize, &str)]) -> Result<Vec<ConflictRegion>> {
         self.budget.check()?;
         let mut seen = BTreeSet::new();
         let mut plan = WorkspaceEditPlan::default();
         let mut expected = HashMap::new();
         let mut selected = Vec::with_capacity(choices.len());
-        for &(index, side) in choices {
+        for &(index, replacement) in choices {
             if !seen.insert(index) { return Err(fail("DUPLICATE", "a region was selected more than once")); }
             let located = self.location(index)?;
             let image = &self.files[located.file];
             let region = &located.region;
             let path = self.root.join(&image.relative);
-            let replacement = region.chosen(&image.text, side)?;
             let start = offset_to_position(&image.text, region.span.start)
                 .ok_or_else(|| fail("RANGE", "conflict start is not a text boundary"))?;
             let end = offset_to_position(&image.text, region.span.end)
@@ -218,21 +229,20 @@ pub fn write_conflict_resolution(cwd: &Path, index: usize, side: &str) -> Result
 }
 
 pub(super) fn resolve(reference: &str, cwd: &Path) -> Result<ResolvedDoc> {
-    let (index, selector) = reference.split_once(' ').map_or((reference, "full"), |(index, side)| {
-        (index, side.trim().strip_prefix('@').unwrap_or(side.trim()))
-    });
-    if !matches!(selector, "full" | "ours" | "theirs" | "base") {
-        return Err(fail("SIDE", "unknown conflict selector; use @ours, @theirs or @base"));
-    }
+    let selection = selection::parse_read(reference)?;
+    let selector = selection.side;
     let snapshot = Snapshot::read(cwd)?;
-    let (content, metadata) = if index == "*" || index.is_empty() {
+    let (content, metadata) = if selection.index.is_none() {
         if selector != "full" { return Err(fail("REFERENCE", "bulk conflict reads cannot select a side")); }
         let mut text = format!("{} text conflict region(s) in {} unmerged file(s).\n", snapshot.regions.len(), snapshot.files.len());
         for index in 0..snapshot.regions.len() { text.push_str(&snapshot.render(index)?); }
         (text, json!({"count":snapshot.regions.len(),"unmergedFiles":snapshot.files.len(),"complete":true}))
     } else {
-        let index = index.parse::<usize>().map_err(|_| fail("REFERENCE", "conflict reference must be a number or *"))?;
+        let index = selection.index.ok_or_else(|| fail("REFERENCE", "conflict index missing"))?;
         let located = snapshot.location(index)?;
+        if selection.token.is_some_and(|token| token != located.token) {
+            return Err(fail("STALE", "conflict read token no longer matches; inspect the current inventory"));
+        }
         let content = if selector == "full" { snapshot.render(index)? }
             else { located.region.chosen(&snapshot.files[located.file].text, selector)?.to_owned() };
         let mut metadata = snapshot.metadata(index)?;

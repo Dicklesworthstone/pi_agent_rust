@@ -106,7 +106,11 @@ pub(super) fn read(root: &Path, relative: &Path) -> Result<String> {
                 return Err(fail("PATH", "conflict paths cannot follow symbolic links"));
             }
         }
-        std::fs::File::open(path)?
+        let canonical = std::fs::canonicalize(path)?;
+        if !canonical.starts_with(root) {
+            return Err(fail("PATH", "conflict source resolves outside the worktree"));
+        }
+        std::fs::File::open(canonical)?
     };
     let metadata = file.metadata()?;
     if !metadata.is_file() { return Err(fail("PATH", "conflict source is not a regular file")); }
