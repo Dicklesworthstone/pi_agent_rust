@@ -16,6 +16,22 @@ const TEXT: &str = "PRIVATE-CANARY 🦀";
 enum Fault {
     None, FocusLost, MalformedFocus, LookupNavigation, EditNavigation,
     InsertNavigation, DownFailure, UpFailure, DownNavigation, RevertedFill,
+    ValueDate, ValueTime, ValueMonth, ValueWeek, ValueDateTime, ValueColor,
+    ValueRange, ValueNoop, ValueMalformed, ValueRejected, ValueNavigation,
+}
+
+fn value_request(fault: Fault) -> Option<(&'static str, &'static str, &'static str)> {
+    match fault {
+        Fault::ValueDate | Fault::ValueNoop | Fault::ValueMalformed |
+        Fault::ValueRejected | Fault::ValueNavigation => Some(("date", "2026-10-16", "2026-10-16")),
+        Fault::ValueTime => Some(("time", "12:34", "12:34")),
+        Fault::ValueMonth => Some(("month", "2026-10", "2026-10")),
+        Fault::ValueWeek => Some(("week", "2026-W42", "2026-W42")),
+        Fault::ValueDateTime => Some(("datetime-local", "2026-10-16 12:34:00", "2026-10-16T12:34")),
+        Fault::ValueColor => Some(("color", "#ABCDEF", "#abcdef")),
+        Fault::ValueRange => Some(("range", "2e1", "20")),
+        _ => None,
+    }
 }
 
 #[derive(Default, Debug)]
@@ -28,13 +44,14 @@ struct Seen {
     ups: usize,
     fronts: usize,
     changed: bool,
+    value_checks: usize,
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match listener.accept() {
-            Ok(socket) => {
+            Ok((socket, _)) => {
                 socket.set_nonblocking(false).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
                 socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -142,7 +159,13 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
                         "edit" | "focus" => {
                             seen.edits += 1;
                             if fault == Fault::EditNavigation { seen.changed = true; }
-                            json!(true)
+                            if let Some((kind, text, value)) = value_request(fault) {
+                                assert_eq!(params["arguments"][1]["value"], json!({"replace":true,"text":text}));
+                                if fault == Fault::ValueNavigation { seen.changed = true; }
+                                let mut result = json!({"kind":kind,"value":value,"changed":fault != Fault::ValueNoop});
+                                if fault == Fault::ValueMalformed { result["changed"] = json!("PRIVATE-CANARY"); }
+                                result
+                            } else { json!(true) }
                         }
                         "focused" => {
                             seen.focus_checks += 1;
@@ -150,9 +173,15 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
                             else { json!(fault != Fault::FocusLost) }
                         }
                         "verify_fill" => json!(fault != Fault::RevertedFill),
+                        "verify_value" => {
+                            seen.value_checks += 1;
+                            let (kind, _, value) = value_request(fault).unwrap();
+                            assert_eq!(params["arguments"][1]["value"], json!({"kind":kind,"value":value}));
+                            json!(fault != Fault::ValueRejected)
+                        }
                         action => panic!("unexpected element action {action}"),
                     };
-                    json!({"result":{"type":if value.is_boolean() {"boolean"} else {"string"},"value":value}})
+                    json!({"result":{"type":if value.is_boolean() {"boolean"} else if value.is_object() {"object"} else {"string"},"value":value}})
                 }
             }
             "Runtime.releaseObject" => { assert_eq!(params["objectId"], "original"); json!({}) }
@@ -210,7 +239,7 @@ fn run(action: &str, scoped: bool, fault: Fault, empty: bool) -> (pi::error::Res
     let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(format!("http://{address}"));
     let mut args = json!({"action":action,"tab":"page-1","selector":"#input","timeout_ms":8000});
     if action == "press" { args["key"] = json!("Ctrl+a"); }
-    else { args["text"] = json!(if empty { "" } else { TEXT }); }
+    else { args["text"] = json!(value_request(fault).map_or(if empty { "" } else { TEXT }, |(_, text, _)| text)); }
     if scoped { args["frame"] = json!("child"); }
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
     let result = runtime.block_on(tool.execute("text-transport", args, None));
@@ -264,7 +293,7 @@ fn keyup_reaches_the_original_page_even_when_keydown_navigates_the_child() {
     let (result,seen) = run("press",true,Fault::DownNavigation,false);
     assert!(result.is_err()); assert_eq!((seen.downs,seen.ups),(1,1));
     let (result,seen) = run("press",false,Fault::DownNavigation,false);
-    assert!(!result.unwrap().is_error()); assert_eq!((seen.downs,seen.ups),(1,1));
+    assert!(!result.unwrap().is_error); assert_eq!((seen.downs,seen.ups),(1,1));
 }
 
 #[test]
@@ -279,7 +308,85 @@ fn rejected_or_navigated_text_is_not_reported_as_a_successful_fill_or_replayed()
 fn empty_fills_use_the_same_guarded_paired_backspace_path() {
     for scoped in [false,true] {
         let (result,seen) = run("fill",scoped,Fault::None,true);
-        assert!(!result.unwrap().is_error()); assert_eq!(seen.inserts,0);
+        assert!(!result.unwrap().is_error); assert_eq!(seen.inserts,0);
         assert_eq!((seen.downs,seen.ups),(1,1)); assert_eq!(seen.focus_checks,1);
     }
+}
+
+#[test]
+fn special_value_fills_use_the_original_node_without_native_text_or_key_fallback() {
+    for scoped in [false, true] {
+        for fault in [Fault::ValueDate, Fault::ValueTime, Fault::ValueMonth, Fault::ValueWeek,
+            Fault::ValueDateTime, Fault::ValueColor, Fault::ValueRange] {
+            let (result, seen) = run("fill", scoped, fault, false);
+            let result = result.unwrap(); assert!(!result.is_error);
+            let details = result.details.unwrap();
+            let (kind, requested, canonical) = value_request(fault).unwrap();
+            assert_eq!(details["input_method"], "dom-value");
+            assert_eq!(details["input_type"], kind);
+            assert_eq!(details["value_normalized"], requested != canonical);
+            assert_eq!(details["changed"], true);
+            assert!(!details.to_string().contains(canonical));
+            assert_eq!((seen.queries, seen.edits, seen.value_checks), (1, 1, 1));
+            assert_eq!((seen.inserts, seen.downs, seen.ups), (0, 0, 0));
+        }
+    }
+}
+
+#[test]
+fn special_value_noops_are_still_verified_without_additional_input() {
+    for scoped in [false, true] {
+        let (result, seen) = run("fill", scoped, Fault::ValueNoop, false);
+        assert_eq!(result.unwrap().details.unwrap()["changed"], false);
+        assert_eq!(seen.value_checks, 1);
+        assert_eq!((seen.inserts, seen.downs, seen.ups), (0, 0, 0));
+    }
+}
+
+#[test]
+fn malformed_reverted_or_navigated_value_fills_stop_without_fallback_or_replay() {
+    for scoped in [false, true] {
+        for fault in [Fault::ValueMalformed, Fault::ValueRejected, Fault::ValueNavigation] {
+            let (result, seen) = run("fill", scoped, fault, false);
+            let failure = result.unwrap_err().to_string();
+            assert!(!failure.contains("PRIVATE-CANARY"));
+            assert_eq!(seen.queries, 1); assert_eq!(seen.edits, 1);
+            assert_eq!((seen.inserts, seen.downs, seen.ups), (0, 0, 0));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires sandbox-capable Chromium; select explicitly in the DSR browser lane"]
+fn live_value_fill_retains_canonical_values_and_does_not_repeat_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false)
+        .with_launch_options(pi::browser::BrowserLaunchOptions {
+            executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),
+            ..Default::default()
+        }).with_domain_allowlist(Some(Vec::new()));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        tool.execute("open", json!({"action":"open","tab":"values","url":"about:blank"}), None).await.unwrap();
+        for (kind, text, canonical) in [
+            ("date","2026-10-16","2026-10-16"), ("time","12:34","12:34"),
+            ("month","2026-10","2026-10"), ("week","2026-W42","2026-W42"),
+            ("datetime-local","2026-10-16 12:34:00","2026-10-16T12:34"),
+            ("color","#ABCDEF","#abcdef"), ("range","25","25"),
+        ] {
+            let script = format!("(() => {{ document.body.innerHTML='<input id=field type={kind}>'; window.events=[]; for(const name of ['input','change']) document.querySelector('#field').addEventListener(name,e=>events.push([e.type,e.isTrusted])); return true; }})()");
+            tool.execute("setup", json!({"action":"evaluate","tab":"values","script":script}), None).await.unwrap();
+            for changed in [true, false] {
+                let result = tool.execute("fill", json!({"action":"fill","tab":"values","selector":"#field","text":text}), None).await.unwrap();
+                assert!(!result.is_error);
+                assert_eq!(result.details.unwrap()["changed"], changed);
+            }
+            let result = tool.execute("read-back", json!({"action":"evaluate","tab":"values",
+                "script":"({value:document.querySelector('#field').value,events})"}), None).await.unwrap();
+            let details = result.details.unwrap();
+            assert_eq!(details["result"]["value"], canonical);
+            assert_eq!(details["result"]["events"], json!([["input",false],["change",false]]));
+        }
+        tool.execute("stop", json!({"action":"stop"}), None).await.unwrap();
+    });
 }

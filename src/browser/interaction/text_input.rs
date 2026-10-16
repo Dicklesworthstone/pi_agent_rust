@@ -6,6 +6,7 @@ use crate::agent_cx::AgentCx;
 use crate::browser::{output, required};
 use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 fn error(message: &'static str) -> Error {
@@ -47,6 +48,38 @@ fn key_pair(key: &str) -> Result<(Value, Value)> {
     fields.remove("commands");
     up["type"] = json!("keyUp");
     Ok((down, up))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueFill {
+    kind: String,
+    value: String,
+    changed: bool,
+}
+
+impl ValueFill {
+    fn parse(value: Value) -> Result<Self> {
+        let result: Self = serde_json::from_value(value)
+            .map_err(|_| error("BROWSER_VALUE_PROTOCOL: invalid fill result"))?;
+        if !matches!(result.kind.as_str(), "date" | "time" | "month" | "week" |
+            "datetime-local" | "color" | "range") || result.value.len() > 4096
+            || result.value.chars().any(char::is_control)
+            || (matches!(result.kind.as_str(), "color" | "range") && result.value.is_empty())
+        {
+            return Err(error("BROWSER_VALUE_PROTOCOL: invalid fill result"));
+        }
+        Ok(result)
+    }
+}
+
+fn value_result(tab: &str, selector: &str, requested: &str, filled: &ValueFill) -> ToolOutput {
+    output(
+        format!("Filled {} control {selector} in tab {tab}; retained value verified using DOM setters, not trusted keyboard input", filled.kind),
+        json!({"action":"fill","selector":selector,"tab":tab,"backend":"cdp",
+            "input_method":"dom-value","input_type":filled.kind,"changed":filled.changed,
+            "value_normalized":filled.value != requested,"char_count":requested.chars().count()}),
+    )
 }
 
 async fn press(owner: &AgentCx, cdp: &mut Cdp, key: &str) -> Result<()> {
@@ -117,7 +150,23 @@ pub(super) async fn execute(
     check_document(owner, cdp, &expected).await?;
     cdp.command(owner, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId":node})).await?;
     check_document(owner, cdp, &expected).await?;
-    if element_call(owner, cdp, node, "edit", json!({"replace":action == "fill"})).await? != true {
+    let mut options = json!({"replace":action == "fill"});
+    if action == "fill" { options["text"] = json!(text); }
+    let prepared = element_call(owner, cdp, node, "edit", options).await?;
+    if prepared.is_object() && action == "fill" {
+        let filled = ValueFill::parse(prepared)?;
+        check_document(owner, cdp, &expected).await?;
+        // A separate protocol turn observes microtasks from input/change.
+        // Never resolve the selector again or retry a rejected mutation.
+        if element_call(owner, cdp, node, "verify_value", json!({
+            "kind":filled.kind,"value":filled.value,
+        })).await? != true {
+            return Err(error("BROWSER_VALUE_REJECTED: control did not retain the requested fill; no retry"));
+        }
+        check_document(owner, cdp, &expected).await?;
+        return Ok(value_result(tab, selector, text, &filled));
+    }
+    if prepared != true {
         return Err(error("BROWSER_INPUT_EDIT: control rejected edit preparation"));
     }
     check_focus(owner, cdp, &expected, node).await?;
@@ -143,6 +192,40 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_fill_results_are_typed_bounded_and_never_fall_back_to_key_input() {
+        for kind in ["date", "time", "month", "week", "datetime-local", "color", "range"] {
+            assert!(ValueFill::parse(json!({"kind":kind,"value":"1","changed":true})).is_ok());
+        }
+        for invalid in [json!(true), json!({"kind":"date","value":"2026-10-16"}),
+            json!({"kind":"text","value":"PRIVATE-CANARY","changed":true}),
+            json!({"kind":"date","value":"x".repeat(4097),"changed":true}),
+            json!({"kind":"date","value":"PRIVATE-CANARY\n","changed":false}),
+            json!({"kind":"color","value":"","changed":false}),
+            json!({"kind":"date","value":"","changed":"true"}),
+            json!({"kind":"date","value":"","changed":true,"extra":1})] {
+            let failure = ValueFill::parse(invalid).unwrap_err().to_string();
+            assert!(failure.contains("BROWSER_VALUE_PROTOCOL"));
+            assert!(!failure.contains("PRIVATE-CANARY"));
+        }
+    }
+
+    #[test]
+    fn value_fill_output_reports_normalization_without_returning_field_values() {
+        let filled = ValueFill { kind:"datetime-local".into(), value:"PRIVATE-CANARY".into(), changed:false };
+        let result = value_result("app", "#date", "PRIVATE-CANARY-REQUEST", &filled);
+        let details = result.details.unwrap();
+        assert_eq!(details["input_method"], "dom-value");
+        assert_eq!(details["changed"], false);
+        assert_eq!(details["value_normalized"], true);
+        assert!(!details.to_string().contains("PRIVATE-CANARY"));
+        for block in result.content {
+            if let crate::model::ContentBlock::Text(text) = block {
+                assert!(!text.text.contains("PRIVATE-CANARY"));
+            }
+        }
+    }
 
     #[test]
     fn key_release_retains_identity_without_repeating_text_or_editing_commands() {
