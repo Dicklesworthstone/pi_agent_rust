@@ -50,3 +50,46 @@ peers and the production client. They are authored, not executed: the required
 `dsr quality --tool pi_agent_rust` could not start because DSR is absent (exit 127).
 Rust compilation, formatting, Clippy, full ReadTool and live GitHub acceptance
 remain unverified. No dependencies, Actions or quality gates are changed.
+
+## Saved notebook results
+
+Notebook reads now include saved stdout/stderr, execution counts, exception
+names/messages/traceback frames, and one textual representation of each saved
+display or result. This is a view of existing evidence, not execution, validation
+of the original computation, or a new kernel session. It is wired into the same
+converter used after GitHub raw retrieval and ordinary URL fetches.
+
+The reader supports nbformat 4. Source/text fields accept strings or string arrays;
+arrays concatenate without inserting separators. Traceback frames remain separate.
+JSON MIME, whitespace and UTF-8 BOMs no longer hide extensionless notebooks. A
+mere occurrence of the word nbformat in ordinary JSON is not enough to classify
+it as a notebook. Declared unsupported versions and malformed interpreted fields
+fail explicitly. This is not a complete Jupyter schema validator: optional and
+extension metadata is not interpreted as an instruction.
+
+MIME selection prefers application/json, then text/plain, text/markdown and
+text/html. JSON is streamed as data into the bounded output rather than expanded
+into an unbounded pretty-print intermediate. HTML uses the existing static reader,
+not a browser. Other saved representations are listed but not duplicated. Images,
+widget state and attachments are explicitly noted as unrendered; base64 payloads
+are not dumped into model context and attachment URLs are not fetched. Unknown
+cell/output types are labeled rather than silently reported as empty results.
+
+Code/raw/output fences cannot be closed by ordinary embedded fence text. Control
+characters other than newline, carriage return and tab are rendered visibly,
+including ANSI escapes in tracebacks. Notebook text and Markdown remain untrusted
+source content and may contain secrets or misleading instructions; this is not a
+prompt-injection sandbox or general secret scrubber.
+
+Limits are 10 MiB input, 4,096 cells, 8,192 total outputs, 32 MIME entries per
+bundle and 16 MiB rendered text. Exceeding a bound fails without publishing a
+silently truncated notebook. A fetch already marked download_truncated is refused
+by the notebook converter, even if the retained prefix happens to parse. Normal
+read line pagination applies only after this complete bounded conversion.
+
+Thirteen additional Rust tests cover saved results, MIME selection, unsupported
+content, errors, literal text, budgets and public converter integration. The
+saved fixture was checked with Python nbformat without executing its cells;
+that fixture check is not execution of the Rust renderer. These Rust tests remain
+uncompiled and unexecuted because DSR is unavailable. The repository's single
+quality entrypoint remains `dsr quality --tool pi_agent_rust`.

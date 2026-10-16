@@ -12,9 +12,9 @@
 //! - Redirects and synthesized source URLs share admission and one deadline.
 
 use crate::error::Error;
-use serde_json::Value;
 
 mod navigation;
+mod notebook;
 pub use navigation::{fetch, github_blob_to_raw, host_is_private_target};
 
 /// Maximum download size for a URL read (10 MiB before conversion).
@@ -115,7 +115,12 @@ pub fn convert_bytes(
     let kind = classify(url, wire_content_type, bytes);
     let (content, extractor): (String, &'static str) = match kind {
         UrlContentKind::Pdf => (convert_pdf(bytes)?, "pdf"),
-        UrlContentKind::Notebook => (convert_notebook(bytes)?, "notebook"),
+        UrlContentKind::Notebook => {
+            if download_truncated {
+                return Err(Error::tool("read", "[NOTEBOOK_INCOMPLETE] cannot interpret a truncated notebook"));
+            }
+            (convert_notebook(bytes)?, "notebook")
+        }
         UrlContentKind::Html => {
             let text = String::from_utf8_lossy(bytes);
             convert_html(url, &text)
@@ -144,17 +149,17 @@ fn classify(url: &str, content_type: &str, bytes: &[u8]) -> UrlContentKind {
     if ct.contains("application/pdf") || ext_is("pdf") || bytes.starts_with(b"%PDF") {
         return UrlContentKind::Pdf;
     }
-    if ext_is("ipynb") {
+    if ext_is("ipynb") || ct.contains("application/x-ipynb+json") {
         return UrlContentKind::Notebook;
     }
     if ct.contains("text/html") || ct.contains("application/xhtml") {
         return UrlContentKind::Html;
     }
+    if notebook::recognizes(bytes) {
+        return UrlContentKind::Notebook;
+    }
     if ct.starts_with("text/") || ct.contains("json") || ct.contains("xml") {
         return UrlContentKind::PlainText;
-    }
-    if bytes.starts_with(b"{") && bytes.windows(9).any(|w| w == b"\"nbformat\"") {
-        return UrlContentKind::Notebook;
     }
     UrlContentKind::PlainText
 }
@@ -185,52 +190,7 @@ fn convert_pdf(_bytes: &[u8]) -> crate::error::Result<String> {
 }
 
 fn convert_notebook(bytes: &[u8]) -> crate::error::Result<String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|err| Error::tool("read", format!("Notebook parse failed: {err}")))?;
-    let cells = value
-        .get("cells")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::tool("read", "Notebook has no cells array".to_string()))?;
-    let mut out = String::new();
-    for (index, cell) in cells.iter().enumerate() {
-        let cell_type = cell
-            .get("cell_type")
-            .and_then(Value::as_str)
-            .unwrap_or("code");
-        let source = cell
-            .get("source")
-            .map(|src| match src {
-                Value::String(text) => text.clone(),
-                Value::Array(lines) => lines
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("\n### cell {} ({})\n", index + 1, cell_type),
-        );
-        if cell_type == "code" {
-            out.push_str("```\n");
-            out.push_str(source.trim_end());
-            out.push_str("\n```\n");
-        } else {
-            out.push_str(source.trim_end());
-            out.push('\n');
-        }
-        if let Some(outputs) = cell.get("outputs").and_then(Value::as_array)
-            && !outputs.is_empty()
-        {
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!("\n_outputs: {} present_\n", outputs.len()),
-            );
-        }
-    }
-    Ok(out)
+    notebook::render(bytes)
 }
 
 /// HTML conversion with site-aware extraction. Returns (markdown, extractor).
