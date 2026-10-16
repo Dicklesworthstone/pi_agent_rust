@@ -21,7 +21,9 @@ pub(super) mod source;
 #[serde(rename_all = "lowercase")]
 enum Kernel {
     #[default]
+    #[serde(alias = "py")]
     Python,
+    #[serde(alias = "javascript")]
     Js,
 }
 
@@ -37,8 +39,13 @@ impl Kernel {
 #[derive(Deserialize)]
 struct Cell {
     code: String,
-    #[serde(default)]
+    // OMP emits language: "py" | "js". Never silently ignore a requested
+    // language and execute/reset the default Python namespace instead.
+    // Serde rejects duplicate native/OMP fields before admission, even when
+    // their values agree; there is no implicit precedence between dialects.
+    #[serde(default, alias = "language")]
     kernel: Kernel,
+    #[serde(alias = "timeout")]
     timeout_secs: Option<u64>,
     soft_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -355,6 +362,96 @@ mod tests {
             .unwrap();
         assert!(!output.is_error, "{}", text(&output));
         output
+    }
+
+    #[test]
+    fn omp_and_native_inputs_select_the_same_kernel_and_budget() {
+        for (input, kernel, timeout) in [
+            (json!({"code":"42"}), "python", None),
+            (json!({"language":"py", "code":"42", "timeout":12}), "python", Some(12)),
+            (json!({"language":"js", "code":"42", "timeout":9}), "js", Some(9)),
+            (json!({"language":"javascript", "code":"42"}), "js", None),
+            (json!({"kernel":"python", "code":"42", "timeout_secs":5}), "python", Some(5)),
+            (json!({"kernel":"py", "code":"42"}), "python", None),
+            (json!({"kernel":"javascript", "code":"42"}), "js", None),
+        ] {
+            let cell: Cell = serde_json::from_value(input).unwrap();
+            assert_eq!(cell.kernel.name(), kernel);
+            assert_eq!(cell.timeout_secs, timeout);
+            assert!(!cell.reset);
+        }
+    }
+
+    #[test]
+    fn omp_invalid_or_ambiguous_inputs_do_not_wait_or_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EvalTool::new(dir.path());
+        run(async {
+            js(&tool, "globalThis.keep = 7").await;
+            let lease = tool.execution.lock().await;
+            for input in [
+                json!({"language":"auto", "code":"", "reset":true}),
+                json!({"language":"unknown", "code":"", "reset":true}),
+                json!({"language":null, "code":"", "reset":true}),
+                json!({"language":42, "code":"", "reset":true}),
+                json!({"language":"js", "kernel":"python", "code":"", "reset":true}),
+                json!({"language":"js", "kernel":"js", "code":"", "reset":true}),
+                json!({"language":"js", "timeout":-1, "code":"", "reset":true}),
+                json!({"language":"js", "timeout":"5", "code":"", "reset":true}),
+                json!({"language":"js", "timeout":5, "timeout_secs":5, "code":"", "reset":true}),
+            ] {
+                let mut request = tool.execute("invalid-omp", input, None);
+                match futures::poll!(request.as_mut()) {
+                    std::task::Poll::Ready(Err(error)) => {
+                        assert!(error.to_string().contains("EVAL_INPUT"));
+                    }
+                    _ => panic!("invalid OMP inputs must fail before admission"),
+                }
+            }
+            drop(lease);
+            let kept = js(&tool, "keep").await;
+            assert_eq!(text(&kept).trim(), "7");
+            assert_eq!(kept.details.unwrap()["cell"], 2);
+        });
+    }
+
+    #[test]
+    fn omp_javascript_requests_reuse_native_state_and_reset_only_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EvalTool::new(dir.path());
+        run(async {
+            js(&tool, "const value = 7").await;
+            let reused = tool.execute("omp", json!({
+                "language":"js", "code":"value", "timeout":5
+            }), None).await.unwrap();
+            assert!(!reused.is_error, "{}", text(&reused));
+            assert_eq!(text(&reused).trim(), "7");
+            assert_eq!(reused.details.as_ref().unwrap()["kernel"], "js");
+            assert_eq!(reused.details.as_ref().unwrap()["cell"], 2);
+            let reset = tool.execute("omp-reset", json!({
+                "language":"js", "code":"const value = 42; value", "reset":true
+            }), None).await.unwrap();
+            assert!(!reset.is_error, "{}", text(&reset));
+            assert_eq!(reset.details.as_ref().unwrap()["cell"], 1);
+            assert_eq!(reset.details.as_ref().unwrap()["reset"], true);
+            assert_eq!(text(&js(&tool, "value").await).trim(), "42");
+        });
+    }
+
+    #[test]
+    fn omp_timeout_is_enforced_instead_of_silently_using_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EvalTool::new(dir.path());
+        run(async {
+            let started = Instant::now();
+            let output = tool.execute("omp-timeout", json!({
+                "language":"js", "code":"await sleep(60000)", "timeout":1
+            }), None).await.unwrap();
+            assert!(output.is_error);
+            assert!(text(&output).contains("EVAL_TIMEOUT"));
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(tool.execution.try_lock().is_some());
+        });
     }
 
     #[test]
