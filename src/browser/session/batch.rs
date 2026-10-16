@@ -23,7 +23,7 @@ const MAX_EXPECT_BYTES: usize = 16 * 1024;
 const MAX_BOUND_BYTES: usize = 64 * 1024;
 const MAX_BINDINGS: usize = 8;
 const ACTIONS: &[&str] = &[
-    "open", "goto", "close", "list_tabs", "list_frames", "snapshot", "ax_tree",
+    "open", "goto", "back", "forward", "reload", "close", "list_tabs", "list_frames", "snapshot", "ax_tree",
     "evaluate", "click", "hover", "drag", "type", "fill", "press", "scroll", "wait_for",
     "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
     "handle_dialog", "diagnostics",

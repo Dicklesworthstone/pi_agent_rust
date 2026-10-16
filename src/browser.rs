@@ -18,6 +18,7 @@ mod dialog;
 mod download;
 mod exports;
 mod frames;
+mod history;
 mod interaction;
 mod launch;
 mod mock;
@@ -156,6 +157,7 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
+         native back/forward/reload history traversal with destination policy checks, \
          structured option selection and checked-state control, frame discovery and frame-scoped \
          inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
          fill also supports date/time/month/week/datetime-local, opaque #RRGGBB color and numeric range inputs using validated DOM value setters and untrusted input/change events, not native keys. Existing values are no-ops; invalid min/max/step or handler-reverted values fail without replay. Ordinary text input still uses native insertion with original-node focus checks. \
@@ -187,7 +189,7 @@ impl Tool for BrowserTool {
                 "action": {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
-                             "list_frames", "snapshot", "ax_tree", "evaluate", "click", "hover", "drag", "type", "fill", "press",
+                             "list_frames", "snapshot", "ax_tree", "evaluate", "back", "forward", "reload", "click", "hover", "drag", "type", "fill", "press",
                              "scroll", "wait_for", "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
                              "handle_dialog", "diagnostics", "release"],
                     "description": "Browser action; ordinary actions lazily start the managed browser. release accepts only action and timeout_ms: discard this conversation's state and request owned-browser cleanup; attached pages/processes remain open."
@@ -304,6 +306,9 @@ impl BrowserTool {
                     | "status"
                     | "stop"
                     | "list_frames"
+                    | "back"
+                    | "forward"
+                    | "reload"
                     | "upload"
                     | "download"
                     | "print_pdf"

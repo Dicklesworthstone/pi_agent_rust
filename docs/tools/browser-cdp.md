@@ -100,6 +100,9 @@ it at a personal browsing profile merely for convenience.
 
 ```json
 {"action":"open","tab":"research","url":"https://example.com"}
+{"action":"back","tab":"research"}
+{"action":"forward","tab":"research"}
+{"action":"reload","tab":"research"}
 {"action":"snapshot","tab":"research"}
 {"action":"fill","selector":"#search","text":"structured concurrency"}
 {"action":"click","selector":"@e3"}
@@ -112,6 +115,17 @@ it at a personal browsing profile merely for convenience.
 navigates that target. `goto` requires an existing tab. `list_tabs` returns actual
 page targets; an unclaimed target can be addressed by its target ID. `close`
 closes the real target. Active means the tool's selected tab, not desktop focus.
+
+`back` and `forward` read Chromium's bounded navigation history, select exactly
+one adjacent entry, check that destination against `domainAllowlist` before
+dispatch, and use `Page.navigateToHistoryEntry` rather than keyboard shortcuts.
+At history boundaries they fail without navigation. Same-document entries are
+supported; cross-document entries report whether the loader changed. `reload`
+uses `Page.reload` and requires a replacement loader before reporting success.
+All three actions reject frame selection, URL overrides and implicit dialog
+responses, wait for a non-loading destination under the original timeout, and
+never replay a failed traversal. Redirected/final URLs are checked again before
+success. They can be used as ordinary steps inside `batch`.
 
 Navigation waits for the matching document's DOMContentLoaded/load lifecycle
 event. Downloads and navigation errors are not reported as successfully loaded

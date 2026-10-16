@@ -2,7 +2,7 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, history, interaction, launch,
     output, policy, required, storage,
 };
 use crate::agent_cx::AgentCx;
@@ -186,6 +186,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "download" => download::validate(args)?,
         "screenshot" | "print_pdf" => exports::validate(args)?,
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
+        "back" | "forward" | "reload" => history::validate(args)?,
         "evaluate" => {
             required(args, "script")?;
         }
@@ -1185,6 +1186,9 @@ impl Session {
                     format!("Navigated tab {tab} to {final_url} (Title: \"{title}\")"),
                     json!({"tab": tab, "url": final_url, "title": title, "loaded": true, "backend": "cdp"}),
                 ))
+            }
+            "back" | "forward" | "reload" => {
+                history::execute(owner, cdp, &tab, args, allowlist).await
             }
             "snapshot" | "ax_tree" => {
                 let (result, references) = interaction::snapshot(
