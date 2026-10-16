@@ -35,6 +35,10 @@ rolled back, and already imported modules are not reloaded automatically.
 
 Tool re-entry bridge: cell code can call `tool.read(path)`, `tool.grep(...)`,
 `tool.find(...)`, `tool.ls(...)`, or `await tool.call("read", {"path": path})`.
+Use `await tool.result("read", {"path": path})` to preserve native content,
+details, and isError instead of flattened text. This uses the same bridge and
+does not enable any additional tools. Native tool errors are returned data;
+bridge, transport, and result-decoding failures raise ToolBridgeError.
 The kernel emits a {"bridge": {"call": m, "tool": ..., "input": {...}}} line
 on the private stdout channel and reads the host's {"bridge_result": ...}
 before resuming. Bridge exchanges are serialized, including async calls;
@@ -834,6 +838,40 @@ class _PiTools:
         if not isinstance(name, str) or not isinstance(arguments, dict):
             raise TypeError("tool.call requires a tool name and an argument object")
         return await _bridge_call_async(name, arguments)
+
+    @staticmethod
+    async def result(name, arguments):
+        """Await native content/details/isError under the ordinary cell owner.
+
+        No separate reader, dispatcher, or retry path: cancellation still drains
+        an already dispatched reply before releasing the shared protocol lock.
+        Decoding happens only after that exchange completes. A malformed inner
+        envelope cannot leave reply bytes for another call or cell to consume.
+        """
+        if (type(name) is not str or not name or len(name) > 128
+                or len(name.encode("utf-8")) > 128 or type(arguments) is not dict):
+            raise TypeError("EVAL_BRIDGE_INPUT: tool.result requires a tool name of at most 128 UTF-8 bytes and an argument object")
+        encoded = await _bridge_call_async("__pi_tool_result", {"name": name, "args": arguments})
+        # The native serializer has the same bound. Check before decoding and
+        # count UTF-8 bytes, not just Python characters. No successful prefix.
+        limit = 4 * 1024 * 1024
+        if len(encoded) > limit or len(encoded.encode("utf-8")) > limit:
+            raise ToolBridgeError("EVAL_BRIDGE_LIMIT: structured result exceeds 4 MiB")
+
+        def reject_constant(_value):
+            # NaN/Infinity are accepted by Python's default decoder, but cannot
+            # occur in the native JSON contract (or JavaScript's JSON.parse).
+            raise ValueError("non-JSON number")
+
+        try:
+            result = json.loads(encoded, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            raise ToolBridgeError("EVAL_BRIDGE_PROTOCOL: invalid structured tool result") from None
+        if (type(result) is not dict or result.get("schema") != "pi.eval.tool_result.v1"
+                or type(result.get("content")) is not list or "details" not in result
+                or type(result.get("isError")) is not bool):
+            raise ToolBridgeError("EVAL_BRIDGE_PROTOCOL: invalid structured tool result")
+        return result
 
     @staticmethod
     def read(path, **kwargs):

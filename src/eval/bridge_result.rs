@@ -221,4 +221,43 @@ mod tests {
         assert!(text.contains("pi.eval.tool_result.v1"));
         assert!(text.contains("false,true"));
     }
+
+    #[test]
+    fn python_helper_reaches_native_reader_in_retained_and_private_cells() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("Skipping: python3 not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.txt"), "structured-python-proof\n").unwrap();
+        let tool = super::super::EvalTool::new(dir.path());
+        let runtime = asupersync::runtime::RuntimeBuilder::new().build().unwrap();
+        let result = runtime.block_on(tool.execute("structured-python", json!({
+            "kernel":"python",
+            "code":"saved = await tool.result('read', {'path':'data.txt'})\n[saved['schema'], saved['isError'], 'structured-python-proof' in saved['content'][0]['text']]"
+        }), None)).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let result_text = text(&result).unwrap();
+        assert!(result_text.contains("pi.eval.tool_result.v1"));
+        assert!(result_text.contains("False, True"));
+
+        let private = runtime.block_on(tool.execute("private-python", json!({
+            "kernel":"python", "kernel_mode":"per_call",
+            "code":"('saved' in globals(), (await tool.result('read', {'path':'data.txt'}))['isError'])"
+        }), None)).unwrap();
+        assert!(!private.is_error, "{private:?}");
+        assert!(text(&private).unwrap().contains("(False, False)"));
+
+        let retained = runtime.block_on(tool.execute("retained-python", json!({
+            "kernel":"python", "code":"saved['schema']"
+        }), None)).unwrap();
+        assert!(!retained.is_error, "{retained:?}");
+        assert!(text(&retained).unwrap().contains("pi.eval.tool_result.v1"));
+    }
 }
