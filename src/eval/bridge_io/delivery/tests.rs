@@ -13,6 +13,7 @@ struct Writer {
     record: Arc<Mutex<Recorded>>,
     short: usize,
     interrupts: usize,
+    backpressure_after: Option<usize>,
     fail_after: Option<usize>,
     fail_flush: bool,
     revoke_after: Option<Arc<AtomicBool>>,
@@ -21,7 +22,7 @@ struct Writer {
 impl Writer {
     fn new(record: &Arc<Mutex<Recorded>>) -> Self {
         Self { record: Arc::clone(record), short: 3, interrupts: 0,
-            fail_after: None, fail_flush: false, revoke_after: None }
+            backpressure_after: None, fail_after: None, fail_flush: false, revoke_after: None }
     }
 }
 
@@ -32,6 +33,10 @@ impl Write for Writer {
         if self.interrupts > 0 {
             self.interrupts -= 1;
             return Err(io::ErrorKind::Interrupted.into());
+        }
+        if self.backpressure_after.is_some_and(|end| record.bytes.len() >= end) {
+            self.backpressure_after = None;
+            return Err(io::ErrorKind::WouldBlock.into());
         }
         if self.fail_after.is_some_and(|end| record.bytes.len() >= end) {
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -205,4 +210,96 @@ fn public_eval_accepts_large_requests_and_native_replies_in_the_same_retained_ke
         assert!(!restored.is_error);
         assert!(restored.content.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.text.trim() == "42")));
     });
+}
+
+#[test]
+fn transient_backpressure_after_partial_delivery_preserves_the_remaining_frame() {
+    let record = Arc::new(Mutex::new(Recorded::default()));
+    let mut writer = Writer::new(&record);
+    writer.interrupts = 1;
+    writer.backpressure_after = Some(6);
+    let frame = encode(&json!({"id":7,"code":"'界'\n42"})).expect("encoded frame");
+    assert!(send(writer, &frame, &AtomicBool::new(false)).is_ok());
+    let record = record.lock().unwrap();
+    assert_eq!(record.bytes, frame);
+    assert_eq!(record.flushes, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_native_input_observes_abandonment_and_deadline_with_reader_retained() {
+    use std::time::Duration;
+
+    struct ObservedWriter {
+        pipe: io::PipeWriter,
+        blocked: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl Write for ObservedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let result = self.pipe.write(bytes);
+            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+                && let Some(blocked) = self.blocked.take()
+            {
+                let _ = blocked.try_send(());
+            }
+            result
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.pipe.flush()
+        }
+    }
+
+    for abandon in [true, false] {
+        let (reader, mut pipe) = io::pipe().expect("native input pipe");
+        crate::eval::transport::prepare_pipe(&pipe).expect("nonblocking input");
+        // Fill the actual kernel buffer, without assuming a platform capacity.
+        loop {
+            match pipe.write(&[b'x'; 8192]) {
+                Ok(0) => panic!("pipe stopped before reaching backpressure"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill native input pipe: {error}"),
+            }
+        }
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let revoked = Arc::new(AtomicBool::new(false));
+        let lease = WriteLease(Arc::clone(&revoked));
+        let owner = AgentCx::for_testing_with_io();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(if abandon { 5 } else { 2 });
+            let result = write_once(
+                ObservedWriter { pipe, blocked: Some(blocked_tx) },
+                b"unsent-cell\n",
+                &revoked,
+                &owner,
+                deadline,
+            ).map(|_| ()).map_err(|error| error.to_string());
+            let _ = done_tx.send(result);
+        });
+        let blocked = blocked_rx.recv_timeout(Duration::from_secs(2));
+        let mut lease = Some(lease);
+        if abandon {
+            drop(lease.take());
+        }
+        let stopped_with_reader_held = done_rx.recv_timeout(Duration::from_secs(3));
+        // Release the peer and lease even on a failing implementation so its
+        // worker can unwind instead of stranding the test's blocking thread.
+        drop(reader);
+        drop(lease);
+        if stopped_with_reader_held.is_err() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(3))
+                .expect("writer retires after releasing its peer");
+        }
+        worker.join().expect("input writer worker");
+        blocked.expect("actual kernel backpressure before cancellation");
+        let error = stopped_with_reader_held.expect("bounded input cancellation")
+            .expect_err("a full pipe must not produce a success receipt");
+        let expected = if abandon { "EVAL_CANCELLED" } else { "EVAL_TIMEOUT" };
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("EVAL_STATE_RESET"), "{error}");
+    }
 }

@@ -1,9 +1,10 @@
 //! Cancellation-aware Python input delivery using the existing blocking-I/O pool.
 //!
 //! Only a complete successful receipt restores the unique pipe to its kernel.
-//! A cancelled/failed write is never replayed. Killing the checked-out owned
-//! process tree closes the reader side of ordinary inherited pipes, allowing
-//! an in-progress blocking write to unwind; native writes are not preemptible.
+//! A cancelled/failed write is never replayed. Unix parent endpoints are
+//! nonblocking, so retained peer descriptors cannot prevent the write lease
+//! or cell deadline from being observed. Other platforms retain their native
+//! pipe behavior and process-tree cleanup discipline.
 
 use std::future::Future;
 use std::io::{self, Write};
@@ -66,6 +67,15 @@ fn write_once<W: Write>(
             Ok(0) => return Err(stopped("EVAL_IO", "Python input write stopped; delivery uncertain, no replay")),
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // The unique Unix stdin endpoint is prepared as nonblocking
+                // before the reader worker starts. Retry the remaining slice,
+                // never the whole frame, and recheck revocation/deadline even
+                // when a descendant keeps the other end open indefinitely.
+                std::thread::sleep(
+                    IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
             Err(_) => return Err(stopped("EVAL_IO", "Python input write failed; delivery uncertain, no replay")),
         }
     }

@@ -12,7 +12,6 @@ use crate::error::{Error, Result};
 use crate::model::ContentBlock;
 use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
@@ -47,6 +46,8 @@ struct PyKernel {
     /// (a cell may emit several bridge-request lines before its final
     /// response). Disconnection is EOF; protocol read failures are explicit.
     lines: std::sync::Mutex<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
+    // Revoke both idle reads and a full response queue before process cleanup.
+    reader_stop: transport::ReaderStop,
     next_id: u64,
     cells_run: u64,
     runtime: python_runtime::Resolved,
@@ -102,42 +103,29 @@ impl PyKernel {
             let _ = child.terminate_and_wait();
             return Err(Error::tool("eval", "EVAL_SPAWN: kernel pipes unavailable"));
         };
-        // Backpressure bounds complete queued frames independently of their
-        // individual byte limit. Dropping the receiver unblocks the reader.
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        // Own the child before starting the reader. A thread-creation failure
-        // must close the Job/process group and reap the kernel as well.
-        let kernel = Self {
+        // Keep the child guarded through all fallible pipe/worker setup. Only
+        // parent endpoints become nonblocking; input delivery already owns a
+        // revocable write lease and now retries backpressure under that lease.
+        #[cfg(unix)]
+        transport::prepare_pipe(&stdin).map_err(|err| {
+            let _ = child.terminate_and_wait();
+            Error::tool("eval", format!("EVAL_SPAWN: prepare kernel stdin: {err}"))
+        })?;
+        let (lines, reader_stop) = transport::spawn_reader(stdout).map_err(|err| {
+            let _ = child.terminate_and_wait();
+            Error::tool("eval", format!("EVAL_SPAWN: {err}"))
+        })?;
+        Ok(Self {
             child,
             stdin: Some(stdin),
             pending_line: None,
-            lines: std::sync::Mutex::new(rx),
+            lines: std::sync::Mutex::new(lines),
+            reader_stop,
             next_id: 1,
             cells_run: 0,
             runtime,
             _packages: packages,
-        };
-        std::thread::Builder::new()
-            .name("eval-py-read".into())
-            .spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                loop {
-                    match transport::read_frame(&mut reader) {
-                        Ok(None) => return,
-                        Err(error) => {
-                            let _ = tx.send(Err(format!("EVAL_PROTOCOL_READ: {error}")));
-                            return;
-                        }
-                        Ok(Some(line)) => {
-                            if tx.send(Ok(line)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?;
-        Ok(kernel)
+        })
     }
 
     /// Await the next stdout line under a budget. Ok(None) = EOF.
@@ -179,6 +167,13 @@ impl PyKernel {
     }
 
     fn kill(&mut self) {
+        // An escaped descendant may retain a pipe endpoint, and the response
+        // queue may be full. Revoke reads and disconnect the owned receiver
+        // before waiting for any process. Exclusive kernel ownership makes
+        // get_mut nonblocking; no live-cell receiver lock is needed here.
+        self.reader_stop.stop_receiving(
+            self.lines.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         // The guard releases its child after reaping, so repeated cleanup
         // cannot signal a recycled PID or replace the kernel's Windows Job.
         let _ = self.child.terminate_and_wait();
