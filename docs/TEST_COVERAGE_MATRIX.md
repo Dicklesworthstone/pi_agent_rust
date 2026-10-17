@@ -62,7 +62,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/browser/dialog/tests.rs` | Browser JavaScript dialog handling test suite | Test module; dialog handling tests. |
 | `src/browser/download.rs` | Browser download lifecycle and management | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/exports.rs` | Browser module exports and public surface | Waived glue; re-exports for browser submodules. |
+| `src/browser/frames.rs` | Explicit, per-operation frame selection for the native browser backend | Unit (8 in-module tests); `tests/browser_frames.rs` (preflight; live Chromium lane is opt-in). |
 | `src/browser/interaction.rs` | Browser interaction and navigation | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/interaction/frame_input.rs` | Frame-local DOM lookup and verified page-viewport input coordinates | Unit (5 in-module tests); `tests/browser_frames.rs` live lane. |
 | `src/browser/interaction/upload.rs` | Browser file upload interaction | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/launch.rs` | Browser process launch and attach | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/mock.rs` | Browser mock backend and fixtures | Unit; `tests/browser_mock.rs`. |
@@ -133,6 +135,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions/fs_connector/atomic_write.rs` | Staged extension filesystem writes with a single atomic publication point | Unit; in-module tests; `tests/security_fs_escape.rs`. |
 | `src/extensions/fs_connector/atomic_write/metadata.rs` | Linux descriptor-scoped metadata (ACL/xattr) preservation for atomic replacement | Unit; in-module tests. |
 | `src/extensions/native_runtime.rs` | Active native descriptor runtime | Active native descriptor runtime interpreter. |
+| `src/extensions/native_runtime/shutdown_tests.rs` | Native runtime shutdown admission test suite | Test module; real native runtime entry points and shared shutdown admission. |
+| `src/extensions/native_runtime/streams.rs` | Native provider stream identities and bounded, explicit terminal receipts | Unit (12 in-module tests). |
 | `src/extensions/native_runtime_experimental.rs` | Native runtime (experimental) | In-source runtime-parity tests. |
 | `src/extensions/permission_drift.rs` | Permission drift detection | In-source tests; policy suites. |
 | `src/extensions/policy_snapshot_tests.rs` | Policy snapshot tests | In-source test module (waived glue). |
@@ -173,6 +177,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/http/client.rs` | HTTP client | Unit; `tests/http_client.rs`; branch export baseline marks `src/http/*.rs` as branch-SIGSEGV fallback. |
 | `src/http/mod.rs` | HTTP module glue | Waived glue: re-export/test-module wiring. |
 | `src/http/proxy.rs` | Outbound HTTP/HTTPS proxy resolution (gh #210) | Unit (21 in-module tests covering precedence, `no_proxy` bypass matching, and credential handling); `tests/http_proxy.rs`. |
+| `src/http/proxy/socks5.rs` | SOCKS5 CONNECT negotiation (RFC 1928) and username/password auth (RFC 1929) | Unit (12 in-module tests covering negotiation, authentication and bounds). |
 | `src/http/sse.rs` | HTTP SSE | Unit; `tests/repro_sse_flush.rs`. |
 | `src/http/test_api.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
 | `src/http/test_asupersync.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
@@ -185,6 +190,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive/ext_session.rs` | Extension session UI | Unit; `tests/interactive_extension_ui.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/interactive/file_refs.rs` | File references | `tests/tui_state.rs`. |
 | `src/interactive/keybindings.rs` | Interactive keybindings | Unit; `tests/tui_state.rs`. |
+| `src/interactive/login_flow.rs` | UI-independent `/login` flow shared by the classic and FTUI stacks | Unit (3 in-module tests). |
 | `src/interactive/model_selector_ui.rs` | Model selector UI | Unit; `tests/model_selector_cycling.rs`, `tests/tui_state.rs`. |
 | `src/interactive/perf.rs` | TUI performance telemetry | Unit; `tests/e2e_tui_perf.rs`, `tests/perf_regression.rs`. |
 | `src/interactive/share.rs` | Share/export UI | Unit; exercised through interactive state and command tests. |
@@ -195,7 +201,14 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive/tree.rs` | Conversation tree | Covered through `tests/tui_state.rs` and session/navigation tests; direct trace should be expanded in `bd-8t27h.3`. |
 | `src/interactive/tree_ui.rs` | Tree UI | Covered through `tests/tui_snapshot.rs` and `tests/tui_state.rs`. |
 | `src/interactive/view.rs` | View rendering | Unit; `tests/tui_snapshot.rs`, `tests/e2e_tui.rs`. |
+| `src/interactive/workspace_reports.rs` | Workspace slash commands shared by the interactive stacks | Unit (9 in-module tests). |
 | `src/interactive_ftui.rs` | FTUI interactive surface | `tests/e2e_ftui.rs`. |
+| `src/interactive_ftui/console_input.rs` | Native Windows console-input ownership for the FTUI lifecycle | Unit (12 in-module tests); `tests/ftui_conhost_console.rs` (real Windows console, opt-in) and `examples/ftui_conhost_probe.rs`. |
+| `src/interactive_ftui/info_commands.rs` | Read-only OMP info commands on the default stack | Unit (7 in-module tests). |
+| `src/interactive_ftui/plan_commands.rs` | Default-FTUI access to the SDK's session-bound plan lifecycle | Unit; `src/interactive_ftui/plan_commands/tests.rs`. |
+| `src/interactive_ftui/plan_commands/tests.rs` | FTUI plan command test suite | Test module; plan command tests. |
+| `src/interactive_ftui/session_pins.rs` | Sessions pinned to the top of the `/resume` list (OMP `/pin`) | Unit (1 in-module test). |
+| `src/interactive_ftui/workspace_commands.rs` | OMP workspace commands on the default stack | Unit (1 in-module test). |
 | `src/jobs.rs` | Background jobs | `tests/jobs.rs`. |
 | `src/keybindings.rs` | Keybinding config | Unit; interactive/TUI tests. |
 | `src/lib.rs` | Crate exports | Waived glue: exported module surface is compiled by all targets; no behavior-only row. |
@@ -233,6 +246,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/completion/item/tests.rs` | LSP completion item test suite | Test module; completion item tests. |
 | `src/lsp/completion/snippet.rs` | LSP completion snippet placeholder parsing and expansion | Unit; `src/lsp/completion/snippet/tests.rs`. |
 | `src/lsp/completion/snippet/tests.rs` | LSP snippet test suite | Test module; snippet tests. |
+| `src/lsp/completion/snippet/transform.rs` | Bounded placeholder transforms for headless semantic completions | Unit; `src/lsp/completion/snippet/transform/tests.rs`. |
+| `src/lsp/completion/snippet/transform/tests.rs` | LSP snippet transform test suite | Test module; snippet transform tests. |
 | `src/lsp/completion/tests.rs` | LSP completion handle and integration test suite | Test module; completion tests. |
 | `src/lsp/completion/tests/protocol.rs` | LSP completion protocol scenario tests | Test module; protocol scenarios. |
 | `src/lsp/diagnostics_tests.rs` | LSP model-facing diagnostics test suite | Test module; diagnostics tool tests. |
@@ -246,6 +261,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/hierarchy.rs` | LSP call hierarchy navigation | Unit; `src/lsp/hierarchy/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
+| `src/lsp/jsonrpc/completion.rs` | LSP request waits that retain their owner and retire abandoned requests on drop | Unit (6 in-module tests). |
+| `src/lsp/jsonrpc/outbound.rs` | Bounded, non-blocking admission to the single child-stdin pump | Unit (6 in-module tests). |
 | `src/lsp/refactor_preview.rs` | LSP refactor preview and approval staging | Unit; `src/lsp/refactor_preview/tests.rs`, `src/lsp/refactor_preview/tests/protocol.rs`. |
 | `src/lsp/refactor_preview/tests.rs` | LSP refactor preview test suite | Test module; refactor preview tests. |
 | `src/lsp/refactor_preview/tests/protocol.rs` | LSP refactor preview protocol test cases | Test support module; refactor protocol scenarios. |
@@ -325,6 +342,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/cohere/streaming.rs` | Bounded Cohere v2 indexed content/tool lifecycle and terminal stream handling | Unit (16 tests), including interleaved calls, malformed arguments, sparse indices, byte/block limits, native completion and one-error-then-EOF behavior. Added, not executed: DSR unavailable. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
+| `src/providers/extension_stream.rs` | Admission and terminal semantics for extension-authored provider streams | Unit; `src/providers/extension_stream/tests.rs`, `tests/extension_stream_terminal.rs`, `tests/extensions_provider_streaming.rs`. |
+| `src/providers/extension_stream/blocks.rs` | Per-block admission for structured extension streams | Unit (8 in-module tests). |
+| `src/providers/extension_stream/tests.rs` | Extension stream decoder test suite | Test module; extension stream terminal and admission tests. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gemini/files.rs` | Credential-scoped Gemini Files API staging for large inline media | Unit (in-module, loopback HTTP fixtures); two concurrency cases are timing-flaky, see bd-eg6ng. |
 | `src/providers/gemini/reasoning.rs` | Gemini reasoning and thinking trace handling | Unit; `tests/provider_streaming/gemini.rs`. |
@@ -347,7 +367,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
 | `src/sdk/extension_bootstrap.rs` | SDK session extension model resolution and runtime bootstrap | Unit; `tests/sdk_integration.rs`. |
 | `src/sdk/extension_bootstrap_tests.rs` | SDK extension bootstrap regression test suite | Test module; extension model resolution tests. |
+| `src/sdk/recovery.rs` | Retry and failover recovery for every SDK turn entry point | Unit; `src/sdk/tests/recovery.rs`, `tests/sdk_multimodal.rs`. |
+| `src/sdk/tests/recovery.rs` | SDK entry-point recovery regression suite | Test module; retry, failover, abort and persistence-quarantine tests. |
 | `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
+| `src/secrets/structured.rs` | Transactional secret screening for structured outbound values | Unit (14 in-module tests); `tests/secrets.rs`. |
 | `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
 | `src/security_scan/dependencies.rs` | Cargo dependency security analysis | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/dependencies/tests.rs` | Dependency security scanning tests | Test support module; exercises dependency scanner. |
@@ -399,6 +422,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/swarm_progress_slo.rs` | Swarm progress SLO evaluation | Unit; `tests/swarm_progress_slo_contract.rs`, `tests/swarm_progress_cli.rs`, and `tests/swarm_progress_slo_e2e.rs`. |
 | `src/swarm_replay.rs` | Swarm trace replay and policy comparison | Unit; `tests/swarm_replay_trace_contract.rs`, `tests/swarm_replay_ingestor.rs`, and `tests/swarm_replay_preview_cli.rs`. |
 | `src/terminal_images.rs` | Terminal images | Unit; interactive/TUI rendering tests. |
+| `src/text_completion.rs` | Bounded, terminal-validated completions for tool-free auxiliary model calls | Unit (23 in-module tests). |
+| `src/text_completion/request.rs` | Owner-scoped deadlines for inline auxiliary provider requests | Unit (8 in-module tests). |
 | `src/theme.rs` | Theme loading | Unit; `tests/tui_snapshot.rs`, interactive UI tests. |
 | `src/todo.rs` | Todo tracking | Covered through TUI/session suites. |
 | `src/token_count.rs` | BPE token counting | In-source tests; `tests/compaction.rs` cut-point calibration. |

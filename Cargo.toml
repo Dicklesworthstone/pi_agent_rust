@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.6.1"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
@@ -251,7 +251,7 @@ rich_rust = { version = "0.2.2", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
-enable-ansi-support = "0.2"
+enable-ansi-support = "0.3"
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour).
 # These are used exclusively by the interactive terminal front-end and are
@@ -281,7 +281,7 @@ ftui = { version = "0.7", default-features = false, features = ["runtime", "cros
 ftui-extras = { version = "0.7", default-features = false, features = ["markdown"], optional = true }
 
 # Filesystem
-dirs = "6"
+dirs = "7"
 tempfile = "3.25.0"
 fs4 = "1.1"
 glob = "0.3"
@@ -291,7 +291,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 # Typed subagent results (bd-cv653.5.1): validate child yields against
 # per-task output schemas.
-jsonschema = { version = "0.42.0", default-features = false }
+jsonschema = { version = "0.58.4", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
 # default-features off: pi's session storage needs only the core engine.
@@ -335,8 +335,8 @@ regex = "1.12.3"
 ring = "0.17.14"
 semver = "1.0.27"
 crc32c = "0.6"
-ast-grep-core = "0.40"
-ast-grep-language = { version = "0.40", default-features = false, features = [
+ast-grep-core = "0.45"
+ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -347,7 +347,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 ] }
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
-similar = "2"
+similar = "3"
 sysinfo = "0.39.6"
 # BPE token counting tables (bd-cv653.7.2.1); enabled via the `bpe-tokens`
 # feature.
@@ -383,7 +383,7 @@ image = { version = "0.25", optional = true, default-features = false, features 
 [build-dependencies]
 crc32c = "0.6.8"
 flate2 = "1.1.9"
-vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+vergen-gix = { version = "10.0.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
@@ -392,7 +392,7 @@ insta = { version = "1", features = ["filters"] }
 tempfile = "3.25.0"
 asupersync = { version = "0.5.0", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-jsonschema = { version = "0.42.0", default-features = false }
+jsonschema = { version = "0.58.4", default-features = false }
 proptest = "1.10.0"
 wat = "1.255.0"
 toml = "1.0.3"

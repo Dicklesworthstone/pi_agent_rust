@@ -838,6 +838,10 @@
           "justification": "Classified vcr suite included in the bd-8t27h.3 traceability backfill so CI governance covers all registered tests."
         },
         {
+          "path": "tests/sdk_multimodal.rs",
+          "justification": "SDK image prompts over a loopback provider fixture: retry, failover, abort and durable-save fencing with attachments."
+        },
+        {
           "path": "tests/context_intelligence_closeout_gate_contract.rs",
           "justification": "Classified traceability repair suite included so CI governance covers the context-intelligence closeout contract and evidence guard."
         },
@@ -1234,6 +1238,10 @@
         {
           "path": "tests/extensions_provider_streaming.rs",
           "justification": "Provider-path extension runtime behavior support."
+        },
+        {
+          "path": "tests/extension_stream_terminal.rs",
+          "justification": "Extension provider terminals through QuickJS and the real agent: incomplete or inconsistent streams never execute tools."
         },
         {
           "path": "tests/extension_auto_repair_integration.rs",
@@ -2235,6 +2243,10 @@
           "justification": "FTUI interactive surface exercised under tmux."
         },
         {
+          "path": "tests/ftui_conhost_console.rs",
+          "justification": "FTUI native Windows console-input lease and restoration on a real ConHost (opt-in lane)."
+        },
+        {
           "path": "tests/e2e_lsp.rs",
           "justification": "LSP bridge exercised end-to-end through the real binary."
         },
@@ -2345,6 +2357,10 @@
         {
           "path": "tests/browser.rs",
           "justification": "Browser tool schema/metadata, navigation, and tab lifecycle behaviour."
+        },
+        {
+          "path": "tests/browser_frames.rs",
+          "justification": "Browser frame selection preflight; the live Chromium iframe-input scenario runs in the DSR browser lane."
         },
         {
           "path": "tests/browser_cdp.rs",

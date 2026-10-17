@@ -123,8 +123,8 @@ file. Use the explicit `download` action below to capture one transfer.
 `ax_tree` also returns up to 1,000 actual accessibility nodes with truncation
 metadata. References identify backend DOM nodes in one document; replacing or
 detaching a node, or navigating to a new document, makes old references unusable.
-Names are captured rather than editable field values. Cross-frame selection is
-not implemented.
+Names are captured rather than editable field values. Explicit frame selection
+is described below; omitting `frame` preserves main-document behavior.
 
 Clicks use native mouse events after visibility and obstruction checks. `type`
 inserts native input; `fill` replaces and verifies the retained text. Read-only,
@@ -133,6 +133,72 @@ chords support Ctrl/Control, Alt, Shift and Meta/Cmd/Command. `scroll` accepts
 `delta_x`/`delta_y` CSS-pixel deltas, defaulting to 0/600. `wait_for` polls for
 visibility and actually times out. Input helpers use an isolated world and
 structured CDP arguments rather than interpolated executable source.
+
+## Inspect and operate an embedded frame
+
+First obtain the frame ID from the selected tab. Frame IDs are browser-generated,
+not CSS selectors, element references, frame names or target IDs.
+
+```json
+{"action":"list_frames","tab":"work"}
+```
+
+The result contains `frames`, with each entry's `frame_id`, `parent_id`,
+`is_main`, `allowed`, `url` and `name`. Names and URLs are omitted for frames
+blocked by the URL policy. Discovery does not itself enter a frame or change
+future calls' document scope. The returned tree is limited to 256 frames and
+32 nesting levels; an oversized or malformed tree fails explicitly.
+
+Use an actual returned frame ID in place of `FRAME_ID` below:
+
+```json
+{"action":"snapshot","tab":"work","frame":"FRAME_ID"}
+{"action":"fill","tab":"work","frame":"FRAME_ID","selector":"#email","text":"person@example.com"}
+{"action":"press","tab":"work","frame":"FRAME_ID","selector":"#email","key":"End"}
+{"action":"click","tab":"work","frame":"FRAME_ID","selector":"@e12"}
+{"action":"wait_for","tab":"work","frame":"FRAME_ID","selector":".result","timeout_ms":10000}
+{"action":"scroll","tab":"work","frame":"FRAME_ID","selector":".results","delta_y":400}
+{"action":"evaluate","tab":"work","frame":"FRAME_ID","script":"({title: document.title, count: document.forms.length})"}
+```
+
+An explicit `tab` is required whenever `frame` is supplied. The frame option is
+per-call: it is never a persistent switch that could silently redirect a later
+operation. Supported scoped actions are `snapshot`, `ax_tree`, `evaluate`,
+`click`, `type`, `fill`, `press`, `scroll` and `wait_for`. Scoped keypress and
+wheel actions also require an explicit selector, instead of using ambient focus
+or the main viewport. Keyboard/text actions bring the selected page to the front,
+focus the requested control and check focus before native input dispatch.
+
+CSS lookup runs in the selected frame's isolated world. Snapshot references must
+be used with the same tab and frame; inspecting the parent or another frame does
+not overwrite them. The registry retains at most 256 document buckets. Evicted,
+detached and navigated references fail rather than rebinding to replacement
+nodes. Snapshot details include `frame_id` and `reference_scope`.
+
+For clicks and wheel input, Pi obtains Chromium's content quads in page-viewport
+coordinates, clips them to the viewport, and verifies the actual hit-test node
+belongs to the selected frame and target element or its composed descendants.
+An overlay in an ancestor document therefore blocks the operation even when the
+frame's own local hit test sees an unobstructed element. Frame-local DOM rectangle
+coordinates are never blindly reused as page coordinates. Geometry and candidate
+counts are bounded, and no mouse event is dispatched when checks fail.
+
+Each scoped operation pins the selected frame and its ancestors' IDs, loader IDs
+and URLs before entering an isolated world. Every ancestor must pass the URL
+policy; nested `about:blank` and `about:srcdoc` cannot bypass a blocked ancestor.
+Navigation, reparenting or detach detected during the operation is an error,
+not permission to enter the new document. These checks are not an atomic browser
+transaction: page scripts can run between protocol commands, and cancellation
+or failure cannot roll back effects already dispatched.
+
+**Current scope:** same-process frames reachable through the attached page's CDP
+session. Out-of-process iframe attachment/routing is not implemented. Chromium
+errors when a frame cannot be entered are propagated without a main-frame
+fallback. Frame-scoped evaluation has DOM access in an isolated world, not access
+to the page's JavaScript global variables. Frame options on uploads, downloads,
+exports, navigation, tab/lifecycle actions or dialog responses are rejected
+before connection or launch. Those existing operations remain main-document or
+tab-level operations.
 
 ## Select real files for upload
 
@@ -250,9 +316,26 @@ navigation/access guard, not network isolation. Page scripts, subresources and
 isolation. The tool declares read, write, network and process effects.
 
 Mock mode requires `with_mock(true)` or `PI_BROWSER_MOCK=1`;
-`with_mock(false)` overrides the environment. New lifecycle, upload, full-page
-capture and PDF operations deliberately reject mock mode rather than inventing
-successful process or transfer results.
+`with_mock(false)` overrides the environment. New lifecycle, frame, upload,
+full-page capture and PDF operations deliberately reject mock mode rather than
+inventing successful process, input or transfer results.
+
+### Frame increment validation status
+
+The frame increment adds 16 Rust test functions: frame-tree/policy/document
+identity tests, geometry and handle-admission tests, public preflight checks,
+and one ignored real-Chromium integration scenario in `tests/browser_frames.rs`.
+That live scenario exercises iframe fill/type/keypress, actual native clicks,
+ancestor overlay rejection, parent-value preservation, reference scoping and
+stale/detached frames. It requires an installed sandbox-capable Chromium and
+explicit selection by the DSR browser lane; missing Chromium is not a fake pass.
+
+These tests were authored but **not executed** in the implementation environment.
+`dsr quality --tool pi_agent_rust` exited 127 because DSR was not installed;
+Rust tooling was absent as well. No build, test pass or browser execution result
+is claimed for the frame increment.
+
+### Earlier lifecycle/file-workflow evidence
 
 The lifecycle/file-workflow increment adds 18 Rust regression test functions
 across the browser modules and `tests/browser_cdp.rs`, including actual loopback

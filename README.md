@@ -65,6 +65,9 @@ Use `dsr quality --tool pi_agent_rust` for the registered quality recipe and
 the canonical DSR build/release commands documented in
 [docs/releasing.md](docs/releasing.md).
 
+For signed published payload verification and offline CLI smoke checks, see
+[Published release consumer checks](docs/published-release-checks.md).
+
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
 - **[rich_rust](https://github.com/Dicklesworthstone/rich_rust)**: A Rust port of [Rich](https://github.com/Textualize/rich) by [Will McGugan](https://github.com/willmcgugan), providing beautiful terminal output with markup syntax
@@ -1030,17 +1033,27 @@ Resolution order for a request, first match wins:
 Ambient proxy variables are honored by default, the same as `git` and `curl`.
 Where they are set for some other tool — a capture proxy, a stale VPN helper —
 turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
-`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. An
-unusable ambient value (e.g. a `socks5://` `ALL_PROXY` — SOCKS is not
-supported) is skipped with a warning rather than failing requests.
+`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
+endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
+proxy), with optional username/password authentication; SOCKS credentials are
+not encrypted on the hop to the proxy. There is no automatic loopback bypass:
+requests to local model servers (Ollama, LM Studio) go through the proxy too
+unless `localhost` and `127.0.0.1` are in `NO_PROXY` or `http.noProxy`. An
+unusable ambient value
+(e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
+than failing requests.
 
-The resolved proxy is also injected into every process the `bash` tool spawns
-(as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase spellings), so
-`git`, `curl`, and `npm` invocations reach the network the same way Pi does.
-The injection is a per-child copy: Pi's own environment and the system
-environment are never modified. Proxy credentials are deliberately left out of
-that copy, so an authenticated proxy needs its own configuration for those
-tools (e.g. `git config --global http.proxy`).
+The `bash` tool's child environment overrides advertise only HTTP proxy
+endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
+spellings). Credentials are deliberately omitted from that per-child copy,
+so authenticated HTTP proxies need their own configuration in those tools
+(e.g. `git config --global http.proxy`). Pi's own environment and the system
+environment are never modified. SOCKS endpoints leave child proxy variables
+as inherited, including authenticated `ALL_PROXY` values and `NO_PROXY`.
+This preserves existing `curl`/`git` SOCKS configuration without forcing tools
+that lack SOCKS support to use it through HTTP-specific variables. A SOCKS
+proxy set only in Pi settings or `PI_*_PROXY` does not configure child tools;
+use their standard proxy environment variables or their own configuration.
 
 ### Configuration Precedence
 
