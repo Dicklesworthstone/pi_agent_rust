@@ -28,6 +28,9 @@ use super::progress::ProgressRegistry;
 #[cfg(test)]
 mod progress_tests;
 
+#[cfg(unix)]
+mod cancellable_stdio;
+
 /// Default per-request timeout for MCP calls.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on an HTTP response body (10 MiB).
@@ -708,7 +711,7 @@ fn classify_read_error(error: &std::io::Error) -> McpStdioError {
 // Ownership is part of the call contract here.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn reader_loop(
-    stdout: std::process::ChildStdout,
+    stdout: impl Read,
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
     progress: std::sync::Arc<ProgressRegistry>,
@@ -720,8 +723,16 @@ fn reader_loop(
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
+        if !alive.load(Ordering::SeqCst) {
+            return;
+        }
         match read_stdio_message(&mut reader) {
             Ok(Some(message)) => {
+                // BufReader may already own another complete frame when a
+                // concurrent close cancels its underlying pipe.
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Err(error) = route_stdio_message(&message, &pending, &writer_tx) {
                     stop_reader_connection(
                         &writer_tx,
@@ -882,6 +893,24 @@ impl McpStdioClient {
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(STDIO_WRITER_QUEUE_CAP);
         let mut child_guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
 
+        // An escaped descendant can retain any of the three pipe ends after
+        // process-tree cleanup. Prepare every parent endpoint before handing
+        // ownership to a worker, while the child is still guarded locally.
+        #[cfg(unix)]
+        let (stdin, stdout, stderr) = {
+            let pipes = cancellable_stdio::prepare(stdin, stdout, stderr, &alive)
+                .map_err(|error| {
+                    alive.store(false, Ordering::SeqCst);
+                    kill_tree_once(pid, &tree_cleanup_state);
+                    let _ = child_guard.kill();
+                    tool_err(
+                        "MCP_TRANSPORT_IO",
+                        format!("failed to prepare cancellable MCP stdio pipes: {error}"),
+                    )
+                })?;
+            (pipes.stdin, pipes.stdout, pipes.stderr)
+        };
+
         let writer_thread = {
             let pending = std::sync::Arc::clone(&pending);
             let alive = std::sync::Arc::clone(&alive);
@@ -939,6 +968,8 @@ impl McpStdioClient {
         let _reader_thread = match reader_thread {
             Ok(thread) => thread, // ubs:ignore intentional process-lifetime thread
             Err(error) => {
+                alive.store(false, Ordering::SeqCst);
+                wake_writer_shutdown(&writer_tx);
                 kill_tree_once(pid, &tree_cleanup_state);
                 let _ = child_guard.kill();
                 return Err(tool_err(
@@ -968,6 +999,8 @@ impl McpStdioClient {
         let _stderr_thread = match stderr_thread {
             Ok(thread) => thread, // ubs:ignore intentional process-lifetime thread
             Err(error) => {
+                alive.store(false, Ordering::SeqCst);
+                wake_writer_shutdown(&writer_tx);
                 kill_tree_once(pid, &tree_cleanup_state);
                 let _ = child_guard.kill();
                 return Err(tool_err(
