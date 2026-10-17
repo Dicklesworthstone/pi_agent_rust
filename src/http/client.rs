@@ -3177,15 +3177,30 @@ mod tests {
         let socks = test_proxy("socks5h://user:password@127.0.0.1:1080");
         let http = test_proxy("http://user:password@127.0.0.1:8080");
         let headers = vec![
-            ("Proxy-Authorization".to_string(), "DO-NOT-FORWARD".to_string()),
-            ("Authorization".to_string(), "Bearer origin-token".to_string()),
+            (
+                "Proxy-Authorization".to_string(),
+                "DO-NOT-FORWARD".to_string(),
+            ),
+            (
+                "Authorization".to_string(),
+                "Bearer origin-token".to_string(),
+            ),
         ];
-        for url in ["http://origin.invalid/v1?x=1", "https://origin.invalid/v1?x=1"] {
+        for url in [
+            "http://origin.invalid/v1?x=1",
+            "https://origin.invalid/v1?x=1",
+        ] {
             let parsed = ParsedUrl::parse(url).unwrap();
             for proxy in [None, Some(&socks), Some(&http)] {
                 let wire = String::from_utf8(build_request_bytes(
-                    Method::Get, &parsed, "test", &headers, &[], proxy,
-                )).unwrap();
+                    Method::Get,
+                    &parsed,
+                    "test",
+                    &headers,
+                    &[],
+                    proxy,
+                ))
+                .unwrap();
                 assert!(!wire.contains("DO-NOT-FORWARD"));
                 assert!(wire.contains("Authorization: Bearer origin-token\r\n"));
                 let absolute = proxy.is_some_and(ProxyEndpoint::is_http)
@@ -3213,15 +3228,22 @@ mod tests {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(started.elapsed() < std::time::Duration::from_secs(5), "proxy accept timed out");
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(5),
+                            "proxy accept timed out"
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                     Err(error) => panic!("proxy accept failed: {error}"),
                 }
             };
             socket.set_nonblocking(false).unwrap();
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             handle(socket);
         });
         (address, thread)
@@ -3242,7 +3264,10 @@ mod tests {
         assert_eq!(fixture_read(socket, 3), [5, 1, method]);
         fixture_write(socket, &[5, method]);
         if authenticated {
-            assert_eq!(fixture_read(socket, 9), [1, 3, b'u', b':', b'x', 3, b'p', 0xff, 0]);
+            assert_eq!(
+                fixture_read(socket, 9),
+                [1, 3, b'u', b':', b'x', 3, b'p', 0xff, 0]
+            );
             fixture_write(socket, &[1, 0]);
         }
     }
@@ -3263,21 +3288,44 @@ mod tests {
     }
 
     fn socks_request(url: &str, proxy: &ProxyEndpoint) -> Result<Vec<u8>> {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let client = Client::new();
             let parsed = ParsedUrl::parse(url).unwrap();
             let headers = vec![
-                ("Authorization".to_string(), "Bearer origin-token".to_string()),
-                ("Proxy-Authorization".to_string(), "DO-NOT-FORWARD".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "Bearer origin-token".to_string(),
+                ),
+                (
+                    "Proxy-Authorization".to_string(),
+                    "DO-NOT-FORWARD".to_string(),
+                ),
             ];
             crate::text_completion::with_timeout(std::time::Duration::from_secs(5), async {
                 let (status, headers, stream) = send_parts_with_proxy(
-                    &client, Method::Get, &parsed, &headers, &[], Some(proxy),
-                ).await?;
+                    &client,
+                    Method::Get,
+                    &parsed,
+                    &headers,
+                    &[],
+                    Some(proxy),
+                )
+                .await?;
                 assert_eq!(status, 200);
-                Response { status, headers, stream, timeout_info: None }.bytes_limited(1024).await
-            }).await.map_err(|_| Error::api("SOCKS fixture request timed out"))?
+                Response {
+                    status,
+                    headers,
+                    stream,
+                    timeout_info: None,
+                }
+                .bytes_limited(1024)
+                .await
+            })
+            .await
+            .map_err(|_| Error::api("SOCKS fixture request timed out"))?
         })
     }
 
@@ -3317,7 +3365,10 @@ mod tests {
             assert!(head.contains("Host: [::1]:9000\r\n"));
             assert!(!head.contains("DO-NOT-FORWARD"));
             assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
-            fixture_write(&mut socket, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            fixture_write(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            );
         });
         let proxy = test_proxy(&format!("socks5://u%3Ax:p%FF%00@{address}"));
         let result = socks_request("http://[::1]:9000/api", &proxy);
@@ -3342,8 +3393,16 @@ mod tests {
         let proxy = test_proxy(&format!("socks5h://{address}"));
         let result = socks_request(&format!("http://{destination}/must-not-run"), &proxy);
         server.join().unwrap();
-        assert!(result.unwrap_err().to_string().contains("SOCKS5 destination refused"));
-        assert_eq!(origin.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SOCKS5 destination refused")
+        );
+        assert_eq!(
+            origin.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -3377,6 +3436,11 @@ mod tests {
         let proxy = test_proxy(&format!("socks5h://{address}"));
         let result = socks_request("https://unresolvable.invalid/v1", &proxy);
         server.join().unwrap();
-        assert!(result.unwrap_err().to_string().contains("TLS connect failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TLS connect failed")
+        );
     }
 }

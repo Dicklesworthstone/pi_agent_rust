@@ -2,7 +2,7 @@
 source: tests/tui_snapshot.rs
 expression: view
 ---
-]0;Pi · dummy/dummy-model · ready  Pi (dummy/dummy-model)
+]0;Pi · Dummy Model · ready  Pi (Dummy Model)
   ctrl+l: model  ctrl+p: next  ctrl+shift+p: prev  ctrl+o: tools  shift+tab: ...
   resources: 0 skills, 0 prompts, 0 themes, 0 extensions
 
@@ -25,4 +25,4 @@ line 25
   │ >
   │ >
 
-  󰚩 dummy/dummy-model / ACT / ctx: 0%
+  󰚩 Dummy Model / ACT / ctx: 0%

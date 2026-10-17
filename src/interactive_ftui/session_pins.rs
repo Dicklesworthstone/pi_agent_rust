@@ -66,9 +66,10 @@ pub fn sort_pinned_first<T, S: std::hash::BuildHasher>(
 }
 
 /// The `/resume` picker rows for `cwd`, newest first with pinned sessions
-/// on top and marked, as `(label, session path)`. Read from the session
-/// index each time, so sessions saved and pins set during this run show up.
-/// Index failures degrade to an empty list.
+/// on top and marked, as `(label, session path)`.
+///
+/// Read from the session index each time, so sessions saved and pins set
+/// during this run show up. Index failures degrade to an empty list.
 pub fn resume_entries(cwd: &str, pins_dir: &Path) -> Vec<(String, String)> {
     let pinned = load_pinned(pins_dir);
     sort_pinned_first(

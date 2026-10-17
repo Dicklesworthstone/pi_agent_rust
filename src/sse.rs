@@ -210,9 +210,7 @@ impl SseParser {
         // Complete metadata lines must not bypass the incomplete-line cap.
         // Check before allocating an event name or a replay ID, which is also
         // carried forward to subsequent events. Data has its own event budget.
-        if line.len() > MAX_BUFFER_SIZE
-            && (line.starts_with("id:") || line.starts_with("event:"))
-        {
+        if line.len() > MAX_BUFFER_SIZE && (line.starts_with("id:") || line.starts_with("event:")) {
             return Err(SseParseError::BufferLimit);
         }
         if let Some(rest) = line.strip_prefix(':') {
@@ -2338,9 +2336,7 @@ data: {"type":"message_stop"}
 
         for field in ["id: ", "event: "] {
             let payload = "x".repeat(MAX_BUFFER_SIZE + 1);
-            let input = format!(
-                "data: before\n\n{field}{payload}\ndata: bad\n\ndata: [DONE]\n\n"
-            );
+            let input = format!("data: before\n\n{field}{payload}\ndata: bad\n\ndata: [DONE]\n\n");
             let mut stream = SseStream::new(stream::iter(vec![Ok(input.into_bytes())]));
             futures::executor::block_on(async {
                 assert_eq!(stream.next().await.unwrap().unwrap().data, "before");

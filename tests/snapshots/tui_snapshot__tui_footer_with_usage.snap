@@ -2,7 +2,7 @@
 source: tests/tui_snapshot.rs
 expression: view
 ---
-]0;Pi · dummy/dummy-model · ready  Pi (dummy/dummy-model)
+]0;Pi · Dummy Model · ready  Pi (Dummy Model)
   ctrl+l: model  ctrl+p: next  ctrl+shift+p: prev  ctrl+o: tools  shift+tab: ...
   resources: 0 skills, 0 prompts, 0 themes, 0 extensions
 
@@ -16,5 +16,5 @@ expression: view
   │ >
   │ >
 
-  󰚩 dummy/dummy-model / ACT /  snapshot-fixture / ctx: 0%
+  󰚩 Dummy Model / ACT /  snapshot-fixture / ctx: 0%
   Tokens: 120 in / 45 out ($0.0030)  |  snapshot-fixture  |  Persist: balance...

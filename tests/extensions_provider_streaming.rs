@@ -362,7 +362,10 @@ export default function init(pi) {
       };
 
       yield { type: "start", partial };
-      yield { type: "error", reason: "stop", error: partial };
+      // An error terminal must carry an error (or aborted) reason that matches
+      // its message's stopReason; `reason: "stop"` is a protocol violation.
+      const failed = { ...partial, stopReason: "error", errorMessage: "upstream failed" };
+      yield { type: "error", reason: "error", error: failed };
     }
   });
 }
@@ -737,7 +740,7 @@ fn stream_simple_string_chunks_accumulate_in_partials() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stream_simple_empty_stream_emits_done() {
+fn stream_simple_empty_stream_is_reported_incomplete() {
     make_runtime().block_on(async move {
         let (_dir, manager) = load_extension(EMPTY_STREAM_EXTENSION).await;
         let entries = manager.extension_model_entries();
@@ -749,24 +752,20 @@ fn stream_simple_empty_stream_emits_done() {
         let provider = create_provider(entry, Some(&manager)).expect("create provider");
         let events = collect_events(provider.as_ref(), &basic_context(), &basic_options()).await;
 
-        // An empty stream should still emit a Done event.
-        assert!(
-            !events.is_empty(),
-            "empty stream should emit at least a Done event"
-        );
-
+        // An iterator that yields nothing never produced text or a terminal
+        // event, so it is not promoted to a successful empty reply.
         let last = events.last().expect("at least one event");
-        match last.as_ref().expect("event ok") {
-            StreamEvent::Done { reason, message } => {
-                assert_eq!(*reason, StopReason::Stop);
-                // Done message should have empty text content.
-                let ContentBlock::Text(text) = &message.content[0] else {
-                    panic!("expected text content");
-                };
-                assert_eq!(text.text, "");
-            }
-            other => panic!("expected Done event, got {other:?}"),
-        }
+        let error = last
+            .as_ref()
+            .expect_err("an empty stream must not complete as Done")
+            .to_string();
+        assert!(error.contains("PI_EXTENSION_STREAM_INCOMPLETE"), "{error}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. }))),
+            "an empty stream must not emit Done"
+        );
     });
 }
 
@@ -790,7 +789,7 @@ fn stream_simple_error_event_from_js_translates() {
         let mut saw_error_event = false;
         for event in &events {
             if let Ok(StreamEvent::Error { reason, .. }) = event {
-                assert_eq!(*reason, StopReason::Stop);
+                assert_eq!(*reason, StopReason::Error);
                 saw_error_event = true;
             }
         }
@@ -873,8 +872,10 @@ fn stream_simple_invalid_event_type_returns_error() {
             if let Err(err) = event {
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("invalid event") || msg.contains("streamSimple"),
-                    "error should mention invalid event, got: {msg}"
+                    msg.contains("PI_EXTENSION_STREAM_PROTOCOL")
+                        || msg.contains("invalid event")
+                        || msg.contains("streamSimple"),
+                    "error should name the invalid event, got: {msg}"
                 );
                 saw_error = true;
             }

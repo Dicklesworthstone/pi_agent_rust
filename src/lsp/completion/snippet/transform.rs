@@ -93,8 +93,10 @@ fn validate_pattern(pattern: &str) -> Result<()> {
                         return Err(unsupported());
                     }
                     index += 2;
-                } else if !(matches!(escaped, b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'n' | b'r' | b't' | b'f' | b'v')
-                    || (!in_class && matches!(escaped, b'b' | b'B'))
+                } else if !(matches!(
+                    escaped,
+                    b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'n' | b'r' | b't' | b'f' | b'v'
+                ) || (!in_class && matches!(escaped, b'b' | b'B'))
                     || b"\\^$.*+?()[]{}|/-".contains(&escaped))
                 {
                     return Err(unsupported());
@@ -116,14 +118,15 @@ fn validate_pattern(pattern: &str) -> Result<()> {
                 // Repeated groups have different capture-reset semantics in
                 // JavaScript and regex. Refuse that ambiguity rather than
                 // retaining captures from an earlier repetition.
-                if bytes.get(index + 1).is_some_and(|byte| matches!(*byte, b'*' | b'+' | b'{')) {
+                if bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| matches!(*byte, b'*' | b'+' | b'{'))
+                {
                     return Err(unsupported());
                 }
             }
-            b'&' | b'-' | b'~' if in_class => {
-                if bytes.get(index + 1) == Some(&bytes[index]) {
-                    return Err(unsupported());
-                }
+            b'&' | b'-' | b'~' if in_class && bytes.get(index + 1) == Some(&bytes[index]) => {
+                return Err(unsupported());
             }
             _ => {}
         }
@@ -154,7 +157,9 @@ impl Parser<'_> {
             match self.take() {
                 Some('/') => break,
                 Some('\\') => {
-                    let ch = self.take().ok_or_else(|| malformed("unterminated transform pattern"))?;
+                    let ch = self
+                        .take()
+                        .ok_or_else(|| malformed("unterminated transform pattern"))?;
                     if ch != '/' {
                         pattern.push('\\');
                     }
@@ -307,7 +312,11 @@ fn case(value: &str, mode: Case) -> String {
                 }
                 result.push_str(rest);
             }
-            if result.is_empty() { value.to_string() } else { result }
+            if result.is_empty() {
+                value.to_string()
+            } else {
+                result
+            }
         }
     }
 }
@@ -316,7 +325,10 @@ impl Transform {
     /// The opening slash was consumed by the numeric-placeholder parser.
     /// Commit the shared cursor only after the complete transform is valid.
     pub(super) fn parse(input: &str, offset: &mut usize) -> Result<Self> {
-        let mut parser = Parser { input, offset: *offset };
+        let mut parser = Parser {
+            input,
+            offset: *offset,
+        };
         let pattern = parser.pattern()?;
         let parts = parser.replacement()?;
         let mut global = false;
@@ -342,7 +354,12 @@ impl Transform {
             return Err(limit());
         }
         *offset = parser.offset;
-        Ok(Self { regex, insensitive, global, parts })
+        Ok(Self {
+            regex,
+            insensitive,
+            global,
+            parts,
+        })
     }
 
     fn format(&self, captures: Option<&Captures<'_>>, work: &mut usize) -> Result<String> {
@@ -353,7 +370,9 @@ impl Transform {
                 Part::Text(text) => append(&mut output, text)?,
                 Part::Group(index, operation) => {
                     let value = captures
-                        .and_then(|captures| captures.get(usize::try_from(*index).expect("bounded capture index")))
+                        .and_then(|captures| {
+                            captures.get(usize::try_from(*index).expect("bounded capture index"))
+                        })
                         .map_or("", |found| {
                             // apply() accepts only ASCII subjects, including all captures.
                             std::str::from_utf8(found.as_bytes()).expect("ASCII capture")
@@ -362,10 +381,16 @@ impl Transform {
                         Operation::Capture => append(&mut output, value)?,
                         Operation::Case(mode) => append(&mut output, &case(value, *mode))?,
                         Operation::If(text) => {
-                            if !value.is_empty() { append(&mut output, text)?; }
+                            if !value.is_empty() {
+                                append(&mut output, text)?;
+                            }
                         }
-                        Operation::Else(text) => append(&mut output, if value.is_empty() { text } else { value })?,
-                        Operation::IfElse(yes, no) => append(&mut output, if value.is_empty() { no } else { yes })?,
+                        Operation::Else(text) => {
+                            append(&mut output, if value.is_empty() { text } else { value })?;
+                        }
+                        Operation::IfElse(yes, no) => {
+                            append(&mut output, if value.is_empty() { no } else { yes })?;
+                        }
                     }
                 }
             }
@@ -390,13 +415,17 @@ impl Transform {
                 .ok_or_else(limit)?;
             *scan = scan.checked_sub(cost).ok_or_else(limit)?;
             *work = work.checked_sub(1).ok_or_else(limit)?;
-            let Some(captures) = self.regex.captures_at(value.as_bytes(), search) else { break };
+            let Some(captures) = self.regex.captures_at(value.as_bytes(), search) else {
+                break;
+            };
             let found = captures.get(0).expect("full match");
             matched = true;
             append(&mut output, &value[copied..found.start()])?;
             append(&mut output, &self.format(Some(&captures), work)?)?;
             copied = found.end();
-            if !self.global { break; }
+            if !self.global {
+                break;
+            }
             // JavaScript permits an empty match immediately after a nonempty
             // one. captures_iter suppresses that case, so advance explicitly.
             search = found.end() + usize::from(found.is_empty());

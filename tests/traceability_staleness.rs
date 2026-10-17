@@ -18,6 +18,7 @@ const HIGH_VALUE_ARTIFACT_INVENTORY: &str =
 const UBS_EXTENSION_RUNTIME_NOISE_BASELINE: &str =
     "docs/evidence/ubs-extension-runtime-noise-baseline.json";
 const PROVIDER_SUPPORT_MODULES: &[&str] = &[
+    "extension_stream",
     "model_fetch",
     "azure_terminal_safety_tests",
     "openai_terminal_safety_tests",

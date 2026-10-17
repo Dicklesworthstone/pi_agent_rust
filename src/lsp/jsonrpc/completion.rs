@@ -86,7 +86,9 @@ pub fn await_completion<T>(
                         Err(TryRecvError::Disconnected) => return Err(CompletionWaitError::Closed),
                         Err(TryRecvError::Empty) => {}
                     }
-                    let delay = timeout.saturating_sub(elapsed).min(Duration::from_millis(10));
+                    let delay = timeout
+                        .saturating_sub(elapsed)
+                        .min(Duration::from_millis(10));
                     asupersync::time::sleep(now, delay).await;
                 }
             })
@@ -174,7 +176,8 @@ mod tests {
 
     #[test]
     fn cancellation_and_cleanup_retain_the_construction_owner() {
-        let parent = AgentCx::for_request_with_budget(asupersync::Budget::new().with_poll_quota(23));
+        let parent =
+            AgentCx::for_request_with_budget(asupersync::Budget::new().with_poll_quota(23));
         let _parent = parent.cx().clone().set_current_restricted();
         let owner = AgentCx::for_request_with_budget(asupersync::Budget::new().with_poll_quota(7));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -183,14 +186,20 @@ mod tests {
         let future = {
             let _current = owner.cx().clone().set_current_restricted();
             await_completion(receiver, Duration::from_secs(60), || {
-                assert_eq!(asupersync::Cx::current().expect("cleanup owner").budget(), owner.budget());
+                assert_eq!(
+                    asupersync::Cx::current().expect("cleanup owner").budget(),
+                    owner.budget()
+                );
                 count.fetch_add(1, Ordering::SeqCst);
             })
         };
         owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
         assert_eq!(once(future), Err(CompletionWaitError::Cancelled));
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert_eq!(asupersync::Cx::current().expect("parent restored").budget(), parent.budget());
+        assert_eq!(
+            asupersync::Cx::current().expect("parent restored").budget(),
+            parent.budget()
+        );
         assert!(!parent.is_cancel_requested());
     }
 

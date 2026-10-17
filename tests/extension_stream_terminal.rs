@@ -1,4 +1,4 @@
-//! Exercise the extension provider boundary through QuickJS and the real agent.
+//! Exercise the extension provider boundary through `QuickJS` and the real agent.
 //! Incomplete structured output must never become a local write operation.
 #![recursion_limit = "512"]
 
@@ -60,17 +60,22 @@ async fn load(body: &str) -> (tempfile::TempDir, ExtensionManager, Arc<dyn Provi
         },
         tools,
         manager.clone(),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     manager.set_js_runtime(js);
-    manager.load_js_extensions(vec![JsExtensionLoadSpec::from_entry_path(&entry).unwrap()])
-        .await.unwrap();
+    manager
+        .load_js_extensions(vec![JsExtensionLoadSpec::from_entry_path(&entry).unwrap()])
+        .await
+        .unwrap();
     let entries = manager.extension_model_entries();
     let provider = create_provider(&entries[0], Some(&manager)).unwrap();
     (root, manager, provider)
 }
 
 fn request_tool(body: &str) -> String {
-    format!(r#"
+    format!(
+        r#"
       const call = {{type: "toolCall", id: "write-1", name: "write",
                      arguments: {{path: "result.txt", content: "committed"}}}};
       message.content = [call];
@@ -79,7 +84,23 @@ fn request_tool(body: &str) -> String {
       yield {{type: "toolcall_start", contentIndex: 0, partial: message}};
       yield {{type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message}};
       {body}
-    "#)
+    "#
+    )
+}
+
+/// The failure text of a run that must not complete. The agent reports a
+/// provider-side failure as an assistant message stopped with `Error`, and an
+/// `Error` stop returns before any tool dispatch; an `Err` is accepted too.
+fn failure_text(result: pi::error::Result<pi::model::AssistantMessage>) -> String {
+    match result {
+        Err(error) => error.to_string(),
+        Ok(message) => {
+            assert_eq!(message.stop_reason, StopReason::Error, "{message:?}");
+            message
+                .error_message
+                .expect("an Error stop names its failure")
+        }
+    }
 }
 
 fn agent(provider: Arc<dyn Provider>, root: &std::path::Path) -> Agent {
@@ -100,14 +121,22 @@ fn incomplete_extension_tool_stream_cannot_write_or_emit_execution_start() {
         let mut agent = agent(provider, root.path());
         let events = Arc::new(Mutex::new(Vec::new()));
         let capture = Arc::clone(&events);
-        let error = agent.run("write the file", move |event| {
-            capture.lock().unwrap().push(event);
-        }).await.unwrap_err();
-        assert!(error.to_string().contains("PI_EXTENSION_STREAM_INCOMPLETE"));
+        let error = failure_text(
+            agent
+                .run("write the file", move |event| {
+                    capture.lock().unwrap().push(event);
+                })
+                .await,
+        );
+        assert!(error.contains("PI_EXTENSION_STREAM_INCOMPLETE"), "{error}");
         assert!(!root.path().join("result.txt").exists());
-        assert!(!events.lock().unwrap().iter().any(|event| {
-            matches!(event, AgentEvent::ToolExecutionStart { .. })
-        }));
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event, AgentEvent::ToolExecutionStart { .. }) })
+        );
     }));
 }
 
@@ -119,13 +148,19 @@ fn valid_explicit_tool_terminal_executes_once_and_then_completes() {
         let mut agent = agent(provider, root.path());
         let starts = Arc::new(Mutex::new(0usize));
         let capture = Arc::clone(&starts);
-        let result = agent.run("write the file", move |event| {
-            if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                *capture.lock().unwrap() += 1;
-            }
-        }).await.unwrap();
+        let result = agent
+            .run("write the file", move |event| {
+                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                    *capture.lock().unwrap() += 1;
+                }
+            })
+            .await
+            .unwrap();
         assert_eq!(result.stop_reason, StopReason::Stop);
-        assert_eq!(std::fs::read_to_string(root.path().join("result.txt")).unwrap(), "committed");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("result.txt")).unwrap(),
+            "committed"
+        );
         assert_eq!(*starts.lock().unwrap(), 1);
     }));
 }
@@ -141,8 +176,8 @@ fn truncated_failed_and_inconsistent_terminals_do_not_execute_tools() {
         ] {
             let (root, _manager, provider) = load(&request_tool(terminal)).await;
             let mut agent = agent(provider, root.path());
-            let error = agent.run("write the file", |_| {}).await.unwrap_err();
-            assert!(error.to_string().contains("PI_EXTENSION_STREAM_PROTOCOL"));
+            let error = failure_text(agent.run("write the file", |_| {}).await);
+            assert!(error.contains("PI_EXTENSION_STREAM_PROTOCOL"), "{error}");
             assert!(!root.path().join("result.txt").exists());
         }
     }));
@@ -203,11 +238,18 @@ fn explicit_terminal_ends_without_pulling_more_iterator_work() {
     runtime().block_on(Box::pin(async {
         let (_root, _manager, provider) = load(
             "yield {type:'done', reason:'stop', message}; throw new Error('must not be pulled');",
-        ).await;
+        )
+        .await;
         let context = Context::default();
         let options = StreamOptions::default();
         let mut stream = provider.stream(&context, &options).await.unwrap();
-        assert!(matches!(stream.next().await.unwrap().unwrap(), StreamEvent::Done { reason: StopReason::Stop, .. }));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            }
+        ));
         assert!(stream.next().await.is_none());
     }));
 }

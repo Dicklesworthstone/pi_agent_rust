@@ -1,7 +1,7 @@
 use flate2::{Compression, GzBuilder};
 use std::fmt::Write as _;
 use std::io::Write;
-use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, GixBuilder, RustcBuilder};
+use vergen_gix::{Build, Cargo, Emitter, Gix, Rustc};
 
 struct EmbeddedTextAsset {
     source: &'static str,
@@ -121,10 +121,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     compress_embedded_text_assets()?;
     emit_benchmark_build_fingerprint()?;
 
-    let build = BuildBuilder::default().build_timestamp(true).build()?;
-    let cargo = CargoBuilder::default().target_triple(true).build()?;
-    // `GixBuilder::sha(short: bool)` -- the bool selects SHORT, it does not
-    // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280). So `.sha(true)`
+    let build = Build::builder().build_timestamp(true).build();
+    let cargo = Cargo::builder().target_triple(true).build();
+    // `Gix::builder().sha(short: bool)` -- the bool selects SHORT, it does not
+    // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280; unchanged in
+    // 10.0, where `sha` is `with = |short: bool| ...`). So `.sha(true)`
     // baked a 9-character sha into VERGEN_GIT_SHA, and every perf evidence
     // record that carries provenance was rejected by its own gate:
     // `is_full_git_sha` wants 40 hex characters, so `source_identity_verified`
@@ -132,8 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // came out "medium" where the contract demands "high". An abbreviated sha is
     // genuinely ambiguous provenance, so the gate is right and this was wrong.
     // `pi --version` still shows the short form; it abbreviates for display.
-    let gix = GixBuilder::default().sha(false).dirty(true).build()?;
-    let rustc = RustcBuilder::default().semver(true).build()?;
+    let gix = Gix::builder().sha(false).dirty(true).build();
+    let rustc = Rustc::builder().semver(true).build();
 
     let mut emitter = Emitter::default();
     // Offloaded builds can temporarily miss git objects and trigger fallback warnings.

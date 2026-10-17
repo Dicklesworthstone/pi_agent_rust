@@ -288,8 +288,12 @@ timeout.
 ### Symptom: Custom `streamSimple` provider returns empty responses
 
 **Cause**: The JS `streamSimple()` function must return an
-`AsyncIterable<string>`. If it returns `undefined` or a non-iterable,
-the Rust side interprets it as an empty stream.
+`AsyncIterable` of text chunks or structured assistant events. Since
+v0.7.0 an iterator that yields nothing, or a structured stream that ends
+without a `done`/`error` terminal, fails with
+`PI_EXTENSION_STREAM_INCOMPLETE` instead of completing as an empty reply. An
+`error` terminal must carry `reason: "error"` (or `"aborted"`) matching its
+message's `stopReason`; anything else is `PI_EXTENSION_STREAM_PROTOCOL`.
 
 **Fix**: Ensure `streamSimple` is an async generator:
 ```js

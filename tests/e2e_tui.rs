@@ -1138,10 +1138,11 @@ fn e2e_tui_startup_sets_delight_terminal_title() {
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
     let title = session.tmux.pane_title();
     assert!(
-        title == "Pi · openai/gpt-4o-mini · ready"
-            || title == "Pi _ openai/gpt-4o-mini _ ready"
+        // The model is shown by its catalog display name (gh #214).
+        title == "Pi · GPT-4o mini · ready"
+            || title == "Pi _ GPT-4o mini _ ready"
             || (title.starts_with("Pi ")
-                && title.contains("openai/gpt-4o-mini")
+                && title.contains("GPT-4o mini")
                 && title.ends_with("ready")),
         "Expected delight terminal title; got: {title:?}"
     );
@@ -1381,12 +1382,13 @@ fn e2e_tui_model_command() {
     // Wait for startup
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
 
-    // Send /model
+    // Send /model: it opens the model picker. Which models it lists depends on
+    // the credentials the host has, so assert the picker, not a model id.
     let pane =
-        session.send_text_and_wait("model_command", "/model", "gpt-4o-mini", COMMAND_TIMEOUT);
+        session.send_text_and_wait("model_command", "/model", "Select a model", COMMAND_TIMEOUT);
     assert!(
-        pane.contains("gpt-4o-mini"),
-        "Expected model info in output; got:\n{pane}"
+        pane.contains("Select a model"),
+        "Expected the model picker; got:\n{pane}"
     );
 
     session.exit_gracefully();
@@ -1587,7 +1589,7 @@ fn e2e_tui_quiet_startup_hides_welcome_message() {
     session.launch(&base_interactive_args());
     let pane = session.wait_and_capture("startup", "resources:", STARTUP_TIMEOUT);
     assert!(
-        pane.contains("Pi (openai/gpt-4o-mini)"),
+        pane.contains("Pi (GPT-4o mini)"),
         "Expected header to render in quiet startup mode; got:\n{pane}"
     );
     assert!(
@@ -1669,8 +1671,8 @@ fn e2e_tui_multi_command_sequence() {
     assert!(pane.contains("Available commands:"));
 
     // Step 3: /model
-    let pane = session.send_text_and_wait("model", "/model", "gpt-4o-mini", COMMAND_TIMEOUT);
-    assert!(pane.contains("gpt-4o-mini"));
+    let pane = session.send_text_and_wait("model", "/model", "Select a model", COMMAND_TIMEOUT);
+    assert!(pane.contains("Select a model"));
 
     // Step 4: Exit
     session.exit_gracefully();
@@ -2838,7 +2840,7 @@ fn e2e_scenario_slash_command_workflow() {
                 .timeout_secs(15),
         )
         .step(
-            ScenarioStep::send_text("/model", "gpt-4o-mini")
+            ScenarioStep::send_text("/model", "Select a model")
                 .label("model_command")
                 .timeout_secs(10),
         )
@@ -2931,7 +2933,7 @@ fn e2e_scenario_provider_switch_missing_key() {
             .timeout_secs(12),
         )
         .step(
-            ScenarioStep::send_text("/model", "openai/gpt-4o-mini")
+            ScenarioStep::send_text("/model", "Select a model")
                 .label("post_error_model_query")
                 .timeout_secs(10),
         )

@@ -20,7 +20,10 @@ impl fmt::Debug for Socks5Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Socks5Config")
             .field("remote_dns", &self.remote_dns)
-            .field("credentials", &self.credentials.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credentials",
+                &self.credentials.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -35,7 +38,10 @@ impl Socks5Config {
         }) {
             return Err("SOCKS5 credentials must each contain 1 to 255 bytes".into());
         }
-        Ok(Self { remote_dns, credentials })
+        Ok(Self {
+            remote_dns,
+            credentials,
+        })
     }
 
     pub(super) const fn scheme(&self) -> &'static str {
@@ -56,19 +62,28 @@ pub(super) async fn connect_request(
     remote_dns: bool,
 ) -> io::Result<Vec<u8>> {
     if port == 0 || host.is_empty() || host.len() > 255 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid SOCKS5 destination"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SOCKS5 destination",
+        ));
     }
     if let Some(inner) = host.strip_prefix('[') {
         let address = inner
             .strip_suffix(']')
             .and_then(|host| host.parse::<std::net::Ipv6Addr>().ok())
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::InvalidInput, "invalid SOCKS5 destination IPv6 address",
-            ))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid SOCKS5 destination IPv6 address",
+                )
+            })?;
         return Ok(ip_request(address.into(), port));
     }
     if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid SOCKS5 destination"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SOCKS5 destination",
+        ));
     }
     if let Ok(address) = host.parse::<IpAddr>() {
         return Ok(ip_request(address, port));
@@ -81,7 +96,10 @@ pub(super) async fn connect_request(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SOCKS5 local DNS lookup failed"))?;
     let address = lookup.addresses().first().copied().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "SOCKS5 local DNS returned no addresses")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "SOCKS5 local DNS returned no addresses",
+        )
     })?;
     Ok(ip_request(address, port))
 }
@@ -108,11 +126,16 @@ fn domain_request(host: &str, port: u16) -> io::Result<Vec<u8>> {
     let length = u8::try_from(host.len())
         .ok()
         .filter(|length| *length != 0)
-        .ok_or_else(|| io::Error::new(
-            io::ErrorKind::InvalidInput, "SOCKS5 destination hostname must contain 1 to 255 bytes",
-        ))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS5 destination hostname must contain 1 to 255 bytes",
+            )
+        })?;
     if !host.is_ascii()
-        || host.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || host
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
         || host.contains(['[', ']', ':', '/', '\\', '@'])
     {
         return Err(io::Error::new(
@@ -130,6 +153,7 @@ fn domain_request(host: &str, port: u16) -> io::Result<Vec<u8>> {
 /// Negotiate on an already-connected socket. When credentials are configured
 /// only username/password is offered: a proxy cannot silently select an
 /// unauthenticated downgrade. Authentication failure sends no CONNECT request.
+#[allow(clippy::too_many_lines)] // the RFC 1928/1929 exchange, kept in wire order
 pub(super) async fn handshake<T>(
     stream: &mut T,
     config: &Socks5Config,
@@ -144,7 +168,9 @@ where
     let mut selected = [0; 2];
     stream.read_exact(&mut selected).await?;
     if selected[0] != 5 {
-        return Err(protocol_error("SOCKS5 proxy returned an invalid negotiation version"));
+        return Err(protocol_error(
+            "SOCKS5 proxy returned an invalid negotiation version",
+        ));
     }
     if selected[1] != method {
         return Err(io::Error::new(
@@ -164,10 +190,15 @@ where
         let mut reply = [0; 2];
         stream.read_exact(&mut reply).await?;
         if reply[0] != 1 {
-            return Err(protocol_error("SOCKS5 proxy returned an invalid authentication version"));
+            return Err(protocol_error(
+                "SOCKS5 proxy returned an invalid authentication version",
+            ));
         }
         if reply[1] != 0 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "SOCKS5 proxy authentication failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SOCKS5 proxy authentication failed",
+            ));
         }
     }
     stream.write_all(request).await?;
@@ -175,18 +206,41 @@ where
     let mut reply = [0; 4];
     stream.read_exact(&mut reply).await?;
     if reply[0] != 5 || reply[2] != 0 {
-        return Err(protocol_error("SOCKS5 proxy returned an invalid CONNECT reply"));
+        return Err(protocol_error(
+            "SOCKS5 proxy returned an invalid CONNECT reply",
+        ));
     }
     if reply[1] != 0 {
         let (kind, message) = match reply[1] {
-            2 => (io::ErrorKind::PermissionDenied, "SOCKS5 proxy denied the destination"),
-            3 => (io::ErrorKind::NetworkUnreachable, "SOCKS5 destination network unreachable"),
-            4 => (io::ErrorKind::HostUnreachable, "SOCKS5 destination host unreachable"),
-            5 => (io::ErrorKind::ConnectionRefused, "SOCKS5 destination refused the connection"),
+            2 => (
+                io::ErrorKind::PermissionDenied,
+                "SOCKS5 proxy denied the destination",
+            ),
+            3 => (
+                io::ErrorKind::NetworkUnreachable,
+                "SOCKS5 destination network unreachable",
+            ),
+            4 => (
+                io::ErrorKind::HostUnreachable,
+                "SOCKS5 destination host unreachable",
+            ),
+            5 => (
+                io::ErrorKind::ConnectionRefused,
+                "SOCKS5 destination refused the connection",
+            ),
             6 => (io::ErrorKind::TimedOut, "SOCKS5 destination TTL expired"),
-            7 => (io::ErrorKind::Unsupported, "SOCKS5 proxy does not support CONNECT"),
-            8 => (io::ErrorKind::Unsupported, "SOCKS5 proxy does not support the address type"),
-            _ => (io::ErrorKind::Other, "SOCKS5 proxy failed to connect to the destination"),
+            7 => (
+                io::ErrorKind::Unsupported,
+                "SOCKS5 proxy does not support CONNECT",
+            ),
+            8 => (
+                io::ErrorKind::Unsupported,
+                "SOCKS5 proxy does not support the address type",
+            ),
+            _ => (
+                io::ErrorKind::Other,
+                "SOCKS5 proxy failed to connect to the destination",
+            ),
         };
         return Err(io::Error::new(kind, message));
     }
@@ -197,11 +251,17 @@ where
             let mut length = [0; 1];
             stream.read_exact(&mut length).await?;
             if length[0] == 0 {
-                return Err(protocol_error("SOCKS5 proxy returned an empty bound hostname"));
+                return Err(protocol_error(
+                    "SOCKS5 proxy returned an empty bound hostname",
+                ));
             }
             usize::from(length[0])
         }
-        _ => return Err(protocol_error("SOCKS5 proxy returned an unknown bound address type")),
+        _ => {
+            return Err(protocol_error(
+                "SOCKS5 proxy returned an unknown bound address type",
+            ));
+        }
     };
     // At most 255 address octets plus the two-byte port. Do not read even
     // one byte beyond the reply: it belongs to the origin protocol.
@@ -289,8 +349,13 @@ mod tests {
         expected.extend_from_slice(b"unresolvable.invalid");
         expected.extend_from_slice(&[0x20, 0xfb]);
         assert_eq!(request, expected);
-        let actual = futures::executor::block_on(connect_request("unresolvable.invalid", 8443, true)).unwrap();
-        assert_eq!(actual, expected, "remote resolution never needs a local DNS query");
+        let actual =
+            futures::executor::block_on(connect_request("unresolvable.invalid", 8443, true))
+                .unwrap();
+        assert_eq!(
+            actual, expected,
+            "remote resolution never needs a local DNS query"
+        );
     }
 
     #[test]
@@ -308,7 +373,13 @@ mod tests {
     #[test]
     fn remote_names_and_ports_are_bounded_before_negotiation() {
         assert!(domain_request(&"a".repeat(255), 443).is_ok());
-        for name in ["".to_string(), "a".repeat(256), "é.example".to_string(), "a/b".to_string(), "a\0b".to_string()] {
+        for name in [
+            String::new(),
+            "a".repeat(256),
+            "é.example".to_string(),
+            "a/b".to_string(),
+            "a\0b".to_string(),
+        ] {
             assert!(domain_request(&name, 443).is_err());
         }
         assert!(futures::executor::block_on(connect_request("host", 0, true)).is_err());
@@ -337,8 +408,17 @@ mod tests {
     #[test]
     fn configured_credentials_cannot_be_downgraded_to_anonymous() {
         let mut wire = WireFixture::new(&[5, 0]);
-        assert_eq!(run_handshake(&mut wire, &authenticated()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(wire.outgoing, [5, 1, 2], "neither credentials nor CONNECT was sent");
+        assert_eq!(
+            run_handshake(&mut wire, &authenticated())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            wire.outgoing,
+            [5, 1, 2],
+            "neither credentials nor CONNECT was sent"
+        );
     }
 
     #[test]
@@ -360,7 +440,10 @@ mod tests {
         let bytes = [5, 0, 5, 0, 0, 1, 127, 0, 0, 1, 1, 187];
         for length in 0..bytes.len() {
             let mut wire = WireFixture::new(&bytes[..length]);
-            assert_eq!(run_handshake(&mut wire, &anonymous()).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(
+                run_handshake(&mut wire, &anonymous()).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
         }
     }
 
@@ -374,10 +457,18 @@ mod tests {
             vec![5, 0, 5, 0, 0, 3, 0],
         ] {
             let mut wire = WireFixture::new(&bytes);
-            assert_eq!(run_handshake(&mut wire, &anonymous()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                run_handshake(&mut wire, &anonymous()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
         let mut wire = WireFixture::new(&[5, 2, 2, 0]);
-        assert_eq!(run_handshake(&mut wire, &authenticated()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            run_handshake(&mut wire, &authenticated())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -392,7 +483,10 @@ mod tests {
             let mut wire = WireFixture::new(&bytes);
             wire.fragment = 257;
             run_handshake(&mut wire, &anonymous()).unwrap();
-            assert_eq!(wire.incoming.position(), u64::try_from(bytes.len() - 6).unwrap());
+            assert_eq!(
+                wire.incoming.position(),
+                u64::try_from(bytes.len() - 6).unwrap()
+            );
         }
     }
 
@@ -401,19 +495,32 @@ mod tests {
         for reply in 1..=255 {
             let mut wire = WireFixture::new(&[5, 0, 5, reply, 0, 1]);
             let error = run_handshake(&mut wire, &anonymous()).unwrap_err();
-            if reply == 5 { assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused); }
-            if reply == 2 { assert_eq!(error.kind(), io::ErrorKind::PermissionDenied); }
+            if reply == 5 {
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            }
+            if reply == 2 {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
             assert_eq!(wire.incoming.position(), 6);
         }
     }
 
     #[test]
     fn credential_lengths_and_debug_output_are_safe() {
-        for (username, password) in [(vec![], vec![1]), (vec![1], vec![]), (vec![1; 256], vec![2]), (vec![1], vec![2; 256])] {
+        for (username, password) in [
+            (vec![], vec![1]),
+            (vec![1], vec![]),
+            (vec![1; 256], vec![2]),
+            (vec![1], vec![2; 256]),
+        ] {
             assert!(Socks5Config::new(true, Some((username, password))).is_err());
         }
         assert!(Socks5Config::new(false, Some((vec![1; 255], vec![2; 255]))).is_ok());
-        let config = Socks5Config::new(true, Some((b"sentinel-user".to_vec(), b"sentinel-secret".to_vec()))).unwrap();
+        let config = Socks5Config::new(
+            true,
+            Some((b"sentinel-user".to_vec(), b"sentinel-secret".to_vec())),
+        )
+        .unwrap();
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("sentinel"));

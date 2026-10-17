@@ -892,11 +892,8 @@ mod tests {
             "docs:"
         );
         assert!(
-            expand_resource_uri(
-                &format!("docs:{}", "{v*}".repeat(allowed + 1)),
-                &variables
-            )
-            .is_err()
+            expand_resource_uri(&format!("docs:{}", "{v*}".repeat(allowed + 1)), &variables)
+                .is_err()
         );
     }
 
@@ -905,10 +902,7 @@ mod tests {
         let variables = vars(json!({"v":[" ".repeat(MAX_URI_BYTES / 3)]}));
         assert!(expand_resource_uri("docs:{?v*}", &variables).is_err());
         let mut values = Map::new();
-        values.insert(
-            " ".repeat(MAX_URI_BYTES / 3),
-            Value::String(String::new()),
-        );
+        values.insert(" ".repeat(MAX_URI_BYTES / 3), Value::String(String::new()));
         assert!(expand_resource_uri("docs:{?v*}", &vars(json!({"v":values}))).is_err());
         let variables = vars(json!({"v":["x".repeat(MAX_URI_BYTES / 2)]}));
         assert!(expand_resource_uri("docs:{v}{v}", &variables).is_err());

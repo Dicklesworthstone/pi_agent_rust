@@ -35,13 +35,16 @@ impl fmt::Debug for StreamRegistry {
             .debug_struct("StreamRegistry")
             .field("active", &self.active.len())
             .field("completed", &self.completed.len())
+            .field("completion_order", &self.completion_order.len())
             .finish()
     }
 }
 
 fn allocate_id(sequence: &AtomicU64) -> Result<String> {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
         .map_err(|_| {
             Error::extension("PI_NATIVE_STREAM_LIMIT: native stream identity space exhausted")
         })?;
@@ -57,7 +60,13 @@ impl StreamRegistry {
             ));
         }
         let id = allocate_id(&NEXT_STREAM_ID)?;
-        self.active.insert(id.clone(), Cursor { chunks, next_index: 0 });
+        self.active.insert(
+            id.clone(),
+            Cursor {
+                chunks,
+                next_index: 0,
+            },
+        );
         Ok(id)
     }
 
@@ -176,7 +185,13 @@ mod tests {
         let ids = (0..MAX_ACTIVE_STREAMS)
             .map(|_| registry.start(chunks()).unwrap())
             .collect::<Vec<_>>();
-        assert!(registry.start(chunks()).unwrap_err().to_string().contains("PI_NATIVE_STREAM_LIMIT"));
+        assert!(
+            registry
+                .start(chunks())
+                .unwrap_err()
+                .to_string()
+                .contains("PI_NATIVE_STREAM_LIMIT")
+        );
         for id in &ids {
             assert_eq!(registry.next(id).unwrap(), Some(json!("first")));
         }
@@ -203,7 +218,10 @@ mod tests {
     #[test]
     fn identity_exhaustion_is_an_error_instead_of_aliasing_the_last_stream() {
         let sequence = AtomicU64::new(u64::MAX - 1);
-        assert_eq!(allocate_id(&sequence).unwrap(), format!("native-stream-{}", u64::MAX));
+        assert_eq!(
+            allocate_id(&sequence).unwrap(),
+            format!("native-stream-{}", u64::MAX)
+        );
         assert!(allocate_id(&sequence).is_err());
         assert!(allocate_id(&sequence).is_err());
         assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
@@ -232,24 +250,45 @@ mod tests {
             NativeRustLoadedExtension,
         };
         let runtime = NativeRustExtensionRuntimeHandle::start().await.unwrap();
-        runtime.state.write().unwrap().load_extensions(vec![NativeRustLoadedExtension {
-            snapshot: JsExtensionSnapshot {
-                id: "fixture".into(), name: "Fixture".into(), version: "1".into(),
-                api_version: "1".into(), tools: Vec::new(), slash_commands: Vec::new(),
-                shortcuts: Vec::new(), providers: Vec::new(), mcp_servers: Vec::new(),
-                flags: Vec::new(), event_hooks: Vec::new(), active_tools: None,
-            },
-            event_responses: HashMap::new(), tool_outputs: HashMap::new(),
-            command_outputs: HashMap::new(), shortcut_outputs: HashMap::new(),
-            provider_streams: HashMap::from([("fixture".to_string(), chunks)]),
-        }]);
+        runtime
+            .state
+            .write()
+            .unwrap()
+            .load_extensions(vec![NativeRustLoadedExtension {
+                snapshot: JsExtensionSnapshot {
+                    id: "fixture".into(),
+                    name: "Fixture".into(),
+                    version: "1".into(),
+                    api_version: "1".into(),
+                    tools: Vec::new(),
+                    slash_commands: Vec::new(),
+                    shortcuts: Vec::new(),
+                    providers: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    flags: Vec::new(),
+                    event_hooks: Vec::new(),
+                    active_tools: None,
+                },
+                event_responses: HashMap::new(),
+                tool_outputs: HashMap::new(),
+                command_outputs: HashMap::new(),
+                shortcut_outputs: HashMap::new(),
+                provider_streams: HashMap::from([("fixture".to_string(), chunks)]),
+            }]);
         ExtensionRuntimeHandle::NativeRust(runtime)
     }
 
     async fn start(runtime: &super::super::ExtensionRuntimeHandle) -> String {
-        runtime.provider_stream_simple_start(
-            "fixture".into(), Value::Null, Value::Null, Value::Null, 1000,
-        ).await.unwrap()
+        runtime
+            .provider_stream_simple_start(
+                "fixture".into(),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                1000,
+            )
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -257,12 +296,29 @@ mod tests {
         futures::executor::block_on(async {
             let runtime = runtime(chunks()).await;
             let old = start(&runtime).await;
-            assert_eq!(runtime.provider_stream_simple_next(old.clone(), 1000).await.unwrap(), Some(json!("first")));
+            assert_eq!(
+                runtime
+                    .provider_stream_simple_next(old.clone(), 1000)
+                    .await
+                    .unwrap(),
+                Some(json!("first"))
+            );
             runtime.reset_transient_state().await.unwrap();
             let new = start(&runtime).await;
             runtime.provider_stream_simple_cancel_best_effort(old.clone());
-            assert!(runtime.provider_stream_simple_next(old, 1000).await.is_err());
-            assert_eq!(runtime.provider_stream_simple_next(new, 1000).await.unwrap(), Some(json!("first")));
+            assert!(
+                runtime
+                    .provider_stream_simple_next(old, 1000)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                runtime
+                    .provider_stream_simple_next(new, 1000)
+                    .await
+                    .unwrap(),
+                Some(json!("first"))
+            );
         });
     }
 
@@ -271,18 +327,36 @@ mod tests {
         futures::executor::block_on(async {
             let runtime = runtime(chunks()).await;
             let old = start(&runtime).await;
-            let super::super::ExtensionRuntimeHandle::NativeRust(native) = &runtime else { unreachable!() };
+            let super::super::ExtensionRuntimeHandle::NativeRust(native) = &runtime else {
+                unreachable!()
+            };
             {
                 let mut state = native.state.write().unwrap();
                 let mut replacement = state.extensions.clone();
-                replacement[0].provider_streams.insert("fixture".into(), vec![json!("new")].into());
+                replacement[0]
+                    .provider_streams
+                    .insert("fixture".into(), vec![json!("new")].into());
                 state.load_extensions(replacement);
             }
             let new = start(&runtime).await;
             assert_ne!(old, new);
-            runtime.provider_stream_simple_cancel(old.clone(), 1000).await.unwrap();
-            assert!(runtime.provider_stream_simple_next(old, 1000).await.is_err());
-            assert_eq!(runtime.provider_stream_simple_next(new, 1000).await.unwrap(), Some(json!("new")));
+            runtime
+                .provider_stream_simple_cancel(old.clone(), 1000)
+                .await
+                .unwrap();
+            assert!(
+                runtime
+                    .provider_stream_simple_next(old, 1000)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                runtime
+                    .provider_stream_simple_next(new, 1000)
+                    .await
+                    .unwrap(),
+                Some(json!("new"))
+            );
         });
     }
 
@@ -291,13 +365,34 @@ mod tests {
         futures::executor::block_on(async {
             let runtime = runtime(vec![json!("partial")].into()).await;
             let id = start(&runtime).await;
-            runtime.provider_stream_simple_next(id.clone(), 1000).await.unwrap();
-            runtime.provider_stream_simple_cancel(id.clone(), 1000).await.unwrap();
+            runtime
+                .provider_stream_simple_next(id.clone(), 1000)
+                .await
+                .unwrap();
+            runtime
+                .provider_stream_simple_cancel(id.clone(), 1000)
+                .await
+                .unwrap();
             assert!(runtime.provider_stream_simple_next(id, 1000).await.is_err());
             let completed = start(&runtime).await;
-            runtime.provider_stream_simple_next(completed.clone(), 1000).await.unwrap();
-            assert!(runtime.provider_stream_simple_next(completed.clone(), 1000).await.unwrap().is_none());
-            assert!(runtime.provider_stream_simple_next(completed, 1000).await.unwrap().is_none());
+            runtime
+                .provider_stream_simple_next(completed.clone(), 1000)
+                .await
+                .unwrap();
+            assert!(
+                runtime
+                    .provider_stream_simple_next(completed.clone(), 1000)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                runtime
+                    .provider_stream_simple_next(completed, 1000)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 }
