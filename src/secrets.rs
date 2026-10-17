@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Result};
 
 mod structured;
+pub(crate) use structured::discover_outbound_json;
 pub use structured::transform_outbound_json;
 
 /// Tool-result schema tag for secrets operations.
@@ -106,7 +107,9 @@ fn dotted_without_digit(value: &str) -> bool {
 /// match cannot expose the tail of a longer credential. The first rule in a
 /// merged region supplies its diagnostic label; rule order breaks start ties.
 /// v4 recognizes quoted assignment keys in JSON/configuration text too.
-pub const SECRETS_RULESET_VERSION: u32 = 4;
+/// v5 no longer matches `sk-` keys directly after a letter, so identifiers
+/// such as `task-management-service` are not credentials.
+pub const SECRETS_RULESET_VERSION: u32 = 5;
 
 /// Token body: `min` or more characters from `class`, with single dots
 /// permitted between characters, ending on a `tail_class` character (the
@@ -123,17 +126,23 @@ fn rules() -> &'static Vec<Rule> {
         const TOKEN: &str = r"A-Za-z0-9_\-";
         const ALNUM: &str = "A-Za-z0-9";
         let sk_body = dotted_body(TOKEN, ALNUM, 16);
+        // Not directly after a letter: identifiers such as
+        // `task-management-service` or an MCP tool `mcp__task-master-ai__x`
+        // contain `sk-` mid-word. Group 1 is the key, so `_sk-`, `2sk-` and
+        // percent-encoded `%22sk-` are still found (`\b` would miss them).
         vec![
             // Before `openai-key`: same prefix, tighter shape.
             Rule {
                 name: "anthropic-key",
-                regex: regex::Regex::new(&format!(r"sk-ant-{sk_body}")).expect("rule"),
+                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-ant-{sk_body})"))
+                    .expect("rule"),
                 label: "anthropic_key",
                 reject: None,
             },
             Rule {
                 name: "openai-key",
-                regex: regex::Regex::new(&format!(r"sk-{sk_body}")).expect("rule"),
+                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-{sk_body})"))
+                    .expect("rule"),
                 label: "openai_key",
                 reject: None,
             },
@@ -240,9 +249,7 @@ pub fn scan(text: &str, extra_patterns: &[regex::Regex]) -> Vec<Detection> {
             // Group 1 isolates the value in KEY=value assignments. Keep the
             // assignment key outside the vault so inbound restores remain values.
             let m = caps.get(1).or_else(|| caps.get(0)).expect("match group 0");
-            if m.start() < covered_until
-                || rule.reject.is_some_and(|reject| reject(m.as_str()))
-            {
+            if m.start() < covered_until || rule.reject.is_some_and(|reject| reject(m.as_str())) {
                 continue;
             }
             let end = if rule.name == "private-key" {
@@ -285,9 +292,9 @@ fn private_key_end(text: &str, start: usize, header_end: usize) -> usize {
     const DASHES: &str = "-----";
     let label = &text[start + BEGIN.len()..header_end - DASHES.len()];
     let footer = format!("-----END {label}-----");
-    text[header_end..].find(&footer).map_or(text.len(), |offset| {
-        header_end + offset + footer.len()
-    })
+    text[header_end..]
+        .find(&footer)
+        .map_or(text.len(), |offset| header_end + offset + footer.len())
 }
 
 fn merge_detections(mut detections: Vec<Detection>) -> Vec<Detection> {
@@ -433,9 +440,7 @@ impl SecretVault {
         let mut replacements: MaskReplacements<'_> = self
             .by_value
             .iter()
-            .map(|(value, placeholder)| {
-                (Cow::Borrowed(value.as_str()), placeholder.as_str())
-            })
+            .map(|(value, placeholder)| (Cow::Borrowed(value.as_str()), placeholder.as_str()))
             .collect();
         for (value, placeholder) in &self.by_value {
             // JSON string serialization cannot fail. Retain only the string
@@ -455,7 +460,7 @@ impl SecretVault {
         let protected = self.protected_placeholders(text);
         let detections = merge_detections(literal_detections(
             text,
-            replacements.keys().map(|value| value.as_ref()),
+            replacements.keys().map(AsRef::as_ref),
             &protected,
         ));
         let mut out = String::with_capacity(text.len());
@@ -508,12 +513,11 @@ impl SecretVault {
                 // A remembered numeric token may be echoed as a JSON number.
                 // Preserve nonsecret primitives; secret ones become strings
                 // holding placeholders rather than disclosing their value.
-                if let Some(placeholder) = self.by_value.get(&other.to_string()) {
-                    *other = serde_json::Value::String(placeholder.clone());
-                    true
-                } else {
-                    false
-                }
+                let Some(placeholder) = self.by_value.get(&other.to_string()) else {
+                    return false;
+                };
+                *other = serde_json::Value::String(placeholder.clone());
+                true
             }
         }
     }
@@ -536,21 +540,15 @@ impl SecretVault {
         Some(serde_json::to_string(&value).expect("serialize masked JSON value"))
     }
 
-    fn mask_json_lines(
-        &self,
-        text: &str,
-        replacements: &MaskReplacements<'_>,
-    ) -> Option<String> {
+    fn mask_json_lines(&self, text: &str, replacements: &MaskReplacements<'_>) -> Option<String> {
         let mut output = String::with_capacity(text.len());
         let mut saw_document = false;
         for line in text.split_inclusive('\n') {
-            let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
-                (body, "\r\n")
-            } else if let Some(body) = line.strip_suffix('\n') {
-                (body, "\n")
-            } else {
-                (line, "")
-            };
+            let (body, ending) = line
+                .strip_suffix("\r\n")
+                .map(|body| (body, "\r\n"))
+                .or_else(|| line.strip_suffix('\n').map(|body| (body, "\n")))
+                .unwrap_or((line, ""));
             if body.trim().is_empty() {
                 output.push_str(line);
                 continue;
@@ -608,6 +606,7 @@ pub struct TransformAudit {
 }
 
 /// Replace newly detected AND remembered values with stable placeholders.
+///
 /// Learn detections first so a bare echo earlier in the same text is protected
 /// too. Remembered values remain protected after their assignment/type hint
 /// disappears from later context, including after compaction.
@@ -618,9 +617,7 @@ pub fn obfuscate(
 ) -> (String, TransformAudit) {
     let protected = vault.protected_placeholders(text);
     let mut detections = scan(text, extra_patterns);
-    detections.retain(|detection| {
-        !inside_placeholder(detection.start, detection.end, &protected)
-    });
+    detections.retain(|detection| !inside_placeholder(detection.start, detection.end, &protected));
     for detection in &detections {
         let _ = vault.placeholder_for(&text[detection.start..detection.end], detection.label);
     }
@@ -712,6 +709,35 @@ mod tests {
         assert!(!contains_secret("let timeout = 30;", &[]));
         assert!(!contains_secret("use std::collections::HashMap;", &[]));
         assert!(!contains_secret("const MAX: usize = 1024;", &[]));
+    }
+
+    #[test]
+    fn sk_rules_do_not_match_inside_identifiers() {
+        // Regression: `sk-` matched mid-word, so a model's own
+        // `mkdir task-management-service` wedged signed replay and an MCP
+        // server key such as `task-master-ai` was refused on every request.
+        for clean in [
+            "mkdir task-management-service",
+            "mcp__task-master-ai__get_tasks",
+            "cd risk-assessment-pipeline-v2",
+            "disk-ant-performance-tuning-guide",
+        ] {
+            assert!(!contains_secret(clean, &[]), "{clean}");
+        }
+        for key in [
+            "OPENAI_API_KEY=sk-proj-0123456789abcdefghij",
+            "\"sk-ant-api03-aaaaaaaaaaaaaaaaaaaa\"",
+            "Authorization: Bearer sk-0123456789abcdefghijklmn",
+            "Bearer%20sk-0123456789abcdefghijklmn",
+            "OPENAI_KEY_sk-0123456789abcdefghijklmn",
+            "sk-0123456789abcdefghijklmn",
+        ] {
+            assert!(contains_secret(key, &[]), "{key}");
+        }
+        // The key alone is the detection, never the character before it.
+        let detections = scan("token:sk-0123456789abcdefghijklmn", &[]);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].start, "token:".len());
     }
 
     #[test]
@@ -983,11 +1009,11 @@ mod tests {
             "",
             "\n-----END PUBLIC KEY-----\nMORE-PRIVATE-MATERIAL",
             "\n-----END EC PRIVATE KEY-----\nMORE-PRIVATE-MATERIAL",
-            "\n-----BEGIN PRIVATE KEY-----\nNESTED-PRIVATE-MATERIAL",
+            concat!("\n-----BEGIN ", "PRIVATE KEY-----\nNESTED-PRIVATE-MATERIAL"),
         ] {
-            let input = format!(
-                "safe prefix\n-----BEGIN RSA PRIVATE KEY-----\nPRIVATE-BODY{suffix}"
-            );
+            // Fragmented so the repository self-scan never sees a literal header.
+            let header = concat!("-----BEGIN ", "RSA PRIVATE KEY-----");
+            let input = format!("safe prefix\n{header}\nPRIVATE-BODY{suffix}");
             let hits = scan(&input, &[]);
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].end, input.len());
@@ -1000,8 +1026,14 @@ mod tests {
 
     #[test]
     fn separate_pem_blocks_do_not_swallow_intervening_safe_text() {
-        let first = "-----BEGIN PRIVATE KEY-----\nFIRST-BODY\n-----END PRIVATE KEY-----";
-        let second = "-----BEGIN EC PRIVATE KEY-----\nSECOND-BODY\n-----END EC PRIVATE KEY-----";
+        let first = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nFIRST-BODY\n-----END PRIVATE KEY-----"
+        );
+        let second = concat!(
+            "-----BEGIN ",
+            "EC PRIVATE KEY-----\nSECOND-BODY\n-----END EC PRIVATE KEY-----"
+        );
         let input = format!("{first}\nsafe separator\n{second}\nsafe tail");
         let mut vault = SecretVault::default();
         let (masked, audit) = obfuscate(&input, &mut vault, &[]);
@@ -1040,8 +1072,8 @@ mod tests {
 
     #[test]
     fn same_start_short_matches_cannot_hide_longer_or_adjacent_matches() {
-        let patterns = ["abc", "abcdef", "bcde", "XYZ"]
-            .map(|pattern| regex::Regex::new(pattern).unwrap());
+        let patterns =
+            ["abc", "abcdef", "bcde", "XYZ"].map(|pattern| regex::Regex::new(pattern).unwrap());
         let input = "α abcdefXYZ ω";
         let hits = scan(input, &patterns);
         assert_eq!(hits.len(), 2);
@@ -1055,8 +1087,8 @@ mod tests {
 
     #[test]
     fn zero_width_user_matches_are_not_credentials() {
-        let patterns = ["", "^", "$", "SENSITIVE"]
-            .map(|pattern| regex::Regex::new(pattern).unwrap());
+        let patterns =
+            ["", "^", "$", "SENSITIVE"].map(|pattern| regex::Regex::new(pattern).unwrap());
         assert!(scan("", &patterns).is_empty());
         assert!(scan("ordinary text", &patterns).is_empty());
         assert!(gate_outbound("ordinary text", SecretsMode::Block, &patterns).is_ok());
@@ -1069,7 +1101,9 @@ mod tests {
     #[test]
     fn quoted_configuration_keys_vault_only_the_credential_value() {
         let secret = "hunter2hunter2hunter2";
-        for key in ["apiKey", "API_KEY", "secret", "token", "password", "passwd", "pwd"] {
+        for key in [
+            "apiKey", "API_KEY", "secret", "token", "password", "passwd", "pwd",
+        ] {
             for quote in ["\"", "'", ""] {
                 let input = format!("{quote}{key}{quote}: \"{secret}\"");
                 let hits = scan(&input, &[]);
@@ -1077,7 +1111,10 @@ mod tests {
                 assert_eq!(&input[hits[0].start..hits[0].end], secret);
                 let mut vault = SecretVault::default();
                 let (masked, _) = obfuscate(&input, &mut vault, &[]);
-                assert_eq!(masked, format!("{quote}{key}{quote}: \"<pi-secret:000001>\""));
+                assert_eq!(
+                    masked,
+                    format!("{quote}{key}{quote}: \"<pi-secret:000001>\"")
+                );
                 assert_eq!(vault.restore(&masked), input);
             }
         }
@@ -1169,7 +1206,7 @@ mod tests {
         let placeholder = vault.placeholder_for(secret, "user");
         let numeric = vault.placeholder_for("1234567890123456", "user");
         let first = serde_json::json!({"content": secret, "safe": true}).to_string();
-        let second = serde_json::json!({"token": 1234567890123456_u64, "safe": 7}).to_string();
+        let second = serde_json::json!({"token": 1_234_567_890_123_456_u64, "safe": 7}).to_string();
         let input = format!("{first}\r\n\r\n{second}\n");
         let masked = vault.mask(&input);
         assert!(masked.contains("\r\n\r\n"));
@@ -1192,8 +1229,14 @@ mod tests {
         let secret = "α secret\nβ secret";
         let placeholder = vault.placeholder_for(secret, "user");
         let encoded = serde_json::to_string(secret).unwrap();
-        assert_eq!(vault.mask(&format!("log={encoded}")), format!("log=\"{placeholder}\""));
-        assert_eq!(vault.mask(&format!("before\n{secret}\nafter")), format!("before\n{placeholder}\nafter"));
+        assert_eq!(
+            vault.mask(&format!("log={encoded}")),
+            format!("log=\"{placeholder}\"")
+        );
+        assert_eq!(
+            vault.mask(&format!("before\n{secret}\nafter")),
+            format!("before\n{placeholder}\nafter")
+        );
     }
 
     #[test]
@@ -1201,7 +1244,10 @@ mod tests {
         let mut vault = SecretVault::default();
         let _ = vault.placeholder_for("abcdef", "user");
         let _ = vault.placeholder_for("defghi", "user");
-        assert_eq!(vault.mask("safe abcdefghi safe"), format!("safe {OVERLAP_REDACTION} safe"));
+        assert_eq!(
+            vault.mask("safe abcdefghi safe"),
+            format!("safe {OVERLAP_REDACTION} safe")
+        );
         let (masked, audit) = obfuscate("safe abcdefghi safe", &mut vault, &[]);
         assert_eq!(masked, "safe <pi-secret:000003> safe");
         assert_eq!(audit.detections, 1);

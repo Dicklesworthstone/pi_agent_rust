@@ -25488,10 +25488,11 @@ mod tests {
             17_837,
             "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
         ),
+        // Re-pinned for 99c07f823 (gh #178): compact() rejects a pre-aborted signal.
         (
             "@mariozechner/pi-coding-agent",
-            27_280,
-            "61463384323e22fac7f3a736c03346cbc177c70177f131190688c8a65773ce65",
+            27_870,
+            "cec3aa92f03004f4e4ed5ddcecaec0da0061dc53569214a5f15d8f9c28a03f48",
         ),
         (
             "@mariozechner/pi-tui",

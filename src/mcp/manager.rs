@@ -1186,8 +1186,11 @@ impl McpManager {
                         format!("server {:?} is http-shaped but has no url", config.name),
                     )
                 })?;
-                let headers =
-                    resolve_secrets(&config.headers, super::config::validate_http_header_value)?;
+                let headers = resolve_server_secrets(
+                    &config.headers,
+                    config.provenance,
+                    super::config::validate_http_header_value,
+                )?;
                 ensure_active()?;
                 return Ok(
                     Box::new(super::transport::HttpTransport::new(&url, headers)?)
@@ -1200,7 +1203,11 @@ impl McpManager {
                     format!("server {:?} has no command or url", config.name),
                 )
             })?;
-            let env = resolve_secrets(&config.env, super::config::validate_env_value)?;
+            let env = resolve_server_secrets(
+                &config.env,
+                config.provenance,
+                super::config::validate_env_value,
+            )?;
             ensure_active()?;
             let transport =
                 super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
@@ -1687,6 +1694,51 @@ fn is_indeterminate_call_delivery(err: &Error) -> bool {
                     .iter()
                     .any(|prefix| message.starts_with(prefix))
     )
+}
+
+/// ACP values are already literal values, not pi's configuration language.
+/// Keep this decision at the actual transport-construction seam: a literal
+/// `$CMD:` header must not gain process-execution semantics after trust.
+fn resolve_server_secrets(
+    entries: &[(String, String)],
+    provenance: Provenance,
+    validate_value: fn(&str) -> std::result::Result<(), String>,
+) -> Result<Vec<(String, String)>> {
+    if provenance != Provenance::Acp {
+        return resolve_secrets(entries, validate_value);
+    }
+    entries
+        .iter()
+        .map(|(name, value)| {
+            validate_value(value).map_err(|_| {
+                tool_err("MCP_CONFIG_INVALID", "invalid literal ACP env/header value")
+            })?;
+            Ok((name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod acp_literal_tests {
+    use super::*;
+
+    #[test]
+    fn acp_transport_construction_never_resolves_references_or_trims_literals() {
+        let entries = vec![
+            ("A".to_string(), "$ENV:PI_ACP_SHOULD_NOT_RESOLVE".to_string()),
+            ("B".to_string(), "$CMD:exit 97".to_string()),
+            ("C".to_string(), "  literal spaces  ".to_string()),
+        ];
+        let resolved = resolve_server_secrets(
+            &entries, Provenance::Acp, super::super::config::validate_env_value,
+        ).expect("literal ACP values");
+        assert_eq!(resolved, entries);
+        assert!(resolve_server_secrets(
+            &[("TOKEN".into(), "bad\r\nvalue".into())],
+            Provenance::Acp,
+            super::super::config::validate_http_header_value,
+        ).is_err());
+    }
 }
 
 /// Resolve `$ENV:`/`$CMD:` secret references in env/header values.

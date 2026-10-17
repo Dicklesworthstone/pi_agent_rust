@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+mod frame_input;
 pub(super) mod upload;
 
 const ELEMENT_FUNCTION: &str = include_str!("dom.js");
@@ -29,11 +30,10 @@ pub(super) struct References {
 }
 
 async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
-    let tree = cdp.command(owner, "Page.getFrameTree", json!({})).await?;
-    let frame = &tree["frameTree"]["frame"];
+    let frame = cdp.frame_document(owner).await?;
     Ok(Document {
-        frame: required(frame, "id")?.into(),
-        loader: required(frame, "loaderId")?.into(),
+        frame: required(&frame, "id")?.into(),
+        loader: required(&frame, "loaderId")?.into(),
     })
 }
 
@@ -182,7 +182,15 @@ pub(super) async fn snapshot(
         elements,
         summary: summary.clone(),
     };
-    let mut details = json!({"snapshot": snapshot, "truncated": truncated, "backend": "cdp", "reference_scope": "main-frame document"});
+    let reference_scope = if cdp.frame_selected() {
+        "selected-frame document"
+    } else {
+        "main-frame document"
+    };
+    let mut details = json!({
+        "snapshot": snapshot, "truncated": truncated, "backend": "cdp",
+        "reference_scope": reference_scope, "frame_id": doc.frame,
+    });
     if include_tree {
         // Return the actual accessibility tree, bounded independently of the
         // compact element inventory. Values are omitted for the same reason above.
@@ -221,6 +229,9 @@ async fn resolve(
                 "unknown or expired element reference; take a new snapshot",
             )
         });
+    }
+    if cdp.frame_selected() {
+        return frame_input::resolve(owner, cdp, selector).await;
     }
     let root = cdp
         .command(owner, "DOM.getDocument", json!({"depth": 0}))
@@ -268,6 +279,12 @@ async fn element_call(
     let context = world["executionContextId"]
         .as_u64()
         .ok_or_else(|| Error::tool("browser", "isolated world has no execution context"))?;
+    if cdp.frame_selected() && document(owner, cdp).await? != doc {
+        return Err(Error::tool(
+            "browser",
+            "selected frame navigated before element access",
+        ));
+    }
     let resolved = cdp
         .command(
             owner,
@@ -307,12 +324,24 @@ pub(super) async fn execute(
     args: &Value,
 ) -> Result<ToolOutput> {
     let action = required(args, "action")?;
+    let scoped = cdp.frame_selected();
+    if scoped && matches!(action, "press" | "type" | "fill") {
+        cdp.command(owner, "Page.bringToFront", json!({})).await?;
+    }
     if action == "press" {
         if let Some(selector) = args.get("selector").and_then(Value::as_str) {
             let id = resolve(owner, cdp, selector, refs)
                 .await?
                 .ok_or_else(|| Error::tool("browser", "selector did not match an element"))?;
             element_call(owner, cdp, id, "focus", json!({})).await?;
+            if scoped {
+                frame_input::ensure_focus(owner, cdp, id).await?;
+            }
+        } else if scoped {
+            return Err(Error::tool(
+                "browser",
+                "frame-scoped keypress requires a selector",
+            ));
         }
         let key = required(args, "key")?;
         press(owner, cdp, key).await?;
@@ -324,6 +353,31 @@ pub(super) async fn execute(
     if action == "scroll" {
         let x = delta(args, "delta_x", 0.0)?;
         let y = delta(args, "delta_y", 600.0)?;
+        if scoped {
+            let selector = required(args, "selector")?;
+            let id = resolve(owner, cdp, selector, refs)
+                .await?
+                .ok_or_else(|| Error::tool("browser", "selector did not match an element"))?;
+            cdp.command(
+                owner,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"backendNodeId": id}),
+            )
+            .await?;
+            let (point_x, point_y) = frame_input::click_point(owner, cdp, id).await?;
+            cdp.command(
+                owner,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel", "x": point_x, "y": point_y, "deltaX": x, "deltaY": y,
+                }),
+            )
+            .await?;
+            return Ok(output(
+                format!("Scrolled over {selector} in the selected frame of tab {tab}"),
+                json!({"action": action, "tab": tab, "selector": selector, "delta_x": x, "delta_y": y, "backend": "cdp"}),
+            ));
+        }
         let metrics = cdp
             .command(owner, "Page.getLayoutMetrics", json!({}))
             .await?;
@@ -370,15 +424,25 @@ pub(super) async fn execute(
     .await?;
     match action {
         "click" => {
-            let point = element_call(owner, cdp, id, "point", json!({})).await?;
-            let x = point["x"]
-                .as_f64()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| Error::tool("browser", "element has no clickable x coordinate"))?;
-            let y = point["y"]
-                .as_f64()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| Error::tool("browser", "element has no clickable y coordinate"))?;
+            let (x, y) = if scoped {
+                let (x, y) = frame_input::click_point(owner, cdp, id).await?;
+                (f64::from(x), f64::from(y))
+            } else {
+                let point = element_call(owner, cdp, id, "point", json!({})).await?;
+                let x = point["x"]
+                    .as_f64()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| {
+                        Error::tool("browser", "element has no clickable x coordinate")
+                    })?;
+                let y = point["y"]
+                    .as_f64()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| {
+                        Error::tool("browser", "element has no clickable y coordinate")
+                    })?;
+                (x, y)
+            };
             for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
                 cdp.command(owner, "Input.dispatchMouseEvent", json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1})).await?;
             }
@@ -390,11 +454,17 @@ pub(super) async fn execute(
         "type" | "fill" => {
             let text = required(args, "text")?;
             element_call(owner, cdp, id, "edit", json!({"replace": action == "fill"})).await?;
+            if scoped {
+                frame_input::ensure_focus(owner, cdp, id).await?;
+            }
             if text.is_empty() && action == "fill" {
                 press(owner, cdp, "Backspace").await?;
             } else if !text.is_empty() {
                 cdp.command(owner, "Input.insertText", json!({"text": text}))
                     .await?;
+            }
+            if scoped {
+                document(owner, cdp).await?;
             }
             if action == "fill"
                 && element_call(owner, cdp, id, "verify_fill", json!({"text": text})).await? != true

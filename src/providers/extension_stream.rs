@@ -50,7 +50,9 @@ fn protocol(message: &'static str) -> Error {
 }
 
 fn limit() -> Error {
-    Error::extension("PI_EXTENSION_STREAM_LIMIT: extension provider stream exceeds its event, text, or message-shape limit")
+    Error::extension(
+        "PI_EXTENSION_STREAM_LIMIT: extension provider stream exceeds its event, text, or message-shape limit",
+    )
 }
 
 struct ByteBudget(usize);
@@ -136,7 +138,9 @@ impl Decoder {
         }
         if let Value::String(chunk) = value {
             if self.mode == Mode::Events {
-                return Err(protocol("structured events and raw text chunks cannot be mixed"));
+                return Err(protocol(
+                    "structured events and raw text chunks cannot be mixed",
+                ));
             }
             self.charge_delta(chunk.len())?;
             let first = self.mode == Mode::Undetermined;
@@ -146,19 +150,29 @@ impl Decoder {
             if first {
                 events.push(StreamEvent::Start {
                     partial: ExtensionStreamSimpleProvider::make_partial(
-                        &self.model, &self.provider, &self.api, "",
+                        &self.model,
+                        &self.provider,
+                        &self.api,
+                        "",
                     ),
                 });
                 events.push(StreamEvent::TextStart { content_index: 0 });
             }
-            events.push(StreamEvent::TextDelta { content_index: 0, delta: chunk });
+            events.push(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: chunk,
+            });
             return Ok(events);
         }
         if self.mode == Mode::Text {
-            return Err(protocol("raw text chunks and structured events cannot be mixed"));
+            return Err(protocol(
+                "raw text chunks and structured events cannot be mixed",
+            ));
         }
         if !value.is_object() {
-            return Err(protocol("expected a text chunk or structured assistant event"));
+            return Err(protocol(
+                "expected a text chunk or structured assistant event",
+            ));
         }
         let mut remaining = MAX_EVENT_NODES;
         admit_shape(&value, MAX_EVENT_DEPTH, &mut remaining)?;
@@ -176,14 +190,29 @@ impl Decoder {
         match &event {
             AssistantMessageEvent::TextDelta { delta, .. }
             | AssistantMessageEvent::ThinkingDelta { delta, .. }
-            | AssistantMessageEvent::ToolCallDelta { delta, .. } => self.charge_delta(delta.len())?,
+            | AssistantMessageEvent::ToolCallDelta { delta, .. } => {
+                self.charge_delta(delta.len())?;
+            }
             _ => {}
         }
         let terminal = matches!(
             event,
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
         );
-        let output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        let mut output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        // Some OpenAI-compatible backends finish complete tool calls with
+        // `stop`. Only normalize after validating the terminal message, so a
+        // failed, inconsistent or malformed call cannot become executable.
+        if let StreamEvent::Done { reason, message } = &mut output
+            && *reason == StopReason::Stop
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            *reason = StopReason::ToolUse;
+            message.stop_reason = StopReason::ToolUse;
+        }
         if terminal {
             self.mode = Mode::Finished;
         }
@@ -202,54 +231,100 @@ impl Decoder {
         }
         let text = std::mem::take(&mut self.text);
         let message = ExtensionStreamSimpleProvider::make_partial(
-            &self.model, &self.provider, &self.api, &text,
+            &self.model,
+            &self.provider,
+            &self.api,
+            &text,
         );
         Ok(vec![
-            StreamEvent::TextEnd { content_index: 0, content: text },
-            StreamEvent::Done { reason: StopReason::Stop, message },
+            StreamEvent::TextEnd {
+                content_index: 0,
+                content: text,
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            },
         ])
     }
 }
 
+#[allow(clippy::too_many_lines)] // one match over every event shape
 fn validate_event(event: &AssistantMessageEvent) -> Result<()> {
     let (message, indexed) = match event {
         AssistantMessageEvent::Start { partial } => (partial, None),
-        AssistantMessageEvent::TextStart { content_index, partial }
-        | AssistantMessageEvent::TextDelta { content_index, partial, .. }
-        | AssistantMessageEvent::TextEnd { content_index, partial, .. } => {
-            (partial, Some((*content_index, "text")))
+        AssistantMessageEvent::TextStart {
+            content_index,
+            partial,
         }
-        AssistantMessageEvent::ThinkingStart { content_index, partial }
-        | AssistantMessageEvent::ThinkingDelta { content_index, partial, .. }
-        | AssistantMessageEvent::ThinkingEnd { content_index, partial, .. } => {
-            (partial, Some((*content_index, "thinking")))
+        | AssistantMessageEvent::TextDelta {
+            content_index,
+            partial,
+            ..
         }
-        AssistantMessageEvent::ToolCallStart { content_index, partial }
-        | AssistantMessageEvent::ToolCallDelta { content_index, partial, .. }
-        | AssistantMessageEvent::ToolCallEnd { content_index, partial, .. } => {
-            (partial, Some((*content_index, "toolCall")))
+        | AssistantMessageEvent::TextEnd {
+            content_index,
+            partial,
+            ..
+        } => (partial, Some((*content_index, "text"))),
+        AssistantMessageEvent::ThinkingStart {
+            content_index,
+            partial,
         }
+        | AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            partial,
+            ..
+        }
+        | AssistantMessageEvent::ThinkingEnd {
+            content_index,
+            partial,
+            ..
+        } => (partial, Some((*content_index, "thinking"))),
+        AssistantMessageEvent::ToolCallStart {
+            content_index,
+            partial,
+        }
+        | AssistantMessageEvent::ToolCallDelta {
+            content_index,
+            partial,
+            ..
+        }
+        | AssistantMessageEvent::ToolCallEnd {
+            content_index,
+            partial,
+            ..
+        } => (partial, Some((*content_index, "toolCall"))),
         AssistantMessageEvent::Done { reason, message } => {
             if *reason != message.stop_reason
                 || matches!(reason, StopReason::Error | StopReason::Aborted)
                 || message.error_message.is_some()
             {
-                return Err(protocol("done event carries a failed or inconsistent terminal message"));
+                return Err(protocol(
+                    "done event carries a failed or inconsistent terminal message",
+                ));
             }
             let mut ids = HashSet::new();
             for block in &message.content {
                 if let ContentBlock::ToolCall(call) = block {
                     // PauseTurn is a server-tool continuation, not local tool
                     // authorization. Preserve its payload for verbatim replay.
-                    if !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn) {
-                        return Err(protocol("tool calls require an explicit tool-use or paused-turn terminal reason"));
+                    if !matches!(
+                        reason,
+                        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn
+                    ) {
+                        return Err(protocol(
+                            "tool calls require a successful stop, tool-use or paused-turn terminal reason",
+                        ));
                     }
                     if call.id.trim().is_empty()
                         || call.name.trim().is_empty()
                         || !call.arguments.is_object()
                         || !ids.insert(call.id.as_str())
                     {
-                        return Err(protocol("terminal tool calls need unique nonempty IDs, names and object arguments"));
+                        return Err(protocol(
+                            "terminal tool calls need unique nonempty IDs, names and object arguments",
+                        ));
                     }
                 }
             }
@@ -259,8 +334,12 @@ fn validate_event(event: &AssistantMessageEvent) -> Result<()> {
             (message, None)
         }
         AssistantMessageEvent::Error { reason, error } => {
-            if *reason != error.stop_reason || !matches!(reason, StopReason::Error | StopReason::Aborted) {
-                return Err(protocol("error event carries an inconsistent terminal reason"));
+            if *reason != error.stop_reason
+                || !matches!(reason, StopReason::Error | StopReason::Aborted)
+            {
+                return Err(protocol(
+                    "error event carries an inconsistent terminal reason",
+                ));
             }
             (error, None)
         }
@@ -276,7 +355,9 @@ fn validate_event(event: &AssistantMessageEvent) -> Result<()> {
                 | ("toolCall", Some(ContentBlock::ToolCall(_)))
         );
         if !valid {
-            return Err(protocol("content index does not identify the event's block type"));
+            return Err(protocol(
+                "content index does not identify the event's block type",
+            ));
         }
     }
     Ok(())

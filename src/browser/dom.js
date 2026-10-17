@@ -1,10 +1,13 @@
 function piBrowserElement(action, options) {
   // Called on a resolved DOM node in a CDP isolated world. Page scripts cannot
   // replace these prototypes or intercept selector strings as executable code.
-  if (!(this instanceof Element) || !this.isConnected) {
+  if (!(this instanceof Element) || !this.isConnected || this.ownerDocument !== document) {
     throw new Error(
-      "Element reference is detached or does not identify an element; take a new snapshot",
+      "Element reference is detached or belongs to another document; take a new snapshot",
     );
+  }
+  if (action === "focused") {
+    return document.hasFocus() && this.getRootNode().activeElement === this;
   }
   // File inputs are commonly hidden behind a styled upload button. Selecting
   // one is explicit, not a synthetic click; visibility is not a precondition.

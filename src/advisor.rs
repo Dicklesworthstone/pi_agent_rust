@@ -96,7 +96,7 @@ fn retain_error_text(result: &crate::model::ToolResultMessage, remaining: &mut u
             .len()
             .checked_add(usize::from(!first))
             .and_then(|bytes| bytes.checked_add(text.text.len()));
-        if !next.is_some_and(|bytes| bytes <= *remaining) {
+        if next.is_none_or(|bytes| bytes > *remaining) {
             // Never retain a partial private-key envelope or an uninspected
             // prefix when a later block makes the whole field too large.
             return OMITTED_INPUT.to_string();
@@ -155,7 +155,9 @@ fn screen_digest(digest: &TurnDigest) -> crate::error::Result<TurnDigest> {
         .collect();
     let final_text = protected
         .next()
-        .ok_or_else(|| crate::error::Error::validation("advisor privacy projection lost final text"))?
+        .ok_or_else(|| {
+            crate::error::Error::validation("advisor privacy projection lost final text")
+        })?
         .chars()
         .take(MAX_FINAL_TEXT_CHARS)
         .collect();
@@ -170,9 +172,11 @@ fn screen_digest(digest: &TurnDigest) -> crate::error::Result<TurnDigest> {
 }
 
 /// Build the digest from the tail of the conversation (last user message
-/// onward), budgeted. Complete selected fields are screened for built-in
-/// credential shapes before clipping; tool-free advisor projections never
-/// need reversible credentials. The source conversation is not modified.
+/// onward), budgeted.
+///
+/// Complete selected fields are screened for built-in credential shapes
+/// before clipping; tool-free advisor projections never need reversible
+/// credentials. The source conversation is not modified.
 #[must_use]
 pub fn build_digest(messages: &[Message]) -> TurnDigest {
     // Start from the last user message (turn boundary).
@@ -200,7 +204,9 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
                                         && digest.files_touched.len() < MAX_DIGEST_FILES
                                         && seen_files.insert(path)
                                     {
-                                        digest.files_touched.push(retain_digest_text(path, &mut remaining));
+                                        digest
+                                            .files_touched
+                                            .push(retain_digest_text(path, &mut remaining));
                                     }
                                 }
                                 "bash" => {
@@ -208,7 +214,9 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
                                         call.arguments.get("command").and_then(Value::as_str)
                                         && digest.commands_run.len() < MAX_DIGEST_COMMANDS
                                     {
-                                        digest.commands_run.push(retain_digest_text(command, &mut remaining));
+                                        digest
+                                            .commands_run
+                                            .push(retain_digest_text(command, &mut remaining));
                                     }
                                 }
                                 _ => {}
@@ -226,7 +234,9 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
             Message::ToolResult(result)
                 if result.is_error && digest.tool_errors.len() < MAX_DIGEST_ERRORS =>
             {
-                digest.tool_errors.push(retain_error_text(result, &mut remaining));
+                digest
+                    .tool_errors
+                    .push(retain_error_text(result, &mut remaining));
             }
             _ => {}
         }
@@ -234,21 +244,18 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
     // Classification describes the source turn, not a short redaction marker.
     digest.is_trivial = digest.tool_call_count == 0 && final_text.len() < 400;
     digest.final_text = retain_digest_text(final_text, &mut remaining);
-    match screen_digest(&digest) {
-        Ok(protected) => protected,
-        Err(_) => {
-            tracing::warn!(
-                event = "pi.advisor.privacy_projection_refused",
-                "Advisor digest omitted because its privacy projection failed"
-            );
-            TurnDigest {
-                final_text: OMITTED_INPUT.to_string(),
-                tool_call_count: digest.tool_call_count,
-                is_trivial: digest.is_trivial,
-                ..Default::default()
-            }
+    screen_digest(&digest).unwrap_or_else(|_| {
+        tracing::warn!(
+            event = "pi.advisor.privacy_projection_refused",
+            "Advisor digest omitted because its privacy projection failed"
+        );
+        TurnDigest {
+            final_text: OMITTED_INPUT.to_string(),
+            tool_call_count: digest.tool_call_count,
+            is_trivial: digest.is_trivial,
+            ..Default::default()
         }
-    }
+    })
 }
 
 /// The review rubric prompt.
@@ -722,7 +729,10 @@ mod tests {
             options: &crate::provider::StreamOptions,
         ) -> crate::error::Result<
             std::pin::Pin<
-                Box<dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>,
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
             >,
         > {
             assert!(context.tools.is_empty());
@@ -743,7 +753,10 @@ mod tests {
                 .pop_front()
                 .expect("unexpected advisor provider call");
             if let Some(owner) = &self.cancel_on_call {
-                owner.cancel_with(asupersync::types::CancelKind::User, Some("review cancelled"));
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("review cancelled"),
+                );
             }
             Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
@@ -850,7 +863,10 @@ mod tests {
             }
             assert!(runtime.is_disabled());
             assert!(runtime.disabled_notice.take().is_some());
-            assert!(runtime.is_disabled(), "delivering a notice must not resume billing");
+            assert!(
+                runtime.is_disabled(),
+                "delivering a notice must not resume billing"
+            );
             assert!(matches!(
                 runtime.review_turn(&review_digest(), 3).await,
                 AdvisorOutcome::Quiet
@@ -943,14 +959,20 @@ mod tests {
         let key = "sk-abcdefghijklmnopqrstuvwxyz012345";
         let messages = vec![
             assistant(vec![
-                call("bash", serde_json::json!({"command": format!("{} {key}", "x".repeat(190))})),
+                call(
+                    "bash",
+                    serde_json::json!({"command": format!("{} {key}", "x".repeat(190))}),
+                ),
                 text(format!("{} {key}", "x".repeat(1_990))),
             ]),
             tool_error(vec![text(format!("{} {key}", "x".repeat(190)))]),
         ];
         let projection = build_digest(&messages);
         let rendered = digest_prompt(&projection);
-        assert!(!rendered.contains("sk-"), "a clipped key prefix must never escape");
+        assert!(
+            !rendered.contains("sk-"),
+            "a clipped key prefix must never escape"
+        );
         assert!(!rendered.contains("abcdef"));
         assert!(projection.commands_run[0].chars().count() <= 200);
         assert!(projection.tool_errors[0].chars().count() <= 200);
@@ -962,7 +984,10 @@ mod tests {
     fn discovery_beyond_final_text_limit_protects_an_earlier_command_echo() {
         let secret = "r4nd0mCredentialValue123456";
         let messages = vec![assistant(vec![
-            call("bash", serde_json::json!({"command": format!("echo {secret}")})),
+            call(
+                "bash",
+                serde_json::json!({"command": format!("echo {secret}")}),
+            ),
             text(format!("{} API_KEY={secret}", "x".repeat(2_100))),
         ])];
         let projection = build_digest(&messages);
@@ -973,7 +998,7 @@ mod tests {
     #[test]
     fn error_blocks_are_screened_as_one_complete_private_key_envelope() {
         let projection = build_digest(&[tool_error(vec![
-            text("-----BEGIN PRIVATE KEY-----"),
+            text(concat!("-----BEGIN ", "PRIVATE KEY-----")),
             text("PRIVATE-MATERIAL-CANARY"),
             text("-----END PRIVATE KEY-----"),
         ])]);
@@ -1016,12 +1041,16 @@ mod tests {
             let (mut runtime, provider) = scripted_runtime(vec![completed_reply(
                 "CONCERN\nAvoid placing credentials in command arguments.",
             )]);
-            assert!(matches!(runtime.review_turn(&digest, 0).await, AdvisorOutcome::Inject(_)));
+            assert!(matches!(
+                runtime.review_turn(&digest, 0).await,
+                AdvisorOutcome::Inject(_)
+            ));
             let prompts = provider.prompts.lock().unwrap();
             assert_eq!(prompts.len(), 1);
             assert!(!prompts[0].contains(secret));
             assert!(prompts[0].contains("<pi-secret:redacted>"));
             assert!(!prompts[0].contains("<pi-secret:000001>"));
+            drop(prompts);
             assert!(digest.commands_run[0].contains(secret));
             assert_eq!(runtime.consecutive_failures, 0);
         });
@@ -1037,12 +1066,21 @@ mod tests {
                 ..Default::default()
             };
             for turn in 0..3 {
-                assert!(matches!(runtime.review_turn(&digest, turn).await, AdvisorOutcome::Failed));
+                assert!(matches!(
+                    runtime.review_turn(&digest, turn).await,
+                    AdvisorOutcome::Failed
+                ));
             }
             assert!(runtime.is_disabled());
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert!(provider.prompts.lock().unwrap().is_empty());
-            assert!(!runtime.disabled_notice.as_deref().unwrap().contains("PRIVATE-CANARY"));
+            assert!(
+                !runtime
+                    .disabled_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("PRIVATE-CANARY")
+            );
         });
     }
 
@@ -1064,10 +1102,15 @@ mod tests {
             )]);
             runtime.consecutive_failures = 2;
             let owner = crate::agent_cx::AgentCx::for_request();
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("review cancelled"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("review cancelled"),
+            );
             for turn in 0..4 {
                 assert!(matches!(
-                    owner.with_current(runtime.review_turn(&review_digest(), turn)).await,
+                    owner
+                        .with_current(runtime.review_turn(&review_digest(), turn))
+                        .await,
                     AdvisorOutcome::Quiet
                 ));
             }
@@ -1094,9 +1137,12 @@ mod tests {
             executor.request_cx_with_budget(asupersync::Budget::new()),
         );
         let provider = Arc::new(ScriptedProvider {
-            responses: std::sync::Mutex::new(vec![completed_reply(
-                "BLOCKER\nThis completed review belongs to cancelled work.",
-            )].into()),
+            responses: std::sync::Mutex::new(
+                vec![completed_reply(
+                    "BLOCKER\nThis completed review belongs to cancelled work.",
+                )]
+                .into(),
+            ),
             calls: std::sync::atomic::AtomicUsize::new(0),
             prompts: std::sync::Mutex::new(Vec::new()),
             cancel_on_call: Some(owner.cx().clone()),
@@ -1104,9 +1150,8 @@ mod tests {
         let mut runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
             .with_api_key(Some("test-key".to_string()));
         runtime.consecutive_failures = 2;
-        let outcome = executor.block_on(owner.with_current(
-            runtime.review_turn(&review_digest(), 0),
-        ));
+        let outcome =
+            executor.block_on(owner.with_current(runtime.review_turn(&review_digest(), 0)));
         assert!(matches!(outcome, AdvisorOutcome::Quiet));
         assert_eq!(runtime.consecutive_failures, 2);
         assert!(!runtime.is_disabled());
@@ -1127,9 +1172,8 @@ mod tests {
             crate::agent_cx::AgentCx::for_current_or_request()
         };
         let (mut runtime, provider) = scripted_runtime(Vec::new());
-        let outcome = executor.block_on(owner.with_current(
-            runtime.review_turn(&review_digest(), 0),
-        ));
+        let outcome =
+            executor.block_on(owner.with_current(runtime.review_turn(&review_digest(), 0)));
         assert!(matches!(outcome, AdvisorOutcome::Failed));
         assert_eq!(runtime.consecutive_failures, 1);
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);

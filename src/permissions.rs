@@ -226,16 +226,19 @@ impl PermissionStore {
         let lock_handle = open_permissions_lock_file(&self.path)?;
         let _file_guard = lock_permissions_file(lock_handle, Duration::from_secs(30))?;
 
-        match load_permissions_decisions(&self.path) {
-            Ok(decisions) => self.decisions = decisions,
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to reload extension permissions before update; repairing from in-memory state: {err}"
-                );
-            }
-        }
-        update(&mut self.decisions);
-        self.save_unlocked()
+        // The locked on-disk snapshot is authoritative. Never repair a failed
+        // reload from this handle's potentially stale grants: another process
+        // may have revoked them, or written a schema we do not understand.
+        self.decisions = load_permissions_decisions(&self.path)?;
+
+        // Stage the mutation separately so a failed write cannot turn a
+        // rejected "Allow Always" into an active in-memory grant. On failure
+        // retain the freshly loaded snapshot, including other writers' denies.
+        let mut next = self.clone();
+        update(&mut next.decisions);
+        next.save_unlocked()?;
+        self.decisions = next.decisions;
+        Ok(())
     }
 
     /// Atomic write to disk following the same pattern as `config.rs`.
@@ -315,16 +318,19 @@ impl PermissionStore {
 fn load_permissions_decisions(
     path: &Path,
 ) -> Result<HashMap<String, HashMap<String, PersistedDecision>>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        Error::config(format!(
-            "Failed to read permissions file {}: {e}",
-            path.display()
-        ))
-    })?;
+    // Only an actually missing file is an empty store. Path::exists also
+    // hides metadata errors (for example, an inaccessible parent) and adds a
+    // check/read race, neither of which is safe for authorization decisions.
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(Error::config(format!(
+                "Failed to read permissions file {}: {err}",
+                path.display()
+            )));
+        }
+    };
     let file: PermissionsFile = serde_json::from_str(&raw).map_err(|e| {
         Error::config(format!(
             "Failed to parse permissions file {}: {e}",
@@ -1354,6 +1360,154 @@ mod tests {
                 Some(idx % 2 == 0)
             );
         }
+    }
+
+    #[test]
+    fn corrupt_reload_does_not_overwrite_disk_or_publish_a_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+        store.record("ext", "exec", false).unwrap();
+        let corrupt = "{interrupted external update";
+        std::fs::write(&path, corrupt).unwrap();
+
+        assert!(store.record("ext", "exec", true).is_err());
+        assert_eq!(store.lookup("ext", "exec"), Some(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+
+        assert!(
+            store
+                .record_with_version("ext", "http", true, "^1.0.0")
+                .is_err()
+        );
+        assert_eq!(store.lookup("ext", "http"), None);
+        assert!(store.revoke_extension("ext").is_err());
+        assert!(store.reset().is_err());
+        assert_eq!(store.lookup("ext", "exec"), Some(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn newer_schema_reload_is_not_replaced_with_stale_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+        store.record("old-ext", "exec", true).unwrap();
+        let newer = r#"{"version":999,"decisions":{},"future_policy":"deny"}"#;
+        std::fs::write(&path, newer).unwrap();
+
+        let err = store.record("new-ext", "http", true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported permissions file schema version")
+        );
+        assert_eq!(store.lookup("new-ext", "http"), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn stale_writer_preserves_revocations_and_denials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut stale = PermissionStore::open(&path).unwrap();
+        stale.record("revoked-ext", "exec", true).unwrap();
+        stale.record("denied-ext", "http", true).unwrap();
+        let mut other = PermissionStore::open(&path).unwrap();
+        other.revoke_extension("revoked-ext").unwrap();
+        other.record("denied-ext", "http", false).unwrap();
+
+        stale.record("new-ext", "env", false).unwrap();
+
+        let reopened = PermissionStore::open(&path).unwrap();
+        for store in [&stale, &reopened] {
+            assert_eq!(store.lookup("revoked-ext", "exec"), None);
+            assert_eq!(store.lookup("denied-ext", "http"), Some(false));
+            assert_eq!(store.lookup("new-ext", "env"), Some(false));
+        }
+    }
+
+    #[test]
+    fn failed_persist_keeps_latest_disk_snapshot_not_staged_or_stale_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let backup = dir.path().join("permissions.before-failure.json");
+        let mut stale = PermissionStore::open(&path).unwrap();
+        stale.record("ext", "exec", true).unwrap();
+        let mut other = PermissionStore::open(&path).unwrap();
+        other.record("ext", "exec", false).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+
+        let result = stale.update_persisted_decisions(|decisions| {
+            decisions
+                .get_mut("ext")
+                .unwrap()
+                .get_mut("exec")
+                .unwrap()
+                .allow = true;
+            // Force a real atomic-replace failure, even when tests run as root.
+            // The old file remains intact; only this test's temporary paths
+            // are changed, after the authoritative reload and before persist.
+            std::fs::rename(&path, &backup).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        });
+
+        assert!(result.is_err());
+        assert_eq!(stale.lookup("ext", "exec"), Some(false));
+        assert_eq!(std::fs::read(&backup).unwrap(), saved);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn failed_reset_does_not_clear_in_memory_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let backup = dir.path().join("permissions.before-reset.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+        store.record("ext", "exec", false).unwrap();
+
+        let result = store.update_persisted_decisions(|decisions| {
+            decisions.clear();
+            std::fs::rename(&path, &backup).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.lookup("ext", "exec"), Some(false));
+        assert_eq!(
+            PermissionStore::open(&backup).unwrap().lookup("ext", "exec"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn retry_after_external_repair_uses_repaired_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut stale = PermissionStore::open(&path).unwrap();
+        stale.record("old-ext", "exec", true).unwrap();
+        std::fs::write(&path, "invalid").unwrap();
+        assert!(stale.record("new-ext", "http", true).is_err());
+
+        std::fs::write(&path, r#"{"version":1,"decisions":{}}"#).unwrap();
+        stale.record("new-ext", "http", false).unwrap();
+
+        assert_eq!(stale.lookup("old-ext", "exec"), None);
+        assert_eq!(stale.lookup("new-ext", "http"), Some(false));
+        let reopened = PermissionStore::open(&path).unwrap();
+        assert_eq!(reopened.lookup("old-ext", "exec"), None);
+        assert_eq!(reopened.lookup("new-ext", "http"), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_directory_parent_is_not_treated_as_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, "ordinary file").unwrap();
+        let path = parent.join("permissions.json");
+
+        let err = PermissionStore::open(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to read permissions file"));
     }
 
     mod proptest_permissions {

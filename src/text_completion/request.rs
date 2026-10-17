@@ -15,7 +15,7 @@ const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 /// Keep owner cancellation separate from provider failure and deadline expiry.
 /// In particular, cancelling a review must not disable a healthy advisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestStop {
+pub enum RequestStop {
     TimedOut,
     Cancelled,
     TimeUnavailable,
@@ -39,7 +39,7 @@ fn now(owner: &AgentCx) -> asupersync::types::Time {
 ///
 /// Missing time authority, an expired deadline and owner cancellation all
 /// refuse provider admission. They are distinct outcomes, not provider errors.
-pub(crate) async fn with_timeout<F>(
+pub async fn with_timeout<F>(
     timeout: Duration,
     future: F,
 ) -> std::result::Result<F::Output, RequestStop>
@@ -177,7 +177,10 @@ mod tests {
             unrelated.cancel_with(asupersync::types::CancelKind::User, Some("unrelated"));
             {
                 let _guard = unrelated.set_current_restricted();
-                assert!(matches!(request.as_mut().poll(&mut cx), Poll::Ready(Ok(42))));
+                assert!(matches!(
+                    request.as_mut().poll(&mut cx),
+                    Poll::Ready(Ok(42))
+                ));
                 assert!(Cx::current().unwrap().is_cancel_requested());
             }
             assert!(!poller.is_cancel_requested());
@@ -209,7 +212,10 @@ mod tests {
                 let _guard = owner.clone().set_current_restricted();
                 assert!(request.as_mut().poll(&mut cx).is_pending());
             }
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel between polls"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel between polls"),
+            );
             assert!(matches!(
                 request.as_mut().poll(&mut cx),
                 Poll::Ready(Err(RequestStop::Cancelled))

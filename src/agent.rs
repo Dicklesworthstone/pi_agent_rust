@@ -2604,6 +2604,7 @@ impl Agent {
     /// cloned vault and owned context, and the live vault is installed only
     /// after every field succeeds. This prevents a late refusal from learning
     /// credentials or consuming placeholder identities.
+    #[allow(clippy::too_many_lines)] // one transaction; splitting it would scatter the commit point
     fn apply_secrets_outbound(
         &mut self,
         mut context: Context<'static>,
@@ -2627,14 +2628,11 @@ impl Agent {
         // one field. A later assignment such as {"api_key": "..."} can
         // therefore identify an earlier bare echo of the same opaque value.
         // Binary image/media bytes and provider-opaque redacted reasoning are
-        // deliberately absent from this projection.
+        // deliberately absent from this projection. Block mode refuses here on
+        // any detection, signed and paused content included; discovery never
+        // rewrites, so it cannot fail on content that is replayed verbatim.
         let discovery = Self::secrets_discovery_projection(&context);
-        let _ = crate::secrets::transform_outbound_json(
-            &discovery,
-            &mut staged_vault,
-            mode,
-            &extra,
-        )?;
+        crate::secrets::discover_outbound_json(&discovery, &mut staged_vault, mode, &extra)?;
 
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
@@ -2661,27 +2659,33 @@ impl Agent {
                     &mut labels,
                 )?,
                 Message::Assistant(assistant) => {
+                    let same_origin = assistant.api == self.provider.api()
+                        && assistant.provider == self.provider.name()
+                        && assistant.model == self.provider.model_id();
                     // Paused server-tool responses and signed blocks must remain
-                    // byte/structure stable for provider replay. Screen them to
-                    // detect leakage, but refuse rather than invalidate a
-                    // signature or alter a verbatim continuation.
-                    if assistant.stop_reason == StopReason::PauseTurn {
-                        let original = serde_json::to_value(assistant.as_ref()).map_err(|_| {
-                            Error::validation(
-                                "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
-                                    .to_string(),
-                            )
-                        })?;
-                        let protected = Self::secrets_transform_json(
-                            &original,
-                            &mut staged_vault,
-                            mode,
-                            &extra,
-                            &mut total,
-                            &mut labels,
-                        )?;
-                        if protected != original {
-                            return Err(Self::secret_signed_content_error());
+                    // byte/structure stable when replayed to their original
+                    // provider, API and model. After a switch, these bytes are
+                    // ordinary history: screen them and discard signatures so
+                    // the new provider cannot receive a now-known raw secret
+                    // or a signature over rewritten content. Block mode has
+                    // already refused detections in either case above.
+                    if same_origin && assistant.stop_reason == StopReason::PauseTurn {
+                        if mode == crate::secrets::SecretsMode::Block {
+                            let original =
+                                serde_json::to_value(assistant.as_ref()).map_err(|_| {
+                                    Error::validation(
+                                        "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Self::secrets_transform_json(
+                                &original,
+                                &mut staged_vault,
+                                mode,
+                                &extra,
+                                &mut total,
+                                &mut labels,
+                            )?;
                         }
                         continue;
                     }
@@ -2690,6 +2694,7 @@ impl Agent {
                     for block in &mut assistant_mut.content {
                         Self::secrets_transform_content_block(
                             block,
+                            same_origin,
                             &mut staged_vault,
                             mode,
                             &extra,
@@ -2725,6 +2730,7 @@ impl Agent {
                     for block in &mut result_mut.content {
                         Self::secrets_transform_content_block(
                             block,
+                            false,
                             &mut staged_vault,
                             mode,
                             &extra,
@@ -2768,7 +2774,9 @@ impl Agent {
 
         for tool in context.tools.to_mut().iter_mut() {
             // Tool names are routing identifiers. A replacement here would
-            // advertise a name the local registry cannot execute.
+            // advertise a name the local registry cannot execute, so names are
+            // never rewritten. Only block mode refuses; obfuscate mode sends
+            // the name as registered (MCP server keys are user configuration).
             let screened_name = Self::secrets_transform_text(
                 &tool.name,
                 &mut staged_vault,
@@ -2777,7 +2785,7 @@ impl Agent {
                 &mut total,
                 &mut labels,
             )?;
-            if screened_name != tool.name {
+            if screened_name != tool.name && mode == crate::secrets::SecretsMode::Block {
                 return Err(Error::validation(
                     "PI_SECRET_IDENTIFIER: tool name contains secret material and cannot be rewritten safely"
                         .to_string(),
@@ -2876,13 +2884,6 @@ impl Agent {
         }
     }
 
-    fn secret_signed_content_error() -> Error {
-        Error::validation(
-            "PI_SECRET_SIGNED_CONTENT: secret replacement would alter signed or verbatim provider content; refusing to send"
-                .to_string(),
-        )
-    }
-
     fn secrets_add_audit(
         audit: crate::secrets::TransformAudit,
         total: &mut usize,
@@ -2904,8 +2905,7 @@ impl Agent {
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<Value> {
-        let (output, audit) =
-            crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
+        let (output, audit) = crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
         Self::secrets_add_audit(audit, total, labels);
         Ok(output)
     }
@@ -2919,8 +2919,7 @@ impl Agent {
         labels: &mut Vec<String>,
     ) -> Result<String> {
         let value = Value::String(text.to_string());
-        let output =
-            Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
+        let output = Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
         output.as_str().map(ToString::to_string).ok_or_else(|| {
             Error::validation(
                 "PI_SECRET_JSON_PRIMITIVE: text screening changed the JSON value type".to_string(),
@@ -2928,41 +2927,66 @@ impl Agent {
         })
     }
 
+    /// `honor_signatures` is true only for assistant output from the current
+    /// provider, API and model. Foreign history, user and tool-result blocks
+    /// are screened without signatures (an extension can set one on any JSON).
     fn secrets_transform_content_block(
         block: &mut ContentBlock,
+        honor_signatures: bool,
         vault: &mut crate::secrets::SecretVault,
         mode: crate::secrets::SecretsMode,
         extra: &[regex::Regex],
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<()> {
+        // A signed assistant block (a real provider signature, or a plain item
+        // id such as OpenAI's `fc_`/`msg_` that replay is keyed on) stays intact
+        // only for its original destination outside block mode. Skipping the
+        // rewrite (not just discarding it) also keeps a type-changing
+        // replacement from refusing the request.
+        let keep_signed = honor_signatures && mode != crate::secrets::SecretsMode::Block;
         match block {
             ContentBlock::Text(text) => {
-                let screened = Self::secrets_transform_text(
-                    &text.text, vault, mode, extra, total, labels,
-                )?;
-                if text.text_signature.is_some() && screened != text.text {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && text.text_signature.is_some() {
+                    return Ok(());
                 }
-                text.text = screened;
+                if !honor_signatures {
+                    text.text_signature = None;
+                }
+                text.text =
+                    Self::secrets_transform_text(&text.text, vault, mode, extra, total, labels)?;
             }
             ContentBlock::Thinking(thinking) => {
-                let screened = Self::secrets_transform_text(
-                    &thinking.thinking, vault, mode, extra, total, labels,
-                )?;
-                if thinking.thinking_signature.is_some() && screened != thinking.thinking {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && thinking.thinking_signature.is_some() {
+                    return Ok(());
                 }
-                thinking.thinking = screened;
+                if !honor_signatures {
+                    thinking.thinking_signature = None;
+                }
+                thinking.thinking = Self::secrets_transform_text(
+                    &thinking.thinking,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
             }
             ContentBlock::ToolCall(call) => {
-                let screened = Self::secrets_transform_json(
-                    &call.arguments, vault, mode, extra, total, labels,
-                )?;
-                if call.thought_signature.is_some() && screened != call.arguments {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && call.thought_signature.is_some() {
+                    return Ok(());
                 }
-                call.arguments = screened;
+                if !honor_signatures {
+                    call.thought_signature = None;
+                }
+                call.arguments = Self::secrets_transform_json(
+                    &call.arguments,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
             }
             ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
                 // Opaque signed/provider bytes and binary payloads are not
@@ -2988,7 +3012,7 @@ impl Agent {
             UserContent::Blocks(blocks) => {
                 for block in blocks {
                     Self::secrets_transform_content_block(
-                        block, vault, mode, extra, total, labels,
+                        block, false, vault, mode, extra, total, labels,
                     )?;
                 }
             }
@@ -6014,6 +6038,21 @@ impl ProviderAdmissionGate {
             .map_err(|err| Error::session(format!("provider admission lock failed: {err}")))
     }
 
+    /// Reserve provider admission before acquiring Session-action authority.
+    /// Preparing or declining a swap does not quarantine the session; the
+    /// shared transition code marks uncertainty at its persistence boundary.
+    pub(crate) async fn acquire_transition_authority(
+        &self,
+        cx: &asupersync::Cx,
+    ) -> Result<ProviderTransitionAuthority> {
+        let permit = self.acquire(cx).await?;
+        self.ensure_allowed()?;
+        Ok(ProviderTransitionAuthority {
+            gate: self.clone(),
+            _permit: permit,
+        })
+    }
+
     pub(crate) async fn begin_transition(
         &self,
         reason: String,
@@ -6023,6 +6062,44 @@ impl ProviderAdmissionGate {
         self.ensure_allowed()?;
         self.block(reason);
         Ok(permit)
+    }
+}
+
+/// Proof that a caller owns this gate's provider permit. Recovery keeps this
+/// authority while acquiring Session-action admission, then uses the same
+/// transition machinery without recursively acquiring the provider mutex.
+pub(crate) struct ProviderTransitionAuthority {
+    gate: ProviderAdmissionGate,
+    _permit: OwnedMutexGuard<()>,
+}
+
+#[derive(Clone, Copy)]
+enum ProviderSwapAdmission<'a> {
+    Gate(&'a ProviderAdmissionGate),
+    Held(&'a ProviderTransitionAuthority),
+}
+
+impl<'a> ProviderSwapAdmission<'a> {
+    const fn gate(self) -> &'a ProviderAdmissionGate {
+        match self {
+            Self::Gate(gate) => gate,
+            Self::Held(authority) => &authority.gate,
+        }
+    }
+
+    async fn begin_transition(
+        self,
+        reason: String,
+        cx: &asupersync::Cx,
+    ) -> Result<Option<OwnedMutexGuard<()>>> {
+        match self {
+            Self::Gate(gate) => gate.begin_transition(reason, cx).await.map(Some),
+            Self::Held(authority) => {
+                authority.gate.ensure_allowed()?;
+                authority.gate.block(reason);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -9967,10 +10044,18 @@ mod extensions_integration_tests {
         runtime.block_on(async {
             let provider = Arc::new(TruncatingProvider::new(0));
             let provider_dyn: Arc<dyn Provider> = provider.clone();
+            // The fixture's final reply ("}\n```\nAll done.") reads as an
+            // unclosed fence, so conservative turn recovery would add a
+            // continuation call. Only steering is manual here (follow-up
+            // dispatch, which suppresses recovery, stays automatic), so turn
+            // recovery is switched off to isolate steering dispatch.
             let mut agent = Agent::new(
                 provider_dyn,
                 ToolRegistry::from_tools(vec![]),
-                AgentConfig::default(),
+                AgentConfig {
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    ..AgentConfig::default()
+                },
             );
             let polls = Arc::new(AtomicUsize::new(0));
             let polls_for_fetcher = Arc::clone(&polls);
@@ -12607,7 +12692,14 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 }
 
-fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> Result<T> {
+/// A failed turn save leaves durability uncertain for every caller, including
+/// surfaces that use [`AgentSession`] without the SDK recovery driver. Fence the
+/// shared admission gate before returning the typed persistence error.
+fn finish_turn_persistence<T>(
+    admission: &ProviderAdmissionGate,
+    result: Result<T>,
+    persist_result: Result<()>,
+) -> Result<T> {
     match persist_result {
         Ok(()) => result,
         Err(persist_err) => {
@@ -12617,6 +12709,7 @@ fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> 
                     format!("{persist_err}; primary provider/tool turn also failed: {primary_err}")
                 }
             };
+            admission.block(message.clone());
             Err(Error::session_persistence(message))
         }
     }
@@ -12628,7 +12721,9 @@ mod finish_turn_persistence_tests {
 
     #[test]
     fn persistence_failure_is_terminal_without_hiding_primary_turn_error() {
+        let admission = ProviderAdmissionGate::default();
         let err = finish_turn_persistence::<()>(
+            &admission,
             Err(Error::provider("test", "provider failed")),
             Err(Error::session("disk flush failed")),
         )
@@ -12638,6 +12733,11 @@ mod finish_turn_persistence_tests {
         let message = err.to_string();
         assert!(message.contains("disk flush failed"));
         assert!(message.contains("provider failed"));
+        let blocked = admission
+            .ensure_allowed()
+            .expect_err("every caller must retain the persistence fence");
+        assert!(blocked.is_session_persistence());
+        assert!(blocked.to_string().contains("provider failed"));
     }
 }
 
@@ -13111,7 +13211,13 @@ impl AgentSession {
             .as_ref()
             .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
             != Some((target_provider_id.as_str(), target_model_id.as_str()))
+            || candidate
+                .active_failover_provenance_for_current_path()
+                .is_some()
         {
+            // Explicitly choosing the active fallback makes it the user's
+            // primary. Persist that intent even when its identity is unchanged,
+            // or reopening the session revives the old automatic restoration.
             candidate.append_model_change(target_provider_id.clone(), target_model_id.clone());
         }
         candidate.set_model_header(
@@ -13577,6 +13683,27 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    pub(crate) async fn restore_primary_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap_admitted(cx, request, Some(ProviderSwapAdmission::Held(authority)))
+            .await
+    }
+
+    async fn restore_primary_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<Option<RestoredPrimary>> {
+        let gate = admission.map(ProviderSwapAdmission::gate);
         let (active_provider, active_model) = request.active;
 
         // The runtime must still be on the fallback the caller recorded.
@@ -13588,7 +13715,7 @@ impl AgentSession {
         {
             return Self::refuse_restore(
                 request,
-                admission,
+                gate,
                 format!(
                     "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
                     runtime_provider.name(),
@@ -13610,7 +13737,7 @@ impl AgentSession {
         if !session_matches_active {
             return Self::refuse_restore(
                 request,
-                admission,
+                gate,
                 format!(
                     "primary restore invariant failed: Session path does not match recorded fallback {active_provider}/{active_model}"
                 ),
@@ -13645,14 +13772,15 @@ impl AgentSession {
             self.invalidate_background_compaction();
         }
         let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "primary restore persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
+            Some(admission) => {
+                admission
+                    .begin_transition(
+                        "primary restore persistence was interrupted before live installation completed"
+                            .to_string(),
+                        cx,
+                    )
+                    .await?
+            }
             None => None,
         };
         if save_enabled
@@ -13664,7 +13792,7 @@ impl AgentSession {
             let reason = format!(
                 "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
+            if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
             if request.strict_invariants {
@@ -13676,7 +13804,7 @@ impl AgentSession {
         // No fallible operation remains after installing the candidate.
         *inner = candidate;
         self.install_restored_entry(&entry, provider_impl, key, target_thinking);
-        if let Some(gate) = admission {
+        if let Some(gate) = gate {
             gate.clear();
         }
         drop(inner);
@@ -13824,6 +13952,26 @@ impl AgentSession {
         attempt: &FailoverSwapAttempt<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap_admitted(cx, attempt, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    pub(crate) async fn try_failover_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap_admitted(cx, attempt, Some(ProviderSwapAdmission::Held(authority)))
+            .await
+    }
+
+    async fn try_failover_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<FailoverSwapOutcome> {
         let (from_provider, from_model) = {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
@@ -13868,7 +14016,8 @@ impl AgentSession {
                 cooldown_secs: attempt.cooldown_secs,
                 lifecycle_id: attempt.lifecycle_id,
             };
-            self.commit_failover_swap(cx, &request, admission).await?;
+            self.commit_failover_swap_admitted(cx, &request, admission)
+                .await?;
             return Ok(FailoverSwapOutcome {
                 next_position,
                 committed: Some(CommittedFailover {
@@ -13986,6 +14135,17 @@ impl AgentSession {
         request: &FailoverSwapRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<crate::model::ThinkingLevel> {
+        self.commit_failover_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+            .await
+    }
+
+    async fn commit_failover_swap_admitted(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+        admission: Option<ProviderSwapAdmission<'_>>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
             .await
@@ -13999,14 +14159,15 @@ impl AgentSession {
         let save_enabled = self.save_enabled();
         self.invalidate_background_compaction();
         let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "failover Session persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
+            Some(admission) => {
+                admission
+                    .begin_transition(
+                        "failover Session persistence was interrupted before live installation completed"
+                            .to_string(),
+                        cx,
+                    )
+                    .await?
+            }
             None => None,
         };
         if save_enabled
@@ -14016,7 +14177,7 @@ impl AgentSession {
             let reason = format!(
                 "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
+            if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
             return Err(Error::session_persistence(reason));
@@ -14050,7 +14211,7 @@ impl AgentSession {
                 .manager()
                 .set_current_model(Some(to_provider), Some(to_model));
         }
-        if let Some(gate) = admission {
+        if let Some(gate) = gate {
             gate.clear();
         }
         Ok(target_thinking)
@@ -15966,7 +16127,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(prompt_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16002,7 +16164,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_text(
@@ -16056,7 +16218,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16086,7 +16249,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_content(
@@ -16140,7 +16303,8 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                let persist_result = session.flush_autosave(AutosaveFlushTrigger::Manual).await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
             }
         }
 
@@ -16170,7 +16334,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Resume the current turn after a transient failure WITHOUT adding a new
@@ -16247,7 +16411,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Persist the turn transcript and both audit ledgers under one session

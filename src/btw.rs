@@ -107,12 +107,12 @@ impl BtwClient {
         .await
         .map_err(|stop| match stop {
             RequestStop::TimedOut => Error::api("side question timed out"),
-            RequestStop::Cancelled => Error::api(
-                "PI_AUXILIARY_CANCELLED: side question cancelled by its request owner",
-            ),
-            RequestStop::TimeUnavailable => Error::config(
-                "PI_AUXILIARY_TIME_DENIED: side question requires timer authority",
-            ),
+            RequestStop::Cancelled => {
+                Error::api("PI_AUXILIARY_CANCELLED: side question cancelled by its request owner")
+            }
+            RequestStop::TimeUnavailable => {
+                Error::config("PI_AUXILIARY_TIME_DENIED: side question requires timer authority")
+            }
         })?
     }
 }
@@ -170,7 +170,11 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                     for block in blocks.iter().rev() {
                         if let crate::model::ContentBlock::Text(text) = block
                             && !push_context_piece(
-                                &mut pieces, &mut raw_bytes, &["user: "], &text.text, 400,
+                                &mut pieces,
+                                &mut raw_bytes,
+                                &["user: "],
+                                &text.text,
+                                400,
                             )
                         {
                             break 'messages;
@@ -182,10 +186,18 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                 for block in assistant.content.iter().rev() {
                     let retained = match block {
                         crate::model::ContentBlock::Text(text) => push_context_piece(
-                            &mut pieces, &mut raw_bytes, &["assistant: "], &text.text, 400,
+                            &mut pieces,
+                            &mut raw_bytes,
+                            &["assistant: "],
+                            &text.text,
+                            400,
                         ),
                         crate::model::ContentBlock::ToolCall(call) => push_context_piece(
-                            &mut pieces, &mut raw_bytes, &["assistant ran tool "], &call.name, 400,
+                            &mut pieces,
+                            &mut raw_bytes,
+                            &["assistant ran tool "],
+                            &call.name,
+                            400,
                         ),
                         _ => true,
                     };
@@ -315,7 +327,9 @@ mod tests {
             context: &crate::provider::Context<'_>,
             options: &crate::provider::StreamOptions,
         ) -> Result<
-            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>,
+            >,
         > {
             assert!(context.tools.is_empty());
             assert_eq!(context.system_prompt.as_deref(), Some(BTW_SYSTEM_PROMPT));
@@ -338,7 +352,10 @@ mod tests {
     }
 
     fn scripted_client(events: Vec<crate::model::StreamEvent>) -> BtwClient {
-        BtwClient::new(Arc::new(ScriptedProvider(events, None)), Some("test-key".to_string()))
+        BtwClient::new(
+            Arc::new(ScriptedProvider(events, None)),
+            Some("test-key".to_string()),
+        )
     }
 
     #[test]
@@ -353,7 +370,10 @@ mod tests {
                     ..Default::default()
                 },
             }]);
-            assert_eq!(client.ask("working context", "why?").await.unwrap(), "the answer");
+            assert_eq!(
+                client.ask("working context", "why?").await.unwrap(),
+                "the answer"
+            );
         });
     }
 
@@ -385,12 +405,14 @@ mod tests {
                     },
                 },
             ]);
-            assert!(client
-                .ask("", "why?")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("provider unavailable"));
+            assert!(
+                client
+                    .ask("", "why?")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("provider unavailable")
+            );
         });
     }
 
@@ -444,10 +466,16 @@ mod tests {
         let summary = build_context_summary(&messages);
         assert!(!summary.contains(secret));
         assert!(summary.contains("echo <pi-secret:redacted>"));
+        // The key starts at the same offset as before; the padding ends in a
+        // space because ruleset v5 does not match `sk-` directly after a letter.
         let clipped = build_context_summary(&[user(format!(
-            "{}sk-abcdefghijklmnopqrstuvwxyz012345", "x".repeat(385),
+            "{} sk-abcdefghijklmnopqrstuvwxyz012345",
+            "x".repeat(384),
         ))]);
-        assert!(!clipped.contains("sk-"), "raw key prefix must not survive clipping");
+        assert!(
+            !clipped.contains("sk-"),
+            "raw key prefix must not survive clipping"
+        );
         assert!(clipped.len() <= CONTEXT_BUDGET_CHARS);
     }
 
@@ -457,8 +485,12 @@ mod tests {
             user("older"),
             Message::User(UserMessage {
                 content: UserContent::Blocks(vec![
-                    crate::model::ContentBlock::Text(crate::model::TextContent::new("first caption")),
-                    crate::model::ContentBlock::Text(crate::model::TextContent::new("second caption")),
+                    crate::model::ContentBlock::Text(crate::model::TextContent::new(
+                        "first caption",
+                    )),
+                    crate::model::ContentBlock::Text(crate::model::TextContent::new(
+                        "second caption",
+                    )),
                 ]),
                 timestamp: 0,
             }),
@@ -502,7 +534,13 @@ mod tests {
                 )),
                 Some("test-key".to_string()),
             );
-            assert_eq!(client.ask(&format!("echo {secret}"), &question).await.unwrap(), "values omitted");
+            assert_eq!(
+                client
+                    .ask(&format!("echo {secret}"), &question)
+                    .await
+                    .unwrap(),
+                "values omitted"
+            );
         });
     }
 
@@ -510,10 +548,16 @@ mod tests {
     fn oversized_direct_question_is_refused_before_provider_admission() {
         asupersync::test_utils::run_test(|| async {
             let client = BtwClient::new(
-                Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+                Arc::new(ScriptedProvider(
+                    Vec::new(),
+                    Some("must not be invoked".to_string()),
+                )),
                 Some("test-key".to_string()),
             );
-            let error = client.ask("", &"x".repeat(MAX_INPUT_BYTES + 1)).await.unwrap_err();
+            let error = client
+                .ask("", &"x".repeat(MAX_INPUT_BYTES + 1))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
         });
     }
@@ -524,9 +568,15 @@ mod tests {
             .build()
             .unwrap();
         let owner = crate::agent_cx::AgentCx::for_request();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel side question"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel side question"),
+        );
         let client = BtwClient::new(
-            Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+            Arc::new(ScriptedProvider(
+                Vec::new(),
+                Some("must not be invoked".to_string()),
+            )),
             Some("test-key".to_string()),
         );
         let error = runtime
@@ -548,7 +598,10 @@ mod tests {
             crate::agent_cx::AgentCx::for_current_or_request()
         };
         let client = BtwClient::new(
-            Arc::new(ScriptedProvider(Vec::new(), Some("must not be invoked".to_string()))),
+            Arc::new(ScriptedProvider(
+                Vec::new(),
+                Some("must not be invoked".to_string()),
+            )),
             Some("test-key".to_string()),
         );
         let error = runtime

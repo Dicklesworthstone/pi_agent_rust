@@ -10,11 +10,11 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, StopReason, StreamEvent};
 
 mod request;
-pub(crate) use request::{RequestStop, with_timeout};
+pub use request::{RequestStop, with_timeout};
 
 /// Auxiliary calls request only a few hundred tokens. Bound host-side output
 /// too: a provider or extension is not obliged to honor max_tokens.
-pub(crate) const MAX_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_STREAM_EVENTS: usize = 65_536;
 /// A ready stream must return control to its deadline/owner, not consume the
 /// entire event budget in one poll. This is a scheduling bound, independent
@@ -22,9 +22,9 @@ const MAX_STREAM_EVENTS: usize = 65_536;
 const READY_EVENT_BATCH: usize = 64;
 /// Bound the raw input before cloning or applying the detector. A projection
 /// that cannot inspect a field must omit it, never send an unscreened prefix.
-pub(crate) const MAX_INPUT_BYTES: usize = 256 * 1024;
+pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 const MAX_INPUT_PARTS: usize = 256;
-pub(crate) const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan budget]";
+pub const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan budget]";
 
 /// Screen a complete set of text inputs before formatting or truncation.
 ///
@@ -35,11 +35,11 @@ pub(crate) const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan
 /// echoes. Disposable-vault IDs become non-restorable markers before a prompt
 /// reaches another model or a verdict is injected into the main conversation.
 /// Authentication headers and caller-owned text are not touched.
-pub(crate) fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
+pub fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
     let bytes = parts
         .iter()
         .try_fold(0usize, |total, part| total.checked_add(part.len()));
-    if parts.len() > MAX_INPUT_PARTS || !bytes.is_some_and(|total| total <= MAX_INPUT_BYTES) {
+    if parts.len() > MAX_INPUT_PARTS || bytes.is_none_or(|total| total > MAX_INPUT_BYTES) {
         return Err(Error::validation(
             "PI_AUXILIARY_INPUT_LIMIT: input exceeds the auxiliary privacy scan budget",
         ));
@@ -52,13 +52,17 @@ pub(crate) fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
         &[],
     )?;
     let serde_json::Value::Array(protected) = protected else {
-        return Err(Error::validation("auxiliary privacy projection changed input shape"));
+        return Err(Error::validation(
+            "auxiliary privacy projection changed input shape",
+        ));
     };
     protected
         .into_iter()
         .map(|part| match part {
             serde_json::Value::String(text) => Ok(vault.redact_placeholders(&text)),
-            _ => Err(Error::validation("auxiliary privacy projection changed text type")),
+            _ => Err(Error::validation(
+                "auxiliary privacy projection changed text type",
+            )),
         })
         .collect()
 }
@@ -70,7 +74,7 @@ pub(crate) fn redact_inputs(parts: &[&str]) -> Result<Vec<String>> {
 /// the wall-clock deadline around both stream creation and this drain.
 /// Ready streams yield after a bounded batch so that outer deadline and
 /// cancellation futures are polled even when the provider never returns Pending.
-pub(crate) async fn collect_text<S>(mut stream: S, max_bytes: usize) -> Result<String>
+pub async fn collect_text<S>(mut stream: S, max_bytes: usize) -> Result<String>
 where
     S: Stream<Item = Result<StreamEvent>> + Unpin,
 {
@@ -94,7 +98,9 @@ where
             StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallDelta { .. }
             | StreamEvent::ToolCallEnd { .. } => {
-                return Err(Error::api("tool-free text completion requested a tool call"));
+                return Err(Error::api(
+                    "tool-free text completion requested a tool call",
+                ));
             }
             StreamEvent::Error { error, .. } => {
                 return Err(Error::api(error.error_message.unwrap_or_else(|| {
@@ -141,7 +147,9 @@ where
             yield_ready_batch().await;
         }
     }
-    Err(Error::api("text completion stream ended without Done event"))
+    Err(Error::api(
+        "text completion stream ended without Done event",
+    ))
 }
 
 /// Yield exactly once after real progress. An idle provider is never
@@ -195,20 +203,29 @@ mod tests {
         let assignment = format!("API_KEY={secret}");
         let parts = [secret, assignment.as_str(), "ordinary context"];
         let protected = redact_inputs(&parts).unwrap();
-        assert_eq!(protected, [
-            "<pi-secret:redacted>",
-            "API_KEY=<pi-secret:redacted>",
-            "ordinary context",
-        ]);
+        assert_eq!(
+            protected,
+            [
+                "<pi-secret:redacted>",
+                "API_KEY=<pi-secret:redacted>",
+                "ordinary context",
+            ]
+        );
         assert_eq!(parts[0], secret, "source input is not mutated");
         let mut other_vault = crate::secrets::SecretVault::default();
         let _ = crate::secrets::obfuscate("sk-differentCredential123456789", &mut other_vault, &[]);
-        assert_eq!(other_vault.restore(&protected.join("\n")), protected.join("\n"));
+        assert_eq!(
+            other_vault.restore(&protected.join("\n")),
+            protected.join("\n")
+        );
     }
 
     #[test]
     fn input_projection_handles_multiline_keys_and_preserves_clean_text_exactly() {
-        let key = "-----BEGIN PRIVATE KEY-----\nprivate\\material\"here\n-----END PRIVATE KEY-----";
+        let key = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nprivate\\material\"here\n-----END PRIVATE KEY-----"
+        );
         let clean = "  α\r\n  code: C:\\work\\file\t\"quoted\"  ";
         let protected = redact_inputs(&[clean, key]).unwrap();
         assert_eq!(protected, [clean, "<pi-secret:redacted>"]);
@@ -218,7 +235,10 @@ mod tests {
     #[test]
     fn input_budget_refuses_without_exposing_or_slicing_the_input() {
         let input = "x".repeat(MAX_INPUT_BYTES);
-        assert_eq!(redact_inputs(&[&input]).unwrap(), [input.clone()]);
+        assert_eq!(
+            redact_inputs(&[&input]).unwrap(),
+            std::slice::from_ref(&input)
+        );
         let error = redact_inputs(&[&input, "SECRET-CANARY"]).unwrap_err();
         assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
         assert!(!error.to_string().contains("SECRET-CANARY"));
@@ -245,8 +265,8 @@ mod tests {
     #[test]
     fn clean_done_does_not_wait_for_connection_close() {
         asupersync::test_utils::run_test(|| async {
-            let stream = futures::stream::iter([Ok(done("done"))])
-                .chain(futures::stream::pending());
+            let stream =
+                futures::stream::iter([Ok(done("done"))]).chain(futures::stream::pending());
             assert_eq!(collect_text(stream, 16).await.unwrap(), "done");
         });
     }
@@ -273,26 +293,28 @@ mod tests {
                     ..Default::default()
                 },
             };
-            assert!(read(vec![delta("partial"), error], 64)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("upstream unavailable"));
+            assert!(
+                read(vec![delta("partial"), error], 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("upstream unavailable")
+            );
         });
     }
 
     #[test]
     fn transport_error_is_preserved() {
         asupersync::test_utils::run_test(|| async {
-            let stream = futures::stream::iter([
-                Ok(delta("partial")),
-                Err(Error::api("connection reset")),
-            ]);
-            assert!(collect_text(stream, 64)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("connection reset"));
+            let stream =
+                futures::stream::iter([Ok(delta("partial")), Err(Error::api("connection reset"))]);
+            assert!(
+                collect_text(stream, 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("connection reset")
+            );
         });
     }
 
@@ -334,9 +356,11 @@ mod tests {
     #[test]
     fn empty_terminal_does_not_fall_back_to_stale_preview() {
         asupersync::test_utils::run_test(|| async {
-            assert!(read(vec![delta("stale preview"), done(" \n")], 64)
-                .await
-                .is_err());
+            assert!(
+                read(vec![delta("stale preview"), done(" \n")], 64)
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -365,9 +389,11 @@ mod tests {
     #[test]
     fn output_budget_is_bytes_and_applies_to_deltas_and_terminal() {
         asupersync::test_utils::run_test(|| async {
-            assert!(read(vec![delta("abcd"), delta("e"), done("ok")], 4)
-                .await
-                .is_err());
+            assert!(
+                read(vec![delta("abcd"), delta("e"), done("ok")], 4)
+                    .await
+                    .is_err()
+            );
             assert!(read(vec![done("abcde")], 4).await.is_err());
             assert!(read(vec![done("éé")], 3).await.is_err());
             assert_eq!(read(vec![done("éé")], 4).await.unwrap(), "éé");
@@ -379,7 +405,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut event = done("abc");
             if let StreamEvent::Done { message, .. } = &mut event {
-                message.content.push(ContentBlock::Text(TextContent::new("def")));
+                message
+                    .content
+                    .push(ContentBlock::Text(TextContent::new("def")));
             }
             assert!(read(vec![event.clone()], 5).await.is_err());
             assert_eq!(read(vec![event], 6).await.unwrap(), "abcdef");
@@ -390,11 +418,13 @@ mod tests {
     fn empty_delta_flood_is_bounded() {
         asupersync::test_utils::run_test(|| async {
             let stream = futures::stream::iter((0..=MAX_STREAM_EVENTS).map(|_| Ok(delta(""))));
-            assert!(collect_text(stream, 64)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("event budget"));
+            assert!(
+                collect_text(stream, 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("event budget")
+            );
         });
     }
 
@@ -457,10 +487,8 @@ mod tests {
     #[test]
     fn terminal_response_survives_multiple_cooperative_batches() {
         asupersync::test_utils::run_test(|| async {
-            let stream = futures::stream::iter(
-                (0..READY_EVENT_BATCH * 3).map(|_| Ok(delta(""))),
-            )
-            .chain(futures::stream::iter([Ok(done("complete"))]));
+            let stream = futures::stream::iter((0..READY_EVENT_BATCH * 3).map(|_| Ok(delta(""))))
+                .chain(futures::stream::iter([Ok(done("complete"))]));
             assert_eq!(collect_text(stream, 64).await.unwrap(), "complete");
         });
     }
@@ -517,7 +545,10 @@ mod tests {
             )));
             assert!(futures::poll!(&mut request).is_pending());
             assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("stream cancelled"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("stream cancelled"),
+            );
             assert!(matches!(request.await, Err(RequestStop::Cancelled)));
             assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
             assert!(!asupersync::Cx::current().unwrap().is_cancel_requested());

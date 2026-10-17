@@ -1818,18 +1818,12 @@ fn build_openai_responses_input(
                 }],
             }),
             Message::Assistant(assistant) => {
-                // TS parity (`convertResponsesMessages`): when this assistant
-                // turn was produced by a *different model*, none of its
-                // captured raw-item metadata may be replayed: OpenAI validates
-                // reasoning/function-call pairing per model, and another
-                // model's `encrypted_content` cannot be decrypted. The TS
-                // reference gets this via `transformMessages` (which strips
-                // thinking/text/thought signatures for non-same-model turns)
-                // plus the `isDifferentModel` fc-id gate in
-                // `convertResponsesMessages`; pi-rust has no transform layer
-                // yet, so the gate lives here. Same-provider/api comparison
-                // keeps foreign-api turns on the existing prefix/JSON gates.
-                let is_different_model = assistant.model != model
+                // Raw output items belong to one provider, API and model.
+                // Another endpoint can use the same item-id prefixes without
+                // being able to decrypt its reasoning or resolve its IDs.
+                // Gate here as well as in Agent screening: direct Provider
+                // callers and embedded `call_id|fc_id` metadata also reach us.
+                let same_origin = assistant.model == model
                     && assistant.provider == provider
                     && assistant.api == api;
                 // Preserve ordering between text and tool calls.
@@ -1850,10 +1844,10 @@ fn build_openai_responses_input(
                 for block in &assistant.content {
                     match block {
                         ContentBlock::Text(t) => {
-                            let replay_id = if is_different_model {
-                                None
-                            } else {
+                            let replay_id = if same_origin {
                                 replayable_message_item_id(t)
+                            } else {
+                                None
                             };
                             if let Some(item_id) = replay_id {
                                 // Replay the original `message` output item with
@@ -1892,13 +1886,12 @@ fn build_openai_responses_input(
                         }
                         ContentBlock::Thinking(thinking) => {
                             // Replay raw reasoning items (with encrypted_content)
-                            // captured from a previous Responses stream — but
-                            // never across models: OpenAI cannot decrypt
-                            // another model's encrypted_content. Thinking
+                            // captured from a previous Responses stream only
+                            // to its original provider, API and model. Thinking
                             // blocks without a replayable raw item keep the
                             // legacy behavior of being dropped without
                             // flushing text.
-                            if !is_different_model
+                            if same_origin
                                 && let Some(raw_item) = replayable_reasoning_item(thinking)
                             {
                                 flush_pending(&mut pending_text, &mut input);
@@ -1910,10 +1903,10 @@ fn build_openai_responses_input(
                             let (call_id, embedded_item_id) = split_responses_tool_call_id(&tc.id);
                             input.push(OpenAIResponsesInputItem::FunctionCall {
                                 r#type: "function_call",
-                                id: if is_different_model {
-                                    None
-                                } else {
+                                id: if same_origin {
                                     replayable_function_call_item_id(tc, embedded_item_id)
+                                } else {
+                                    None
                                 },
                                 call_id: call_id.to_string(),
                                 name: tc.name.clone(),
@@ -3147,65 +3140,87 @@ mod tests {
         );
     }
 
-    /// TS-net parity: an assistant turn produced by a different model on the
-    /// same provider/api must not replay any captured raw-item metadata —
-    /// OpenAI validates reasoning/function-call pairing per model and cannot
-    /// decrypt another model's `encrypted_content` (in TS, `transformMessages`
-    /// strips the signatures and `isDifferentModel` gates the fc id). The
-    /// request falls back to the legacy shape.
+    /// Foreign origins must not replay raw reasoning or output-item IDs,
+    /// including IDs embedded in tool-call correlation strings. Ordinary
+    /// assistant text, tool arguments and call/result pairing survive.
     #[test]
-    fn test_build_request_omits_raw_item_replay_for_different_model_same_api() {
+    fn test_build_request_omits_raw_item_replay_for_foreign_origin() {
         let provider = OpenAIResponsesProvider::new("gpt-test");
-        let other_model = Message::Assistant(std::sync::Arc::new(AssistantMessage {
-            content: vec![
-                ContentBlock::Thinking(ThinkingContent {
-                    thinking: "Plan the echo.".to_string(),
-                    thinking_signature: Some(raw_reasoning_item().to_string()),
-                }),
-                ContentBlock::Text(TextContent {
-                    text: "Calling echo.".to_string(),
-                    text_signature: Some("msg_1".to_string()),
-                }),
-                ContentBlock::ToolCall(ToolCall {
-                    id: "call_1".to_string(),
-                    name: "echo".to_string(),
-                    arguments: json!({ "text": "hi" }),
-                    thought_signature: Some("fc_1".to_string()),
-                }),
-            ],
-            api: "openai-responses".to_string(),
-            provider: "openai".to_string(),
-            model: "gpt-other".to_string(),
-            usage: Usage::default(),
-            stop_reason: StopReason::ToolUse,
-            stop_details: None,
-            error_message: None,
-            timestamp: 0,
-        }));
-        let context = Context::owned(
-            None,
-            vec![other_model, tool_result_message("call_1", "ok")],
-            vec![],
-        );
+        for (source_api, source_provider, source_model) in [
+            ("openai-responses", "openai", "gpt-other"),
+            ("openai-responses", "other-provider", "gpt-test"),
+            ("other-api", "openai", "gpt-test"),
+            ("", "", ""),
+        ] {
+            let foreign = Message::Assistant(std::sync::Arc::new(AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking: "Plan the echo.".to_string(),
+                        thinking_signature: Some(raw_reasoning_item().to_string()),
+                    }),
+                    ContentBlock::Text(TextContent {
+                        text: "Calling echo.".to_string(),
+                        text_signature: Some("msg_1".to_string()),
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "text": "hi" }),
+                        thought_signature: Some("fc_1".to_string()),
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_2|fc_2".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "text": "again" }),
+                        thought_signature: None,
+                    }),
+                ],
+                api: source_api.to_string(),
+                provider: source_provider.to_string(),
+                model: source_model.to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            }));
+            let context = Context::owned(
+                None,
+                vec![
+                    foreign,
+                    tool_result_message("call_1", "ok"),
+                    tool_result_message("call_2|fc_2", "again ok"),
+                ],
+                vec![],
+            );
 
-        let request = provider.build_request(&context, &StreamOptions::default());
-        let value = serde_json::to_value(&request).expect("serialize request");
-        assert_eq!(
-            value["input"],
-            json!([
-                {
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "Calling echo." }]
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "echo",
-                    "arguments": "{\"text\":\"hi\"}"
-                },
-                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
-            ])
-        );
+            let request = provider.build_request(&context, &StreamOptions::default());
+            let value = serde_json::to_value(&request).expect("serialize request");
+            assert_eq!(
+                value["input"],
+                json!([
+                    {
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Calling echo." }]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "echo",
+                        "arguments": "{\"text\":\"hi\"}"
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "echo",
+                        "arguments": "{\"text\":\"again\"}"
+                    },
+                    { "type": "function_call_output", "call_id": "call_1", "output": "ok" },
+                    { "type": "function_call_output", "call_id": "call_2", "output": "again ok" }
+                ]),
+                "origin: {source_provider}/{source_api}/{source_model}"
+            );
+        }
     }
 
     #[test]

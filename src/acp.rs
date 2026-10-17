@@ -27,6 +27,10 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::significant_drop_tightening)]
 
+mod content;
+mod history;
+mod mcp;
+
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
     ToolApprovalRequest,
@@ -185,6 +189,8 @@ struct AcpSessionState {
     /// out during prompt execution without holding the session lock.
     agent_session: Option<AgentSession>,
     cwd: PathBuf,
+    /// Remains reachable during a turn so EOF/exit can close external tools.
+    mcp: Option<Arc<mcp::SessionMcp>>,
 }
 
 // ============================================================================
@@ -205,9 +211,9 @@ pub struct AcpOptions {
     pub auth: AuthStorage,
     pub runtime_handle: RuntimeHandle,
     /// When set (from the `--session-dir` CLI flag), ACP sessions persist to
-    /// this directory and autosave is enabled, so they can be resumed later via
-    /// `pi --session`/`--resume` (#102). When `None`, ACP keeps its in-memory,
-    /// non-persisted behavior.
+    /// this directory and autosave is enabled. After an editor restart they
+    /// can be reopened by ID via `session/load` or `session/resume`, as well
+    /// as via `pi --session`/`--resume`. When `None`, sessions remain in-memory.
     pub session_dir: Option<PathBuf>,
     /// The "available skills" system-prompt block, rendered by the host from
     /// its resource loader (`--no-skills` and trust applied), so the model
@@ -363,6 +369,8 @@ async fn run(
         Arc::new(Mutex::new(HashMap::new()));
     let initialized = Arc::new(AtomicBool::new(false));
 
+    // Capture dispatch errors so every exit path still tears down MCP state.
+    let result: Result<()> = async {
     while let Ok(line) = in_rx.recv(&cx).await {
         let raw_message: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
@@ -439,6 +447,15 @@ async fn run(
                     continue;
                 }
 
+                // Validate the entire definition list before constructing state.
+                // The constructor repeats this for non-dispatch callers/tests.
+                let validated = history::requested_cwd(&request.params)
+                    .map_err(|error| error.message)
+                    .and_then(|cwd| crate::mcp::config::parse_acp_servers(&request.params, &cwd).map(|_| ()));
+                if let Err(error) = validated {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                    continue;
+                }
                 let permission_client = AcpPermissionClient {
                     out_tx: out_tx.clone(),
                     pending: Arc::clone(&pending_permissions),
@@ -475,8 +492,11 @@ async fn run(
                         ];
 
                         let config_options = config_options_for(&state, &options.available_models);
+                        let mcp_state = state.mcp.clone();
                         let state_arc = Arc::new(Mutex::new(state));
-                        if let Ok(mut guard) = sessions.lock(&cx).await {
+                        {
+                            let mut guard = sessions.lock(&cx).await
+                                .map_err(|_| Error::session("Session registry is unavailable"))?;
                             guard.insert(session_id.clone(), state_arc);
                         }
 
@@ -492,6 +512,10 @@ async fn run(
                                 "modes": modes,
                             }),
                         ));
+                        if let Some(mcp_state) = mcp_state {
+                            mcp::announce(&mcp_state, &session_id, &out_tx).await
+                                .map_err(Error::session)?;
+                        }
                     }
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(
@@ -528,9 +552,9 @@ async fn run(
                     continue;
                 };
 
-                // ACP wire shape: `prompt` is a ContentBlock[]. Concatenate text
-                // blocks; anything we don't yet support (image/audio/resource)
-                // surfaces a clear capability error rather than silently dropping.
+                // Decode the complete ContentBlock[] before starting a turn.
+                // Images stay native image blocks, and embedded editor context
+                // retains its provenance without implicitly opening its URI.
                 let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
                 let Some(prompt_blocks) = prompt_blocks else {
                     let _ = out_tx.send(json_rpc_error(
@@ -541,8 +565,15 @@ async fn run(
                     continue;
                 };
 
-                let message_text = match extract_prompt_text(prompt_blocks) {
-                    Ok(text) => text,
+                let mcp_command = match mcp::command_from_prompt(prompt_blocks) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                        continue;
+                    }
+                };
+                let message_content = match content::extract_prompt_content(prompt_blocks) {
+                    Ok(content) => content,
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
                         continue;
@@ -586,7 +617,9 @@ async fn run(
                 let _ = prompt_counter.fetch_add(1, Ordering::SeqCst);
 
                 let (abort_handle, abort_signal) = AbortHandle::new();
-                if let Ok(mut guard) = active_prompts.lock(&cx).await {
+                {
+                    let mut guard = active_prompts.lock(&cx).await
+                        .map_err(|_| Error::session("Active prompt registry is unavailable"))?;
                     guard.insert(session_id.clone(), abort_handle);
                 }
 
@@ -602,7 +635,8 @@ async fn run(
                 options.runtime_handle.spawn(async move {
                     let stop_reason = run_prompt(
                         session_state,
-                        message_text,
+                        message_content,
+                        mcp_command,
                         abort_signal,
                         out_tx_prompt.clone(),
                         prompt_session_id.clone(),
@@ -655,114 +689,78 @@ async fn run(
             }
 
             "session/list" => {
-                let entries: Vec<(String, Arc<Mutex<AcpSessionState>>)> =
-                    sessions.lock(&cx).await.map_or_else(
-                        |_| Vec::new(),
-                        |guard| {
-                            guard
-                                .iter()
-                                .map(|(sid, state)| (sid.clone(), Arc::clone(state)))
-                                .collect()
-                        },
-                    );
-                // ACP SessionInfo requires `cwd` alongside `sessionId`.
-                let mut session_list: Vec<Value> = Vec::with_capacity(entries.len());
-                for (sid, state) in entries {
-                    let cwd = state
-                        .lock(&cx)
-                        .await
-                        .map(|guard| guard.cwd.display().to_string())
-                        .unwrap_or_default();
-                    session_list.push(json!({ "sessionId": sid, "cwd": cwd }));
+                if !initialized.load(Ordering::SeqCst) {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
+                    continue;
                 }
-
-                let _ = out_tx.send(json_rpc_ok(id, json!({ "sessions": session_list })));
+                let response = match history::list(&request.params, &options, &sessions, &cx).await {
+                    Ok(result) => json_rpc_ok(id, result),
+                    Err(error) => json_rpc_error(id, error.code, error.message),
+                };
+                history::send_line(&out_tx, response)
+                    .await
+                    .map_err(|error| Error::session(error.message))?;
             }
 
-            "session/load" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
-                    ));
+            "session/load" | "session/resume" => {
+                if !initialized.load(Ordering::SeqCst) {
+                    let _ = out_tx.send(json_rpc_error(id, INVALID_REQUEST, "Server not initialized"));
                     continue;
+                }
+                let session_id = match history::requested_session_id(&request.params) {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(id, error.code, error.message));
+                        continue;
+                    }
                 };
-
-                let exists = sessions
+                // Check the reservation as well as agent_session: a spawned
+                // prompt may not yet have taken the agent out of its state.
+                let busy = active_prompts
                     .lock(&cx)
                     .await
-                    .is_ok_and(|guard| guard.contains_key(&session_id));
-
-                if exists {
-                    let models: Vec<AcpModel> = options
-                        .available_models
-                        .iter()
-                        .map(|entry| AcpModel {
-                            id: entry.model.id.clone(),
-                            name: entry.model.name.clone(),
-                            provider: Some(entry.model.provider.clone()),
-                        })
-                        .collect();
-
-                    let _ = out_tx.send(json_rpc_ok(
-                        id,
-                        json!({
-                            "sessionId": session_id,
-                            "models": models,
-                        }),
-                    ));
-                } else {
+                    .map_err(|error| Error::session(format!("Active prompt registry unavailable: {error}")))?
+                    .contains_key(session_id);
+                if busy {
                     let _ = out_tx.send(json_rpc_error(
                         id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
-                }
-            }
-
-            "session/resume" => {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-
-                let Some(session_id) = session_id else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        INVALID_PARAMS,
-                        "Missing required parameter: sessionId",
+                        PROMPT_IN_PROGRESS,
+                        "Cannot load or resume a session while a prompt is in progress",
                     ));
                     continue;
-                };
-
-                let exists = sessions
-                    .lock(&cx)
-                    .await
-                    .is_ok_and(|guard| guard.contains_key(&session_id));
-
-                if exists {
-                    let _ = out_tx.send(json_rpc_ok(
-                        id,
-                        json!({
-                            "sessionId": session_id,
-                            "resumed": true,
-                        }),
-                    ));
-                } else {
-                    let _ = out_tx.send(json_rpc_error(
-                        id,
-                        SESSION_NOT_FOUND,
-                        format!("Session not found: {session_id}"),
-                    ));
                 }
+                let permission_client = AcpPermissionClient {
+                    out_tx: out_tx.clone(),
+                    pending: Arc::clone(&pending_permissions),
+                    request_counter: Arc::clone(&permission_counter),
+                    timeout: acp_permission_timeout(),
+                    cx: cx.clone(),
+                };
+                let replay = request.method == "session/load";
+                let result = history::load(
+                    &request.params,
+                    &options,
+                    &permission_client,
+                    &sessions,
+                    &cx,
+                    &out_tx,
+                    replay,
+                )
+                .await;
+                // All replay notifications precede this response. Resume is
+                // intentionally history-free for clients that kept their view.
+                let response = match result {
+                    Ok(mut result) => {
+                        if !replay {
+                            result["resumed"] = json!(true);
+                        }
+                        json_rpc_ok(id, result)
+                    }
+                    Err(error) => json_rpc_error(id, error.code, error.message),
+                };
+                history::send_line(&out_tx, response)
+                    .await
+                    .map_err(|error| Error::session(error.message))?;
             }
 
             // Dynamic, per-session model switch (#105). Switches the live
@@ -1050,8 +1048,16 @@ async fn run(
             }
         }
     }
-
     Ok(())
+    }.await;
+
+    let cleanup = AgentCx::for_request();
+    if let Ok(guard) = active_prompts.lock(&cleanup).await {
+        for abort in guard.values() { abort.abort(); }
+    }
+    if let Ok(mut pending) = pending_permissions.lock() { pending.clear(); }
+    mcp::shutdown(&sessions).await;
+    result
 }
 
 // ============================================================================
@@ -1247,20 +1253,14 @@ fn handle_initialize() -> Value {
             "version": version,
         },
         "agentCapabilities": {
-            // Sessions live only in-process; we do not rehydrate persisted history.
-            "loadSession": false,
+            // Loads replay the selected conversation before responding and
+            // reopen persisted stores when --session-dir is configured.
+            "loadSession": true,
             "mcpCapabilities": {
-                "http": false,
+                "http": true,
                 "sse": false,
             },
-            "promptCapabilities": {
-                "audio": false,
-                "embeddedContext": false,
-                "image": false,
-            },
-            // `session/list` is implemented (GH #245). `loadSession` stays
-            // false: ACP's `session/load` must replay the whole conversation
-            // as `session/update`s, and ours only re-attaches a live session.
+            "promptCapabilities": content::prompt_capabilities(),
             "sessionCapabilities": { "list": {} },
             "_meta": {
                 "pi.dev": {
@@ -1468,25 +1468,53 @@ fn handle_session_new(
     options: &AcpOptions,
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
-    let cwd = params.get("cwd").and_then(Value::as_str).map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        PathBuf::from,
-    );
+    let cwd = history::requested_cwd(params).map_err(|error| Error::session(error.message))?;
+    let servers = crate::mcp::config::parse_acp_servers(params, &cwd)
+        .map_err(Error::session)?.unwrap_or_default();
 
     // Create the backing session. Persists to disk when --session-dir is set
     // (save_enabled), otherwise in-memory (existing default behavior).
     let (session, save_enabled) =
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
+    let (id, mut state) = build_acp_session(session, save_enabled, cwd.clone(), options, permission_client)?;
+    let mcp_state = mcp::prepare(&cwd, &Config::global_dir(), servers);
+    if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
+        mcp::mount(agent, mcp_state);
+    }
+    state.mcp = mcp_state;
+    Ok((id, state))
+}
+
+/// New and reopened sessions use the same tool registry, approval handler,
+/// auth resolution, system prompt, and persistence owner. Restore the selected
+/// branch's settings instead of another branch's header tip or startup defaults.
+fn build_acp_session(
+    session: Session,
+    save_enabled: bool,
+    cwd: PathBuf,
+    options: &AcpOptions,
+    permission_client: Option<&AcpPermissionClient>,
+) -> Result<(String, AcpSessionState)> {
     let session_id = session.header.id.clone();
 
     let enabled_tools = acp_enabled_tools();
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
 
-    // ACP should respect the same configured default provider/model preference
-    // as the normal startup path instead of picking an arbitrary ready model.
-    let model_entry = select_acp_model_entry(&options.config, &options.available_models)
-        .ok_or_else(|| Error::provider("acp", "No models available"))?;
+    let model_entry = if let Some((provider, model)) = session.effective_model_for_current_path() {
+        options.model_registry.find(&provider, &model).ok_or_else(|| {
+            Error::provider("acp", format!("Saved session model is not registered: {provider}/{model}"))
+        })?
+    } else {
+        select_acp_model_entry(&options.config, &options.available_models)
+            .ok_or_else(|| Error::provider("acp", "No models available"))?
+    };
+    let thinking_level = match session.effective_thinking_level_for_current_path() {
+        Some(level) => model_entry.clamp_thinking_level(level.parse().map_err(|_| {
+            Error::session("Saved session has an invalid thinking level")
+        })?),
+        None => resolve_acp_thinking_level(&options.config, &model_entry),
+    };
 
     let provider = providers::create_provider(&model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
@@ -1510,7 +1538,7 @@ fn handle_session_new(
 
     let stream_options = StreamOptions {
         api_key,
-        thinking_level: Some(resolve_acp_thinking_level(&options.config, &model_entry)),
+        thinking_level: Some(thinking_level),
         headers: model_entry.headers.clone(),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so ACP sessions honor the configured limit instead of the provider's
@@ -1568,6 +1596,7 @@ fn handle_session_new(
         AcpSessionState {
             agent_session: Some(agent_session),
             cwd,
+            mcp: None,
         },
     ))
 }
@@ -1834,40 +1863,106 @@ async fn apply_set_config_option(
 /// `session/prompt` response (which only completes when the turn does).
 async fn run_prompt(
     session_state: Arc<Mutex<AcpSessionState>>,
-    message: String,
+    message: Vec<ContentBlock>,
+    mcp_command: Option<mcp::Command>,
     abort_signal: AbortSignal,
     out_tx: std::sync::mpsc::SyncSender<String>,
     session_id: String,
     cx: AgentCx,
 ) -> &'static str {
+    if abort_signal.is_aborted() || cx.is_cancel_requested() {
+        return ACP_STOP_REASON_CANCELLED;
+    }
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
     // Take the agent_session out of the lock, run the prompt, then put it back.
     // Holding the session mutex across the whole turn would block session/cancel
     // and session/list. The concurrent-prompt guard upstream guarantees only one
     // task is in here per session at a time, so the Option swap is safe.
-    let mut agent_session = {
-        let Ok(mut guard) = session_state.lock(&cx).await else {
-            return ACP_STOP_REASON_ERROR;
-        };
-        let Some(agent) = guard.agent_session.take() else {
-            return ACP_STOP_REASON_ERROR;
-        };
-        agent
+    let taken = match session_state.lock(&cx).await {
+        Ok(mut guard) => guard
+            .agent_session
+            .take()
+            .map(|agent| (agent, guard.mcp.clone()))
+            .ok_or_else(|| Error::session("Agent session is unavailable while a prompt is active")),
+        Err(error) => Err(Error::from(error)),
+    };
+    let (mut agent_session, mcp_state) = match taken {
+        Ok(taken) => taken,
+        Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
 
-    let result = agent_session
-        .run_text_with_abort(message, Some(abort_signal), event_handler)
-        .await;
+    let prepared = mcp::before_prompt(
+        mcp_state.as_ref(), &mut agent_session, mcp_command,
+        &abort_signal, &cx, &out_tx, &session_id,
+    ).await;
+    let stop_reason = if let Some(reason) = prepared {
+        reason
+    } else {
+        match agent_session
+            .run_with_content_with_abort(message, Some(abort_signal), event_handler)
+            .await
+        {
+            Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
+                let error = Error::provider(
+                    message.provider,
+                    message
+                        .error_message
+                        .unwrap_or_else(|| "Request failed".to_string()),
+                );
+                report_prompt_error(&out_tx, &session_id, &error).await
+            }
+            Ok(message) => map_stop_reason(message.stop_reason),
+            Err(error) => report_prompt_error(&out_tx, &session_id, &error).await,
+        }
+    };
 
     if let Ok(mut guard) = session_state.lock(&cx).await {
         guard.agent_session = Some(agent_session);
     }
 
-    match result {
-        Ok(msg) => map_stop_reason(msg.stop_reason),
-        Err(_) => ACP_STOP_REASON_ERROR,
+    stop_reason
+}
+
+/// ACP has no error stop reason. Emit one notice after the complete session
+/// outcome, including its save: stream terminals are deliberately not rendered
+/// by `build_acp_event_handler`, so `Error`/`MessageEnd`/`AgentEnd` events cannot
+/// duplicate this notice. MCP operator responses use their own completed path.
+async fn report_prompt_error(
+    out_tx: &std::sync::mpsc::SyncSender<String>,
+    session_id: &str,
+    error: &Error,
+) -> &'static str {
+    if matches!(error, Error::Aborted) {
+        return ACP_STOP_REASON_CANCELLED;
     }
+    let summary = if error.is_session_persistence() {
+        "Session persistence failed. Further prompts are blocked for this session. \
+         Check storage space and permissions, then start a new session or resume the saved session."
+            .to_string()
+    } else if let Error::Provider { provider, message } = error {
+        let summary = crate::error::ProviderErrorSummary::from_error_text(Some(provider), message);
+        format!("{}\n{}", summary.headline(), summary.retry_note(None))
+    } else {
+        // Hint context and raw provider payloads can contain credentials,
+        // private prompts or paths. Only the public category summary is sent.
+        error.hints().summary
+    };
+    let _ = history::send_line(
+        out_tx,
+        json_rpc_notification(
+            "session/update",
+            json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("\n\nError: {summary}\n") },
+                },
+            }),
+        ),
+    )
+    .await;
+    ACP_STOP_REASON_ERROR
 }
 
 // ACP stopReason values per the protocol spec.
@@ -1875,8 +1970,8 @@ const ACP_STOP_REASON_END_TURN: &str = "end_turn";
 const ACP_STOP_REASON_MAX_TOKENS: &str = "max_tokens";
 const ACP_STOP_REASON_CANCELLED: &str = "cancelled";
 // Spec lists: end_turn | max_tokens | max_turn_requests | refusal | cancelled.
-// We collapse provider/local errors into end_turn so the response stays well-formed;
-// the error text has already been streamed via session/update.
+// Provider/local errors use end_turn to keep the response well-formed;
+// report_prompt_error publishes their safe summary before the response.
 const ACP_STOP_REASON_ERROR: &str = "end_turn";
 
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
@@ -1891,11 +1986,8 @@ const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     }
 }
 
-/// Extract a single text string from an ACP `prompt: ContentBlock[]`.
-///
-/// Per the spec, baseline support is `text` and `resource_link` blocks. We accept
-/// either, concatenate text and link URIs in order, and reject any block whose
-/// type we did not advertise as supported in `agentCapabilities.promptCapabilities`.
+/// Extract baseline text/link content. Rich prompt blocks are handled by the
+/// content module and must never be flattened through this text-only helper.
 fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> {
     let mut out = String::new();
     for block in blocks {
@@ -1913,8 +2005,7 @@ fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> 
                 out.push_str(text);
             }
             "resource_link" => {
-                // Surface the URI inline. Clients that want richer handling can
-                // upgrade once we advertise embeddedContext: true.
+                // Surface the URI inline without implicitly opening it.
                 let Some(uri) = block.get("uri").and_then(Value::as_str) else {
                     return Err(
                         "Prompt block of type \"resource_link\" missing required field \"uri\""
@@ -1933,7 +2024,7 @@ fn extract_prompt_text(blocks: &[Value]) -> std::result::Result<String, String> 
             }
             other => {
                 return Err(format!(
-                    "Prompt block type \"{other}\" is not supported by this agent (advertised capabilities only allow text and resource_link)"
+                    "Prompt block type \"{other}\" is not supported by the text-only content decoder"
                 ));
             }
         }
@@ -1994,25 +2085,14 @@ fn build_acp_event_handler(
                 args: _,
                 partial_result,
             } => {
-                let content_text = partial_result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tool_content = content::tool_result_content(&partial_result.content);
                 let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
                     "status": "in_progress",
                 });
-                if !content_text.is_empty() {
-                    update["content"] = json!([{
-                        "type": "content",
-                        "content": { "type": "text", "text": content_text },
-                    }]);
+                if !tool_content.is_empty() {
+                    update["content"] = json!(tool_content);
                 }
                 Some(update)
             }
@@ -2023,24 +2103,13 @@ fn build_acp_event_handler(
                 result,
                 is_error,
             } => {
-                let content_text = result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let tool_content = content::tool_result_content(&result.content);
 
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
                     "status": if *is_error { "failed" } else { "completed" },
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": content_text },
-                    }],
+                    "content": tool_content,
                 }))
             }
 
@@ -2103,9 +2172,286 @@ fn classify_tool_kind(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AssistantMessage, StopReason, StreamEvent, TextContent};
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Copy)]
+    enum PromptTestOutcome {
+        Complete,
+        OpenError,
+        StreamError,
+        Aborted,
+        StreamAborted,
+    }
+
+    struct PromptTestProvider {
+        outcome: PromptTestOutcome,
+        calls: AtomicUsize,
+        save_fault: Option<(Arc<Mutex<Session>>, PathBuf)>,
+    }
+
+    const PRIVATE_PROMPT_ERROR: &str =
+        "HTTP 503: {\"authorization\":\"PRIVATE-CREDENTIAL\",\"prompt\":\"PRIVATE-PROMPT\"}";
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for PromptTestProvider {
+        fn name(&self) -> &str {
+            "acp-test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "acp-test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "acp-test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((stored, path)) = &self.save_fault {
+                stored.try_lock().expect("prompt already persisted").path = Some(path.clone());
+            }
+            match self.outcome {
+                PromptTestOutcome::OpenError => {
+                    return Err(Error::provider(self.name(), PRIVATE_PROMPT_ERROR));
+                }
+                PromptTestOutcome::Aborted => return Err(Error::Aborted),
+                _ => {}
+            }
+            let partial = AssistantMessage {
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                api: self.api().to_string(),
+                ..AssistantMessage::default()
+            };
+            let mut message = partial.clone();
+            let mut events = vec![Ok(StreamEvent::Start { partial })];
+            if matches!(self.outcome, PromptTestOutcome::Complete) {
+                message.content = vec![ContentBlock::Text(TextContent::new("Provider reply"))];
+                events.push(Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Provider reply".to_string(),
+                }));
+                events.push(Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }));
+            } else {
+                message.stop_reason = if matches!(self.outcome, PromptTestOutcome::StreamAborted) {
+                    StopReason::Aborted
+                } else {
+                    StopReason::Error
+                };
+                message.error_message = Some(PRIVATE_PROMPT_ERROR.to_string());
+                events.push(Ok(StreamEvent::Error {
+                    reason: message.stop_reason,
+                    error: message,
+                }));
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn prompt_test_state(
+        root: &std::path::Path,
+        outcome: PromptTestOutcome,
+        fail_after_provider: bool,
+    ) -> (
+        Arc<Mutex<AcpSessionState>>,
+        Arc<PromptTestProvider>,
+        Arc<Mutex<Session>>,
+    ) {
+        let mut stored = Session::create_with_dir_and_store(
+            Some(root.to_path_buf()),
+            SessionStoreKind::Jsonl,
+        );
+        stored.set_model_header(
+            Some("acp-test-provider".to_string()),
+            Some("acp-test-model".to_string()),
+            Some("off".to_string()),
+        );
+        stored.save().await.expect("persist initial metadata");
+        let stored = Arc::new(Mutex::new(stored));
+        let provider = Arc::new(PromptTestProvider {
+            outcome,
+            calls: AtomicUsize::new(0),
+            save_fault: fail_after_provider.then(|| (Arc::clone(&stored), root.to_path_buf())),
+        });
+        let agent = crate::agent::Agent::new(
+            Arc::clone(&provider) as Arc<dyn crate::provider::Provider>,
+            ToolRegistry::new(&[], root, None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::clone(&stored),
+            true,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        );
+        let state = Arc::new(Mutex::new(AcpSessionState {
+            agent_session: Some(session),
+            cwd: root.to_path_buf(),
+            mcp: None,
+        }));
+        (state, provider, stored)
+    }
+
+    async fn drive_test_prompt(
+        state: Arc<Mutex<AcpSessionState>>,
+        signal: AbortSignal,
+    ) -> (&'static str, Vec<Value>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let reason = run_prompt(
+            state,
+            vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+            None,
+            signal,
+            tx,
+            "editor-session".to_string(),
+            AgentCx::for_current_or_request(),
+        )
+        .await;
+        let updates = rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).expect("ACP notification"))
+            .collect();
+        (reason, updates)
+    }
+
+    fn prompt_notice_text(update: &Value) -> &str {
+        assert_eq!(update["method"], "session/update");
+        assert_eq!(update["params"]["sessionId"], "editor-session");
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        update["params"]["update"]["content"]["text"]
+            .as_str()
+            .expect("text notice")
+    }
+
+    #[test]
+    fn prompt_errors_are_reported_once_without_private_provider_payloads() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for outcome in [PromptTestOutcome::OpenError, PromptTestOutcome::StreamError] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, _) = prompt_test_state(root.path(), outcome, false).await;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    updates.len(),
+                    1,
+                    "stream terminal and result must not duplicate errors"
+                );
+                let text = prompt_notice_text(&updates[0]);
+                assert!(text.contains("HTTP 503"), "{text}");
+                assert!(!text.contains("PRIVATE-CREDENTIAL"));
+                assert!(!text.contains("PRIVATE-PROMPT"));
+            }
+        });
+    }
+
+    #[test]
+    fn prompt_save_failure_and_quarantine_are_visible_before_returning_to_the_editor() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for after_provider in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, stored) = prompt_test_state(
+                    root.path(),
+                    PromptTestOutcome::Complete,
+                    after_provider,
+                )
+                .await;
+                let original = stored.try_lock().unwrap().path.clone();
+                if !after_provider {
+                    stored.try_lock().unwrap().path = Some(root.path().to_path_buf());
+                }
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(Arc::clone(&state), signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(updates.len(), if after_provider { 2 } else { 1 });
+                let text = prompt_notice_text(updates.last().unwrap());
+                assert!(text.contains("Session persistence failed"), "{text}");
+                assert!(text.contains("resume the saved session"));
+                assert!(!text.contains(&root.path().display().to_string()));
+
+                stored.try_lock().unwrap().path = original;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_ERROR);
+                assert_eq!(
+                    updates.len(),
+                    1,
+                    "rejected admission still needs a visible error"
+                );
+                assert!(prompt_notice_text(&updates[0]).contains("Session persistence failed"));
+                assert_eq!(
+                    provider.calls.load(Ordering::SeqCst),
+                    usize::from(after_provider)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn prompt_preflight_errors_do_not_expose_raw_error_context() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            stored.try_lock().unwrap().header.provider =
+                Some("PRIVATE-UNRESOLVED-PROVIDER".to_string());
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = drive_test_prompt(state, signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_ERROR);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(updates.len(), 1);
+            let text = prompt_notice_text(&updates[0]);
+            assert!(text.contains("Validation failed"));
+            assert!(!text.contains("PRIVATE-UNRESOLVED-PROVIDER"));
+        });
+    }
+
+    #[test]
+    fn prompt_cancellation_retains_cancelled_without_an_error_notice() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for outcome in [PromptTestOutcome::Aborted, PromptTestOutcome::StreamAborted] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, _) = prompt_test_state(root.path(), outcome, false).await;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) = drive_test_prompt(Arc::clone(&state), signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+                assert!(updates.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert!(state.try_lock().unwrap().agent_session.is_some());
+
+                let (abort, signal) = AbortHandle::new();
+                abort.abort();
+                let (reason, updates) = drive_test_prompt(state, signal).await;
+                assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+                assert!(updates.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
 
     #[test]
     fn acp_offers_the_cli_default_tools_without_host_coupled_ones() {
@@ -2316,23 +2662,27 @@ mod tests {
         assert_eq!(result["protocolVersion"], 1);
         assert_eq!(result["agentInfo"]["name"], "pi-agent");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
-        // Sessions are in-process only — we never advertise loadSession.
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        // Loading now replays history before returning its response.
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
         // GH #245: session/list is implemented, so it is advertised.
         assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
-        // promptCapabilities advertise text/resource_link baseline only.
+        // Native image and embedded-context prompt decoding is wired to the agent.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],
             false
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["image"],
-            false
+            true
+        );
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
         );
         // mcpCapabilities advertised explicitly so the client knows transports.
         assert_eq!(
             result["agentCapabilities"]["mcpCapabilities"]["http"],
-            false
+            true
         );
         assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], false);
         // Tool approval is exposed as implementation metadata; the standard
@@ -2484,8 +2834,8 @@ mod tests {
 
     #[test]
     fn extract_prompt_text_rejects_unsupported_block_type() {
-        // We advertise audio: false / image: false in agentCapabilities, so
-        // the only honest behavior on those blocks is a clear capability error.
+        // The text-only helper must not silently flatten images. Rich prompt
+        // decoding and native image preservation are covered by content tests.
         let blocks = vec![json!({ "type": "image", "data": "base64..." })];
         let err = extract_prompt_text(&blocks).expect_err("should reject");
         assert!(err.contains("not supported"), "got: {err}");
@@ -2802,6 +3152,7 @@ mod tests {
         let state = Arc::new(Mutex::new(AcpSessionState {
             agent_session: Some(agent_session),
             cwd: PathBuf::from("."),
+            mcp: None,
         }));
         (state, auth, registry)
     }

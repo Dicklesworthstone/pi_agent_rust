@@ -759,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // RFC 6570 URI templates, not format strings
     fn template_execution_validates_composites_before_server_lookup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = template_tool(dir.path());
@@ -769,10 +770,13 @@ mod tests {
             ("docs:{v}", serde_json::json!({})),
             ("docs:{v}", serde_json::json!({"v":vec![Value::Null; 1025]})),
         ] {
-            let error = template_execute_error(&tool, serde_json::json!({
-                "action":"read_resource_template",
-                "uri_template":template, "variables":variables
-            }));
+            let error = template_execute_error(
+                &tool,
+                serde_json::json!({
+                    "action":"read_resource_template",
+                    "uri_template":template, "variables":variables
+                }),
+            );
             assert!(error.contains("MCP_TEMPLATE_INVALID"), "{error}");
             assert!(!error.contains("private-sentinel"));
         }
@@ -784,20 +788,35 @@ mod tests {
     fn composite_template_execution_preserves_the_server_trust_gate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = template_tool(dir.path());
-        tool.manager.register_extension_server("docs", &serde_json::json!({
-            "command":"__pi_mcp_template_test_must_not_spawn__"
-        }));
+        tool.manager.register_extension_server(
+            "docs",
+            &serde_json::json!({
+                "command":"__pi_mcp_template_test_must_not_spawn__"
+            }),
+        );
         assert_eq!(tool.manager.list().len(), 1, "server registered");
-        let direct = template_execute_error(&tool, serde_json::json!({
-            "action":"read_resource", "uri":"docs://private/a%2Fb?q=x&q=y"
-        }));
-        let expanded = template_execute_error(&tool, serde_json::json!({
-            "action":"read_resource_template",
-            "uri_template":"docs://private{/parts*}{?q*}",
-            "variables":{"parts":["a/b"], "q":["x","y"]}
-        }));
-        assert_eq!(expanded, direct, "templates retain normal resource admission");
-        assert!(expanded.to_ascii_lowercase().contains("trust"), "{expanded}");
+        let direct = template_execute_error(
+            &tool,
+            serde_json::json!({
+                "action":"read_resource", "uri":"docs://private/a%2Fb?q=x&q=y"
+            }),
+        );
+        let expanded = template_execute_error(
+            &tool,
+            serde_json::json!({
+                "action":"read_resource_template",
+                "uri_template":"docs://private{/parts*}{?q*}",
+                "variables":{"parts":["a/b"], "q":["x","y"]}
+            }),
+        );
+        assert_eq!(
+            expanded, direct,
+            "templates retain normal resource admission"
+        );
+        assert!(
+            expanded.to_ascii_lowercase().contains("trust"),
+            "{expanded}"
+        );
         let rows = tool.manager.list();
         assert_eq!(rows[0].trust, "pending");
         assert_eq!(rows[0].health, "not started");

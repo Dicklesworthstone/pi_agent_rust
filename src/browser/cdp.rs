@@ -2,8 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, interaction, launch, output,
-    policy, required,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch,
+    output, policy, required,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -19,6 +19,7 @@ use std::time::Duration;
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 const MAX_DOWNLOAD_RECORDS: usize = 128;
+const MAX_REFERENCE_DOCUMENTS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub(super) struct DownloadRecord {
@@ -111,7 +112,7 @@ pub(super) struct Session {
     tabs: BTreeMap<String, String>,
     active: Option<String>,
     endpoint: Option<String>,
-    references: BTreeMap<String, interaction::References>,
+    references: BTreeMap<(String, String), interaction::References>,
     next_ref: u64,
     // Field order matters: stop the owned browser before dropping upload copies.
     browser: Option<launch::ManagedBrowser>,
@@ -121,6 +122,7 @@ pub(super) struct Session {
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     let action = required(args, "action")?;
+    frames::validate(args)?;
     dialog::validate_action(args)?;
     dialog::Expected::from_args(args, allowlist)?;
     match action {
@@ -145,7 +147,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "evaluate" => {
             required(args, "script")?;
         }
-        "handle_dialog" | "close" | "list_tabs" | "snapshot" | "ax_tree" => {}
+        "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree" => {}
         "click" | "wait_for" => {
             required(args, "selector")?;
         }
@@ -282,6 +284,7 @@ pub(super) struct Cdp {
     socket: WebSocket<TcpStream>,
     next_id: u64,
     session_id: Option<String>,
+    frame_scope: Option<frames::Scope>,
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
     timeout_ms: u64,
@@ -334,6 +337,7 @@ impl Cdp {
             socket,
             next_id: 0,
             session_id: None,
+            frame_scope: None,
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
             timeout_ms: 30_000,
@@ -552,18 +556,43 @@ impl Cdp {
         record_download_event_into(&mut self.downloads, value)
     }
 
+    pub(super) const fn frame_selected(&self) -> bool {
+        self.frame_scope.is_some()
+    }
+
+    /// Resolve only the pinned frame, or the main document when no frame was
+    /// requested. Never substitute the root after a detach or navigation.
+    pub(super) async fn frame_document(&mut self, owner: &AgentCx) -> Result<Value> {
+        let tree = self.command(owner, "Page.getFrameTree", json!({})).await?;
+        self.frame_scope.as_ref().map_or_else(
+            || {
+                tree["frameTree"]
+                    .get("frame")
+                    .cloned()
+                    .ok_or_else(|| Error::tool("browser", "page has no main-frame document"))
+            },
+            |scope| scope.check(&tree),
+        )
+    }
+
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
-        let response = self
-            .command(
-                owner,
-                "Runtime.evaluate",
-                json!({
-                    "expression": expression, "returnByValue": true, "awaitPromise": true,
-                    "timeout": self.timeout_ms, "allowUnsafeEvalBlockedByCSP": false
-                }),
-            )
-            .await?;
-        evaluation_value(&response)
+        let context = self.frame_scope.as_ref().map(frames::Scope::context_id);
+        if context.is_some() {
+            self.frame_document(owner).await?;
+        }
+        let mut params = json!({
+            "expression": expression, "returnByValue": true, "awaitPromise": true,
+            "timeout": self.timeout_ms, "allowUnsafeEvalBlockedByCSP": false
+        });
+        if let Some(context) = context {
+            params["contextId"] = json!(context);
+        }
+        let response = self.command(owner, "Runtime.evaluate", params).await?;
+        let value = evaluation_value(&response)?;
+        if context.is_some() {
+            self.frame_document(owner).await?;
+        }
+        Ok(value)
     }
 
     async fn navigate(&mut self, owner: &AgentCx, url: &str) -> Result<()> {
@@ -764,7 +793,7 @@ impl Session {
             .filter_map(|v| v["targetId"].as_str().map(|id| (id.to_owned(), v.clone())))
             .collect();
         self.tabs.retain(|_, id| pages.contains_key(id));
-        self.references.retain(|id, _| pages.contains_key(id));
+        self.references.retain(|(id, _), _| pages.contains_key(id));
         if self
             .active
             .as_ref()
@@ -841,7 +870,7 @@ impl Session {
                 ));
             }
             self.tabs.retain(|_, id| id != &target);
-            self.references.remove(&target);
+            self.references.retain(|(id, _), _| id != &target);
             if self
                 .active
                 .as_ref()
@@ -872,6 +901,14 @@ impl Session {
         cdp.session_id = Some(required(&attached, "sessionId")?.to_owned());
         self.tabs.insert(tab.clone(), target.clone());
         self.active = Some(tab.clone());
+        if action == "list_frames" {
+            return frames::list(owner, cdp, &tab, allowlist).await;
+        }
+        let frame = args.get("frame").and_then(Value::as_str);
+        if let Some(frame) = frame {
+            cdp.frame_scope = Some(frames::select(owner, cdp, frame, allowlist).await?);
+        }
+        let reference_key = (target.clone(), frame.unwrap_or_default().to_owned());
         if let Some(expected) = dialog::Expected::from_args(args, allowlist)? {
             // An already-open dialog surfaced by Page.enable is not consent
             // for a future action. Arm only after enabling has completed.
@@ -901,16 +938,22 @@ impl Session {
                     owner,
                     cdp,
                     &tab,
-                    self.references.get(&target),
+                    self.references.get(&reference_key),
                     &mut self.next_ref,
                     action == "ax_tree",
                 )
                 .await?;
-                self.references.insert(target.clone(), references);
+                if !self.references.contains_key(&reference_key)
+                    && self.references.len() >= MAX_REFERENCE_DOCUMENTS
+                {
+                    self.references.pop_first();
+                }
+                self.references.insert(reference_key.clone(), references);
                 Ok(result)
             }
             "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
-                interaction::execute(owner, cdp, &tab, self.references.get(&target), args).await
+                interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
+                    .await
             }
             "upload" => {
                 self.uploads
@@ -918,7 +961,7 @@ impl Session {
                         owner,
                         cdp,
                         cwd,
-                        self.references.get(&target),
+                        self.references.get(&reference_key),
                         args,
                         allowlist,
                     )
@@ -934,7 +977,7 @@ impl Session {
                     cdp,
                     cwd,
                     &tab,
-                    self.references.get(&target),
+                    self.references.get(&reference_key),
                     args,
                     allowlist,
                 )
@@ -958,6 +1001,11 @@ impl Session {
             )),
         };
         let mut result = result?;
+        if let Some(frame) = frame
+            && let Some(details) = result.details.as_mut().and_then(Value::as_object_mut)
+        {
+            details.insert("frame_id".to_string(), json!(frame));
+        }
         if cdp.dialog.requested() {
             cdp.finish_expected_dialog(owner).await?;
             cdp.dialog.annotate(&mut result);
@@ -1009,6 +1057,33 @@ mod tests {
             input[field] = json!("untrusted");
             assert!(validate(&input, None).is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn frame_preflight_runs_before_any_connection_or_launch() {
+        assert!(validate(&json!({"action":"list_frames","tab":"work"}), None).is_ok());
+        assert!(
+            validate(
+                &json!({"action":"snapshot","tab":"work","frame":"child"}),
+                None
+            )
+            .is_ok()
+        );
+        assert!(validate(&json!({"action":"snapshot","frame":"child"}), None).is_err());
+        assert!(
+            validate(
+                &json!({"action":"goto","tab":"work","frame":"child","url":"https://example.com"}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &json!({"action":"evaluate","tab":"work","frame":"child"}),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

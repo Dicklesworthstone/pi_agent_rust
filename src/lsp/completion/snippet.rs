@@ -255,7 +255,8 @@ impl Renderer<'_> {
                 Node::Field(id) => append(&mut output, &self.field(*id, depth + 1)?)?,
                 Node::Transformed(id, transform) => {
                     let source = self.field(*id, depth + 1)?;
-                    let text = transform.apply(&source, &mut self.work, &mut self.transform_scan)?;
+                    let text =
+                        transform.apply(&source, &mut self.work, &mut self.transform_scan)?;
                     append(&mut output, &text)?;
                 }
             }

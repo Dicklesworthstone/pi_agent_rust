@@ -53,7 +53,11 @@ fn secret_block_error() -> Error {
 
 /// Discover before replacement so a bare echo appearing before its identifying
 /// `api_key` field is protected on this same structured input.
-fn discover_outbound_json(
+///
+/// Learns detected values into `vault` and, in block mode, refuses on any
+/// detection. Never rewrites, so it cannot fail on a replacement that would
+/// change a JSON type or merge object members.
+pub fn discover_outbound_json(
     value: &serde_json::Value,
     vault: &mut SecretVault,
     mode: SecretsMode,
@@ -108,10 +112,7 @@ fn discover_json_assignment(
         if mode == SecretsMode::Block {
             return Err(secret_block_error());
         }
-        let _ = vault.placeholder_for(
-            &contextual[detection.start..detection.end],
-            detection.label,
-        );
+        let _ = vault.placeholder_for(&contextual[detection.start..detection.end], detection.label);
     }
     Ok(())
 }
@@ -183,13 +184,15 @@ fn rewrite_json_inner(
     secret_json_depth(depth)?;
     match value {
         serde_json::Value::String(text) => Ok(serde_json::Value::String(rewrite_json_text(
-            text, vault, mode, extra_patterns, audit,
+            text,
+            vault,
+            mode,
+            extra_patterns,
+            audit,
         )?)),
         serde_json::Value::Array(items) => items
             .iter()
-            .map(|item| {
-                rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1)
-            })
+            .map(|item| rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1))
             .collect::<Result<Vec<_>>>()
             .map(serde_json::Value::Array),
         serde_json::Value::Object(map) => {
@@ -274,9 +277,12 @@ mod structured_outbound_tests {
     fn restore_value(value: &Value, vault: &SecretVault) -> Value {
         match value {
             Value::String(text) => Value::String(vault.restore(text)),
-            Value::Array(items) => {
-                Value::Array(items.iter().map(|item| restore_value(item, vault)).collect())
-            }
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| restore_value(item, vault))
+                    .collect(),
+            ),
             Value::Object(map) => Value::Object(
                 map.iter()
                     .map(|(key, item)| (vault.restore(key), restore_value(item, vault)))
@@ -288,8 +294,12 @@ mod structured_outbound_tests {
 
     #[test]
     fn nested_strings_and_keys_round_trip_without_changing_nonsecret_types() {
-        let mut input = json!({"nested": [{"secret": KEY}], "count": 4, "enabled": true, "empty": null});
-        input.as_object_mut().unwrap().insert(KEY.into(), json!(["ordinary", 2]));
+        let mut input =
+            json!({"nested": [{"secret": KEY}], "count": 4, "enabled": true, "empty": null});
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert(KEY.into(), json!(["ordinary", 2]));
         let original = input.clone();
         let mut vault = SecretVault::default();
         let (output, audit) = protect(&input, &mut vault).unwrap();
@@ -316,7 +326,10 @@ mod structured_outbound_tests {
 
     #[test]
     fn decoded_private_key_preserves_quotes_backslashes_and_newlines() {
-        let pem = "-----BEGIN PRIVATE KEY-----\nabc\\def\"ghi\n-----END PRIVATE KEY-----";
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nabc\\def\"ghi\n-----END PRIVATE KEY-----"
+        );
         let input = json!({"credentials": [pem], "path": "C:\\work\\project"});
         let mut vault = SecretVault::default();
         let (output, _) = protect(&input, &mut vault).unwrap();
@@ -330,8 +343,12 @@ mod structured_outbound_tests {
     fn block_refuses_assignment_only_credentials_without_mutating_vault() {
         let mut vault = SecretVault::default();
         let error = transform_outbound_json(
-            &json!({"api_key": GENERIC}), &mut vault, SecretsMode::Block, &[],
-        ).unwrap_err();
+            &json!({"api_key": GENERIC}),
+            &mut vault,
+            SecretsMode::Block,
+            &[],
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("PI_SECRET_BLOCK"));
         assert!(!error.to_string().contains(GENERIC));
         assert_eq!(vault.len(), 0);
@@ -342,9 +359,8 @@ mod structured_outbound_tests {
         let mut vault = SecretVault::default();
         let _ = obfuscate(&format!("api_key={GENERIC}"), &mut vault, &[]);
         let before = vault.len();
-        let error = transform_outbound_json(
-            &json!([GENERIC]), &mut vault, SecretsMode::Block, &[],
-        ).unwrap_err();
+        let error = transform_outbound_json(&json!([GENERIC]), &mut vault, SecretsMode::Block, &[])
+            .unwrap_err();
         assert!(error.to_string().contains("PI_SECRET_BLOCK"));
         assert_eq!(vault.len(), before);
     }
@@ -353,11 +369,18 @@ mod structured_outbound_tests {
     fn replacement_key_collision_is_refused_without_dropping_a_member() {
         let mut vault = SecretVault::default();
         let mut input = json!({"<pi-secret:000001>": "first"});
-        input.as_object_mut().unwrap().insert(KEY.into(), json!("second"));
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert(KEY.into(), json!("second"));
         let error = protect(&input, &mut vault).unwrap_err();
         assert!(error.to_string().contains("PI_SECRET_JSON_KEY_COLLISION"));
         assert_eq!(input.as_object().unwrap().len(), 2);
-        assert_eq!(vault.len(), 0, "failed transaction must not install placeholders");
+        assert_eq!(
+            vault.len(),
+            0,
+            "failed transaction must not install placeholders"
+        );
     }
 
     #[test]
@@ -372,7 +395,7 @@ mod structured_outbound_tests {
 
     #[test]
     fn numeric_credential_is_refused_rather_than_changing_argument_type() {
-        let input = json!({"token": 123456789012345678_u64});
+        let input = json!({"token": 123_456_789_012_345_678_u64});
         for mode in [SecretsMode::Obfuscate, SecretsMode::Block] {
             let mut vault = SecretVault::default();
             let error = transform_outbound_json(&input, &mut vault, mode, &[]).unwrap_err();
@@ -388,25 +411,27 @@ mod structured_outbound_tests {
 
     #[test]
     fn off_mode_preserves_json_and_does_not_learn_secrets() {
-        let input = json!({"api_key": KEY, "token": 123456789012345678_u64});
+        let input = json!({"api_key": KEY, "token": 123_456_789_012_345_678_u64});
         let mut vault = SecretVault::default();
-        let (output, audit) = transform_outbound_json(
-            &input, &mut vault, SecretsMode::Off, &[],
-        ).unwrap();
+        let (output, audit) =
+            transform_outbound_json(&input, &mut vault, SecretsMode::Off, &[]).unwrap();
         assert_eq!(output, input);
         assert_eq!(audit.detections, 0);
         assert_eq!(vault.len(), 0);
     }
 
     #[test]
+    #[allow(clippy::trivial_regex)] // the API under test takes user-supplied regexes
     fn custom_patterns_screen_unicode_keys_and_values() {
         let mut input = json!({"value": "before 🦀secret after"});
-        input.as_object_mut().unwrap().insert("🦀secret".into(), json!("untouched"));
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert("🦀secret".into(), json!("untouched"));
         let patterns = [regex::Regex::new("🦀secret").unwrap()];
         let mut vault = SecretVault::default();
-        let (output, audit) = transform_outbound_json(
-            &input, &mut vault, SecretsMode::Obfuscate, &patterns,
-        ).unwrap();
+        let (output, audit) =
+            transform_outbound_json(&input, &mut vault, SecretsMode::Obfuscate, &patterns).unwrap();
         assert!(!output.to_string().contains("🦀secret"));
         assert_eq!(restore_value(&output, &vault), input);
         assert_eq!(audit.detections, 2);
@@ -425,13 +450,13 @@ mod structured_outbound_tests {
     }
 
     #[test]
+    #[allow(clippy::trivial_regex)] // the API under test takes user-supplied regexes
     fn custom_regexes_never_scan_synthetic_assignment_text() {
         let input = json!({"ordinary": "short"});
         let patterns = [regex::Regex::new("ordinary=short").unwrap()];
         let mut vault = SecretVault::default();
-        let (output, audit) = transform_outbound_json(
-            &input, &mut vault, SecretsMode::Obfuscate, &patterns,
-        ).unwrap();
+        let (output, audit) =
+            transform_outbound_json(&input, &mut vault, SecretsMode::Obfuscate, &patterns).unwrap();
         assert_eq!(output, input);
         assert_eq!(audit.detections, 0);
         assert_eq!(vault.len(), 0);
@@ -448,7 +473,11 @@ mod structured_outbound_tests {
         let _ = obfuscate("sk-otherCredential0123456789", &mut session, &[]);
         assert_ne!(session.restore(&protected), KEY);
         assert_eq!(session.restore(&projection), projection);
-        assert_eq!(auxiliary.restore(&protected), KEY, "projection is read-only");
+        assert_eq!(
+            auxiliary.restore(&protected),
+            KEY,
+            "projection is read-only"
+        );
     }
 
     #[test]
@@ -457,7 +486,10 @@ mod structured_outbound_tests {
         let (protected, _) = obfuscate(KEY, &mut vault, &[]);
         let text = format!("α {protected} ω <pi-secret:ffffff> <pi-secret:bad>");
         let output = vault.redact_placeholders(&text);
-        assert_eq!(output, "α <pi-secret:redacted> ω <pi-secret:ffffff> <pi-secret:bad>");
+        assert_eq!(
+            output,
+            "α <pi-secret:redacted> ω <pi-secret:ffffff> <pi-secret:bad>"
+        );
         assert_eq!(vault.redact_placeholders(&output), output);
         assert!(!output.contains(KEY));
     }
