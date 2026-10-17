@@ -1421,10 +1421,10 @@ fn sdk_continue_turn_uses_combined_listener_path() {
 }
 
 #[test]
-fn sdk_continue_turn_with_abort_returns_aborted_message() {
+fn sdk_continue_turn_with_abort_refuses_a_pre_aborted_signal() {
     use pi::sdk::EventListeners;
 
-    let harness = TestHarness::new("sdk_continue_turn_with_abort_returns_aborted_message");
+    let harness = TestHarness::new("sdk_continue_turn_with_abort_refuses_a_pre_aborted_signal");
     let cwd = harness.temp_dir().to_path_buf();
 
     run_async(async move {
@@ -1466,12 +1466,13 @@ fn sdk_continue_turn_with_abort_returns_aborted_message() {
         let (abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
         abort_handle.abort();
 
-        let message = handle
+        // A pre-aborted turn is refused before any provider or session work
+        // (src/sdk/recovery.rs `ensure_not_aborted`), as the recovery tests
+        // pin for every entry point.
+        let result = handle
             .continue_turn_with_abort(abort_signal, |_event| {})
-            .await
-            .expect("continue turn with pre-aborted signal");
+            .await;
 
-        assert_eq!(message.stop_reason, StopReason::Aborted);
-        assert_eq!(message.error_message.as_deref(), Some("Aborted"));
+        assert!(matches!(result, Err(Error::Aborted)), "{result:?}");
     });
 }

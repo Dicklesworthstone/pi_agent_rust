@@ -7024,7 +7024,8 @@ fn tui_state_header_shows_pi_and_model_name() {
         KeyMsg::from_runes(vec![' ']),
     );
     assert_after_contains(&harness, &step, "Pi");
-    assert_after_contains(&harness, &step, "dummy-model");
+    // The header names the model by its display name (gh #214).
+    assert_after_contains(&harness, &step, "Dummy Model");
 }
 
 #[test]

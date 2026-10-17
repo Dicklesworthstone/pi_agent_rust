@@ -27,7 +27,7 @@ use pi::agent::{Agent, AgentConfig};
 use pi::model::StreamEvent;
 use pi::provider::{Context, StreamOptions};
 use pi::secrets::SecretsSettings;
-use pi::tools::{ToolOutput, ToolRegistry};
+use pi::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 use serde_json::json;
 use std::path::Path;
 use std::pin::Pin;
@@ -68,10 +68,13 @@ fn first_text(output: &pi::tools::ToolOutput) -> &str {
         .unwrap_or("")
 }
 
-/// Records the provider-visible payload text; replies with a text turn.
+/// Records the provider-visible payload text and advertised tool names;
+/// replies with a text turn.
 #[derive(Default)]
 struct Capture {
     payloads: Vec<String>,
+    tools: Vec<String>,
+    messages: Vec<Vec<pi::model::Message>>,
 }
 
 struct CaptureProvider {
@@ -110,7 +113,13 @@ impl pi::provider::Provider for CaptureProvider {
             let _ = write!(payload, "{message:?}"); // ubs:ignore capture loop in a stub provider
             payload.push('\n');
         }
-        self.capture.lock().expect("capture").payloads.push(payload); // ubs:ignore test capture
+        let mut capture = self.capture.lock().expect("capture"); // ubs:ignore test capture
+        capture.payloads.push(payload);
+        capture.messages.push(context.messages.to_vec());
+        capture
+            .tools
+            .extend(context.tools.iter().map(|tool| tool.name.clone()));
+        drop(capture);
         Ok(Box::pin(futures::stream::iter(vec![Ok(
             StreamEvent::TextDelta {
                 content_index: 0,
@@ -121,11 +130,20 @@ impl pi::provider::Provider for CaptureProvider {
 }
 
 fn build_agent(root: &Path, secrets: Option<SecretsSettings>) -> (Agent, Arc<Mutex<Capture>>) {
+    build_agent_with_tools(root, secrets, Vec::new())
+}
+
+fn build_agent_with_tools(
+    root: &Path,
+    secrets: Option<SecretsSettings>,
+    extra_tools: Vec<Box<dyn Tool>>,
+) -> (Agent, Arc<Mutex<Capture>>) {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let provider = Arc::new(CaptureProvider {
         capture: Arc::clone(&capture),
     });
-    let tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
+    let mut tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
+    tools.extend(extra_tools);
     let config = AgentConfig {
         system_prompt: Some("base prompt".to_string()),
         secrets,
@@ -393,6 +411,7 @@ fn complete_and_truncated_private_keys_protect_the_body_at_the_provider_boundary
         assert!(!capture.payloads[0].contains(PEM_BODY));
         assert!(!capture.payloads[0].contains("Proc-Type"));
         assert!(!capture.payloads[0].contains("-----END"));
+        drop(capture);
     }
     finish_case(&harness, case);
 }
@@ -462,12 +481,16 @@ impl pi::provider::Provider for PrivateKeyToolProvider {
                 thought_signature: None,
             }));
         } else {
-            message.content.push(ContentBlock::Text(TextContent::new("key copied")));
+            message
+                .content
+                .push(ContentBlock::Text(TextContent::new("key copied")));
         }
-        Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Done {
-            reason: message.stop_reason,
-            message,
-        })])))
+        Ok(Box::pin(futures::stream::iter(vec![Ok(
+            StreamEvent::Done {
+                reason: message.stop_reason,
+                message,
+            },
+        )])))
     }
 }
 
@@ -477,7 +500,9 @@ fn private_key_placeholder_executes_real_write_and_read_without_cloud_disclosure
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let capture = Arc::new(Mutex::new(Capture::default()));
-    let provider = Arc::new(PrivateKeyToolProvider { capture: Arc::clone(&capture) });
+    let provider = Arc::new(PrivateKeyToolProvider {
+        capture: Arc::clone(&capture),
+    });
     let tools = ToolRegistry::new(&["write", "read"], &root, None);
     let mut agent = Agent::new(provider, tools, AgentConfig::default());
     let key = private_key_fixture();
@@ -486,14 +511,25 @@ fn private_key_placeholder_executes_real_write_and_read_without_cloud_disclosure
     let result = block_on_local(agent.run(
         format!("Copy this private key, then read the copy:\n{key}"),
         move |event| {
-            if let pi::agent::AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } = event {
-                recorded.lock().expect("tool events").push((tool_name, is_error));
+            if let pi::agent::AgentEvent::ToolExecutionEnd {
+                tool_name,
+                is_error,
+                ..
+            } = event
+            {
+                recorded
+                    .lock()
+                    .expect("tool events")
+                    .push((tool_name, is_error));
             }
         },
     ))
     .expect("real tool round trip");
     assert_eq!(result.stop_reason, pi::model::StopReason::Stop);
-    assert_eq!(std::fs::read_to_string(root.join("copied.pem")).expect("written key"), key);
+    assert_eq!(
+        std::fs::read_to_string(root.join("copied.pem")).expect("written key"),
+        key
+    );
     assert_eq!(
         *completed_tools.lock().expect("tool events"),
         vec![("write".to_string(), false), ("read".to_string(), false)]
@@ -502,7 +538,10 @@ fn private_key_placeholder_executes_real_write_and_read_without_cloud_disclosure
     assert_eq!(capture.payloads.len(), 3);
     for payload in &capture.payloads {
         assert!(payload.contains("<pi-secret:"));
-        assert!(!payload.contains(PEM_BODY), "private body reached the provider");
+        assert!(
+            !payload.contains(PEM_BODY),
+            "private body reached the provider"
+        );
         assert!(!payload.contains("-----BEGIN"));
         assert!(!payload.contains("-----END"));
     }
@@ -515,15 +554,18 @@ fn truncated_private_key_block_mode_never_calls_the_provider() {
     let case = "private_key_block_before_provider";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
-        mode: Some("block".to_string()),
-        extra_patterns: None,
-    }));
-    let result = block_on_local(agent.run(
-        format!("-----BEGIN PRIVATE KEY-----\n{PEM_BODY}"),
-        |_| {},
-    ));
-    let error = result.expect_err("block mode refuses before provider entry").to_string();
+    let (mut agent, capture) = build_agent(
+        &root,
+        Some(SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: None,
+        }),
+    );
+    let result =
+        block_on_local(agent.run(format!("-----BEGIN PRIVATE KEY-----\n{PEM_BODY}"), |_| {}));
+    let error = result
+        .expect_err("block mode refuses before provider entry")
+        .to_string();
     assert!(error.contains("PI_SECRET_BLOCK"));
     assert!(!error.contains(PEM_BODY));
     assert!(capture.lock().expect("capture").payloads.is_empty());
@@ -535,10 +577,17 @@ fn overlapping_custom_rules_cover_the_full_secret_in_real_agent_context() {
     let case = "overlapping_rules_provider_boundary";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
-        mode: Some("obfuscate".to_string()),
-        extra_patterns: Some(vec!["abcde".to_string(), "defgh".to_string(), "ghij".to_string()]),
-    }));
+    let (mut agent, capture) = build_agent(
+        &root,
+        Some(SecretsSettings {
+            mode: Some("obfuscate".to_string()),
+            extra_patterns: Some(vec![
+                "abcde".to_string(),
+                "defgh".to_string(),
+                "ghij".to_string(),
+            ]),
+        }),
+    );
     block_on_local(agent.run("safe abcdefghij safe", |_| {})).expect("run");
     let capture = capture.lock().expect("capture");
     assert_eq!(capture.payloads.len(), 1);
@@ -561,7 +610,8 @@ fn json_credentials_stay_protected_after_the_assignment_leaves_history() {
     // Keep the session's vault, but remove the original KEY=value hint.
     // This tests the loss of context, not a synthetic second detector call.
     agent.clear_messages();
-    block_on_local(agent.run(format!("echoed value: {OPAQUE_SECRET}"), |_| {})).expect("later turn");
+    block_on_local(agent.run(format!("echoed value: {OPAQUE_SECRET}"), |_| {}))
+        .expect("later turn");
     let capture = capture.lock().expect("capture");
     assert_eq!(capture.payloads.len(), 2);
     for payload in &capture.payloads {
@@ -639,18 +689,27 @@ fn serialized_transcript_export_masks_multiline_keys_without_breaking_jsonl() {
     let root = harness.temp_path(".");
     let (mut agent, _) = build_agent(&root, None);
     block_on_local(agent.run(private_key_fixture(), |_| {})).expect("establish vault");
-    let records = agent.messages().iter().map(|message| {
-        serde_json::to_string(message).expect("serialize local transcript")
-    }).collect::<Vec<_>>();
+    let records = agent
+        .messages()
+        .iter()
+        .map(|message| serde_json::to_string(message).expect("serialize local transcript"))
+        .collect::<Vec<_>>();
     let original = format!("{}\r\n", records.join("\r\n"));
-    assert!(original.contains(PEM_BODY), "local input is deliberately not an export");
+    assert!(
+        original.contains(PEM_BODY),
+        "local input is deliberately not an export"
+    );
     let exported = agent.mask_secrets_text(&original);
     assert!(!exported.contains(PEM_BODY));
     assert!(exported.contains("<pi-secret:000001>"));
     assert!(exported.ends_with("\r\n"));
-    let decoded = exported.lines().map(|line| {
-        serde_json::from_str::<serde_json::Value>(line).expect("screened record remains valid JSON")
-    }).collect::<Vec<_>>();
+    let decoded = exported
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("screened record remains valid JSON")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(decoded.len(), records.len());
     for (before, after) in records.iter().zip(&decoded) {
         let before: serde_json::Value = serde_json::from_str(before).unwrap();
@@ -666,17 +725,20 @@ fn quoted_generic_credentials_obey_block_and_off_modes_at_provider_entry() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     for mode in ["block", "off"] {
-        let (mut agent, capture) = build_agent(&root, Some(SecretsSettings {
-            mode: Some(mode.to_string()),
-            extra_patterns: None,
-        }));
-        let result = block_on_local(agent.run(
-            json!({"password": OPAQUE_SECRET}).to_string(),
-            |_| {},
-        ));
+        let (mut agent, capture) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: None,
+            }),
+        );
+        let result =
+            block_on_local(agent.run(json!({"password": OPAQUE_SECRET}).to_string(), |_| {}));
         let capture = capture.lock().expect("capture");
         if mode == "block" {
-            let error = result.expect_err("quoted keys must not bypass block mode").to_string();
+            let error = result
+                .expect_err("quoted keys must not bypass block mode")
+                .to_string();
             assert!(error.contains("PI_SECRET_BLOCK"));
             assert!(!error.contains(OPAQUE_SECRET));
             assert!(capture.payloads.is_empty());
@@ -685,15 +747,16 @@ fn quoted_generic_credentials_obey_block_and_off_modes_at_provider_entry() {
             assert_eq!(capture.payloads.len(), 1);
             assert!(capture.payloads[0].contains(OPAQUE_SECRET));
         }
+        drop(capture);
     }
     finish_case(&harness, case);
 }
 
-
 #[test]
 fn structured_custom_and_tool_arguments_are_screened_request_wide() {
     const OPAQUE: &str = "opaqueCredentialValue1234567890";
-    let harness = TestHarness::new("structured_custom_and_tool_arguments_are_screened_request_wide");
+    let harness =
+        TestHarness::new("structured_custom_and_tool_arguments_are_screened_request_wide");
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
 
@@ -719,15 +782,14 @@ fn structured_custom_and_tool_arguments_are_screened_request_wide() {
         ..pi::model::AssistantMessage::default()
     }));
 
-    block_on_local(agent.run_with_messages_with_abort(
-        vec![custom, assistant],
-        None,
-        |_| {},
-    ))
-    .expect("screened request should reach provider");
+    block_on_local(agent.run_with_messages_with_abort(vec![custom, assistant], None, |_| {}))
+        .expect("screened request should reach provider");
 
     let joined = capture.lock().expect("capture").payloads.join("\n");
-    assert!(!joined.contains(OPAQUE), "opaque credential leaked: {joined}");
+    assert!(
+        !joined.contains(OPAQUE),
+        "opaque credential leaked: {joined}"
+    );
     assert!(
         joined.matches("<pi-secret:").count() >= 4,
         "content, details and structured arguments should all be protected: {joined}"
@@ -742,38 +804,108 @@ fn structured_custom_and_tool_arguments_are_screened_request_wide() {
     assert_eq!(restored.arguments["value"], OPAQUE);
 }
 
+fn user_text(text: &str) -> pi::model::Message {
+    pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Text(text.to_string()),
+        timestamp: 0,
+    })
+}
+
+fn assistant(
+    content: Vec<pi::model::ContentBlock>,
+    stop_reason: pi::model::StopReason,
+) -> pi::model::Message {
+    pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
+        content,
+        stop_reason,
+        api: "capture-api".to_string(),
+        provider: "capture".to_string(),
+        model: "capture-model".to_string(),
+        timestamp: 0,
+        ..pi::model::AssistantMessage::default()
+    }))
+}
+
+fn tool_call(
+    id: &str,
+    arguments: serde_json::Value,
+    thought_signature: Option<&str>,
+) -> pi::model::ContentBlock {
+    pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
+        id: id.to_string(),
+        name: "fixture".to_string(),
+        arguments,
+        thought_signature: thought_signature.map(ToString::to_string),
+    })
+}
+
+fn block_mode() -> SecretsSettings {
+    SecretsSettings {
+        mode: Some("block".to_string()),
+        extra_patterns: None,
+    }
+}
+
+/// Advertised to the provider under a fixed name; never executed.
+struct NamedTool(&'static str);
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for NamedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn label(&self) -> &str {
+        self.0
+    }
+
+    fn description(&self) -> &str {
+        "fixture tool that is advertised but never executed"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<ToolOutput> {
+        Err(pi::error::Error::tool(
+            self.0,
+            "fixture tool is never executed",
+        ))
+    }
+}
+
 #[test]
-fn late_signed_content_refusal_rolls_back_the_entire_request_vault() {
+fn late_refusal_rolls_back_the_entire_request_vault() {
     const EARLY: &str = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
-    const SIGNED: &str = "sk-bbbbbbbbbbbbbbbbbbbbbbbb";
-    let harness = TestHarness::new("late_signed_content_refusal_rolls_back_the_entire_request_vault");
+    let harness = TestHarness::new("late_refusal_rolls_back_the_entire_request_vault");
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
 
-    let early = pi::model::Message::User(pi::model::UserMessage {
-        content: pi::model::UserContent::Text(format!("remember {EARLY}")),
-        timestamp: 0,
-    });
-    let signed = pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
-        content: vec![pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
-            id: "signed-call".to_string(),
-            name: "fixture".to_string(),
-            arguments: json!({"token": SIGNED}),
-            thought_signature: Some("provider-signature".to_string()),
-        })],
-        stop_reason: pi::model::StopReason::ToolUse,
-        timestamp: 0,
-        ..pi::model::AssistantMessage::default()
-    }));
-
+    // A numeric credential cannot be replaced without changing its JSON type,
+    // so obfuscate mode still refuses the whole request.
+    let numeric = assistant(
+        vec![tool_call(
+            "numeric-call",
+            json!({"token": 123_456_789_012_345_678_u64}),
+            None,
+        )],
+        pi::model::StopReason::ToolUse,
+    );
     let error = block_on_local(agent.run_with_messages_with_abort(
-        vec![early, signed],
+        vec![user_text(&format!("remember {EARLY}")), numeric],
         None,
         |_| {},
     ))
-    .expect_err("signed content must never be rewritten");
+    .expect_err("a numeric credential must not change type");
     assert!(
-        error.to_string().contains("PI_SECRET_SIGNED_CONTENT"),
+        error.to_string().contains("PI_SECRET_JSON_PRIMITIVE"),
         "{error}"
     );
     assert!(
@@ -781,57 +913,324 @@ fn late_signed_content_refusal_rolls_back_the_entire_request_vault() {
         "provider must not be invoked after a screening refusal"
     );
 
-    // The refused request discovered both values in its staged vault. Neither
-    // may survive into the live session or consume placeholder identities.
+    // The refused request learned EARLY and the numeric value in its staged
+    // vault. Neither may survive into the live session: the numeric value is
+    // not remembered, and EARLY gets the first placeholder identity afresh.
     assert_eq!(
         agent
-            .secrets_transform_outbound_text(SIGNED)
-            .expect("screen signed credential after rollback"),
-        "<pi-secret:000001>"
+            .secrets_transform_outbound_text("123456789012345678")
+            .expect("screen numeric value after rollback"),
+        "123456789012345678"
     );
     assert_eq!(
         agent
             .secrets_transform_outbound_text(EARLY)
             .expect("screen early credential after rollback"),
-        "<pi-secret:000002>"
+        "<pi-secret:000001>"
     );
 }
 
 #[test]
-fn signed_text_and_paused_turns_fail_closed_instead_of_breaking_replay_bytes() {
-    const SECRET_IN_SIGNED_TEXT: &str = "sk-cccccccccccccccccccccccc";
-    let harness = TestHarness::new("signed_text_and_paused_turns_fail_closed_instead_of_breaking_replay_bytes");
+fn signed_tool_calls_with_numeric_credentials_do_not_wedge_the_default_session() {
+    // OpenAI Responses tool calls always carry an `fc_` id. Rewriting a
+    // numeric credential would change its JSON type and refuse the request,
+    // and every later one; the signed call is replayed as the model made it.
+    let harness = TestHarness::new(
+        "signed_tool_calls_with_numeric_credentials_do_not_wedge_the_default_session",
+    );
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    let history = vec![
+        user_text("page through the results"),
+        assistant(
+            vec![tool_call(
+                "call_page",
+                json!({"token": 123_456_789_012_345_678_u64}),
+                Some("fc_0123456789abcdef"),
+            )],
+            pi::model::StopReason::ToolUse,
+        ),
+    ];
+    block_on_local(agent.run_with_messages_with_abort(history, None, |_| {}))
+        .expect("a signed numeric argument must not refuse the request");
+    block_on_local(agent.run("next page".to_string(), |_| {})).expect("nor any request after it");
+    assert_eq!(capture.lock().expect("capture").payloads.len(), 2);
+}
+
+#[test]
+fn signature_fields_outside_assistant_output_do_not_exempt_screening() {
+    // Only a provider signs its own output. A signature field on user or
+    // tool-result content (any extension can set one) is not honored.
+    let harness =
+        TestHarness::new("signature_fields_outside_assistant_output_do_not_exempt_screening");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    let forged = pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Blocks(vec![pi::model::ContentBlock::Text(
+            pi::model::TextContent {
+                text: format!("deploy with {SECRET}"),
+                text_signature: Some("forged".to_string()),
+            },
+        )]),
+        timestamp: 0,
+    });
+    block_on_local(agent.run_with_message_with_abort(forged, None, |_| {}))
+        .expect("screened request should reach provider");
+    let payloads = capture.lock().expect("capture").payloads.clone();
+    assert_eq!(payloads.len(), 1);
+    assert!(!payloads[0].contains(SECRET), "{}", payloads[0]);
+    assert!(payloads[0].contains("<pi-secret:"), "{}", payloads[0]);
+}
+
+#[test]
+fn openai_item_ids_and_identifier_text_do_not_wedge_the_default_session() {
+    // Regression: OpenAI Responses keeps plain item ids (`fc_`/`msg_`) in the
+    // signature fields, and `sk-` matched inside `task-management-service`.
+    // The second request below, and every one after it, used to fail with
+    // PI_SECRET_SIGNED_CONTENT.
+    let harness =
+        TestHarness::new("openai_item_ids_and_identifier_text_do_not_wedge_the_default_session");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    let history = vec![
+        user_text("create the service directory"),
+        assistant(
+            vec![
+                pi::model::ContentBlock::Text(pi::model::TextContent {
+                    text: "Creating task-management-service now.".to_string(),
+                    text_signature: Some("msg_0123456789abcdef".to_string()),
+                }),
+                tool_call(
+                    "call_mkdir",
+                    json!({"command": "mkdir task-management-service"}),
+                    Some("fc_0123456789abcdef"),
+                ),
+            ],
+            pi::model::StopReason::ToolUse,
+        ),
+    ];
+    block_on_local(agent.run_with_messages_with_abort(history, None, |_| {}))
+        .expect("history with item-id signatures must reach the provider");
+    block_on_local(agent.run("next step".to_string(), |_| {}))
+        .expect("the following request must not be refused either");
+
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 2);
+    for payload in &capture.payloads {
+        assert!(
+            payload.contains("mkdir task-management-service"),
+            "{payload}"
+        );
+        assert!(!payload.contains("<pi-secret:"), "{payload}");
+    }
+    drop(capture);
+}
+
+#[test]
+fn mcp_tool_names_are_advertised_unchanged_and_refused_only_in_block_mode() {
+    // Regression: `sk-` matched inside `task-master`, and any tool name the
+    // detector would change was refused with PI_SECRET_IDENTIFIER on every
+    // request, in the default mode too.
+    const MCP_TOOL: &str = "mcp__task-master-ai__get_tasks";
+    const KEYED_TOOL: &str = "deploy-sk-0123456789abcdefghijklmnop";
+    let harness =
+        TestHarness::new("mcp_tool_names_are_advertised_unchanged_and_refused_only_in_block_mode");
     let root = harness.temp_path(".");
 
-    for message in [
-        pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
-            content: vec![pi::model::ContentBlock::Text(pi::model::TextContent {
-                text: SECRET_IN_SIGNED_TEXT.to_string(),
-                text_signature: Some("text-signature".to_string()),
-            })],
-            stop_reason: pi::model::StopReason::Stop,
-            timestamp: 0,
-            ..pi::model::AssistantMessage::default()
-        })),
-        pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
-            content: vec![pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
-                id: "server-tool".to_string(),
-                name: "server_tool".to_string(),
-                arguments: json!({"api_key": SECRET_IN_SIGNED_TEXT}),
-                thought_signature: Some("server-signature".to_string()),
-            })],
-            stop_reason: pi::model::StopReason::PauseTurn,
-            timestamp: 0,
-            ..pi::model::AssistantMessage::default()
-        })),
-    ] {
+    let (mut agent, capture) = build_agent_with_tools(
+        &root,
+        None,
+        vec![
+            Box::new(NamedTool(MCP_TOOL)),
+            Box::new(NamedTool(KEYED_TOOL)),
+        ],
+    );
+    block_on_local(agent.run("list my tasks".to_string(), |_| {})).expect("first request");
+    block_on_local(agent.run("and again".to_string(), |_| {})).expect("second request");
+    let advertised = capture.lock().expect("capture").tools.clone();
+    assert_eq!(
+        advertised.iter().filter(|name| *name == MCP_TOOL).count(),
+        2
+    );
+    // Names are routing identifiers: never rewritten, even when detected.
+    assert_eq!(
+        advertised.iter().filter(|name| *name == KEYED_TOOL).count(),
+        2
+    );
+
+    let (mut agent, _capture) = build_agent_with_tools(
+        &root,
+        Some(block_mode()),
+        vec![Box::new(NamedTool(MCP_TOOL))],
+    );
+    block_on_local(agent.run("list my tasks".to_string(), |_| {}))
+        .expect("an MCP server key is not a credential, even in block mode");
+
+    let (mut agent, capture) = build_agent_with_tools(
+        &root,
+        Some(block_mode()),
+        vec![Box::new(NamedTool(KEYED_TOOL))],
+    );
+    let error = block_on_local(agent.run("list my tasks".to_string(), |_| {}))
+        .expect_err("block mode refuses a credential-shaped tool name");
+    let error = error.to_string();
+    assert!(
+        error.contains("PI_SECRET_BLOCK") || error.contains("PI_SECRET_IDENTIFIER"),
+        "{error}"
+    );
+    assert!(capture.lock().expect("capture").payloads.is_empty());
+}
+
+#[test]
+fn signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses() {
+    // Signed content must stay byte-stable for provider replay. The default
+    // mode sends it as the provider produced it (refusing wedged the session);
+    // block mode still refuses on any detection.
+    const SECRET_IN_SIGNED_CONTENT: &str = "sk-cccccccccccccccccccccccc";
+    let harness = TestHarness::new(
+        "signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses",
+    );
+    let root = harness.temp_path(".");
+
+    let messages = || {
+        [
+            assistant(
+                vec![pi::model::ContentBlock::Text(pi::model::TextContent {
+                    text: SECRET_IN_SIGNED_CONTENT.to_string(),
+                    text_signature: Some("text-signature".to_string()),
+                })],
+                pi::model::StopReason::Stop,
+            ),
+            assistant(
+                vec![pi::model::ContentBlock::Thinking(
+                    pi::model::ThinkingContent {
+                        thinking: SECRET_IN_SIGNED_CONTENT.to_string(),
+                        thinking_signature: Some("thinking-signature".to_string()),
+                    },
+                )],
+                pi::model::StopReason::Stop,
+            ),
+            assistant(
+                vec![tool_call(
+                    "signed-call",
+                    json!({"token": SECRET_IN_SIGNED_CONTENT}),
+                    Some("provider-signature"),
+                )],
+                pi::model::StopReason::ToolUse,
+            ),
+            assistant(
+                vec![tool_call(
+                    "server-tool",
+                    json!({"api_key": SECRET_IN_SIGNED_CONTENT}),
+                    Some("server-signature"),
+                )],
+                pi::model::StopReason::PauseTurn,
+            ),
+        ]
+    };
+
+    for message in messages() {
         let (mut agent, capture) = build_agent(&root, None);
-        let error = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
-            .expect_err("signed/verbatim payload must fail closed");
+        let original = serde_json::to_value(&message).expect("original signed history");
+        block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
+            .expect("signed content must not wedge the default mode");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
         assert!(
-            error.to_string().contains("PI_SECRET_SIGNED_CONTENT"),
-            "{error}"
+            capture.payloads[0].contains(SECRET_IN_SIGNED_CONTENT),
+            "{}",
+            capture.payloads[0]
         );
+        assert_eq!(
+            serde_json::to_value(&capture.messages[0][0]).expect("replayed signed history"),
+            original,
+            "same-origin signed or paused content must replay verbatim"
+        );
+    }
+    for message in messages() {
+        let (mut agent, capture) = build_agent(&root, Some(block_mode()));
+        let error = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
+            .expect_err("block mode refuses detected secrets in signed content");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
         assert!(capture.lock().expect("capture").payloads.is_empty());
+    }
+}
+
+#[test]
+fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() {
+    use pi::model::{ContentBlock, Message, StopReason, TextContent, ThinkingContent};
+
+    const OPAQUE: &str = "opaqueCredentialValue1234567890";
+    let harness = TestHarness::new(
+        "foreign_signed_and_paused_history_is_screened_without_mutating_the_session",
+    );
+    let root = harness.temp_path(".");
+
+    for mismatch in ["api", "provider", "model", "unknown"] {
+        for reason in [StopReason::ToolUse, StopReason::PauseTurn] {
+            let (mut agent, capture) = build_agent(&root, None);
+            let mut source = assistant(
+                vec![
+                    ContentBlock::Text(TextContent {
+                        text: OPAQUE.to_string(),
+                        text_signature: Some("msg_source".to_string()),
+                    }),
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking: OPAQUE.to_string(),
+                        thinking_signature: Some(format!("signature-{OPAQUE}")),
+                    }),
+                    tool_call("call_source", json!({"echo": OPAQUE}), Some("fc_source")),
+                ],
+                reason,
+            );
+            let Message::Assistant(message) = &mut source else {
+                unreachable!()
+            };
+            let message = Arc::make_mut(message);
+            match mismatch {
+                "api" => message.api = "other-api".to_string(),
+                "provider" => message.provider = "other-provider".to_string(),
+                "model" => message.model = "other-model".to_string(),
+                _ => {
+                    message.api.clear();
+                    message.provider.clear();
+                    message.model.clear();
+                }
+            }
+            let original = serde_json::to_value(&source).expect("original history");
+
+            // The later assignment teaches the vault about an earlier bare
+            // echo, including one that was signed by a previous provider.
+            block_on_local(agent.run_with_messages_with_abort(
+                vec![source, user_text(&format!("api_key={OPAQUE}"))],
+                None,
+                |_| {},
+            ))
+            .expect("screened foreign history reaches the provider");
+
+            let capture = capture.lock().expect("capture");
+            assert_eq!(capture.payloads.len(), 1);
+            assert!(!capture.payloads[0].contains(OPAQUE), "{mismatch} {reason:?}");
+            let Message::Assistant(screened) = &capture.messages[0][0] else {
+                panic!("expected screened assistant history")
+            };
+            assert_eq!(screened.stop_reason, reason);
+            assert!(matches!(&screened.content[0], ContentBlock::Text(text)
+                if text.text == "<pi-secret:000001>" && text.text_signature.is_none()));
+            assert!(matches!(&screened.content[1], ContentBlock::Thinking(thinking)
+                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none()));
+            assert!(matches!(&screened.content[2], ContentBlock::ToolCall(call)
+                if call.id == "call_source" && call.name == "fixture"
+                    && call.arguments == json!({"echo": "<pi-secret:000001>"})
+                    && call.thought_signature.is_none()));
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).expect("session history"),
+                original,
+                "outbound screening must retain original history for a switch back"
+            );
+        }
     }
 }

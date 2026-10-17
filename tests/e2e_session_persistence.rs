@@ -14,7 +14,7 @@ use common::TestHarness;
 #[cfg(unix)]
 use common::tmux::{TmuxInstance, sh_escape};
 use futures::Stream;
-use pi::agent::{Agent, AgentConfig, AgentSession};
+use pi::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::cli::Cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
@@ -1640,6 +1640,172 @@ fn create_and_save() {
         );
     });
     write_jsonl_artifacts(&harness, test_name);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TurnSaveEntrypoint {
+    Text,
+    Content,
+    Continue,
+}
+
+async fn invoke_turn_save_entrypoint(
+    agent_session: &mut AgentSession,
+    entrypoint: TurnSaveEntrypoint,
+    on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> Result<AssistantMessage> {
+    match entrypoint {
+        TurnSaveEntrypoint::Text => {
+            agent_session
+                .run_text("save this prompt".to_string(), on_event)
+                .await
+        }
+        TurnSaveEntrypoint::Content => {
+            agent_session
+                .run_with_content(
+                    vec![ContentBlock::Text(TextContent::new("save this prompt"))],
+                    on_event,
+                )
+                .await
+        }
+        TurnSaveEntrypoint::Continue => {
+            agent_session.run_continue_with_abort(None, on_event).await
+        }
+    }
+}
+
+fn session_turn_snapshot(session: &Session) -> Value {
+    json!({
+        "header": &session.header,
+        "entries": &session.entries,
+        "leaf": session.leaf_id(),
+        "path": &session.path,
+        "pendingMutations": session.autosave_metrics().pending_mutations,
+        "flushesStarted": session.autosave_metrics().flush_started,
+    })
+}
+
+/// Exercise `AgentSession` directly: RPC, ACP and extension-triggered turns do
+/// not pass through the SDK's additional persistence fence.
+async fn assert_agent_turn_save_failure_fences_reentry(
+    entrypoint: TurnSaveEntrypoint,
+    before_provider: bool,
+) {
+    let root = tempfile::tempdir().expect("turn persistence tempdir");
+    let blocked = root.path().join("directory-not-a-session.jsonl");
+    std::fs::create_dir(&blocked).expect("blocked save destination");
+    let mut stored = Session::create_with_dir(Some(root.path().to_path_buf()));
+    // Make selection synchronization a no-op so the injected failure reaches
+    // the prompt/turn save, rather than an already-fenced model transition.
+    stored.set_model_header(
+        Some("planned-provider".to_string()),
+        Some("planned-model".to_string()),
+        Some("off".to_string()),
+    );
+    stored.append_message(SessionMessage::User {
+        content: UserContent::Text("original input".to_string()),
+        timestamp: Some(0),
+    });
+    stored.save().await.expect("persist original session");
+    let original = stored.path.clone().expect("original session path");
+    let original_bytes = std::fs::read(&original).expect("original session bytes");
+    if before_provider {
+        stored.path = Some(blocked.clone());
+    }
+    let stored = Arc::new(asupersync::sync::Mutex::new(stored));
+    // An extra valid step makes an illegal later provider call observable.
+    let provider = Arc::new(PlannedProvider::new(vec![
+        text_step("completed provider work", 1, 8),
+        text_step("must not be requested", 1, 8),
+    ]));
+    let mut agent_session = make_agent_session(
+        root.path(),
+        Arc::clone(&provider) as Arc<dyn Provider>,
+        Arc::clone(&stored),
+    );
+    let injected = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&injected);
+    let callback_store = Arc::clone(&stored);
+    let result = invoke_turn_save_entrypoint(&mut agent_session, entrypoint, move |event| {
+        if !before_provider
+            && matches!(
+                event,
+                AgentEvent::MessageEnd {
+                    message: Message::Assistant(_)
+                }
+            )
+        {
+            assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
+            callback_store
+                .try_lock()
+                .expect("between-stream-and-save lock")
+                .path = Some(blocked.clone());
+        }
+    })
+    .await;
+    assert!(
+        result.as_ref().is_err_and(Error::is_session_persistence),
+        "{entrypoint:?}, before_provider={before_provider}: {result:?}"
+    );
+    let expected_calls = usize::from(!before_provider);
+    assert_eq!(provider.call_count.load(Ordering::SeqCst), expected_calls);
+    assert_eq!(injected.load(Ordering::SeqCst), expected_calls);
+    if before_provider {
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+    }
+
+    // Repairing the path cannot establish which part of the failed save was
+    // durable. Subsequent calls must fail before modifying either transcript.
+    stored.try_lock().unwrap().path = Some(original.clone());
+    let disk_before = std::fs::read(&original).expect("durable transcript after failed turn");
+    let stored_before = session_turn_snapshot(&stored.try_lock().unwrap());
+    let agent_before = serde_json::to_value(agent_session.agent.messages()).unwrap();
+    for next in [
+        TurnSaveEntrypoint::Text,
+        TurnSaveEntrypoint::Content,
+        TurnSaveEntrypoint::Continue,
+    ] {
+        let result = invoke_turn_save_entrypoint(&mut agent_session, next, |_| {
+            panic!("a quarantined session must not emit provider events");
+        })
+        .await;
+        assert!(
+            result.as_ref().is_err_and(Error::is_session_persistence),
+            "{entrypoint:?} must fence later {next:?}: {result:?}"
+        );
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(
+            session_turn_snapshot(&stored.try_lock().unwrap()),
+            stored_before
+        );
+        assert_eq!(
+            serde_json::to_value(agent_session.agent.messages()).unwrap(),
+            agent_before
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), disk_before);
+    }
+}
+
+#[test]
+fn initial_prompt_save_failure_fences_every_agent_session_entrypoint() {
+    run_async_test(async {
+        for entrypoint in [TurnSaveEntrypoint::Text, TurnSaveEntrypoint::Content] {
+            assert_agent_turn_save_failure_fences_reentry(entrypoint, true).await;
+        }
+    });
+}
+
+#[test]
+fn completed_turn_save_failure_fences_every_agent_session_entrypoint() {
+    run_async_test(async {
+        for entrypoint in [
+            TurnSaveEntrypoint::Text,
+            TurnSaveEntrypoint::Content,
+            TurnSaveEntrypoint::Continue,
+        ] {
+            assert_agent_turn_save_failure_fences_reentry(entrypoint, false).await;
+        }
+    });
 }
 
 #[test]
