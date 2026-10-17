@@ -1,4 +1,4 @@
-//! Minimal real-FTUI ConHost probe with an independent, file-only heartbeat.
+//! Minimal real-FTUI `ConHost` probe with an independent, file-only heartbeat.
 //! See docs/investigations/issue-239-conhost.md before interpreting its output.
 #![forbid(unsafe_code)]
 
@@ -15,7 +15,7 @@ mod enabled {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Write};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -52,7 +52,8 @@ mod enabled {
         }
 
         fn completed(&self) {
-            self.completed_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+            self.completed_ms
+                .store(self.elapsed_ms(), Ordering::Relaxed);
             self.phase.store(3, Ordering::Relaxed);
         }
 
@@ -88,12 +89,16 @@ mod enabled {
         }
     }
 
-    #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+    #[cfg_attr(
+        not(windows),
+        allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+    )]
     fn input_mode() -> io::Result<Option<u32>> {
         #[cfg(windows)]
         {
-            let handle = winapi_util::Handle::from_file(OpenOptions::new()
-                .read(true).write(true).open("CONIN$")?);
+            let handle = winapi_util::Handle::from_file(
+                OpenOptions::new().read(true).write(true).open("CONIN$")?,
+            );
             winapi_util::console::mode(&handle).map(Some)
         }
         #[cfg(not(windows))]
@@ -119,12 +124,12 @@ mod enabled {
                             // terminal events, and never contend for stdout/stderr.
                             writeln!(log, "{}", state.record(input_mode(), native_fix))?;
                             log.flush()?;
-                            match stopped.recv_timeout(Duration::from_millis(500)) {
-                                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                _ => {
-                                    writeln!(log, "{}", state.record(input_mode(), native_fix))?;
-                                    return log.flush();
-                                }
+                            if !matches!(
+                                stopped.recv_timeout(Duration::from_millis(500)),
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                            ) {
+                                writeln!(log, "{}", state.record(input_mode(), native_fix))?;
+                                return log.flush();
                             }
                         }
                     })();
@@ -142,7 +147,9 @@ mod enabled {
         fn finish(mut self) -> io::Result<()> {
             let _ = self.stop.send(());
             if let Some(worker) = self.worker.take() {
-                return worker.join().map_err(|_| io::Error::other("console observer panicked"))?;
+                return worker
+                    .join()
+                    .map_err(|_| io::Error::other("console observer panicked"))?;
             }
             Ok(())
         }
@@ -195,8 +202,12 @@ mod enabled {
                             .and_then(|()| crossterm::terminal::enable_raw_mode())
                             .and_then(|()| console_input::resume());
                         if let Err(error) = result {
-                            *self.state.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                                = Some(error.to_string());
+                            *self
+                                .state
+                                .error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(error.to_string());
                             Cmd::quit()
                         } else {
                             Cmd::none()
@@ -231,7 +242,7 @@ mod enabled {
         }
     }
 
-    pub(super) fn run() -> io::Result<()> {
+    pub fn run() -> io::Result<()> {
         let mut path = None;
         let mut native_fix = false;
         let mut fullscreen = false;
@@ -243,16 +254,24 @@ mod enabled {
             } else if path.is_none() && !arg.to_string_lossy().starts_with('-') {
                 path = Some(PathBuf::from(arg));
             } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                    "usage: ftui_conhost_probe TRACE.jsonl [--native-input] [--fullscreen]"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: ftui_conhost_probe TRACE.jsonl [--native-input] [--fullscreen]",
+                ));
             }
         }
-        let path = path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
-            "a new trace file path is required"))?;
+        let path = path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a new trace file path is required",
+            )
+        })?;
         #[cfg(not(windows))]
         if native_fix {
-            return Err(io::Error::new(io::ErrorKind::Unsupported,
-                "--native-input requires a real Windows console"));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "--native-input requires a real Windows console",
+            ));
         }
         // Never truncate an existing trace. No provider, credentials, Pi
         // session, typed characters, or terminal input bytes are collected.
@@ -261,22 +280,31 @@ mod enabled {
         writeln!(log, "{}", state.record(input_mode(), native_fix))?;
         log.flush()?;
         let observer = Observer::start(log, Arc::clone(&state), native_fix)?;
-        let guard = if native_fix { Some(console_input::enter(true)?) } else { None };
-        let model = Probe { state: Arc::clone(&state) };
+        let model = Probe {
+            state: Arc::clone(&state),
+        };
         let app = if fullscreen {
             App::fullscreen(model)
         } else {
             App::inline_auto(model, 3, 8)
         };
-        // Use the same FTUI 0.7 builder surface as pi's production run path.
-        let result = app.with_mouse().run();
-        let restored = guard.map_or(Ok(()), console_input::Guard::finish);
+        // Exercise the same lease runner as the pending production integration:
+        // drop an unrun app on acquisition failure, and restore after App::run
+        // even when it fails. Baseline runs intentionally leave native modes alone.
+        let result = if native_fix {
+            console_input::run(app, true, |app| app.with_mouse().run())
+        } else {
+            app.with_mouse().run()
+        };
         state.phase.store(4, Ordering::Relaxed);
-        let observed = observer.finish();
+        let observer_result = observer.finish();
         result?;
-        restored?;
-        observed?;
-        let failure = state.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        observer_result?;
+        let failure = state
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(error) = failure {
             return Err(io::Error::other(error));
         }
@@ -291,5 +319,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(not(feature = "ftui"))]
 fn main() -> std::io::Result<()> {
-    Err(std::io::Error::other("ftui_conhost_probe requires the ftui feature"))
+    Err(std::io::Error::other(
+        "ftui_conhost_probe requires the ftui feature",
+    ))
 }
