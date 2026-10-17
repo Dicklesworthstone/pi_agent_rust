@@ -229,6 +229,7 @@ pub mod interactive;
 pub mod interactive_ftui;
 #[doc(hidden)]
 pub mod jobs;
+pub mod judgment;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]
