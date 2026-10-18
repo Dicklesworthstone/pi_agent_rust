@@ -161,13 +161,26 @@ impl LspClient {
         env: &[(String, String)],
         root: &Path,
         initialization_options: Option<&Value>,
+        settings: Option<&Value>,
         timeout: Duration,
     ) -> Result<Self> {
+        // Reject invalid configured settings before a server can run. The
+        // same snapshot answers reverse requests during initialize, then is
+        // pushed only after initialized, as required by the protocol.
+        let budget = request::RequestBudget::new(timeout);
+        let settings = settings.map(workspace::Settings::parse).transpose()?;
+        if settings.is_some() {
+            crate::lsp::refactor_preview::check_owner(&AgentCx::for_current_or_request())?;
+        }
+        budget.remaining()?;
         // Resolve the workspace before spawning; never send an ambiguous or
         // relative native path as the server's document root.
         let root = root.canonicalize()?;
         let root_uri = try_path_to_uri(&root)?;
-        let workspace = std::sync::Arc::new(workspace::Workspace::new(&root_uri)?);
+        let workspace = std::sync::Arc::new(workspace::Workspace::new(
+            &root_uri,
+            settings.as_ref(),
+        )?);
         let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
@@ -261,7 +274,7 @@ impl LspClient {
             params["initializationOptions"] = options.clone();
         }
         let result = client
-            .call("initialize", params, timeout)
+            .call("initialize", params, budget.remaining()?)
             .await
             .map_err(|err| {
                 client.rpc.kill();
@@ -291,6 +304,11 @@ impl LspClient {
             .rpc
             .notify("initialized", serde_json::json!({}))
             .map_err(|err| Error::tool("lsp", format!("[LSP_TRANSPORT_IO] {}", err.message())))?;
+        if let Some(settings) = settings {
+            client
+                .set_workspace_settings_with_timeout(&settings, budget.remaining()?)
+                .await?;
+        }
         Ok(client)
     }
 

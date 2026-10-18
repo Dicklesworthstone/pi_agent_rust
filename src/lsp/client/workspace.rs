@@ -86,13 +86,21 @@ pub(super) struct Workspace {
 }
 
 impl Workspace {
-    pub(super) fn new(root_uri: &str) -> Result<Self> {
+    pub(super) fn new(root_uri: &str, settings: Option<&Settings>) -> Result<Self> {
         let root = uri_to_path(root_uri).filter(|_| root_uri.len() <= MAX_URI_BYTES)
             .ok_or_else(|| tool_err("LSP_CONFIGURATION_INVALID", "invalid workspace root URI"))?;
         Ok(Self {
             root,
             folders: json!([{"uri":root_uri,"name":"workspace"}]),
-            state: Mutex::new(State { settings: Arc::new(json!({})), revision: 0 }),
+            state: Mutex::new(State {
+                settings: settings.map_or_else(
+                    || Arc::new(json!({})),
+                    |settings| Arc::clone(&settings.0),
+                ),
+                // Revision zero still requires the initial push, including
+                // an explicitly configured empty object.
+                revision: 0,
+            }),
         })
     }
 

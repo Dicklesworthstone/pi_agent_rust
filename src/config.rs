@@ -547,6 +547,9 @@ pub struct LspServerSettings {
     /// `initializationOptions` payload for the handshake.
     #[serde(alias = "initializationOptions")]
     pub initialization_options: Option<serde_json::Value>,
+    /// Workspace settings exposed during initialization and notified after it.
+    /// Must be an object; each higher-precedence value replaces the whole object.
+    pub settings: Option<serde_json::Value>,
 }
 
 /// Approval mode configuration (bd-cv653.3.19).
@@ -2069,14 +2072,31 @@ fn merge_browser(
     }
 }
 
-/// Merge LSP settings: server maps union (other wins per server name),
-/// scalars prefer `other` (bd-cv653.1.1).
+/// Merge LSP settings: server maps union, set fields prefer `other` within
+/// each server, and object-valued fields replace as a whole (bd-cv653.1.1).
 fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<LspSettings> {
     match (base, other) {
         (Some(base), Some(other)) => {
             let mut servers = base.servers.unwrap_or_default();
             if let Some(other_servers) = other.servers {
-                servers.extend(other_servers);
+                for (name, other) in other_servers {
+                    let server = match servers.remove(&name) {
+                        Some(base) => LspServerSettings {
+                            command: other.command.or(base.command),
+                            args: other.args.or(base.args),
+                            env: other.env.or(base.env),
+                            languages: other.languages.or(base.languages),
+                            extensions: other.extensions.or(base.extensions),
+                            root_markers: other.root_markers.or(base.root_markers),
+                            initialization_options: other
+                                .initialization_options
+                                .or(base.initialization_options),
+                            settings: other.settings.or(base.settings),
+                        },
+                        None => other,
+                    };
+                    servers.insert(name, server);
+                }
             }
             Some(LspSettings {
                 servers: if servers.is_empty() {

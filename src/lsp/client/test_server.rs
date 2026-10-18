@@ -171,6 +171,7 @@ impl Fixture {
                 &[],
                 root,
                 None,
+                None,
                 Duration::from_secs(5),
             ))
             .expect("initialize real stdio peer");

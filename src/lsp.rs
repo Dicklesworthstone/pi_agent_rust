@@ -430,7 +430,7 @@ impl LspTool {
             "configured":revision != 0,"changed":changed,"applied":false,
             "preview":proposed.is_some() && input.apply != Some(true),
             "notificationQueued":false,"persisted":false,
-            "note":"Connection-local replacement, not merged or persisted. Repeat the payload with apply:true to update. Queue acceptance does not prove server adoption; reload resets these settings."
+            "note":"Connection-local replacement, not merged or persisted. Repeat the payload with apply:true to update. Queue acceptance does not prove server adoption; reload restores this server's configured settings."
         });
         // Bound the complete response before any update. Reserve the widest
         // possible revision number, then replace it with the actual revision.

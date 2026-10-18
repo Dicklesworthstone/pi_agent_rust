@@ -18,6 +18,14 @@ struct Peer {
 
 impl Peer {
     fn new(startup: Value, hold_initialize: bool) -> Option<Self> {
+        Self::with_settings(startup, hold_initialize, None)
+    }
+
+    fn with_settings(
+        startup: Value,
+        hold_initialize: bool,
+        settings: Option<Value>,
+    ) -> Option<Self> {
         let python = ["python3", "python"].into_iter().find(|program| {
             Command::new(program).arg("--version")
                 .stdout(Stdio::null()).stderr(Stdio::null())
@@ -43,6 +51,8 @@ impl Peer {
                     extensions: Some(vec![".cfgfixture".into()]),
                     languages: Some(vec!["plaintext".into()]),
                     root_markers: Some(vec![".cfg-root".into()]),
+                    initialization_options: Some(json!({"fixtureInitializationOnly":"init-only"})),
+                    settings,
                     ..Default::default()
                 })])),
                 ..Default::default()
@@ -114,6 +124,74 @@ fn configuration_services_answer_before_initialize_completes() {
     let malformed = frames.iter().find(|frame| frame["id"] == "early/invalid").unwrap();
     assert_eq!(malformed["error"]["code"], -32602);
     assert!(malformed.get("result").is_none());
+}
+
+#[test]
+fn configured_settings_are_available_during_initialize_then_pushed_before_documents() {
+    let settings = json!({"analysis":{"enabled":false,"depth":0,"paths":["src"]}});
+    let startup = json!([
+        {"id":"configured/early","method":"workspace/configuration","params":{"items":[
+            {},{"section":"analysis.enabled"},{"section":"analysis.depth"},
+            {"section":"fixtureInitializationOnly"}
+        ]}}
+    ]);
+    let Some(peer) = Peer::with_settings(startup, false, Some(settings.clone())) else { return };
+    let inspected = peer.run(json!({"action":"configure","file":"source.cfgfixture"})).unwrap();
+    assert_eq!(inspected["settings"], settings);
+    assert_eq!(inspected["configured"], true);
+    assert_eq!(inspected["revision"], 1);
+    assert_eq!(inspected["notificationQueued"], false, "inspection must not push twice");
+    peer.wire("test/success", json!({}));
+    let frames = peer.frames();
+    let init = frames.iter().find(|frame| frame["method"] == "initialize").unwrap();
+    assert_eq!(init["params"]["initializationOptions"], json!({"fixtureInitializationOnly":"init-only"}));
+    let early = frames.iter().position(|frame| frame["id"] == "configured/early").unwrap();
+    assert_eq!(frames[early]["result"], json!([settings,false,0,null]));
+    let initialized = frames.iter().position(|frame| frame["method"] == "initialized").unwrap();
+    let configured = frames.iter().position(|frame| frame["method"] == "workspace/didChangeConfiguration").unwrap();
+    let opened = frames.iter().position(|frame| frame["method"] == "textDocument/didOpen").unwrap();
+    assert!(early < initialized && initialized < configured && configured < opened);
+    assert_eq!(frames[configured]["params"], json!({"settings":settings}));
+    assert_eq!(frames.iter().filter(|frame| frame["method"] == "workspace/didChangeConfiguration").count(), 1);
+    let unchanged = peer.configure(settings, true);
+    assert_eq!(unchanged["changed"], false);
+    assert_eq!(unchanged["notificationQueued"], false);
+    assert_eq!(unchanged["revision"], 1);
+}
+
+#[test]
+fn configured_empty_settings_are_pushed_but_absent_settings_are_not() {
+    for settings in [None, Some(json!({}))] {
+        let configured = settings.is_some();
+        let Some(peer) = Peer::with_settings(json!([]), false, settings) else { return };
+        let inspected = peer.run(json!({"action":"configure","file":"source.cfgfixture"})).unwrap();
+        assert_eq!(inspected["settings"], json!({}));
+        assert_eq!(inspected["configured"], configured);
+        assert_eq!(inspected["revision"], u64::from(configured));
+        let pushes = peer.frames().iter()
+            .filter(|frame| frame["method"] == "workspace/didChangeConfiguration").count();
+        assert_eq!(pushes, usize::from(configured));
+    }
+}
+
+#[test]
+fn reload_restores_configured_settings_after_a_connection_local_override() {
+    let baseline = json!({"analysis":{"strict":false}});
+    let Some(peer) = Peer::with_settings(json!([]), false, Some(baseline.clone())) else { return };
+    let applied = peer.configure(json!({"analysis":{"strict":true}}), true);
+    assert_eq!(applied["settings"]["analysis"]["strict"], true);
+    assert_eq!(applied["revision"], 2);
+    assert_eq!(peer.reverse("workspace/configuration", json!({"items":[{}]}))["result"],
+        json!([{"analysis":{"strict":true}}]));
+    let reloaded = peer.run(json!({"action":"reload","file":"source.cfgfixture"})).unwrap();
+    assert_eq!(reloaded["killed"], 1);
+    let restored = peer.run(json!({"action":"configure","file":"source.cfgfixture"})).unwrap();
+    assert_eq!(restored["settings"], baseline);
+    assert_eq!(restored["revision"], 1);
+    let frames = peer.frames();
+    let pushes: Vec<_> = frames.iter().filter(|frame| frame["method"] == "workspace/didChangeConfiguration").collect();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0]["params"], json!({"settings":baseline}));
 }
 
 #[test]

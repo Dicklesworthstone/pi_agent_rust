@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 fn fixture() -> (tempfile::TempDir, Workspace) {
     let temp = tempfile::tempdir().unwrap();
     let uri = super::super::try_path_to_uri(&temp.path().canonicalize().unwrap()).unwrap();
-    let workspace = Workspace::new(&uri).unwrap();
+    let workspace = Workspace::new(&uri, None).unwrap();
     (temp, workspace)
 }
 

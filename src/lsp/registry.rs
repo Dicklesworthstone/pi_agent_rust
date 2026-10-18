@@ -43,6 +43,8 @@ pub struct ServerSpec {
     pub root_markers: Vec<String>,
     /// `initializationOptions` payload for the handshake.
     pub initialization_options: Option<Value>,
+    /// Explicit workspace settings, separate from initialization-only options.
+    pub settings: Option<Value>,
     /// Install hint shown when the command is missing.
     pub install_hint: String,
 }
@@ -60,6 +62,7 @@ pub fn default_servers() -> Vec<ServerSpec> {
             extensions: vec![".rs".to_string()],
             root_markers: vec!["Cargo.toml".to_string(), ".git".to_string()],
             initialization_options: None,
+            settings: None,
             install_hint: "install with: rustup component add rust-analyzer".to_string(),
         },
         ServerSpec {
@@ -83,6 +86,7 @@ pub fn default_servers() -> Vec<ServerSpec> {
             ],
             root_markers: vec!["package.json".to_string(), "tsconfig.json".to_string()],
             initialization_options: None,
+            settings: None,
             install_hint: "install with: npm install -g typescript-language-server typescript"
                 .to_string(),
         },
@@ -99,6 +103,7 @@ pub fn default_servers() -> Vec<ServerSpec> {
                 "requirements.txt".to_string(),
             ],
             initialization_options: None,
+            settings: None,
             install_hint: "install with: npm install -g pyright".to_string(),
         },
         ServerSpec {
@@ -110,6 +115,7 @@ pub fn default_servers() -> Vec<ServerSpec> {
             extensions: vec![".go".to_string()],
             root_markers: vec!["go.mod".to_string(), "go.work".to_string()],
             initialization_options: None,
+            settings: None,
             install_hint: "install with: go install golang.org/x/tools/gopls@latest".to_string(),
         },
         ServerSpec {
@@ -132,6 +138,7 @@ pub fn default_servers() -> Vec<ServerSpec> {
                 ".git".to_string(),
             ],
             initialization_options: None,
+            settings: None,
             install_hint: "install clangd via your system package manager".to_string(),
         },
     ]
@@ -199,6 +206,9 @@ fn merge_servers(config: Option<&Config>) -> Vec<ServerSpec> {
                     .initialization_options
                     .clone_from(&entry.initialization_options);
             }
+            if entry.settings.is_some() {
+                existing.settings.clone_from(&entry.settings);
+            }
         } else if let Some(command) = &entry.command {
             servers.push(ServerSpec {
                 name: name.clone(),
@@ -213,6 +223,7 @@ fn merge_servers(config: Option<&Config>) -> Vec<ServerSpec> {
                 extensions: entry.extensions.clone().unwrap_or_default(),
                 root_markers: entry.root_markers.clone().unwrap_or_default(),
                 initialization_options: entry.initialization_options.clone(),
+                settings: entry.settings.clone(),
                 install_hint: format!("ensure {command:?} is on PATH"),
             });
         }
@@ -398,6 +409,7 @@ impl LspRegistry {
             &spec.env,
             &root,
             spec.initialization_options.as_ref(),
+            spec.settings.as_ref(),
             self.request_timeout,
         )
         .await
@@ -588,6 +600,83 @@ mod tests {
     }
 
     #[test]
+    fn settings_only_project_override_keeps_the_global_server_definition() {
+        let global: Config = serde_json::from_value(serde_json::json!({
+            "lsp":{"requestTimeoutSecs":45,"servers":{"custom":{
+                "command":"configured-server","args":["--stdio"],
+                "env":{"LANG":"C"},"languages":["custom"],
+                "extensions":[".custom"],"rootMarkers":["custom.project"],
+                "initializationOptions":{"initializationOnly":true},
+                "settings":{"analysis":{"old":true,"retained":false}}
+            }}}
+        })).unwrap();
+        let project: Config = serde_json::from_value(serde_json::json!({
+            "lsp":{"servers":{"custom":{"settings":{"analysis":{"new":true}}}}}
+        })).unwrap();
+        let config = Config::merge(global, project);
+        let registry = LspRegistry::new(Path::new("."), Some(&config));
+        let spec = registry.spec_for_file(Path::new("source.custom")).expect("custom server retained");
+        assert_eq!(spec.command, "configured-server");
+        assert_eq!(spec.args, ["--stdio"]);
+        assert_eq!(spec.env, [("LANG".to_string(), "C".to_string())]);
+        assert_eq!(spec.languages, ["custom"]);
+        assert_eq!(spec.root_markers, ["custom.project"]);
+        assert_eq!(spec.initialization_options, Some(serde_json::json!({"initializationOnly":true})));
+        assert_eq!(spec.settings, Some(serde_json::json!({"analysis":{"new":true}})));
+        assert_eq!(registry.request_timeout(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn settings_omission_inherits_and_an_empty_object_replaces() {
+        for (override_settings, expected) in [
+            (serde_json::json!({"args":[]}), serde_json::json!({"enabled":true})),
+            (serde_json::json!({"settings":{}}), serde_json::json!({})),
+        ] {
+            let global: Config = serde_json::from_value(serde_json::json!({
+                "lsp":{"servers":{"rust-analyzer":{
+                    "command":"/custom/rust-analyzer","args":["--log-file","ra.log"],
+                    "settings":{"enabled":true}
+                }}}
+            })).unwrap();
+            let project: Config = serde_json::from_value(serde_json::json!({
+                "lsp":{"servers":{"rust-analyzer":override_settings}}
+            })).unwrap();
+            let config = Config::merge(global, project);
+            let registry = LspRegistry::new(Path::new("."), Some(&config));
+            let spec = registry.spec_for_file(Path::new("source.rs")).unwrap();
+            assert_eq!(spec.command, "/custom/rust-analyzer");
+            assert_eq!(spec.settings, Some(expected));
+            if override_settings.get("args").is_some() {
+                assert!(spec.args.is_empty(), "an explicit empty argv replaces the inherited one");
+            } else {
+                assert_eq!(spec.args, ["--log-file", "ra.log"]);
+            }
+        }
+    }
+
+    #[test]
+    fn project_workspace_settings_follow_the_existing_trust_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let global_dir = temp.path().join("global");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+        std::fs::write(global_dir.join("settings.json"),
+            r#"{"lsp":{"servers":{"rust-analyzer":{"command":"/global/server","settings":{"source":"global"}}}}}"#).unwrap();
+        std::fs::write(cwd.join(".pi/settings.json"),
+            r#"{"lsp":{"servers":{"rust-analyzer":{"settings":{"source":"project"}}}}}"#).unwrap();
+        for trusted in [false, true] {
+            let config = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, trusted).unwrap();
+            let registry = LspRegistry::new(&cwd, Some(&config));
+            let spec = registry.spec_for_file(Path::new("source.rs")).unwrap();
+            assert_eq!(spec.command, "/global/server");
+            assert_eq!(spec.settings, Some(serde_json::json!({
+                "source":if trusted { "project" } else { "global" }
+            })));
+        }
+    }
+
+    #[test]
     fn root_detection_walks_up_to_marker() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -622,6 +711,7 @@ mod tests {
             extensions: vec![".rs".to_string()],
             root_markers: vec!["definitely-not-present-9f3k.marker".to_string()],
             initialization_options: None,
+            settings: None,
             install_hint: "n/a".to_string(),
         };
         assert_eq!(registry.workspace_root(&file, &spec), temp.path());
