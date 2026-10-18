@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
+const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | run <review> --steps N | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
 const RECEIPT_PREFIX: &str = "g1-";
 
 #[derive(Clone, Copy)]
@@ -27,6 +27,7 @@ enum Action<'a> {
     Create { objective: &'a str, budget: GoalBudget },
     Budget { reason: &'a str, budget: GoalBudget },
     Step,
+    Run { steps: u32 },
     Pause,
     Resume,
     Drop(&'a str),
@@ -120,6 +121,19 @@ fn parse(args: &str) -> Result<Command<'_>> {
         }
         "drop" => Action::Drop(text_tail(&mut remaining)?),
         "complete" => Action::Complete(text_tail(&mut remaining)?),
+        "run" => {
+            if word(&mut remaining) != Some("--steps") {
+                return Err(usage());
+            }
+            let steps = word(&mut remaining)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|steps| (1..=32).contains(steps))
+                .ok_or_else(usage)?;
+            if word(&mut remaining).is_some() {
+                return Err(usage());
+            }
+            Action::Run { steps }
+        }
         "step" | "pause" | "resume" | "save" => {
             if word(&mut remaining).is_some() { return Err(usage()); }
             match verb.to_ascii_lowercase().as_str() {
@@ -190,24 +204,44 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
     if review != expected {
         return Err(failure("GOAL_STALE", "session, branch or goal changed; run /goal status and review it again. Nothing was changed."));
     }
-    if matches!(action, Action::Step) {
+    if matches!(action, Action::Step | Action::Run { .. }) {
         require_no_plan(&session, live_plan)?;
         let (id, record) = current.as_ref()
             .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
         let reviewed = snapshot(&store, &session, id.clone(), record.clone());
+        let (requested_steps, label) = match action {
+            Action::Step => (1, "step"),
+            Action::Run { steps } => (steps, "run"),
+            _ => unreachable!(),
+        };
         drop(session);
+        let mut completed_steps = 0u32;
         let run = handle.run_goal(
             &owner,
             &reviewed,
             Duration::from_secs(15 * 60),
             |_control, _event| {},
-            |_goal, _message| GoalDecision::Pause {
-                reason: "Terminal step completed; review the result before continuing.".into(),
+            move |_goal, _message| {
+                completed_steps = completed_steps.saturating_add(1);
+                if completed_steps >= requested_steps {
+                    GoalDecision::Pause {
+                        reason: format!(
+                            "Terminal run completed {completed_steps} reviewed prompt(s); inspect the result before continuing."
+                        ),
+                    }
+                } else {
+                    GoalDecision::Continue {
+                        instruction: format!(
+                            "Continue working on the same objective. This is prompt {} of the user's bounded terminal run; do not claim completion on the user's behalf.",
+                            completed_steps.saturating_add(1)
+                        ),
+                    }
+                }
             },
         )?;
         let report = run.await;
         let mut output = String::new();
-        let _ = writeln!(output, "Goal step stopped: {:?}", report.stop);
+        let _ = writeln!(output, "Goal {label} stopped: {:?}", report.stop);
         if let Some(Ok(message)) = &report.completion {
             let mut wrote = false;
             for block in &message.content {
@@ -255,7 +289,7 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
             if current.is_none() { return Err(failure("GOAL_MISSING", "this branch has no goal to save")); }
             None
         }
-        Action::Step => unreachable!("step handled before journal mutation"),
+        Action::Step | Action::Run { .. } => unreachable!("execution handled before journal mutation"),
         Action::Pause | Action::Resume | Action::Drop(_) | Action::Complete(_) => {
             if matches!(action, Action::Resume) { require_no_plan(&session, live_plan)?; }
             let (_, record) = current.as_ref()

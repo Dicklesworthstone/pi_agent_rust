@@ -63,9 +63,13 @@ fn command_grammar_preserves_text_and_refuses_ambiguous_inputs() {
     ] { assert!(parse(&format!("create {token} {tail}")).is_err(), "{tail}"); }
     let Command::Change { action: Action::Step, .. } =
         parse(&format!("step {token}")).unwrap() else { panic!("step"); };
+    let Command::Change { action: Action::Run { steps: 3 }, .. } =
+        parse(&format!("run {token} --steps 3")).unwrap() else { panic!("run"); };
     for input in [
         "status extra".to_string(), "pause".into(), "run".into(),
-        format!("step {token} extra"), format!("pause {token} extra"), format!("resume {token} extra"),
+        format!("run {token}"), format!("run {token} --steps 0"),
+        format!("run {token} --steps 33"), format!("run {token} --steps nope"),
+        format!("run {token} --steps 2 extra"), format!("step {token} extra"), format!("pause {token} extra"), format!("resume {token} extra"),
         format!("save {token} extra"), format!("complete {token}"),
         format!("drop {token} --   "), format!("create {token} -- {}", "x".repeat(MAX_TEXT_BYTES + 1)),
         format!("create {token} -- nul\0byte"), "pause g1-日本語".into(),
@@ -205,8 +209,8 @@ fn step_respects_exhausted_budget_without_dispatching_provider_work() {
     append(&mut stored, &record).unwrap();
     let (mut handle, events) = fixture(stored, false);
     let token = review(&mut handle);
-    let output = execute(run(&mut handle, &format!("step {token}"))).unwrap();
-    assert!(output.contains("Goal step stopped: BudgetLimited"));
+    let output = execute(run(&mut handle, &format!("run {token} --steps 4"))).unwrap();
+    assert!(output.contains("Goal run stopped: BudgetLimited"));
     assert_eq!(current(&handle).status(), GoalStatus::BudgetLimited);
     assert_eq!(current(&handle).prompts_started(), 1);
     assert_eq!(events.load(Ordering::SeqCst), 0, "budget preflight must not start a provider turn");

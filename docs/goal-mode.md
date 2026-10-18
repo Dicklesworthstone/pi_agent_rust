@@ -76,27 +76,32 @@ original text. Persistence diagnostics are bounded and explicitly labelled
 when truncated.
 
 **Lifecycle commands do not imply autonomous completion.** The terminal now has
-one bounded execution command:
+two bounded execution commands:
 
 ```text
 /goal step <review>
+/goal run <review> --steps 4
 ```
 
-`step` runs exactly one native goal prompt through the same SDK driver, then the
-terminal supplies a host-side **Pause** verdict. Assistant prose cannot mark the
-goal complete or authorize another prompt. The step uses the existing goal
-prompt/token accounting, tool permissions, approvals, persistence, retries,
-compaction and native cancellation path. Its absolute execution budget is 15
-minutes, still subject to stricter native turn limits. Review the new receipt and
-result before `resume` plus another `step`, budget revision, drop, or explicit
-completion attestation.
+`step` runs exactly one native goal prompt. `run` authorizes 1–32 prompts in
+one terminal invocation, still bounded by the goal's own remaining prompt and
+token budgets. Between successful prompts the terminal supplies a host-side
+**Continue** verdict; after the requested count it supplies **Pause**. Assistant
+prose can never mark the goal complete or extend the user-selected run.
 
-There is still no `/goal run` autonomous multi-prompt loop, selected verifier,
-or model-facing completion tool. Ordinary terminal prompts do not invoke the
-bounded goal driver, consume its prompt counter, or become governed by its token
-budget; active-interval assistant usage is still accounted by the journal. Use
-the SDK runners below when a host can provide a real continuation/completion
-verifier for bounded multi-prompt execution.
+Both commands use the existing SDK driver, tool permissions, approvals,
+persistence, retries, compaction and native cancellation path. Their absolute
+execution budget is 15 minutes, still subject to stricter native turn limits.
+A failure, cancellation, exhausted goal budget, or unconfirmed persistence can
+stop earlier. Review the fresh receipt and result before another `resume`/run,
+budget revision, drop, or explicit completion attestation.
+
+Terminal `run` is deliberately **not** a completion verifier: it never returns
+`GoalDecision::Complete`. Hosts that need evidence-based automatic completion
+must use the SDK runner with a real verifier. Ordinary terminal prompts do not
+invoke the bounded goal driver, consume its prompt counter, or become governed
+by its token budget; active-interval assistant usage is still accounted by the
+journal.
 The classic terminal is unchanged. Regression coverage uses native sessions in
 `src/goal/terminal/tests.rs` and the default routing/driver in
 `src/interactive_ftui/workspace_commands.rs`; authored tests still require DSR.
