@@ -47,9 +47,60 @@ request cancellation/deadline authority. Responses are limited to 32 KiB and
 Usage is returned on successful calls; this API does not yet journal failed
 attempts or update aggregate Agent session cost. It does not implement TypeSafe,
 a role fallback chain, background batches, caching, or a retained workpool.
-Eval helper integration is a separate change; merely exporting this module does
-not yet expose a `judge` global in either kernel.
+
+## Judgments inside eval
+
+Both native eval kernels support the `__pi_judge` bridge operation. It returns
+JSON text containing the same complete typed verdict, never a preview or a
+retained task handle. For example, this JavaScript cell can be supplied to eval:
+
+```json
+{
+  "kernel": "js",
+  "judge_model": {"provider": "your-registered-provider", "model": "your-model-id"},
+  "code": "JSON.parse(await tool.call('__pi_judge', {state: {change: 'adds regression tests'}, questions: {safe: {type: 'bool', instructions: 'Does this change improve test coverage?'}}})).answers.safe.bool"
+}
+```
+
+Python uses `json.loads(await tool.call('__pi_judge', {'state': evidence,
+'questions': questions}))`. An SDK host may instead construct
+`EvalTool::new(cwd).with_judge(judge)` with an already authenticated `Judge`.
+Neither path adds general tool re-entry: the normal bridge remains restricted
+to read/grep/find/ls, and nesting the operation inside `tool.result` is denied.
+
+`judge_model` selects exactly one model from the host registry and applies
+trusted configuration, configured disabled providers and normal host credential
+resolution. Its only fields are `provider` and `model`, each at most 256 bytes;
+guest-supplied endpoints, keys and headers are refused. Unknown models or missing
+credentials fail without fallback. Selection is per cell, not retained with
+interpreter variables, and cannot override a host-bound Judge. Invalid selection
+fails before waiting for a kernel or applying a reset. Cells that do not request
+a judgment do not load judgment configuration or credentials.
+
+At most **16 judgment attempts per cell** are admitted, including failed attempts.
+The existing eval deadline, cancellation and original session owner cover model
+resolution and response collection. A shorter cell deadline wins over the
+Judge's 60-second ceiling. No generation task is detached; local credential
+resolution may finish after its wait is dropped, but cannot dispatch a model
+request. Both session and per-call kernels use the same native path.
+
+Agent-owned eval calls borrow the current auxiliary privacy projection for the
+whole cell. This also screens dynamic evidence read from files inside the
+kernel, not just the original eval source. The projection is never stored in a
+shared tool or retained interpreter. Standalone calls use the bound Judge's
+auxiliary privacy policy.
+
+Native `details.judgments` metadata has schema `pi.eval.judgments.v1` and records
+admitted attempts even when guest code discards the answer or catches its error.
+Completed attempts include provider/model identity and reported usage. Failed
+or interrupted attempts have `usage: null` and `usageKnown: false`, not an
+invented zero cost. Python host errors append the bounded receipt JSON under
+`EVAL_JUDGMENTS`; ordinary guest failures retain result metadata. These receipts
+do not update aggregate Agent cost and are not a durable billing journal: a
+caller dropping the entire eval future cannot receive its result or receipts.
 
 The module includes request/response validation and controlled provider-stream
-unit fixtures. They are not live-model tests. The authoritative acceptance
+unit fixtures, plus native Python/QuickJS eval integrations with controlled
+providers in `src/eval/judgment/tests.rs`. They are not live-model tests.
+The authoritative acceptance
 command remains `dsr quality --tool pi_agent_rust`.

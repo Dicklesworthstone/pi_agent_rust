@@ -22,6 +22,7 @@ mod bridge_result;
 mod display;
 mod isolation;
 mod js_kernel;
+mod judgment;
 mod lifecycle;
 mod output;
 mod python_runtime;
@@ -200,6 +201,8 @@ pub struct EvalTool {
     // Slot mutexes protect storage, not execution: each runner takes its
     // kernel out across awaits. Keep this lease until it returns or drops.
     execution: Arc<futures::lock::Mutex<()>>,
+    // Fixed host binding only; invocation privacy is always borrowed per cell.
+    judge: Option<crate::judgment::Judge>,
 }
 
 impl EvalTool {
@@ -214,12 +217,22 @@ impl EvalTool {
             session_scope: crate::jobs::JobSessionScope::default(),
             retained_sessions: Mutex::new(session::RetainedSessions::default()),
             execution: Arc::new(futures::lock::Mutex::new(())),
+            judge: None,
         }
+    }
+
+    /// Bind typed eval judgments to a host-owned provider and request options.
+    /// Cells cannot override this binding or access its credentials. Ordinary
+    /// eval instances require an explicit judge_model on each requesting cell.
+    #[must_use]
+    pub fn with_judge(mut self, judge: crate::judgment::Judge) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     /// Run one JavaScript cell on the persistent QuickJS kernel. Both native
     /// console output and bridge requests are serviced by the owning host.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn run_js_cell(
         &self,
         code: &str,
@@ -227,6 +240,7 @@ impl EvalTool {
         timeout: Duration,
         capture: &mut output::Capture,
         session_guard: &session::CellSession,
+        judgments: &mut judgment::Invocation<'_>,
     ) -> Result<ToolOutput> {
         let kernel = {
             let mut slot = self
@@ -272,7 +286,7 @@ impl EvalTool {
                     "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
                 ))?;
                 session_guard.check_tool().await?;
-                let mut pending = Box::pin(self.run_bridge_call_parts(&bridge.tool, bridge.input));
+                let mut pending = Box::pin(judgments.dispatch(self, &bridge.tool, bridge.input));
                 let reply = loop {
                     // An async JS timer can print while its tool request is in
                     // flight. Keep draining instead of blocking that producer.
@@ -372,7 +386,7 @@ impl EvalTool {
     /// Run one cell: writes the request line, then reads the response on a
     /// blocking thread while this async fn polls with the cell budget. On
     /// timeout the kernel is killed (state loss) and the next cell restarts.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn run_py_cell(
         &self,
         code: &str,
@@ -380,6 +394,7 @@ impl EvalTool {
         soft_timeout_secs: Option<u64>,
         capture: &mut output::Capture,
         session_guard: &session::CellSession,
+        judgments: &mut judgment::Invocation<'_>,
     ) -> Result<ToolOutput> {
         let deadline = Instant::now() + timeout;
         // Take the kernel out (or spawn) so the mutex is not held across await.
@@ -486,7 +501,7 @@ impl EvalTool {
                 session_guard.check_tool().await?;
                 let reply = bridge_io::wait_python(
                     &kernel.lines, id, deadline, capture, session_guard,
-                    self.run_bridge_call(bridge),
+                    self.run_bridge_call(bridge, judgments),
                 ).await?;
                 session_guard.check_tool().await?;
                 bridge_io::delivery::send_python(
@@ -539,11 +554,11 @@ impl EvalTool {
 
     /// Execute one whitelisted bridge call through the SAME tool
     /// implementations a direct call uses — identical path policy.
-    async fn run_bridge_call(&self, bridge: &Value) -> Value {
+    async fn run_bridge_call(&self, bridge: &Value, judgments: &mut judgment::Invocation<'_>) -> Value {
         let call = bridge.get("call").cloned().unwrap_or(Value::Null);
         let tool_name = bridge.get("tool").and_then(Value::as_str).unwrap_or("");
         let input = bridge.get("input").cloned().unwrap_or_else(|| json!({}));
-        match self.run_bridge_call_parts(tool_name, input).await {
+        match judgments.dispatch(self, tool_name, input).await {
             Ok(content) => json!({"call": call, "ok": true, "content": content}),
             Err(error) => json!({"call": call, "ok": false, "error": error}),
         }
@@ -614,7 +629,12 @@ impl Tool for EvalTool {
          Module state is cached until reset. No package, network or Node imports. \
          JavaScript await tool.result(name, args) returns native content blocks, \
          details and isError without flattening images or metadata. It uses the \
-         same read/grep/find/ls bridge as tool.call; no additional tools are enabled."
+         same read/grep/find/ls bridge as tool.call. For typed model judgments, \
+         set judge_model={provider,model} for this cell, then call \
+         __pi_judge through tool.call with {state,questions} and parse its JSON. \
+         Questions use bool/choice/score rubrics. At most 16 attempts per cell; \
+         no model fallback, tool execution, or automatic permission expansion. \
+         Native attempt/usage receipts are included in result details."
     }
 
     fn parameters(&self) -> Value {
@@ -651,6 +671,16 @@ impl Tool for EvalTool {
                     "default": false,
                     "description": "Discard only the selected language's retained state before executing code"
                 },
+                "judge_model": {
+                    "type": "object",
+                    "description": "Explicit model for this cell's typed judgments; host registry credentials only, no fallback. Omit when the host already binds a Judge. Not retained by later cells.",
+                    "properties": {
+                        "provider": {"type":"string", "minLength":1, "maxLength":256},
+                        "model": {"type":"string", "minLength":1, "maxLength":256}
+                    },
+                    "required": ["provider", "model"],
+                    "additionalProperties": false
+                },
                 "output_path": {
                     "type": "string",
                     "description": "Optional new workspace-relative .jsonl console archive; create-only, up to 64 MiB encoded. Validated before reset/execution. No file is published for an incomplete run."
@@ -666,12 +696,30 @@ impl Tool for EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update).await
+        self.execute_with_mode(input, on_update, None).await
+    }
+
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        self.execute_with_mode(input, on_update, Some(protect)).await
     }
 
     fn effects(&self) -> ToolEffects {
         // Arbitrary code: process-level effects, serialized fail-closed.
         ToolEffects::process()
+    }
+
+    fn effects_for_input(&self, input: &Value) -> ToolEffects {
+        if self.judge.is_some() || input.get("judge_model").is_some() {
+            ToolEffects::process().union(ToolEffects::network())
+        } else {
+            self.effects()
+        }
     }
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {

@@ -155,10 +155,12 @@ impl EvalTool {
         &self,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: Option<&crate::judgment::Protect<'_>>,
     ) -> Result<ToolOutput> {
         // Validate before waiting, spawning, or destroying any retained state.
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
+        let mut judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?;
         let archive_path = super::output::Archive::requested_path(&input)?;
         let cell: Cell = serde_json::from_value(input)
             .map_err(|error| Error::tool("eval", format!("EVAL_INPUT: {error}")))?;
@@ -229,12 +231,12 @@ impl EvalTool {
         let deadline = Instant::now() + timeout;
         let outcome = match cell.kernel {
             Kernel::Python => wait_in_session(&owner, deadline, &session_guard,
-                self.run_py_cell(&cell.code, timeout, cell.soft_timeout_secs, &mut capture, &session_guard)).await,
+                self.run_py_cell(&cell.code, timeout, cell.soft_timeout_secs, &mut capture, &session_guard, &mut judgments)).await,
             Kernel::Js => {
                 let code = prepared.as_ref().map_or(cell.code.as_str(), |file| file.code.as_str());
                 let filename = prepared.as_ref().map(|file| file.path.as_str());
                 wait_in_session(&owner, deadline, &session_guard,
-                    self.run_js_cell(code, filename, timeout, &mut capture, &session_guard)).await
+                    self.run_js_cell(code, filename, timeout, &mut capture, &session_guard, &mut judgments)).await
             }
         };
         let interrupted = outcome.is_err();
@@ -266,6 +268,9 @@ impl EvalTool {
                 }
             }
         };
+        // Receipts are native metadata, not guest-controlled console output.
+        // Include failed/cancelled attempts even when the guest caught an error.
+        let outcome = judgments.finish(outcome);
         // Do not emit another running update after an interrupted cell. Do
         // not await its resolver outside the watchdog during error cleanup.
         // Already received bytes remain in the existing failure result.

@@ -43,6 +43,7 @@ impl EvalTool {
             session_scope: self.session_scope.clone(),
             retained_sessions: Mutex::new(super::session::RetainedSessions::default()),
             execution: Arc::clone(&self.execution),
+            judge: self.judge.clone(),
         }
     }
 
@@ -50,9 +51,10 @@ impl EvalTool {
         &self,
         input: Value,
         on_update: Option<Update>,
+        protect: Option<&crate::judgment::Protect<'_>>,
     ) -> Result<ToolOutput> {
         if KernelMode::parse(&input)? == KernelMode::Session {
-            return self.execute_cell(input, on_update).await;
+            return self.execute_cell(input, on_update, protect).await;
         }
         let owner = AgentCx::for_current_or_request();
         let private = self.isolated_executor();
@@ -62,7 +64,7 @@ impl EvalTool {
                 callback(update);
             }) as Update
         });
-        let outcome = private.execute_cell(input, on_update).await;
+        let outcome = private.execute_cell(input, on_update, protect).await;
         // Retire even a successful or ordinary-error kernel before handing
         // out the result. Abandonment drops the private executor and checked-
         // out runner too; neither has access to the parent's kernel slots.
