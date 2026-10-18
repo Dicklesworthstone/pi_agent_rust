@@ -182,7 +182,10 @@ pub fn default_adapters() -> Vec<AdapterSpec> {
         AdapterSpec {
             id: "flutter-debug-adapter".to_string(),
             command_candidates: vec!["dart".to_string(), "dart.exe".to_string()],
-            adapter_args: vec!["debug_adapter".to_string(), "--flutter-sdk-path".to_string(), "".to_string()],
+            // The Dart SDK locates Flutter through the project and SDK
+            // configuration. An empty --flutter-sdk-path is not a valid path
+            // and prevents the adapter from starting.
+            adapter_args: vec!["debug_adapter".to_string()],
             languages: vec!["flutter"],
             install_hint: "install the Dart and Flutter SDKs; configure the Flutter SDK path when required".to_string(),
         },
@@ -426,7 +429,7 @@ mod tests {
         assert_eq!(by_id("dart-debug-adapter").adapter_args, ["debug_adapter"]);
         assert_eq!(
             by_id("flutter-debug-adapter").adapter_args,
-            ["debug_adapter", "--flutter-sdk-path", ""]
+            ["debug_adapter"]
         );
         for id in [
             "kotlin-debug-adapter",
