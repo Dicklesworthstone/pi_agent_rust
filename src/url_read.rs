@@ -18,7 +18,7 @@ mod notebook;
 pub use navigation::{fetch, github_blob_to_raw, host_is_private_target};
 
 /// Maximum download size for a URL read (10 MiB before conversion).
-const MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// What the converter produced, for metadata + tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

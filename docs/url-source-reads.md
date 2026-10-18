@@ -1,5 +1,39 @@
 # Source-aware URL reads
 
+## Local documents and bounded output
+
+The same `read` tool also renders local `.ipynb` notebooks and PDFs. Notebook
+reads show saved cells, results, and tracebacks without starting a kernel. PDF
+extraction requires the existing `url-pdf` build feature. Local HTML continues
+to return its source so it remains suitable for code inspection and editing.
+
+```json
+{"path":"analysis.ipynb"}
+{"path":"analysis.ipynb","offset":20,"limit":40}
+{"path":"analysis.ipynb","raw":true,"hashline":true}
+```
+
+Rendered line numbers belong to the document view. They cannot be used as
+`hashline_edit` anchors: a converted local read with `hashline=true` returns an
+actionable error. Use `raw=true` to obtain the original notebook JSON for edits.
+`raw=true` also bypasses URL conversion and GitHub source rewriting, like the
+existing URL `:raw` suffix.
+
+Local conversion consumes the file descriptor admitted by the workspace scope
+check. It never reopens the path or changes the source, and refuses inputs larger
+than 10 MiB, including files that grow while being read. Converted local and URL
+output share a limit of 2,000 lines and 1 MB per response even when a larger
+`limit` is requested. `details.nextOffset` and the visible continuation notice
+identify the first unread rendered line. An individual line larger than the
+byte budget produces an explicit error instead of an offset that never advances.
+The metadata does not duplicate the complete document outside that output limit.
+
+The local read regressions cover saved outputs, raw hashline access, pagination,
+invalid/oversized documents, unchanged HTML source, and byte/line limits. They
+require the DSR quality recipe for execution.
+
+## GitHub and other URLs
+
 The ordinary `read` tool now fetches a GitHub file page's actual raw document.
 For example, a `https://github.com/OWNER/REPO/blob/REF/PATH` input in reader mode
 resolves to the raw host before the HTTP request. The result contains file bytes,

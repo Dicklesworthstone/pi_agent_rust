@@ -6386,6 +6386,8 @@ struct ReadInput {
     limit: Option<i64>,
     #[serde(default)]
     hashline: bool,
+    #[serde(default)]
+    raw: bool,
 }
 
 pub struct ReadTool {
@@ -6593,7 +6595,7 @@ impl ReadTool {
         } else {
             crate::url_read::SsrfPolicy::BlockPrivateTargets
         };
-        let mode = if raw {
+        let mode = if raw || input.raw {
             crate::url_read::UrlReadMode::Raw
         } else {
             crate::url_read::UrlReadMode::Reader
@@ -6605,55 +6607,106 @@ impl ReadTool {
             );
         }
 
-        let lines: Vec<&str> = outcome.content.lines().collect();
-        let total_lines = lines.len();
-        let start_line = usize::try_from(input.offset.unwrap_or(1))
-            .unwrap_or(1)
-            .max(1);
-        if start_line > total_lines && total_lines > 0 {
-            return Err(Error::validation(format!(
-                "Offset {start_line} is beyond end of URL content ({total_lines} lines total)"
-            )));
-        }
-        let limit = usize::try_from(input.limit.unwrap_or(2000))
-            .unwrap_or(2000)
-            .max(1);
-        let end_line = start_line
-            .saturating_add(limit)
-            .saturating_sub(1)
-            .min(total_lines);
-        let window = if total_lines == 0 {
-            String::new()
-        } else {
-            lines[(start_line - 1)..end_line].join("\n")
-        };
-
-        let mut output_text = window;
-        if end_line < total_lines {
-            let next_offset = end_line + 1;
-            let _ = std::fmt::Write::write_fmt(
-                &mut output_text,
-                format_args!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {total_lines}. Use offset={next_offset} to continue.]"
-                ),
-            );
-        }
-
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(output_text))],
-            details: Some(serde_json::json!({
+        document_read_output(
+            input,
+            &outcome.content,
+            serde_json::json!({
                 "url": outcome.final_url,
                 "contentType": outcome.kind.as_str(),
                 "wireContentType": outcome.wire_content_type,
                 "extractor": outcome.extractor,
-                "totalLines": total_lines,
-                "offset": start_line,
-                "limit": limit,
-                "truncated": end_line < total_lines || outcome.download_truncated,
-            })),
-            is_error: false,
-        })
+                "downloadTruncated": outcome.download_truncated,
+            }),
+            false,
+        )
     }
+}
+
+/// Window rendered documents without returning their full text a second time
+/// in `details`. Offsets address the projection, never the source's edit lines.
+fn document_read_output(
+    input: &ReadInput,
+    content: &str,
+    mut details: serde_json::Value,
+    numbered: bool,
+) -> Result<ToolOutput> {
+    let total_lines = content.lines().count();
+    let start = usize::try_from(input.offset.unwrap_or(1))
+        .unwrap_or(1)
+        .max(1);
+    if start > total_lines && total_lines > 0 {
+        return Err(Error::tool(
+            "read",
+            format!("Offset {start} is beyond end of document ({total_lines} lines total)"),
+        ));
+    }
+    let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_MAX_LINES as i64))
+        .unwrap_or(DEFAULT_MAX_LINES)
+        .clamp(1, DEFAULT_MAX_LINES);
+    let width = start
+        .saturating_add(limit)
+        .saturating_sub(1)
+        .min(total_lines)
+        .to_string()
+        .len()
+        .max(5);
+    let mut output_text = String::new();
+    let mut shown = 0usize;
+    let mut byte_limited = false;
+    for (index, line) in content.lines().skip(start - 1).take(limit).enumerate() {
+        let prefix = if numbered {
+            format!("{:>width$}→", start + index)
+        } else {
+            String::new()
+        };
+        let additional = line
+            .len()
+            .saturating_add(prefix.len())
+            .saturating_add(usize::from(shown > 0));
+        if additional > DEFAULT_MAX_BYTES.saturating_sub(output_text.len()) {
+            if shown == 0 {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "[DOCUMENT_LINE_LIMIT] Rendered line {start} exceeds the {} byte output limit; read the source with raw=true or inspect it with a format-specific tool",
+                        DEFAULT_MAX_BYTES
+                    ),
+                ));
+            }
+            byte_limited = true;
+            break;
+        }
+        if shown > 0 {
+            output_text.push('\n');
+        }
+        output_text.push_str(&prefix);
+        output_text.push_str(line);
+        shown += 1;
+    }
+    let end = start.saturating_sub(1).saturating_add(shown);
+    let remaining = end < total_lines;
+    if remaining {
+        let next = end + 1;
+        let _ = write!(
+            output_text,
+            "\n\n[Showing lines {start}-{end} of {total_lines}. Use offset={next} to continue.]"
+        );
+    }
+    let source_truncated = details["downloadTruncated"].as_bool().unwrap_or(false);
+    details["totalLines"] = serde_json::json!(total_lines);
+    details["offset"] = serde_json::json!(start);
+    details["limit"] = serde_json::json!(limit);
+    details["outputLines"] = serde_json::json!(shown);
+    details["truncated"] = serde_json::json!(remaining || source_truncated);
+    details["byteLimited"] = serde_json::json!(byte_limited);
+    if remaining {
+        details["nextOffset"] = serde_json::json!(end + 1);
+    }
+    Ok(ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(output_text))],
+        details: Some(details),
+        is_error: false,
+    })
 }
 
 #[async_trait]
@@ -6666,7 +6719,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+        "Read local files, document URLs, and images (jpg, png, gif, webp). Notebooks render saved cells, results, and errors without execution; PDF text extraction requires the url-pdf build feature. Use raw=true to read original source text for editing. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text, not source edit locations."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6675,7 +6728,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
+                    "description": "File path (relative or absolute), http(s) document URL, or internal resource URL"
                 },
                 "offset": {
                     "type": "integer",
@@ -6688,6 +6741,10 @@ impl Tool for ReadTool {
                 "hashline": {
                     "type": "boolean",
                     "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Read original source text instead of converting a document. Use with hashline=true when editing notebook JSON. Local HTML and ordinary text files already return source text."
                 }
             },
             "required": ["path"]
@@ -6892,6 +6949,75 @@ impl Tool for ReadTool {
                 details: None,
                 is_error: false,
             });
+        }
+
+        // Documents are decoded from the admitted descriptor, never reopened
+        // by pathname after the scope check. Ordinary HTML remains source text
+        // for coding workflows; notebook/PDF reads expose useful saved content.
+        let document_mime = if input.raw {
+            None
+        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
+            Some("application/x-ipynb+json")
+        } else if initial_bytes.starts_with(b"%PDF")
+            || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            Some("application/pdf")
+        } else {
+            None
+        };
+        if let Some(document_mime) = document_mime {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_HASHLINE] Rendered document lines are not source edit locations; use raw=true with hashline=true to read the original source",
+                ));
+            }
+            let bound = crate::url_read::MAX_DOWNLOAD_BYTES;
+            if meta.len() > bound as u64 {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+                ));
+            }
+            let mut bytes = initial_bytes.to_vec();
+            let remaining = bound.saturating_sub(bytes.len());
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| Error::tool("read", format!("Failed to read document: {error}")))?;
+            if bytes.len() > bound {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document grew beyond the 10 MiB conversion limit",
+                ));
+            }
+            let source = path.to_string_lossy().into_owned();
+            let outcome = asupersync::runtime::spawn_blocking_io(move || {
+                crate::url_read::convert_bytes(&source, document_mime, &bytes, false)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
         }
 
         // Text path: optimized streaming read.

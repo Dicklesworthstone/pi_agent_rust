@@ -3230,6 +3230,155 @@ mod e2e_read {
     use super::*;
 
     #[test]
+    fn e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access",
+            );
+            let source = serde_json::json!({
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "metadata": {"language_info": {"name": "python"}},
+                "cells": [{
+                    "cell_type": "code",
+                    "metadata": {},
+                    "source": ["raise RuntimeError('must never execute during read')\n"],
+                    "execution_count": 7,
+                    "outputs": [
+                        {"output_type": "stream", "name": "stdout", "text": ["saved result: 42\n"]},
+                        {"output_type": "error", "ename": "ValueError", "evalue": "saved failure", "traceback": ["saved frame"]}
+                    ]
+                }]
+            });
+            let bytes = serde_json::to_vec(&source).expect("notebook JSON");
+            let path = harness.create_file("analysis.ipynb", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let output = execute_tool_with_diagnostics(
+                &harness, &tool, "read", "notebook-rendered",
+                serde_json::json!({"path": "analysis.ipynb"}),
+            ).await.expect("render saved notebook");
+            let text = get_text_content(&output.content);
+            assert!(text.contains("### cell 1 (code)"));
+            assert!(text.contains("saved result: 42"));
+            assert!(text.contains("ValueError: saved failure"));
+            assert!(text.contains("saved frame"));
+            assert!(text.contains("code was not executed"));
+            assert_eq!(output.details.as_ref().unwrap()["contentType"], "notebook");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+            let error = execute_tool_with_diagnostics(
+                &harness, &tool, "read", "notebook-hashline-refused",
+                serde_json::json!({"path": "analysis.ipynb", "hashline": true}),
+            ).await.expect_err("rendered lines cannot authorize source edits");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            let raw = execute_tool_with_diagnostics(
+                &harness, &tool, "read", "notebook-raw",
+                serde_json::json!({"path": "analysis.ipynb", "raw": true, "hashline": true}),
+            ).await.expect("read exact JSON for editing");
+            let raw_text = get_text_content(&raw.content);
+            assert!(raw_text.starts_with("1#"));
+            assert!(raw_text.ends_with(std::str::from_utf8(&bytes).unwrap()));
+            assert!(!raw_text.contains("### cell 1 (code)"));
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_pagination_covers_every_rendered_line_once() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_document_pagination_covers_every_rendered_line_once",
+            );
+            let source = serde_json::json!({
+                "nbformat": 4,
+                "cells": [{"cell_type": "markdown", "source": "first\nsecond\nthird\n世界\nlast"}]
+            });
+            let bytes = serde_json::to_vec(&source).unwrap();
+            harness.create_file("pages.ipynb", &bytes);
+            let expected = pi::url_read::convert_bytes(
+                "pages.ipynb", "application/x-ipynb+json", &bytes, false,
+            ).unwrap().content;
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1u64;
+            let mut actual = Vec::new();
+            for page in 0..20 {
+                let output = execute_tool_with_diagnostics(
+                    &harness, &tool, "read", &format!("notebook-page-{page}"),
+                    serde_json::json!({"path": "pages.ipynb", "offset": offset, "limit": 2}),
+                ).await.unwrap();
+                let details = output.details.as_ref().unwrap();
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, content) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(content.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else { break; };
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(actual, expected.lines().map(str::to_string).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_rejects_malformed_and_oversized_inputs() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("e2e_read_document_rejects_malformed_and_oversized_inputs");
+            harness.create_file("broken.ipynb", b"{invalid notebook");
+            let large = harness.create_file("large.ipynb", b"{}");
+            std::fs::OpenOptions::new().write(true).open(large).unwrap()
+                .set_len(10 * 1024 * 1024 + 1).unwrap();
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (path, code) in [
+                ("broken.ipynb", "NOTEBOOK_INVALID"),
+                ("large.ipynb", "DOCUMENT_TOO_LARGE"),
+            ] {
+                let error = execute_tool_with_diagnostics(
+                    &harness, &tool, "read", code,
+                    serde_json::json!({"path": path}),
+                ).await.expect_err("invalid document must not return misleading source text");
+                assert!(error.to_string().contains(code), "{error}");
+            }
+            harness.create_file("source.html", b"<script>source_code()</script>");
+            let html = execute_tool_with_diagnostics(
+                &harness, &tool, "read", "local-html-source",
+                serde_json::json!({"path": "source.html"}),
+            ).await.unwrap();
+            assert!(get_text_content(&html.content).contains("<script>source_code()</script>"));
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_limit_cannot_bypass_line_or_byte_budgets() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("e2e_read_document_limit_cannot_bypass_line_or_byte_budgets");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (name, source) in [
+                ("lines.ipynb", "line\n".repeat(2100)),
+                ("bytes.ipynb", format!("{}\n", "界".repeat(100_000)).repeat(4)),
+            ] {
+                let notebook = serde_json::json!({
+                    "nbformat": 4,
+                    "cells": [{"cell_type": "markdown", "source": source}]
+                });
+                harness.create_file(name, &serde_json::to_vec(&notebook).unwrap());
+                let output = execute_tool_with_diagnostics(
+                    &harness, &tool, "read", name,
+                    serde_json::json!({"path": name, "limit": i64::MAX}),
+                ).await.unwrap();
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["truncated"], true);
+                assert!(details["outputLines"].as_u64().unwrap() <= 2000);
+                assert!(details["nextOffset"].as_u64().is_some());
+                assert!(get_text_content(&output.content).len() <= pi::tools::DEFAULT_MAX_BYTES + 200);
+                if name == "bytes.ipynb" { assert_eq!(details["byteLimited"], true); }
+            }
+        });
+    }
+
+    #[test]
     fn e2e_read_success_with_artifacts() {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("e2e_read_success_with_artifacts");
