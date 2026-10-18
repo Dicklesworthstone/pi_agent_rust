@@ -611,6 +611,55 @@ fn format_current_datetime() -> String {
     )
 }
 
+/// A provider in the model spec wins over the separate default provider.
+/// Keep nested bare IDs intact when they exist under that default provider.
+fn configured_model_spec<'a>(
+    spec: &'a str,
+    provider: Option<&'a str>,
+    registry: &ModelRegistry,
+) -> (Option<&'a str>, &'a str) {
+    let spec = spec.trim();
+    if let Some((prefix, id)) = split_provider_model_spec(spec) {
+        let explicit_provider = canonical_provider_id(prefix).is_some()
+            || registry
+                .models()
+                .iter()
+                .any(|entry| provider_ids_match(&entry.model.provider, prefix));
+        if !explicit_provider
+            && provider.is_some_and(|provider| registry.find(provider, spec).is_some())
+        {
+            return (provider, spec);
+        }
+        (Some(prefix), id)
+    } else {
+        (provider, spec)
+    }
+}
+
+fn resolve_configured_model(
+    config: &Config,
+    registry: &ModelRegistry,
+    scoped: &[ScopedModel],
+) -> Result<Option<(ModelEntry, Option<model::ThinkingLevel>)>> {
+    let Some(spec) = config.default_model.as_deref() else {
+        return Ok(None);
+    };
+    let (provider, id) = configured_model_spec(spec, config.default_provider.as_deref(), registry);
+    if let Some(found) = scoped.iter().find(|sm| {
+        provider.is_none_or(|provider| provider_ids_match(&sm.model.model.provider, provider))
+            && sm.model.model.id.eq_ignore_ascii_case(id)
+    }) {
+        return Ok(Some((found.model.clone(), found.thinking_level)));
+    }
+    let entry = match provider {
+        Some(provider) => registry.find(provider, id),
+        None => registry.find_by_id(id),
+    };
+    entry.map(|entry| (entry, None)).map(Some).ok_or_else(|| {
+        anyhow::anyhow!("Configured default_model '{spec}' could not be resolved; check default_provider and the model identifier or use --provider/--model to override it")
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn select_model_and_thinking(
     cli: &cli::Cli,
@@ -625,6 +674,7 @@ pub fn select_model_and_thinking(
     let mut scoped_thinking: Option<model::ThinkingLevel> = None;
     let mut fallback_message = None;
     let mut deferred_restore_warning = None;
+    let mut selected_configured_default = false;
 
     if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
         let found = registry
@@ -651,11 +701,13 @@ pub fn select_model_and_thinking(
             // provider (via `config.default_provider`); otherwise it belongs to
             // a different provider and we fall back to the provider's built-in
             // default model.
-            let configured_default = config
-                .default_provider
-                .as_deref()
-                .filter(|default_provider| provider_ids_match(provider, default_provider))
-                .and(config.default_model.as_deref());
+            let configured_default = config.default_model.as_deref().and_then(|spec| {
+                let (configured_provider, id) =
+                    configured_model_spec(spec, config.default_provider.as_deref(), registry);
+                configured_provider
+                    .filter(|configured_provider| provider_ids_match(provider, configured_provider))
+                    .map(|_| id)
+            });
             let default_model = configured_default.or_else(|| provider_default_model_id(provider));
             selected_model = default_model
                 .and_then(|model_id| crate::models::ad_hoc_model_entry(provider, model_id));
@@ -676,7 +728,17 @@ pub fn select_model_and_thinking(
             selected_model = config
                 .default_model
                 .as_deref()
-                .and_then(|default_model| registry.find(provider, default_model))
+                .and_then(|spec| {
+                    let (configured_provider, id) =
+                        configured_model_spec(spec, config.default_provider.as_deref(), registry);
+                    if configured_provider.is_some_and(|configured_provider| {
+                        !provider_ids_match(provider, configured_provider)
+                    }) {
+                        None
+                    } else {
+                        registry.find(provider, id)
+                    }
+                })
                 .filter(|found| {
                     preferred_pool.iter().any(|candidate| {
                         candidate.model.id.eq_ignore_ascii_case(&found.model.id)
@@ -739,16 +801,11 @@ pub fn select_model_and_thinking(
             }
         }
     } else if !scoped_models.is_empty() && !is_continuing {
-        if let (Some(default_provider), Some(default_model)) = (
-            config.default_provider.as_deref(),
-            config.default_model.as_deref(),
-        ) && let Some(found) = scoped_models.iter().find(|sm| {
-            provider_ids_match(&sm.model.model.provider, default_provider)
-                && sm.model.model.id.eq_ignore_ascii_case(default_model)
-        }) {
-            selected_model = Some(found.model.clone());
+        if let Some((entry, thinking)) = resolve_configured_model(config, registry, scoped_models)? {
+            selected_model = Some(entry);
+            selected_configured_default = true;
             if cli.thinking.is_none() {
-                scoped_thinking = found.thinking_level;
+                scoped_thinking = thinking;
             }
         }
         if selected_model.is_none() {
@@ -786,13 +843,11 @@ pub fn select_model_and_thinking(
     }
 
     if selected_model.is_none()
-        && let (Some(default_provider), Some(default_model)) = (
-            config.default_provider.as_deref(),
-            config.default_model.as_deref(),
-        )
-        && let Some(found) = registry.find(default_provider, default_model)
+        && let Some((entry, thinking)) = resolve_configured_model(config, registry, scoped_models)?
     {
-        selected_model = Some(found);
+        selected_model = Some(entry);
+        selected_configured_default = true;
+        scoped_thinking = thinking.or(scoped_thinking);
     }
 
     if selected_model.is_none() {
@@ -814,7 +869,8 @@ pub fn select_model_and_thinking(
     // If we restored or defaulted into a model that requires credentials but has
     // none configured, prefer falling back to any ready model instead of forcing
     // an immediate setup prompt. (Explicit CLI selection should still error.)
-    let explicit_model_selection = cli.provider.is_some() || cli.model.is_some();
+    let explicit_model_selection =
+        cli.provider.is_some() || cli.model.is_some() || selected_configured_default;
     // A scoped/configured entry can be unready in the catalog while --api-key
     // already supplies this run's credential. Keep the selected destination;
     // falling back here would send that explicit key to a different provider.
@@ -3134,6 +3190,108 @@ mod tests {
 
         assert_eq!(selection.model_entry.model.provider, "openai");
         assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn configured_defaults_select_exact_destination_independent_of_scope_order() {
+        let id = "deepseek/deepseek-v4.1-flash-1017";
+        let requested = "deepseek/deepseek-v4-pro-0813";
+        let entries = vec![
+            test_model_entry(id, "polza", true),
+            test_model_entry(id, "routerAI", true),
+            test_model_entry(requested, "routerAI", true),
+        ];
+        let registry = registry_with_entries(entries.clone());
+        for spec in [format!("routerAI/{id}"), format!("routerAI/{requested}")] {
+            for default_provider in [None, Some("polza"), Some("routerAI")] {
+                for reverse in [false, true] {
+                    for with_scope in [false, true] {
+                        let mut scoped: Vec<_> = entries.iter().cloned().map(|model| ScopedModel {
+                            model,
+                            thinking_level: Some(model::ThinkingLevel::High),
+                        }).collect();
+                        if reverse { scoped.reverse(); }
+                        if !with_scope { scoped.clear(); }
+                        let config = Config {
+                            default_provider: default_provider.map(str::to_string),
+                            default_model: Some(spec.clone()),
+                            ..Config::default()
+                        };
+                        let selection = select_model_and_thinking(
+                            &cli::Cli::parse_from(["pi"]), &config, &Session::in_memory(),
+                            &registry, &scoped, Path::new("/tmp"),
+                        ).expect("qualified default must resolve");
+                        assert_eq!(selection.model_entry.model.provider, "routerAI");
+                        assert_eq!(selection.model_entry.model.id, spec.strip_prefix("routerAI/").unwrap());
+                        if with_scope { assert_eq!(selection.thinking_level, model::ThinkingLevel::High); }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_defaults_fail_closed_but_cli_and_role_overrides_still_work() {
+        let registry = registry_with_entries(vec![test_model_entry("available", "routerAI", true)]);
+        let scoped = vec![ScopedModel {
+            model: test_model_entry("available", "routerAI", true),
+            thinking_level: None,
+        }];
+        for spec in ["missing/available", "routerAI/missing", "routerAI/", "", "missing"] {
+            for scope in [&[][..], scoped.as_slice()] {
+                let config = Config {
+                    default_provider: Some("routerAI".into()),
+                    default_model: Some(spec.into()),
+                    ..Config::default()
+                };
+                let result = select_model_and_thinking(
+                    &cli::Cli::parse_from(["pi"]), &config, &Session::in_memory(),
+                    &registry, scope, Path::new("/tmp"),
+                );
+                assert!(result.unwrap_err().to_string().contains("Configured default_model"));
+                for args in [vec!["pi", "--model", "routerAI/available"], vec!["pi", "--provider", "routerAI"], vec!["pi", "--provider", "routerAI", "--model", "available"]] {
+                    let selection = select_model_and_thinking(
+                        &cli::Cli::parse_from(args), &config, &Session::in_memory(),
+                        &registry, scope, Path::new("/tmp"),
+                    ).expect("CLI overrides invalid default");
+                    assert_eq!(selection.model_entry.model.id, "available");
+                }
+            }
+            let mut config = config_with_roles(crate::config::ModelRoleSettings {
+                default: Some("routerAI/available".into()),
+                ..Default::default()
+            });
+            config.default_model = Some(spec.into());
+            let selection = select_model_and_thinking(
+                &cli::Cli::parse_from(["pi"]), &config, &Session::in_memory(),
+                &registry, &[], Path::new("/tmp"),
+            ).expect("default role overrides legacy default");
+            assert_eq!(selection.model_entry.model.id, "available");
+        }
+    }
+
+    #[test]
+    fn configured_default_keeps_unready_provider_and_supports_bare_nested_ids() {
+        let mut unready = test_model_entry("deepseek/model", "routerAI", true);
+        unready.api_key = None;
+        unready.auth_header = true;
+        let registry = registry_with_entries(vec![
+            test_model_entry("other", "polza", true), unready,
+        ]);
+        for spec in ["routerAI/deepseek/model", "deepseek/model"] {
+            let config = Config {
+                default_provider: Some("routerAI".into()),
+                default_model: Some(spec.into()),
+                ..Config::default()
+            };
+            let selection = select_model_and_thinking(
+                &cli::Cli::parse_from(["pi"]), &config, &Session::in_memory(),
+                &registry, &[], Path::new("/tmp"),
+            ).expect("configured destination is retained for credential setup");
+            assert_eq!(selection.model_entry.model.provider, "routerAI");
+            assert_eq!(selection.model_entry.model.id, "deepseek/model");
+            assert!(selection.fallback_message.is_none());
+        }
     }
 
     #[test]
