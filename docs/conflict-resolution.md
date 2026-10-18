@@ -25,6 +25,46 @@ The ordinal-only API cannot detect a choice made against an older read.
 
 ## Guarded batches and authored merges
 
+The agent's existing `write` tool accepts two guarded forms. First inspect
+`conflict://*` and use the current token for every chosen region.
+
+For an exact authored replacement, put the token in the path:
+
+```json
+{
+  "path": "conflict://0/READ_TIME_SHA256_TOKEN",
+  "content": "merged implementation\n"
+}
+```
+
+Content is always literal. In particular, `"@theirs"` writes those characters;
+it does not select a side. Side-view paths remain read-only. Use a typed batch,
+including a batch of one, to select sides:
+
+```json
+{
+  "path": "conflict://*",
+  "conflicts": [
+    {
+      "index": 0,
+      "token": "READ_TIME_SHA256_TOKEN",
+      "resolution": {"kind": "theirs"}
+    },
+    {
+      "index": 2,
+      "token": "ANOTHER_READ_TIME_SHA256_TOKEN",
+      "resolution": {"kind": "text", "value": "reviewed merge\n"}
+    }
+  ]
+}
+```
+
+Omit `content` for a batch. A conflict request must contain exactly its path
+and either content or choices; ordinary file writes reject a `conflicts` field
+instead of ignoring it. Tokenless writes, side-view writes and invalid shapes
+fail before Git inspection. Normal file and SSH writes retain their existing
+content behavior.
+
 The Rust API `apply_conflict_choices(cwd, &[ConflictChoice])` validates every
 read-time token before applying any choice. Use the `token` from a single-region
 read or its printed snapshot token. Choices may select different sides in one
@@ -66,10 +106,22 @@ staging, preimage checks and rollback/recovery semantics, not Git staging.
 re-reads. A stale token never redirects to another current region. These tokens
 are not durable IDs across edits: re-read the inventory after a resolution.
 
-The new batch writer is an exported Rust API, not a newly registered agent tool.
-The existing `WriteTool` scheme dispatch remains SSH-only; it has not been
-silently redirected through the process working directory. The API requires the
-caller's explicit `cwd`, including when embedded tools use another workspace.
+Native writes prepare one inventory using the tool's own `cwd`, check every
+selected file against the session's live workspace roots, and capture the
+selected files in one undo unit. A nested working directory does not authorize
+writes elsewhere in the Git worktree. Additional roots added or removed through
+the workspace handle are checked again before publication. A successful batch
+supports one-step undo and redo across its selected files.
+
+The returned `pi.conflict.write.v1` details identify resolved indices and paths
+without repeating the complete preimage content. Re-read the conflict inventory
+before making another choice. The Git index is unchanged. The tool declares
+both file-write and process effects because inventory uses Git; ordinary file
+writes keep file-only effects, and remote scheme writes also declare network
+effects. Existing approval and plan-mode gates consume those declarations.
+
+The exported Rust APIs remain available to embedded callers. Such callers own
+workspace authorization and undo recording themselves.
 
 Publication reuses Pi's staged workspace-edit transaction. It validates
 preimages before mutation and rechecks them at commit. Reported failures use
@@ -103,6 +155,12 @@ reverse-order authored splices, stale and duplicate batch admission, ordinal
 renumbering, empty authored replacements, multi-file publication without index
 staging, and cancelled callers. Together with the first increment there are
 20 authored Rust regressions.
+
+Native-tool regressions additionally cover typed side resolution, literal
+CRLF/BOM/Unicode splices, multi-file admission failures, one-unit undo/redo,
+unchanged Git index bytes, live workspace root changes, malformed requests
+before Git access, and invocation-specific effect declarations. Conformance
+fixtures also exercise invalid conflict inputs without a Git worktree.
 
 These Rust tests are authored, not executed in the implementation environment.
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was unavailable.

@@ -21,6 +21,7 @@ mod parser;
 mod selection;
 
 pub use selection::{ConflictChoice, ConflictResolution, apply_conflict_choices};
+pub(crate) use selection::prepare_conflict_write;
 
 const MAX_FILES: usize = 256;
 const MAX_REGIONS: usize = 1024;

@@ -21,6 +21,7 @@ pub use documents::{
     write_local,
 };
 
+pub(crate) use conflicts::prepare_conflict_write;
 pub use conflicts::{
     ConflictChoice, ConflictResolution, apply_conflict_choices, conflict_regions,
     write_conflict_resolution,

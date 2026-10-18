@@ -11193,6 +11193,64 @@ impl WriteTool {
         self
     }
 
+    async fn execute_conflict_write(
+        &self,
+        tool_call_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<ToolOutput> {
+        let prepared = crate::url_router::prepare_conflict_write(&self.cwd, input)?;
+        let paths = prepared.paths();
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+            let metadata = std_metadata_async(path)
+                .await
+                .map_err(|error| Error::tool("write", format!("Cannot inspect conflict file: {error}")))?;
+            if !metadata.is_file() {
+                return Err(Error::tool("write", "A conflict target is not a regular file"));
+            }
+            ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_WRITE, "conflict resolution")
+                .map_err(|error| Error::tool("write", format!("Cannot write conflict file: {error}")))?;
+        }
+        if let Some(hook) = &self.before_persist_hook {
+            hook();
+        }
+        // Recheck the live root set after preparation and any awaited I/O.
+        // The transaction separately checks exact preimages and path identity.
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+        }
+        if let Some(recorder) = &self.mutation_recorder {
+            for path in &paths {
+                recorder.begin_file(tool_call_id, "write", path);
+            }
+        }
+        let resolved = prepared.apply();
+        if let Some(recorder) = &self.mutation_recorder {
+            if resolved.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        let resolved = resolved?;
+        let regions: Vec<_> = resolved.iter().map(|region| {
+            serde_json::json!({"index": region.index, "file": region.file})
+        }).collect();
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Resolved {} conflict region(s) in {} file(s). Re-read conflict://* before resolving more regions.",
+                regions.len(), paths.len()
+            )))],
+            details: Some(serde_json::json!({
+                "schema": "pi.conflict.write.v1",
+                "regions": regions,
+                "paths": paths,
+                "gitIndexUpdated": false
+            })),
+            is_error: false,
+        })
+    }
+
     #[cfg(test)]
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
@@ -11214,7 +11272,30 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        "Write content to a file, creating parent directories as needed. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+            .union(ToolEffects::process())
+            .union(ToolEffects::network())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+            return self.effects();
+        };
+        if path.starts_with("conflict://") {
+            // Git inventory uses a process even though publication is local.
+            ToolEffects::write().union(ToolEffects::process())
+        } else if crate::url_router::has_scheme(path)
+            || input.get("content").and_then(serde_json::Value::as_str).is_none()
+            || input.get("conflicts").is_some()
+        {
+            self.effects()
+        } else {
+            ToolEffects::write()
+        }
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -11223,14 +11304,49 @@ impl Tool for WriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
+                    "description": "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write to the file"
+                    "description": "Exact content to write; always literal, including @ours or @theirs. Omit for a conflict batch."
+                },
+                "conflicts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "description": "Choices from one fresh conflict://* read. Valid only with path conflict://* and no content.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["index", "token", "resolution"],
+                        "properties": {
+                            "index": {"type": "integer", "minimum": 0},
+                            "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "resolution": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["kind"],
+                                        "properties": {"kind": {"enum": ["ours", "theirs", "base"]}}
+                                    },
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["kind", "value"],
+                                        "properties": {
+                                            "kind": {"const": "text"},
+                                            "value": {"type": "string"}
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
                 }
             },
-            "required": ["path", "content"]
+            "required": ["path"],
+            "anyOf": [{"required": ["content"]}, {"required": ["conflicts"]}]
         })
     }
 
@@ -11241,6 +11357,14 @@ impl Tool for WriteTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if input.get("path").and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path.starts_with("conflict://"))
+        {
+            return self.execute_conflict_write(tool_call_id, &input).await;
+        }
+        if input.get("conflicts").is_some() {
+            return Err(Error::validation("conflicts requires path conflict://*"));
+        }
         let input: WriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
