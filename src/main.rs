@@ -496,6 +496,7 @@ fn collect_fetch_models_context_conflicts(
     add_fetch_models_conflict(conflicts, cli.no_migrations, "--no-migrations");
     add_fetch_models_conflict(conflicts, cli.verbose, "--verbose");
     add_fetch_models_conflict(conflicts, cli.no_tools, "--no-tools");
+    add_fetch_models_conflict(conflicts, cli.no_mcp, "--no-mcp");
     add_fetch_models_conflict(
         conflicts,
         cli.extension_policy.is_some() || cli.repair_policy.is_some(),
@@ -2417,7 +2418,7 @@ async fn run(
             max_tool_iterations,
             max_time: cli.max_time.map(std::time::Duration::from_secs),
             package_dir: Some(package_dir.clone()),
-            mcp: Some(pi::sdk::McpSessionOptions {
+            mcp: (!cli.no_mcp).then(|| pi::sdk::McpSessionOptions {
                 config_paths: cli.mcp_config.clone(),
                 global_dir: Some(pi::config::Config::global_dir()),
             }),
@@ -2759,12 +2760,16 @@ async fn run(
     // first-class mcp__<server>__<tool> tools. Pending/denied servers are
     // never spawned; /mcp shows provenance + health for everything. The
     // default FTUI launched above owns its manager through its SDK session.
-    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
-        &cwd,
-        &pi::config::Config::global_dir(),
-        &cli.mcp_config,
-        workspace_trusted,
-    )?);
+    let mcp_manager = if cli.no_mcp {
+        None
+    } else {
+        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+            &cwd,
+            &pi::config::Config::global_dir(),
+            &cli.mcp_config,
+            workspace_trusted,
+        )?))
+    };
     let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
@@ -2841,14 +2846,16 @@ async fn run(
             // Bridge extension-registered MCP servers into the unified MCP
             // client registry (bd-cv653.6.1): same spawn path, same trust
             // gate, provenance=extension in /mcp.
-            for spec in region.manager().extension_mcp_servers() {
-                let name = spec
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if !name.is_empty() {
-                    mcp_manager.register_extension_server(&name, &spec);
+            if let Some(mcp_manager) = &mcp_manager {
+                for spec in region.manager().extension_mcp_servers() {
+                    let name = spec
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        mcp_manager.register_extension_server(&name, &spec);
+                    }
                 }
             }
             extension_bindings =
@@ -2943,8 +2950,10 @@ async fn run(
     // The classic/RPC session owns this manager; FTUI's SDK-owned manager
     // performs its own connect-and-mount pass after that session's
     // extensions load (bd-vjfol).
-    mcp_manager.connect_trusted().await;
-    pi::mcp::reconcile_tools(&mcp_manager, &agent_session.agent.shared_tools());
+    if let Some(mcp_manager) = &mcp_manager {
+        mcp_manager.connect_trusted().await;
+        pi::mcp::reconcile_tools(mcp_manager, &agent_session.agent.shared_tools());
+    }
 
     if has_extensions {
         let session_snapshot = {
@@ -3077,7 +3086,9 @@ async fn run(
         // owns the MCP manager: servers extensions register after startup are
         // synced into the session at the next prompt (bd-1wr1n).
         let mut agent_session = agent_session;
-        agent_session.set_mcp_manager(mcp_manager.clone());
+        if let Some(mcp_manager) = &mcp_manager {
+            agent_session.set_mcp_manager(mcp_manager.clone());
+        }
         // Boxed: this future is large (clippy::large_futures); boxing keeps the
         // enclosing future small.
         Box::pin(run_rpc_mode(
@@ -3146,7 +3157,7 @@ async fn run(
             ask_tool,
             btw_client,
             Some(btw_factory),
-            Some(mcp_manager),
+            mcp_manager,
             failover,
         ))
         .await

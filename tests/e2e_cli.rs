@@ -4849,6 +4849,87 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
     assert_contains(&harness.harness, &result.stdout, "ok");
 }
 
+/// A process isolation flag must also skip already acknowledged MCP servers
+/// and command-based credential resolvers, not merely hide their tool names.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials");
+    let cwd = harness.harness.temp_dir().to_path_buf();
+    let global = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&global).expect("global MCP directory");
+    let server_marker = harness.harness.temp_path("mcp-server-started");
+    let credential_marker = harness.harness.temp_path("mcp-credential-resolved");
+    let quote = |path: &Path| {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    };
+    fs::write(
+        global.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "isolation-fixture": {
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("printf started > {}; exit 1", quote(&server_marker))],
+                    "env": {
+                        "TOKEN": format!(
+                            "$CMD:printf resolved > {}; printf fixture-token",
+                            quote(&credential_marker)
+                        )
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write MCP fixture");
+    let discovery = pi::mcp::config::discover(&cwd, &global, &[], true);
+    assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+    let server = discovery.servers.first().expect("discover fixture");
+    pi::mcp::TrustStore::load(&global.join("mcp-trust.json"))
+        .expect("load MCP trust")
+        .acknowledge(&server.name, &server.fingerprint(&cwd), "CLI isolation test")
+        .expect("acknowledge fixture without executing it");
+
+    let system_prompt = "Test MCP isolation.";
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
+        ],
+        "system": expected_system_prompt(system_prompt),
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
+        "stream": true
+    });
+    setup_vcr_anthropic(&mut harness, "e2e_no_mcp", &request_body, "ok");
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-mcp",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        system_prompt,
+        "Say ok.",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "ok");
+    assert!(!server_marker.exists(), "disabled MCP server was started");
+    assert!(
+        !credential_marker.exists(),
+        "disabled MCP credential command was resolved"
+    );
+}
+
 /// `--tools read,grep` enables only read and grep tools.
 /// The VCR cassette expects a request with exactly those two tool definitions.
 #[test]

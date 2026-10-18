@@ -21,6 +21,25 @@ use super::{
 };
 use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager, ServerInfo};
 
+/// Enforce host isolation before inspecting definitions or constructing state.
+pub(super) fn parse_servers(
+    params: &Value,
+    cwd: &Path,
+    disabled: bool,
+) -> Result<Option<Vec<ConfiguredServer>>, String> {
+    if disabled {
+        return match params.get("mcpServers") {
+            None => Ok(None),
+            Some(Value::Array(servers)) if servers.is_empty() => Ok(Some(Vec::new())),
+            _ => Err(
+                "PI_MCP_DISABLED: this host was launched with --no-mcp; omit mcpServers or supply an empty list"
+                    .to_string(),
+            ),
+        };
+    }
+    crate::mcp::config::parse_acp_servers(params, cwd)
+}
+
 // Refresh before the native manager's five-minute tool-cache TTL expires.
 // Failed setup is eligible sooner, but the native restart budget still owns
 // whether any connection is attempted. No background task or timer is spawned.
@@ -454,6 +473,31 @@ mod integration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_host_refuses_definitions_before_parsing() {
+        let cwd = Path::new("/not-opened");
+        assert!(parse_servers(&json!({}), cwd, true).unwrap().is_none());
+        assert!(parse_servers(&json!({"mcpServers": []}), cwd, true)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        for supplied in [json!([{"not": "a server"}]), json!(null), json!("bad")] {
+            let error = parse_servers(&json!({"mcpServers": supplied}), cwd, true)
+                .expect_err("host isolation wins before definition validation");
+            assert!(error.starts_with("PI_MCP_DISABLED:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn launch_flag_survives_acp_selection_reconstruction() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::parse_from(["pi", "--acp", "--no-mcp"]);
+        let launch = super::super::AcpLaunchOptions::from_cli(&cli);
+        assert!(launch.no_mcp);
+        assert!(launch.selection_cli().unwrap().no_mcp);
+        assert!(!launch.no_tools);
+    }
 
     fn runtime() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()

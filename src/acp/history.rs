@@ -195,8 +195,8 @@ pub(super) async fn load(
 ) -> HistoryResult<Value> {
     let id = requested_session_id(params)?;
     let cwd = requested_cwd(params)?;
-    let supplied =
-        crate::mcp::config::parse_acp_servers(params, &cwd).map_err(HistoryError::invalid)?;
+    let supplied = super::mcp::parse_servers(params, &cwd, options.launch.no_mcp)
+        .map_err(HistoryError::invalid)?;
     let live = {
         let guard = sessions
             .lock(cx)

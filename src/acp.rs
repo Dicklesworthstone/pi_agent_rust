@@ -465,6 +465,8 @@ pub struct AcpLaunchOptions {
     pub api_key: Option<String>,
     pub tools: Option<String>,
     pub no_tools: bool,
+    /// Host-level refusal of all client-supplied MCP servers.
+    pub no_mcp: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub no_context_files: bool,
@@ -484,6 +486,7 @@ impl AcpLaunchOptions {
             api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
             tools: Some(cli.tools.clone()),
             no_tools: cli.no_tools,
+            no_mcp: cli.no_mcp,
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             no_context_files: cli.no_context_files,
@@ -513,6 +516,7 @@ impl AcpLaunchOptions {
             cli.tools.clone_from(tools);
         }
         cli.no_tools = self.no_tools;
+        cli.no_mcp = self.no_mcp;
         cli.system_prompt.clone_from(&self.system_prompt);
         cli.append_system_prompt
             .clone_from(&self.append_system_prompt);
@@ -844,7 +848,7 @@ async fn run(
                         let validated = history::requested_cwd(&request.params)
                             .map_err(|error| error.message)
                             .and_then(|cwd| {
-                                crate::mcp::config::parse_acp_servers(&request.params, &cwd)
+                                mcp::parse_servers(&request.params, &cwd, options.launch.no_mcp)
                                     .map(|_| ())
                             });
                         if let Err(error) = validated {
@@ -1889,7 +1893,7 @@ fn handle_session_new(
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
     let cwd = history::requested_cwd(params).map_err(|error| Error::session(error.message))?;
-    let servers = crate::mcp::config::parse_acp_servers(params, &cwd)
+    let servers = mcp::parse_servers(params, &cwd, options.launch.no_mcp)
         .map_err(Error::session)?
         .unwrap_or_default();
 

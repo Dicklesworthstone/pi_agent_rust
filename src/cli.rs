@@ -77,6 +77,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "acp"
         | "verbose"
         | "no-tools"
+        | "no-mcp"
         | "no-extensions"
         | "plan-mode"
         | "plan-yolo"
@@ -558,6 +559,11 @@ pub struct Cli {
     /// discovered foreign configs)
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub mcp_config: Vec<PathBuf>,
+
+    /// Disable MCP discovery, server startup and tool mounting for this run.
+    /// ACP clients cannot attach MCP servers while this flag is set.
+    #[arg(long)]
+    pub no_mcp: bool,
 
     /// Disable extension discovery
     #[arg(long)]
@@ -1866,6 +1872,24 @@ mod tests {
     fn no_extensions_flag() {
         let cli = Cli::parse_from(["pi", "--no-extensions"]);
         assert!(cli.no_extensions);
+    }
+
+    #[test]
+    fn no_mcp_survives_preprocessing_and_keeps_other_tools_enabled() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--no-mcp".to_string(),
+            "--mcp-config".to_string(),
+            "ignored.json".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --no-mcp");
+        assert!(parsed.cli.no_mcp);
+        assert!(!parsed.cli.no_tools);
+        assert!(!parsed.cli.no_extensions);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi"]).no_mcp);
     }
 
     #[test]
