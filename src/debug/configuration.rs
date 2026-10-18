@@ -107,9 +107,10 @@ pub(super) fn select(
     registered: &[AdapterSpec],
 ) -> Result<Selection> {
     let Some(config) = config else {
-        return adapters::select_adapter(target, requested, registered)
-            .map(Selection::registered)
-            .ok_or_else(|| tool_err("DAP_ADAPTER_MISSING", "no matching registered debug adapter is available"));
+        let adapter = adapters::select_adapter(target, requested, registered)
+            .ok_or_else(|| tool_err("DAP_ADAPTER_MISSING", "no matching registered debug adapter is available"))?;
+        adapters::dotnet::require_built_target(&adapter, target)?;
+        return Ok(Selection::registered(adapter));
     };
     // Defense in depth for direct callers, before any filesystem access.
     validate_request(Some(config), requested, "launch", false)?;
@@ -175,6 +176,7 @@ pub(super) fn select(
     if adapter.command_candidates.is_empty() {
         return Err(tool_err("DAP_CONFIG", "a new adapter requires command"));
     }
+    adapters::dotnet::require_built_target(&adapter, target)?;
     let accepts_directory_program = definition.accepts_directory_program
         .unwrap_or(adapter.id == "dlv");
     tracing::info!(target: "debug", reason_code = "dap_config_selected", adapter_id = id,
@@ -214,7 +216,7 @@ fn validate_definition(id: &str, definition: &Definition) -> Result<()> {
     for defaults in [&definition.launch_defaults, &definition.attach_defaults] {
         if defaults.len() > 128 || defaults.keys().any(|key| matches!(key.as_str(),
             "program" | "args" | "cwd" | "pid" | "processId" | "mode" | "output"
-            | "stopOnEntry" | "stopAtBeginningOfMainSubprogram" | "console"
+            | "stopOnEntry" | "stopAtBeginningOfMainSubprogram" | "stopAtEntry" | "console"
             | "runInTerminal" | "redirectOutput" | "subProcess" | "request" | "type"
         )) {
             return Err(tool_err("DAP_CONFIG", "adapter defaults cannot replace caller identity, execution mode, launch artifacts or terminal ownership"));
@@ -231,6 +233,11 @@ pub(super) fn set_stop_on_entry(adapter: &str, arguments: &mut Value, stop: Opti
             // Explicit false must clear BOTH flags; never leave a hidden stop.
             arguments["stopOnEntry"] = Value::Bool(false);
             arguments["stopAtBeginningOfMainSubprogram"] = Value::Bool(stop);
+        } else if adapter == "netcoredbg" && arguments.get("program").is_some() {
+            // netcoredbg does not read stopOnEntry. In particular, false must
+            // replace the native true default instead of adding an ignored key.
+            if let Some(object) = arguments.as_object_mut() { object.remove("stopOnEntry"); }
+            arguments["stopAtEntry"] = Value::Bool(stop);
         } else {
             arguments["stopOnEntry"] = Value::Bool(stop);
         }
@@ -318,7 +325,7 @@ mod tests {
         logged("owned_fields");
         let directory = tempfile::tempdir().unwrap();
         for key in ["program","cwd","args","pid","processId","mode","output",
-            "stopOnEntry","stopAtBeginningOfMainSubprogram","console","runInTerminal",
+            "stopOnEntry","stopAtBeginningOfMainSubprogram","stopAtEntry","console","runInTerminal",
             "redirectOutput","subProcess","request","type"] {
             for field in ["launchDefaults", "attachDefaults"] {
                 let mut definition = json!({"command":"adapter"});

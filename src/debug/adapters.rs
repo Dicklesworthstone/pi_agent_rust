@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+pub(super) mod dotnet;
+
 /// One debug-adapter definition. Tool arguments select a registered ID, or
 /// explicitly name a workspace adapterConfig plus ID; never a shell command.
 /// SDK hosts can override definitions explicitly.
@@ -210,7 +212,8 @@ pub enum TargetKind {
 
 /// Local package directories are meaningful Go targets, not native binaries.
 /// A compiled Go binary still needs adapter="dlv" because its language cannot
-/// be inferred reliably from its filename.
+/// be inferred reliably from its filename. Managed PE targets are recognized
+/// from bounded CLR/metadata headers, not a .dll filename alone.
 #[must_use]
 pub fn classify_target(target: &Path) -> TargetKind {
     if target.is_dir()
@@ -233,13 +236,14 @@ pub fn classify_target(target: &Path) -> TargetKind {
     match target.extension().and_then(|extension| extension.to_str()) {
         Some("py") => TargetKind::Python,
         Some("go") => TargetKind::Go,
-        Some("cs" | "csx" | "fs" | "fsx") => TargetKind::DotNet,
+        Some("cs" | "csx" | "fs" | "fsx" | "csproj" | "fsproj" | "sln" | "slnx") => TargetKind::DotNet,
         Some("kt" | "kts") => TargetKind::Kotlin,
         Some("rb" | "rake" | "gemspec") => TargetKind::Ruby,
         Some("php" | "phtml") => TargetKind::Php,
         Some("sh" | "bash") => TargetKind::Shell,
         Some("dart") => TargetKind::Dart,
         Some("ex" | "exs" | "heex" | "eex") => TargetKind::Elixir,
+        _ if dotnet::is_managed_image(target) => TargetKind::DotNet,
         _ => TargetKind::NativeBinary,
     }
 }
@@ -379,7 +383,7 @@ pub fn launch_arguments(
 #[must_use]
 pub fn attach_arguments(adapter: &AdapterSpec, pid: u32) -> Value {
     match adapter.id.as_str() {
-        "debugpy" => serde_json::json!({ "processId": pid }),
+        "debugpy" | "netcoredbg" => serde_json::json!({ "processId": pid }),
         "dlv" => serde_json::json!({ "processId": pid, "mode": "local" }),
         _ => serde_json::json!({ "pid": pid }),
     }
