@@ -6,24 +6,27 @@
 //! permission, or implicit continuation is introduced by a slash command.
 
 use super::{
-    GoalBudget, GoalPersistence, GoalStatus, MAX_TEXT_BYTES, Record, Transition, append,
-    check_owner, failure, latest, persist, transition, validate_text,
+    GoalBudget, GoalDecision, GoalPersistence, GoalStatus, MAX_TEXT_BYTES, Record,
+    Transition, append, check_owner, failure, latest, persist, snapshot, transition, validate_text,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use crate::plan::PlanMode;
+use crate::model::ContentBlock;
 use crate::sdk::AgentSessionHandle;
 use crate::session::Session;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::time::Duration;
 
-const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
+const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
 const RECEIPT_PREFIX: &str = "g1-";
 
 #[derive(Clone, Copy)]
 enum Action<'a> {
     Create { objective: &'a str, budget: GoalBudget },
     Budget { reason: &'a str, budget: GoalBudget },
+    Step,
     Pause,
     Resume,
     Drop(&'a str),
@@ -117,9 +120,10 @@ fn parse(args: &str) -> Result<Command<'_>> {
         }
         "drop" => Action::Drop(text_tail(&mut remaining)?),
         "complete" => Action::Complete(text_tail(&mut remaining)?),
-        "pause" | "resume" | "save" => {
+        "step" | "pause" | "resume" | "save" => {
             if word(&mut remaining).is_some() { return Err(usage()); }
             match verb.to_ascii_lowercase().as_str() {
+                "step" => Action::Step,
                 "pause" => Action::Pause,
                 "resume" => Action::Resume,
                 _ => Action::Save,
@@ -186,6 +190,53 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
     if review != expected {
         return Err(failure("GOAL_STALE", "session, branch or goal changed; run /goal status and review it again. Nothing was changed."));
     }
+    if matches!(action, Action::Step) {
+        require_no_plan(&session, live_plan)?;
+        let (id, record) = current.as_ref()
+            .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+        let reviewed = snapshot(&store, &session, id.clone(), record.clone());
+        drop(session);
+        let run = handle.run_goal(
+            &owner,
+            &reviewed,
+            Duration::from_secs(15 * 60),
+            |_control, _event| {},
+            |_goal, _message| GoalDecision::Pause {
+                reason: "Terminal step completed; review the result before continuing.".into(),
+            },
+        )?;
+        let report = run.await;
+        let mut output = String::new();
+        let _ = writeln!(output, "Goal step stopped: {:?}", report.stop);
+        if let Some(Ok(message)) = &report.completion {
+            let mut wrote = false;
+            for block in &message.content {
+                if let ContentBlock::Text(text) = block
+                    && !text.text.trim().is_empty()
+                {
+                    if !wrote {
+                        output.push_str("Assistant result:\n");
+                        wrote = true;
+                    }
+                    quoted(&mut output, &text.text);
+                }
+            }
+        }
+        if let Some(error) = &report.error {
+            output.push_str("Step error:\n");
+            quoted(&mut output, &error.to_string());
+        }
+        if let Some(persistence) = &report.persistence {
+            let _ = writeln!(output, "{}", persistence_text(persistence));
+        }
+        let store = handle.session_store();
+        let session = store.try_lock_owned()
+            .map_err(|_| failure("GOAL_BUSY", "session is busy after goal step"))?;
+        let current = latest(&session)?;
+        let review = receipt(&session, &current, live_plan, persistent)?;
+        let _ = write!(output, "{}", render(current.as_ref().map(|(_, record)| record), &review));
+        return Ok(output);
+    }
     check_owner(&owner, persistent)?;
     let next = match action {
         Action::Create { objective, budget } => {
@@ -204,6 +255,7 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
             if current.is_none() { return Err(failure("GOAL_MISSING", "this branch has no goal to save")); }
             None
         }
+        Action::Step => unreachable!("step handled before journal mutation"),
         Action::Pause | Action::Resume | Action::Drop(_) | Action::Complete(_) => {
             if matches!(action, Action::Resume) { require_no_plan(&session, live_plan)?; }
             let (_, record) = current.as_ref()

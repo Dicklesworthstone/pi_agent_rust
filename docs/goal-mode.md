@@ -75,12 +75,28 @@ scalars and backslashes are visibly escaped, while the journal retains the
 original text. Persistence diagnostics are bounded and explicitly labelled
 when truncated.
 
-**These commands manage lifecycle, not autonomous terminal execution.** They
-do not add `/goal step` or `/goal run`, a new live cancellation lane, a selected
-verifier, or a model-facing completion tool. Ordinary terminal prompts do not
-invoke the bounded goal driver, consume its prompt counter, or become governed
-by its token budget; active-interval assistant usage is still accounted by the
-journal. Use the SDK runners below for actual bounded multi-prompt execution.
+**Lifecycle commands do not imply autonomous completion.** The terminal now has
+one bounded execution command:
+
+```text
+/goal step <review>
+```
+
+`step` runs exactly one native goal prompt through the same SDK driver, then the
+terminal supplies a host-side **Pause** verdict. Assistant prose cannot mark the
+goal complete or authorize another prompt. The step uses the existing goal
+prompt/token accounting, tool permissions, approvals, persistence, retries,
+compaction and native cancellation path. Its absolute execution budget is 15
+minutes, still subject to stricter native turn limits. Review the new receipt and
+result before `resume` plus another `step`, budget revision, drop, or explicit
+completion attestation.
+
+There is still no `/goal run` autonomous multi-prompt loop, selected verifier,
+or model-facing completion tool. Ordinary terminal prompts do not invoke the
+bounded goal driver, consume its prompt counter, or become governed by its token
+budget; active-interval assistant usage is still accounted by the journal. Use
+the SDK runners below when a host can provide a real continuation/completion
+verifier for bounded multi-prompt execution.
 The classic terminal is unchanged. Regression coverage uses native sessions in
 `src/goal/terminal/tests.rs` and the default routing/driver in
 `src/interactive_ftui/workspace_commands.rs`; authored tests still require DSR.

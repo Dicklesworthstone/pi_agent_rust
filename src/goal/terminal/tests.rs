@@ -61,9 +61,11 @@ fn command_grammar_preserves_text_and_refuses_ambiguous_inputs() {
         "--tokens 1.5 -- x", "--tokens 1 --tokens 2 -- x", "--prompts 2 --prompts 3 -- x",
         "--unknown 1 -- x", "--tokens -- x", "missing separator", "--   ",
     ] { assert!(parse(&format!("create {token} {tail}")).is_err(), "{tail}"); }
+    let Command::Change { action: Action::Step, .. } =
+        parse(&format!("step {token}")).unwrap() else { panic!("step"); };
     for input in [
         "status extra".to_string(), "pause".into(), "run".into(),
-        format!("pause {token} extra"), format!("resume {token} extra"),
+        format!("step {token} extra"), format!("pause {token} extra"), format!("resume {token} extra"),
         format!("save {token} extra"), format!("complete {token}"),
         format!("drop {token} --   "), format!("create {token} -- {}", "x".repeat(MAX_TEXT_BYTES + 1)),
         format!("create {token} -- nul\0byte"), "pause g1-日本語".into(),
@@ -190,6 +192,24 @@ fn interrupted_and_exhausted_work_cannot_be_silently_completed_or_reset() {
     assert!(execute(run(&mut handle, &format!("resume {token}"))).unwrap_err().to_string().contains("GOAL_BUDGET"));
     assert_eq!(current(&handle).prompts_started(), 2);
     assert_eq!(current(&handle).status(), GoalStatus::BudgetLimited);
+}
+
+#[test]
+fn step_respects_exhausted_budget_without_dispatching_provider_work() {
+    let mut stored = Session::in_memory();
+    let mut record = Record::new(
+        "already exhausted objective",
+        GoalBudget { max_prompts: 1, token_budget: 100 },
+    ).unwrap();
+    record.prompts_started = 1;
+    append(&mut stored, &record).unwrap();
+    let (mut handle, events) = fixture(stored, false);
+    let token = review(&mut handle);
+    let output = execute(run(&mut handle, &format!("step {token}"))).unwrap();
+    assert!(output.contains("Goal step stopped: BudgetLimited"));
+    assert_eq!(current(&handle).status(), GoalStatus::BudgetLimited);
+    assert_eq!(current(&handle).prompts_started(), 1);
+    assert_eq!(events.load(Ordering::SeqCst), 0, "budget preflight must not start a provider turn");
 }
 
 #[test]
