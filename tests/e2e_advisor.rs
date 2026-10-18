@@ -1,5 +1,5 @@
-//! E2E (bd-cv653.3.3): the advisor over RPC — a scripted risky turn yields a
-//! CONCERN injected into the next turn's context; a failing advisor never
+//! E2E (bd-cv653.3.3): the advisor over the CLI — a scripted risky turn yields
+//! a CONCERN that automatically continues the turn; a failing advisor never
 //! breaks the main turn. Two mock providers (doer + advisor) on one server,
 //! JSONL logs per tests/common/logging.rs.
 
@@ -115,8 +115,8 @@ impl PiEnv {
 }
 
 #[test]
-fn e2e_advisor_concern_injected_into_next_turn() {
-    let harness = TestHarness::new("e2e_advisor_concern_injected_into_next_turn");
+fn e2e_advisor_concern_automatically_continues_completed_turn() {
+    let harness = TestHarness::new("e2e_advisor_concern_automatically_continues_completed_turn");
     harness
         .log()
         .info("setup", "doer risky turn; advisor returns CONCERN");
@@ -159,17 +159,17 @@ fn e2e_advisor_concern_injected_into_next_turn() {
         "doer-model",
         "--tools",
         "read,ls",
+        // One authored request must reach the corrected reply without a
+        // second prompt or an explicit continue command.
         "sweep it",
-        // A second turn: the advisor reviews after turn one and queues its
-        // CONCERN as steering, which is delivered into this next turn.
-        "continue",
     ]);
     let mut child = command.spawn().expect("spawn pi");
     let start = Instant::now();
-    let (_stdout, _stderr) = loop {
+    let (stdout, stderr) = loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 let out = child.wait_with_output().expect("output");
+                assert!(out.status.success(), "advisor continuation command failed");
                 break (
                     String::from_utf8_lossy(&out.stdout).to_string(),
                     String::from_utf8_lossy(&out.stderr).to_string(),
@@ -181,13 +181,24 @@ fn e2e_advisor_concern_injected_into_next_turn() {
         }
     };
 
+    assert!(
+        stdout.contains("continued after the note"),
+        "the original request must return its advisor-driven continuation: {stderr}"
+    );
+    let doer_hits = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/doer/v1/chat/completions")
+        .count();
+    assert_eq!(doer_hits, 3, "read, initial completion, and one continuation");
+
     // The advisor was consulted…
     let advisor_hits = server
         .requests()
         .into_iter()
         .filter(|r| r.path == "/advisor/v1/chat/completions")
         .count();
-    assert!(advisor_hits >= 1, "advisor provider must be consulted");
+    assert_eq!(advisor_hits, 1, "the short corrected reply needs no second review");
 
     // …and the CONCERN injection reached the doer's next-turn context
     // (visible in the final request body).

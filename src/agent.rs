@@ -6270,21 +6270,146 @@ pub struct AgentSession {
     session_action_admission: SessionActionAdmissionGate,
 }
 
+const MAX_ADVISOR_CONTINUATIONS: u64 = 2;
+const ADVISOR_CONTINUATION_ENTRY: &str = "advisor_continuation";
+
+/// One host-visible turn can contain a completed attempt plus advisor-driven
+/// continuations. Keep its terminal event until the final durable result;
+/// ordinary message/tool events and native extension lifecycle still stream.
+struct AdvisorTurn {
+    on_event: AgentEventHandler,
+    terminal: Option<Arc<StdMutex<Option<AgentEvent>>>>,
+    started: Instant,
+    max_time: Option<Duration>,
+}
+
+impl AdvisorTurn {
+    fn new(session: &AgentSession, on_event: AgentEventHandler) -> Self {
+        Self {
+            on_event,
+            terminal: session
+                .advisor
+                .as_ref()
+                .map(|_| Arc::new(StdMutex::new(None))),
+            started: Instant::now(),
+            max_time: session.agent.config.max_time,
+        }
+    }
+
+    fn event_handler(&self) -> AgentEventHandler {
+        let Some(terminal) = &self.terminal else {
+            return Arc::clone(&self.on_event);
+        };
+        let terminal = Arc::clone(terminal);
+        let on_event = Arc::clone(&self.on_event);
+        Arc::new(move |event| {
+            if let AgentEvent::AgentEnd {
+                session_id,
+                mut messages,
+                error,
+            } = event
+            {
+                let mut held = terminal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(AgentEvent::AgentEnd {
+                    messages: previous,
+                    error: previous_error,
+                    ..
+                }) = held.as_mut()
+                {
+                    previous.append(&mut messages);
+                    *previous_error = error;
+                } else {
+                    *held = Some(AgentEvent::AgentEnd {
+                        session_id,
+                        messages,
+                        error,
+                    });
+                }
+            } else {
+                on_event(event);
+            }
+        })
+    }
+
+    fn remaining_time(&self) -> Option<Duration> {
+        self.max_time
+            .map(|budget| budget.saturating_sub(self.started.elapsed()))
+    }
+
+    fn time_exhausted(&self) -> bool {
+        self.remaining_time().is_some_and(|time| time.is_zero())
+    }
+
+    fn may_continue(&self, agent: &Agent, abort: Option<&AbortSignal>) -> bool {
+        !self.time_exhausted()
+            && !abort.is_some_and(AbortSignal::is_aborted)
+            && !crate::advisor::ADVISOR_PAUSED.load(Ordering::SeqCst)
+            && agent.automatic_queue_dispatch() == (true, true)
+            && matches!(
+                agent.plan_state.mode(),
+                crate::plan::PlanMode::Off | crate::plan::PlanMode::Approved
+            )
+    }
+
+    fn finish(self, result: Result<AssistantMessage>) -> Result<AssistantMessage> {
+        if let Some(terminal) = &self.terminal {
+            let held = terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(mut event) = held {
+                if let Err(failure) = &result
+                    && let AgentEvent::AgentEnd { error, .. } = &mut event
+                {
+                    *error = Some(failure.to_string());
+                }
+                (self.on_event)(event);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for AdvisorTurn {
+    fn drop(&mut self) {
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        let held = terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut event) = held {
+            // The native attempt already produced this terminal, but its
+            // owning future was abandoned during review or publication.
+            if let AgentEvent::AgentEnd { error, .. } = &mut event {
+                error.get_or_insert_with(|| "Aborted".to_string());
+            }
+            (self.on_event)(event);
+        }
+    }
+}
+
 /// Keep an extension-selected prompt local to one provider attempt, including
 /// when its future is dropped inside the agent loop or session persistence.
 /// Owning the session borrow lets `Drop` restore state without an async lock.
 struct SessionTurnPromptGuard<'a> {
     session: &'a mut AgentSession,
     base_system_prompt: Option<String>,
+    base_max_time: Option<Duration>,
 }
 
 impl<'a> SessionTurnPromptGuard<'a> {
     fn new(session: &'a mut AgentSession, system_prompt: Option<String>) -> Self {
         let base_system_prompt = session.agent.system_prompt().map(str::to_string);
+        let base_max_time = session.agent.config.max_time;
         session.agent.set_system_prompt(system_prompt);
         Self {
             session,
             base_system_prompt,
+            base_max_time,
         }
     }
 }
@@ -6294,6 +6419,7 @@ impl Drop for SessionTurnPromptGuard<'_> {
         self.session
             .agent
             .set_system_prompt(self.base_system_prompt.take());
+        self.session.agent.config.max_time = self.base_max_time;
         // The agent normally consumes this at loop entry. Early returns and
         // cancellation must not hand this turn's provenance to another input.
         let _ = self.session.agent.magic_keyword_scan_override.take();
@@ -17407,32 +17533,36 @@ impl AgentSession {
 
     /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
     /// role resolved a model, review a compact digest and inject the verdict
-    /// into the next turn via the steering queue. Zero-overhead gate: no
-    /// advisor configured → no digest built. Failures are isolated inside
-    /// the runtime and never fail the run.
-    async fn maybe_advise_turn(&mut self, abort: Option<&AbortSignal>) {
-        if abort.is_some_and(AbortSignal::is_aborted) {
-            return;
+    /// through the native steering queue. Reserve any automatic continuation
+    /// durably before returning; optional provider failures remain isolated.
+    async fn maybe_advise_turn(
+        &mut self,
+        abort: Option<&AbortSignal>,
+        turn: &AdvisorTurn,
+        allow_continuation: bool,
+    ) -> Result<bool> {
+        if abort.is_some_and(AbortSignal::is_aborted) || turn.time_exhausted() {
+            return Ok(false);
         }
         let Some(runtime) = self.advisor.as_mut() else {
-            return;
+            return Ok(false);
         };
         let Ok(digest) = runtime.build_digest_with_agent(&self.agent) else {
             tracing::info!(
                 event = "pi.advisor.privacy_projection_refused",
                 "Advisor request omitted because the configured privacy policy refused its digest"
             );
-            return;
+            return Ok(false);
         };
         if digest.is_trivial() {
-            return;
+            return Ok(false);
         }
         let turn_index = self.agent.messages().len() as u64;
         let outcome = runtime
-            .review_turn_with_abort(&digest, turn_index, abort)
+            .review_turn_with_budget(&digest, turn_index, abort, turn.remaining_time())
             .await;
         if abort.is_some_and(AbortSignal::is_aborted) {
-            return;
+            return Ok(false);
         }
         if std::env::var_os("PI_DEBUG_ADVISOR").is_some() {
             eprintln!(
@@ -17449,7 +17579,7 @@ impl AgentSession {
         }
         let verdict = match outcome {
             crate::advisor::AdvisorOutcome::Inject(verdict) => verdict,
-            crate::advisor::AdvisorOutcome::Quiet => return,
+            crate::advisor::AdvisorOutcome::Quiet => return Ok(false),
             crate::advisor::AdvisorOutcome::Failed => {
                 // Surface the one-time disable notice if the watchdog fired.
                 if let Some(notice) = runtime.disabled_notice.clone() {
@@ -17461,51 +17591,119 @@ impl AgentSession {
                     });
                     self.agent.queue_generated_steering(msg);
                 }
-                return;
+                return Ok(false);
             }
         };
+        let severity_allows_continuation = runtime.should_continue(verdict.level);
         let level_str = verdict.level.as_str().to_string();
         let injection = crate::advisor::format_injection(&verdict);
         let message = crate::model::Message::User(crate::model::UserMessage {
-            content: crate::model::UserContent::Text(injection.clone()),
+            content: crate::model::UserContent::Text(injection),
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
-        // Session audit entry (replayable advisor trail).
-        let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
-            if abort.is_some_and(AbortSignal::is_aborted) {
-                return;
-            }
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Ok(false);
+        }
+        // The latest authored input resets this counter. Recording each
+        // reservation before provider admission also bounds retry/reopen;
+        // an interrupted continuation cannot silently acquire a fresh budget.
+        let continuations = inner
+            .entries_for_current_path()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                {
+                    Some(
+                        custom
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("count"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(MAX_ADVISOR_CONTINUATIONS),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let continue_turn = allow_continuation
+            && severity_allows_continuation
+            && continuations < MAX_ADVISOR_CONTINUATIONS
+            && turn.may_continue(&self.agent, abort);
+        inner.append_custom_entry(
+            "advisor_note".to_string(),
+            Some(serde_json::json!({
+                "level": level_str,
+                "rationale": verdict.rationale,
+                "continuationReserved": continue_turn,
+            })),
+        );
+        if continue_turn {
             inner.append_custom_entry(
-                "advisor_note".to_string(),
-                Some(serde_json::json!({
-                    "level": level_str,
-                    "rationale": verdict.rationale,
-                })),
+                ADVISOR_CONTINUATION_ENTRY.to_string(),
+                Some(serde_json::json!({"count": continuations + 1})),
             );
         }
-        if !abort.is_some_and(AbortSignal::is_aborted) {
-            self.agent.queue_generated_steering(message);
+        self.agent.queue_generated_steering(message);
+        if self.save_enabled {
+            persist_session_mutations(
+                &mut inner,
+                &self.provider_admission,
+                AutosaveFlushTrigger::Manual,
+            )
+            .await?;
         }
+        Ok(continue_turn)
     }
 
-    /// Every execution entrypoint reaches this boundary once, after its
-    /// transcript save. Pauses and failed turns retain their existing queue;
-    /// only a durable completion can admit a new advisory provider request.
+    /// Every execution entrypoint reaches this boundary after its transcript
+    /// save. Pauses and failed turns retain their existing queue; only a
+    /// durable completion can admit a new advisory provider request.
     async fn finish_turn_with_advice(
         &mut self,
         result: Result<AssistantMessage>,
-        persist_result: Result<()>,
         abort: Option<&AbortSignal>,
+        turn: AdvisorTurn,
     ) -> Result<AssistantMessage> {
-        let message = finish_turn_persistence(&self.provider_admission, result, persist_result)?;
-        if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
-            && time_cap_marker(&message).is_none()
-            && !abort.is_some_and(AbortSignal::is_aborted)
-        {
-            self.maybe_advise_turn(abort).await;
+        let result = async {
+            let mut message = result?;
+            for continuation in 0..=MAX_ADVISOR_CONTINUATIONS {
+                if message.stop_reason != StopReason::Stop
+                    || time_cap_marker(&message).is_some()
+                    || abort.is_some_and(AbortSignal::is_aborted)
+                    || turn.time_exhausted()
+                {
+                    break;
+                }
+                let should_continue = self
+                    .maybe_advise_turn(
+                        abort,
+                        &turn,
+                        continuation < MAX_ADVISOR_CONTINUATIONS,
+                    )
+                    .await?;
+                if !should_continue || !turn.may_continue(&self.agent, abort) {
+                    break;
+                }
+                message = self
+                    .run_continuation_attempt(
+                        false,
+                        abort.cloned(),
+                        || true,
+                        turn.event_handler(),
+                        Some(&turn),
+                    )
+                    .await?;
+            }
+            Ok(message)
         }
-        Ok(message)
+        .await;
+        turn.finish(result)
     }
 
     pub async fn run_text_with_abort(
@@ -18175,7 +18373,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18200,6 +18399,7 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            // Extension custom messages do not start a new authored request.
             session.append_model_message(prompt_message.clone());
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
@@ -18244,7 +18444,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
             .await
     }
 
@@ -18255,7 +18456,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18298,6 +18500,12 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
+            if self.advisor.is_some() && self.input_source != InputSource::Extension {
+                session.append_custom_entry(
+                    ADVISOR_CONTINUATION_ENTRY.to_string(),
+                    Some(serde_json::json!({"count": 0})),
+                );
+            }
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
                     &mut session,
@@ -18335,7 +18543,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
             .await
     }
 
@@ -18346,7 +18555,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18389,6 +18599,12 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
+            if self.advisor.is_some() && self.input_source != InputSource::Extension {
+                session.append_custom_entry(
+                    ADVISOR_CONTINUATION_ENTRY.to_string(),
+                    Some(serde_json::json!({"count": 0})),
+                );
+            }
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
                     &mut session,
@@ -18426,7 +18642,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
             .await
     }
 
@@ -18499,7 +18716,32 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let result = self
+            .run_continuation_attempt(
+                follow_up_first,
+                abort.clone(),
+                on_ready,
+                turn.event_handler(),
+                None,
+            )
+            .await;
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
+            .await
+    }
+
+    /// One native continuation and its transcript save. Explicit retry,
+    /// late queued input, and advisor follow-up all use this same path.
+    /// Only automatic advisor follow-up overrides the remaining time budget.
+    async fn run_continuation_attempt(
+        &mut self,
+        follow_up_first: bool,
+        abort: Option<AbortSignal>,
+        on_ready: impl FnOnce() -> bool + Send + 'static,
+        on_event: AgentEventHandler,
+        advisor_turn: Option<&AdvisorTurn>,
+    ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         self.sync_runtime_selection_from_session_header().await?;
 
         // Rehydrate the agent transcript from the (already reverted) session
@@ -18521,10 +18763,15 @@ impl AgentSession {
             semantic_context.as_ref(),
         );
         let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt);
-
         let streaming_guard =
             AtomicBoolGuard::activate(&prompt_scope.session.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);
+        if let Some(turn) = advisor_turn {
+            // Rehydration may have awaited a session lock. Sample the shared
+            // budget only after that preparation, immediately before dispatch.
+            // Some(ZERO) is the native stop boundary, never an unlimited run.
+            prompt_scope.session.agent.config.max_time = turn.remaining_time();
+        }
         let result = if follow_up_first {
             prompt_scope
                 .session
@@ -18559,8 +18806,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
-            .await
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Persist the turn transcript and both audit ledgers under one session
@@ -26214,6 +26460,7 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         session: Arc<Mutex<Session>>,
         fail_save_at_completion: StdMutex<Option<PathBuf>>,
+        observed_durable_advice: AtomicBool,
     }
 
     #[async_trait]
@@ -26233,10 +26480,48 @@ mod tests {
 
         async fn stream(
             &self,
-            _context: &Context<'_>,
+            context: &Context<'_>,
             _options: &StreamOptions,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if context.messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(user)
+                        if matches!(&user.content, UserContent::Text(text) if text.starts_with("[ADVISOR:"))
+                )
+            }) {
+                let path = {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let session = self
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .map_err(|error| Error::session(error.to_string()))?;
+                    session
+                        .path
+                        .clone()
+                        .ok_or_else(|| Error::session("advisor continuation was not saved"))?
+                };
+                let reopened = Session::open(path.to_string_lossy().as_ref()).await?;
+                let entries = reopened.entries_for_current_path();
+                let durable_note = entries.iter().any(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "advisor_note"
+                ));
+                let durable_reservation = entries.iter().any(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == ADVISOR_CONTINUATION_ENTRY
+                            && custom.data.as_ref()
+                                .and_then(|data| data.get("count"))
+                                .and_then(Value::as_u64)
+                                .is_some_and(|count| count > 0)
+                ));
+                self.observed_durable_advice
+                    .store(durable_note && durable_reservation, Ordering::SeqCst);
+            }
             let reply = self
                 .replies
                 .lock()
@@ -26269,6 +26554,9 @@ mod tests {
         session: Arc<Mutex<Session>>,
         observed_durable_completion: AtomicBool,
         abort_on_call: Option<AbortHandle>,
+        verdict: StdMutex<Option<&'static str>>,
+        fail_save_on_call: StdMutex<Option<PathBuf>>,
+        pending_on_call: AtomicBool,
     }
 
     #[async_trait]
@@ -26320,8 +26608,37 @@ mod tests {
                     }),
                 Ordering::SeqCst,
             );
+            if self.pending_on_call.load(Ordering::SeqCst) {
+                futures::future::pending::<()>().await;
+            }
             if let Some(handle) = &self.abort_on_call {
                 handle.abort();
+            }
+            let blocked_path = self
+                .fail_save_on_call
+                .lock()
+                .expect("advisor publication fault")
+                .clone();
+            if let Some(path) = blocked_path {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                    .await
+                    .map_err(|error| Error::session(error.to_string()))?;
+                session.path = Some(path);
+            }
+            let verdict = *self.verdict.lock().expect("advisor verdict script");
+            if let Some(verdict) = verdict {
+                return Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new(verdict))],
+                        api: "test-api".to_string(),
+                        provider: "advisor".to_string(),
+                        model: "advisor-model".to_string(),
+                        stop_reason: StopReason::Stop,
+                        ..AssistantMessage::default()
+                    },
+                })])));
             }
             ScriptedAdvisorProvider.stream(context, options).await
         }
@@ -26372,12 +26689,16 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             session: Arc::clone(&session),
             fail_save_at_completion: StdMutex::new(None),
+            observed_durable_advice: AtomicBool::new(false),
         });
         let advisor = Arc::new(AdvisorLifecycleReview {
             calls: std::sync::atomic::AtomicUsize::new(0),
             session: Arc::clone(&session),
             observed_durable_completion: AtomicBool::new(false),
             abort_on_call: abort_on_review,
+            verdict: StdMutex::new(None),
+            fail_save_on_call: StdMutex::new(None),
+            pending_on_call: AtomicBool::new(false),
         });
         let mut agent_session = AgentSession::new(
             Agent::new(
@@ -26392,10 +26713,13 @@ mod tests {
                 ..ResolvedCompactionSettings::default()
             },
         );
-        agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
-            advisor.clone(),
-            "advisor/advisor-model".to_string(),
-        ));
+        agent_session.advisor = Some(
+            crate::advisor::AdvisorRuntime::new(
+                advisor.clone(),
+                "advisor/advisor-model".to_string(),
+            )
+            .with_continue_severity(crate::advisor::ContinueSeverity::Blocker),
+        );
         (agent_session, doer, advisor)
     }
 
@@ -26480,6 +26804,381 @@ mod tests {
                     !session.extensions_turn_active.load(Ordering::SeqCst),
                     "{entrypoint}"
                 ); // ubs:ignore[rust.panic.assert-macros] -- Completion releases turn ownership on every path.
+            }
+        });
+    }
+
+    #[test]
+    fn default_advisor_concern_continues_before_the_only_terminal_event() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut corrected = advisor_lifecycle_reply(StopReason::Stop);
+            corrected.content = vec![ContentBlock::Text(TextContent::new(
+                "corrected after advisor feedback",
+            ))];
+            let (mut session, doer, advisor) = advisor_lifecycle_session(
+                temp.path(),
+                vec![
+                    Ok(advisor_lifecycle_tool_call()),
+                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                    Ok(corrected),
+                ],
+                None,
+            );
+            // Exercise the production default rather than an explicit concern
+            // override; the legacy lifecycle fixture intentionally uses blocker.
+            session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                advisor.clone(),
+                "advisor/advisor-model".to_string(),
+            ));
+            session.agent.config.max_time = Some(Duration::from_secs(600));
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let result = session
+                .run_text("check the fixture".to_string(), move |event| {
+                    captured.lock().expect("events").push(event);
+                })
+                .await
+                .expect("reviewed completion");
+            assert_eq!(
+                assistant_text_content(&result.content),
+                "corrected after advisor feedback"
+            );
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
+            assert!(advisor.observed_durable_completion.load(Ordering::SeqCst));
+            assert!(doer.observed_durable_advice.load(Ordering::SeqCst));
+            assert!(session.agent.message_queue.steering.is_empty());
+            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(600)));
+            assert!(!session.extensions_turn_active.load(Ordering::SeqCst));
+
+            let events = events.lock().expect("events");
+            assert_eq!(
+                events.iter().filter(|event| matches!(event, AgentEvent::AgentEnd { .. })).count(),
+                1
+            );
+            assert_eq!(
+                events.iter().filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. })).count(),
+                1
+            );
+            let Some(AgentEvent::AgentEnd { messages, error, .. }) = events.last() else {
+                panic!("the complete reviewed turn must end with one terminal");
+            };
+            assert!(error.is_none());
+            assert!(matches!(
+                messages.last(),
+                Some(Message::Assistant(assistant))
+                    if assistant_text_content(&assistant.content) == "corrected after advisor feedback"
+            ));
+            assert_eq!(
+                messages.iter().filter(|message| matches!(
+                    message, Message::User(user)
+                        if matches!(&user.content, UserContent::Text(text) if text == "check the fixture")
+                )).count(),
+                1,
+                "automatic continuation must not resubmit the authored input"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_advisor_review_releases_the_completed_terminal_once() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (mut session, doer, advisor) = advisor_lifecycle_session(
+                temp.path(),
+                vec![
+                    Ok(advisor_lifecycle_tool_call()),
+                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                ],
+                None,
+            );
+            advisor.pending_on_call.store(true, Ordering::SeqCst);
+            session.agent.config.max_time = Some(Duration::from_secs(600));
+            session.agent.set_system_prompt(Some("base-system".to_string()));
+            let active = Arc::clone(&session.extensions_turn_active);
+            let streaming = Arc::clone(&session.extensions_is_streaming);
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let mut turn = Box::pin(session.run_text(
+                "check the fixture".to_string(),
+                move |event| captured.lock().expect("events").push(event),
+            ));
+            let reached_review = futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                if advisor.observed_durable_completion.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                reached_review,
+            )
+            .await
+            .expect("advisor must hold after durable native completion");
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
+            assert!(active.load(Ordering::SeqCst));
+            assert!(events.lock().expect("events").iter().all(|event| {
+                !matches!(event, AgentEvent::AgentEnd { .. })
+            }));
+
+            drop(turn);
+
+            assert!(!active.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            assert_eq!(session.agent.system_prompt(), Some("base-system"));
+            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(600)));
+            assert!(session.agent.message_queue.steering.is_empty());
+            let events = events.lock().expect("events after drop");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                    .count(),
+                1,
+            );
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::AgentEnd { error: Some(error), .. }) if error == "Aborted"
+            ));
+        }));
+    }
+
+    #[test]
+    fn advisor_blocker_continuation_cap_survives_fresh_session_runtime() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut reviewed = advisor_lifecycle_reply(StopReason::Stop);
+            reviewed.content = vec![ContentBlock::Text(TextContent::new(
+                "Reviewed the requested changes and recorded the result. ".repeat(10),
+            ))];
+            let (mut session, doer, advisor) = advisor_lifecycle_session(
+                temp.path(),
+                vec![
+                    Ok(advisor_lifecycle_tool_call()),
+                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                    Ok(reviewed.clone()),
+                    Ok(reviewed.clone()),
+                    Ok(reviewed),
+                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                ],
+                None,
+            );
+            *advisor.verdict.lock().expect("blocker script") =
+                Some("BLOCKER: the completed change still needs a correction");
+            session
+                .run_text("check the fixture".to_string(), |_| {})
+                .await
+                .expect("bounded reviewed turn");
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(session.agent.message_queue.steering.len(), 1);
+            assert!(doer.observed_durable_advice.load(Ordering::SeqCst));
+
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                session.session.lock(cx.cx()).await.expect("session").path.clone().expect("path")
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref()).await.expect("reopen");
+            let reservations = reopened.entries_for_current_path().into_iter().filter_map(|entry| {
+                match entry {
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                    {
+                        custom.data.as_ref().and_then(|data| data.get("count")).and_then(Value::as_u64)
+                    }
+                    _ => None,
+                }
+            }).collect::<Vec<_>>();
+            assert_eq!(reservations, vec![0, 1, 2]);
+
+            // Install the independently reopened journal in a completely fresh
+            // Agent and AdvisorRuntime. Neither their queues nor emission guard
+            // can supply the saved continuation limit.
+            let shared_session = Arc::clone(&session.session);
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                *shared_session.lock(cx.cx()).await.expect("replace with reopened") = reopened;
+            }
+            let mut resumed = AgentSession::new(
+                Agent::new(
+                    doer.clone(),
+                    ToolRegistry::new(&["read"], temp.path(), None),
+                    AgentConfig::default(),
+                ),
+                shared_session,
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            resumed.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                advisor.clone(),
+                "advisor/advisor-model".to_string(),
+            ));
+            resumed.run_continue_with_abort(None, |_| {}).await.expect("explicit resume");
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 5);
+            assert_eq!(advisor.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(resumed.agent.message_queue.steering.len(), 1);
+
+            resumed.run_text("a new task".to_string(), |_| {}).await.expect("new authored input");
+            assert_eq!(doer.calls.load(Ordering::SeqCst), 6);
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = resumed.session.lock(cx.cx()).await.expect("new turn state");
+            let count = inner.entries_for_current_path().into_iter().rev().find_map(|entry| {
+                match entry {
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                    {
+                        custom.data.as_ref().and_then(|data| data.get("count")).and_then(Value::as_u64)
+                    }
+                    _ => None,
+                }
+            });
+            assert_eq!(count, Some(0), "new authored input renews the bounded budget");
+        });
+    }
+
+    #[test]
+    fn extension_input_does_not_renew_advisor_continuation_budget() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for entrypoint in ["extension_text", "extension_custom", "extension_content", "custom"] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                    ],
+                    None,
+                );
+                let previous_source = session.input_source;
+                {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut inner = session.session.lock(cx.cx()).await.expect("seed cap");
+                    inner.append_model_message(user_message("original authored task"));
+                    inner.append_custom_entry(
+                        ADVISOR_CONTINUATION_ENTRY.to_string(),
+                        Some(json!({"count": MAX_ADVISOR_CONTINUATIONS})),
+                    );
+                }
+                *advisor.verdict.lock().expect("blocker script") =
+                    Some("BLOCKER: the completed change still needs a correction");
+                let custom = Message::Custom(CustomMessage {
+                    content: "check the fixture".to_string(),
+                    custom_type: "extension-task".to_string(),
+                    display: false,
+                    details: None,
+                    timestamp: 0,
+                });
+                match entrypoint {
+                    "extension_text" | "extension_custom" => {
+                        let action = if entrypoint == "extension_text" {
+                            PendingIdleAction::UserText("check the fixture".to_string())
+                        } else {
+                            PendingIdleAction::CustomMessage(custom)
+                        };
+                        session
+                            .extensions_pending_idle_actions
+                            .lock()
+                            .expect("pending extension action")
+                            .push_back(action);
+                        session
+                            .run_pending_idle_actions_with_abort(None, Arc::new(|_| {}))
+                            .await
+                            .expect("native extension dispatch");
+                    }
+                    "extension_content" => {
+                        let source_scope =
+                            SessionInputSourceGuard::new(&mut session, InputSource::Extension);
+                        source_scope
+                            .session
+                            .run_with_content(
+                                vec![ContentBlock::Text(TextContent::new("check the fixture"))],
+                                |_| {},
+                            )
+                            .await
+                            .expect("extension content");
+                    }
+                    _ => {
+                        session
+                            .run_custom_message_with_abort(custom, None, |_| {})
+                            .await
+                            .expect("custom input");
+                    }
+                }
+                assert_eq!(session.input_source, previous_source, "{entrypoint}");
+                assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{entrypoint}");
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 1, "{entrypoint}");
+                assert_eq!(session.agent.message_queue.steering.len(), 1, "{entrypoint}");
+
+                let path = {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("inspect session")
+                        .path
+                        .clone()
+                        .expect("saved path")
+                };
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen generated turn");
+                let reservations = reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                        {
+                            custom
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("count"))
+                                .and_then(Value::as_u64)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(reservations, vec![MAX_ADVISOR_CONTINUATIONS], "{entrypoint}");
+            }
+        });
+    }
+
+    #[test]
+    fn advisor_respects_paused_automatic_queue_lanes() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for lanes in [(false, true), (true, false)] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                    ],
+                    None,
+                );
+                session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    advisor.clone(),
+                    "advisor/advisor-model".to_string(),
+                ));
+                session.agent.set_automatic_queue_dispatch(lanes.0, lanes.1);
+                session.run_text("check the fixture".to_string(), |_| {}).await.expect("paused lanes");
+                assert_eq!(doer.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(session.agent.message_queue.steering.len(), 1);
             }
         });
     }
@@ -26608,7 +27307,13 @@ mod tests {
             .build()
             .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- All cases use the real session completion boundary.
         runtime.block_on(async {
-            for case in ["aborted", "save_failed", "late_abort", "advisor_abort"] {
+            for case in [
+                "aborted",
+                "save_failed",
+                "late_abort",
+                "advisor_abort",
+                "advisor_save_failed",
+            ] {
                 let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Each fault owns a separate durable session.
                 let (handle, signal) = AbortHandle::new();
                 let (mut session, doer, advisor) = advisor_lifecycle_session(
@@ -26632,20 +27337,36 @@ mod tests {
                         .expect("inject save failure") // ubs:ignore[rust.panic.expect] -- Install the failure after the initial authored input is saved.
                         = Some(blocked_path);
                 }
+                if case == "advisor_save_failed" {
+                    let blocked_path = temp.path().join("advisor-blocked.jsonl");
+                    std::fs::create_dir(&blocked_path).expect("block advisor note save");
+                    *advisor.fail_save_on_call.lock().expect("publication fault") =
+                        Some(blocked_path);
+                    session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                        advisor.clone(),
+                        "advisor/advisor-model".to_string(),
+                    ));
+                }
                 let result = session
                     .run_text_with_abort(
                         "check the fixture".to_string(),
                         Some(signal),
                         move |event| {
                             if case == "late_abort"
-                                && matches!(event, AgentEvent::AgentEnd { .. })
+                                && matches!(
+                                    event,
+                                    AgentEvent::TurnEnd {
+                                        message: Message::Assistant(assistant),
+                                        ..
+                                    } if assistant.stop_reason == StopReason::Stop
+                                )
                             {
                                 handle.abort();
                             }
                         },
                     )
                     .await;
-                if case == "save_failed" {
+                if matches!(case, "save_failed" | "advisor_save_failed") {
                     assert!(result.is_err()); // ubs:ignore[rust.panic.assert-macros] -- A failed durable completion cannot report success.
                     assert!(session.ensure_provider_reentry_allowed().is_err()); // ubs:ignore[rust.panic.assert-macros] -- The existing persistence fence remains installed.
                 } else {
@@ -26653,17 +27374,22 @@ mod tests {
                     assert_eq!(reply.stop_reason, if case == "aborted" { StopReason::Aborted } else { StopReason::Stop }); // ubs:ignore[rust.panic.assert-macros] -- Main-turn outcomes retain their original meaning.
                 }
                 assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Every fault occurs after substantive tool work.
-                assert_eq!(advisor.calls.load(Ordering::SeqCst), usize::from(case == "advisor_abort"), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Only the deliberate in-review cancellation case enters the advisor.
-                assert!(session.agent.message_queue.steering.is_empty(), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- No cancelled or failed completion injects a late concern.
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), usize::from(matches!(case, "advisor_abort" | "advisor_save_failed")), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Only the deliberate in-review cancellation case enters the advisor.
+                assert_eq!(
+                    session.agent.message_queue.steering.len(),
+                    usize::from(case == "advisor_save_failed"),
+                    "{case}"
+                ); // ubs:ignore[rust.panic.assert-macros] -- A failed note save retains its live note behind the provider-admission fence.
                 let cx = crate::agent_cx::AgentCx::for_request();
                 let inner = session
                     .session
                     .lock(cx.cx())
                     .await
                     .expect("inspect advisor trail"); // ubs:ignore[rust.panic.expect] -- Publication is checked through the authoritative session path.
-                assert!(inner.entries_for_current_path().iter().all(|entry| !matches!( // ubs:ignore[rust.panic.assert-macros] -- Cancelled or withheld review creates no audit verdict.
+                let note_count = inner.entries_for_current_path().iter().filter(|entry| matches!(
                     entry, crate::session::SessionEntry::Custom(custom) if custom.custom_type == "advisor_note"
-                )), "{case}");
+                )).count();
+                assert_eq!(note_count, usize::from(case == "advisor_save_failed"), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Only the explicit publication fault has an unflushed audit note.
             }
         });
     }
@@ -26687,10 +27413,13 @@ mod tests {
             let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session =
                 AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-            agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
-                Arc::new(ScriptedAdvisorProvider),
-                "advisor/advisor-model".to_string(),
-            ));
+            agent_session.advisor = Some(
+                crate::advisor::AdvisorRuntime::new(
+                    Arc::new(ScriptedAdvisorProvider),
+                    "advisor/advisor-model".to_string(),
+                )
+                .with_continue_severity(crate::advisor::ContinueSeverity::Blocker),
+            );
 
             let _ = agent_session
                 .run_text_with_abort("check the fixture".to_string(), None, |_| {})
@@ -26782,7 +27511,8 @@ mod tests {
                         ..Default::default()
                     }))]);
                 let original = serde_json::to_value(session.agent.messages()).unwrap();
-                session.maybe_advise_turn(None).await;
+                let turn = AdvisorTurn::new(&session, Arc::new(|_| {}));
+                session.maybe_advise_turn(None, &turn, false).await.unwrap();
                 assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
                 assert_eq!(
                     serde_json::to_value(session.agent.messages()).unwrap(),
@@ -26798,7 +27528,8 @@ mod tests {
                     content: vec![ContentBlock::Text(TextContent::new("x".repeat(500)))],
                     ..Default::default()
                 }))]);
-            session.maybe_advise_turn(None).await;
+            let turn = AdvisorTurn::new(&session, Arc::new(|_| {}));
+            session.maybe_advise_turn(None, &turn, false).await.unwrap();
             assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }

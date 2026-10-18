@@ -85,6 +85,53 @@ Example:
 }
 ```
 
+### Advisor
+
+Assign an advisor model through `modelRoles.advisor` to review substantial completed
+turns. The advisor uses its own provider and compact context.
+
+```json
+{
+  "modelRoles": { "advisor": "provider/model" },
+  "advisor": {
+    "enabled": true,
+    "timeoutSecs": 15,
+    "continueSeverity": "concern"
+  }
+}
+```
+
+- `advisor.enabled` defaults to `true` when an advisor model is configured.
+- `advisor.timeout_secs` (alias `timeoutSecs`) defaults to `15` seconds per review.
+  A configured main-turn time limit also bounds the review's remaining time.
+- `advisor.continue_severity` (alias `continueSeverity`) is the lowest verdict
+  that automatically resumes a completed main-agent turn. The default is
+  `concern`, matching OMP 18.12.1. Use `blocker` to continue only for blockers,
+  or `nit` to include notes; `note` is accepted as an alias for `nit`.
+
+A qualifying verdict reaches the main agent through its ordinary steering queue,
+and the original request returns the resulting corrected answer. Completed tools
+and the authored prompt are retained in history. Lower-severity notes remain
+queued for a later turn.
+
+Each authored request permits at most **two automatic advisor continuations**.
+The reservation and advisor note are saved before the additional provider request,
+so retrying or reopening the same session cannot reset the limit. A new authored
+prompt starts a fresh budget. Further notes remain queued when the limit is reached.
+
+Advisor reviews and automatic continuations use the main turn's remaining
+wall-clock allowance; a continuation does not grant another full time allowance.
+`max_tool_iterations` remains the native limit for each core pass, including
+each of the at most two advisor continuations. Reaching that
+limit, a length limit, an error, cancellation, or a plan pause does not restart the
+main agent. Extension-generated text and custom messages do not renew the advisor
+continuation budget.
+
+Automatic continuation respects cancellation, the remaining time budget, paused
+queue lanes, and plan review. Advisor provider failures are isolated from the main
+turn; a session save failure retains the existing provider-admission fence.
+Advisor settings merge field by field across global and project configuration.
+
 ### Message delivery (queue modes)
 
 - `steering_mode` (string): `one-at-a-time` or `all` (default `one-at-a-time`).

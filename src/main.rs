@@ -1509,6 +1509,7 @@ fn advisor_options(
             provider,
             label: format!("{}/{}", entry.model.provider, entry.model.id),
             timeout: Duration::from_secs(config.advisor_timeout_secs()),
+            continue_severity: config.advisor_continue_severity(),
             api_key: key,
         }),
         Err(err) => {

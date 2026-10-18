@@ -508,6 +508,9 @@ pub struct AdvisorSettings {
     /// Hard timeout per advisor call in seconds (default 15).
     #[serde(alias = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
+    /// Lowest severity that resumes a completed turn. Default: concern.
+    #[serde(alias = "continueSeverity")]
+    pub continue_severity: Option<crate::advisor::ContinueSeverity>,
 }
 
 /// LSP tool configuration (bd-cv653.1.1).
@@ -1107,6 +1110,15 @@ impl Config {
             .as_ref()
             .and_then(|a| a.timeout_secs)
             .unwrap_or(15)
+    }
+
+    /// Lowest advisor severity that resumes a completed turn. Default: concern.
+    #[must_use]
+    pub fn advisor_continue_severity(&self) -> crate::advisor::ContinueSeverity {
+        self.advisor
+            .as_ref()
+            .and_then(|advisor| advisor.continue_severity)
+            .unwrap_or_default()
     }
 
     pub fn steering_queue_mode(&self) -> QueueMode {
@@ -1953,6 +1965,7 @@ fn merge_advisor(
         (Some(base), Some(other)) => Some(AdvisorSettings {
             enabled: other.enabled.or(base.enabled),
             timeout_secs: other.timeout_secs.or(base.timeout_secs),
+            continue_severity: other.continue_severity.or(base.continue_severity),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2454,6 +2467,50 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn advisor_continuation_threshold_aliases_defaults_and_layering() {
+        use crate::advisor::ContinueSeverity;
+
+        assert_eq!(
+            Config::default().advisor_continue_severity(),
+            ContinueSeverity::Concern
+        );
+        for (key, value, expected) in [
+            ("continueSeverity", "nit", ContinueSeverity::Nit),
+            ("continue_severity", "note", ContinueSeverity::Nit),
+            ("continueSeverity", "concern", ContinueSeverity::Concern),
+            ("continue_severity", "blocker", ContinueSeverity::Blocker),
+        ] {
+            let content = format!(r#"{{"advisor":{{"{key}":"{value}"}}}}"#);
+            let config: Config = serde_json::from_str(&content).expect("advisor settings");
+            assert_eq!(config.advisor_continue_severity(), expected);
+            assert!(unrecognised_setting_keys(&content).is_empty());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"advisor":{"continueSeverity":"critical"}}"#)
+                .is_err(),
+            "unknown thresholds must not silently enable automatic continuation"
+        );
+        let global: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": false, "timeoutSecs": 25, "continueSeverity": "blocker"}
+        })).expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "advisor": {"timeoutSecs": 8}
+        })).expect("project settings");
+        let inherited = Config::merge(global, project);
+        assert!(!inherited.advisor_enabled());
+        assert_eq!(inherited.advisor_timeout_secs(), 8);
+        assert_eq!(inherited.advisor_continue_severity(), ContinueSeverity::Blocker);
+
+        let override_config: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": true, "continue_severity": "nit"}
+        })).expect("project override");
+        let overridden = Config::merge(inherited, override_config);
+        assert!(overridden.advisor_enabled());
+        assert_eq!(overridden.advisor_timeout_secs(), 8);
+        assert_eq!(overridden.advisor_continue_severity(), ContinueSeverity::Nit);
+    }
 
     #[test]
     fn http_loopback_proxy_setting_accepts_camel_and_snake_case() {

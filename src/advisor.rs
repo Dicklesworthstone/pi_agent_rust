@@ -40,6 +40,29 @@ impl VerdictLevel {
     }
 }
 
+/// The lowest verdict severity that can resume a completed main-agent turn.
+/// OMP calls a quiet note a nit; accept note for the native verdict name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueSeverity {
+    #[serde(alias = "note")]
+    Nit,
+    #[default]
+    Concern,
+    Blocker,
+}
+
+impl ContinueSeverity {
+    #[must_use]
+    pub const fn includes(self, level: VerdictLevel) -> bool {
+        match self {
+            Self::Nit => true,
+            Self::Concern => matches!(level, VerdictLevel::Concern | VerdictLevel::Blocker),
+            Self::Blocker => matches!(level, VerdictLevel::Blocker),
+        }
+    }
+}
+
 /// A parsed advisor verdict.
 #[derive(Debug, Clone)]
 pub struct AdvisorVerdict {
@@ -466,6 +489,7 @@ pub struct AdvisorOptions {
     pub provider: Arc<dyn Provider>,
     pub label: String,
     pub timeout: Duration,
+    pub continue_severity: ContinueSeverity,
     pub api_key: Option<String>,
 }
 
@@ -474,6 +498,7 @@ impl AdvisorOptions {
     pub fn runtime(&self) -> AdvisorRuntime {
         AdvisorRuntime::new(Arc::clone(&self.provider), self.label.clone())
             .with_timeout(self.timeout)
+            .with_continue_severity(self.continue_severity)
             .with_api_key(self.api_key.clone())
     }
 }
@@ -484,6 +509,7 @@ pub struct AdvisorRuntime {
     provider: Arc<dyn Provider>,
     label: String,
     timeout: Duration,
+    continue_severity: ContinueSeverity,
     guard: EmissionGuard,
     consecutive_failures: u32,
     /// Resolved credential for the advisor's provider; forwarded on every
@@ -514,6 +540,7 @@ impl AdvisorRuntime {
             provider,
             label,
             timeout: Duration::from_secs(15),
+            continue_severity: ContinueSeverity::default(),
             guard: EmissionGuard::new(3, 10),
             consecutive_failures: 0,
             api_key: None,
@@ -526,6 +553,17 @@ impl AdvisorRuntime {
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    #[must_use]
+    pub const fn with_continue_severity(mut self, severity: ContinueSeverity) -> Self {
+        self.continue_severity = severity;
+        self
+    }
+
+    #[must_use]
+    pub const fn should_continue(&self, level: VerdictLevel) -> bool {
+        self.continue_severity.includes(level)
     }
 
     #[must_use]
@@ -591,7 +629,20 @@ impl AdvisorRuntime {
         turn_index: u64,
         abort: Option<&crate::agent::AbortSignal>,
     ) -> AdvisorOutcome {
-        if abort.is_some_and(crate::agent::AbortSignal::is_aborted) {
+        self.review_turn_with_budget(digest, turn_index, abort, None)
+            .await
+    }
+
+    pub(crate) async fn review_turn_with_budget(
+        &mut self,
+        digest: &TurnDigest,
+        turn_index: u64,
+        abort: Option<&crate::agent::AbortSignal>,
+        remaining_time: Option<Duration>,
+    ) -> AdvisorOutcome {
+        if abort.is_some_and(crate::agent::AbortSignal::is_aborted)
+            || remaining_time.is_some_and(|time| time.is_zero())
+        {
             return AdvisorOutcome::Quiet;
         }
         if self.is_disabled() || ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -607,10 +658,18 @@ impl AdvisorRuntime {
             return AdvisorOutcome::Failed;
         };
         let call = self.call_advisor(&digest);
+        let timeout = remaining_time.map_or(self.timeout, |time| time.min(self.timeout));
         let reply =
-            match crate::text_completion::with_timeout_and_abort(self.timeout, abort, call).await {
+            match crate::text_completion::with_timeout_and_abort(timeout, abort, call).await {
                 Ok(Ok(reply)) => reply,
                 Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
+                Err(RequestStop::TimedOut)
+                    if remaining_time.is_some_and(|time| time < self.timeout) =>
+                {
+                    // The owning turn used its budget; this is not evidence
+                    // of a failed advisor and must not trip its watchdog.
+                    return AdvisorOutcome::Quiet;
+                }
                 Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
                     self.consecutive_failures += 1;
                     if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -1444,6 +1503,26 @@ mod tests {
         assert!(runtime.disabled_notice.is_none());
         assert_eq!(runtime.guard.notes_in_window, 0);
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exhausted_turn_budget_is_quiet_without_admitting_the_advisor() {
+        let executor = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (mut runtime, provider) = scripted_runtime(Vec::new());
+        runtime.consecutive_failures = 2;
+        let outcome = executor.block_on(runtime.review_turn_with_budget(
+            &review_digest(),
+            0,
+            None,
+            Some(Duration::ZERO),
+        ));
+        assert!(matches!(outcome, AdvisorOutcome::Quiet));
+        assert_eq!(runtime.consecutive_failures, 2);
+        assert!(runtime.disabled_notice.is_none());
+        assert_eq!(runtime.guard.notes_in_window, 0);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
