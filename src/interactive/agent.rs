@@ -329,6 +329,11 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AutoCompactionStart { reason } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
         }
+        AgentEvent::AdvisorNote { level, rationale } => {
+            batcher.send_immediate(PiMsg::SystemNote(format!(
+                "[ADVISOR:{level}] {rationale}"
+            )));
+        }
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -5316,6 +5321,34 @@ mod stream_delta_batcher_tests {
         assert!(
             matches!(second, PiMsg::ToolStart { name, tool_id } if name == "bash" && tool_id == "t1")
         );
+    }
+
+    #[test]
+    fn advisor_note_dispatch_flushes_text_and_reaches_the_transcript() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+        batcher.push_delta(StreamDeltaKind::Text, "Completed review.");
+        dispatch_agent_event_to_ui(
+            &AgentEvent::AdvisorNote {
+                level: "CONCERN".to_string(),
+                rationale: "The fixture omits Unicode input.".to_string(),
+            },
+            &mut batcher,
+        );
+
+        let text = rx.try_recv().expect("pending answer precedes the note");
+        assert!(matches!(&text, PiMsg::TextDelta(text) if text == "Completed review."));
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(text);
+        let _ = app.handle_pi_message(rx.try_recv().expect("immediate advisor note"));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "[ADVISOR:CONCERN] The fixture omits Unicode input."
+        ));
+        assert!(rx.try_recv().is_err(), "one emitted note has one display event");
     }
 
     #[test]

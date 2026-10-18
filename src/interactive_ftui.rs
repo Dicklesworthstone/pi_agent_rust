@@ -5986,6 +5986,9 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::AutoCompactionStart { reason } => {
             vec![PiMsg::SystemNote(format!("compacting context: {reason}"))]
         }
+        E::AdvisorNote { level, rationale } => {
+            vec![PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}"))]
+        }
         E::AutoCompactionEnd {
             aborted,
             error_message,
@@ -13850,6 +13853,27 @@ mod tests {
             // ubs:ignore panic in #[cfg(test)] match-else is an assertion failure, not library code
             other => panic!("unexpected translation: {other:?}"),
         }
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for message in agent_event_to_pi_msgs(&E::AdvisorNote {
+            level: "BLOCKER".to_string(),
+            rationale: "The patch skips the configured limit.".to_string(),
+        }) {
+            sim.send(PiFtuiMsg::Agent(message));
+        }
+        assert_eq!(
+            sim.model()
+                .transcript
+                .iter()
+                .filter(|entry| {
+                    entry.text == "[ADVISOR:BLOCKER] The patch skips the configured limit."
+                })
+                .count(),
+            1,
+            "an emitted advisor note must reach the visible transcript once"
+        );
     }
 
     #[test]

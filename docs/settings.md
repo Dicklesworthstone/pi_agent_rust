@@ -114,6 +114,11 @@ and the original request returns the resulting corrected answer. Completed tools
 and the authored prompt are retained in history. Lower-severity notes remain
 queued for a later turn.
 
+Both native interactive interfaces display each note as soon as it is recorded
+and any required session save succeeds, including notes held below the continuation
+threshold. Delivering the queued note into a later model request does not display
+it again.
+
 Each authored request permits at most **two automatic advisor continuations**.
 The reservation and advisor note are saved before the additional provider request,
 so retrying or reopening the same session cannot reset the limit. A new authored
