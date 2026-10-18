@@ -3228,6 +3228,273 @@ fn log_tool_execution(
 
 mod e2e_read {
     use super::*;
+    use std::io::{Cursor, Write as _};
+
+    fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start ZIP member");
+            writer.write_all(content).expect("write ZIP member");
+        }
+        writer.finish().expect("finish ZIP fixture").into_inner()
+    }
+
+    #[test]
+    fn e2e_read_zip_navigation_paginates_members_and_keeps_cache_identity() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_zip_navigation_paginates_members_and_keeps_cache_identity",
+            );
+            let bytes = zip_fixture(&[
+                ("config/a.txt", b"alpha-1\nalpha-2\nalpha-3\n"),
+                ("config/b.txt", b"beta-1\nbeta-2\nbeta-3\n"),
+                ("README.md", b"release\n"),
+            ]);
+            let path = harness.create_file("release.zip", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (request, expected) in [
+                ("release.zip", "    1→README.md (8 bytes)\n    2→config/"),
+                (
+                    "release.zip:config",
+                    "    1→a.txt (24 bytes)\n    2→b.txt (21 bytes)",
+                ),
+            ] {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    request,
+                    serde_json::json!({"path": request}),
+                )
+                .await
+                .expect("list archive without explicit directory entries");
+                assert_eq!(get_text_content(&output.content), expected);
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "archive");
+                assert_eq!(details["isDirectory"], true);
+                assert_eq!(details["entryCount"], 3);
+            }
+            // Alternate equal windows from distinct members, then revisit
+            // each cached request. The outer archive is the same dependency.
+            for (attempt, (member, expected)) in [
+                ("config/a.txt", "alpha-2"),
+                ("config/b.txt", "beta-2"),
+                ("config/a.txt", "alpha-2"),
+                ("config/b.txt", "beta-2"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-member-{attempt}"),
+                    serde_json::json!({
+                        "path": format!("release.zip:{member}"), "offset": 2, "limit": 1,
+                    }),
+                )
+                .await
+                .expect("read the selected ZIP member window");
+                let text = get_text_content(&output.content);
+                assert_eq!(text.lines().next().unwrap(), format!("    2→{expected}"));
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["member"], member);
+                assert_eq!(details["isDirectory"], false);
+                assert_eq!(details["totalLines"], 3);
+                assert_eq!(details["outputLines"], 1);
+                assert_eq!(details["nextOffset"], 3);
+                assert_eq!(details["truncated"], true);
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("config").exists());
+            assert!(!harness.temp_dir().join("README.md").exists());
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_listing_pages_reach_every_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("e2e_read_zip_listing_pages_reach_every_entry");
+            let names: Vec<String> = (0..501).map(|index| format!("entry-{index:03}.txt")).collect();
+            let entries: Vec<(&str, &[u8])> = names
+                .iter()
+                .map(|name| (name.as_str(), b"x".as_slice()))
+                .collect();
+            harness.create_file("many.zip", &zip_fixture(&entries));
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..4 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-listing-page-{page}"),
+                    serde_json::json!({"path": "many.zip", "offset": offset, "limit": 200}),
+                )
+                .await
+                .expect("read the next archive listing page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["entryCount"], 501);
+                assert_eq!(details["totalLines"], 501);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 200);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, entry) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(entry.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            let expected: Vec<String> = names.iter().map(|name| format!("{name} (1 bytes)")).collect();
+            assert_eq!(actual, expected);
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_raw_and_hashline_flags_preserve_container_boundaries() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_zip_raw_and_hashline_flags_preserve_container_boundaries",
+            );
+            let bytes = zip_fixture(&[("member.txt", b"inside\n")]);
+            harness.create_file("release.zip", &bytes);
+            harness.create_file("source.zip", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-container",
+                serde_json::json!({"path": "release.zip", "raw": true}),
+            )
+            .await
+            .expect("raw ZIP uses the existing source-byte read behavior");
+            assert!(get_text_content(&raw.content).starts_with("    1→PK"));
+            assert_ne!(
+                raw.details
+                    .as_ref()
+                    .and_then(|details| details["contentType"].as_str()),
+                Some("archive"),
+            );
+            let source = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-source",
+                serde_json::json!({"path": "source.zip", "raw": true}),
+            )
+            .await
+            .expect("raw bypasses format recognition");
+            assert_eq!(get_text_content(&source.content), "    1→literal source");
+            let member = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-member",
+                serde_json::json!({"path": "release.zip:member.txt", "raw": true}),
+            )
+            .await
+            .expect("an explicit member selector still navigates the archive");
+            assert_eq!(get_text_content(&member.content), "    1→inside");
+            assert_eq!(member.details.as_ref().unwrap()["member"], "member.txt");
+            for (path, raw) in [
+                ("release.zip", false),
+                ("release.zip:member.txt", false),
+                ("release.zip:member.txt", true),
+            ] {
+                let error = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-hashline-{raw}-{path}"),
+                    serde_json::json!({"path": path, "raw": raw, "hashline": true}),
+                )
+                .await
+                .expect_err("archive views cannot authorize source hashline edits");
+                assert!(error.to_string().contains("ARCHIVE_HASHLINE"));
+            }
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_keeps_outer_scope_and_rechecks_cached_permissions() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_zip_keeps_outer_scope_and_rechecks_cached_permissions",
+            );
+            let outside = tempfile::tempdir().expect("outside workspace");
+            let bytes = zip_fixture(&[("nested/private.txt", b"private fixture\n")]);
+            let outside_path = outside.path().join("outside.zip");
+            std::fs::write(&outside_path, &bytes).unwrap();
+            let local_path = harness.create_file("local.zip", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for suffix in ["", ":nested/private.txt"] {
+                let error = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-outside{suffix}"),
+                    serde_json::json!({"path": format!("{}{suffix}", outside_path.display())}),
+                )
+                .await
+                .expect_err("the outer archive must be admitted before reading any member");
+                assert!(error.to_string().contains("outside"));
+            }
+            let input = serde_json::json!({"path": "local.zip:nested/private.txt"});
+            let output = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-admitted",
+                input.clone(),
+            )
+            .await
+            .expect("read an admitted member");
+            assert_eq!(get_text_content(&output.content), "    1→private fixture");
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside_path, harness.temp_dir().join("escape.zip"))
+                    .expect("outside archive symlink");
+                for path in ["escape.zip", "escape.zip:nested/private.txt"] {
+                    let error = execute_tool_with_diagnostics(
+                        &harness,
+                        &tool,
+                        "read",
+                        path,
+                        serde_json::json!({"path": path}),
+                    )
+                    .await
+                    .expect_err("a symlink cannot admit an outside archive");
+                    assert!(error.to_string().contains("outside"));
+                }
+                let _mode = UnixModeGuard::set(&local_path, 0);
+                execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    "zip-cache-mode-denied",
+                    input,
+                )
+                .await
+                .expect_err("cached archive output must not bypass current file permissions");
+            }
+            assert_eq!(std::fs::read(&local_path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&outside_path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("nested").exists());
+            assert!(!outside.path().join("nested").exists());
+        });
+    }
 
     #[test]
     fn e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access() {

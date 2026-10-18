@@ -97,6 +97,7 @@ pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
 pub mod approval;
+pub(crate) mod archive_read;
 #[doc(hidden)]
 pub(crate) mod artifact_output;
 pub mod ask;
@@ -150,6 +151,7 @@ pub mod delight;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
+pub(crate) mod document_read;
 #[doc(hidden)]
 pub(crate) mod embedded_assets;
 #[doc(hidden)]

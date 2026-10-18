@@ -174,11 +174,12 @@ impl Route {
         if self.mode == UrlReadMode::Raw {
             return Ok(super::raw_bytes(self.current.as_str(), content_type, bytes, truncated));
         }
-        // Repository HTML is source code, not a page to strip. PDF and notebook
-        // documents retain their specialized readers; ordinary files stay text.
+        // Repository HTML is source code, not a page to strip. Documents retain
+        // their specialized readers; ordinary files stay text.
         if self.github_source
             && !matches!(super::classify(self.current.as_str(), content_type, bytes),
-                UrlContentKind::Pdf | UrlContentKind::Notebook)
+                UrlContentKind::Pdf | UrlContentKind::Notebook
+                    | UrlContentKind::Docx | UrlContentKind::Pptx)
         {
             return Ok(UrlReadOutcome {
                 content: String::from_utf8_lossy(bytes).into_owned(),
@@ -268,7 +269,13 @@ async fn retrieve(mut route: Route, owner: &AgentCx) -> Result<UrlReadOutcome> {
         }
         drop(stream);
         checkpoint(owner)?;
-        return route.finish(&content_type, &bytes, truncated);
+        // Native document conversion can parse and decompress multiple parts.
+        // Keep that bounded CPU work off the async executor so the enclosing
+        // owner deadline and cancellation remain observable while it runs.
+        return asupersync::runtime::spawn_blocking_io(move || {
+            route.finish(&content_type, &bytes, truncated)
+        })
+        .await;
     }
 }
 

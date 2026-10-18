@@ -1,8 +1,8 @@
 //! URL-aware reads (bd-cv653.2.2).
 //!
 //! `read` on http(s):// paths fetches and converts to reader-mode markdown,
-//! with site-aware extractors, PDF text extraction, notebook rendering, and a
-//! default-on SSRF guard.
+//! with site-aware extractors, PDF text extraction, native DOCX/PPTX text,
+//! notebook rendering, and a default-on SSRF guard.
 //!
 //! Design notes:
 //! - GitHub file pages resolve to their actual raw document before downloading.
@@ -26,6 +26,8 @@ pub enum UrlContentKind {
     Html,
     Pdf,
     Notebook,
+    Docx,
+    Pptx,
     PlainText,
 }
 
@@ -36,6 +38,8 @@ impl UrlContentKind {
             Self::Html => "html",
             Self::Pdf => "pdf",
             Self::Notebook => "notebook",
+            Self::Docx => "docx",
+            Self::Pptx => "pptx",
             Self::PlainText => "plaintext",
         }
     }
@@ -121,6 +125,23 @@ pub fn convert_bytes(
             }
             (convert_notebook(bytes)?, "notebook")
         }
+        UrlContentKind::Docx | UrlContentKind::Pptx => {
+            if download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_INCOMPLETE] Cannot interpret a truncated Office document",
+                ));
+            }
+            let document_kind = if kind == UrlContentKind::Docx {
+                crate::document_read::DocumentKind::Docx
+            } else {
+                crate::document_read::DocumentKind::Pptx
+            };
+            (
+                crate::document_read::convert(bytes, document_kind)?,
+                document_kind.as_str(),
+            )
+        }
         UrlContentKind::Html => {
             let text = String::from_utf8_lossy(bytes);
             convert_html(url, &text)
@@ -148,6 +169,12 @@ fn classify(url: &str, content_type: &str, bytes: &[u8]) -> UrlContentKind {
     };
     if ct.contains("application/pdf") || ext_is("pdf") || bytes.starts_with(b"%PDF") {
         return UrlContentKind::Pdf;
+    }
+    if let Some(kind) = crate::document_read::recognize(url, content_type) {
+        return match kind {
+            crate::document_read::DocumentKind::Docx => UrlContentKind::Docx,
+            crate::document_read::DocumentKind::Pptx => UrlContentKind::Pptx,
+        };
     }
     if ext_is("ipynb") || ct.contains("application/x-ipynb+json") {
         return UrlContentKind::Notebook;
@@ -288,6 +315,18 @@ mod tests {
         assert_eq!(
             classify("https://x/data", "application/json", b"{}"),
             UrlContentKind::PlainText
+        );
+        assert_eq!(
+            classify("https://x/REPORT.DOCX?download=1", "application/octet-stream", b"PK"),
+            UrlContentKind::Docx
+        );
+        assert_eq!(
+            classify(
+                "https://x/download",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation; charset=binary",
+                b"PK",
+            ),
+            UrlContentKind::Pptx
         );
     }
 

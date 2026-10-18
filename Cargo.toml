@@ -225,6 +225,10 @@ async-trait = "0.1"
 # (release binary size budget, 22 MiB). `full` includes it.
 htmd = "0.5.5"
 pdf-extract = { version = "0.12", optional = true }
+# Native archive/document reads. Reuse the existing flate2 backend without
+# enabling ZIP encryption, additional codecs, or the write-only zopfli backend.
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
+quick-xml = { version = "=0.42.0", default-features = false }
 
 # URL parsing/building
 url = "2"

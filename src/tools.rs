@@ -6600,6 +6600,12 @@ impl ReadTool {
         } else {
             crate::url_read::UrlReadMode::Reader
         };
+        if input.hashline && mode == crate::url_read::UrlReadMode::Reader {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_HASHLINE] Rendered URL lines are not source edit locations; save source text locally before using hashline edits",
+            ));
+        }
         let mut outcome = crate::url_read::fetch(&url, policy, mode).await?;
         if outcome.download_truncated {
             outcome.content.push_str(
@@ -6719,7 +6725,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, and images (jpg, png, gif, webp). Notebooks render saved cells, results, and errors without execution; PDF text extraction requires the url-pdf build feature. Use raw=true to read original source text for editing. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text, not source edit locations."
+        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). DOCX and PPTX render document and slide text; notebooks render saved cells, results, and errors without execution. PDF extraction requires the url-pdf build feature. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member, without extraction. Use raw=true for original source text; rendered documents and archive members do not provide hashline edit anchors. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6728,7 +6734,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path (relative or absolute), http(s) document URL, or internal resource URL"
+                    "description": "File path (relative or absolute), archive.zip:member/path, http(s) document URL, or internal resource URL"
                 },
                 "offset": {
                     "type": "integer",
@@ -6792,7 +6798,12 @@ impl Tool for ReadTool {
             return self.execute_scheme_read(&input).await;
         }
 
-        let path = resolve_read_path(&input.path, &self.cwd);
+        let archive_path = crate::archive_read::parse_path(&input.path)?
+            .filter(|archive| !input.raw || !archive.member.is_empty());
+        let source_path = archive_path
+            .as_ref()
+            .map_or(input.path.as_str(), |archive| archive.archive_path.as_str());
+        let path = resolve_read_path(source_path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
 
         let path_for_open = path.clone();
@@ -6828,6 +6839,44 @@ impl Tool for ReadTool {
             if stable_deps.is_some() {
                 return Ok(output);
             }
+        }
+
+        if let Some(archive) = archive_path {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[ARCHIVE_HASHLINE] Archive members are read-only views and cannot provide source edit anchors",
+                ));
+            }
+            let outcome = asupersync::runtime::spawn_blocking_io(move || {
+                crate::archive_read::read_open_file(std_file, &archive.member)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": "archive",
+                    "extractor": "zip",
+                    "member": outcome.member,
+                    "isDirectory": outcome.is_directory,
+                    "entryCount": outcome.entry_count,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
         }
 
         let mut file = asupersync::fs::File::from_std(std_file);
@@ -6953,7 +7002,7 @@ impl Tool for ReadTool {
 
         // Documents are decoded from the admitted descriptor, never reopened
         // by pathname after the scope check. Ordinary HTML remains source text
-        // for coding workflows; notebook/PDF reads expose useful saved content.
+        // for coding workflows; document reads expose useful saved content.
         let document_mime = if input.raw {
             None
         } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
@@ -6963,7 +7012,14 @@ impl Tool for ReadTool {
         {
             Some("application/pdf")
         } else {
-            None
+            crate::document_read::recognize(&path.to_string_lossy(), "").map(|kind| match kind {
+                crate::document_read::DocumentKind::Docx => {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                }
+                crate::document_read::DocumentKind::Pptx => {
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                }
+            })
         };
         if let Some(document_mime) = document_mime {
             if input.hashline {
@@ -17509,6 +17565,115 @@ mod tests {
                     .contains(&blocked_parent.display().to_string()),
                 "permission error must identify the denied lexical ancestor: {error}"
             );
+        });
+    }
+
+    fn office_read_fixture(presentation: bool, text: &str) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let package_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let main = if presentation { "ppt/presentation.xml" } else { "word/document.xml" };
+        let relationships = format!(
+            "<Relationships xmlns='{package_rel}'><Relationship Id='main' Type='{office_rel}/officeDocument' Target='{main}'/></Relationships>"
+        );
+        let mut entries = vec![("_rels/.rels", relationships)];
+        if presentation {
+            let presentation_ns = "http://schemas.openxmlformats.org/presentationml/2006/main";
+            let drawing_ns = "http://schemas.openxmlformats.org/drawingml/2006/main";
+            entries.push((main, format!(
+                "<p:presentation xmlns:p='{presentation_ns}' xmlns:r='{office_rel}'><p:sldIdLst><p:sldId id='256' r:id='slide'/></p:sldIdLst></p:presentation>"
+            )));
+            entries.push(("ppt/_rels/presentation.xml.rels", format!(
+                "<Relationships xmlns='{package_rel}'><Relationship Id='slide' Type='{office_rel}/slide' Target='slides/slide1.xml'/></Relationships>"
+            )));
+            entries.push(("ppt/slides/slide1.xml", format!(
+                "<p:sld xmlns:p='{presentation_ns}' xmlns:a='{drawing_ns}'><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            )));
+        } else {
+            entries.push((main, format!(
+                "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p><w:r><w:t>Document heading</w:t></w:r></w:p><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            )));
+        }
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(name, options).expect("start Office fixture member");
+            writer.write_all(content.as_bytes()).expect("write Office fixture XML");
+        }
+        writer.finish().expect("finish Office fixture ZIP").into_inner()
+    }
+
+    #[test]
+    fn read_office_documents_render_local_and_downloaded_bytes_consistently() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office read fixtures");
+            let tool = ReadTool::new(tmp.path());
+            for (name, presentation, kind) in [
+                ("report.DOCX", false, "docx"),
+                ("slides.pptx", true, "pptx"),
+            ] {
+                let bytes = office_read_fixture(presentation, "Saved text 世界");
+                let path = tmp.path().join(name);
+                std::fs::write(&path, &bytes).unwrap();
+                let output = tool.execute(name, serde_json::json!({"path": name}), None)
+                    .await.expect("read native document");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], kind);
+                assert_eq!(details["extractor"], kind);
+                assert_eq!(details["rendered"], true);
+                assert_eq!(details["totalLines"], 3);
+                assert!(first_text(&output).contains("Saved text 世界"));
+
+                let downloaded = crate::url_read::convert_bytes(
+                    &format!("https://example.test/{name}?download=1"),
+                    "application/octet-stream", &bytes, false,
+                ).expect("convert downloaded Office bytes");
+                let numbered: Vec<_> = first_text(&output).lines()
+                    .map(|line| line.split_once('→').unwrap().1).collect();
+                assert_eq!(numbered, downloaded.content.lines().collect::<Vec<_>>());
+
+                let page = tool.execute(
+                    "office-page", serde_json::json!({"path": name, "offset": 3, "limit": 1}), None,
+                ).await.unwrap();
+                assert_eq!(first_text(&page), "    3→Saved text 世界");
+                assert_eq!(page.details.as_ref().unwrap()["truncated"], false);
+                let error = tool.execute(
+                    "office-edit-anchor", serde_json::json!({"path": name, "hashline": true}), None,
+                ).await.expect_err("rendered lines are not binary edit locations");
+                assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+                assert_eq!(std::fs::read(path).unwrap(), bytes, "read must not rewrite the package");
+            }
+            let error = tool.execute(
+                "url-edit-anchor",
+                serde_json::json!({"path": "https://example.invalid/report.docx", "hashline": true}),
+                None,
+            ).await.expect_err("invalid anchor request must fail before a network lookup");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_office_document_uses_admitted_inode_and_does_not_cache_replacement() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office descriptor fixture");
+            let target = tmp.path().join("report.docx");
+            let retained = tmp.path().join("opened-report.docx");
+            std::fs::write(&target, office_read_fixture(false, "admitted content")).unwrap();
+            let swapped_path = target.clone();
+            let tool = ReadTool::with_after_open_hook(tmp.path(), move || {
+                std::fs::rename(&swapped_path, &retained).unwrap();
+                std::fs::write(&swapped_path, office_read_fixture(false, "replacement content")).unwrap();
+            });
+            let input = serde_json::json!({"path": "report.docx"});
+            let opened = tool.execute("office-opened", input.clone(), None).await.unwrap();
+            assert!(first_text(&opened).contains("admitted content"));
+            assert!(!first_text(&opened).contains("replacement content"));
+            let replacement = ReadTool::new(tmp.path())
+                .execute("office-replacement", input, None).await.unwrap();
+            assert!(first_text(&replacement).contains("replacement content"));
+            assert!(!first_text(&replacement).contains("admitted content"));
         });
     }
 

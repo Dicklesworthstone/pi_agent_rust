@@ -46,6 +46,31 @@ fn only_exact_github_routes_are_synthesized() {
 }
 
 #[test]
+fn github_office_documents_use_native_readers_and_reject_partial_downloads() {
+    for extension in ["docx", "pptx"] {
+        let url = format!("https://github.com/team/repo/blob/main/report.{extension}");
+        let route = Route::new(
+            &url,
+            SsrfPolicy::BlockPrivateTargets,
+            UrlReadMode::Reader,
+        )
+        .unwrap();
+        let error = route
+            .finish("application/octet-stream", b"partial ZIP", true)
+            .expect_err("a partial Office archive must not become raw source text");
+        assert!(error.to_string().contains("DOCUMENT_INCOMPLETE"), "{error}");
+
+        let raw = Route::new(&url, SsrfPolicy::BlockPrivateTargets, UrlReadMode::Raw)
+            .unwrap()
+            .finish("application/octet-stream", b"original bytes", true)
+            .unwrap();
+        assert_eq!(raw.content, "original bytes");
+        assert_eq!(raw.extractor, "raw");
+        assert!(raw.download_truncated);
+    }
+}
+
+#[test]
 fn relative_redirects_use_url_reference_semantics() {
     for (base, location, expected) in [
         ("https://a.test", "file", "https://a.test/file"),
