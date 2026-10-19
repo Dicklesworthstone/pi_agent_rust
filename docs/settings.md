@@ -309,13 +309,37 @@ Accessor defaults:
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.
 - `shell_command_prefix` (string): Default `set -e`.
 - `gh_path` (string): Override path to `gh` for `/share`. Alias: `ghPath`.
+- `bash.auto_background.enabled` (bool): Automatically promote eligible
+  non-PTY Bash commands to managed background jobs. Default `true`.
+  Alias for the object: `autoBackground`.
+- `bash.auto_background.threshold_ms` (integer): Foreground wait before
+  promotion, in milliseconds. Default `60000`; values above `600000` are
+  clamped. `0` promotes immediately. Alias: `thresholdMs`.
 
 ```json
 {
   "shell_path": "/bin/bash",
-  "shell_command_prefix": "set -e"
+  "shell_command_prefix": "set -e",
+  "bash": {
+    "autoBackground": {
+      "enabled": true,
+      "thresholdMs": 60000
+    }
+  }
 }
 ```
+
+Promotion keeps the same process and execution deadline. A call whose timeout
+expires at or before the threshold uses the direct foreground runner. Explicit
+`background: true` starts immediately; `background: false` keeps the direct
+foreground runner for that call. Automatic promotion is disabled for PTY calls.
+
+Automatic mode uses managed-job storage, including a **16 MiB artifact cap**
+even when the command finishes before promotion. Set `enabled` to `false`, or
+pass `background: false`, to retain the direct runner's larger spill limit.
+Project settings merge the enabled flag and threshold independently, so setting
+one does not discard the other. See [Bash execution and background jobs](tools/bash.md)
+for timeouts, cancellation, output limits, and examples.
 
 ### Project memory
 

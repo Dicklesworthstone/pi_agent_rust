@@ -71,6 +71,21 @@ fn bash_tool_for_session(root: &std::path::Path, session_id: &str) -> pi::tools:
     tool
 }
 
+fn auto_bash_tool(
+    root: &std::path::Path,
+    session_id: &str,
+    threshold_ms: u64,
+) -> pi::tools::BashTool {
+    bash_tool_for_session(root, session_id).with_mediation(Some(pi::config::BashSettings {
+        pty: Some("off".to_string()),
+        auto_background: Some(pi::config::BashAutoBackgroundSettings {
+            enabled: Some(true),
+            threshold_ms: Some(threshold_ms),
+        }),
+        ..Default::default()
+    }))
+}
+
 fn jobs_tool_for_session(session_id: &str) -> pi::tools::JobsTool {
     let mut tool = pi::tools::JobsTool::new();
     tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
@@ -103,6 +118,284 @@ fn job_id(output: &ToolOutput) -> String {
         .as_str()
         .expect("job id") // ubs:ignore test helper
         .to_string()
+}
+
+#[test]
+fn automatic_foreground_completion_preserves_output_and_exit_status() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "automatic_foreground_completion_preserves_output_and_exit_status";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-inline-{}", uuid::Uuid::new_v4().simple());
+    let tool = auto_bash_tool(&root, &owner, 60_000);
+
+    let output = execute(&tool, json!({"command": "printf inline-marker"}));
+    assert!(!output.is_error, "{}", first_text(&output));
+    assert_eq!(first_text(&output), "inline-marker");
+    assert!(output.details.is_none());
+
+    // Managed foreground output must keep the ordinary Bash display tail,
+    // rather than silently adopting the background registry's 64 KiB tail.
+    let large = execute(
+        &tool,
+        json!({"command": "printf '%100000s' '' | tr ' ' x"}),
+    );
+    assert!(!large.is_error, "{}", first_text(&large));
+    assert_eq!(first_text(&large).len(), 100_000);
+    assert!(first_text(&large).bytes().all(|byte| byte == b'x'));
+    assert!(large.details.is_none());
+
+    let failed = execute(&tool, json!({"command": "printf failed-marker; exit 7"}));
+    assert!(failed.is_error, "nonzero exit must remain a tool error");
+    assert!(first_text(&failed).contains("failed-marker"));
+    assert!(first_text(&failed).contains("Command exited with code 7"));
+    assert!(pi::jobs::list(&owner).expect("list").is_empty());
+    assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_foreground_reports_the_partial_job_artifact_honestly() {
+    if !std::path::Path::new("/dev/zero").exists() {
+        return;
+    }
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "automatic_foreground_reports_the_partial_job_artifact_honestly";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-auto-partial-{}", uuid::Uuid::new_v4().simple());
+    let output = execute(
+        &auto_bash_tool(&root, &owner, 60_000),
+        json!({"command": "head -c 16777217 /dev/zero | tr '\\0' x"}),
+    );
+    assert!(!output.is_error, "bounded retention is reported, not a failed exit");
+    let text = first_text(&output);
+    assert!(text.contains("Partial output artifact:"), "partial footer missing");
+    assert!(!text.contains("Full output:"), "partial capture cannot be labeled full");
+    assert!(!text.contains("undefined"), "partial path must be real");
+    let details = output.details.as_ref().expect("capture details");
+    assert!(details.get("fullOutputPath").is_none());
+    assert_eq!(details["capture"]["outputComplete"], true);
+    assert_eq!(details["capture"]["artifactTruncated"], true);
+    let path = details["capture"]["artifactPath"]
+        .as_str()
+        .expect("retained artifact path");
+    assert!(text.contains(path));
+    assert_eq!(
+        std::fs::metadata(path).expect("retained artifact").len(),
+        16 * 1024 * 1024
+    );
+    assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn automatic_promotion_keeps_the_same_process_and_executes_once() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "automatic_promotion_keeps_the_same_process_and_executes_once";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-promote-{}", uuid::Uuid::new_v4().simple());
+    let tool = auto_bash_tool(&root, &owner, 0);
+
+    // The release file prevents natural completion from racing the zero
+    // threshold. Replaying the command would append a second start PID.
+    let output = execute(
+        &tool,
+        json!({
+            "command": "printf '%s\\n' \"$$\" >> starts; printf started; while [ ! -f release ]; do sleep 0.025; done; printf '%s\\n' \"$$\" > completed; printf finished",
+            "timeout": 30
+        }),
+    );
+    assert!(!output.is_error, "{}", first_text(&output));
+    let id = job_id(&output);
+    let details = output.details.as_ref().expect("job details");
+    assert_eq!(details["autoBackgrounded"], true);
+    assert_eq!(details["status"], "running");
+    let pid = details["pid"].as_u64().expect("running PID");
+    std::fs::write(root.join("release"), "continue").expect("release command");
+
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("wait for promoted command");
+    assert_eq!(settled.status, "exited");
+    assert_eq!(settled.exit_code, Some(0));
+    assert_eq!(settled.output_tail, "startedfinished");
+    assert_eq!(settled.output_bytes, "startedfinished".len());
+    let starts = std::fs::read_to_string(root.join("starts")).expect("start PIDs");
+    let completed = std::fs::read_to_string(root.join("completed")).expect("completion PID");
+    assert_eq!(starts.lines().count(), 1, "command must execute once");
+    assert_eq!(starts.trim(), pid.to_string());
+    assert_eq!(completed.trim(), pid.to_string(), "promotion must retain its PID");
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+    assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn automatic_promotion_keeps_the_original_execution_deadline() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "automatic_promotion_keeps_the_original_execution_deadline";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-auto-timeout-{}", uuid::Uuid::new_v4().simple());
+    let output = execute(
+        &auto_bash_tool(&root, &owner, 0),
+        json!({"command": "printf timeout-marker; sleep 300", "timeout": 1}),
+    );
+    let id = job_id(&output);
+    assert_eq!(
+        output.details.as_ref().expect("job details")["autoBackgrounded"],
+        true
+    );
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("wait for original deadline");
+    let status = settled.status.clone();
+    // Clean up even if a regression reset the timeout to the 30-minute
+    // explicit-background default.
+    if status == "running" {
+        block_on_local(pi::jobs::kill_session(&owner)).expect("timeout test cleanup");
+    }
+    assert_eq!(status, "timedOut", "promotion must not reset the timeout");
+    assert!(settled.output_tail.contains("timeout-marker"));
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_an_automatic_foreground_call_kills_its_process_tree() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "dropping_an_automatic_foreground_call_kills_its_process_tree";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-auto-drop-{}", uuid::Uuid::new_v4().simple());
+    let tool = auto_bash_tool(&root, &owner, 60_000);
+    let ready = Arc::new(AtomicBool::new(false));
+    let update_ready = Arc::clone(&ready);
+    block_on_local(async {
+        let pending = Box::pin(tool.execute(
+            "cancelled-call",
+            json!({
+                "command": "trap '' TERM; sleep 300 & echo $! > child.pid; echo $$ > parent.pid; printf cancel-ready; wait",
+                "timeout": 120
+            }),
+            Some(Box::new(move |update| {
+                if update.content.iter().any(|block| {
+                    matches!(block, pi::model::ContentBlock::Text(text)
+                        if text.text.contains("cancel-ready"))
+                }) {
+                    update_ready.store(true, Ordering::Release);
+                }
+            })),
+        ));
+        let observed = Box::pin(async {
+            let started = std::time::Instant::now();
+            while !ready.load(Ordering::Acquire) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "command did not stream its readiness marker"
+                );
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(25),
+                )
+                .await;
+            }
+        });
+        match futures::future::select(pending, observed).await {
+            futures::future::Either::Left((result, _)) => {
+                panic!("foreground command finished before it was dropped: {result:?}");
+            }
+            futures::future::Either::Right(((), pending)) => {
+                // Drop the owned future, not a Pin<&mut _> that leaves the
+                // actual execution future alive in the test stack.
+                drop(pending);
+            }
+        }
+    });
+
+    let read_pid = |name| {
+        std::fs::read_to_string(root.join(name))
+            .expect("PID file")
+            .trim()
+            .parse::<u32>()
+            .expect("PID")
+    };
+    let parent_pid = read_pid("parent.pid");
+    let child_pid = read_pid("child.pid");
+    let child_is_running = |pid| {
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && stat.rsplit_once(')').is_some_and(|(_, fields)| {
+                fields.split_whitespace().next() == Some("Z")
+            })
+        {
+            // KILL can orphan a dead grandchild before a container's PID 1
+            // reaps it. That zombie cannot run; the monitor still must reap
+            // its own parent, which keeps the strict kill_zero check below.
+            return false;
+        }
+        kill_zero(pid)
+    };
+    let started = std::time::Instant::now();
+    while (kill_zero(parent_pid) || child_is_running(child_pid))
+        && started.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let survived = kill_zero(parent_pid) || child_is_running(child_pid);
+    // Observe the drop contract before cleanup, so explicit session shutdown
+    // cannot hide a missing foreground cancellation guard.
+    block_on_local(pi::jobs::kill_session(&owner)).expect("settle remaining cleanup");
+    assert!(!survived, "dropped foreground command left a live process");
+    assert!(pi::jobs::list(&owner).expect("list").is_empty());
+    assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn managed_commands_inherit_configured_child_proxy_environment() {
+    struct RestoreProxy(pi::http::proxy::ProxyConfig);
+    impl Drop for RestoreProxy {
+        fn drop(&mut self) {
+            pi::http::proxy::install(self.0.clone());
+        }
+    }
+
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "managed_commands_inherit_configured_child_proxy_environment";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("jobs-proxy-{}", uuid::Uuid::new_v4().simple());
+    let _restore = RestoreProxy(pi::http::proxy::active());
+    let settings = pi::http::proxy::HttpSettings {
+        http_proxy: Some("http://127.0.0.1:49199".to_string()),
+        ignore_env_proxy: Some(true),
+        ..Default::default()
+    };
+    let (proxy, warnings) = pi::http::proxy::ProxyConfig::resolve(Some(&settings), &|_| None);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    pi::http::proxy::install(proxy);
+
+    let tool = auto_bash_tool(&root, &owner, 60_000);
+    let inline = execute(&tool, json!({"command": "printf '%s' \"$HTTP_PROXY\""}));
+    assert!(!inline.is_error, "{}", first_text(&inline));
+    assert_eq!(first_text(&inline), "http://127.0.0.1:49199");
+    let background = execute(
+        &tool,
+        json!({"command": "printf '%s' \"$HTTP_PROXY\"", "background": true}),
+    );
+    let id = job_id(&background);
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("proxy command completion");
+    assert_eq!(settled.status, "exited");
+    assert_eq!(settled.output_tail, "http://127.0.0.1:49199");
+    let _ = pi::jobs::take_completion_notices(&owner);
+    finish_case(&harness, case);
 }
 
 #[test]
@@ -431,6 +724,22 @@ fn capacity_rejects_ninth_job() {
         text.contains("PI_JOBS_AT_CAPACITY"),
         "the 9th job must be rejected with the named capacity error: {text}"
     );
+
+    // Automatic mode may safely use the ordinary foreground runner when
+    // the registry rejects admission before spawning any process.
+    let owner = format!("jobs-capacity-inline-{}", uuid::Uuid::new_v4().simple());
+    let inline = execute(
+        &auto_bash_tool(&root, &owner, 0),
+        json!({"command": "printf once >> inline-starts; printf capacity-inline"}),
+    );
+    assert!(!inline.is_error, "{}", first_text(&inline));
+    assert_eq!(first_text(&inline), "capacity-inline");
+    assert!(inline.details.is_none());
+    assert_eq!(
+        std::fs::read_to_string(root.join("inline-starts")).expect("inline counter"),
+        "once"
+    );
+    assert!(pi::jobs::take_completion_notices(&owner).is_empty());
 
     // Clean up the 8 sleepers so they do not linger past the test.
     pi::jobs::kill_all();

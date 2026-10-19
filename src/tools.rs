@@ -7939,9 +7939,16 @@ fn assemble_bash_run_result(
             .saturating_add(1);
         let end_line = truncation.total_lines;
 
-        let display_path = full_output_path.as_deref().unwrap_or("undefined");
+        let display_path = bash_output
+            .partial_output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| full_output_path.clone())
+            .unwrap_or_else(|| "unavailable".to_string());
         let file_limit_hit = bash_output.total_bytes > BASH_FILE_LIMIT_BYTES;
-        let output_qualifier = if file_limit_hit {
+        let output_qualifier = if bash_output.partial_output_path.is_some() {
+            "Partial output artifact".to_string()
+        } else if file_limit_hit {
             format!(
                 "Partial output (capped at {})",
                 format_size(BASH_FILE_LIMIT_BYTES)
@@ -8250,6 +8257,313 @@ impl BashTool {
         self
     }
 
+
+    async fn still_owns_foreground(
+        &self,
+        owner: &AgentCx,
+        session_id: &str,
+    ) -> Result<bool> {
+        if owner.checkpoint().is_err() {
+            return Ok(false);
+        }
+        let current_session = self.job_session_scope.session_id().await?;
+        // Resolution may suspend while cancellation arrives. The caller must
+        // observe that cancellation before transferring process ownership.
+        Ok(owner.checkpoint().is_ok() && current_session == session_id)
+    }
+
+    /// Wait on the managed process itself; promotion transfers ownership and
+    /// never spawns or replays the user's command.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn execute_auto_background(
+        &self,
+        tool_call_id: &str,
+        session_id: &str,
+        input: &BashInput,
+        threshold_ms: u64,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    ) -> Result<Option<ToolOutput>> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let job = match crate::jobs::spawn_foreground(
+            session_id,
+            &self.cwd,
+            self.shell_path.as_deref(),
+            self.command_prefix.as_deref(),
+            &input.command,
+            input.timeout,
+            self.artifact_root.as_deref(),
+        ) {
+            Ok(job) => job,
+            // This named refusal precedes OS spawn, so falling back cannot
+            // execute the command twice. Other failures are never replayed.
+            Err(Error::Tool { message, .. })
+                if message.starts_with("PI_JOBS_AT_CAPACITY:") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let started = std::time::Instant::now();
+        let threshold = Duration::from_millis(threshold_ms);
+        let mut last_bytes = None;
+        loop {
+            let snapshot = job.snapshot()?;
+            // Preserve a completed exit even if cancellation arrives while
+            // the caller is observing the already settled output.
+            if snapshot.status != "running" {
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if last_bytes != Some(snapshot.output_bytes) {
+                if let Some(callback) = on_update {
+                    let preview = truncate_tail(
+                        snapshot.output_tail,
+                        DEFAULT_MAX_LINES,
+                        DEFAULT_MAX_BYTES,
+                    );
+                    callback(ToolUpdate {
+                        content: vec![ContentBlock::Text(TextContent::new(preview.content))],
+                        details: Some(serde_json::json!({
+                            "progress": {
+                                "elapsedMs": started.elapsed().as_millis(),
+                                "lineCount": snapshot.output_lines,
+                                "byteCount": snapshot.output_bytes,
+                            }
+                        })),
+                    });
+                }
+                last_bytes = Some(snapshot.output_bytes);
+            }
+            // An update callback or the session resolver can cancel the
+            // turn. Recheck after its await, immediately before promotion.
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if started.elapsed() >= threshold {
+                return match job.promote()? {
+                    crate::jobs::ForegroundPromotion::Completed(snapshot) => self
+                        .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                        .map(Some),
+                    crate::jobs::ForegroundPromotion::Background(snapshot) => {
+                        Self::background_start_output(snapshot, true).map(Some)
+                    }
+                };
+            }
+            job.wait(
+                threshold
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(50)),
+            )
+            .await?;
+        }
+    }
+
+    fn background_start_output(
+        mut job: crate::jobs::JobSnapshot,
+        automatic: bool,
+    ) -> Result<ToolOutput> {
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, 64 * 1024);
+        job.tail_truncated |= preview.truncated;
+        job.output_tail = preview.content;
+        let mut details = serde_json::to_value(&job)?;
+        details["autoBackgrounded"] = serde_json::json!(automatic);
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).content;
+        let mut text = if preview.is_empty() {
+            String::new()
+        } else {
+            format!("{preview}\n\n")
+        };
+        let reason = if automatic {
+            "Command continues in the background"
+        } else {
+            "Background job started"
+        };
+        let _ = write!(
+            text,
+            "{reason}: {} (pid {}). Output streams to {}. \
+             A completion notice will arrive as a follow-up message; \
+             manage it with the jobs tool (list/wait/cancel).",
+            job.id,
+            job.pid
+                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            job.artifact_path,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn managed_bash_output(
+        &self,
+        tool_call_id: &str,
+        snapshot: crate::jobs::JobSnapshot,
+        timeout_secs: Option<u64>,
+    ) -> Result<ToolOutput> {
+        if snapshot.tail_truncated && snapshot.output_bytes == 0 {
+            return Err(Error::tool(
+                "bash",
+                "PI_JOBS_OUTPUT_UNAVAILABLE: command settled but its output snapshot is unavailable",
+            ));
+        }
+        let capture_complete = snapshot.output_complete
+            && !snapshot.artifact_truncated
+            && snapshot.artifact_error.is_none();
+        let mut state = BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2));
+        state.total_bytes = snapshot.output_bytes;
+        state.last_byte_was_newline = snapshot.output_tail.ends_with('\n');
+        state.line_count = snapshot.output_lines.saturating_sub(usize::from(
+            snapshot.output_bytes > 0 && !state.last_byte_was_newline,
+        ));
+        state.chunks_bytes = snapshot.output_tail.len();
+        state.chunks.push_back(snapshot.output_tail.into_bytes());
+        if capture_complete {
+            state.temp_file_path = Some(PathBuf::from(&snapshot.artifact_path));
+        } else {
+            state.partial_output_path = Some(PathBuf::from(&snapshot.artifact_path));
+        }
+        let timed_out = snapshot.status == "timedOut";
+        let cancelled = snapshot.status == "killed" || timed_out;
+        let cancellation_reason = if timed_out {
+            Some(BashCancellationReason::Timeout)
+        } else if cancelled {
+            Some(BashCancellationReason::AmbientCancellation)
+        } else {
+            None
+        };
+        let result = assemble_bash_run_result(
+            state,
+            snapshot.exit_code,
+            timed_out,
+            cancelled,
+            cancellation_reason,
+            match timeout_secs {
+                Some(0) => None,
+                Some(value) => Some(value),
+                None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+            },
+        );
+        let mut output = self.bash_result_output(tool_call_id, result)?;
+        if cancelled && !timed_out
+            && let Some(ContentBlock::Text(text)) = output.content.first_mut()
+        {
+            text.text.push_str("\n\nCommand cancelled");
+        }
+        if !capture_complete {
+            let warning = format!(
+                "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
+                 Retained artifact: {}]",
+                snapshot.output_complete,
+                snapshot.artifact_truncated,
+                snapshot.artifact_error.as_deref().unwrap_or("none"),
+                snapshot.artifact_path,
+            );
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text.push_str(&warning);
+            }
+            output.is_error |= !snapshot.output_complete;
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["capture"] = serde_json::json!({
+                "outputComplete": snapshot.output_complete,
+                "artifactTruncated": snapshot.artifact_truncated,
+                "artifactError": snapshot.artifact_error,
+                "artifactPath": snapshot.artifact_path,
+            });
+        }
+        Ok(output)
+    }
+
+    fn bash_result_output(
+        &self,
+        tool_call_id: &str,
+        result: BashRunResult,
+    ) -> Result<ToolOutput> {
+        let mut details_map = serde_json::Map::new();
+        if let Some(truncation) = result.truncation.as_ref() {
+            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+        }
+        if let Some(path) = result.full_output_path.as_ref() {
+            details_map.insert(
+                "fullOutputPath".to_string(),
+                serde_json::Value::String(path.clone()),
+            );
+        }
+        if let Some(reason) = result.cancellation_reason {
+            details_map.insert(
+                "cancellation".to_string(),
+                bash_cancellation_details(reason, result.timeout_ms, result.exit_code),
+            );
+        }
+
+        let details = if details_map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(details_map))
+        };
+        let mut details = details;
+        let mut output_text = result.output;
+
+        if let Some(path) = result.full_output_path.as_deref() {
+            attach_text_artifact_from_path_if_needed_with_root(
+                self.artifact_root.as_deref(),
+                &mut output_text,
+                &mut details,
+                "bash",
+                tool_call_id,
+                "fullCommandOutput",
+                Path::new(path),
+            );
+        }
+
+        let is_error = result.cancelled || result.exit_code != 0;
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
+            details,
+            is_error,
+        })
+    }
+
+    fn annotate_bash_mediation(
+        mut output: ToolOutput,
+        warning: &Option<(String, serde_json::Value)>,
+    ) -> ToolOutput {
+        if let Some((rules, payload)) = warning {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text = format!("[MEDIATION WARN: {rules}]\n\n{}", text.text);
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            // Foreground warnings historically exposed their audit fields
+            // at the top level. Keep that contract alongside execution
+            // metadata, without replacing a background job's own schema.
+            if details.get("schema").and_then(serde_json::Value::as_str)
+                != Some(crate::jobs::JOB_SCHEMA)
+                && let (Some(fields), Some(audit)) =
+                    (details.as_object_mut(), payload.as_object())
+            {
+                for (key, value) in audit {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            details["mediation"] = payload.clone();
+        }
+        output
+    }
+
     #[cfg(test)]
     fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
@@ -8273,7 +8587,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
+        "Execute a bash command in the current working directory. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -8286,11 +8600,11 @@ impl Tool for BashTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default 120; set 0 to disable)"
+                    "description": "Timeout in seconds (foreground/automatic default 120; explicit background default 1800; set 0 to disable). Automatic promotion preserves this deadline."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Run detached as a background job: returns a job id immediately; output streams to an artifact file and a completion notice arrives as a follow-up message. Manage with the jobs tool (list/wait/cancel)."
+                    "description": "true: start a background job immediately; false: keep this call in the foreground with the direct runner. If omitted, long-running non-PTY calls automatically background according to bash.autoBackground (default after 60 seconds). Automatic mode uses the 16MiB job artifact cap even before promotion. A completion notice arrives later; manage with jobs (list/wait/cancel)."
                 }
             },
             "required": ["command"]
@@ -8314,12 +8628,6 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        let background_session_id = if input.background.unwrap_or(false) {
-            Some(self.job_session_scope.session_id().await?)
-        } else {
-            None
-        };
-
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
         // contract is identical either way.
@@ -8332,6 +8640,28 @@ impl Tool for BashTool {
                 crate::bash_mediation::pty_required(&input.command)
             }
         };
+
+        let auto_settings = self
+            .mediation
+            .as_ref()
+            .and_then(|settings| settings.auto_background.as_ref());
+        let threshold_ms = auto_settings
+            .and_then(|settings| settings.threshold_ms)
+            .unwrap_or(60_000)
+            .min(600_000);
+        let timeout_secs = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        // A deadline that comes before promotion uses the ordinary foreground
+        // runner, avoiding a pointless job transition just before it expires.
+        let auto_background = input.background.is_none()
+            && !use_pty
+            && auto_settings.and_then(|settings| settings.enabled).unwrap_or(true)
+            && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
+        let background_session_id = if input.background == Some(true) || auto_background {
+            Some(self.job_session_scope.session_id().await?)
+        } else {
+            None
+        };
+        let mut mediation_warning = None;
 
         // Mediation gate (bd-cv653.1.7): classify before spawn against
         // `bash.mediation`. This runs on the execution path, so it applies
@@ -8386,60 +8716,7 @@ impl Tool for BashTool {
                                         .join(", ")
                                 })
                                 .unwrap_or_default();
-                            if input.background.unwrap_or(false) {
-                                // Warn + background: annotate the job-start
-                                // result instead of blocking on foreground
-                                // output.
-                                let job = crate::jobs::spawn_background(
-                                    background_session_id.as_deref().ok_or_else(|| {
-                                        Error::tool(
-                                            "bash",
-                                            "background job session scope was not resolved"
-                                                .to_string(),
-                                        )
-                                    })?,
-                                    &self.cwd,
-                                    self.shell_path.as_deref(),
-                                    self.command_prefix.as_deref(),
-                                    &input.command,
-                                    input.timeout,
-                                    self.artifact_root.as_deref(),
-                                )?;
-                                let mut details = serde_json::to_value(&job)?;
-                                details["mediation"] = payload;
-                                return Ok(ToolOutput {
-                                    content: vec![ContentBlock::Text(TextContent::new(format!(
-                                        "[MEDIATION WARN: {rules}]\n\nBackground job {} started \
-                                         (pid {}). Output streams to {}. A completion notice \
-                                         will arrive as a follow-up message.",
-                                        job.id,
-                                        job.pid.map_or_else(
-                                            || "unknown".to_string(),
-                                            |pid| pid.to_string()
-                                        ),
-                                        job.artifact_path
-                                    )))],
-                                    details: Some(details),
-                                    is_error: false,
-                                });
-                            }
-                            let mut result = execute_bash_spawn(
-                                &self.cwd,
-                                self.shell_path.as_deref(),
-                                self.command_prefix.as_deref(),
-                                &input.command,
-                                input.timeout,
-                                on_update.as_deref(),
-                                use_pty,
-                            )
-                            .await?;
-                            result.output =
-                                format!("[MEDIATION WARN: {rules}]\n\n{}", result.output);
-                            return Ok(ToolOutput {
-                                content: vec![ContentBlock::Text(TextContent::new(result.output))],
-                                details: Some(payload),
-                                is_error: false,
-                            });
+                            mediation_warning = Some((rules, payload));
                         }
                         crate::bash_mediation::MediationVerdict::Block { hits } => {
                             let payload = crate::bash_mediation::MediationVerdict::Block { hits }
@@ -8480,16 +8757,11 @@ impl Tool for BashTool {
             }
         }
 
-        // Background dispatch (bd-cv653.3.10): the mediation gate above has
-        // already classified the command; detached jobs run under the same
-        // timeout/tree-kill discipline via the jobs registry.
-        if input.background.unwrap_or(false) {
+        // Every execution route passes the same mediation gate above.
+        if input.background == Some(true) {
             let job = match crate::jobs::spawn_background(
                 background_session_id.as_deref().ok_or_else(|| {
-                    Error::tool(
-                        "bash",
-                        "background job session scope was not resolved".to_string(),
-                    )
+                    Error::tool("bash", "background job session scope was not resolved")
                 })?,
                 &self.cwd,
                 self.shell_path.as_deref(),
@@ -8499,30 +8771,35 @@ impl Tool for BashTool {
                 self.artifact_root.as_deref(),
             ) {
                 Ok(job) => job,
-                Err(err) => {
-                    // Named refusals (PI_JOBS_AT_CAPACITY, …) surface as a
-                    // tool result the model can read, not a transport error.
-                    return Ok(ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
-                        details: None,
-                        is_error: true,
-                    });
+                Err(error) => {
+                    return Ok(Self::annotate_bash_mediation(
+                        ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(error.to_string()))],
+                            details: None,
+                            is_error: true,
+                        },
+                        &mediation_warning,
+                    ));
                 }
             };
-            let details = serde_json::to_value(&job)?;
-            return Ok(ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(format!(
-                    "Background job {} started (pid {}). Output streams to {}. \
-                     A completion notice will arrive as a follow-up message; \
-                     manage it with the jobs tool (list/wait/cancel).",
-                    job.id,
-                    job.pid
-                        .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
-                    job.artifact_path
-                )))],
-                details: Some(details),
-                is_error: false,
-            });
+            return Self::background_start_output(job, false)
+                .map(|output| Self::annotate_bash_mediation(output, &mediation_warning));
+        }
+
+        if auto_background
+            && let Some(output) = self
+                .execute_auto_background(
+                    tool_call_id,
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "managed job session scope was not resolved")
+                    })?,
+                    &input,
+                    threshold_ms,
+                    on_update.as_deref(),
+                )
+                .await?
+        {
+            return Ok(Self::annotate_bash_mediation(output, &mediation_warning));
         }
 
         let result = execute_bash_spawn(
@@ -8536,50 +8813,8 @@ impl Tool for BashTool {
         )
         .await?;
 
-        let mut details_map = serde_json::Map::new();
-        if let Some(truncation) = result.truncation.as_ref() {
-            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
-        }
-        if let Some(path) = result.full_output_path.as_ref() {
-            details_map.insert(
-                "fullOutputPath".to_string(),
-                serde_json::Value::String(path.clone()),
-            );
-        }
-        if let Some(reason) = result.cancellation_reason {
-            details_map.insert(
-                "cancellation".to_string(),
-                bash_cancellation_details(reason, result.timeout_ms, result.exit_code),
-            );
-        }
-
-        let details = if details_map.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(details_map))
-        };
-        let mut details = details;
-        let mut output_text = result.output;
-
-        if let Some(path) = result.full_output_path.as_deref() {
-            attach_text_artifact_from_path_if_needed_with_root(
-                self.artifact_root.as_deref(),
-                &mut output_text,
-                &mut details,
-                "bash",
-                tool_call_id,
-                "fullCommandOutput",
-                Path::new(path),
-            );
-        }
-
-        let is_error = result.cancelled || result.exit_code != 0;
-
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(output_text))],
-            details,
-            is_error,
-        })
+        self.bash_result_output(tool_call_id, result)
+            .map(|output| Self::annotate_bash_mediation(output, &mediation_warning))
     }
 }
 
@@ -8634,8 +8869,9 @@ impl Tool for JobsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background bash jobs started with `bash {background: true}`. \
-         Actions: `list` (every job with status/pid/artifact), `wait` (block \
+        "Manage background bash jobs started explicitly or automatically promoted \
+         from long-running foreground calls. Actions: `list` (every job with \
+         status/pid/artifact), `wait` (block \
          until the job settles, bounded), `cancel` (kill the whole process \
          tree). Completion notices also arrive automatically as follow-up \
          messages."
@@ -14180,6 +14416,9 @@ struct BashOutputState {
     start_time: std::time::Instant,
     timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
+    // Managed jobs may retain a bounded prefix without a complete artifact.
+    // Render that path honestly without publishing it as fullOutputPath.
+    partial_output_path: Option<PathBuf>,
     temp_file: Option<asupersync::fs::File>,
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
@@ -14196,6 +14435,7 @@ impl BashOutputState {
             start_time: std::time::Instant::now(),
             timeout_ms: None,
             temp_file_path: None,
+            partial_output_path: None,
             temp_file: None,
             chunks: VecDeque::new(),
             chunks_bytes: 0,
@@ -20146,6 +20386,42 @@ mod tests {
                 Err(err) => Err(err),
             }
         }
+    }
+
+    #[test]
+    fn automatic_bash_rechecks_cancellation_after_session_resolution() {
+        let root = tempfile::tempdir().expect("workspace");
+        let owner = AgentCx::for_request();
+        let resolver_owner = owner.clone();
+        let scope = crate::jobs::JobSessionScope::fixed("resolver-owner");
+        scope.bind(Arc::new(move || {
+            let owner = resolver_owner.clone();
+            let mut suspended = false;
+            Box::pin(std::future::poll_fn(move |task| {
+                if !suspended {
+                    suspended = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancelled while resolving the session"),
+                    );
+                    std::task::Poll::Ready(Some("resolver-owner".to_string()))
+                }
+            }))
+        }));
+        let mut tool = BashTool::new(root.path());
+        tool.bind_job_session_scope(scope);
+        let mut check = Box::pin(tool.still_owns_foreground(&owner, "resolver-owner"));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(check.as_mut().poll(&mut task).is_pending());
+        assert!(!owner.is_cancel_requested());
+        assert!(matches!(
+            check.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok(false))
+        ));
+        assert!(owner.is_cancel_requested());
     }
 
     #[test]

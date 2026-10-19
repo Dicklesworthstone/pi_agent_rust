@@ -608,6 +608,21 @@ pub struct BashSettings {
     /// PTY allocation for isatty-requiring commands: `off`, `auto`
     /// (default), or `always` (bd-cv653.1.7).
     pub pty: Option<String>,
+    /// Promote long-running non-PTY calls without restarting the command.
+    #[serde(alias = "autoBackground")]
+    pub auto_background: Option<BashAutoBackgroundSettings>,
+}
+
+/// Foreground waiting policy for managed bash commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashAutoBackgroundSettings {
+    /// Enabled by default; explicit background:false disables it for one call.
+    pub enabled: Option<bool>,
+    /// Foreground wait in milliseconds (default 60,000; clamped to 600,000).
+    /// Zero promotes immediately. The command's execution timeout is unchanged.
+    #[serde(alias = "thresholdMs")]
+    pub threshold_ms: Option<u64>,
 }
 
 /// `memory.backend` (bd-cv653.4.1).
@@ -2001,6 +2016,22 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_forced: other.mediation_forced.or(base.mediation_forced),
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
+            auto_background: merge_bash_auto_background(base.auto_background, other.auto_background),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_bash_auto_background(
+    base: Option<BashAutoBackgroundSettings>,
+    other: Option<BashAutoBackgroundSettings>,
+) -> Option<BashAutoBackgroundSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashAutoBackgroundSettings {
+            enabled: other.enabled.or(base.enabled),
+            threshold_ms: other.threshold_ms.or(base.threshold_ms),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2510,6 +2541,38 @@ mod tests {
         assert!(overridden.advisor_enabled());
         assert_eq!(overridden.advisor_timeout_secs(), 8);
         assert_eq!(overridden.advisor_continue_severity(), ContinueSeverity::Nit);
+    }
+
+    #[test]
+    fn bash_auto_background_settings_merge_without_losing_parent_fields() {
+        for content in [
+            r#"{"bash":{"autoBackground":{"enabled":false,"thresholdMs":250}}}"#,
+            r#"{"bash":{"auto_background":{"enabled":false,"threshold_ms":250}}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("bash settings");
+            let settings = config.bash.expect("bash").auto_background.expect("auto background");
+            assert_eq!(settings.enabled, Some(false));
+            assert_eq!(settings.threshold_ms, Some(250));
+            assert!(unrecognised_setting_keys(content).is_empty());
+        }
+        let global: Config = serde_json::from_value(json!({
+            "bash": {
+                "mediation": "block-high",
+                "autoBackground": {"enabled": false, "thresholdMs": 400}
+            }
+        })).expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "bash": {"autoBackground": {"enabled": true}}
+        })).expect("project settings");
+        let merged = Config::merge(global, project);
+        let bash = merged.bash.expect("merged bash");
+        assert_eq!(bash.mediation.as_deref(), Some("block-high"));
+        let auto = bash.auto_background.expect("merged auto background");
+        assert_eq!(auto.enabled, Some(true));
+        assert_eq!(auto.threshold_ms, Some(400));
+        assert!(serde_json::from_value::<Config>(json!({
+            "bash": {"autoBackground": {"thresholdMs": -1}}
+        })).is_err());
     }
 
     #[test]
