@@ -30,6 +30,7 @@ mod execution;
 #[cfg(test)]
 mod execution_tests;
 mod protocol;
+mod seance;
 mod workspace;
 mod workflow;
 
@@ -58,6 +59,8 @@ const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
 
 type UpdateCallback = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
+/// Optional live admission policy retained by retries and explicit revival.
+type LaunchAdmission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 /// Settled result from an interactive `/tan` background child.
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +121,8 @@ impl TanCompletion {
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
+    /// Shared admission policy for saved-session reads, including live roots.
+    workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
     structured_results: bool,
     /// Model spec children run with when their agent definition does not pin
@@ -129,6 +134,9 @@ pub struct SubagentTool {
     parent_model: Option<ToolModelSelection>,
     /// Host ceiling for the entire request, not a fresh allowance per child.
     timeout: Option<Duration>,
+    /// Fallback policy for direct SDK calls; live Agent execution supplies its
+    /// own projection so discoveries stay scoped to the invoking session.
+    privacy: Option<crate::text_completion::AuxiliaryPrivacy>,
 }
 
 /// Private execution policy retained for an explicit hub revival. In
@@ -146,6 +154,23 @@ pub(crate) struct RevivalSpec {
     parent_model: Option<ToolModelSelection>,
     timeout: Duration,
     depth: usize,
+    public_task: Option<String>,
+    launch_admission: Option<LaunchAdmission>,
+}
+
+impl RevivalSpec {
+    /// Public assignment label; the private launch keeps its complete prompt.
+    pub(crate) fn public_task(&self) -> Option<&str> {
+        self.public_task.as_deref()
+    }
+
+    fn display_task(&self) -> &str {
+        self.public_task().unwrap_or(&self.task.task)
+    }
+
+    fn check_launch_admission(&self) -> Result<()> {
+        self.launch_admission.as_ref().map_or(Ok(()), |check| check())
+    }
 }
 
 /// Execute one explicitly requested replacement through the ordinary native
@@ -200,7 +225,7 @@ pub(crate) async fn revive_child(
         .await;
     // Continuation and schema-correction prompts are transport details. The
     // returned assignment and any later revival keep the authored source.
-    result.task = launch.task.task;
+    result.task = launch.display_task().to_string();
     let text = render_results(std::slice::from_ref(&result));
     Ok(ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(text))],
@@ -225,13 +250,31 @@ impl SubagentTool {
         Self {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
+            workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
             role_model_spec: None,
             model_scope: None,
             parent_model: None,
             timeout: None,
+            privacy: None,
         }
+    }
+
+    /// Share the owning agent's live additional roots with saved-session
+    /// consultation. Changes to this handle apply to subsequent admission checks.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Configure privacy for saved-session consultation through direct SDK
+    /// calls. Live Agent calls use the invoking session's current vault.
+    #[must_use]
+    pub fn with_secrets_settings(mut self, settings: Option<&crate::secrets::SecretsSettings>) -> Self {
+        self.privacy = Some(crate::text_completion::AuxiliaryPrivacy::from_settings(settings));
+        self
     }
 
     /// Set the role model spec children fall back to when their agent
@@ -340,16 +383,18 @@ impl SubagentTool {
     /// process-global agent directory or current executable.
     #[doc(hidden)]
     #[must_use]
-    pub const fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
+    pub fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
         Self {
             cwd,
             global_dir,
+            workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
             role_model_spec: None,
             model_scope: None,
             parent_model: None,
             timeout: None,
+            privacy: None,
         }
     }
 
@@ -451,6 +496,7 @@ impl Tool for SubagentTool {
     fn description(&self) -> &'static str {
         concat!(
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
+            " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback."
         )
     }
@@ -461,6 +507,8 @@ impl Tool for SubagentTool {
             "properties": {
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
+                "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
+                "model": {"type": "string", "minLength": 1, "description": "Optional model selector override for a single seance consultation. Otherwise use the saved active branch model; task/smol and parent defaults are not substituted."},
                 "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
                 "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Single delegation isolation. worktree uses the existing captured-baseline and acceptance gates; non-Git directories refuse rather than falling back."},
                 "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "description": "Single delegation worktree disposition, requiring isolation: worktree. Defaults to apply; keep preserves it for inspection, drop reports the patch without writeback."},
@@ -493,9 +541,22 @@ impl Tool for SubagentTool {
 
     async fn execute(
         &self,
+        tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let privacy = self.privacy.clone()
+            .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect).await
+    }
+
+    async fn execute_with_auxiliary_privacy(
+        &self,
         _tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
         if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
             return Err(Error::tool(
@@ -515,6 +576,9 @@ impl Tool for SubagentTool {
                 "subagent",
                 "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
+        }
+        if seance::is_request(&input)? {
+            return seance::execute(self, input, on_update.map(Arc::from), protect).await;
         }
         if let Some(plan) = workflow::Plan::parse(&input)? {
             return plan.execute(self, on_update.map(Arc::from)).await;
@@ -901,6 +965,19 @@ fn child_args(
     if agent.tools.as_ref().is_some_and(Vec::is_empty) {
         args.push("--no-tools".into());
     }
+    let consultant = seance::is_consultant(agent);
+    if consultant {
+        args.extend([
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-migrations",
+            "--hide-cwd-in-prompt",
+        ].into_iter().map(OsString::from));
+    }
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
     // spec from settings > captured active parent > ambient configuration.
     if let Some(model) = &agent.model {
@@ -938,7 +1015,10 @@ fn child_args(
         (prompt, Some(directive)) => Some(format!("{prompt}\n\n{directive}")),
     };
     if let Some(prompt) = appended_prompt {
-        args.extend(["--append-system-prompt".into(), prompt.into()]);
+        // The historical consultant owns the entire prompt. Ordinary agents
+        // continue appending their definitions to the host's context.
+        let flag = if consultant { "--system-prompt" } else { "--append-system-prompt" };
+        args.extend([flag.into(), prompt.into()]);
     }
     args.push(format!("Task: {task}").into());
     args

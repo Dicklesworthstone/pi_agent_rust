@@ -10,7 +10,7 @@
 
 use super::deadline::Deadline;
 use super::{
-    AgentDefinition, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
+    AgentDefinition, LaunchAdmission, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
     UpdateCallback, append_bounded_line, child_args, child_depth, compile_output_schema,
     corrective_retry_task, emit_progress, protocol, validate_child_output,
 };
@@ -59,6 +59,8 @@ pub(super) struct ChildRunner {
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
+    public_task: Option<String>,
+    launch_admission: Option<LaunchAdmission>,
 }
 
 impl ChildRunner {
@@ -79,7 +81,30 @@ impl ChildRunner {
             hub_kind,
             deadline,
             revival: None,
+            public_task: None,
+            launch_admission: None,
         }
+    }
+
+    pub(super) fn with_public_task(mut self, task: Option<String>) -> Self {
+        self.public_task = task;
+        self
+    }
+
+    pub(super) fn with_launch_admission(mut self, admission: Option<LaunchAdmission>) -> Self {
+        self.launch_admission = admission;
+        self
+    }
+
+    fn public_result(&self, mut result: SubagentResult) -> SubagentResult {
+        let task = self.revival.as_ref().map_or(
+            self.public_task.as_deref(),
+            |(_, launch)| launch.public_task(),
+        );
+        if let Some(task) = task {
+            result.task = task.to_string();
+        }
+        result
     }
 
     pub(super) fn with_revival(mut self, source: String, launch: RevivalSpec) -> Self {
@@ -123,7 +148,7 @@ impl ChildRunner {
         completed.sort_by_key(|(index, _)| *index);
         completed
             .into_iter()
-            .map(|(_, pending)| pending.finish(update))
+            .map(|(_, pending)| self.public_result(pending.finish(update)))
             .collect()
     }
 
@@ -214,9 +239,10 @@ impl ChildRunner {
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
         let update = on_update.as_ref();
-        self.run_pending(agents, task, step, update, None)
+        let result = self.run_pending(agents, task, step, update, None)
             .await
-            .finish(update)
+            .finish(update);
+        self.public_result(result)
     }
 
     /// At most one fresh corrective run. The first attempt's isolated edits
@@ -273,6 +299,8 @@ impl ChildRunner {
                 parent_model: self.parent_model.clone(),
                 timeout: self.deadline.remaining(),
                 depth: child_depth(),
+                public_task: self.public_task.clone(),
+                launch_admission: self.launch_admission.clone(),
             },
             |(_, launch)| launch.clone(),
         );
@@ -357,7 +385,7 @@ impl ChildRunner {
         retry.result.schema_retries = Some(1);
         // Keep the public assignment stable; corrective prompt text is a
         // transport detail, not a replacement for the user's original task.
-        retry.result.task.clone_from(&launch.task.task);
+        retry.result.task = launch.display_task().to_string();
         if let Some(iso) = previous.iso {
             retry.result.preserved_worktrees.push(iso);
         }
@@ -411,7 +439,7 @@ impl ChildRunner {
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
-        attempt.result.task.clone_from(&launch.task.task);
+        attempt.result.task = launch.display_task().to_string();
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
@@ -539,6 +567,17 @@ impl ChildRunner {
         // Check after callbacks and setup, immediately before dispatch.
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
+        }
+        // Scope can change during host progress callbacks. Retain this policy
+        // on the private launch so schema retries and revival check it too.
+        if launch.launch_admission.is_some() {
+            if let Err(error) = launch.check_launch_admission() {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+            if !check_budget(owner, self.deadline, &mut attempt.result) {
+                return attempt;
+            }
         }
         let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
             // Bind process authority before activation. The same guard then

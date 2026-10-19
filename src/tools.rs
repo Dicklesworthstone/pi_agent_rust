@@ -4267,7 +4267,7 @@ async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
-fn enforce_read_scope_with_roots(
+pub(crate) fn enforce_read_scope_with_roots(
     path: &Path,
     cwd: &Path,
     agent_dir: &Path,
@@ -5827,6 +5827,8 @@ impl ToolRegistry {
                     tools.push(Box::new(
                         crate::subagents::SubagentTool::new(cwd)
                             .with_structured_results(structured_results)
+                            .with_workspace(workspace.clone())
+                            .with_secrets_settings(config.and_then(|config| config.secrets.as_ref()))
                             .with_role_model_spec(role_model_spec),
                     ));
                 }

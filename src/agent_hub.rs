@@ -343,6 +343,11 @@ impl AgentHubRegistry {
             None
         };
         let mut entry = self.register_kind(name, task, kind)?;
+        // Retain the complete protected assignment for revival, while a
+        // consultant's visible roster entry carries only its question.
+        if let Some(public_task) = launch.public_task() {
+            entry.task = truncate_chars(public_task, 500);
+        }
         entry.revived_from = revived_from.map(str::to_string);
         self.entries.insert(entry.id.clone(), entry.clone());
         self.native_launches.insert(entry.id.clone(), launch);
