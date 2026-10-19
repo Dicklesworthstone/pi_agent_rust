@@ -32,6 +32,16 @@ If none is found, the `bash` tool fails with a message listing these options. Yo
 }
 ```
 
+## npm Packages
+
+npm-sourced packages (`pi install npm:...`, or npm entries under `packages` in
+`settings.json`) run `npm`. Pi looks it up on `PATH` the way the shell does:
+directories in `PATH` order, and in each one the `%PATHEXT%` extensions that
+Windows can start (`.com`, `.exe`, `.bat`, `.cmd`). That finds the Node.js
+installer's `npm.cmd` as well as an `npm.exe` shim such as pnpm's. Empty and
+relative `PATH` entries are skipped. If no `npm` is found, loading the
+configured packages fails with `Failed to spawn npm: program not found`.
+
 ## Keybindings
 
 ### Windows Terminal

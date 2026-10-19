@@ -5828,7 +5828,9 @@ impl ToolRegistry {
                         crate::subagents::SubagentTool::new(cwd)
                             .with_structured_results(structured_results)
                             .with_workspace(workspace.clone())
-                            .with_secrets_settings(config.and_then(|config| config.secrets.as_ref()))
+                            .with_secrets_settings(
+                                config.and_then(|config| config.secrets.as_ref()),
+                            )
                             .with_role_model_spec(role_model_spec),
                     ));
                 }
@@ -7007,13 +7009,21 @@ impl Tool for ReadTool {
         // for coding workflows; document reads expose useful saved content.
         let document_mime = if input.raw {
             None
-        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
+        {
             Some("application/x-ipynb+json")
         } else if initial_bytes.starts_with(b"%PDF")
-            || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+            || path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
         {
             Some("application/pdf")
-        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) {
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
             Some("application/epub+zip")
         } else {
             crate::document_read::recognize(&path.to_string_lossy(), "").map(|kind| match kind {
@@ -7047,7 +7057,9 @@ impl Tool for ReadTool {
             file.take(remaining as u64 + 1)
                 .read_to_end(&mut bytes)
                 .await
-                .map_err(|error| Error::tool("read", format!("Failed to read document: {error}")))?;
+                .map_err(|error| {
+                    Error::tool("read", format!("Failed to read document: {error}"))
+                })?;
             if bytes.len() > bound {
                 return Err(Error::tool(
                     "read",
@@ -7594,6 +7606,82 @@ fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
         .collect()
+}
+
+/// The `%PATHEXT%` extensions a program can be launched with, lowercase and
+/// without the dot: `com` and `exe` start through `CreateProcess`, `bat` and
+/// `cmd` through `cmd.exe` (the standard library does that, with its argument
+/// escaping). Scripts such as `.js` or `.vbs` need a host and are skipped.
+#[cfg(any(windows, test))]
+const LAUNCHABLE_WINDOWS_EXTENSIONS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+/// Find the program a Windows shell would run for `name` (GH #182): each
+/// directory of `path_dirs` in order, trying the launchable extensions of
+/// `pathext` (`%PATHEXT%`, default `.COM;.EXE;.BAT;.CMD`) in their order.
+///
+/// The standard library's own `PATH` search only adds `.exe`, so a bare
+/// `npm` misses the Node.js installer's `npm.cmd`, while a hard-coded
+/// `npm.cmd` misses an `npm.exe` shim such as pnpm's. A `name` that already ends in a launchable
+/// extension is looked up as written. An extensionless file is never
+/// returned: Node.js installs a POSIX `npm` script next to `npm.cmd`, and
+/// Windows cannot start it. `None` for a name with a directory part.
+///
+/// Callers pass absolute directories only (see [`absolute_path_dirs`]), so a
+/// program in the current directory is never picked up through `PATH`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program(
+    name: &str,
+    path_dirs: &[PathBuf],
+    pathext: Option<&std::ffi::OsStr>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let launchable = |ext: &str| {
+        LAUNCHABLE_WINDOWS_EXTENSIONS
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(ext))
+    };
+    let has_launchable_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| launchable(ext).is_some());
+    let file_names: Vec<String> = if has_launchable_extension {
+        vec![name.to_string()]
+    } else {
+        let pathext = pathext.map(|value| value.to_string_lossy().into_owned());
+        let mut extensions: Vec<&str> = pathext
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|ext| launchable(ext.trim().trim_start_matches('.')))
+            .collect();
+        if extensions.is_empty() {
+            extensions = LAUNCHABLE_WINDOWS_EXTENSIONS.to_vec();
+        }
+        extensions
+            .into_iter()
+            .map(|ext| format!("{name}.{ext}"))
+            .collect()
+    };
+    path_dirs
+        .iter()
+        .flat_map(|dir| file_names.iter().map(move |file| dir.join(file)))
+        .find(|candidate| is_file(candidate))
+}
+
+/// [`find_windows_program`] on this process's `PATH` and `PATHEXT`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program_on_path(name: &str) -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| absolute_path_dirs(&path))
+        .unwrap_or_default();
+    find_windows_program(
+        name,
+        &path_dirs,
+        std::env::var_os("PATHEXT").as_deref(),
+        Path::is_file,
+    )
 }
 
 /// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
@@ -8257,12 +8345,7 @@ impl BashTool {
         self
     }
 
-
-    async fn still_owns_foreground(
-        &self,
-        owner: &AgentCx,
-        session_id: &str,
-    ) -> Result<bool> {
+    async fn still_owns_foreground(&self, owner: &AgentCx, session_id: &str) -> Result<bool> {
         if owner.checkpoint().is_err() {
             return Ok(false);
         }
@@ -8299,9 +8382,7 @@ impl BashTool {
             Ok(job) => job,
             // This named refusal precedes OS spawn, so falling back cannot
             // execute the command twice. Other failures are never replayed.
-            Err(Error::Tool { message, .. })
-                if message.starts_with("PI_JOBS_AT_CAPACITY:") =>
-            {
+            Err(Error::Tool { message, .. }) if message.starts_with("PI_JOBS_AT_CAPACITY:") => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -8326,11 +8407,8 @@ impl BashTool {
             }
             if last_bytes != Some(snapshot.output_bytes) {
                 if let Some(callback) = on_update {
-                    let preview = truncate_tail(
-                        snapshot.output_tail,
-                        DEFAULT_MAX_LINES,
-                        DEFAULT_MAX_BYTES,
-                    );
+                    let preview =
+                        truncate_tail(snapshot.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
                     callback(ToolUpdate {
                         content: vec![ContentBlock::Text(TextContent::new(preview.content))],
                         details: Some(serde_json::json!({
@@ -8458,7 +8536,8 @@ impl BashTool {
             },
         );
         let mut output = self.bash_result_output(tool_call_id, result)?;
-        if cancelled && !timed_out
+        if cancelled
+            && !timed_out
             && let Some(ContentBlock::Text(text)) = output.content.first_mut()
         {
             text.text.push_str("\n\nCommand cancelled");
@@ -8487,11 +8566,7 @@ impl BashTool {
         Ok(output)
     }
 
-    fn bash_result_output(
-        &self,
-        tool_call_id: &str,
-        result: BashRunResult,
-    ) -> Result<ToolOutput> {
+    fn bash_result_output(&self, tool_call_id: &str, result: BashRunResult) -> Result<ToolOutput> {
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
@@ -8552,8 +8627,7 @@ impl BashTool {
             // metadata, without replacing a background job's own schema.
             if details.get("schema").and_then(serde_json::Value::as_str)
                 != Some(crate::jobs::JOB_SCHEMA)
-                && let (Some(fields), Some(audit)) =
-                    (details.as_object_mut(), payload.as_object())
+                && let (Some(fields), Some(audit)) = (details.as_object_mut(), payload.as_object())
             {
                 for (key, value) in audit {
                     fields.entry(key.clone()).or_insert_with(|| value.clone());
@@ -8654,7 +8728,9 @@ impl Tool for BashTool {
         // runner, avoiding a pointless job transition just before it expires.
         let auto_background = input.background.is_none()
             && !use_pty
-            && auto_settings.and_then(|settings| settings.enabled).unwrap_or(true)
+            && auto_settings
+                .and_then(|settings| settings.enabled)
+                .unwrap_or(true)
             && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
         let background_session_id = if input.background == Some(true) || auto_background {
             Some(self.job_session_scope.session_id().await?)
@@ -11501,14 +11577,19 @@ impl WriteTool {
         let paths = prepared.paths();
         for path in &paths {
             enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
-            let metadata = std_metadata_async(path)
-                .await
-                .map_err(|error| Error::tool("write", format!("Cannot inspect conflict file: {error}")))?;
+            let metadata = std_metadata_async(path).await.map_err(|error| {
+                Error::tool("write", format!("Cannot inspect conflict file: {error}"))
+            })?;
             if !metadata.is_file() {
-                return Err(Error::tool("write", "A conflict target is not a regular file"));
+                return Err(Error::tool(
+                    "write",
+                    "A conflict target is not a regular file",
+                ));
             }
             ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_WRITE, "conflict resolution")
-                .map_err(|error| Error::tool("write", format!("Cannot write conflict file: {error}")))?;
+                .map_err(|error| {
+                    Error::tool("write", format!("Cannot write conflict file: {error}"))
+                })?;
         }
         if let Some(hook) = &self.before_persist_hook {
             hook();
@@ -11532,13 +11613,15 @@ impl WriteTool {
             }
         }
         let resolved = resolved?;
-        let regions: Vec<_> = resolved.iter().map(|region| {
-            serde_json::json!({"index": region.index, "file": region.file})
-        }).collect();
+        let regions: Vec<_> = resolved
+            .iter()
+            .map(|region| serde_json::json!({"index": region.index, "file": region.file}))
+            .collect();
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Resolved {} conflict region(s) in {} file(s). Re-read conflict://* before resolving more regions.",
-                regions.len(), paths.len()
+                regions.len(),
+                paths.len()
             )))],
             details: Some(serde_json::json!({
                 "schema": "pi.conflict.write.v1",
@@ -11588,7 +11671,10 @@ impl Tool for WriteTool {
             // Git inventory uses a process even though publication is local.
             ToolEffects::write().union(ToolEffects::process())
         } else if crate::url_router::has_scheme(path)
-            || input.get("content").and_then(serde_json::Value::as_str).is_none()
+            || input
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
             || input.get("conflicts").is_some()
         {
             self.effects()
@@ -11670,7 +11756,9 @@ impl Tool for WriteTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        if input.get("path").and_then(serde_json::Value::as_str)
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
             .is_some_and(|path| path.starts_with("conflict://"))
         {
             return self.execute_conflict_write(tool_call_id, &input).await;
@@ -16580,6 +16668,165 @@ mod tests {
         let _ = find_windows_bash(&env, Path::is_file);
     }
 
+    fn find_program(
+        name: &str,
+        path_dirs: &[PathBuf],
+        pathext: Option<&str>,
+        existing: &[PathBuf],
+    ) -> Option<PathBuf> {
+        find_windows_program(name, path_dirs, pathext.map(OsStr::new), |path| {
+            existing.iter().any(|file| file == path)
+        })
+    }
+
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+    fn nodejs_dir() -> PathBuf {
+        PathBuf::from("C:").join("Program Files").join("nodejs")
+    }
+
+    fn pnpm_dir() -> PathBuf {
+        PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("pnpm")
+            .join("bin")
+    }
+
+    /// GH #182: pnpm puts an `npm.exe` shim on `PATH` and no `npm.cmd`.
+    #[test]
+    fn find_windows_program_finds_an_npm_exe_shim() {
+        let dirs = [system32(), pnpm_dir()];
+        let shim = pnpm_dir().join("npm.exe");
+        assert_eq!(
+            find_program(
+                "npm",
+                &dirs,
+                Some(DEFAULT_PATHEXT),
+                std::slice::from_ref(&shim)
+            ),
+            Some(shim)
+        );
+    }
+
+    /// The Node.js installer puts a POSIX `npm` script, `npm.cmd` and
+    /// `npm.ps1` side by side; only the batch wrapper can be started.
+    #[test]
+    fn find_windows_program_takes_the_batch_wrapper_over_the_posix_script() {
+        let existing = [
+            nodejs_dir().join("npm"),
+            nodejs_dir().join("npm.ps1"),
+            nodejs_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program("npm", &[nodejs_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing[..2]
+            ),
+            None,
+            "an extensionless script or a .ps1 is never launched"
+        );
+    }
+
+    /// Like `cmd.exe`, an earlier `PATH` directory wins over a preferred
+    /// extension in a later one, and `PATHEXT` orders extensions within one
+    /// directory (case-insensitively).
+    #[test]
+    fn find_windows_program_honours_path_then_pathext_order() {
+        let existing = [
+            nodejs_dir().join("npm.cmd"),
+            pnpm_dir().join("npm.exe"),
+            pnpm_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir(), pnpm_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing
+            ),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(pnpm_dir().join("npm.exe"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(".Cmd;.exe"), &existing),
+            Some(pnpm_dir().join("npm.cmd"))
+        );
+    }
+
+    /// Script extensions in `PATHEXT` need a host and are skipped; an unset,
+    /// empty or script-only `PATHEXT` falls back to `.COM;.EXE;.BAT;.CMD`.
+    #[test]
+    fn find_windows_program_skips_unlaunchable_pathext_entries() {
+        let js = pnpm_dir().join("npm.js");
+        let cmd = pnpm_dir().join("npm.cmd");
+        let dirs = [pnpm_dir()];
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS;.CMD"), &[js.clone(), cmd.clone()]),
+            Some(cmd.clone())
+        );
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS"), std::slice::from_ref(&js)),
+            None
+        );
+        for pathext in [None, Some(""), Some(";;"), Some(".JS;.VBS")] {
+            assert_eq!(
+                find_program("npm", &dirs, pathext, std::slice::from_ref(&cmd)),
+                Some(cmd.clone()),
+                "PATHEXT {pathext:?}"
+            );
+        }
+    }
+
+    /// A name that already carries a launchable extension is looked up as
+    /// written; a name with a directory part is not searched for at all.
+    #[test]
+    fn find_windows_program_takes_explicit_extensions_and_rejects_paths() {
+        let dirs = [pnpm_dir()];
+        let exe = pnpm_dir().join("npm.exe");
+        let cmd = pnpm_dir().join("npm.cmd");
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, std::slice::from_ref(&exe)),
+            None
+        );
+        let upper = pnpm_dir().join("NPM.CMD");
+        assert_eq!(
+            find_program("NPM.CMD", &dirs, None, &[exe.clone(), upper.clone()]),
+            Some(upper)
+        );
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, &[exe.clone(), cmd.clone()]),
+            Some(cmd)
+        );
+        for name in ["", "bin\\npm", "bin/npm", "C:npm"] {
+            assert_eq!(
+                find_program(name, &dirs, None, std::slice::from_ref(&exe)),
+                None,
+                "{name:?}"
+            );
+        }
+    }
+
+    /// The process-environment variant runs on every OS.
+    #[test]
+    fn find_windows_program_on_path_reads_the_process_environment() {
+        assert_eq!(
+            find_windows_program_on_path("pi-no-such-program-gh182"),
+            None
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_bash_shell_on_unix_is_an_absolute_bash_or_sh() {
@@ -17834,7 +18081,11 @@ mod tests {
 
         let office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let package_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
-        let main = if presentation { "ppt/presentation.xml" } else { "word/document.xml" };
+        let main = if presentation {
+            "ppt/presentation.xml"
+        } else {
+            "word/document.xml"
+        };
         let relationships = format!(
             "<Relationships xmlns='{package_rel}'><Relationship Id='main' Type='{office_rel}/officeDocument' Target='{main}'/></Relationships>"
         );
@@ -17857,12 +18108,20 @@ mod tests {
             )));
         }
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, content) in entries {
-            writer.start_file(name, options).expect("start Office fixture member");
-            writer.write_all(content.as_bytes()).expect("write Office fixture XML");
+            writer
+                .start_file(name, options)
+                .expect("start Office fixture member");
+            writer
+                .write_all(content.as_bytes())
+                .expect("write Office fixture XML");
         }
-        writer.finish().expect("finish Office fixture ZIP").into_inner()
+        writer
+            .finish()
+            .expect("finish Office fixture ZIP")
+            .into_inner()
     }
 
     #[test]
@@ -17877,8 +18136,10 @@ mod tests {
                 let bytes = office_read_fixture(presentation, "Saved text 世界");
                 let path = tmp.path().join(name);
                 std::fs::write(&path, &bytes).unwrap();
-                let output = tool.execute(name, serde_json::json!({"path": name}), None)
-                    .await.expect("read native document");
+                let output = tool
+                    .execute(name, serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("read native document");
                 let details = output.details.as_ref().unwrap();
                 assert_eq!(details["contentType"], kind);
                 assert_eq!(details["extractor"], kind);
@@ -17888,22 +18149,41 @@ mod tests {
 
                 let downloaded = crate::url_read::convert_bytes(
                     &format!("https://example.test/{name}?download=1"),
-                    "application/octet-stream", &bytes, false,
-                ).expect("convert downloaded Office bytes");
-                let numbered: Vec<_> = first_text(&output).lines()
-                    .map(|line| line.split_once('→').unwrap().1).collect();
+                    "application/octet-stream",
+                    &bytes,
+                    false,
+                )
+                .expect("convert downloaded Office bytes");
+                let numbered: Vec<_> = first_text(&output)
+                    .lines()
+                    .map(|line| line.split_once('→').unwrap().1)
+                    .collect();
                 assert_eq!(numbered, downloaded.content.lines().collect::<Vec<_>>());
 
-                let page = tool.execute(
-                    "office-page", serde_json::json!({"path": name, "offset": 3, "limit": 1}), None,
-                ).await.unwrap();
+                let page = tool
+                    .execute(
+                        "office-page",
+                        serde_json::json!({"path": name, "offset": 3, "limit": 1}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
                 assert_eq!(first_text(&page), "    3→Saved text 世界");
                 assert_eq!(page.details.as_ref().unwrap()["truncated"], false);
-                let error = tool.execute(
-                    "office-edit-anchor", serde_json::json!({"path": name, "hashline": true}), None,
-                ).await.expect_err("rendered lines are not binary edit locations");
+                let error = tool
+                    .execute(
+                        "office-edit-anchor",
+                        serde_json::json!({"path": name, "hashline": true}),
+                        None,
+                    )
+                    .await
+                    .expect_err("rendered lines are not binary edit locations");
                 assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
-                assert_eq!(std::fs::read(path).unwrap(), bytes, "read must not rewrite the package");
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "read must not rewrite the package"
+                );
             }
             let error = tool.execute(
                 "url-edit-anchor",
@@ -17925,14 +18205,23 @@ mod tests {
             let swapped_path = target.clone();
             let tool = ReadTool::with_after_open_hook(tmp.path(), move || {
                 std::fs::rename(&swapped_path, &retained).unwrap();
-                std::fs::write(&swapped_path, office_read_fixture(false, "replacement content")).unwrap();
+                std::fs::write(
+                    &swapped_path,
+                    office_read_fixture(false, "replacement content"),
+                )
+                .unwrap();
             });
             let input = serde_json::json!({"path": "report.docx"});
-            let opened = tool.execute("office-opened", input.clone(), None).await.unwrap();
+            let opened = tool
+                .execute("office-opened", input.clone(), None)
+                .await
+                .unwrap();
             assert!(first_text(&opened).contains("admitted content"));
             assert!(!first_text(&opened).contains("replacement content"));
             let replacement = ReadTool::new(tmp.path())
-                .execute("office-replacement", input, None).await.unwrap();
+                .execute("office-replacement", input, None)
+                .await
+                .unwrap();
             assert!(first_text(&replacement).contains("replacement content"));
             assert!(!first_text(&replacement).contains("admitted content"));
         });

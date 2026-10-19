@@ -1366,7 +1366,7 @@ impl PackageManager {
 
     #[allow(clippy::unused_self)]
     fn global_npm_root(&self) -> Result<PathBuf> {
-        let output = Command::new(npm_program())
+        let output = program_command(NPM_PROGRAM)
             .args(["root", "-g"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1513,7 +1513,7 @@ impl PackageManager {
         if let Some(install_root) = self.npm_prefix_root(scope) {
             ensure_npm_project(&install_root)?;
             run_command(
-                "npm",
+                NPM_PROGRAM,
                 [
                     "install",
                     "--prefix",
@@ -1526,7 +1526,7 @@ impl PackageManager {
         } else {
             // `--` so a spec beginning with '-' cannot be parsed as an npm
             // flag (the prefix/uninstall branches already do this).
-            run_command(npm_program(), ["install", "-g", "--", spec], None)
+            run_command(NPM_PROGRAM, ["install", "-g", "--", spec], None)
                 .map_err(|err| enrich_global_npm_install_error(err, spec))?;
         }
 
@@ -1547,14 +1547,14 @@ impl PackageManager {
 
     fn uninstall_npm(&self, name: &str, scope: PackageScope) -> Result<()> {
         let Some(install_root) = self.npm_prefix_root(scope) else {
-            run_command(npm_program(), ["uninstall", "-g", "--", name], None)?;
+            run_command(NPM_PROGRAM, ["uninstall", "-g", "--", name], None)?;
             return Ok(());
         };
         if !install_root.exists() {
             return Ok(());
         }
         run_command(
-            "npm",
+            NPM_PROGRAM,
             [
                 "uninstall",
                 "--prefix",
@@ -1612,7 +1612,7 @@ impl PackageManager {
         }
 
         if target_dir.join("package.json").exists() {
-            run_command(npm_program(), ["install"], Some(&target_dir))?;
+            run_command(NPM_PROGRAM, ["install"], Some(&target_dir))?;
         }
 
         Ok(())
@@ -1640,7 +1640,7 @@ impl PackageManager {
         run_command("git", ["clean", "-fdx"], Some(&target_dir))?;
 
         if target_dir.join("package.json").exists() {
-            run_command(npm_program(), ["install"], Some(&target_dir))?;
+            run_command(NPM_PROGRAM, ["install"], Some(&target_dir))?;
         }
 
         Ok(())
@@ -4002,14 +4002,26 @@ fn enrich_global_npm_install_error(err: Error, spec: &str) -> Error {
     )
 }
 
-/// The npm executable name for this platform.
+const NPM_PROGRAM: &str = "npm";
+
+/// A [`Command`] for `program`, a bare name such as `npm` or `git`.
 ///
-/// On Windows, npm ships as `npm.cmd` (a batch wrapper), and `CreateProcess`
-/// does not resolve `npm` to it the way a shell would, so spawning `"npm"`
-/// fails with "program not found" even though `npm` works in the terminal
-/// (#182). Batch files are spawned through `cmd.exe` by the standard library.
-const fn npm_program() -> &'static str {
-    if cfg!(windows) { "npm.cmd" } else { "npm" }
+/// On Windows, the standard library's `PATH` search only adds `.exe` to a
+/// bare name. Spawning `npm` then fails with "program not found" when npm is
+/// the Node.js installer's `npm.cmd` batch wrapper, and spawning `npm.cmd`
+/// fails when npm is an `npm.exe` shim such as pnpm's (#182). The program is
+/// found the way a shell finds it instead (`find_windows_program_on_path` in
+/// `tools`); the standard library runs a `.cmd` or `.bat` result through
+/// `cmd.exe` with its argument escaping. If nothing matches, the bare name is
+/// spawned, so the error still names what is missing.
+fn program_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        if let Some(path) = crate::tools::find_windows_program_on_path(program) {
+            return Command::new(path);
+        }
+    }
+    Command::new(program)
 }
 
 fn run_command<I, S>(program: &str, args: I, cwd: Option<&Path>) -> Result<()>
@@ -4017,7 +4029,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = Command::new(program);
+    let mut cmd = program_command(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -4054,7 +4066,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = Command::new(program);
+    let mut cmd = program_command(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -4631,14 +4643,14 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
+    /// #182: off Windows the OS resolves bare names on `PATH`, so programs
+    /// are spawned as written. The Windows lookup is tested in `tools`
+    /// (`find_windows_program_*`).
+    #[cfg(not(windows))]
     #[test]
-    fn npm_program_is_the_batch_wrapper_on_windows() {
-        // #182: `CreateProcess` does not resolve `npm` to `npm.cmd`.
-        if cfg!(windows) {
-            assert_eq!(npm_program(), "npm.cmd");
-        } else {
-            assert_eq!(npm_program(), "npm");
-        }
+    fn program_command_spawns_bare_names_as_written_off_windows() {
+        assert_eq!(program_command(NPM_PROGRAM).get_program(), "npm");
+        assert_eq!(program_command("git").get_program(), "git");
     }
     use std::future::Future;
 
