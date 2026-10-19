@@ -1890,6 +1890,23 @@ impl ModelRegistry {
         }
     }
 
+    /// Admit a supplied catalog without replacing existing routes or metadata.
+    /// Declared provider IDs stay distinct even when they are built-in aliases.
+    pub(crate) fn merge_missing_entries(&mut self, entries: Vec<ModelEntry>) {
+        let key = |entry: &ModelEntry| {
+            (
+                entry.model.provider.trim().to_ascii_lowercase(),
+                entry.model.id.trim().to_ascii_lowercase(),
+            )
+        };
+        let mut present: HashSet<_> = self.models.iter().map(key).collect();
+        for entry in entries {
+            if present.insert(key(&entry)) {
+                self.models.push(entry);
+            }
+        }
+    }
+
     /// Merge extension-provided models while preserving the runtime provider
     /// identity used by the extension's `streamSimple` registry.
     ///
@@ -6445,6 +6462,54 @@ mod tests {
 
         registry.merge_entries(vec![alias_case_variant]);
         assert_eq!(registry.models().len(), before);
+    }
+
+    #[test]
+    fn model_registry_admission_preserves_declared_aliases_and_existing_metadata() {
+        let mut original = ad_hoc_model_entry("openai", "shared").expect("model template");
+        original.model.provider = "azure-openai".to_string();
+        original.model.base_url = "https://original.example.test/v1".to_string();
+        original.api_key = Some("original-key".to_string());
+        original
+            .headers
+            .insert("x-route".to_string(), "original".to_string());
+        original.oauth_config = Some(OAuthConfig {
+            auth_url: "https://original.example.test/authorize".to_string(),
+            token_url: "https://original.example.test/token".to_string(),
+            client_id: "original-client".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: None,
+        });
+        let mut duplicate = original.clone();
+        duplicate.model.provider = " AZURE-OPENAI ".to_string();
+        duplicate.model.id = " SHARED ".to_string();
+        duplicate.model.base_url = "https://replacement.example.test/v1".to_string();
+        duplicate.api_key = None;
+        duplicate.headers.clear();
+        duplicate.oauth_config = None;
+        let mut declared = duplicate.clone();
+        declared.model.provider = "azure".to_string();
+        declared.model.id = "shared".to_string();
+
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![original.clone()]);
+        registry.merge_missing_entries(vec![duplicate, declared.clone(), declared]);
+
+        assert_eq!(registry.models().len(), 2);
+        let retained = registry
+            .find("azure-openai", "shared")
+            .expect("original route");
+        assert_eq!(retained.model.base_url, original.model.base_url);
+        assert_eq!(retained.api_key, original.api_key);
+        assert_eq!(retained.headers, original.headers);
+        assert_eq!(retained.oauth_config, original.oauth_config);
+        let admitted = registry
+            .find("azure", "shared")
+            .expect("distinct admitted route");
+        assert_eq!(admitted.model.provider, "azure");
+        assert_eq!(
+            admitted.model.base_url,
+            "https://replacement.example.test/v1"
+        );
     }
 
     #[test]

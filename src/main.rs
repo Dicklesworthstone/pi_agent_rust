@@ -3039,7 +3039,7 @@ async fn run(
             .lock(cx.cx())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        pi::app::update_session_for_selection(&mut session, &selection);
+        pi::app::update_session_for_selection(&mut session, &selection, &model_registry);
     }
 
     if let Some(message) = &selection.fallback_message {

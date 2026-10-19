@@ -3726,7 +3726,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         .map_err(|err| Error::validation(err.to_string()))?
     };
     if !has_extensions {
-        app::update_session_for_selection(&mut session, &selection);
+        app::update_session_for_selection(&mut session, &selection, &model_registry);
     }
 
     let enabled_tools_owned = cli

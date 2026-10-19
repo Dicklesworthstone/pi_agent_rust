@@ -220,7 +220,7 @@ async fn finish_selection_inner(
             window
         });
     }
-    app::update_session_for_selection(&mut stored, &selection);
+    app::update_session_for_selection(&mut stored, &selection, &candidate_registry);
     drop(stored);
     session.set_model_registry(candidate_registry.clone());
     *registry = candidate_registry;

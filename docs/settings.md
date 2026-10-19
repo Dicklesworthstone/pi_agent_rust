@@ -132,6 +132,19 @@ configured model that has no stored credentials. Without a provider override
 or scope exclusion, Pi keeps the configured destination for credential setup
 instead of switching providers.
 
+Editor sessions started through ACP follow the same configured-model and scope
+rules. When no explicit, saved, role, configured-model, or scoped choice applies,
+ACP uses its available-model list in order, preferring `default_provider` when
+that provider is available. This automatic fallback stays within that list.
+Permitted substitutions are reported on stderr, and an unresolved configured
+model returns an error to the editor.
+
+Startup records a switch between separately declared providers even when they
+share the same model ID or their names are built-in aliases. Continuing the
+session therefore restores the selected provider. Reopening an ACP session
+preserves its selected branch's saved model and thinking level ahead of new
+launch defaults.
+
 Example:
 
 ```json

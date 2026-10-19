@@ -1674,34 +1674,67 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn select_acp_model_entry(config: &Config, available_models: &[ModelEntry]) -> Option<ModelEntry> {
-    if let (Some(default_provider), Some(default_model)) = (
-        config.default_provider.as_deref(),
-        config.default_model.as_deref(),
-    ) && let Some(entry) = available_models.iter().find(|entry| {
-        provider_ids_match(&entry.model.provider, default_provider)
-            && entry.model.id.eq_ignore_ascii_case(default_model)
-    }) {
-        return Some(entry.clone());
-    }
+fn acp_model_registry(options: &AcpOptions) -> ModelRegistry {
+    let mut registry = options.model_registry.clone();
+    registry.merge_missing_entries(options.available_models.clone());
+    registry
+}
 
-    if let Some(default_provider) = config.default_provider.as_deref()
-        && let Some(entry) = available_models
-            .iter()
-            .find(|entry| provider_ids_match(&entry.model.provider, default_provider))
-    {
-        return Some(entry.clone());
+/// ACP's admitted catalog retains its order for automatic selection. Explicit
+/// defaults, model roles, and scope are resolved by the shared selector first.
+fn acp_automatic_fallback(
+    options: &AcpOptions,
+    registry: &ModelRegistry,
+) -> crate::app::AutomaticModelFallback {
+    let preferred = options
+        .config
+        .default_provider
+        .as_deref()
+        .and_then(|provider| {
+            let exact_provider_exists = registry.models().iter().any(|entry| {
+                entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
+            });
+            options.available_models.iter().find(|entry| {
+                if exact_provider_exists {
+                    entry
+                        .model
+                        .provider
+                        .trim()
+                        .eq_ignore_ascii_case(provider.trim())
+                } else {
+                    provider_ids_match(&entry.model.provider, provider)
+                }
+            })
+        });
+    let model_entry = preferred
+        .or_else(|| options.available_models.first())
+        .and_then(|entry| registry.find(&entry.model.provider, &entry.model.id));
+    let warning = if preferred.is_none() {
+        options
+            .config
+            .default_provider
+            .as_deref()
+            .and_then(|provider| {
+                model_entry.as_ref().map(|entry| {
+                    format!(
+                        "Configured default_provider '{provider}' has no admitted ACP model. \
+                         Using {}/{}. Check default_provider and credentials, run pi --list-models, \
+                         or use --provider/--model to select a destination explicitly.",
+                        entry.model.provider, entry.model.id,
+                    )
+                })
+            })
+    } else {
+        None
+    };
+    crate::app::AutomaticModelFallback {
+        model_entry,
+        warning,
     }
-
-    if let Some(default_model) = config.default_model.as_deref()
-        && let Some(entry) = available_models
-            .iter()
-            .find(|entry| entry.model.id.eq_ignore_ascii_case(default_model))
-    {
-        return Some(entry.clone());
-    }
-
-    available_models.first().cloned()
 }
 
 fn resolve_acp_thinking_level(
@@ -1717,15 +1750,15 @@ fn resolve_acp_thinking_level(
 }
 
 /// Resolve against the actual new/reopened session, without constructing a
-/// throwaway agent. ACP retains its configured-default selection when no model
-/// choice was supplied, and shares the CLI's explicit model/effort resolver.
+/// throwaway agent. Saved branches keep their identity and effort; fresh
+/// conversations share the CLI's configured-model, role, and scope resolution.
 fn resolve_acp_selection(
     session: &Session,
     cwd: &std::path::Path,
     options: &AcpOptions,
     cli: &mut crate::cli::Cli,
 ) -> Result<crate::app::ModelSelection> {
-    let mut registry = options.model_registry.clone();
+    let mut registry = acp_model_registry(options);
     let mut scoped_models = Vec::new();
     if let Some((provider, model)) = session.effective_model_for_current_path() {
         let entry = registry
@@ -1749,7 +1782,7 @@ fn resolve_acp_selection(
                     .to_string(),
                 None => resolve_acp_thinking_level(&options.config, &entry).to_string(),
             });
-        registry.merge_entries(vec![entry]);
+        registry.merge_missing_entries(vec![entry]);
     } else if cli.provider.is_none() && cli.model.is_none() {
         let scope_override = options
             .config
@@ -1772,48 +1805,26 @@ fn resolve_acp_selection(
             cwd,
         )
         .map_err(|error| Error::config(error.to_string()))?;
-        let scoped = scoped_models
-            .iter()
-            .find(|scoped| {
-                options
-                    .config
-                    .default_provider
-                    .as_deref()
-                    .is_some_and(|provider| {
-                        provider_ids_match(provider, &scoped.model.model.provider)
-                    })
-                    && options
-                        .config
-                        .default_model
-                        .as_deref()
-                        .is_some_and(|model| model.eq_ignore_ascii_case(&scoped.model.model.id))
-            })
-            .or_else(|| scoped_models.first());
-        let entry = if let Some(scoped) = scoped {
-            if cli.thinking.is_none() {
-                cli.thinking = scoped.thinking_level.map(|level| level.to_string());
-            }
-            scoped.model.clone()
-        } else {
-            if cli.api_key.is_some() {
-                return Err(Error::config(
-                    "--api-key requires a model to be specified via --provider/--model or --models",
-                ));
-            }
-            select_acp_model_entry(&options.config, &options.available_models)
-                .ok_or_else(|| Error::provider("acp", "No models available"))?
-        };
-        cli.provider = Some(entry.model.provider.clone());
-        cli.model = Some(entry.model.id.clone());
-        registry.merge_entries(vec![entry]);
+        if scoped_models.is_empty()
+            && cli
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Err(Error::config(
+                "--api-key requires a model to be specified via --provider/--model or --models",
+            ));
+        }
     }
-    crate::app::select_model_and_thinking(
+    let fallback = acp_automatic_fallback(options, &registry);
+    crate::app::select_model_and_thinking_with_fallback(
         cli,
         &options.config,
         session,
         &registry,
         &scoped_models,
         &Config::global_dir(),
+        Some(fallback),
     )
     .map_err(|error| Error::config(error.to_string()))
 }
@@ -1940,6 +1951,9 @@ fn build_acp_session(
     };
 
     let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
+    if let Some(message) = &selection.fallback_message {
+        eprintln!("Warning: {message}");
+    }
     let model_entry = &selection.model_entry;
     if cli.api_key.is_none()
         && options
@@ -1956,13 +1970,21 @@ fn build_acp_session(
         .map_err(|error| Error::provider("acp", error.to_string()))?;
     let stream_options =
         crate::app::build_stream_options(&options.config, api_key, &selection, &session);
-    crate::app::update_session_for_selection(&mut session, &selection);
-    let mut registry = options.model_registry.clone();
-    registry.merge_entries(vec![model_entry.clone()]);
+    let mut registry = acp_model_registry(options);
+    registry.merge_missing_entries(vec![model_entry.clone()]);
+    crate::app::update_session_for_selection(&mut session, &selection, &registry);
     let mut available_models = options.available_models.clone();
     if !available_models.iter().any(|entry| {
-        provider_ids_match(&entry.model.provider, &model_entry.model.provider)
-            && entry.model.id.eq_ignore_ascii_case(&model_entry.model.id)
+        entry
+            .model
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(model_entry.model.provider.trim())
+            && entry
+                .model
+                .id
+                .trim()
+                .eq_ignore_ascii_case(model_entry.model.id.trim())
     }) {
         available_models.push(model_entry.clone());
     }
@@ -3755,6 +3777,41 @@ mod tests {
         }
     }
 
+    fn ready_selection_model(provider: &str, id: &str) -> ModelEntry {
+        let mut entry = test_model_entry(provider, id);
+        entry.model.base_url = format!("https://{provider}.example.test/v1");
+        entry.api_key = Some("acp-selection-fixture-key".to_string());
+        entry
+    }
+
+    fn selection_options(
+        config: Config,
+        models: Vec<ModelEntry>,
+        runtime_handle: RuntimeHandle,
+    ) -> AcpOptions {
+        AcpOptions {
+            config,
+            launch: AcpLaunchOptions::default(),
+            available_models: models.clone(),
+            model_registry: ModelRegistry::from_entries_for_tests(models),
+            auth: AuthStorage::empty_at(PathBuf::from("/tmp/acp-selection-auth.json")),
+            oauth_refresh_failures: Vec::new(),
+            runtime_handle,
+            session_dir: None,
+            skills_prompt: None,
+        }
+    }
+
+    fn select_new_acp_model(options: &AcpOptions) -> Result<crate::app::ModelSelection> {
+        let mut cli = options.launch.selection_cli()?;
+        resolve_acp_selection(
+            &Session::in_memory(),
+            std::path::Path::new("/tmp/acp-selection"),
+            options,
+            &mut cli,
+        )
+    }
+
     fn pending_permissions_empty(pending: &PendingPermissionMap) -> bool {
         pending.lock().is_ok_and(|guard| guard.is_empty())
     }
@@ -3888,87 +3945,436 @@ mod tests {
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_exact_configured_model() {
-        let config = Config {
-            default_provider: Some("anthropic".to_string()),
-            default_model: Some("claude-opus-4-5".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-opus-4-5"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "anthropic");
-        assert_eq!(selected.model.id, "claude-opus-4-5");
+    fn acp_configured_model_is_independent_of_provider_and_scope_order() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let model_id = "deepseek/deepseek-v4.1-flash-1017";
+        for reverse_registry in [false, true] {
+            for scope_order in [None, Some(false), Some(true)] {
+                for (provider, spec) in [
+                    ("routerAI", format!("routerAI/{model_id}")),
+                    ("polza", format!("routerAI/{model_id}")),
+                    ("routerAI", model_id.to_string()),
+                ] {
+                    let mut models = vec![
+                        ready_selection_model("polza", model_id),
+                        ready_selection_model("routerAI", "deepseek/different"),
+                        ready_selection_model("routerAI", model_id),
+                    ];
+                    if reverse_registry {
+                        models.reverse();
+                    }
+                    let enabled_models = scope_order.map(|reverse| {
+                        let mut patterns = vec![
+                            format!("polza/{model_id}"),
+                            "routerAI/deepseek/different".to_string(),
+                            format!("routerAI/{model_id}"),
+                        ];
+                        if reverse {
+                            patterns.reverse();
+                        }
+                        patterns
+                    });
+                    let options = selection_options(
+                        Config {
+                            default_provider: Some(provider.to_string()),
+                            default_model: Some(spec),
+                            enabled_models,
+                            ..Config::default()
+                        },
+                        models,
+                        runtime.handle(),
+                    );
+                    let selected = select_new_acp_model(&options).expect("configured ACP model");
+                    assert_eq!(selected.model_entry.model.provider, "routerAI");
+                    assert_eq!(selected.model_entry.model.id, model_id);
+                    assert_eq!(
+                        selected.model_entry.model.base_url,
+                        "https://routerAI.example.test/v1"
+                    );
+                    assert!(selected.fallback_message.is_none());
+                }
+            }
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_default_provider_when_model_is_unset() {
-        let config = Config {
-            default_provider: Some("anthropic".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-sonnet-4"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "anthropic");
-        assert_eq!(selected.model.id, "claude-sonnet-4");
+    fn acp_unresolved_configured_model_never_uses_automatic_fallback() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for scoped in [false, true] {
+            for (provider, spec) in [
+                ("routerAI", "routerAI/missing"),
+                ("routerAI", "unknown-acp-provider/shared"),
+                ("unknown-acp-provider", "shared"),
+                ("routerAI", ""),
+            ] {
+                let options = selection_options(
+                    Config {
+                        default_provider: Some(provider.to_string()),
+                        default_model: Some(spec.to_string()),
+                        enabled_models: scoped.then(|| vec!["polza/shared".to_string()]),
+                        ..Config::default()
+                    },
+                    vec![
+                        ready_selection_model("polza", "shared"),
+                        ready_selection_model("routerAI", "different"),
+                    ],
+                    runtime.handle(),
+                );
+                let error = select_new_acp_model(&options)
+                    .expect_err("unresolvable configured ACP model")
+                    .to_string();
+                assert!(
+                    error.contains(&format!("default_model '{spec}'")),
+                    "{error}"
+                );
+                assert!(error.contains("--list-models"), "{error}");
+            }
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_default_model_when_provider_is_unset() {
-        let config = Config {
-            default_model: Some("gpt-5.2".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("anthropic", "claude-sonnet-4"),
-            test_model_entry("openai", "gpt-5.2"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "openai");
-        assert_eq!(selected.model.id, "gpt-5.2");
+    fn acp_unprefixed_defaults_and_undeclared_provider_aliases_resolve() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, model_id, expected_provider) in [
+            (Some("anthropic"), "claude-opus-4-5", "anthropic"),
+            (None, "gpt-5.2", "openai"),
+            (Some("gemini-cli"), "gemini-2.5-pro", "google-gemini-cli"),
+        ] {
+            let options = selection_options(
+                Config {
+                    default_provider: provider.map(str::to_string),
+                    default_model: Some(model_id.to_string()),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("acp-first", "different"),
+                    ready_selection_model(expected_provider, model_id),
+                ],
+                runtime.handle(),
+            );
+            let selected = select_new_acp_model(&options).expect("configured ACP model");
+            assert_eq!(selected.model_entry.model.provider, expected_provider);
+            assert_eq!(selected.model_entry.model.id, model_id);
+            assert!(selected.fallback_message.is_none());
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_matches_provider_aliases() {
-        let config = Config {
-            default_provider: Some("gemini-cli".to_string()),
-            default_model: Some("gemini-2.5-pro".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("google-gemini-cli", "gemini-2.5-pro"),
-        ];
+    fn acp_automatic_selection_preserves_admitted_order_and_provider_preference() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, expected_provider, expected_id) in [
+            (None, "anthropic", "claude-sonnet-4"),
+            (Some("acp-second"), "acp-second", "shared"),
+        ] {
+            let mut options = selection_options(
+                Config {
+                    default_provider: provider.map(str::to_string),
+                    ..Config::default()
+                },
+                vec![ready_selection_model("openai", "gpt-5.5")],
+                runtime.handle(),
+            );
+            options.available_models = vec![
+                ready_selection_model("anthropic", "claude-sonnet-4"),
+                ready_selection_model("anthropic", "claude-opus-4-5"),
+                ready_selection_model("acp-second", "shared"),
+            ];
+            let selected = select_new_acp_model(&options).expect("admitted automatic model");
+            assert_eq!(selected.model_entry.model.provider, expected_provider);
+            assert_eq!(selected.model_entry.model.id, expected_id);
+            assert!(selected.fallback_message.is_none());
+        }
 
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "google-gemini-cli");
-        assert_eq!(selected.model.id, "gemini-2.5-pro");
+        let authoritative = test_model_entry("acp-admitted", "shared");
+        let mut options = selection_options(
+            Config::default(),
+            vec![
+                ready_selection_model("openai", "gpt-5.5"),
+                authoritative.clone(),
+            ],
+            runtime.handle(),
+        );
+        options.available_models = vec![ready_selection_model("acp-admitted", "shared")];
+        let selected = select_new_acp_model(&options).expect("admitted identity remains selected");
+        assert_eq!(selected.model_entry.model.provider, "acp-admitted");
+        assert_eq!(
+            selected.model_entry.model.base_url,
+            authoritative.model.base_url
+        );
+        assert!(selected.model_entry.api_key.is_none());
+        let cli = options.launch.selection_cli().expect("launch CLI");
+        let error = crate::app::resolve_api_key(&options.auth, &cli, &selected.model_entry)
+            .expect_err("authoritative missing credentials must remain visible")
+            .to_string();
+        assert!(error.contains("No API key found for provider acp-admitted"));
     }
 
     #[test]
-    fn select_acp_model_entry_falls_back_to_first_available_model() {
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-sonnet-4"),
-        ];
+    fn acp_automatic_selection_keeps_declared_provider_aliases_distinct() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, competitor) in [("azure", "azure-openai"), ("azure-openai", "azure")] {
+            for reverse in [false, true] {
+                let mut options = selection_options(
+                    Config {
+                        default_provider: Some(provider.to_string()),
+                        ..Config::default()
+                    },
+                    vec![ready_selection_model(competitor, "shared")],
+                    runtime.handle(),
+                );
+                options
+                    .available_models
+                    .push(ready_selection_model(provider, "shared"));
+                if reverse {
+                    options.available_models.reverse();
+                }
+                let selected = select_new_acp_model(&options).expect("exact admitted provider");
+                assert_eq!(selected.model_entry.model.provider, provider);
+                assert!(selected.fallback_message.is_none());
 
-        let selected =
-            select_acp_model_entry(&Config::default(), &available).expect("selected model");
+                let mut entries = acp_model_registry(&options).models().to_vec();
+                for entry in &mut entries {
+                    if entry.model.provider == provider {
+                        entry.api_key = None;
+                    }
+                }
+                options.model_registry = ModelRegistry::from_entries_for_tests(entries);
+                options
+                    .available_models
+                    .retain(|entry| entry.model.provider == competitor);
+                let selected = select_new_acp_model(&options).expect("permitted ACP fallback");
+                assert_eq!(selected.model_entry.model.provider, competitor);
+                let warning = selected
+                    .fallback_message
+                    .expect("provider fallback diagnostic");
+                assert!(warning.contains(&format!("default_provider '{provider}'")));
+                assert!(warning.contains(&format!("{competitor}/shared")));
+                assert!(warning.contains("--provider/--model"));
+            }
+        }
+        let options = selection_options(
+            Config {
+                default_provider: Some("azure".to_string()),
+                ..Config::default()
+            },
+            vec![ready_selection_model("azure-openai", "shared")],
+            runtime.handle(),
+        );
+        let selected = select_new_acp_model(&options).expect("undeclared alias");
+        assert_eq!(selected.model_entry.model.provider, "azure-openai");
+        assert!(selected.fallback_message.is_none());
+    }
 
-        assert_eq!(selected.model.provider, "openai");
-        assert_eq!(selected.model.id, "gpt-5.2");
+    #[test]
+    fn acp_empty_admitted_catalog_still_allows_configured_models_and_roles() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config::default(),
+            vec![
+                ready_selection_model("polza", "shared"),
+                ready_selection_model("routerAI", "shared"),
+            ],
+            runtime.handle(),
+        );
+        options.available_models.clear();
+        assert!(
+            select_new_acp_model(&options)
+                .expect_err("an empty admitted catalog forbids registry fallback")
+                .to_string()
+                .contains("No models available")
+        );
+        options.config.default_model = Some("routerAI/shared".to_string());
+        let selected = select_new_acp_model(&options).expect("explicit configured destination");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        options.config.default_model = None;
+        options.config.model_roles = Some(crate::config::ModelRoleSettings {
+            default: Some("routerAI/shared:low".to_string()),
+            ..crate::config::ModelRoleSettings::default()
+        });
+        let selected = select_new_acp_model(&options).expect("configured default role");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+    }
+
+    #[test]
+    fn acp_default_role_precedes_legacy_defaults_and_preserves_thinking_precedence() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for explicit_thinking in [None, Some("low")] {
+            let mut options = selection_options(
+                Config {
+                    default_provider: Some("missing-acp-provider".to_string()),
+                    default_model: Some("missing-acp-provider/missing".to_string()),
+                    model_roles: Some(crate::config::ModelRoleSettings {
+                        default: Some("routerAI/shared:high".to_string()),
+                        ..crate::config::ModelRoleSettings::default()
+                    }),
+                    enabled_models: Some(vec![
+                        "polza/shared:low".to_string(),
+                        "routerAI/shared:medium".to_string(),
+                    ]),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("polza", "shared"),
+                    ready_selection_model("routerAI", "shared"),
+                ],
+                runtime.handle(),
+            );
+            options.launch.thinking = explicit_thinking.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("default role selection");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+            assert_eq!(
+                selected.thinking_level,
+                if explicit_thinking.is_some() {
+                    crate::model::ThinkingLevel::Low
+                } else {
+                    crate::model::ThinkingLevel::High
+                }
+            );
+            assert!(selected.fallback_message.is_none());
+        }
+    }
+
+    #[test]
+    fn acp_scope_fallback_reports_requested_destination_and_preserves_scoped_thinking() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let options = selection_options(
+            Config {
+                default_model: Some("routerAI/shared".to_string()),
+                enabled_models: Some(vec!["polza/shared:low".to_string()]),
+                ..Config::default()
+            },
+            vec![
+                ready_selection_model("routerAI", "shared"),
+                ready_selection_model("polza", "shared"),
+            ],
+            runtime.handle(),
+        );
+        let selected = select_new_acp_model(&options).expect("permitted scope fallback");
+        assert_eq!(selected.model_entry.model.provider, "polza");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+        let warning = selected
+            .fallback_message
+            .expect("scope fallback diagnostic");
+        assert!(warning.contains("routerAI/shared"));
+        assert!(warning.contains("Using polza/shared"));
+        assert!(warning.contains("enabled_models/--models"));
+    }
+
+    #[test]
+    fn acp_supplied_key_requires_a_launch_destination_or_resolved_scope() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config {
+                default_model: Some("routerAI/shared".to_string()),
+                ..Config::default()
+            },
+            vec![ready_selection_model("routerAI", "shared")],
+            runtime.handle(),
+        );
+        for key in [None, Some(" \t ")] {
+            options.launch.api_key = key.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("no key override");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+        }
+        options.launch.api_key = Some("supplied-fixture-key".to_string());
+        let error = select_new_acp_model(&options)
+            .expect_err("bare key cannot authorize automatic selection")
+            .to_string();
+        assert!(error.contains("--api-key requires a model"));
+
+        let mut unready = test_model_entry("routerAI", "shared");
+        unready.model.base_url = "https://routerAI.example.test/v1".to_string();
+        options.model_registry = ModelRegistry::from_entries_for_tests(vec![unready]);
+        options.available_models.clear();
+        options.launch.models = Some("routerAI/shared:low".to_string());
+        let selected = select_new_acp_model(&options).expect("scoped supplied key");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+        assert!(selected.fallback_message.is_none());
+    }
+
+    #[test]
+    fn acp_explicit_launch_selection_overrides_invalid_configured_defaults() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, model) in [
+            (Some("routerAI"), Some("shared")),
+            (Some("routerAI"), None),
+            (None, Some("routerAI/shared")),
+        ] {
+            let mut options = selection_options(
+                Config {
+                    default_model: Some("missing-acp-provider/missing".to_string()),
+                    enabled_models: Some(vec!["missing-acp-provider/missing".to_string()]),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("polza", "shared"),
+                    ready_selection_model("routerAI", "shared"),
+                ],
+                runtime.handle(),
+            );
+            options.launch.provider = provider.map(str::to_string);
+            options.launch.model = model.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("explicit launch override");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+            assert_eq!(selected.model_entry.model.id, "shared");
+            if model.is_none() {
+                assert!(selected.fallback_message.is_some());
+            } else {
+                assert!(selected.fallback_message.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn acp_restores_selected_branch_before_launch_scope_and_default_settings() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config {
+                default_model: Some("missing-acp-provider/missing".to_string()),
+                enabled_models: Some(vec!["missing-acp-provider/missing".to_string()]),
+                ..Config::default()
+            },
+            vec![
+                ready_selection_model("routerAI", "shared"),
+                ready_selection_model("polza", "different"),
+            ],
+            runtime.handle(),
+        );
+        options.launch.provider = Some("polza".to_string());
+        options.launch.model = Some("different".to_string());
+        options.launch.thinking = Some("off".to_string());
+        let mut session = Session::in_memory();
+        session.append_model_change("routerAI".to_string(), "shared".to_string());
+        session.append_thinking_level_change("low".to_string());
+        let branch = session.leaf_id.clone().expect("selected branch");
+        session.append_model_change("polza".to_string(), "different".to_string());
+        assert!(session.navigate_to(&branch));
+        let mut cli = options.launch.selection_cli().expect("launch CLI");
+        let selected = resolve_acp_selection(
+            &session,
+            std::path::Path::new("/tmp/acp-selection"),
+            &options,
+            &mut cli,
+        )
+        .expect("saved branch selection");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.model_entry.model.id, "shared");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+
+        let mut missing = Session::in_memory();
+        missing.append_model_change("missing-acp-provider".to_string(), "shared".to_string());
+        let error = resolve_acp_selection(
+            &missing,
+            std::path::Path::new("/tmp/acp-selection"),
+            &options,
+            &mut cli,
+        )
+        .expect_err("missing saved destination cannot silently change")
+        .to_string();
+        assert!(error.contains("Saved session model is not registered"));
+        assert!(error.contains("missing-acp-provider/shared"));
     }
 
     #[test]

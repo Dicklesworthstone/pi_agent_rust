@@ -57,6 +57,15 @@ pub struct ModelSelection {
     pub fallback_message: Option<String>,
 }
 
+/// A frontend's admitted automatic destination, considered only after explicit
+/// choices, saved state, configured defaults, and model scope. An empty entry
+/// keeps an empty admitted catalog from authorizing unrelated registry models.
+#[derive(Debug, Clone)]
+pub(crate) struct AutomaticModelFallback {
+    pub model_entry: Option<ModelEntry>,
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum StartupError {
     #[error("No models available. Set API keys in environment variables or create {models_path}")]
@@ -748,7 +757,6 @@ fn resolve_configured_model(
         })
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn select_model_and_thinking(
     cli: &cli::Cli,
     config: &Config,
@@ -757,6 +765,28 @@ pub fn select_model_and_thinking(
     scoped_models: &[ScopedModel],
     global_dir: &Path,
 ) -> Result<ModelSelection> {
+    select_model_and_thinking_with_fallback(
+        cli,
+        config,
+        session,
+        registry,
+        scoped_models,
+        global_dir,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn select_model_and_thinking_with_fallback(
+    cli: &cli::Cli,
+    config: &Config,
+    session: &Session,
+    registry: &ModelRegistry,
+    scoped_models: &[ScopedModel],
+    global_dir: &Path,
+    automatic_fallback: Option<AutomaticModelFallback>,
+) -> Result<ModelSelection> {
+    let use_registry_fallback = automatic_fallback.is_none();
     let is_continuing = cli.r#continue || cli.resume || cli.session.is_some();
     let use_scope = !scoped_models.is_empty()
         && !is_continuing
@@ -770,7 +800,7 @@ pub fn select_model_and_thinking(
     let mut scoped_thinking: Option<model::ThinkingLevel> = None;
     let mut fallback_message = None;
     let mut deferred_restore_warning = None;
-    let mut selected_configured_default = false;
+    let mut keep_selected_destination = false;
 
     if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
         let found = registry
@@ -959,7 +989,8 @@ pub fn select_model_and_thinking(
         && !use_scope
         && let Some((provider, model_id)) = model_from_session_state(session)
     {
-        let restore = restore_model_from_session(&provider, &model_id, None, registry);
+        let restore =
+            restore_model_from_session(&provider, &model_id, registry, use_registry_fallback);
         selected_model = restore.model;
         fallback_message = restore.fallback_message;
         deferred_restore_warning = restore.deferred_warning;
@@ -978,7 +1009,7 @@ pub fn select_model_and_thinking(
                 scoped_thinking = resolution.thinking_level.or(scoped_thinking);
             }
             selected_model = Some(resolution.model_entry);
-            selected_configured_default = true;
+            keep_selected_destination = true;
         }
     }
 
@@ -986,7 +1017,7 @@ pub fn select_model_and_thinking(
         && let Some((entry, thinking)) = resolve_configured_model(config, registry, scoped_models)?
     {
         selected_model = Some(entry);
-        selected_configured_default = true;
+        keep_selected_destination = true;
         scoped_thinking = thinking.or(scoped_thinking);
     }
 
@@ -1021,7 +1052,22 @@ pub fn select_model_and_thinking(
         }
     }
 
-    if selected_model.is_none() {
+    if selected_model.is_none()
+        && let Some(fallback) = automatic_fallback
+    {
+        selected_model = fallback.model_entry;
+        if selected_model.is_some() {
+            keep_selected_destination = true;
+            if let Some(warning) = fallback.warning {
+                fallback_message = Some(match fallback_message.take() {
+                    Some(previous) => format!("{previous} {warning}"),
+                    None => warning,
+                });
+            }
+        }
+    }
+
+    if selected_model.is_none() && use_registry_fallback {
         let available = registry.get_available();
         if !available.is_empty() {
             let fallback = default_model_from_available(&available);
@@ -1040,12 +1086,14 @@ pub fn select_model_and_thinking(
     // If we restored or defaulted into a model that requires credentials but has
     // none configured, prefer falling back to any ready model instead of forcing
     // an immediate setup prompt. (Explicit CLI selection should still error.)
-    let explicit_model_selection =
-        cli.provider.is_some() || cli.model.is_some() || selected_configured_default;
+    let preserve_selection =
+        cli.provider.is_some() || cli.model.is_some() || keep_selected_destination;
     // A scoped/configured entry can be unready in the catalog while --api-key
     // already supplies this run's credential. Keep the selected destination;
     // falling back here would send that explicit key to a different provider.
-    let missing_creds = if explicit_model_selection || has_api_key_override {
+    // Frontends with their own admitted catalog also retain that destination
+    // for credential setup instead of escaping into the complete registry.
+    let missing_creds = if preserve_selection || has_api_key_override || !use_registry_fallback {
         None
     } else {
         selected_model.as_ref().and_then(|entry| {
@@ -1084,7 +1132,7 @@ pub fn select_model_and_thinking(
     // If nothing was selected yet, default to our preferred catalog entry even
     // when no credentials are configured. This keeps first-run UX consistent
     // and avoids the misleading "No models configured" path when built-ins exist.
-    if selected_model.is_none() && !registry.models().is_empty() {
+    if selected_model.is_none() && use_registry_fallback && !registry.models().is_empty() {
         let fallback = default_model_from_catalog(registry.models());
         if fallback_message.is_none()
             && let Some(warning) = deferred_restore_warning.take()
@@ -1358,12 +1406,44 @@ fn thinking_level_from_session_state(session: &Session) -> Option<model::Thinkin
     last_thinking_level(session)
 }
 
-pub fn update_session_for_selection(session: &mut Session, selection: &ModelSelection) {
+pub fn update_session_for_selection(
+    session: &mut Session,
+    selection: &ModelSelection,
+    registry: &ModelRegistry,
+) {
     let previous_model = model_from_session_state(session);
     let previous_thinking = thinking_level_from_session_state(session);
+    let selected_provider = &selection.model_entry.model.provider;
+    let same_provider = |previous_provider: &str| {
+        if previous_provider
+            .trim()
+            .eq_ignore_ascii_case(selected_provider.trim())
+        {
+            return true;
+        }
+        if !provider_ids_match(previous_provider, selected_provider) {
+            return false;
+        }
+        let is_declared = |provider: &str| {
+            registry
+                .models()
+                .iter()
+                .chain(selection.scoped_models.iter().map(|entry| &entry.model))
+                .any(|entry| {
+                    entry
+                        .model
+                        .provider
+                        .trim()
+                        .eq_ignore_ascii_case(provider.trim())
+                })
+        };
+        // Native alias spelling changes need no history entry. Two separately
+        // declared providers do: otherwise --continue restores the old route.
+        !(is_declared(previous_provider) && is_declared(selected_provider))
+    };
     let (stored_provider, stored_model_id, model_changed) = match previous_model {
         Some((provider, model_id))
-            if provider_ids_match(&provider, &selection.model_entry.model.provider)
+            if same_provider(&provider)
                 && model_id.eq_ignore_ascii_case(&selection.model_entry.model.id) =>
         {
             (provider, model_id, false)
@@ -1395,8 +1475,8 @@ pub fn update_session_for_selection(session: &mut Session, selection: &ModelSele
 fn restore_model_from_session(
     saved_provider: &str,
     saved_model_id: &str,
-    current_model: Option<ModelEntry>,
     registry: &ModelRegistry,
+    use_registry_fallback: bool,
 ) -> RestoreResult {
     let restored = registry
         .find(saved_provider, saved_model_id)
@@ -1412,28 +1492,19 @@ fn restore_model_from_session(
 
     let reason = "model no longer exists";
 
-    if let Some(current) = current_model {
-        return RestoreResult {
-            model: Some(current.clone()),
-            fallback_message: Some(format!(
-                "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
-                current.model.provider, current.model.id
-            )),
-            deferred_warning: None,
-        };
-    }
-
-    let available = registry.get_available();
-    if !available.is_empty() {
-        let fallback = default_model_from_available(&available);
-        return RestoreResult {
-            model: Some(fallback.clone()),
-            fallback_message: Some(format!(
-                "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
-                fallback.model.provider, fallback.model.id
-            )),
-            deferred_warning: None,
-        };
+    if use_registry_fallback {
+        let available = registry.get_available();
+        if !available.is_empty() {
+            let fallback = default_model_from_available(&available);
+            return RestoreResult {
+                model: Some(fallback.clone()),
+                fallback_message: Some(format!(
+                    "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
+                    fallback.model.provider, fallback.model.id
+                )),
+                deferred_warning: None,
+            };
+        }
     }
 
     RestoreResult {
@@ -3384,6 +3455,85 @@ mod tests {
     }
 
     #[test]
+    fn admitted_automatic_fallback_does_not_escape_after_missing_session_model() {
+        let admitted_entry = test_model_entry("admitted", "admitted-provider", true);
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-5.4", "openai-codex", true),
+            test_model_entry("configured", "configured-provider", true),
+            admitted_entry.clone(),
+        ]);
+        let cli = cli::Cli::parse_from(["pi", "--continue"]);
+        for with_saved_model in [false, true] {
+            let mut session = Session::in_memory();
+            if with_saved_model {
+                session.append_model_change(
+                    "missing-provider".to_string(),
+                    "missing-model".to_string(),
+                );
+            }
+            for has_admitted_model in [false, true] {
+                for default_spec in [
+                    None,
+                    Some("configured-provider/configured"),
+                    Some("missing-provider/missing-default"),
+                ] {
+                    let config = Config {
+                        default_model: default_spec.map(str::to_string),
+                        ..Config::default()
+                    };
+                    let result = select_model_and_thinking_with_fallback(
+                        &cli,
+                        &config,
+                        &session,
+                        &registry,
+                        &[],
+                        Path::new("/tmp"),
+                        Some(AutomaticModelFallback {
+                            model_entry: has_admitted_model.then(|| admitted_entry.clone()),
+                            warning: None,
+                        }),
+                    );
+                    if default_spec == Some("missing-provider/missing-default") {
+                        let error = result
+                            .expect_err("an invalid configured default must remain an error")
+                            .to_string();
+                        assert!(error.contains("Configured default_model"), "{error}");
+                        assert!(
+                            error.contains("missing-provider/missing-default"),
+                            "{error}"
+                        );
+                        assert!(error.contains("--list-models"), "{error}");
+                        continue;
+                    }
+                    let expected = if default_spec.is_some() {
+                        Some(("configured-provider", "configured"))
+                    } else if has_admitted_model {
+                        Some(("admitted-provider", "admitted"))
+                    } else {
+                        None
+                    };
+                    let Some((provider, model_id)) = expected else {
+                        let error = result
+                            .expect_err("empty admission must not select an unrelated ready model")
+                            .to_string();
+                        assert!(error.contains("No models available"), "{error}");
+                        continue;
+                    };
+                    let selection = result.expect("select the configured or admitted destination");
+                    assert_eq!(selection.model_entry.model.provider, provider);
+                    assert_eq!(selection.model_entry.model.id, model_id);
+                    let expected_warning = with_saved_model.then(|| {
+                        format!(
+                            "Could not restore model missing-provider/missing-model (model no longer exists). Using {provider}/{model_id}."
+                        )
+                    });
+                    assert_eq!(selection.fallback_message, expected_warning);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn select_model_and_thinking_restores_model_from_header_when_history_missing() {
         let cli = cli::Cli::parse_from(["pi"]);
         let config = Config::default();
@@ -3588,8 +3738,9 @@ mod tests {
             scoped_models: Vec::new(),
             fallback_message: None,
         };
+        let registry = registry_with_entries(vec![selection.model_entry.clone()]);
 
-        update_session_for_selection(&mut session, &selection);
+        update_session_for_selection(&mut session, &selection, &registry);
 
         assert!(
             session.entries.is_empty(),
@@ -3599,41 +3750,231 @@ mod tests {
 
     #[test]
     fn update_session_for_selection_preserves_alias_equivalent_model_state() {
-        let mut session = Session::in_memory();
-        session.append_model_change("gemini".to_string(), "gemini-2.5-pro".to_string());
-        session.set_model_header(
-            Some("gemini".to_string()),
-            Some("gemini-2.5-pro".to_string()),
-            Some("high".to_string()),
-        );
-
         let selection = ModelSelection {
             model_entry: test_model_entry("GEMINI-2.5-PRO", "google", true),
             thinking_level: model::ThinkingLevel::High,
             scoped_models: Vec::new(),
             fallback_message: None,
         };
+        let registry = registry_with_entries(vec![selection.model_entry.clone()]);
 
-        update_session_for_selection(&mut session, &selection);
+        for with_history in [false, true] {
+            let mut session = Session::in_memory();
+            if with_history {
+                session.append_model_change("gemini".to_string(), "gemini-2.5-pro".to_string());
+            }
+            session.set_model_header(
+                Some("gemini".to_string()),
+                Some("gemini-2.5-pro".to_string()),
+                Some("high".to_string()),
+            );
+            update_session_for_selection(&mut session, &selection, &registry);
 
-        let model_changes: Vec<_> = session
-            .entries_for_current_path()
-            .iter()
-            .filter_map(|entry| {
-                if let crate::session::SessionEntry::ModelChange(change) = entry {
-                    Some((change.provider.as_str(), change.model_id.as_str()))
-                } else {
-                    None
+            let continued = select_model_and_thinking(
+                &cli::Cli::parse_from(["pi", "--continue"]),
+                &Config::default(),
+                &session,
+                &registry,
+                &[],
+                Path::new("/tmp"),
+            )
+            .expect("an undeclared native alias should restore through its canonical provider");
+            assert_eq!(continued.model_entry.model.provider, "google");
+            update_session_for_selection(&mut session, &continued, &registry);
+
+            let model_changes: Vec<_> = session
+                .entries_for_current_path()
+                .iter()
+                .filter_map(|entry| {
+                    if let crate::session::SessionEntry::ModelChange(change) = entry {
+                        Some((change.provider.as_str(), change.model_id.as_str()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let expected = if with_history {
+                vec![("gemini", "gemini-2.5-pro")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                model_changes, expected,
+                "native alias-equivalent selection and continuation must not invent history"
+            );
+            assert_eq!(session.header.provider.as_deref(), Some("gemini"));
+            assert_eq!(session.header.model_id.as_deref(), Some("gemini-2.5-pro"));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn selected_declared_provider_survives_persistence_and_continuation() {
+        let temp = tempdir().expect("tempdir");
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            for (previous_provider, requested_provider) in
+                [("azure", "azure-openai"), ("azure-openai", "azure")]
+            {
+                for reverse in [false, true] {
+                    let requested_url = format!("https://{requested_provider}.example.test/v1");
+                    let mut requested = test_model_entry("shared", requested_provider, true);
+                    requested.model.base_url.clone_from(&requested_url);
+                    let mut entries = vec![
+                        test_model_entry("shared", previous_provider, true),
+                        requested,
+                    ];
+                    if reverse {
+                        entries.reverse();
+                    }
+                    let registry = registry_with_entries(entries);
+                    for with_history in [false, true] {
+                        let mut session = Session::in_memory();
+                        if with_history {
+                            session.append_model_change(
+                                previous_provider.to_string(),
+                                "shared".to_string(),
+                            );
+                        }
+                        session.set_model_header(
+                            Some(previous_provider.to_string()),
+                            Some("shared".to_string()),
+                            Some("high".to_string()),
+                        );
+                        let path = temp.path().join(format!(
+                            "{previous_provider}-{requested_provider}-{reverse}-{with_history}.jsonl"
+                        ));
+                        session.path = Some(path.clone());
+                        session.session_dir = Some(temp.path().to_path_buf());
+                        let config = Config {
+                            default_provider: Some(previous_provider.to_string()),
+                            default_model: Some("shared".to_string()),
+                            ..Config::default()
+                        };
+                        let requested_spec = format!("{requested_provider}/shared");
+                        let cli = cli::Cli::parse_from([
+                            "pi",
+                            "--model",
+                            &requested_spec,
+                            "--thinking",
+                            "high",
+                        ]);
+                        let selected = select_model_and_thinking(
+                            &cli,
+                            &config,
+                            &session,
+                            &registry,
+                            &[],
+                            temp.path(),
+                        )
+                        .expect("select the separately declared provider");
+                        assert_eq!(selected.model_entry.model.provider, requested_provider);
+
+                        update_session_for_selection(&mut session, &selected, &registry);
+                        update_session_for_selection(&mut session, &selected, &registry);
+                        session.save().await.expect("persist selected provider");
+                        drop(session);
+                        let mut reopened = Session::open(path.to_str().expect("UTF-8 path"))
+                            .await
+                            .expect("reopen selected provider");
+                        let expected_model =
+                            Some((requested_provider.to_string(), "shared".to_string()));
+                        assert_eq!(reopened.header.provider.as_deref(), Some(requested_provider));
+                        assert_eq!(reopened.effective_model_for_current_path(), expected_model);
+                        let expected_changes = usize::from(with_history) + 1;
+                        assert_eq!(
+                            reopened
+                                .entries_for_current_path()
+                                .iter()
+                                .filter(|entry| {
+                                    matches!(entry, crate::session::SessionEntry::ModelChange(_))
+                                })
+                                .count(),
+                            expected_changes,
+                            "the provider switch must be recorded once"
+                        );
+
+                        let continued = select_model_and_thinking(
+                            &cli::Cli::parse_from(["pi", "--continue"]),
+                            &config,
+                            &reopened,
+                            &registry,
+                            &[],
+                            temp.path(),
+                        )
+                        .expect("continue the actual persisted destination");
+                        assert_eq!(continued.model_entry.model.provider, requested_provider);
+                        assert_eq!(continued.model_entry.model.base_url, requested_url);
+                        assert_eq!(continued.thinking_level, model::ThinkingLevel::High);
+                        let entry_count = reopened.entries.len();
+                        update_session_for_selection(&mut reopened, &continued, &registry);
+                        assert_eq!(reopened.entries.len(), entry_count);
+                        assert_eq!(reopened.effective_model_for_current_path(), expected_model);
+                    }
                 }
-            })
-            .collect();
-        assert_eq!(
-            model_changes,
-            vec![("gemini", "gemini-2.5-pro")],
-            "alias-equivalent startup restore should not append duplicate history"
-        );
-        assert_eq!(session.header.provider.as_deref(), Some("gemini"));
-        assert_eq!(session.header.model_id.as_deref(), Some("gemini-2.5-pro"));
+            }
+        }));
+    }
+
+    #[test]
+    fn provider_declared_only_in_scope_is_distinct_when_persisting_selection() {
+        for (previous_provider, requested_provider) in
+            [("azure", "azure-openai"), ("azure-openai", "azure")]
+        {
+            let requested = test_model_entry("shared", requested_provider, true);
+            let registry = registry_with_entries(vec![requested.clone()]);
+            let config = Config {
+                default_model: Some(format!("{requested_provider}/shared")),
+                ..Config::default()
+            };
+            for reverse in [false, true] {
+                let mut scoped = vec![
+                    ScopedModel {
+                        model: test_model_entry("shared", previous_provider, true),
+                        thinking_level: Some(model::ThinkingLevel::Low),
+                    },
+                    ScopedModel {
+                        model: requested.clone(),
+                        thinking_level: Some(model::ThinkingLevel::High),
+                    },
+                ];
+                if reverse {
+                    scoped.reverse();
+                }
+                let mut session = Session::in_memory();
+                session.append_model_change(previous_provider.to_string(), "shared".to_string());
+                let selected = select_model_and_thinking(
+                    &cli::Cli::parse_from(["pi"]),
+                    &config,
+                    &session,
+                    &registry,
+                    &scoped,
+                    Path::new("/tmp"),
+                )
+                .expect("the configured provider wins within the declared scope");
+                assert_eq!(selected.model_entry.model.provider, requested_provider);
+                update_session_for_selection(&mut session, &selected, &registry);
+                assert_eq!(session.header.provider.as_deref(), Some(requested_provider));
+                assert_eq!(
+                    session.effective_model_for_current_path(),
+                    Some((requested_provider.to_string(), "shared".to_string()))
+                );
+                let continued = select_model_and_thinking(
+                    &cli::Cli::parse_from(["pi", "--continue"]),
+                    &Config::default(),
+                    &session,
+                    &registry,
+                    &scoped,
+                    Path::new("/tmp"),
+                )
+                .expect("continuation restores the selected registry provider");
+                assert_eq!(continued.model_entry.model.provider, requested_provider);
+            }
+        }
     }
 
     #[test]

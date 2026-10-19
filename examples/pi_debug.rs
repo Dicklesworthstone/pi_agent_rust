@@ -196,7 +196,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
 
     step!("11. Building agent...");
     let mut session = session;
-    pi::app::update_session_for_selection(&mut session, &selection);
+    pi::app::update_session_for_selection(&mut session, &selection, &model_registry);
     let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
