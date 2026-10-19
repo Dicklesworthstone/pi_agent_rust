@@ -74,6 +74,51 @@ Resulting behavior:
 - `default_thinking_level` (string)
 - `enabled_models` (array of model patterns)
 
+`default_model` accepts either a bare model ID or `provider/model`. Pi first
+tries to resolve the complete provider/model pair. When it exists, that
+provider takes precedence over `default_provider`. For example:
+
+```json
+{
+  "default_provider": "polza",
+  "default_model": "routerAI/deepseek/deepseek-v4.1-flash-1017",
+  "enabled_models": ["polza/*", "routerAI/*"]
+}
+```
+
+This selects `routerAI` and its exact `deepseek/deepseek-v4.1-flash-1017`
+model, regardless of the order of the two enabled-model patterns, provided
+the model is available in that scope.
+
+If the qualified pair does not exist, Pi checks whether the entire value is
+a registered bare ID under `default_provider`, or across providers when no
+default provider is set. This preserves namespaced IDs such as
+`deepseek/deepseek-v4.1-flash-1017`. If both interpretations exist, the
+qualified pair wins. Use the full `routerAI/deepseek/...` form to pin the
+destination when model IDs contain a provider-like namespace.
+
+An unresolved configured default stops startup with the requested provider
+and model in the error. Use `pi --list-models` to inspect registered IDs and
+correct the settings, or override them with `--provider`/`--model`.
+Explicit CLI choices and restored sessions retain their precedence;
+`model_roles.default` (also spelled `modelRoles.default`) outranks the
+legacy `default_provider`/`default_model` settings.
+
+An active model scope still controls automatic selection. If a valid
+configured default or default role is outside that scope, Pi uses the first
+allowed scoped model and warns with both destinations. Check
+`enabled_models`, `--models`, `disabled_providers`, workspace scope overrides,
+and credentials when this happens. Missing defaults never take this fallback.
+Without a configured default, the normal scope-order and automatic selection
+behavior is unchanged.
+
+With `--provider` alone, Pi may use that provider's ready default when the
+configured model is incompatible, unavailable, or lacks credentials; it
+reports the substitution. A nonblank `--api-key` lets Pi retain a matching
+configured model that has no stored credentials. Without a provider override
+or scope exclusion, Pi keeps the configured destination for credential setup
+instead of switching providers.
+
 Example:
 
 ```json
