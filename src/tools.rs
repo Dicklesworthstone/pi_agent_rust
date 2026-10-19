@@ -11355,6 +11355,45 @@ impl Tool for WriteTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
+        // Gemini's legacy parameters field accepts its OpenAPI subset.
+        // Exact envelopes and unknown-field rejection remain native checks.
+        let content = serde_json::json!({
+            "type": "string",
+            "description": "Exact content to write; always literal, including @ours or @theirs. Required except with path conflict://*; omit for a conflict batch."
+        });
+        let conflicts = serde_json::json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "description": "Choices from one fresh conflict://* read. Valid only with path conflict://* and no content.",
+            "items": {
+                "type": "object",
+                "required": ["index", "token", "resolution"],
+                "properties": {
+                    "index": {"type": "integer", "minimum": 0},
+                    "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "resolution": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["ours", "theirs", "base"]}
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "required": ["kind", "value"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["text"]},
+                                    "value": {"type": "string"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -11362,47 +11401,22 @@ impl Tool for WriteTool {
                     "type": "string",
                     "description": "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
                 },
-                "content": {
-                    "type": "string",
-                    "description": "Exact content to write; always literal, including @ours or @theirs. Omit for a conflict batch."
-                },
-                "conflicts": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 64,
-                    "description": "Choices from one fresh conflict://* read. Valid only with path conflict://* and no content.",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["index", "token", "resolution"],
-                        "properties": {
-                            "index": {"type": "integer", "minimum": 0},
-                            "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-                            "resolution": {
-                                "anyOf": [
-                                    {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["kind"],
-                                        "properties": {"kind": {"enum": ["ours", "theirs", "base"]}}
-                                    },
-                                    {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["kind", "value"],
-                                        "properties": {
-                                            "kind": {"const": "text"},
-                                            "value": {"type": "string"}
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                }
+                "content": content,
+                "conflicts": conflicts
             },
             "required": ["path"],
-            "anyOf": [{"required": ["content"]}, {"required": ["conflicts"]}]
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {"content": content},
+                    "required": ["content"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"conflicts": conflicts},
+                    "required": ["conflicts"]
+                }
+            ]
         })
     }
 

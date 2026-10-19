@@ -326,6 +326,15 @@ fn conflict_write_rejects_bad_shapes_before_git_or_filesystem_fallback() {
         json!({"path":format!("conflict://0/{token}/theirs"),"content":"x"}),
         json!({"path":"conflict://*","conflicts":[]}),
         json!({"path":"conflict://*","conflicts":[choice.clone()],"content":""}),
+        json!({"path":"conflict://*"}),
+        json!({"path":"conflict://*","conflicts":[choice.clone()],"extra":true}),
+        json!({"path":format!("conflict://0/{token}"),"content":"x","extra":true}),
+        json!({"path":"conflict://*","conflicts":[{
+            "index":0,"token":token,"resolution":{"kind":"ours"},"path":"elsewhere"
+        }]}),
+        json!({"path":"conflict://*","conflicts":[{
+            "index":0,"token":token,"resolution":{"kind":"text","value":"x","extra":true}
+        }]}),
         json!({"path":"conflict://*","conflicts":[{"index":0,"token":token,"resolution":{"kind":"shell","value":"ignored"}}]}),
         json!({"path":format!("conflict://0/{token}"),"content":"x".repeat(64*1024+1)}),
     ] {

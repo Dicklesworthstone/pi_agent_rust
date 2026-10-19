@@ -2053,6 +2053,103 @@ mod tests {
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
     }
 
+    fn assert_legacy_gemini_schema_fields(schema: &Value) {
+        // Field vocabulary from https://ai.google.dev/api/generate-content#Schema.
+        // This checks the outgoing contract, without emulating a live provider.
+        let object = schema.as_object().expect("schema object");
+        for keyword in object.keys() {
+            assert!(
+                matches!(
+                    keyword.as_str(),
+                    "type" | "format" | "title" | "description" | "nullable" | "enum"
+                        | "maxItems" | "minItems" | "properties" | "required"
+                        | "minProperties" | "maxProperties" | "minLength" | "maxLength"
+                        | "pattern" | "example" | "anyOf" | "propertyOrdering" | "default"
+                        | "items" | "minimum" | "maximum"
+                ),
+                "unsupported Gemini Schema field {keyword}: {schema}"
+            );
+        }
+        assert!(
+            schema.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(kind, "object" | "array" | "string" | "integer" | "number" | "boolean")
+            }) || object.contains_key("anyOf"),
+            "schema needs a type or typed alternatives: {schema}"
+        );
+        if let Some(properties) = object.get("properties") {
+            for property in properties.as_object().expect("properties object").values() {
+                assert_legacy_gemini_schema_fields(property);
+            }
+        }
+        if let Some(items) = object.get("items") {
+            assert_legacy_gemini_schema_fields(items);
+        }
+        if let Some(alternatives) = object.get("anyOf") {
+            let alternatives = alternatives.as_array().expect("anyOf array");
+            assert!(!alternatives.is_empty(), "empty alternatives: {schema}");
+            for alternative in alternatives {
+                assert_legacy_gemini_schema_fields(alternative);
+            }
+        }
+        if let Some(required) = object.get("required") {
+            let properties = schema["properties"].as_object().expect("required properties");
+            for name in required.as_array().expect("required array") {
+                let name = name.as_str().expect("required property name");
+                assert!(properties.contains_key(name), "undefined required property {name}: {schema}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_tool_request_uses_legacy_gemini_schema_fields() {
+        use crate::tools::Tool as _;
+
+        let write = crate::tools::WriteTool::new(std::path::Path::new("."));
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Resolve the inspected conflict.".to_string()),
+                timestamp: 0,
+            })],
+            vec![ToolDef {
+                name: write.name().to_string(),
+                description: write.description().to_string(),
+                parameters: write.parameters(),
+            }],
+        );
+        let request = serde_json::to_value(
+            provider.build_request(&context, &StreamOptions::default()),
+        ).expect("serialize real write tool request");
+        let declarations = request["tools"][0]["functionDeclarations"]
+            .as_array().expect("function declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0]["name"], "write");
+        let parameters = &declarations[0]["parameters"];
+        assert_legacy_gemini_schema_fields(parameters);
+        assert_eq!(parameters["required"], serde_json::json!(["path"]));
+        assert_eq!(parameters["properties"]["content"]["type"], "string");
+        let choices = &parameters["properties"]["conflicts"];
+        assert_eq!(choices["type"], "array");
+        assert_eq!(choices["minItems"], 1);
+        assert_eq!(choices["maxItems"], 64);
+        let resolution = &choices["items"]["properties"]["resolution"]["anyOf"];
+        assert_eq!(
+            resolution[0]["properties"]["kind"]["enum"],
+            serde_json::json!(["ours", "theirs", "base"])
+        );
+        assert_eq!(
+            resolution[1]["properties"]["kind"]["enum"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(resolution[1]["required"], serde_json::json!(["kind", "value"]));
+        assert_eq!(
+            parameters["anyOf"][0]["properties"]["content"],
+            parameters["properties"]["content"]
+        );
+        assert_eq!(parameters["anyOf"][1]["properties"]["conflicts"], *choices);
+    }
+
     #[test]
     fn test_build_request_default_max_tokens() {
         let provider = GeminiProvider::new("gemini-2.0-flash");
