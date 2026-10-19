@@ -104,6 +104,13 @@ Explicit CLI choices and restored sessions retain their precedence;
 `model_roles.default` (also spelled `modelRoles.default`) outranks the
 legacy `default_provider`/`default_model` settings.
 
+An explicit `--provider` selects the declared provider before checking model
+credentials. Separately declared extension providers remain distinct even if
+their names are built-in aliases. Undeclared aliases still resolve normally.
+With `--model` alone, a matching `default_provider` is preferred; if that
+provider does not supply the requested model, Pi warns before using another
+provider that does.
+
 An active model scope still controls automatic selection. If a valid
 configured default or default role is outside that scope, Pi uses the first
 allowed scoped model and warns with both destinations. Check
@@ -111,6 +118,12 @@ allowed scoped model and warns with both destinations. Check
 and credentials when this happens. Missing defaults never take this fallback.
 Without a configured default, the normal scope-order and automatic selection
 behavior is unchanged.
+
+A nonempty `enabled_models`, `--models`, or workspace model scope that leaves
+no usable allowed models stops automatic startup. Check the patterns,
+credentials, and disabled providers with the diagnostic and `pi --list-models`.
+Explicit CLI selections and valid restored sessions retain their existing
+precedence. An explicitly empty list still clears the inherited scope.
 
 With `--provider` alone, Pi may use that provider's ready default when the
 configured model is incompatible, unavailable, or lacks credentials; it

@@ -663,7 +663,7 @@ fn should_retry_selection_after_extensions(
     // The complete scope may contain an allowed extension model that has
     // not been registered yet. Defer this decision once; final selection
     // after extension loading must pass the same provider policy.
-    if message.contains("[model_scope_disabled]") {
+    if message.contains("[model_scope_disabled]") || message.contains("[model_scope_empty]") {
         return true;
     }
     if cli.provider.is_none() && cli.model.is_none() {
@@ -2257,7 +2257,7 @@ async fn run(
         config.enabled_models.clone().unwrap_or_default()
     };
     let disabled_providers = config.disabled_providers.clone().unwrap_or_default();
-    // This pre-registration view feeds the initial picker and key check.
+    // This pre-registration view feeds the initial picker.
     // resolve_selection_with_auth validates the final scope on every pass.
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
@@ -2279,15 +2279,7 @@ async fn run(
     };
     let has_extensions = !resources.extensions().is_empty();
 
-    if has_cli_api_key_override(cli.api_key.as_deref())
-        && cli.provider.is_none()
-        && cli.model.is_none()
-    {
-        let allow_unresolved_scope = has_extensions && !scoped_patterns.is_empty();
-        if scoped_models.is_empty() && !allow_unresolved_scope {
-            bail!("--api-key requires a model to be specified via --provider/--model or --models");
-        }
-    }
+    validate_startup_api_key_scope(&cli, &scoped_patterns)?;
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -9105,6 +9097,19 @@ fn has_cli_api_key_override(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|value| !value.trim().is_empty())
 }
 
+fn validate_startup_api_key_scope(cli: &cli::Cli, patterns: &[String]) -> Result<()> {
+    // Nonempty scopes are validated against the final registry, after any
+    // extension registration. A key alone must not select an arbitrary provider.
+    if has_cli_api_key_override(cli.api_key.as_deref())
+        && cli.provider.is_none()
+        && cli.model.is_none()
+        && patterns.is_empty()
+    {
+        bail!("--api-key requires a model to be specified via --provider/--model or --models");
+    }
+    Ok(())
+}
+
 /// Reject stale native OAuth credentials only after the final destination is
 /// known. A pending extension pass may change both the model and its auth flow.
 fn validate_startup_oauth_refresh(
@@ -11721,6 +11726,128 @@ mod tests {
                 .any(|entry| entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o")),
             "CLI API-key override should expose remote models to RPC model switching"
         );
+    }
+
+    #[test]
+    fn startup_api_key_scope_requires_a_destination_before_automatic_selection() {
+        use clap::Parser as _;
+
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-fixture-key"]);
+        cli.provider = None;
+        cli.model = None;
+        for raw_scope in ["", " , \t , "] {
+            let patterns = pi::app::parse_models_arg(raw_scope);
+            let error = validate_startup_api_key_scope(&cli, &patterns)
+                .expect_err("a key without a destination must not select an arbitrary provider");
+            assert!(error.to_string().contains("--provider/--model or --models"));
+        }
+
+        // A nonempty inherited or CLI scope reaches final registry validation,
+        // including when an extension has not registered its models yet.
+        let patterns = vec!["pending-extension/*".to_string()];
+        validate_startup_api_key_scope(&cli, &patterns)
+            .expect("scope availability is checked by the final model resolver");
+
+        cli.provider = Some("openai".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("an explicit provider supplies the key destination");
+        cli.provider = None;
+        cli.model = Some("openai/gpt-4o".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("an explicit model supplies the key destination");
+        cli.model = None;
+        cli.api_key = Some(" \t ".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("a blank key retains ordinary automatic selection");
+    }
+
+    #[test]
+    fn startup_scope_errors_defer_only_for_pending_extension_registration() {
+        use clap::Parser as _;
+
+        let temp = TempDir::new().expect("tempdir");
+        let auth = AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = ModelRegistry::load(&auth, None);
+        let config = Config::default();
+        let bootstrap = build_extension_bootstrap_selection(
+            &config,
+            &registry,
+            &temp.path().join("models.json"),
+        )
+        .expect("native bootstrap model");
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-fixture-key"]);
+        cli.provider = None;
+        cli.model = None;
+        let session = pi::session::Session::in_memory();
+        let patterns = vec!["pending-scope-extension/*".to_string()];
+        validate_startup_api_key_scope(&cli, &patterns)
+            .expect("the requested extension scope passes the early key guard");
+        let empty_error = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect_err("the extension scope is not registered yet");
+        assert!(empty_error.to_string().contains("[MODEL_SCOPE_EMPTY]"));
+
+        let disabled_config = Config {
+            disabled_providers: Some(vec![bootstrap.model_entry.model.provider.clone()]),
+            ..Config::default()
+        };
+        let disabled_patterns = vec![format!(
+            "{}/{}",
+            bootstrap.model_entry.model.provider, bootstrap.model_entry.model.id,
+        )];
+        let disabled_error = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &disabled_patterns,
+            &registry,
+            &disabled_config,
+            temp.path(),
+        )
+        .expect_err("the current native scope is disabled");
+        assert!(
+            disabled_error
+                .to_string()
+                .contains("[MODEL_SCOPE_DISABLED]")
+        );
+        for error in [&empty_error, &disabled_error] {
+            assert!(should_retry_selection_after_extensions(&cli, error, true));
+            assert!(!should_retry_selection_after_extensions(&cli, error, false));
+        }
+
+        let mut registered = bootstrap.model_entry;
+        registered.model.provider = "pending-scope-extension".to_string();
+        registered.model.id = "scoped".to_string();
+        registered.api_key = Some("scope-fixture-key".to_string());
+        registry.merge_entries(vec![registered]);
+        let scoped = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect("registration resolves the requested scope");
+        let selected = pi::app::select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped,
+            temp.path(),
+        )
+        .expect("the registered extension remains the final destination");
+        assert_eq!(
+            selected.model_entry.model.provider,
+            "pending-scope-extension"
+        );
+        assert_eq!(selected.model_entry.model.id, "scoped");
     }
 
     /// gh #218: an explicit key for an explicit model must not reach for the
