@@ -1,7 +1,7 @@
 //! URL-aware reads (bd-cv653.2.2).
 //!
 //! `read` on http(s):// paths fetches and converts to reader-mode markdown,
-//! with site-aware extractors, PDF text extraction, native DOCX/PPTX/XLSX text,
+//! with site-aware extractors, PDF text extraction, native DOCX/PPTX/XLSX/EPUB text,
 //! notebook rendering, and a default-on SSRF guard.
 //!
 //! Design notes:
@@ -29,6 +29,7 @@ pub enum UrlContentKind {
     Docx,
     Pptx,
     Xlsx,
+    Epub,
     PlainText,
 }
 
@@ -42,6 +43,7 @@ impl UrlContentKind {
             Self::Docx => "docx",
             Self::Pptx => "pptx",
             Self::Xlsx => "xlsx",
+            Self::Epub => "epub",
             Self::PlainText => "plaintext",
         }
     }
@@ -146,6 +148,15 @@ pub fn convert_bytes(
                 document_kind.as_str(),
             )
         }
+        UrlContentKind::Epub => {
+            if download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_INCOMPLETE] Cannot interpret a truncated EPUB book",
+                ));
+            }
+            (crate::document_read::convert_epub(bytes)?, "epub")
+        }
         UrlContentKind::Html => {
             let text = String::from_utf8_lossy(bytes);
             convert_html(url, &text)
@@ -180,6 +191,15 @@ fn classify(url: &str, content_type: &str, bytes: &[u8]) -> UrlContentKind {
             crate::document_read::DocumentKind::Pptx => UrlContentKind::Pptx,
             crate::document_read::DocumentKind::Xlsx => UrlContentKind::Xlsx,
         };
+    }
+    let media_type = ct.split(';').next().unwrap_or_default().trim();
+    if ext_is("epub")
+        || matches!(
+            media_type,
+            "application/epub+zip" | "application/epub" | "application/x-epub+zip"
+        )
+    {
+        return UrlContentKind::Epub;
     }
     if ext_is("ipynb") || ct.contains("application/x-ipynb+json") {
         return UrlContentKind::Notebook;
@@ -344,6 +364,28 @@ mod tests {
                 b"PK",
             ),
             UrlContentKind::Xlsx
+        );
+    }
+
+    #[test]
+    fn epub_classification_uses_exact_mime_or_case_insensitive_extension() {
+        assert_eq!(
+            classify("https://x/BOOK.EPUB?download=1#chapter", "", b"PK"),
+            UrlContentKind::Epub,
+        );
+        for media_type in [
+            "application/epub+zip; charset=binary",
+            "application/epub",
+            "application/x-epub+zip",
+        ] {
+            assert_eq!(
+                classify("https://x/download", media_type, b"PK"),
+                UrlContentKind::Epub,
+            );
+        }
+        assert_eq!(
+            classify("https://x/download", "application/epub+zip-extra", b"PK"),
+            UrlContentKind::PlainText,
         );
     }
 

@@ -6727,7 +6727,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). DOCX and PPTX render document and slide text; XLSX renders named worksheets with cell coordinates and saved formula results. Notebooks render saved cells, results, and errors without execution. PDF extraction requires the url-pdf build feature. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member, without extraction. Use raw=true for original source text; rendered documents and archive members do not provide hashline edit anchors. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text."
+        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). DOCX and PPTX render document and slide text; XLSX renders named worksheets with cell coordinates and saved formula results. EPUB renders book metadata and chapters in reading order. Notebooks render saved cells, results, and errors without execution. PDF extraction requires the url-pdf build feature. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member, without extraction. Use raw=true for original source text; rendered documents and archive members do not provide hashline edit anchors. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -7013,6 +7013,8 @@ impl Tool for ReadTool {
             || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
         {
             Some("application/pdf")
+        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) {
+            Some("application/epub+zip")
         } else {
             crate::document_read::recognize(&path.to_string_lossy(), "").map(|kind| match kind {
                 crate::document_read::DocumentKind::Docx => {

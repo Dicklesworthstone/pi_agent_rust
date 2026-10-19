@@ -3620,6 +3620,141 @@ mod e2e_read {
     }
 
     #[test]
+    fn e2e_read_epub_pages_follow_the_spine_and_preserve_the_source() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_epub_pages_follow_the_spine_and_preserve_the_source",
+            );
+            let bytes = zip_fixture(&[
+                ("mimetype", b"application/epub+zip"),
+                (
+                    "META-INF/container.xml",
+                    br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="Book/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+                ),
+                (
+                    "Book/package.opf",
+                    br#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Field Guide</dc:title></metadata><manifest><item id="last" href="last.xhtml" media-type="application/xhtml+xml"/><item id="first" href="first.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="first"/><itemref idref="last"/></spine></package>"#,
+                ),
+                (
+                    "Book/last.xhtml",
+                    br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Final saved chapter.</p><script>must_not_execute()</script></body></html>"#,
+                ),
+                (
+                    "Book/first.xhtml",
+                    br#"<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><body><p>First saved chapter.</p></body></html>"#,
+                ),
+            ]);
+            let path = harness.create_file("GUIDE.EPUB", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..6 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("epub-page-{page}"),
+                    serde_json::json!({"path": "GUIDE.EPUB", "offset": offset, "limit": 2}),
+                )
+                .await
+                .expect("read the next EPUB page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "epub");
+                assert_eq!(details["extractor"], "epub");
+                assert_eq!(details["rendered"], true);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, value) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(value.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(
+                actual,
+                [
+                    "**Title:** Field Guide",
+                    "",
+                    "## Section 1",
+                    "",
+                    "First saved chapter.",
+                    "",
+                    "## Section 2",
+                    "",
+                    "Final saved chapter.",
+                ],
+            );
+            let error = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-hashline-refused",
+                serde_json::json!({"path": "GUIDE.EPUB", "hashline": true}),
+            )
+            .await
+            .expect_err("book text does not provide source edit anchors");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("Book").exists());
+        });
+    }
+
+    #[test]
+    fn e2e_read_epub_checks_all_chapters_before_returning_a_short_page() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_epub_checks_all_chapters_before_returning_a_short_page",
+            );
+            let bytes = zip_fixture(&[
+                ("mimetype", b"application/epub+zip"),
+                (
+                    "META-INF/container.xml",
+                    br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+                ),
+                (
+                    "book.opf",
+                    br#"<package xmlns="http://www.idpf.org/2007/opf"><metadata/><manifest><item id="first" href="first.xhtml" media-type="application/xhtml+xml"/><item id="missing" href="missing.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="first"/><itemref idref="missing"/></spine></package>"#,
+                ),
+                (
+                    "first.xhtml",
+                    br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Partial book.</p></body></html>"#,
+                ),
+            ]);
+            let path = harness.create_file("incomplete.epub", &bytes);
+            harness.create_file("source.epub", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-missing-chapter",
+                serde_json::json!({"path": "incomplete.epub", "offset": 1, "limit": 1}),
+            )
+            .await
+            .expect_err("a readable first page cannot hide a missing later chapter");
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-raw-source",
+                serde_json::json!({"path": "source.epub", "raw": true}),
+            )
+            .await
+            .expect("raw bypasses book recognition");
+            assert_eq!(get_text_content(&raw.content), "    1→literal source");
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
     fn e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access() {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new(

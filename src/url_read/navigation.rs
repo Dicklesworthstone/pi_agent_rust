@@ -179,7 +179,8 @@ impl Route {
         if self.github_source
             && !matches!(super::classify(self.current.as_str(), content_type, bytes),
                 UrlContentKind::Pdf | UrlContentKind::Notebook
-                    | UrlContentKind::Docx | UrlContentKind::Pptx | UrlContentKind::Xlsx)
+                    | UrlContentKind::Docx | UrlContentKind::Pptx | UrlContentKind::Xlsx
+                    | UrlContentKind::Epub)
         {
             return Ok(UrlReadOutcome {
                 content: String::from_utf8_lossy(bytes).into_owned(),

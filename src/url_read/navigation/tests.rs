@@ -46,8 +46,8 @@ fn only_exact_github_routes_are_synthesized() {
 }
 
 #[test]
-fn github_office_documents_use_native_readers_and_reject_partial_downloads() {
-    for extension in ["docx", "pptx", "xlsx"] {
+fn github_documents_use_native_readers_and_reject_partial_downloads() {
+    for extension in ["docx", "pptx", "xlsx", "epub"] {
         let url = format!("https://github.com/team/repo/blob/main/report.{extension}");
         let route = Route::new(
             &url,
@@ -57,7 +57,7 @@ fn github_office_documents_use_native_readers_and_reject_partial_downloads() {
         .unwrap();
         let error = route
             .finish("application/octet-stream", b"partial ZIP", true)
-            .expect_err("a partial Office archive must not become raw source text");
+            .expect_err("a partial document archive must not become raw source text");
         assert!(error.to_string().contains("DOCUMENT_INCOMPLETE"), "{error}");
 
         let raw = Route::new(&url, SsrfPolicy::BlockPrivateTargets, UrlReadMode::Raw)
@@ -117,6 +117,48 @@ fn github_xlsx_sources_render_saved_cells_with_original_coordinates() {
         outcome.content,
         "## Orders\n\n| Row | D |\n| --- | --- |\n| 7 | Order 0004 |"
     );
+}
+
+#[test]
+fn github_epub_sources_render_book_text_instead_of_zip_bytes() {
+    use std::io::{Cursor, Write as _};
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, content) in [
+        ("mimetype", "application/epub+zip"),
+        (
+            "META-INF/container.xml",
+            r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+        ),
+        (
+            "book.opf",
+            r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata/><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#,
+        ),
+        (
+            "chapter.xhtml",
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Saved chapter.</p></body></html>"#,
+        ),
+    ] {
+        zip.start_file(path, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let route = Route::new(
+        "https://github.com/team/repo/blob/main/books/guide.EPUB",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    let outcome = route.finish("application/octet-stream", &bytes, false).unwrap();
+    assert_eq!(outcome.kind, UrlContentKind::Epub);
+    assert_eq!(outcome.extractor, "epub");
+    assert_eq!(
+        outcome.final_url,
+        "https://raw.githubusercontent.com/team/repo/main/books/guide.EPUB",
+    );
+    assert_eq!(outcome.content, "## Section 1\n\nSaved chapter.");
 }
 
 #[test]

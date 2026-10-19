@@ -1,4 +1,4 @@
-//! Native, bounded text extraction from DOCX, PPTX, and XLSX packages.
+//! Native, bounded text extraction from DOCX, PPTX, XLSX, and EPUB packages.
 //!
 //! Only document XML and internal package relationships are interpreted. Images,
 //! charts, macros, embedded objects, and external relationships are never opened
@@ -17,6 +17,7 @@ use quick_xml::reader::NsReader;
 use crate::archive_read::ArchiveReader;
 use crate::error::{Error, Result};
 
+mod epub;
 mod xlsx;
 
 /// Maximum compressed document size, shared by local and URL conversion.
@@ -92,6 +93,14 @@ pub fn recognize(path: &str, content_type: &str) -> Option<DocumentKind> {
     } else {
         None
     }
+}
+
+/// Extract metadata and spine-ordered XHTML text from an admitted EPUB.
+///
+/// The ZIP, package references, XML, and rendered output share the native
+/// document bounds. Resources and doctype identifiers are never fetched.
+pub fn convert_epub(bytes: &[u8]) -> Result<String> {
+    epub::convert(bytes)
 }
 
 /// Convert a complete, already-admitted local or downloaded document.
@@ -211,6 +220,7 @@ enum Tag {
     CellInlineString,
     Relationships,
     Relationship,
+    Epub(epub::Tag),
     Other,
 }
 
@@ -267,7 +277,7 @@ fn tag(namespace: &str, local: &str) -> Tag {
         (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "is") => Tag::CellInlineString,
         (RELATIONSHIPS_NS, "Relationships") => Tag::Relationships,
         (RELATIONSHIPS_NS, "Relationship") => Tag::Relationship,
-        _ => Tag::Other,
+        _ => epub::tag(namespace, local).map_or(Tag::Other, Tag::Epub),
     }
 }
 
@@ -283,9 +293,14 @@ struct Properties {
     cell_type: Option<String>,
     sheet_id: Option<String>,
     sheet_state: Option<String>,
+    epub: epub::Properties,
 }
 
-fn properties(resolver: &NamespaceResolver, start: &BytesStart<'_>) -> Result<Properties> {
+fn properties(
+    resolver: &NamespaceResolver,
+    start: &BytesStart<'_>,
+    html_entities: bool,
+) -> Result<Properties> {
     let mut result = Properties::default();
     let mut names = HashSet::new();
     for (index, attribute) in start.attributes().enumerate() {
@@ -303,7 +318,9 @@ fn properties(resolver: &NamespaceResolver, start: &BytesStart<'_>) -> Result<Pr
             return Err(document_error("invalid or oversized XML attribute"));
         }
         let value = attribute
-            .normalized_value(XmlVersion::Implicit1_0)
+            .normalized_value_with(XmlVersion::Implicit1_0, 1, |name| {
+                resolve_named_entity(name, html_entities)
+            })
             .map_err(document_error)?;
         if !value.chars().all(xml_character) {
             return Err(document_error("invalid XML character in attribute"));
@@ -319,7 +336,12 @@ fn properties(resolver: &NamespaceResolver, start: &BytesStart<'_>) -> Result<Pr
             ("", "t") => &mut result.cell_type,
             ("", "sheetId") => &mut result.sheet_id,
             ("", "state") => &mut result.sheet_state,
-            _ => continue,
+            _ => {
+                let Some(slot) = epub::property(namespace, local.as_ref(), &mut result.epub) else {
+                    continue;
+                };
+                slot
+            }
         };
         if slot.replace(value.into_owned()).is_some() {
             return Err(document_error("ambiguous document attribute"));
@@ -348,6 +370,8 @@ fn visit_xml(
     let mut parents = Vec::new();
     let mut root_seen = false;
     let mut first_event = true;
+    let mut doctype_seen = false;
+    let html_entities = expected_root == Tag::Epub(epub::Tag::Html);
     for _ in 0..MAX_XML_EVENTS {
         let event = reader.read_event().map_err(document_error)?;
         match event {
@@ -364,7 +388,7 @@ fn visit_xml(
                 if parents.len() >= MAX_XML_DEPTH {
                     return Err(document_error("XML nesting exceeds 128 levels"));
                 }
-                let attributes = properties(reader.resolver(), &start)?;
+                let attributes = properties(reader.resolver(), &start, html_entities)?;
                 visit(XmlEvent::Start(current, attributes), &parents)?;
                 parents.push(current);
             }
@@ -397,9 +421,18 @@ fn visit_xml(
                 if parents.is_empty() {
                     return Err(document_error("entity outside the XML document root"));
                 }
-                visit(XmlEvent::Text(&resolve_reference(&reference)?), &parents)?;
+                visit(
+                    XmlEvent::Text(&resolve_reference(&reference, html_entities)?),
+                    &parents,
+                )?;
             }
-            Event::DocType(_) => return Err(document_error("XML document types are forbidden")),
+            Event::DocType(declaration) => {
+                if !html_entities || root_seen || doctype_seen {
+                    return Err(document_error("XML document types are forbidden here"));
+                }
+                epub::validate_doctype(declaration.as_ref())?;
+                doctype_seen = true;
+            }
             Event::Decl(declaration) => {
                 if !first_event {
                     return Err(document_error("misplaced XML declaration"));
@@ -422,21 +455,29 @@ fn visit_xml(
     Err(document_error("XML event budget exceeded"))
 }
 
-fn resolve_reference(reference: &BytesRef<'_>) -> Result<Cow<'static, str>> {
+fn resolve_named_entity(name: &str, html_entities: bool) -> Option<&'static str> {
+    if html_entities {
+        quick_xml::escape::resolve_html5_entity(name)
+    } else {
+        // Keep package metadata and Office XML strict even when escape-html
+        // is enabled for XHTML chapter text.
+        quick_xml::escape::resolve_xml_entity(name)
+    }
+}
+
+fn resolve_reference(
+    reference: &BytesRef<'_>,
+    html_entities: bool,
+) -> Result<Cow<'static, str>> {
     if let Some(character) = reference.resolve_char_ref().map_err(document_error)? {
         if !xml_character(character) {
             return Err(document_error("invalid XML character reference"));
         }
         return Ok(Cow::Owned(character.to_string()));
     }
-    Ok(Cow::Borrowed(match reference.as_ref() {
-        "amp" => "&",
-        "lt" => "<",
-        "gt" => ">",
-        "apos" => "'",
-        "quot" => "\"",
-        _ => return Err(document_error("custom XML entities are forbidden")),
-    }))
+    resolve_named_entity(reference.as_ref(), html_entities)
+        .map(Cow::Borrowed)
+        .ok_or_else(|| document_error("custom XML entities are forbidden"))
 }
 
 fn validate_declaration(declaration: &BytesDecl<'_>, encoding: XmlEncoding) -> Result<()> {
