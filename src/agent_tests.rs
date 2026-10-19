@@ -7778,6 +7778,323 @@ mod tests {
         });
     }
 
+    fn advisor_reservation_counts(session: &Session) -> Vec<u64> {
+        session
+            .entries_for_current_path()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                {
+                    custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("count"))
+                        .and_then(Value::as_u64)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queued_authored_inputs_renew_advisor_budget_and_generated_inputs_do_not() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (authored, follow_up) in [(true, false), (true, true), (false, false), (false, true)] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut reviewed = advisor_lifecycle_reply(StopReason::Stop);
+                reviewed.content = vec![ContentBlock::Text(TextContent::new(
+                    "Reviewed the queued task and recorded the requested correction. ".repeat(10),
+                ))];
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
+                        Ok(reviewed.clone()),
+                        Ok(reviewed.clone()),
+                        Ok(reviewed),
+                    ],
+                    None,
+                );
+                let path = {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut inner = session.session.lock(cx.cx()).await.expect("seed session");
+                    inner.append_model_message(user_message("previous authored task"));
+                    inner.append_custom_entry(
+                        ADVISOR_CONTINUATION_ENTRY.to_string(),
+                        Some(json!({"count": MAX_ADVISOR_CONTINUATIONS})),
+                    );
+                    inner.save().await.expect("persist exhausted previous budget");
+                    inner.path.clone().expect("saved path")
+                };
+                *advisor.verdict.lock().expect("blocker script") =
+                    Some("BLOCKER: the queued task needs another correction");
+                let message = user_message("check the fixture for the queued task");
+                let delivery = if authored {
+                    // An empty keyword source still proves authorship. Budget
+                    // renewal must not depend on finding a magic keyword.
+                    QueuedAgentMessage::authored(message, "")
+                } else {
+                    QueuedAgentMessage::generated(message)
+                };
+                if follow_up {
+                    session.agent.message_queue.push_follow_up(delivery);
+                } else {
+                    session.agent.message_queue.push_steering(delivery);
+                }
+                session
+                    .run_continue_with_follow_up_with_abort(follow_up, None, || true, |_| {})
+                    .await
+                    .expect("queued turn");
+                let expected_calls = if authored { 4 } else { 2 };
+                assert_eq!(doer.calls.load(Ordering::SeqCst), expected_calls);
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), if authored { 3 } else { 1 });
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen queued turn");
+                assert_eq!(
+                    advisor_reservation_counts(&reopened),
+                    if authored { vec![2, 0, 1, 2] } else { vec![2] },
+                    "authored={authored}, follow_up={follow_up}"
+                );
+                let shared_session = Arc::clone(&session.session);
+                {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    *shared_session.lock(cx.cx()).await.expect("replace session") = reopened;
+                }
+                let mut resumed = AgentSession::new(
+                    Agent::new(
+                        doer.clone(),
+                        ToolRegistry::new(&["read"], temp.path(), None),
+                        AgentConfig::default(),
+                    ),
+                    shared_session,
+                    true,
+                    ResolvedCompactionSettings {
+                        enabled: false,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                );
+                resumed.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    advisor.clone(),
+                    "advisor/advisor-model".to_string(),
+                ));
+                resumed
+                    .run_continue_with_abort(None, |_| {})
+                    .await
+                    .expect("fresh runtime resumes without renewing exhausted budget");
+                assert_eq!(doer.calls.load(Ordering::SeqCst), expected_calls + 1);
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen explicit retry");
+                assert_eq!(
+                    advisor_reservation_counts(&reopened),
+                    if authored { vec![2, 0, 1, 2] } else { vec![2] }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn queued_authored_budget_boundary_survives_failed_and_aborted_attempts() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for stop_reason in [StopReason::Error, StopReason::Aborted] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut reviewed = advisor_lifecycle_reply(StopReason::Stop);
+                reviewed.content = vec![ContentBlock::Text(TextContent::new(
+                    "Recovered the queued task while preserving its completed tool work. ".repeat(10),
+                ))];
+                let (mut session, doer, advisor) = advisor_lifecycle_session(
+                    temp.path(),
+                    vec![
+                        Ok(advisor_lifecycle_tool_call()),
+                        Ok(advisor_lifecycle_reply(stop_reason)),
+                        Ok(reviewed.clone()),
+                        Ok(reviewed.clone()),
+                        Ok(reviewed),
+                    ],
+                    None,
+                );
+                let path = {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut inner = session.session.lock(cx.cx()).await.expect("seed session");
+                    inner.append_model_message(user_message("previous authored task"));
+                    inner.append_custom_entry(
+                        ADVISOR_CONTINUATION_ENTRY.to_string(),
+                        Some(json!({"count": MAX_ADVISOR_CONTINUATIONS})),
+                    );
+                    inner.save().await.expect("persist exhausted budget");
+                    inner.path.clone().expect("saved path")
+                };
+                *advisor.verdict.lock().expect("blocker script") =
+                    Some("BLOCKER: the recovered task needs another correction");
+                session.agent.queue_steering(user_message("check the fixture again"));
+                let failed = session
+                    .run_continue_with_abort(None, |_| {})
+                    .await
+                    .expect("failed provider terminal");
+                assert_eq!(failed.stop_reason, stop_reason);
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 0);
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen incomplete queued turn");
+                assert_eq!(advisor_reservation_counts(&reopened), vec![2, 0]);
+                assert!(session.revert_incomplete_response().await.expect("remove failed tail"));
+                session
+                    .run_continue_with_abort(None, |_| {})
+                    .await
+                    .expect("retry queued turn");
+                assert_eq!(doer.calls.load(Ordering::SeqCst), 5);
+                assert_eq!(advisor.calls.load(Ordering::SeqCst), 3);
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen recovered queued turn");
+                assert_eq!(advisor_reservation_counts(&reopened), vec![2, 0, 1, 2]);
+                let completed_reads = reopened
+                    .to_messages_for_current_path()
+                    .into_iter()
+                    .filter(|message| matches!(message, Message::ToolResult(result) if result.tool_name == "read"))
+                    .count();
+                assert_eq!(completed_reads, 1, "retry must not replay the completed read");
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_arriving_input_renews_advisor_budget_only_when_authored() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for terminal in ["provider_error", "assistant_error", "aborted"] {
+                for authored in [true, false] {
+                    let temp = tempfile::tempdir().expect("tempdir");
+                    let mut reviewed = advisor_lifecycle_reply(StopReason::Stop);
+                    reviewed.content = vec![ContentBlock::Text(TextContent::new(
+                        "Recovered the late queued task while retaining its completed read. ".repeat(10),
+                    ))];
+                    let failed_reply = match terminal {
+                        "provider_error" => Err(Error::api("injected provider stream failure")),
+                        "assistant_error" => Ok(advisor_lifecycle_reply(StopReason::Error)),
+                        _ => Ok(advisor_lifecycle_reply(StopReason::Aborted)),
+                    };
+                    let (mut session, doer, advisor) = advisor_lifecycle_session(
+                        temp.path(),
+                        vec![
+                            Ok(advisor_lifecycle_tool_call()),
+                            failed_reply,
+                            Ok(reviewed.clone()),
+                            Ok(reviewed.clone()),
+                            Ok(reviewed),
+                        ],
+                        None,
+                    );
+                    let path = {
+                        let cx = crate::agent_cx::AgentCx::for_request();
+                        let mut inner = session.session.lock(cx.cx()).await.expect("seed session");
+                        inner.append_model_message(user_message("previous authored task"));
+                        inner.append_custom_entry(
+                            ADVISOR_CONTINUATION_ENTRY.to_string(),
+                            Some(json!({"count": MAX_ADVISOR_CONTINUATIONS})),
+                        );
+                        inner.save().await.expect("persist exhausted budget");
+                        inner.path.clone().expect("saved path")
+                    };
+                    *advisor.verdict.lock().expect("blocker script") =
+                        Some("BLOCKER: the late queued task needs another correction");
+                    let fetched = Arc::new(AtomicBool::new(false));
+                    let fetcher: MessageFetcher = {
+                        let doer = Arc::clone(&doer);
+                        let fetched = Arc::clone(&fetched);
+                        Arc::new(move || {
+                            let doer = Arc::clone(&doer);
+                            let fetched = Arc::clone(&fetched);
+                            Box::pin(async move {
+                                // The first request performs the read. This
+                                // input arrives only after the next request has
+                                // started, so a terminal drain must persist it.
+                                if doer.calls.load(Ordering::SeqCst) < 2
+                                    || fetched.swap(true, Ordering::SeqCst)
+                                {
+                                    return Vec::new();
+                                }
+                                let message = user_message("late queued task");
+                                vec![if authored {
+                                    QueuedAgentMessage::authored(message, "")
+                                } else {
+                                    QueuedAgentMessage::generated(message)
+                                }]
+                            })
+                        })
+                    };
+                    session.agent.register_message_fetchers(Some(fetcher), None);
+                    let failed = session.run_continue_with_abort(None, |_| {}).await;
+                    if terminal == "provider_error" {
+                        assert!(failed.is_err(), "provider failure must remain an error");
+                    } else {
+                        assert_eq!(
+                            failed.expect("incomplete assistant").stop_reason,
+                            if terminal == "assistant_error" {
+                                StopReason::Error
+                            } else {
+                                StopReason::Aborted
+                            }
+                        );
+                    }
+                    assert!(fetched.load(Ordering::SeqCst));
+                    assert_eq!(doer.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(advisor.calls.load(Ordering::SeqCst), 0);
+                    let reopened = Session::open(path.to_string_lossy().as_ref())
+                        .await
+                        .expect("reopen terminal delivery");
+                    assert_eq!(
+                        advisor_reservation_counts(&reopened),
+                        if authored { vec![2, 0] } else { vec![2] },
+                        "terminal={terminal}, authored={authored}"
+                    );
+                    session
+                        .revert_incomplete_response()
+                        .await
+                        .expect("remove incomplete tail when present");
+                    session
+                        .run_continue_with_abort(None, |_| {})
+                        .await
+                        .expect("resume late queued task");
+                    assert_eq!(doer.calls.load(Ordering::SeqCst), if authored { 5 } else { 3 });
+                    assert_eq!(advisor.calls.load(Ordering::SeqCst), if authored { 3 } else { 1 });
+                    let reopened = Session::open(path.to_string_lossy().as_ref())
+                        .await
+                        .expect("reopen recovered terminal delivery");
+                    assert_eq!(
+                        advisor_reservation_counts(&reopened),
+                        if authored { vec![2, 0, 1, 2] } else { vec![2] }
+                    );
+                    let messages = reopened.to_messages_for_current_path();
+                    assert_eq!(
+                        messages.iter().filter(|message| matches!(
+                            message,
+                            Message::ToolResult(result) if result.tool_name == "read"
+                        )).count(),
+                        1,
+                        "the completed read must not replay"
+                    );
+                    assert_eq!(
+                        messages.iter().filter(|message| matches!(
+                            message,
+                            Message::User(user)
+                                if matches!(&user.content, UserContent::Text(text) if text == "late queued task")
+                        )).count(),
+                        1,
+                        "the terminal input must remain durable exactly once"
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn extension_input_does_not_renew_advisor_continuation_budget() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");

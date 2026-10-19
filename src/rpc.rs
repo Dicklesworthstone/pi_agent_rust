@@ -1458,6 +1458,7 @@ impl RpcSharedState {
         &mut self,
         session: &Session,
         messages: &[Message],
+        is_authored: impl Fn(usize) -> bool,
     ) -> Result<()> {
         let session_id = session.header.id.clone();
         let base_leaf_id = session.leaf_id().map(str::to_string);
@@ -1475,8 +1476,10 @@ impl RpcSharedState {
                     "live completed-tool transcript changed during terminal recovery",
                 ));
             }
-            for (existing, message) in staged.entries.iter().zip(messages) {
-                if serde_json::to_vec(existing.message())? != serde_json::to_vec(message)? {
+            for (index, (existing, message)) in staged.entries.iter().zip(messages).enumerate() {
+                if serde_json::to_vec(existing.message())? != serde_json::to_vec(message)?
+                    || existing.keyword_scan_source().is_some() != is_authored(index)
+                {
                     return Err(Error::session(
                         "live completed-tool transcript changed during terminal recovery",
                     ));
@@ -1491,7 +1494,17 @@ impl RpcSharedState {
                 entries: messages
                     .iter()
                     .cloned()
-                    .map(QueuedAgentMessage::generated)
+                    .enumerate()
+                    .map(|(index, message)| {
+                        if is_authored(index) {
+                            // This envelope is only persisted, never scanned or
+                            // delivered again. Retain authorship without copying
+                            // the original input's keyword source into recovery.
+                            QueuedAgentMessage::authored(message, "")
+                        } else {
+                            QueuedAgentMessage::generated(message)
+                        }
+                    })
                     .collect(),
             });
         }
@@ -5595,7 +5608,12 @@ async fn preserve_terminal_rpc_state(
     }
     let completed_tool_transcript =
         completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
-    state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
+    let completed_message_start = inner.to_messages_for_current_path().len();
+    state.stage_completed_tool_transcript(&inner, &completed_tool_transcript, |index| {
+        guard
+            .agent
+            .is_authored_queue_delivery(completed_message_start + index)
+    })?;
     let completed_tool_transcript_count = state.completed_tool_transcript_entries().len();
     if completed_tool_transcript_count == 0
         && (input_preservation == RpcInputPreservation::LeaveForNextAgentTurn
@@ -5628,6 +5646,7 @@ async fn preserve_terminal_rpc_state(
     // the candidate flush, retry sees the original queues and reuses their
     // stable entry metadata against the pinned persistence target.
     let mut candidate = inner.clone();
+    let reset_advisor_on_authored_input = guard.advisor.is_some();
     let mut parent_id = candidate.leaf_id().map(str::to_string);
     for delivery in state.completed_tool_transcript_entries() {
         let message = delivery.message().clone();
@@ -5640,6 +5659,12 @@ async fn preserve_terminal_rpc_state(
             &timestamp,
             bound_parent_id.as_deref(),
         )?;
+        if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
+            parent_id = Some(crate::agent::append_advisor_input_reset(
+                &mut candidate,
+                &entry_id,
+            )?);
+        }
     }
     if input_preservation == RpcInputPreservation::Include {
         let in_flight = state.in_flight_in_lease_order();
@@ -5663,6 +5688,14 @@ async fn preserve_terminal_rpc_state(
                 &timestamp,
                 bound_parent_id.as_deref(),
             )?;
+            if reset_advisor_on_authored_input
+                && in_flight.delivery.keyword_scan_source().is_some()
+            {
+                parent_id = Some(crate::agent::append_advisor_input_reset(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
         }
         for delivery in state.steering.iter_mut().chain(&mut state.follow_up) {
             let message = delivery.message().clone();
@@ -5675,6 +5708,12 @@ async fn preserve_terminal_rpc_state(
                 &timestamp,
                 bound_parent_id.as_deref(),
             )?;
+            if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::agent::append_advisor_input_reset(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
         }
     }
 
@@ -22346,6 +22385,238 @@ export default function init(pi) {
         });
     }
 
+    fn terminal_advisor_counts(session: &Session) -> Vec<u64> {
+        session
+            .entries_for_current_path()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Custom(custom) if custom.custom_type == "advisor_continuation" => custom
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("count"))
+                    .and_then(Value::as_u64),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_advisor_budget_reset_requires_authored_input_and_successful_save() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for (authored, leased) in [(true, false), (true, true), (false, false), (false, true)] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::create_with_dir(Some(temp.path().join("sessions")));
+                stored.append_model_message(build_user_message("previous task", &[]));
+                stored.append_custom_entry(
+                    "advisor_continuation".to_string(),
+                    Some(json!({"count": 2})),
+                );
+                stored.save().await.expect("save exhausted budget");
+                let path = stored.path.clone().expect("saved path");
+                let baseline = stored.entries.len();
+                let inner_session = Arc::new(asupersync::sync::Mutex::new(stored));
+                let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+                let agent = Agent::new(
+                    Arc::clone(&provider),
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    provider,
+                    "test/noop".to_string(),
+                ));
+                let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &Config::default(),
+                )));
+                let cx = AgentCx::for_request();
+                {
+                    let mut state = shared_state.lock(&cx).await.expect("queue state");
+                    let message = build_user_message("same queued payload", &[]);
+                    let delivery = if authored {
+                        QueuedAgentMessage::authored(message, "")
+                    } else {
+                        QueuedAgentMessage::generated(message)
+                    };
+                    state.push_follow_up(delivery).expect("accepted input");
+                    if leased {
+                        assert_eq!(state.lease_follow_up_for_fetch(baseline).len(), 1);
+                    }
+                }
+                inner_session.lock(&cx).await.expect("fault target").path =
+                    Some(temp.path().to_path_buf());
+                assert!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .is_err(),
+                    "a directory cannot publish the candidate"
+                );
+                {
+                    let mut inner = inner_session.lock(&cx).await.expect("failed live state");
+                    assert_eq!(terminal_advisor_counts(&inner), vec![2]);
+                    assert_eq!(inner.entries.len(), baseline);
+                    inner.path = Some(path.clone());
+                }
+                assert_eq!(
+                    shared_state.lock(&cx).await.expect("retained queue").pending_count(),
+                    1
+                );
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("retry terminal persistence"),
+                    1
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen recovered input");
+                assert_eq!(
+                    terminal_advisor_counts(&reopened),
+                    if authored { vec![2, 0] } else { vec![2] }
+                );
+                assert_eq!(
+                    reopened.to_messages_for_current_path().len(),
+                    2,
+                    "the retry must publish the queued message only once"
+                );
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("repeat terminal reconciliation"),
+                    0
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_tool_transcript_retains_authored_delivery_provenance() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for authored in [true, false] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::create_with_dir(Some(temp.path().join("sessions")));
+                stored.append_model_message(build_user_message("previous task", &[]));
+                stored.append_custom_entry(
+                    "advisor_continuation".to_string(),
+                    Some(json!({"count": 2})),
+                );
+                stored.save().await.expect("save exhausted budget");
+                let path = stored.path.clone().expect("saved path");
+                let baseline = stored.entries.len();
+                let history = stored.to_messages_for_current_path();
+                let delivered_index = history.len();
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &Config::default(),
+                )));
+                let cx = AgentCx::for_request();
+                let leased = {
+                    let mut state = shared_state.lock(&cx).await.expect("queue state");
+                    let message = build_user_message("queued task with a completed effect", &[]);
+                    let delivery = if authored {
+                        QueuedAgentMessage::authored(message, "")
+                    } else {
+                        QueuedAgentMessage::generated(message)
+                    };
+                    state.push_steering(delivery).expect("accept steering");
+                    state.lease_steering(baseline)
+                };
+                let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+                let mut agent = Agent::new(
+                    Arc::clone(&provider),
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                agent.replace_messages(history);
+                let delivery = Arc::new(std::sync::Mutex::new(Some(leased)));
+                agent.register_message_fetchers(
+                    Some(Arc::new(move || {
+                        let delivery = Arc::clone(&delivery);
+                        Box::pin(async move {
+                            delivery.lock().expect("leased input").take().unwrap_or_default()
+                        })
+                    })),
+                    None,
+                );
+                // Exercise the real queue-delivery boundary without admitting a
+                // provider. Build the closed tool suffix that terminal recovery
+                // may inherit when an outer task is dropped before its save.
+                let (handle, signal) = crate::agent::AbortHandle::new();
+                handle.abort();
+                let aborted = agent
+                    .run_continue_with_abort(Some(signal), |_| {})
+                    .await
+                    .expect("aborted queue delivery");
+                assert_eq!(aborted.stop_reason, StopReason::Aborted);
+                assert_eq!(agent.is_authored_queue_delivery(delivered_index), authored);
+                agent.truncate_messages(agent.messages().len() - 1);
+                agent.add_message(Message::Assistant(Arc::new(AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "completed-effect".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": "fixture.txt"}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                })));
+                agent.add_message(Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+                    tool_call_id: "completed-effect".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new("completed output"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 2,
+                })));
+                let inner_session = Arc::new(asupersync::sync::Mutex::new(stored));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    inner_session,
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    provider,
+                    "test/noop".to_string(),
+                ));
+                let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("preserve completed tool transcript and input lease"),
+                    4
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen terminal tool transcript");
+                assert_eq!(
+                    terminal_advisor_counts(&reopened),
+                    if authored { vec![2, 0] } else { vec![2] }
+                );
+                let messages = reopened.to_messages_for_current_path();
+                assert_eq!(messages.len(), 4, "one input and one completed tool pair");
+                assert_eq!(
+                    messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                    2,
+                    "the in-flight lease must not duplicate its recovered user message"
+                );
+            }
+        });
+    }
+
     #[test]
     fn terminal_recovery_preserves_completed_tool_effects_after_task_drop() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -22666,12 +22937,12 @@ export default function init(pi) {
         ))];
         let mut state = RpcSharedState::new(&Config::default());
         state
-            .stage_completed_tool_transcript(&session, &recorded)
+            .stage_completed_tool_transcript(&session, &recorded, |_| false)
             .expect("stage recovery transcript");
         session.append_custom_entry("drift".to_string(), Some(json!({"changed": true})));
 
         let err = state
-            .stage_completed_tool_transcript(&session, &recorded)
+            .stage_completed_tool_transcript(&session, &recorded, |_| false)
             .expect_err("session-base drift must fail closed");
         assert!(err.to_string().contains("session base changed"));
     }
@@ -22832,6 +23103,7 @@ export default function init(pi) {
 
     fn assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
         store_kind: crate::session::SessionStoreKind,
+        advisor_enabled: bool,
     ) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -22870,6 +23142,12 @@ export default function init(pi) {
                             &timestamp,
                             bound_parent_id.as_deref(),
                         )?;
+                        if advisor_enabled && delivery.keyword_scan_source().is_some() {
+                            parent_id = Some(crate::agent::append_advisor_input_reset(
+                                candidate,
+                                &entry_id,
+                            )?);
+                        }
                     }
                     Ok(())
                 };
@@ -22899,9 +23177,20 @@ export default function init(pi) {
                 .expect("reopen replayed session");
             assert_eq!(
                 reopened.entries.len(),
-                4,
+                if advisor_enabled { 6 } else { 4 },
                 "cancelled-writer replay must not retain a duplicate durable branch"
             );
+            let reset_count = reopened
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "advisor_continuation"
+                            && custom.data.as_ref().and_then(|data| data.get("count")) == Some(&json!(0))
+                ))
+                .count();
+            assert_eq!(reset_count, if advisor_enabled { 2 } else { 0 });
             let later_branch_count = reopened
                 .entries
                 .iter()
@@ -22943,6 +23232,15 @@ export default function init(pi) {
     fn terminal_jsonl_queue_replay_reuses_stable_entry_identity() {
         assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
             crate::session::SessionStoreKind::Jsonl,
+            false,
+        );
+    }
+
+    #[test]
+    fn terminal_jsonl_advisor_reset_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Jsonl,
+            true,
         );
     }
 
@@ -22951,6 +23249,16 @@ export default function init(pi) {
     fn terminal_sqlite_queue_replay_reuses_stable_entry_identity() {
         assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
             crate::session::SessionStoreKind::Sqlite,
+            false,
+        );
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn terminal_sqlite_advisor_reset_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Sqlite,
+            true,
         );
     }
 

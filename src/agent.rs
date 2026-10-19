@@ -1816,6 +1816,11 @@ pub struct Agent {
     /// Message history.
     messages: Vec<Message>,
 
+    /// Authored queued inputs that reached the live transcript but have not
+    /// yet reached Session persistence. Absolute, sorted message indices retain
+    /// provenance after the ephemeral delivery envelope is consumed.
+    authored_queue_delivery_indices: Vec<usize>,
+
     /// Fetchers for queued steering messages (interrupts).
     steering_fetchers: Vec<RegisteredMessageFetcher>,
 
@@ -2001,6 +2006,7 @@ impl Agent {
             config,
             extensions: None,
             messages: Vec::new(),
+            authored_queue_delivery_indices: Vec::new(),
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
@@ -2229,12 +2235,23 @@ impl Agent {
     /// Clear the message history.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.authored_queue_delivery_indices.clear();
     }
 
     /// Truncate the active message history to `len` (rewind/retry keep the
     /// full span in the session tree — bd-cv653.3.7).
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
+        self.authored_queue_delivery_indices
+            .retain(|index| *index < len);
+    }
+
+    /// Used by terminal recovery when a dropped Agent future left completed
+    /// tool work in memory. Generated user-role messages never qualify.
+    pub(crate) fn is_authored_queue_delivery(&self, index: usize) -> bool {
+        self.authored_queue_delivery_indices
+            .binary_search(&index)
+            .is_ok()
     }
 
     /// Add a message to the history.
@@ -2245,6 +2262,14 @@ impl Agent {
                 MAX_AGENT_MESSAGES
             );
             self.messages.remove(0);
+            self.authored_queue_delivery_indices.retain_mut(|index| {
+                if let Some(shifted) = index.checked_sub(1) {
+                    *index = shifted;
+                    true
+                } else {
+                    false
+                }
+            });
         }
         self.messages.push(message);
     }
@@ -2252,6 +2277,7 @@ impl Agent {
     /// Replace the message history.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        self.authored_queue_delivery_indices.clear();
     }
 
     /// Replace the provider implementation (used for model/provider switching).
@@ -3346,6 +3372,16 @@ impl Agent {
         }
     }
 
+    /// Consume a delivery immediately before appending its message. Every
+    /// normal and terminal drain uses this boundary so persistence can still
+    /// distinguish authored input from generated user-role messages.
+    fn consume_queued_delivery(&mut self, delivery: QueuedAgentMessage) -> Message {
+        if delivery.keyword_scan_source().is_some() {
+            self.authored_queue_delivery_indices.push(self.messages.len());
+        }
+        delivery.into_message()
+    }
+
     fn apply_magic_keywords_for_text(
         &mut self,
         scan_text: &str,
@@ -3545,7 +3581,7 @@ impl Agent {
 
                 for delivery in std::mem::take(&mut pending_messages) {
                     self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
-                    let message = delivery.into_message();
+                    let message = self.consume_queued_delivery(delivery);
                     self.messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
@@ -3614,7 +3650,7 @@ impl Agent {
                                 &delivery,
                                 &mut turn_keyword_words,
                             );
-                            let message = delivery.into_message();
+                            let message = self.consume_queued_delivery(delivery);
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -3674,7 +3710,7 @@ impl Agent {
                     let steering_to_add = self.drain_steering_messages().await;
                     for delivery in steering_to_add {
                         self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
-                        let message = delivery.into_message();
+                        let message = self.consume_queued_delivery(delivery);
                         self.messages.push(message.clone());
                         on_event(AgentEvent::MessageStart {
                             message: message.clone(),
@@ -3814,7 +3850,7 @@ impl Agent {
                                 &delivery,
                                 &mut turn_keyword_words,
                             );
-                            let message = delivery.into_message();
+                            let message = self.consume_queued_delivery(delivery);
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -3866,7 +3902,7 @@ impl Agent {
                                     &delivery,
                                     &mut turn_keyword_words,
                                 );
-                                let message = delivery.into_message();
+                                let message = self.consume_queued_delivery(delivery);
                                 self.messages.push(message.clone());
                                 on_event(AgentEvent::MessageStart {
                                     message: message.clone(),
@@ -6259,6 +6295,34 @@ pub struct AgentSession {
 
 const MAX_ADVISOR_CONTINUATIONS: u64 = 2;
 const ADVISOR_CONTINUATION_ENTRY: &str = "advisor_continuation";
+
+/// Couple an authored queued input to its advisor budget boundary. The stable
+/// identity also lets terminal RPC recovery replay a cancelled candidate save
+/// without creating another reset or a divergent session branch.
+pub(crate) fn append_advisor_input_reset(
+    session: &mut Session,
+    message_entry_id: &str,
+) -> Result<String> {
+    let timestamp = match session.get_entry(message_entry_id) {
+        Some(crate::session::SessionEntry::Message(entry))
+            if matches!(&entry.message, crate::session::SessionMessage::User { .. }) =>
+        {
+            entry.base.timestamp.clone()
+        }
+        _ => {
+            return Err(Error::session(
+                "advisor input reset requires a persisted user message",
+            ));
+        }
+    };
+    session.append_custom_entry_with_identity(
+        ADVISOR_CONTINUATION_ENTRY.to_string(),
+        Some(json!({"count": 0})),
+        &format!("advisor-input-{message_entry_id}"),
+        &timestamp,
+        Some(message_entry_id),
+    )
+}
 
 /// One host-visible turn can contain a completed attempt plus advisor-driven
 /// continuations. Keep its terminal event until the final durable result;
@@ -18812,12 +18876,17 @@ impl AgentSession {
         run_failed: bool,
         run_incomplete: bool,
     ) -> Result<()> {
-        let mut new_messages = self.agent.messages()[start_len..].to_vec();
+        let mut new_messages = self.agent.messages()[start_len..]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, message)| (start_len + index, message))
+            .collect::<Vec<_>>();
         let incomplete_assistant = if run_incomplete {
             new_messages
                 .iter()
-                .rposition(is_incomplete_assistant_message)
-                .map(|index| new_messages.remove(index))
+                .rposition(|(_, message)| is_incomplete_assistant_message(message))
+                .map(|index| new_messages.remove(index).1)
         } else {
             None
         };
@@ -18828,12 +18897,19 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             let repairs = self.agent.drain_repair_ledger()?;
             let activations = self.agent.drain_keyword_ledger();
-            for message in new_messages {
+            for (message_index, message) in new_messages {
                 if run_failed && is_synthetic_empty_error_assistant(&message) {
                     continue;
                 }
-                session.append_model_message(message);
+                let reset_advisor = self.advisor.is_some()
+                    && self.agent.is_authored_queue_delivery(message_index)
+                    && matches!(&message, Message::User(_));
+                let entry_id = session.append_model_message(message);
+                if reset_advisor {
+                    append_advisor_input_reset(&mut session, &entry_id)?;
+                }
             }
+            self.agent.authored_queue_delivery_indices.clear();
             append_dialect_repair_telemetry(&mut session, &repairs);
             crate::magic_keywords::append_session_telemetry(&mut session, &activations);
             if let Some(message) = incomplete_assistant

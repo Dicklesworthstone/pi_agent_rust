@@ -5390,6 +5390,66 @@ impl Session {
         id
     }
 
+    /// Append custom state with the stable identity of an associated operation.
+    /// Terminal recovery uses this for metadata coupled to an acknowledged
+    /// input, so a cancelled candidate save can replay the same session branch.
+    pub(crate) fn append_custom_entry_with_identity(
+        &mut self,
+        custom_type: String,
+        data: Option<serde_json::Value>,
+        id: &str,
+        timestamp: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
+        if id.trim().is_empty() {
+            return Err(Error::session("stable session entry ID cannot be empty"));
+        }
+        chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|err| {
+            Error::session(format!(
+                "stable session entry timestamp is not RFC 3339: {err}"
+            ))
+        })?;
+
+        let id = id.to_string();
+        let base = EntryBase {
+            id: Some(id.clone()),
+            parent_id: parent_id.map(str::to_string),
+            timestamp: timestamp.to_string(),
+        };
+        let entry = SessionEntry::Custom(CustomEntry {
+            base,
+            custom_type,
+            data,
+        });
+        if let Some(&existing_index) = self.entry_index.get(&id) {
+            if serde_json::to_vec(&self.entries[existing_index])? != serde_json::to_vec(&entry)? {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} has conflicting in-memory content"
+                )));
+            }
+            if !self.navigate_to(&id) {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} disappeared during replay"
+                )));
+            }
+            return Ok(id);
+        }
+        if let Some(parent_id) = parent_id
+            && !self.entry_ids.contains(parent_id)
+        {
+            return Err(Error::session(format!(
+                "stable session entry ID {id} references missing parent {parent_id}"
+            )));
+        }
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.clear_persisted_leaf_override_after_append();
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        Ok(id)
+    }
+
     pub fn append_bash_execution(
         &mut self,
         command: String,
