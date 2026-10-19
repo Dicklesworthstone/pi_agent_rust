@@ -47,7 +47,7 @@ fn only_exact_github_routes_are_synthesized() {
 
 #[test]
 fn github_office_documents_use_native_readers_and_reject_partial_downloads() {
-    for extension in ["docx", "pptx"] {
+    for extension in ["docx", "pptx", "xlsx"] {
         let url = format!("https://github.com/team/repo/blob/main/report.{extension}");
         let route = Route::new(
             &url,
@@ -68,6 +68,55 @@ fn github_office_documents_use_native_readers_and_reject_partial_downloads() {
         assert_eq!(raw.extractor, "raw");
         assert!(raw.download_truncated);
     }
+}
+
+#[test]
+fn github_xlsx_sources_render_saved_cells_with_original_coordinates() {
+    use std::io::{Cursor, Write as _};
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (path, xml) in [
+        (
+            "_rels/.rels",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="main" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/workbook.xml",
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Orders" sheetId="1" r:id="sheet"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="sheet" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet.xml",
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="7"><c r="D7" t="inlineStr"><is><t>Order 0004</t></is></c></row></sheetData></worksheet>"#,
+        ),
+    ] {
+        zip.start_file(path, options).unwrap();
+        zip.write_all(xml.as_bytes()).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let route = Route::new(
+        "https://github.com/team/repo/blob/main/data/orders.XLSX",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    let outcome = route.finish("application/octet-stream", &bytes, false).unwrap();
+    assert_eq!(outcome.kind, UrlContentKind::Xlsx);
+    assert_eq!(outcome.extractor, "xlsx");
+    assert_eq!(
+        outcome.final_url,
+        "https://raw.githubusercontent.com/team/repo/main/data/orders.XLSX"
+    );
+    assert_eq!(
+        outcome.content,
+        "## Orders\n\n| Row | D |\n| --- | --- |\n| 7 | Order 0004 |"
+    );
 }
 
 #[test]

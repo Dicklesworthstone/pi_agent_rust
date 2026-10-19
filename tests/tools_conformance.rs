@@ -3497,6 +3497,129 @@ mod e2e_read {
     }
 
     #[test]
+    fn e2e_read_xlsx_pages_keep_saved_values_and_original_coordinates() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_xlsx_pages_keep_saved_values_and_original_coordinates",
+            );
+            let bytes = zip_fixture(&[
+                (
+                    "_rels/.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="main" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/workbook.xml",
+                    br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Finance" sheetId="1" r:id="sheet"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="sheet" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet.xml"/><Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/sharedStrings.xml",
+                    br#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Revenue</t></si><si><t>Amount</t></si></sst>"#,
+                ),
+                (
+                    "xl/worksheets/sheet.xml",
+                    br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row><row r="3"><c r="C3"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"#,
+                ),
+            ]);
+            let path = harness.create_file("FINANCE.XLSX", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..4 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("xlsx-page-{page}"),
+                    serde_json::json!({"path": "FINANCE.XLSX", "offset": offset, "limit": 2}),
+                )
+                .await
+                .expect("render the next workbook page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "xlsx");
+                assert_eq!(details["totalLines"], 6);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, value) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(value.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(
+                actual,
+                [
+                    "## Finance",
+                    "",
+                    "| Row | A | C |",
+                    "| --- | --- | --- |",
+                    "| 1 | Revenue | Amount |",
+                    "| 3 |  | 2 |",
+                ],
+            );
+            let error = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-hashline-refused",
+                serde_json::json!({"path": "FINANCE.XLSX", "hashline": true}),
+            )
+            .await
+            .expect_err("rendered workbook coordinates cannot authorize source edits");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn e2e_read_xlsx_raw_bypasses_conversion_and_invalid_packages_fail() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_xlsx_raw_bypasses_conversion_and_invalid_packages_fail",
+            );
+            let path = harness.create_file("source.xlsx", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-invalid-package",
+                serde_json::json!({"path": "source.xlsx"}),
+            )
+            .await
+            .expect_err("an XLSX extension must not turn an invalid ZIP into text");
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-raw-source",
+                serde_json::json!({"path": "source.xlsx", "raw": true}),
+            )
+            .await
+            .expect("raw keeps the original source-byte read behavior");
+            assert_eq!(get_text_content(&raw.content), "    1→literal source");
+            assert_ne!(
+                raw.details
+                    .as_ref()
+                    .and_then(|details| details["contentType"].as_str()),
+                Some("xlsx"),
+            );
+            assert_eq!(std::fs::read(path).unwrap(), b"literal source\n");
+        });
+    }
+
+    #[test]
     fn e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access() {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new(

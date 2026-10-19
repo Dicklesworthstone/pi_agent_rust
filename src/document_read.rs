@@ -1,4 +1,4 @@
-//! Native, bounded text extraction from DOCX and PPTX packages.
+//! Native, bounded text extraction from DOCX, PPTX, and XLSX packages.
 //!
 //! Only document XML and internal package relationships are interpreted. Images,
 //! charts, macros, embedded objects, and external relationships are never opened
@@ -17,6 +17,8 @@ use quick_xml::reader::NsReader;
 use crate::archive_read::ArchiveReader;
 use crate::error::{Error, Result};
 
+mod xlsx;
+
 /// Maximum compressed document size, shared by local and URL conversion.
 pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PART_BYTES: u64 = 16 * 1024 * 1024;
@@ -30,11 +32,13 @@ const MAX_SLIDES: usize = 1024;
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const DRAWING_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const PRESENTATION_NS: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+const SPREADSHEET_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const RELATIONSHIPS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const OFFICE_REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const STRICT_WORD_NS: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
 const STRICT_DRAWING_NS: &str = "http://purl.oclc.org/ooxml/drawingml/main";
 const STRICT_PRESENTATION_NS: &str = "http://purl.oclc.org/ooxml/presentationml/main";
+const STRICT_SPREADSHEET_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 const STRICT_OFFICE_REL_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
 
 /// Supported Office Open XML document families.
@@ -42,6 +46,7 @@ const STRICT_OFFICE_REL_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/re
 pub enum DocumentKind {
     Docx,
     Pptx,
+    Xlsx,
 }
 
 impl DocumentKind {
@@ -50,6 +55,7 @@ impl DocumentKind {
         match self {
             Self::Docx => "docx",
             Self::Pptx => "pptx",
+            Self::Xlsx => "xlsx",
         }
     }
 }
@@ -70,12 +76,19 @@ pub fn recognize(path: &str, content_type: &str) -> Option<DocumentKind> {
     ) {
         return Some(DocumentKind::Pptx);
     }
+    if media_type.eq_ignore_ascii_case(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ) {
+        return Some(DocumentKind::Xlsx);
+    }
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let extension = std::path::Path::new(path).extension()?.to_str()?;
     if extension.eq_ignore_ascii_case("docx") {
         Some(DocumentKind::Docx)
     } else if extension.eq_ignore_ascii_case("pptx") {
         Some(DocumentKind::Pptx)
+    } else if extension.eq_ignore_ascii_case("xlsx") {
+        Some(DocumentKind::Xlsx)
     } else {
         None
     }
@@ -129,6 +142,9 @@ pub fn convert(bytes: &[u8], kind: DocumentKind) -> Result<String> {
                 output.separate("\n\n")?;
             }
         }
+        DocumentKind::Xlsx => {
+            xlsx::render(&main_xml, &main_part, &mut archive, &mut budget, &mut output)?;
+        }
     }
     while output.text.ends_with('\n') {
         output.text.pop();
@@ -178,6 +194,21 @@ enum Tag {
     SlideList,
     SlideId,
     Slide,
+    Workbook,
+    WorkbookSheets,
+    WorkbookSheet,
+    SharedStrings,
+    SharedString,
+    SpreadsheetRun,
+    SpreadsheetText,
+    Worksheet,
+    ChartSheet,
+    SheetData,
+    SheetRow,
+    SheetCell,
+    CellValue,
+    CellFormula,
+    CellInlineString,
     Relationships,
     Relationship,
     Other,
@@ -219,6 +250,21 @@ fn tag(namespace: &str, local: &str) -> Tag {
         (PRESENTATION_NS | STRICT_PRESENTATION_NS, "sldIdLst") => Tag::SlideList,
         (PRESENTATION_NS | STRICT_PRESENTATION_NS, "sldId") => Tag::SlideId,
         (PRESENTATION_NS | STRICT_PRESENTATION_NS, "sld") => Tag::Slide,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "workbook") => Tag::Workbook,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "sheets") => Tag::WorkbookSheets,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "sheet") => Tag::WorkbookSheet,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "sst") => Tag::SharedStrings,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "si") => Tag::SharedString,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "r") => Tag::SpreadsheetRun,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "t") => Tag::SpreadsheetText,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "worksheet") => Tag::Worksheet,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "chartsheet") => Tag::ChartSheet,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "sheetData") => Tag::SheetData,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "row") => Tag::SheetRow,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "c") => Tag::SheetCell,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "v") => Tag::CellValue,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "f") => Tag::CellFormula,
+        (SPREADSHEET_NS | STRICT_SPREADSHEET_NS, "is") => Tag::CellInlineString,
         (RELATIONSHIPS_NS, "Relationships") => Tag::Relationships,
         (RELATIONSHIPS_NS, "Relationship") => Tag::Relationship,
         _ => Tag::Other,
@@ -232,6 +278,11 @@ struct Properties {
     target: Option<String>,
     target_mode: Option<String>,
     kind: Option<String>,
+    name: Option<String>,
+    reference: Option<String>,
+    cell_type: Option<String>,
+    sheet_id: Option<String>,
+    sheet_state: Option<String>,
 }
 
 fn properties(resolver: &NamespaceResolver, start: &BytesStart<'_>) -> Result<Properties> {
@@ -263,6 +314,11 @@ fn properties(resolver: &NamespaceResolver, start: &BytesStart<'_>) -> Result<Pr
             ("", "Target") => &mut result.target,
             ("", "TargetMode") => &mut result.target_mode,
             ("", "Type") => &mut result.kind,
+            ("", "name") => &mut result.name,
+            ("", "r") => &mut result.reference,
+            ("", "t") => &mut result.cell_type,
+            ("", "sheetId") => &mut result.sheet_id,
+            ("", "state") => &mut result.sheet_state,
             _ => continue,
         };
         if slot.replace(value.into_owned()).is_some() {
@@ -894,6 +950,17 @@ mod tests {
     #[test]
     fn recognizes_document_filenames_and_exact_media_types() {
         assert_eq!(
+            recognize("https://example.test/DATA.XLSX?download=1", ""),
+            Some(DocumentKind::Xlsx)
+        );
+        assert_eq!(
+            recognize(
+                "https://example.test/download",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=binary",
+            ),
+            Some(DocumentKind::Xlsx)
+        );
+        assert_eq!(
             recognize("https://example.test/SCORE.DOCX?download=1", ""),
             Some(DocumentKind::Docx)
         );
@@ -916,7 +983,11 @@ mod tests {
             Some(DocumentKind::Pptx)
         );
         assert_eq!(recognize("legacy.doc", "application/msword"), None);
-        assert_eq!(recognize("sheet.xlsx", "application/zip"), None);
+        assert_eq!(
+            recognize("sheet.xlsx", "application/zip"),
+            Some(DocumentKind::Xlsx)
+        );
+        assert_eq!(recognize("sheet.xls", "application/zip"), None);
         assert_eq!(recognize("plain.txt?name=.docx", "text/plain"), None);
     }
 

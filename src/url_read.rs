@@ -1,7 +1,7 @@
 //! URL-aware reads (bd-cv653.2.2).
 //!
 //! `read` on http(s):// paths fetches and converts to reader-mode markdown,
-//! with site-aware extractors, PDF text extraction, native DOCX/PPTX text,
+//! with site-aware extractors, PDF text extraction, native DOCX/PPTX/XLSX text,
 //! notebook rendering, and a default-on SSRF guard.
 //!
 //! Design notes:
@@ -28,6 +28,7 @@ pub enum UrlContentKind {
     Notebook,
     Docx,
     Pptx,
+    Xlsx,
     PlainText,
 }
 
@@ -40,6 +41,7 @@ impl UrlContentKind {
             Self::Notebook => "notebook",
             Self::Docx => "docx",
             Self::Pptx => "pptx",
+            Self::Xlsx => "xlsx",
             Self::PlainText => "plaintext",
         }
     }
@@ -125,7 +127,7 @@ pub fn convert_bytes(
             }
             (convert_notebook(bytes)?, "notebook")
         }
-        UrlContentKind::Docx | UrlContentKind::Pptx => {
+        UrlContentKind::Docx | UrlContentKind::Pptx | UrlContentKind::Xlsx => {
             if download_truncated {
                 return Err(Error::tool(
                     "read",
@@ -134,8 +136,10 @@ pub fn convert_bytes(
             }
             let document_kind = if kind == UrlContentKind::Docx {
                 crate::document_read::DocumentKind::Docx
-            } else {
+            } else if kind == UrlContentKind::Pptx {
                 crate::document_read::DocumentKind::Pptx
+            } else {
+                crate::document_read::DocumentKind::Xlsx
             };
             (
                 crate::document_read::convert(bytes, document_kind)?,
@@ -174,6 +178,7 @@ fn classify(url: &str, content_type: &str, bytes: &[u8]) -> UrlContentKind {
         return match kind {
             crate::document_read::DocumentKind::Docx => UrlContentKind::Docx,
             crate::document_read::DocumentKind::Pptx => UrlContentKind::Pptx,
+            crate::document_read::DocumentKind::Xlsx => UrlContentKind::Xlsx,
         };
     }
     if ext_is("ipynb") || ct.contains("application/x-ipynb+json") {
@@ -327,6 +332,18 @@ mod tests {
                 b"PK",
             ),
             UrlContentKind::Pptx
+        );
+        assert_eq!(
+            classify("https://x/BOOK.XLSX?download=1", "application/octet-stream", b"PK"),
+            UrlContentKind::Xlsx
+        );
+        assert_eq!(
+            classify(
+                "https://x/download",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=binary",
+                b"PK",
+            ),
+            UrlContentKind::Xlsx
         );
     }
 
