@@ -7,12 +7,14 @@ use super::{Judge, Protect};
 use crate::error::{Error, Result};
 use serde_json::Value;
 
+mod schema;
+
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_SYSTEM_BYTES: usize = 16 * 1024;
 const DEFAULT_SYSTEM: &str = "Answer the supplied request. Return the answer as text. Do not call tools.";
 
 fn invalid() -> Error {
-    Error::tool("eval", "PI_COMPLETION_INPUT: expected prompt, optional system and max_tokens (1-4096); prompt/system must be nonempty text of at most 64/16 KiB")
+    Error::tool("eval", "PI_COMPLETION_INPUT: expected prompt, optional system, schema and max_tokens (1-4096); prompt/system must be nonempty text of at most 64/16 KiB")
 }
 
 /// Validated input for a one-shot, tool-free auxiliary completion. No model,
@@ -21,12 +23,13 @@ pub struct CompletionRequest {
     prompt: String,
     system: String,
     max_tokens: Option<u32>,
+    schema: Option<schema::OutputSchema>,
 }
 
 impl CompletionRequest {
     pub fn parse(input: Value) -> Result<Self> {
         let fields = input.as_object().ok_or_else(invalid)?;
-        if fields.keys().any(|key| !matches!(key.as_str(), "prompt" | "system" | "max_tokens")) {
+        if fields.keys().any(|key| !matches!(key.as_str(), "prompt" | "system" | "max_tokens" | "schema")) {
             return Err(invalid());
         }
         let prompt = fields.get("prompt").and_then(Value::as_str).ok_or_else(invalid)?;
@@ -39,8 +42,14 @@ impl CompletionRequest {
             value.as_u64().filter(|value| (1..=4096).contains(value))
                 .and_then(|value| u32::try_from(value).ok()).ok_or_else(invalid)
         }).transpose()?;
+        // Compile before any attempt reservation, credential resolution or
+        // provider I/O. A schema cannot grant a reference retriever authority.
+        let schema = fields.get("schema").map(schema::OutputSchema::parse).transpose()?;
         // Check all borrowed values before cloning any guest-controlled text.
-        Ok(Self { prompt: prompt.to_owned(), system: system.to_owned(), max_tokens })
+        if let Some(schema) = &schema {
+            schema.envelope(prompt)?;
+        }
+        Ok(Self { prompt: prompt.to_owned(), system: system.to_owned(), max_tokens, schema })
     }
 }
 
@@ -54,8 +63,8 @@ fn validate_text(prompt: &str, system: &str) -> Result<()> {
 }
 
 impl Judge {
-    /// Use this same explicit provider binding for a general text completion.
-    /// No conversation is replayed and no tool is advertised or executed.
+    /// Use this same explicit provider binding for text or schema-validated
+    /// JSON. No conversation is replayed and no tool is advertised or executed.
     pub async fn complete(&self, request: CompletionRequest) -> Result<Value> {
         self.complete_protected(request, None).await
     }
@@ -65,10 +74,33 @@ impl Judge {
         request: CompletionRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
-        let [system, prompt] = self.screen(&request.system, &request.prompt, protect)?;
-        validate_text(&prompt, &system)?;
+        let (system, prompt) = match &request.schema {
+            Some(schema) => {
+                // Screen prompt and schema together: annotations and example
+                // values can contain secrets too. Never validate against a
+                // redacted/weakened contract or send the unscreened original.
+                let envelope = schema.envelope(&request.prompt)?;
+                let [system, envelope] = self.screen(&request.system, &envelope, protect)?;
+                let prompt = schema.screened_prompt(&envelope)?;
+                validate_text(&prompt, &system)?;
+                (schema::json_system(system), envelope)
+            }
+            None => {
+                let [system, prompt] = self.screen(&request.system, &request.prompt, protect)?;
+                validate_text(&prompt, &system)?;
+                (system, prompt)
+            }
+        };
         let (text, usage) = self.request_text(system, prompt, request.max_tokens).await?;
-        Ok(self.reply("pi.completion.v1", "text", Value::String(text), usage))
+        let data = request.schema.as_ref().map(|schema| schema.answer(&text)).transpose()?;
+        let mut reply = self.reply("pi.completion.v1", "text", Value::String(text), usage);
+        if let Some(data) = data {
+            // Explicit JSON null is valid data. Absence means no schema was
+            // requested; neither malformed output nor failure yields null.
+            reply["data"] = data;
+            reply["schemaValid"] = Value::Bool(true);
+        }
+        Ok(reply)
     }
 }
 

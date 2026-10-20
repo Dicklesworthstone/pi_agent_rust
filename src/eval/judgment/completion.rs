@@ -51,7 +51,8 @@ impl Invocation<'_> {
 
 fn public_error(error: Error) -> String {
     let text = error.to_string();
-    for code in ["PI_SECRET_BLOCK", "PI_AUXILIARY_INPUT_LIMIT", "PI_AUXILIARY_KEY_COLLISION", "PI_COMPLETION_INPUT"] {
+    for code in ["PI_SECRET_BLOCK", "PI_AUXILIARY_INPUT_LIMIT", "PI_AUXILIARY_KEY_COLLISION",
+        "PI_COMPLETION_INPUT", "PI_COMPLETION_SCHEMA", "PI_COMPLETION_PRIVACY", "PI_COMPLETION_RESPONSE"] {
         if text.contains(code) { return format!("{code}: completion failed; no answer"); }
     }
     for suffix in ["BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER"] {

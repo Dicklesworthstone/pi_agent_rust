@@ -189,7 +189,7 @@ fn concentration(values: &[f64]) -> f64 {
     (1.0 - entropy / f64::from(count).ln()).clamp(0.0, 1.0)
 }
 
-fn bounded_json(value: &Value, limit: usize) -> Result<String> {
+pub(super) fn bounded_json(value: &Value, limit: usize) -> Result<String> {
     fn shape(value: &Value, depth: usize, left: &mut usize) -> Result<()> {
         if depth > 32 || *left == 0 { return Err(invalid()); }
         *left -= 1;
@@ -254,6 +254,6 @@ impl<'de> Deserialize<'de> for Strict {
         deserializer.deserialize_any(Json)
     }
 }
-fn strict_json(text: &str) -> serde_json::Result<Value> {
+pub(super) fn strict_json(text: &str) -> serde_json::Result<Value> {
     serde_json::from_str::<Strict>(text).map(|Strict(value)| value)
 }
