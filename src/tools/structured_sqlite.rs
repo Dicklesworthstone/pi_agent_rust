@@ -26,6 +26,8 @@ const MAX_NAME_BYTES: usize = 1024;
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_TABLES: usize = 500;
 const MAX_COLUMNS: usize = 256;
+const MAX_PAGE_ROWS: usize = 500;
+const MAX_RAW_QUERY_ROWS: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct QueryRequest {
@@ -57,6 +59,45 @@ impl QueryRequest {
 
     pub(super) fn has_selectors(&self) -> bool {
         self.table.is_some() || self.query.is_some() || self.paged
+    }
+
+    /// Validate both path-authored requests and the deserialized worker input.
+    /// Pagination applies to a query's result, never to its source tables.
+    fn validate(&self) -> Result<()> {
+        if !(1..=MAX_PAGE_ROWS).contains(&self.row_limit)
+            || self.row_offset > i64::MAX as u64
+        {
+            return Err(invalid("row limit must be 1 through 500 and offset a non-negative SQLite integer"));
+        }
+        if !self.paged && (self.row_offset != 0 || self.row_limit != 20) {
+            return Err(invalid("row pagination requires an explicit page request"));
+        }
+        if let Some(query) = &self.query {
+            if self.table.is_some() || self.key.is_some() {
+                return Err(invalid("q queries the database; remove the :table or :table:key selector"));
+            }
+            if self.predicate.is_some() || self.order.is_some() {
+                return Err(invalid("q accepts only limit and offset; put where/order clauses inside the SQL"));
+            }
+            validate_query(query)?;
+        } else {
+            if self.paged && (self.table.is_none() || self.key.is_some()) {
+                return Err(invalid("where/order/limit/offset require a table without a row key, or q"));
+            }
+            if self.key.is_some() && self.table.is_none() {
+                return Err(invalid("row keys require a table"));
+            }
+            if (self.predicate.is_some() || self.order.is_some()) && !self.paged {
+                return Err(invalid("where/order require table pagination"));
+            }
+            if let Some(predicate) = &self.predicate {
+                validate_predicate(predicate)?;
+            }
+        }
+        if self.table.as_deref() == Some("") || self.key.as_deref() == Some("") {
+            return Err(invalid("table names and row keys cannot be empty"));
+        }
+        Ok(())
     }
 }
 
@@ -138,8 +179,8 @@ pub(super) fn parse_path(path: &str) -> Result<Option<QueryRequest>> {
                     request.row_limit = value
                         .parse::<usize>()
                         .ok()
-                        .filter(|limit| (1..=500).contains(limit))
-                        .ok_or_else(|| invalid("table limit must be between 1 and 500"))?;
+                        .filter(|limit| (1..=MAX_PAGE_ROWS).contains(limit))
+                        .ok_or_else(|| invalid("row limit must be between 1 and 500"))?;
                     request.paged = true;
                 }
                 "offset" => {
@@ -147,25 +188,14 @@ pub(super) fn parse_path(path: &str) -> Result<Option<QueryRequest>> {
                         .parse::<u64>()
                         .ok()
                         .filter(|offset| *offset <= i64::MAX as u64)
-                        .ok_or_else(|| invalid("table offset must be a non-negative SQLite integer"))?;
+                        .ok_or_else(|| invalid("row offset must be a non-negative SQLite integer"))?;
                     request.paged = true;
                 }
                 _ => return Err(invalid(format!("unknown SQLite query parameter {key}"))),
             }
         }
     }
-    if request.query.is_some() && (request.table.is_some() || request.paged) {
-        return Err(invalid("q cannot be combined with table selectors or table pagination"));
-    }
-    if request.paged && (request.table.is_none() || request.key.is_some()) {
-        return Err(invalid("where/order/limit/offset require a table without a row key"));
-    }
-    if let Some(query) = &request.query {
-        validate_query(query)?;
-    }
-    if let Some(predicate) = &request.predicate {
-        validate_predicate(predicate)?;
-    }
+    request.validate()?;
     Ok(Some(request))
 }
 
@@ -421,7 +451,7 @@ fn apply_wal(mut image: Vec<u8>, wal: &[u8]) -> Result<(Vec<u8>, usize)> {
         return Err(invalid("WAL does not match the database format"));
     }
     let little_endian = be32(wal, 0) == 0x377f_0682;
-    let mut state = checksum(&wal[..24], little_endian, [0, 0]);
+    let mut state = checksum(wal.get(..24).ok_or_else(|| invalid("invalid WAL header"))?, little_endian, [0, 0]);
     if state != [be32(wal, 24), be32(wal, 28)] {
         return Err(invalid("WAL header checksum mismatch"));
     }
@@ -472,6 +502,7 @@ pub(super) async fn execute(
     path: PathBuf,
     roots: Vec<PathBuf>,
 ) -> Result<QueryOutcome> {
+    request.validate()?;
     let (image, wal_frames) = asupersync::runtime::spawn_blocking_io(move || snapshot(file, &path, &roots)).await?;
     let wire = WorkerRequest {
         request,
@@ -693,7 +724,31 @@ fn render_rows(result: &QueryRows) -> Result<String> {
     Ok(text)
 }
 
+/// Build a copyable next-page query without reinterpreting SQL punctuation,
+/// '+' arithmetic, '%' escapes, Unicode, or parameter delimiters. A query that
+/// was supplied mostly unescaped can expand beyond the input bound: omit the
+/// copyable selector in that case, but still provide the numeric next offset.
+fn next_query(sql: &str, limit: usize, offset: u64) -> Option<String> {
+    let suffix = format!("&limit={limit}&offset={offset}");
+    let mut next = String::from("q=");
+    for byte in sql.bytes() {
+        let plain = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let size = if plain { 1 } else { 3 };
+        if next.len() + size + suffix.len() > MAX_QUERY_BYTES {
+            return None;
+        }
+        if plain {
+            next.push(char::from(byte));
+        } else {
+            write!(next, "%{byte:02X}").ok();
+        }
+    }
+    next.push_str(&suffix);
+    Some(next)
+}
+
 async fn query_image(image: &[u8], request: &QueryRequest, wal_frames: usize) -> Result<QueryOutcome> {
+    request.validate()?;
     let conn = Connection::import_bytes(image).await.map_err(sql_error)?;
     conn.execute("PRAGMA query_only = ON").await.map_err(sql_error)?;
     let mut metadata = serde_json::json!({
@@ -706,13 +761,39 @@ async fn query_image(image: &[u8], request: &QueryRequest, wal_frames: usize) ->
         "walFrames": wal_frames,
     });
     if let Some(query) = &request.query {
-        validate_query(query)?;
-        let result = bounded_rows(&conn, &format!("SELECT * FROM ({query}) AS pi_read_query LIMIT 1001"), &[], 1000).await?;
+        let limit = if request.paged { request.row_limit } else { MAX_RAW_QUERY_ROWS };
+        // The outer page preserves any LIMIT/OFFSET, aggregation, DISTINCT,
+        // or ordering already in q. Skipped rows are not retained by the host.
+        // Query admission still forbids comments, semicolons and parameters;
+        // these two bound parameters belong only to the host-authored wrapper.
+        let result = bounded_rows(
+            &conn,
+            &format!("SELECT * FROM ({query}) AS pi_read_query LIMIT ?1 OFFSET ?2"),
+            &[
+                SqliteValue::Integer((limit + 1) as i64),
+                SqliteValue::Integer(request.row_offset as i64),
+            ],
+            limit,
+        ).await?;
         let mut content = render_rows(&result)?;
         if result.has_more {
-            content.push_str("\n[Result limited to 1000 rows or 8 MiB. Add LIMIT/OFFSET to q to continue.]\n");
+            let next = request.row_offset.checked_add(result.rows.len() as u64)
+                .filter(|offset| *offset <= i64::MAX as u64)
+                .ok_or_else(|| invalid("next row offset exceeds the SQLite integer range"))?;
+            // An unpaged query keeps its historical 1000-row ceiling. Its
+            // continuation switches to an explicitly bounded page of <=500.
+            let next_limit = limit.min(MAX_PAGE_ROWS);
+            if let Some(selector) = next_query(query, next_limit, next) {
+                writeln!(content, "\n[More rows available. Replace the database query suffix with ?{selector} to continue.]").ok();
+                metadata["nextQuery"] = serde_json::json!(selector);
+            } else {
+                writeln!(content, "\n[More rows available. Keep q unchanged and set limit={next_limit}&offset={next}; the encoded continuation would exceed 32 KiB.]").ok();
+            }
+            metadata["nextRowOffset"] = serde_json::json!(next);
         }
         metadata["rowCount"] = serde_json::json!(result.rows.len());
+        metadata["rowOffset"] = serde_json::json!(request.row_offset);
+        metadata["rowLimit"] = serde_json::json!(limit);
         metadata["hasMoreRows"] = serde_json::json!(result.has_more);
         metadata["cellsTruncated"] = serde_json::json!(result.cells_truncated);
         metadata["namesTruncated"] = serde_json::json!(result.names_truncated);
@@ -865,7 +946,10 @@ mod tests {
         assert_eq!(request.key.as_deref(), Some("key:value"));
         let request = parse_path("data.sqlite?q=SELECT+1%2B2").unwrap().unwrap();
         assert_eq!(request.query.as_deref(), Some("SELECT+1+2"));
-        assert!(parse_path("data.sqlite3?query=SELECT 1&limit=2").is_err());
+        let request = parse_path("data.sqlite3?query=SELECT 1&limit=2").unwrap().unwrap();
+        assert_eq!(request.query.as_deref(), Some("SELECT 1"));
+        assert_eq!(request.row_limit, 2);
+        assert!(request.paged);
         assert!(parse_path("data.db:users:1?where=active=1").is_err());
         assert!(parse_path("data.db:users?limit=501").is_err());
         assert!(parse_path("data.db:users?offset=-1").is_err());
@@ -888,6 +972,194 @@ mod tests {
             assert!(validate_predicate(predicate).is_err(), "{predicate}");
         }
         assert!(validate_predicate("name='ORDER' AND (active=1 OR id>5)").is_ok());
+    }
+
+    #[test]
+    fn query_pages_accept_either_parameter_order_and_preserve_unpaged_defaults() {
+        for path in [
+            "data.sqlite?q=SELECT name FROM users&limit=2&offset=1",
+            "data.sqlite?offset=1&query=SELECT name FROM users&limit=2",
+            "data.sqlite?limit=2&offset=1&q=SELECT name FROM users",
+        ] {
+            let request = parse_path(path).unwrap().unwrap();
+            assert_eq!(request.query.as_deref(), Some("SELECT name FROM users"));
+            assert_eq!(request.row_limit, 2);
+            assert_eq!(request.row_offset, 1);
+            assert!(request.paged);
+            // The supervised worker receives exactly the admitted page.
+            let wire = serde_json::to_vec(&request).unwrap();
+            let decoded: QueryRequest = serde_json::from_slice(&wire).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.row_limit, 2);
+            assert_eq!(decoded.row_offset, 1);
+        }
+        let offset_only = parse_path("data.db?q=SELECT 1&offset=0").unwrap().unwrap();
+        assert!(offset_only.paged);
+        assert_eq!(offset_only.row_limit, 20);
+        assert!(!parse_path("data.db?q=SELECT 1").unwrap().unwrap().paged);
+        assert!(parse_path("data.db?q=SELECT 1&limit=500").is_ok());
+        assert!(parse_path("data.db?q=SELECT 1&offset=9223372036854775807").is_ok());
+    }
+
+    #[test]
+    fn query_pages_reject_mixed_selectors_invalid_bounds_and_duplicate_fields() {
+        for path in [
+            "data.db:users?q=SELECT 1&limit=1",
+            "data.db:users:1?q=SELECT 1&offset=1",
+            "data.db?q=SELECT 1&where=id=1",
+            "data.db?order=id:desc&q=SELECT 1",
+            "data.db?q=SELECT 1&limit=0",
+            "data.db?q=SELECT 1&limit=501",
+            "data.db?q=SELECT 1&limit=1.5",
+            "data.db?q=SELECT 1&offset=-1",
+            "data.db?q=SELECT 1&offset=9223372036854775808",
+            "data.db?q=SELECT 1&limit=1&limit=2",
+            "data.db?q=SELECT 1&offset=0&offset=1",
+            "data.db?q=SELECT 1&query=SELECT 2&limit=1",
+            "data.db?q=&limit=1",
+            "data.db?limit=1",
+            "data.db:users:1?limit=1",
+        ] {
+            assert!(parse_path(path).is_err(), "{path}");
+        }
+        for sql in [
+            "DELETE FROM users", "PRAGMA table_info(users)",
+            "SELECT 1; SELECT 2", "SELECT ?1", "SELECT 1 -- trailing",
+            "SELECT readfile('/etc/passwd')",
+        ] {
+            assert!(parse_path(&format!("data.db?q={sql}&limit=1&offset=1")).is_err());
+        }
+    }
+
+    #[test]
+    fn worker_revalidates_page_bounds_and_shape_before_importing_the_image() {
+        on_engine_thread(|| futures::executor::block_on(async {
+            let valid = parse_path("data.db?q=SELECT 1&limit=1").unwrap().unwrap();
+            let original = serde_json::to_value(valid).unwrap();
+            for (field, value) in [
+                ("row_limit", serde_json::json!(0)),
+                ("row_limit", serde_json::json!(usize::MAX)),
+                ("row_offset", serde_json::json!(u64::MAX)),
+                ("table", serde_json::json!("users")),
+                ("predicate", serde_json::json!("1=1")),
+                ("order", serde_json::json!("id:asc")),
+                ("paged", serde_json::json!(false)),
+            ] {
+                let mut wire = original.clone();
+                wire[field] = value;
+                let request: QueryRequest = serde_json::from_value(wire).unwrap();
+                let expected = request.validate().unwrap_err().to_string();
+                let actual = query_image(&[], &request, 0).await.unwrap_err().to_string();
+                assert_eq!(actual, expected, "must reject before importing invalid image bytes");
+            }
+        }));
+    }
+
+    #[test]
+    fn query_continuation_roundtrips_sql_delimiters_unicode_and_literal_plus() {
+        let sql = "SELECT 'a&b+% 雪?#' AS text, id+1 FROM users ORDER BY id";
+        let next = next_query(sql, 2, 4).unwrap();
+        assert!(!next.contains(' '));
+        assert!(!next.contains('+'));
+        assert!(next.contains("%26"));
+        assert!(next.contains("%2B"));
+        assert!(next.contains("%25"));
+        let request = parse_path(&format!("data.sqlite?{next}")).unwrap().unwrap();
+        assert_eq!(request.query.as_deref(), Some(sql));
+        assert_eq!(request.row_offset, 4);
+        assert_eq!(request.row_limit, 2);
+        let suffix_size = "q=".len() + "&limit=1&offset=0".len();
+        assert_eq!(next_query(&"x".repeat(MAX_QUERY_BYTES - suffix_size), 1, 0).unwrap().len(), MAX_QUERY_BYTES);
+        assert!(next_query(&"x".repeat(MAX_QUERY_BYTES - suffix_size + 1), 1, 0).is_none());
+        assert!(next_query(&" ".repeat(MAX_QUERY_BYTES / 2), 1, 0).is_none());
+    }
+
+    #[test]
+    fn native_query_pages_traverse_the_result_once_and_stop_at_exact_boundary() {
+        on_engine_thread(|| futures::executor::block_on(async {
+            let image = image_fixture().await;
+            let mut request = parse_path("data.sqlite?q=SELECT name FROM users ORDER BY id DESC&limit=1").unwrap().unwrap();
+            for (index, expected) in ["Max", "Grace", "Ada"].into_iter().enumerate() {
+                let page = query_image(&image, &request, 0).await.unwrap();
+                assert!(page.content.lines().any(|line| line == format!("| {expected} |")));
+                assert_eq!(page.metadata["rowCount"], 1);
+                assert_eq!(page.metadata["rowOffset"], index);
+                assert_eq!(page.metadata["rowLimit"], 1);
+                assert_eq!(page.metadata["hasMoreRows"], index < 2);
+                if index < 2 {
+                    assert_eq!(page.metadata["nextRowOffset"], index + 1);
+                    let selector = page.metadata["nextQuery"].as_str().unwrap();
+                    assert!(page.content.contains(&format!("?{selector}")));
+                    request = parse_path(&format!("data.sqlite?{selector}")).unwrap().unwrap();
+                } else {
+                    assert!(page.metadata.get("nextRowOffset").is_none());
+                    assert!(page.metadata.get("nextQuery").is_none());
+                }
+            }
+            // A page exactly as large as the entire result has no false next page.
+            let request = parse_path("data.sqlite?q=SELECT name FROM users ORDER BY id&limit=3").unwrap().unwrap();
+            let page = query_image(&image, &request, 0).await.unwrap();
+            assert_eq!(page.metadata["rowCount"], 3);
+            assert_eq!(page.metadata["hasMoreRows"], false);
+            assert!(page.metadata.get("nextQuery").is_none());
+        }));
+    }
+
+    #[test]
+    fn native_query_paging_preserves_inner_limits_ctes_values_and_aggregates() {
+        on_engine_thread(|| futures::executor::block_on(async {
+            let image = image_fixture().await;
+            for (sql, expected, more) in [
+                ("SELECT name FROM users ORDER BY id LIMIT 2 OFFSET 1", "| Max |", false),
+                ("WITH selected AS (SELECT id, name FROM users) SELECT name FROM selected ORDER BY id", "| Grace |", true),
+                ("VALUES (11), (22), (33)", "| 22 |", true),
+                ("SELECT active, count(*) AS n FROM users GROUP BY active ORDER BY active", "| 1 | 2 |", false),
+                ("SELECT DISTINCT active FROM users ORDER BY active", "| 1 |", false),
+                ("SELECT 'alpha' AS name UNION ALL SELECT 'beta' AS name UNION ALL SELECT 'gamma' AS name ORDER BY name", "| beta |", true),
+                ("SELECT id AS x, id+10 AS x FROM users WHERE id<10 ORDER BY id", "| 2 | 12 |", false),
+            ] {
+                let selector = next_query(sql, 1, 1).unwrap();
+                let request = parse_path(&format!("data.sqlite?{selector}")).unwrap().unwrap();
+                let page = query_image(&image, &request, 0).await.unwrap();
+                assert!(page.content.lines().any(|line| line == expected), "{sql}: {}", page.content);
+                assert_eq!(page.metadata["rowCount"], 1, "{sql}");
+                assert_eq!(page.metadata["hasMoreRows"], more, "{sql}");
+            }
+        }));
+    }
+
+    #[test]
+    fn native_empty_and_beyond_end_pages_have_no_continuation() {
+        on_engine_thread(|| futures::executor::block_on(async {
+            let image = image_fixture().await;
+            for path in [
+                "data.sqlite?q=SELECT name FROM users WHERE 0&limit=1",
+                "data.sqlite?q=SELECT name FROM users ORDER BY id&limit=1&offset=3",
+                "data.sqlite?q=SELECT name FROM users ORDER BY id&offset=9223372036854775807",
+                "data.sqlite?q=SELECT name FROM users LIMIT 0&limit=1",
+            ] {
+                let request = parse_path(path).unwrap().unwrap();
+                let page = query_image(&image, &request, 0).await.unwrap();
+                assert_eq!(page.content, "(no rows)\n");
+                assert_eq!(page.metadata["rowCount"], 0);
+                assert_eq!(page.metadata["hasMoreRows"], false);
+                assert!(page.metadata.get("nextRowOffset").is_none());
+                assert!(page.metadata.get("nextQuery").is_none());
+            }
+        }));
+    }
+
+    #[test]
+    fn native_long_query_uses_numeric_continuation_without_an_unparseable_selector() {
+        on_engine_thread(|| futures::executor::block_on(async {
+            let image = image_fixture().await;
+            let sql = format!("SELECT{}name FROM users ORDER BY id", " ".repeat(MAX_QUERY_BYTES / 2));
+            let request = parse_path(&format!("data.sqlite?q={sql}&limit=1")).unwrap().unwrap();
+            let page = query_image(&image, &request, 0).await.unwrap();
+            assert_eq!(page.metadata["nextRowOffset"], 1);
+            assert!(page.metadata.get("nextQuery").is_none());
+            assert!(page.content.contains("Keep q unchanged and set limit=1&offset=1"));
+        }));
     }
 
     #[test]
@@ -944,6 +1216,17 @@ mod tests {
             let output = query_image(&image, &request, 0).await.unwrap();
             assert_eq!(output.metadata["rowCount"], 1000);
             assert_eq!(output.metadata["hasMoreRows"], true);
+            assert_eq!(output.metadata["rowLimit"], 1000);
+            assert_eq!(output.metadata["nextRowOffset"], 1000);
+            let selector = output.metadata["nextQuery"].as_str().unwrap();
+            let next = parse_path(&format!("data.sqlite?{selector}")).unwrap().unwrap();
+            assert_eq!(next.row_limit, MAX_PAGE_ROWS);
+            let tail = query_image(&image, &next, 0).await.unwrap();
+            assert_eq!(tail.metadata["rowCount"], 5);
+            assert_eq!(tail.metadata["hasMoreRows"], false);
+            assert!(tail.content.lines().any(|line| line == "| 1001 |"));
+            assert!(tail.content.lines().any(|line| line == "| 1005 |"));
+            assert!(tail.metadata.get("nextQuery").is_none());
             let conn = Connection::import_bytes(&image).await.unwrap();
             let result = bounded_rows(&conn, "SELECT ?1 AS value", &[SqliteValue::Text("界".repeat(MAX_CELL_BYTES).into())], 1).await.unwrap();
             assert!(result.cells_truncated);
