@@ -75,6 +75,57 @@ resends anything or resets the goal's prompt/token allowances.
 This SDK input surface is a prerequisite for terminal queue editing and native
 attachments during goals; it does not itself wire the default terminal's keys.
 
+## Explicit restoration of returned input
+
+Both `SessionControlHandle` and `GoalControl` provide:
+
+```rust
+pub fn restore_pending(
+    &self,
+    pending: &mut Vec<PendingInput>,
+) -> Result<Vec<TransferredInput>>;
+```
+
+This accepts a detached batch returned in `GoalRunReport::pending`, by
+`take_pending()`, or assembled from successful `retract()` calls. It is an
+explicit host decision after reviewing the previous native result, not an
+automatic retry. Choose an accepting destination turn; for goals, explicitly
+resume/run the reviewed goal first and restore through the control for its
+current native prompt. An idle, paused or finished goal cannot be implicitly
+resumed by restoration.
+
+On success, the source vector is empty, the destination contains the entire
+batch after existing queued input, and receipts map each previous ID to its
+new ID in admission order. Steering/follow-up lanes, ordered text/image/media
+blocks and original authored prose survive. Old IDs cannot edit or retract the
+new entries. Repeating the operation on the now-empty vector admits nothing.
+An empty batch is a no-op only when the destination is still accepting input.
+
+On validation, duplicate-ID, closed-destination, allocation or count/byte
+capacity failure, both the source vector and destination queue remain unchanged.
+There is no accepted prefix that the host must guess how to retry. Source
+payloads are temporarily moved into an exclusively borrowed staging view;
+refusal or unwinding restores them without rereading files or allocating payload
+copies. Only validated, bounded payloads are copied into native batch admission.
+All receipt allocation precedes publication.
+
+`PendingInput` exposes editable `text` and `content` fields. Restoration therefore
+uses ordinary native batch validation again and recomputes byte accounting;
+it never trusts the private size recorded before a host edit. Duplicate source
+IDs fail with `SESSION_CONTROL_DUPLICATE_INPUT` before admission. Existing
+native limits still apply: 100 pending inputs, 8 MiB total accounted bytes,
+4 MiB serialized native content per item, 128 blocks and 256 KiB authored text.
+Invalid or oversized content is retained with the caller for correction.
+
+Queue admission is atomic; execution is not. A turn may consume part of an
+accepted batch before cancellation. These receipts do not acknowledge provider
+execution or durable persistence. A host can clone a `PendingInput` itself, so
+this is not a durable exactly-once or cross-invocation deduplication service.
+Never reconstruct unclaimed input from already-delivered transcript messages.
+Restoration does not dispatch a model request, reset goal counters or authorize
+another goal-driver prompt. The existing `transfer_pending_to` API remains the
+separate zero-copy path between a finished native mailbox and an accepting one.
+
 ## Reports preserve native outcomes
 
 The final report distinguishes the goal driver's stop from the native turn's
@@ -118,3 +169,13 @@ The image/audio data in mailbox fixtures is structural test input, not live
 media-decoding evidence. The required DSR command was retried for this change
 and again could not start (`dsr: command not found`, exit 127). These seven
 Rust tests, compilation, formatting and Clippy remain unexecuted.
+
+Detached restoration adds seven native mailbox regressions in
+`src/session_control/recovery.rs` for full-batch acceptance, identity rotation,
+capacity/closed refusal, edited-content revalidation, duplicate IDs, source
+restoration on unwind and byte/count limits. Two further goal tests cover
+idle/closed refusal without consumption and an actual goal report whose pending
+content is explicitly restored into a later resumed goal's native prompt.
+All nine additional Rust tests are authored, not executed. DSR was retried and
+remained unavailable (exit 127); no compilation, formatting, Clippy, live-model,
+PTY or cross-platform pass is claimed.

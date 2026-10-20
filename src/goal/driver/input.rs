@@ -4,7 +4,7 @@
 use super::GoalControl;
 use crate::error::Result;
 use crate::model::UserContent;
-use crate::session_control::{ControlSnapshot, InputId, InputKind, PendingInput};
+use crate::session_control::{ControlSnapshot, InputId, InputKind, PendingInput, TransferredInput};
 
 impl GoalControl {
     /// Queue ordered native text/image/media blocks at a steering boundary.
@@ -43,6 +43,19 @@ impl GoalControl {
         inputs: &[(InputKind, UserContent, String)],
     ) -> Result<Vec<InputId>> {
         self.current_turn()?.enqueue_batch_with_content(inputs)
+    }
+
+    /// Explicitly restore detached, unclaimed input to this goal's currently
+    /// accepting native turn. Success empties the supplied vector and returns
+    /// fresh identity mappings; failure leaves both source and mailbox intact.
+    /// Lanes, attachment blocks and authored source survive revalidation.
+    ///
+    /// This never resumes an idle/paused goal or targets a future prompt. Use
+    /// only after reviewing the prior run's outcome and choosing to resend its
+    /// unclaimed input. It is not durable deduplication or permission to replay
+    /// already-delivered messages; only native batch admission is atomic.
+    pub fn restore_pending(&self, pending: &mut Vec<PendingInput>) -> Result<Vec<TransferredInput>> {
+        self.current_turn()?.restore_pending(pending)
     }
 
     /// Correct one unclaimed message in place without moving it to the tail.
@@ -364,5 +377,86 @@ mod tests {
         assert!(requests[1].iter().any(|message| {
             matches!(message, Message::User(user) if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&content).unwrap())
         }));
+    }
+
+    #[test]
+    fn detached_recovery_refuses_idle_or_closed_goals_without_consuming_input() {
+        event("goal_detached_admission");
+        let (mut handle, provider) = fixture();
+        let old = handle.prompt_controlled("old".into(), |_| {});
+        let source = old.control();
+        let previous_id = source.follow_up_with_content(&payload(), "recovered image").unwrap();
+        drop(old);
+        let mut pending = source.take_pending();
+        let goal = GoalControl::new();
+        assert!(goal.restore_pending(&mut pending).unwrap_err().to_string().contains("GOAL_INPUT_IDLE"));
+        assert_eq!(pending[0].id, previous_id);
+        same_content(&pending[0].content, &payload());
+        let target = handle.prompt_controlled("target".into(), |_| {});
+        goal.install(target.control());
+        let closed = GoalControl::new();
+        closed.pause();
+        assert!(closed.restore_pending(&mut pending).unwrap_err().to_string().contains("GOAL_INPUT_CLOSED"));
+        assert_eq!(pending[0].id, previous_id);
+        let receipts = goal.restore_pending(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(receipts[0].previous_id, previous_id);
+        assert_ne!(receipts[0].new_id, previous_id);
+        assert!(goal.retract(previous_id).is_none());
+        let recovered = goal.retract(receipts[0].new_id).unwrap();
+        same_content(&recovered.content, &payload());
+        assert_eq!(recovered.text, "recovered image");
+        assert!(provider.requests.lock().unwrap().is_empty(), "restoration alone dispatches no prompt");
+    }
+
+    #[test]
+    fn reviewed_goal_report_inputs_can_be_restored_into_one_later_native_turn() {
+        event("goal_report_restoration");
+        let (mut handle, provider) = fixture();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let content = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new("retained expanded instruction"))]);
+        let for_first = content.clone();
+        runtime.block_on(async {
+            let owner = AgentCx::for_current_or_request();
+            let created = handle.create_goal(&owner, "inspect work", GoalBudget::default()).await.unwrap();
+            let first = handle.run_goal(&owner, &created.goal, Duration::from_secs(30), move |control, event| {
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    control.follow_up_with_content(&for_first, "user instruction to retain").unwrap();
+                }
+            }, |_, _| panic!("unclaimed input must stop verification")).unwrap();
+            let old_control = first.control();
+            let mut report = first.await;
+            assert_eq!(report.pending.len(), 1);
+            let old_id = report.pending[0].id;
+            assert!(old_control.restore_pending(&mut report.pending).is_err());
+            assert_eq!(report.pending[0].id, old_id);
+            // Explicit host review/resume, not automatic replay or a new goal.
+            let resumed = handle.resume_goal(&owner, &report.goal).await.unwrap();
+            let pending = Arc::new(Mutex::new(report.pending));
+            let source = Arc::clone(&pending);
+            let restored = Arc::new(Mutex::new(Vec::new()));
+            let receipts = Arc::clone(&restored);
+            let next = handle.run_goal(&owner, &resumed.goal, Duration::from_secs(30), move |control, event| {
+                if matches!(event, AgentEvent::AgentStart { .. }) {
+                    let mappings = control.restore_pending(&mut source.lock().unwrap()).unwrap();
+                    receipts.lock().unwrap().extend(mappings);
+                }
+            }, |_, _| GoalDecision::Pause { reason: "review restored input outcome".into() }).unwrap().await;
+            assert_eq!(next.stop, GoalRunStop::Paused);
+            assert_eq!(next.goal.id(), created.goal.id());
+            assert_eq!(next.goal.prompts_started(), 2);
+            assert!(next.pending.is_empty());
+            assert!(next.error.is_none());
+            assert!(pending.lock().unwrap().is_empty());
+            let receipts = restored.lock().unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].previous_id, old_id);
+            assert_ne!(receipts[0].new_id, old_id);
+        });
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "one old prompt and one resumed prompt with one restored follow-up");
+        assert_eq!(requests.last().unwrap().iter().filter(|message| {
+            matches!(message, Message::User(user) if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&content).unwrap())
+        }).count(), 1, "the pending input must be delivered once, not regenerated or duplicated");
     }
 }
