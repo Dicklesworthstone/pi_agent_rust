@@ -88,7 +88,8 @@ fn nested_dependencies_resolve_nearest_without_searching_above_workspace() {
     let inner = package(&outer, "dep", r#"{"exports":"./nested.mjs"}"#, &[("nested.mjs", "export default 2;")]);
     let files = files(&root);
     let importer = std::fs::canonicalize(outer.join("index.mjs")).unwrap();
-    assert_eq!(files.resolve_path(importer.to_str().unwrap(), "dep").unwrap(),
+    let identity = files.resolve_path(importer.to_str().unwrap(), "dep").unwrap();
+    assert_eq!(files.module_path(&identity).unwrap(),
         std::fs::canonicalize(inner.join("nested.mjs")).unwrap().to_str().unwrap());
     assert!(files.resolve_path("eval_script", "outside-only").unwrap_err().contains("NOT_FOUND"));
     std::fs::write(inner.join("package.json"), r#"{"exports":null}"#).unwrap();
@@ -176,4 +177,82 @@ fn in_workspace_package_links_work_but_escaping_links_and_special_manifests_fail
     rustix::fs::mkfifoat(rustix::fs::CWD, root.join("node_modules/pipe/package.json"),
         rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).unwrap();
     assert!(files.resolve_path("eval_script", "pipe").unwrap_err().contains("LIMIT"));
+}
+
+#[test]
+fn reloaded_package_exports_keep_older_importers_on_their_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = r#"{"exports":"./old.mjs"}"#;
+    let replacement = r#"{"exports":"./new.mjs"}"#;
+    let directory = package(dir.path(), "pkg", original,
+        &[("old.mjs", "export default 1;"), ("new.mjs", "export default 2;")]);
+    let files = files(dir.path());
+    let old = files.resolve_path("eval_script", "pkg").unwrap();
+    std::fs::write(directory.join("package.json"), replacement).unwrap();
+    // Ordinary imports retain both the module identity and metadata snapshot.
+    assert_eq!(files.resolve_path("eval_script", "pkg").unwrap(), old);
+    files.begin(AgentCx::for_testing_with_io(), Instant::now() + Duration::from_secs(5));
+    assert_eq!(files.reload().unwrap(), 1);
+    let fresh = files.resolve_path("eval_script", "pkg").unwrap();
+    assert_ne!(old, fresh);
+    assert_eq!(files.module_path(&fresh).unwrap(),
+        std::fs::canonicalize(directory.join("new.mjs")).unwrap().to_str().unwrap());
+    // Resolution inside an already-retained module uses its graph's metadata,
+    // not the current generation selected for inline cells and loaded scripts.
+    assert_eq!(files.resolve_path(&old, "pkg").unwrap(), old);
+    assert_eq!(files.resolve_path(&fresh, "pkg").unwrap(), fresh);
+    let state = files.0.borrow();
+    assert_eq!(state.packages.lookups, 2);
+    assert_eq!(state.packages.manifests.len(), 2);
+    assert_eq!(state.packages.bytes, original.len() + replacement.len());
+}
+
+#[test]
+fn missing_metadata_and_lookup_limits_are_versioned_without_resetting_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("package.json");
+    let files = files(&root);
+    assert!(manifest(&files, &root, &path, 0).unwrap().is_none());
+    std::fs::write(&path, "{}").unwrap();
+    assert!(manifest(&files, &root, &path, 0).unwrap().is_none());
+    for generation in 1..MAX_MANIFEST_LOOKUPS {
+        files.begin(AgentCx::for_testing_with_io(), Instant::now() + Duration::from_secs(5));
+        assert_eq!(files.reload().unwrap() as usize, generation);
+        assert!(manifest(&files, &root, &path, generation as u32).unwrap().is_some());
+    }
+    files.begin(AgentCx::for_testing_with_io(), Instant::now() + Duration::from_secs(5));
+    let next = files.reload().unwrap();
+    assert!(manifest(&files, &root, &path, next).unwrap_err().contains("LIMIT"));
+    // Existing positive and negative snapshots are still usable at capacity.
+    assert!(manifest(&files, &root, &path, 0).unwrap().is_none());
+    assert!(manifest(&files, &root, &path, 1).unwrap().is_some());
+    let state = files.0.borrow();
+    assert_eq!(state.packages.lookups, MAX_MANIFEST_LOOKUPS);
+    assert_eq!(state.packages.manifests.len(), MAX_MANIFEST_LOOKUPS);
+    assert_eq!(state.packages.bytes, 2 * (MAX_MANIFEST_LOOKUPS - 1));
+    drop(state);
+    files.begin(AgentCx::for_testing(), Instant::now() + Duration::from_secs(5));
+    assert!(manifest(&files, &root, &path, 1).unwrap_err().contains("DENIED"));
+}
+
+#[test]
+fn reloading_package_metadata_cannot_recover_the_realm_byte_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("package.json");
+    let content = r#"{"type":"module"}"#;
+    std::fs::write(&path, content).unwrap();
+    let files = files(&root);
+    files.0.borrow_mut().packages.bytes = MAX_METADATA_BYTES - content.len();
+    let original = manifest(&files, &root, &path, 0).unwrap().unwrap();
+    assert_eq!(files.0.borrow().packages.bytes, MAX_METADATA_BYTES);
+    let generation = files.reload().unwrap();
+    assert!(manifest(&files, &root, &path, generation).unwrap_err().contains("LIMIT"));
+    let retained = manifest(&files, &root, &path, 0).unwrap().unwrap();
+    assert!(Rc::ptr_eq(&original, &retained));
+    let state = files.0.borrow();
+    assert_eq!(state.packages.bytes, MAX_METADATA_BYTES);
+    assert_eq!(state.packages.lookups, 2);
+    assert_eq!(state.packages.manifests.len(), 1);
 }

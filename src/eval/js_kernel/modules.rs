@@ -172,7 +172,7 @@ impl ModuleFiles {
             .parent()
             .ok_or("EVAL_MODULE_BASE: importer has no directory")?;
         let (requested, package_root) = if relative { (parent.join(name), None) } else {
-            let (path, package_root) = packages::resolve(self, &root, parent, name)?;
+            let (path, package_root) = packages::resolve(self, &root, parent, name, generation)?;
             (path, Some(package_root))
         };
         let resolved = std::fs::canonicalize(&requested)
@@ -195,7 +195,7 @@ impl ModuleFiles {
         {
             return Err("EVAL_MODULE_TYPE: module alias changes its data/code type".into());
         }
-        packages::validate_javascript(self, &root, &resolved)?;
+        packages::validate_javascript(self, &root, &resolved, generation)?;
         let resolved = resolved
             .to_str()
             .filter(|path| path.len() <= MAX_PATH_BYTES && !path.chars().any(char::is_control))

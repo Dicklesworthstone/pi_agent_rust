@@ -58,13 +58,25 @@ The helper checks the current cell's I/O authority, deadline and cancellation,
 not the permissions of the cell that originally created it. It grants no extra
 filesystem roots, package paths or host tools.
 
-Package entry selection still follows the retained package-metadata catalog in
-this implementation. Reload refreshes code and data selected by that catalog,
-not changed `package.json` exports or previously missing manifest entries.
+Package metadata is also scoped to the graph generation. After an explicit
+reload, new imports reread `package.json`: changes to `exports`, `main`, and
+`type` take effect, and a previously absent manifest may become available.
+Previously imported modules continue to resolve through their original metadata
+snapshots. These include recorded missing manifests; ordinary imports never
+silently reinterpret an older graph after a manifest edit. Metadata not yet
+requested is still read on demand, not snapshotted atomically at reload time.
+
+Metadata versions retain the existing realm-wide limits of 128 manifest lookups
+and 2 MiB of metadata. Missing or failed lookups count too, and reload cannot
+recover either allowance. Cached snapshots can still be consulted at capacity
+under a valid current owner. Changed CommonJS scopes, sealed exports, malformed
+manifests and unsafe targets remain explicit failures, not fallback to an older
+successful cache entry. No packages are installed or fetched by this helper.
 
 Tests exercise the actual public EvalTool, native linking, transitive typed/data
-imports, old references, script origins, invalid attributes, reset and admission
-limits. Run `dsr quality --tool pi_agent_rust` for repository acceptance.
+imports, old references, script origins, invalid attributes, reset, package
+entry/type changes, negative metadata caches and cumulative admission limits.
+Run `dsr quality --tool pi_agent_rust` for repository acceptance.
 This implementation environment has no DSR, so Rust compilation, tests, rustfmt
 and Clippy have not run. This adds a native explicit reload workflow, not OMP's
 automatic per-cell module invalidation or full Bun compatibility.

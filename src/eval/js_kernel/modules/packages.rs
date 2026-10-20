@@ -1,7 +1,8 @@
 //! Workspace-installed ESM packages over the existing file/linker boundary.
 //!
 //! This is a resolver, not a package manager or Node compatibility runtime.
-//! Package metadata is an immutable, bounded snapshot of this retained realm.
+//! Package metadata is immutable within a module-graph generation. Reloads
+//! retain older snapshots and share the same realm-wide lookup/byte budgets.
 //! Conditional exports retain JSON insertion order; serde_json's default map
 //! ordering must not change which branch a package author selected.
 
@@ -24,7 +25,7 @@ const MAX_MAP_DEPTH: usize = 32;
 
 #[derive(Default)]
 pub(super) struct Catalog {
-    manifests: BTreeMap<PathBuf, Option<Rc<Manifest>>>,
+    manifests: BTreeMap<(u32, PathBuf), Option<Rc<Manifest>>>,
     roots: BTreeSet<PathBuf>,
     lookups: usize,
     bytes: usize,
@@ -118,11 +119,12 @@ fn check_map(value: &Export, depth: usize, remaining: &mut usize) -> Admission<(
     Ok(())
 }
 
-fn manifest(files: &ModuleFiles, root: &Path, path: &Path) -> Admission<Option<Rc<Manifest>>> {
+fn manifest(files: &ModuleFiles, root: &Path, path: &Path, generation: u32) -> Admission<Option<Rc<Manifest>>> {
+    let key = (generation, path.to_path_buf());
     {
         let mut state = files.0.borrow_mut();
         state.check()?;
-        if let Some(cached) = state.packages.manifests.get(path) { return Ok(cached.clone()); }
+        if let Some(cached) = state.packages.manifests.get(&key) { return Ok(cached.clone()); }
         if state.packages.lookups >= MAX_MANIFEST_LOOKUPS {
             return Err(error("LIMIT", "package metadata catalog exhausted; reset JavaScript"));
         }
@@ -168,7 +170,7 @@ fn manifest(files: &ModuleFiles, root: &Path, path: &Path) -> Admission<Option<R
     } else { None };
     let mut state = files.0.borrow_mut();
     state.check()?;
-    state.packages.manifests.insert(path.to_path_buf(), value.clone());
+    state.packages.manifests.insert(key, value.clone());
     Ok(value)
 }
 
@@ -263,7 +265,7 @@ fn target_path(root: &Path, target: &str) -> Admission<PathBuf> {
 
 /// Resolve only installed packages found at or below the workspace boundary.
 /// An existing nearer package is authoritative even when broken or sealed.
-pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &str) -> Admission<(PathBuf, PathBuf)> {
+pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &str, generation: u32) -> Admission<(PathBuf, PathBuf)> {
     let (package, tail) = split_package(name)?;
     let subpath = format!(".{tail}");
     let mut directory = parent;
@@ -280,7 +282,7 @@ pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &st
                     if !package_root.starts_with(root) || !package_root.is_dir() {
                         return Err(error("PATH", "installed package must be a directory inside the workspace"));
                     }
-                    let manifest = manifest(files, root, &package_root.join("package.json"))?
+                    let manifest = manifest(files, root, &package_root.join("package.json"), generation)?
                         .ok_or_else(|| error("MANIFEST", "installed package requires package.json"))?;
                     let target = if let Some(exports) = &manifest.exports {
                         exported_target(exports, &subpath)?
@@ -310,7 +312,7 @@ pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &st
 
 /// A package .js file needs an explicit ESM scope, including relative edges
 /// within symlinked workspace packages. Ordinary workspace scripts are unchanged.
-pub(super) fn validate_javascript(files: &ModuleFiles, root: &Path, path: &Path) -> Admission<()> {
+pub(super) fn validate_javascript(files: &ModuleFiles, root: &Path, path: &Path, generation: u32) -> Admission<()> {
     if path.extension().is_none_or(|extension| extension != "js") { return Ok(()); }
     let is_package = path.components().any(|part| part.as_os_str() == "node_modules")
         || files.0.borrow().packages.roots.iter().any(|root| path.starts_with(root));
@@ -319,7 +321,7 @@ pub(super) fn validate_javascript(files: &ModuleFiles, root: &Path, path: &Path)
     for _ in 0..MAX_ANCESTORS {
         files.0.borrow().check()?;
         if directory.file_name().is_some_and(|name| name == "node_modules") { break; }
-        if let Some(manifest) = manifest(files, root, &directory.join("package.json"))? {
+        if let Some(manifest) = manifest(files, root, &directory.join("package.json"), generation)? {
             return if manifest.kind.as_deref() == Some("module") { Ok(()) } else {
                 Err(error("COMMONJS", "package .js requires type:module; CommonJS is not executed"))
             };

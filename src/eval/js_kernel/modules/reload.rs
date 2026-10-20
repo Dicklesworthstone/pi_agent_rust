@@ -65,7 +65,7 @@ impl ModuleFiles {
             .ok_or_else(|| "EVAL_MODULE_PATH: unknown native module identity".to_owned())
     }
 
-    fn reload(&self) -> Admission<u32> {
+    pub(super) fn reload(&self) -> Admission<u32> {
         let mut state = self.0.borrow_mut();
         state.check()?;
         let active = state.active.as_ref().expect("checked active owner");

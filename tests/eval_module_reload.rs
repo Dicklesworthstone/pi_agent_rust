@@ -113,3 +113,75 @@ fn full_reset_remains_explicit_and_separate_tools_do_not_share_reload_state() {
     assert_eq!(reset.details.as_ref().unwrap()["cell"], 1);
     assert_eq!(text(&cell(&first, "reloadModules()")).trim(), "1");
 }
+
+#[test]
+fn changed_package_exports_and_transitive_main_refresh_as_one_new_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("node_modules/entry");
+    let dependency = dir.path().join("node_modules/dep");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::create_dir_all(&dependency).unwrap();
+    std::fs::write(entry.join("package.json"), r#"{"exports":"./old.mjs"}"#).unwrap();
+    std::fs::write(entry.join("old.mjs"),
+        "export const revision = 1; export async function later(){return (await import('dep')).n;}").unwrap();
+    std::fs::write(entry.join("new.mts"),
+        "export const revision: number = 2; export async function later(){return (await import('dep')).n;}").unwrap();
+    std::fs::write(dependency.join("package.json"), r#"{"main":"./old.mjs"}"#).unwrap();
+    std::fs::write(dependency.join("old.mjs"), "export const n = 42;").unwrap();
+    std::fs::write(dependency.join("new.mjs"), "export const n = 99;").unwrap();
+    let tool = EvalTool::new(dir.path());
+    cell(&tool, "globalThis.keep = 7; globalThis.old = await import('entry'); await old.later()");
+    std::fs::write(entry.join("package.json"), r#"{"exports":"./new.mts"}"#).unwrap();
+    std::fs::write(dependency.join("package.json"), r#"{"main":"./new.mjs"}"#).unwrap();
+    assert_eq!(text(&cell(&tool, "(await import('entry')) === old")).trim(), "true");
+    let output = cell(&tool, concat!(
+        "reloadModules(); globalThis.fresh = await import('entry');",
+        "display([keep,old.revision,fresh.revision,await old.later(),await fresh.later()]);"
+    ));
+    assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"][0], json!([7,1,2,42,99]));
+    assert_eq!(output.details.as_ref().unwrap()["reset"], false);
+    assert_eq!(output.details.as_ref().unwrap()["restarted"], false);
+}
+
+#[test]
+fn newly_created_manifest_requires_reload_and_does_not_erase_working_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join("node_modules/new-package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("index.mjs"), "export const n = 42;").unwrap();
+    let tool = EvalTool::new(dir.path());
+    cell(&tool, "globalThis.keep = 7");
+    let missing = run(&tool, json!({"kernel":"js", "code":"await import('new-package')"}));
+    assert!(missing.is_error);
+    assert!(text(&missing).contains("EVAL_PACKAGE_MANIFEST"));
+    std::fs::write(package.join("package.json"), r#"{"exports":"./index.mjs"}"#).unwrap();
+    let cached = run(&tool, json!({"kernel":"js", "code":"await import('new-package')"}));
+    assert!(cached.is_error);
+    assert!(text(&cached).contains("EVAL_PACKAGE_MANIFEST"));
+    let output = cell(&tool, "reloadModules(); display([keep,(await import('new-package')).n]);");
+    assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"][0], json!([7,42]));
+    assert_eq!(output.details.as_ref().unwrap()["restarted"], false);
+}
+
+#[test]
+fn changed_package_type_or_sealed_exports_are_not_bypassed_by_old_cache_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join("node_modules/pkg");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("package.json"), r#"{"type":"module","exports":"./index.js"}"#).unwrap();
+    std::fs::write(package.join("index.js"), "export const n = 42;").unwrap();
+    let tool = EvalTool::new(dir.path());
+    cell(&tool, "globalThis.old = await import('pkg')");
+    std::fs::write(package.join("package.json"), r#"{"type":"commonjs","exports":"./index.js"}"#).unwrap();
+    std::fs::write(package.join("index.js"), "globalThis.unadmittedPrefix = true; module.exports = 99;").unwrap();
+    assert_eq!(text(&cell(&tool, "(await import('pkg')) === old")).trim(), "true");
+    let wrong_type = run(&tool, json!({"kernel":"js", "code":"reloadModules(); await import('pkg')"}));
+    assert!(wrong_type.is_error);
+    assert!(text(&wrong_type).contains("EVAL_PACKAGE_COMMONJS"));
+    std::fs::write(package.join("package.json"), r#"{"type":"module","exports":null,"main":"index.js"}"#).unwrap();
+    let sealed = run(&tool, json!({"kernel":"js", "code":"reloadModules(); await import('pkg')"}));
+    assert!(sealed.is_error);
+    assert!(text(&sealed).contains("EVAL_PACKAGE_NOT_EXPORTED"));
+    let kept = cell(&tool, "display([old.n,typeof unadmittedPrefix]);");
+    assert_eq!(kept.details.as_ref().unwrap()["jsonOutputs"][0], json!([42,"undefined"]));
+}
