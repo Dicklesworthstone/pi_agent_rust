@@ -620,7 +620,7 @@ mod tests {
             stop_reason: crate::model::StopReason::ToolUse,
             ..crate::model::AssistantMessage::default()
         })];
-        for (index, id) in calls.iter().enumerate() {
+        for (index, id) in calls.iter().enumerate().rev() {
             let content = if index == 0 {
                 vec![crate::model::ContentBlock::Image(
                     crate::model::ImageContent {

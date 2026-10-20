@@ -6,7 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, ToolResultMessage,
+    Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
 mod files;
@@ -1105,24 +1106,70 @@ pub(crate) struct GeminiUsageMetadata {
 /// Keep every parallel function response in the same user turn. Gemini
 /// validates that the response turn answers all calls in the preceding model
 /// turn; separate user turns fail that contract even for text-only results.
+/// Responses without wire IDs are matched by position, so restore call order
+/// when parallel tools completed or were persisted in a different order.
 /// Media follows the complete response turn, with its originating call named.
 ///
 /// Shared by the Developer API, Cloud Code Assist and Vertex adapters.
 /// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#parallel-function-calling-example
 pub(crate) fn convert_messages_to_gemini(messages: &[Message]) -> Vec<GeminiContent> {
     let mut contents = Vec::with_capacity(messages.len());
-    let mut responses = Vec::new();
-    let mut media = Vec::new();
+    let mut results = Vec::new();
+    let mut call_order = HashMap::new();
+    let mut next_call_ordinal = 0;
     for message in messages {
         if let Message::ToolResult(result) = message {
-            append_tool_result_parts(result, &mut responses, &mut media);
+            results.push(result.as_ref());
         } else {
-            append_tool_result_turns(&mut contents, &mut responses, &mut media);
+            append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
+            if let Message::Assistant(assistant) = message {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        call_order.insert(call.id.as_str(), next_call_ordinal);
+                        next_call_ordinal += 1;
+                    }
+                }
+            }
             contents.extend(convert_message_to_gemini(message));
         }
     }
-    append_tool_result_turns(&mut contents, &mut responses, &mut media);
+    append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
     contents
+}
+
+fn append_ordered_tool_result_turns(
+    contents: &mut Vec<GeminiContent>,
+    results: &mut Vec<&ToolResultMessage>,
+    call_order: &HashMap<&str, usize>,
+) {
+    if results.is_empty() {
+        return;
+    }
+    let mut known_results: Vec<_> = results
+        .iter()
+        .filter_map(|result| {
+            call_order
+                .get(result.tool_call_id.as_str())
+                .map(|&ordinal| (ordinal, *result))
+        })
+        .collect();
+    known_results.sort_by_key(|(ordinal, _)| *ordinal);
+    // Only matched slots move. Imported or incomplete histories may contain
+    // results with no recorded call; preserve those results where they were.
+    for (slot, (_, result)) in results
+        .iter_mut()
+        .filter(|result| call_order.contains_key(result.tool_call_id.as_str()))
+        .zip(known_results)
+    {
+        *slot = result;
+    }
+
+    let mut responses = Vec::with_capacity(results.len());
+    let mut media = Vec::new();
+    for result in results.drain(..) {
+        append_tool_result_parts(result, &mut responses, &mut media);
+    }
+    append_tool_result_turns(contents, &mut responses, &mut media);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2349,8 +2396,13 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn parallel_function_results_share_one_turn_before_their_media() {
-        for with_media in [false, true] {
+    fn parallel_function_results_follow_call_order_before_their_media() {
+        for (with_media, result_order) in [
+            (false, [0, 1, 2, 3, 4]),
+            (false, [2, 4, 3, 1, 0]),
+            (true, [0, 1, 2, 3, 4]),
+            (true, [2, 4, 3, 1, 0]),
+        ] {
             let image = ContentBlock::Image(crate::model::ImageContent {
                 data: "AQ==".to_string(),
                 mime_type: "image/png".to_string(),
@@ -2397,7 +2449,8 @@ mod tests {
                     ..AssistantMessage::default()
                 }),
             ];
-            for (index, (id, name)) in calls.iter().enumerate() {
+            for index in result_order {
+                let (id, name) = calls[index];
                 let mut content = match index {
                     0 => vec![ContentBlock::Text(TextContent::new("image result"))],
                     1 => vec![ContentBlock::Text(TextContent::new("text result"))],
@@ -2412,8 +2465,8 @@ mod tests {
                     }
                 }
                 messages.push(Message::tool_result(crate::model::ToolResultMessage {
-                    tool_call_id: (*id).to_string(),
-                    tool_name: (*name).to_string(),
+                    tool_call_id: id.to_string(),
+                    tool_name: name.to_string(),
                     content,
                     details: Some(serde_json::json!({"kept_in_history": true})),
                     is_error: index == 3,
@@ -2476,14 +2529,19 @@ mod tests {
 
     #[test]
     fn function_response_batches_preserve_turn_boundaries_and_user_images() {
-        let call = |id: &str| {
+        let call = |ids: &[&str]| {
             Message::assistant(AssistantMessage {
-                content: vec![ContentBlock::ToolCall(ToolCall {
-                    id: id.to_string(),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({"path": id}),
-                    thought_signature: None,
-                })],
+                content: ids
+                    .iter()
+                    .map(|id| {
+                        ContentBlock::ToolCall(ToolCall {
+                            id: (*id).to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": id}),
+                            thought_signature: None,
+                        })
+                    })
+                    .collect(),
                 stop_reason: StopReason::ToolUse,
                 ..AssistantMessage::default()
             })
@@ -2507,7 +2565,8 @@ mod tests {
         let context = Context::owned(
             None,
             vec![
-                call("call_a"),
+                call(&["call_a", "call_b"]),
+                result("call_b", "Ag=="),
                 result("call_a", "AQ=="),
                 Message::Custom(crate::model::CustomMessage {
                     custom_type: "context".to_string(),
@@ -2516,10 +2575,13 @@ mod tests {
                     details: None,
                     timestamp: 0,
                 }),
-                call("call_b"),
-                result("call_b", "Ag=="),
+                // Reused IDs follow this model turn's order, without changing
+                // the order of the already completed first turn.
+                call(&["call_b", "call_a"]),
+                result("call_a", "BA=="),
+                result("call_b", "Aw=="),
                 Message::User(crate::model::UserMessage {
-                    content: UserContent::Blocks(vec![image("Aw==")]),
+                    content: UserContent::Blocks(vec![image("BQ==")]),
                     timestamp: 0,
                 }),
             ],
@@ -2531,34 +2593,106 @@ mod tests {
                 .unwrap();
         let contents = wire["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 8);
-        for (model_index, response_index, media_index, id, data) in
-            [(0, 1, 2, "call_a", "AQ=="), (4, 5, 6, "call_b", "Ag==")]
-        {
+        for (model_index, response_index, media_index, expected) in [
+            (0, 1, 2, [("call_a", "AQ=="), ("call_b", "Ag==")]),
+            (4, 5, 6, [("call_b", "Aw=="), ("call_a", "BA==")]),
+        ] {
             assert_eq!(contents[model_index]["role"], "model");
             assert_eq!(
                 contents[response_index]["parts"].as_array().unwrap().len(),
-                1
+                2
             );
-            assert_eq!(
-                contents[response_index]["parts"][0]["functionResponse"]["response"]["result"],
-                "(see attached media)",
-            );
-            assert_eq!(contents[media_index]["parts"].as_array().unwrap().len(), 3);
-            assert_eq!(
-                contents[media_index]["parts"][1]["text"],
-                format!("Media from read (tool call {id}):"),
-            );
-            assert_eq!(
-                contents[media_index]["parts"][2]["inline_data"]["data"],
-                data
-            );
+            assert_eq!(contents[media_index]["parts"].as_array().unwrap().len(), 5);
+            for (index, (id, data)) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    contents[response_index]["parts"][index]["functionResponse"]["response"]["result"],
+                    "(see attached media)",
+                );
+                assert_eq!(
+                    contents[media_index]["parts"][1 + index * 2]["text"],
+                    format!("Media from read (tool call {id}):"),
+                );
+                assert_eq!(
+                    contents[media_index]["parts"][2 + index * 2]["inline_data"]["data"],
+                    data
+                );
+            }
         }
         assert_eq!(
             contents[3]["parts"][0]["text"],
             "Keep the second result separate"
         );
         assert_eq!(contents[7]["parts"].as_array().unwrap().len(), 1);
-        assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "Aw==");
+        assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "BQ==");
+    }
+
+    #[test]
+    fn function_response_order_preserves_unmatched_slots_and_duplicate_results() {
+        let mut messages = vec![Message::assistant(AssistantMessage {
+            content: ["call_a", "call_b"]
+                .into_iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })];
+        for (id, text) in [
+            ("unknown_first", "first unmatched"),
+            ("call_b", "b"),
+            ("unknown_middle", "middle unmatched"),
+            ("call_a", "first a"),
+            ("call_a", "second a"),
+            ("unknown_last", "last unmatched"),
+        ] {
+            messages.push(Message::tool_result(ToolResultMessage {
+                tool_call_id: id.to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+        }
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages)).unwrap();
+        let results: Vec<_> = wire[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                part["functionResponse"]["response"]["result"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                "first unmatched",
+                "first a",
+                "middle unmatched",
+                "second a",
+                "b",
+                "last unmatched",
+            ]
+        );
+
+        // Without any matching assistant calls, preserve the entire batch.
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages[1..])).unwrap();
+        assert_eq!(
+            wire[0]["parts"][1]["functionResponse"]["response"]["result"],
+            "b"
+        );
+        assert_eq!(
+            wire[0]["parts"][3]["functionResponse"]["response"]["result"],
+            "first a"
+        );
     }
 
     #[test]
@@ -2862,12 +2996,15 @@ mod tests {
             }),
             replay,
         ];
-        for block in &message.content {
+        for block in message.content.iter().rev() {
             if let ContentBlock::ToolCall(call) = block {
                 messages.push(Message::tool_result(crate::model::ToolResultMessage {
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
-                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "contents of {}",
+                        call.arguments["path"].as_str().unwrap()
+                    )))],
                     details: None,
                     is_error: false,
                     timestamp: 1,
@@ -2900,6 +3037,14 @@ mod tests {
         assert_eq!(
             wire["contents"][2]["parts"][1]["functionResponse"]["name"],
             "read"
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+            "contents of a.txt"
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][1]["functionResponse"]["response"]["result"],
+            "contents of b.txt"
         );
     }
 
