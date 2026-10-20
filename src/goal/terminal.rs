@@ -2,11 +2,12 @@
 //!
 //! A revision receipt binds even creation to the displayed session/branch.
 //! Receipt verification and journal mutation share the same owned store lock.
-//! These are lifecycle controls only: no provider turn, polling task, tool
-//! permission, or implicit continuation is introduced by a slash command.
+//! Lifecycle changes do not dispatch provider work. Explicit step/run commands
+//! use the bounded native driver and pause on absent or repeated tool progress.
+//! No command grants additional tool permissions or infers goal completion.
 
 use super::{
-    GoalBudget, GoalDecision, GoalPersistence, GoalStatus, MAX_TEXT_BYTES, Record,
+    GoalBudget, GoalPersistence, GoalStatus, MAX_TEXT_BYTES, Record,
     Transition, append, check_owner, failure, latest, persist, snapshot, transition, validate_text,
 };
 use crate::agent_cx::AgentCx;
@@ -215,29 +216,12 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
             _ => unreachable!(),
         };
         drop(session);
-        let mut completed_steps = 0u32;
-        let run = handle.run_goal(
+        let run = handle.run_goal_until_review(
             &owner,
             &reviewed,
+            requested_steps,
             Duration::from_secs(15 * 60),
             |_control, _event| {},
-            move |_goal, _message| {
-                completed_steps = completed_steps.saturating_add(1);
-                if completed_steps >= requested_steps {
-                    GoalDecision::Pause {
-                        reason: format!(
-                            "Terminal run completed {completed_steps} reviewed prompt(s); inspect the result before continuing."
-                        ),
-                    }
-                } else {
-                    GoalDecision::Continue {
-                        instruction: format!(
-                            "Continue working on the same objective. This is prompt {} of the user's bounded terminal run; do not claim completion on the user's behalf.",
-                            completed_steps.saturating_add(1)
-                        ),
-                    }
-                }
-            },
         )?;
         let report = run.await;
         let mut output = String::new();
@@ -385,9 +369,31 @@ fn render(record: Option<&Record>, review: &str) -> String {
         let _ = writeln!(text, "Pause: /goal pause {review}\nResume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nAttest completion: /goal complete {review} -- <evidence>\nRetry saving: /goal save {review}");
         let _ = writeln!(text, "Revise total budgets: /goal budget {review} --tokens N --prompts N -- <reason>\nBudget revision preserves spent counters and interruption; it does not resume work.");
     }
-    text.push_str("Lifecycle controls only: no model request was started or resumed. Bounded execution uses the SDK run_goal APIs; ordinary terminal prompts do not run that driver.\nToken accounting is reported usage, not a hard billing ceiling. Completion evidence is an attestation, not an independently verified test result.");
+    if record.is_some_and(|record| record.effective_status() == GoalStatus::Active) {
+        let _ = writeln!(text, "Execute one prompt: /goal step {review}\nExecute up to N prompts: /goal run {review} --steps N (1..32)\nRuns pause early on absent or repeated successful tool activity; review the recorded reason before resuming.");
+    }
+    text.push_str("Lifecycle controls do not start provider work; step and run explicitly execute bounded goal prompts. Activity is not proof of completion.\nToken accounting is reported usage, not a hard billing ceiling. Completion evidence is an attestation, not an independently verified test result.");
     text
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod progress_contract_tests {
+    use super::*;
+
+    #[test]
+    fn status_explains_explicit_execution_and_only_offers_it_for_active_goals() {
+        let mut record = Record::new("inspect files", GoalBudget::default()).unwrap();
+        let active = render(Some(&record), "review-token");
+        assert!(active.contains("/goal step review-token"));
+        assert!(active.contains("/goal run review-token --steps N"));
+        assert!(active.contains("pause early"));
+        assert!(!active.contains("no model request was started"));
+        record.status = GoalStatus::Paused;
+        let paused = render(Some(&record), "review-token");
+        assert!(!paused.contains("Execute one prompt:"));
+        assert!(paused.contains("/goal resume review-token"));
+    }
+}
