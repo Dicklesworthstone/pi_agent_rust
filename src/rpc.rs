@@ -191,88 +191,98 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
 }
 
 /// Keep an accepted turn runnable until its terminal event and persistence
-/// finish. Client cancellation is cooperative: cancelling the ambient context
-/// used by its timers can otherwise park the turn before it can answer.
-async fn run_rpc_turn<F, Fut>(
+/// finish. Construct ownership before runtime admission: a rejected or never
+/// polled future must answer the client and release its streaming flag too.
+fn run_rpc_turn<F, Fut>(
     runtime: RuntimeHandle,
     client_cx: AgentCx,
     retry_abort: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_streaming: Arc<AtomicBool>,
     turn: F,
-) where
-    F: FnOnce(AgentCx) -> Fut,
+) -> impl Future<Output = ()>
+where
+    F: FnOnce(AgentCx, TerminalAgentEndOnDrop) -> Fut,
     Fut: Future<Output = ()>,
 {
-    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+    let terminal_guard =
+        TerminalAgentEndOnDrop::for_accepted_turn(out_tx, client_cx.clone(), is_streaming);
+    async move {
+        use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 
-    let supervisor = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
-    let owner = {
-        // Preserve the client's budget and capability restrictions without
-        // sharing its cancellation bit. The supervisor retains a separate
-        // lifetime so it can deliver abort even while the work is pending.
-        let capabilities = client_cx.capabilities();
-        let mut mask = CapMask::all();
-        for (allowed, restriction) in [
-            (
-                capabilities.spawn,
-                CapSet::<false, true, true, true, true>::MASK,
-            ),
-            (
-                capabilities.time,
-                CapSet::<true, false, true, true, true>::MASK,
-            ),
-            (
-                capabilities.entropy,
-                CapSet::<true, true, false, true, true>::MASK,
-            ),
-            (
-                capabilities.io,
-                CapSet::<true, true, true, false, true>::MASK,
-            ),
-            (
-                capabilities.remote,
-                CapSet::<true, true, true, true, false>::MASK,
-            ),
-        ] {
-            if !allowed {
-                mask = mask.intersect(restriction);
-            }
-        }
-        let _owner = runtime
-            .request_cx_with_budget(client_cx.budget())
-            .set_current_restricted();
-        let _restriction = asupersync::Cx::push_restriction(mask);
-        AgentCx::for_current_or_request()
-    };
-    let future = owner.with_current(turn(owner.clone()));
-    supervisor
-        .with_current(async {
-            let cancellation = async {
-                loop {
-                    if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
-                        retry_abort.store(true, Ordering::SeqCst);
-                        if let Ok(guard) =
-                            OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await
-                            && let Some(handle) = guard.as_ref()
-                        {
-                            handle.abort();
-                        }
-                        break;
-                    }
-                    supervisor.time().sleep(Duration::from_millis(25)).await;
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = {
+            // Preserve the client's budget and capability restrictions without
+            // sharing its cancellation bit. The supervisor retains a separate
+            // lifetime so it can deliver abort even while the work is pending.
+            let capabilities = client_cx.capabilities();
+            let mut mask = CapMask::all();
+            for (allowed, restriction) in [
+                (
+                    capabilities.spawn,
+                    CapSet::<false, true, true, true, true>::MASK,
+                ),
+                (
+                    capabilities.time,
+                    CapSet::<true, false, true, true, true>::MASK,
+                ),
+                (
+                    capabilities.entropy,
+                    CapSet::<true, true, false, true, true>::MASK,
+                ),
+                (
+                    capabilities.io,
+                    CapSet::<true, true, true, false, true>::MASK,
+                ),
+                (
+                    capabilities.remote,
+                    CapSet::<true, true, true, true, false>::MASK,
+                ),
+            ] {
+                if !allowed {
+                    mask = mask.intersect(restriction);
                 }
-            };
-            futures::pin_mut!(cancellation, future);
-            if let futures::future::Either::Left(((), pending_turn)) =
-                futures::future::select(cancellation, future).await
-            {
-                // Never drop the turn to cancel it: completed tool effects
-                // still need to reach the durable transcript, and the client
-                // still owns an accepted prompt awaiting agent_end.
-                pending_turn.await;
             }
-        })
-        .await;
+            let _owner = runtime
+                .request_cx_with_budget(client_cx.budget())
+                .set_current_restricted();
+            let _restriction = asupersync::Cx::push_restriction(mask);
+            AgentCx::for_current_or_request()
+        };
+        // Move the same guard through the factory and into the turn body.
+        // There is no disarm/rearm interval, including a factory panic.
+        let future = owner.with_current(turn(owner.clone(), terminal_guard));
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            if let Ok(guard) =
+                                OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await
+                                && let Some(handle) = guard.as_ref()
+                            {
+                                handle.abort();
+                            }
+                            break;
+                        }
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
+                    }
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending_turn)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    // Never drop the turn to cancel it: completed tool effects
+                    // still need to reach the durable transcript, and the client
+                    // still owns an accepted prompt awaiting agent_end.
+                    pending_turn.await;
+                }
+            })
+            .await;
+    }
 }
 
 fn normalize_command_type(command_type: &str) -> &str {
@@ -1246,6 +1256,7 @@ struct TerminalAgentEndOnDrop {
     out_tx: std::sync::mpsc::SyncSender<String>,
     cx: AgentCx,
     armed: bool,
+    is_streaming: Option<Arc<AtomicBool>>,
 }
 
 impl TerminalAgentEndOnDrop {
@@ -1254,7 +1265,18 @@ impl TerminalAgentEndOnDrop {
             out_tx,
             cx,
             armed: true,
+            is_streaming: None,
         }
+    }
+
+    fn for_accepted_turn(
+        out_tx: std::sync::mpsc::SyncSender<String>,
+        cx: AgentCx,
+        is_streaming: Arc<AtomicBool>,
+    ) -> Self {
+        let mut guard = Self::new(out_tx, cx);
+        guard.is_streaming = Some(is_streaming);
+        guard
     }
 
     /// The turn reached one of its own terminal emissions; stand down.
@@ -1265,23 +1287,25 @@ impl TerminalAgentEndOnDrop {
 
 impl Drop for TerminalAgentEndOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
+        if self.armed {
+            // Same condition and wording as the in-loop checkpoint break.
+            // Other premature endings are defects, not successful cancellation.
+            let error = if self.cx.is_cancel_requested() {
+                "Retry aborted"
+            } else {
+                "Turn ended without a terminal event"
+            };
+            let _ = self.out_tx.send(event(&json!({
+                "type": "agent_end",
+                "messages": [],
+                "error": error,
+            })));
         }
-        // Same condition and same wording as the in-loop checkpoint break, so
-        // a client cannot tell whether the turn observed its cancellation or
-        // was ended by it — only that it ended. Anything else reaching here is
-        // a real defect and says so rather than masquerading as a cancel.
-        let error = if self.cx.is_cancel_requested() {
-            "Retry aborted"
-        } else {
-            "Turn ended without a terminal event"
-        };
-        let _ = self.out_tx.send(event(&json!({
-            "type": "agent_end",
-            "messages": [],
-            "error": error,
-        })));
+        // Keep EOF draining active until the terminal frame is queued, even
+        // when runtime admission rejected the future before its first poll.
+        if let Some(is_streaming) = &self.is_streaming {
+            is_streaming.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -2612,13 +2636,15 @@ pub async fn run(
                     let command_runtime = runtime_handle.clone();
                     let retry_abort = Arc::clone(&retry_abort);
                     let command_output = output.for_turn();
-                    runtime_handle.spawn(run_rpc_turn(
+                    let _ = runtime_handle.try_spawn(run_rpc_turn(
                         runtime_handle.clone(),
                         cx.clone(),
                         Arc::clone(&retry_abort),
                         Arc::clone(&abort_handle_slot),
-                        move |command_cx| async move {
-                            run_extension_command(
+                        out_tx.clone(),
+                        Arc::clone(&is_streaming),
+                        move |command_cx, terminal_guard| async move {
+                            run_extension_command_owned(
                                 session,
                                 is_streaming,
                                 abort_handle_slot,
@@ -2629,6 +2655,7 @@ pub async fn run(
                                 args,
                                 command_cx,
                                 command_output,
+                                terminal_guard,
                             )
                             .await;
                         },
@@ -2637,13 +2664,15 @@ pub async fn run(
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
                     let expanded = options.resources.expand_input(&message);
-                    runtime_handle.spawn(run_rpc_turn(
+                    let _ = runtime_handle.try_spawn(run_rpc_turn(
                         runtime_handle.clone(),
                         cx.clone(),
                         Arc::clone(&retry_abort),
                         Arc::clone(&abort_handle_slot),
-                        move |prompt_cx| async move {
-                            run_prompt_with_retry(
+                        out_tx.clone(),
+                        Arc::clone(&is_streaming),
+                        move |prompt_cx, terminal_guard| async move {
+                            run_prompt_with_retry_owned(
                                 session,
                                 shared_state,
                                 is_streaming,
@@ -2657,6 +2686,7 @@ pub async fn run(
                                 Some(message),
                                 attachments,
                                 prompt_cx,
+                                terminal_guard,
                             )
                             .await;
                         },
@@ -2758,13 +2788,15 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -2778,6 +2810,7 @@ pub async fn run(
                             Some(message),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -2880,13 +2913,15 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -2900,6 +2935,7 @@ pub async fn run(
                             Some(message),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -4456,13 +4492,15 @@ pub async fn run(
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -4480,6 +4518,7 @@ pub async fn run(
                             Some(String::new()),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -5951,8 +5990,8 @@ async fn restore_rpc_retry_tail(
         .await
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_prompt_with_retry(
+#[cfg(test)]
+fn run_prompt_with_retry(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
     is_streaming: Arc<AtomicBool>,
@@ -5966,13 +6005,53 @@ async fn run_prompt_with_retry(
     keyword_scan_source: Option<String>,
     attachments: Vec<ContentBlock>,
     cx: AgentCx,
+) -> impl Future<Output = ()> {
+    let terminal_guard = TerminalAgentEndOnDrop::for_accepted_turn(
+        out_tx.clone(),
+        cx.clone(),
+        Arc::clone(&is_streaming),
+    );
+    run_prompt_with_retry_owned(
+        session,
+        shared_state,
+        is_streaming,
+        is_compacting,
+        turn_phase_linearizer,
+        abort_handle_slot,
+        out_tx,
+        retry_abort,
+        options,
+        message,
+        keyword_scan_source,
+        attachments,
+        cx,
+        terminal_guard,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_prompt_with_retry_owned(
+    session: Arc<Mutex<AgentSession>>,
+    shared_state: Arc<Mutex<RpcSharedState>>,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
+    turn_phase_linearizer: Arc<std::sync::Mutex<()>>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    retry_abort: Arc<AtomicBool>,
+    options: RpcOptions,
+    message: String,
+    keyword_scan_source: Option<String>,
+    attachments: Vec<ContentBlock>,
+    cx: AgentCx,
+    terminal_guard: TerminalAgentEndOnDrop,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
     let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
-    // The prompt was accepted before this task started. Cover its first
-    // await as well as provider execution, persistence and retry cleanup.
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+    // Keep this local after both activity guards so an unwinding turn queues
+    // its terminal frame before either flag allows EOF draining to finish.
+    let mut terminal_guard = terminal_guard;
 
     let initial_state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await;
     let (provider_reentry_blocked, output) = match initial_state {
@@ -6937,7 +7016,8 @@ async fn try_failover_to_next_chain_entry(
     Ok(true)
 }
 
-async fn run_extension_command(
+#[cfg(test)]
+fn run_extension_command(
     session: Arc<Mutex<AgentSession>>,
     is_streaming: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
@@ -6948,10 +7028,43 @@ async fn run_extension_command(
     args: String,
     cx: AgentCx,
     output: RpcOutput,
+) -> impl Future<Output = ()> {
+    let terminal_guard = TerminalAgentEndOnDrop::for_accepted_turn(
+        out_tx.clone(),
+        cx.clone(),
+        Arc::clone(&is_streaming),
+    );
+    run_extension_command_owned(
+        session,
+        is_streaming,
+        abort_handle_slot,
+        retry_abort,
+        out_tx,
+        runtime_handle,
+        command_name,
+        args,
+        cx,
+        output,
+        terminal_guard,
+    )
+}
+
+async fn run_extension_command_owned(
+    session: Arc<Mutex<AgentSession>>,
+    is_streaming: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    retry_abort: Arc<AtomicBool>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    runtime_handle: RuntimeHandle,
+    command_name: String,
+    args: String,
+    cx: AgentCx,
+    output: RpcOutput,
+    terminal_guard: TerminalAgentEndOnDrop,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+    let mut terminal_guard = terminal_guard;
 
     let (abort_handle, abort_signal) = AbortHandle::new();
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -12176,12 +12289,17 @@ mod retry_tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let forbidden_path = temp.path().join("must-not-write.txt");
             let turn_path = forbidden_path.clone();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let streaming = Arc::new(AtomicBool::new(true));
             let task = handle.spawn(run_rpc_turn(
                 handle.clone(),
                 client.clone(),
                 Arc::clone(&retry_abort),
                 Arc::new(Mutex::new(Some(abort_handle))),
-                move |owner| async move {
+                out_tx,
+                Arc::clone(&streaming),
+                move |owner, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
                     assert_eq!(owner.capabilities(), expected_capabilities);
                     assert_eq!(
                         AgentCx::for_current_or_request().budget().deadline,
@@ -12206,6 +12324,14 @@ mod retry_tests {
                 .expect("cancelled turn must drain");
             assert!(retry_abort.load(Ordering::SeqCst));
             assert!(finished.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            let terminal: Vec<Value> = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                .collect();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0]["type"], "agent_end");
+            assert_eq!(terminal[0]["error"], "Retry aborted");
             assert!(!forbidden_path.exists());
         });
     }
@@ -12579,6 +12705,182 @@ mod retry_tests {
                 "provider.stream must remain unreachable after admission failure"
             );
         });
+    }
+
+    #[test]
+    fn rpc_never_polled_accepted_turn_releases_streaming_and_answers_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for cancelled in [false, true] {
+            let client = AgentCx::for_testing();
+            client.set_cancel_requested(cancelled);
+            let streaming = Arc::new(AtomicBool::new(true));
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_turn = Arc::clone(&entered);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let turn = run_rpc_turn(
+                runtime.handle(),
+                client,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(None)),
+                out_tx.clone(),
+                Arc::clone(&streaming),
+                move |_, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
+                    entered_turn.store(true, Ordering::SeqCst);
+                },
+            );
+
+            // Construction already owns the accepted response, even though
+            // neither the supervisor nor the turn factory has been polled.
+            drop(turn);
+            assert!(!entered.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            let frame = out_rx.try_recv().expect("terminal frame");
+            let terminal: Value = serde_json::from_str(&frame).expect("RPC event");
+            assert_eq!(terminal["type"], "agent_end");
+            assert_eq!(terminal["messages"], json!([]));
+            assert_eq!(
+                terminal["error"],
+                if cancelled {
+                    "Retry aborted"
+                } else {
+                    "Turn ended without a terminal event"
+                }
+            );
+            assert!(
+                matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "a never-polled accepted turn must answer exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_rejected_runtime_admission_releases_streaming_and_answers_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        let streaming = Arc::new(AtomicBool::new(true));
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_turn = Arc::clone(&entered);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let turn = run_rpc_turn(
+            handle.clone(),
+            AgentCx::for_testing(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            out_tx.clone(),
+            Arc::clone(&streaming),
+            move |_, terminal_guard| async move {
+                let _terminal_guard = terminal_guard;
+                entered_turn.store(true, Ordering::SeqCst);
+            },
+        );
+
+        // The real runtime closes new admission synchronously, while this
+        // retained handle remains available to report the rejection.
+        runtime.shutdown_background();
+        assert!(handle.try_spawn(turn).is_err());
+        assert!(!entered.load(Ordering::SeqCst));
+        assert!(!streaming.load(Ordering::SeqCst));
+        let terminal: Value =
+            serde_json::from_str(&out_rx.try_recv().expect("terminal frame")).expect("RPC event");
+        assert_eq!(terminal["type"], "agent_end");
+        assert_eq!(terminal["error"], "Turn ended without a terminal event");
+        assert!(
+            matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "runtime admission rejection must answer exactly once"
+        );
+    }
+
+    #[test]
+    fn rpc_accepted_turn_handoff_keeps_one_guard_on_drop_or_unwind() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for panic_in_body in [false, true] {
+            let streaming = Arc::new(AtomicBool::new(true));
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_turn = Arc::clone(&entered);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let mut turn = Box::pin(run_rpc_turn(
+                runtime.handle(),
+                AgentCx::for_testing(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(None)),
+                out_tx.clone(),
+                Arc::clone(&streaming),
+                move |_, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
+                    entered_turn.store(true, Ordering::SeqCst);
+                    assert!(!panic_in_body, "intentional accepted-turn panic");
+                    futures::future::pending::<()>().await;
+                },
+            ));
+            let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let result = {
+                let _panic_guard = crate::crash::SuppressPanicHook::new();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    turn.as_mut().poll(&mut task)
+                }))
+            };
+            if panic_in_body {
+                assert!(result.is_err(), "the turn body must unwind");
+            } else {
+                assert!(result.expect("poll turn").is_pending());
+            }
+            assert!(entered.load(Ordering::SeqCst));
+            drop(turn);
+
+            assert!(!streaming.load(Ordering::SeqCst));
+            let frame = out_rx.try_recv().expect("terminal frame");
+            let terminal: Value = serde_json::from_str(&frame).expect("RPC event");
+            assert_eq!(terminal["type"], "agent_end");
+            assert!(
+                matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "handoff must not leave a second terminal guard behind"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_accepted_turn_factory_unwind_releases_its_owned_response() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let streaming = Arc::new(AtomicBool::new(true));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let mut turn = Box::pin(run_rpc_turn(
+            runtime.handle(),
+            AgentCx::for_testing(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            out_tx.clone(),
+            Arc::clone(&streaming),
+            |_, terminal_guard| -> std::future::Ready<()> {
+                let _terminal_guard = terminal_guard;
+                panic!("intentional turn-factory panic");
+            },
+        ));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let result = {
+            let _panic_guard = crate::crash::SuppressPanicHook::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                turn.as_mut().poll(&mut task)
+            }))
+        };
+        assert!(result.is_err());
+        drop(turn);
+        assert!(!streaming.load(Ordering::SeqCst));
+        let terminal: Value =
+            serde_json::from_str(&out_rx.try_recv().expect("terminal frame")).expect("RPC event");
+        assert_eq!(terminal["type"], "agent_end");
+        assert!(
+            matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "factory unwind must answer exactly once"
+        );
     }
 
     /// A turn that ends without sending its own terminal frame must still
