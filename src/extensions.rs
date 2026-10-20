@@ -11120,6 +11120,46 @@ impl JsRuntimeHost {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum JsProviderStreamKind {
+    Assistant,
+    Http,
+}
+
+/// Owns a published provider route until the start caller claims its ID.
+/// Keeping this guard in the reply also covers a successful send whose
+/// receiver is dropped before reading the value.
+struct JsProviderStreamStartGuard {
+    runtime: JsExtensionRuntimeHandle,
+    stream_id: Option<String>,
+}
+
+impl std::fmt::Debug for JsProviderStreamStartGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsProviderStreamStartGuard")
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JsProviderStreamStartGuard {
+    fn into_stream_id(mut self) -> Result<String> {
+        self.stream_id.take().ok_or_else(|| {
+            Error::extension("Provider stream start completed without a published route")
+        })
+    }
+}
+
+impl Drop for JsProviderStreamStartGuard {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take() {
+            self.runtime
+                .provider_stream_simple_cancel_best_effort(stream_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum JsRuntimeCommand {
     LoadExtensions {
@@ -11182,6 +11222,7 @@ enum JsRuntimeCommand {
         reply: oneshot::Sender<Result<Value>>,
     },
     ProviderStreamSimpleStart {
+        kind: JsProviderStreamKind,
         provider_id: String,
         model: Value,
         context: Value,
@@ -11189,7 +11230,8 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
-        reply: oneshot::Sender<Result<String>>,
+        guard: JsProviderStreamStartGuard,
+        reply: oneshot::Sender<Result<JsProviderStreamStartGuard>>,
     },
     ProviderStreamSimpleNext {
         stream_id: String,
@@ -12119,6 +12161,7 @@ impl JsExtensionRuntimeHandle {
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ProviderStreamSimpleStart {
+                            kind,
                             provider_id,
                             model,
                             context,
@@ -12126,6 +12169,7 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            mut guard,
                             reply,
                         } => {
                             if reply.is_closed() {
@@ -12138,7 +12182,7 @@ impl JsExtensionRuntimeHandle {
                                 let _ = reply.send(&cx, Err(err));
                                 continue;
                             }
-                            let result = async {
+                            let mut result = async {
                                 let shard_index = shard_set.shard_index_for_route(
                                     &shard_set.provider_owner,
                                     "provider",
@@ -12149,6 +12193,7 @@ impl JsExtensionRuntimeHandle {
                                         &mut shard_set,
                                         &host,
                                         JsProviderStreamStart {
+                                            kind,
                                             shard_index,
                                             provider_id: &provider_id,
                                             model,
@@ -12268,11 +12313,13 @@ impl JsExtensionRuntimeHandle {
                                         origin: origin.clone(),
                                     },
                                 );
-                                Ok(outer_stream_id)
+                                guard.stream_id = Some(outer_stream_id);
+                                Ok(guard)
                             }
                             .await;
                             if reply.is_closed() {
-                                if let Ok(outer_stream_id) = result.as_ref()
+                                if let Ok(guard) = result.as_mut()
+                                    && let Some(outer_stream_id) = guard.stream_id.as_deref()
                                     && let Some(route) = shard_set
                                         .provider_stream_routes
                                         .get(outer_stream_id)
@@ -12288,19 +12335,20 @@ impl JsExtensionRuntimeHandle {
                                             route.origin.as_ref(),
                                         )
                                         .await;
-                                    if let Err(cleanup_err) = shard_set
-                                        .finish_provider_stream_cleanup(
-                                            outer_stream_id,
-                                            cleanup_result,
-                                        )
-                                    {
-                                        tracing::warn!(
-                                            event = "extension_runtime.provider_stream.route_publish_cleanup_failed",
-                                            outer_stream_id,
-                                            inner_stream_id = %route.inner_stream_id,
-                                            error = %cleanup_err,
-                                            "Failed to cancel provider stream whose caller closed during route publication"
-                                        );
+                                    match shard_set.finish_provider_stream_cleanup(
+                                        outer_stream_id,
+                                        cleanup_result,
+                                    ) {
+                                        Ok(()) => guard.stream_id = None,
+                                        Err(cleanup_err) => {
+                                            tracing::warn!(
+                                                event = "extension_runtime.provider_stream.route_publish_cleanup_failed",
+                                                outer_stream_id,
+                                                inner_stream_id = %route.inner_stream_id,
+                                                error = %cleanup_err,
+                                                "Failed to cancel provider stream whose caller closed during route publication"
+                                            );
+                                        }
                                     }
                                 }
                                 continue;
@@ -13114,10 +13162,51 @@ impl JsExtensionRuntimeHandle {
         options: Value,
         timeout_ms: u64,
     ) -> Result<String> {
+        self.provider_stream_start(
+            JsProviderStreamKind::Assistant,
+            provider_id,
+            model,
+            context,
+            options,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// Open an owner-scoped virtual HTTP response using the same actor routing,
+    /// deadlines, and abandoned-start cleanup as extension provider streams.
+    pub(crate) async fn provider_http_stream_start(
+        &self,
+        provider_id: &str,
+        request: Value,
+        timeout_ms: u64,
+    ) -> Result<String> {
+        self.provider_stream_start(
+            JsProviderStreamKind::Http,
+            provider_id.to_string(),
+            request,
+            Value::Null,
+            Value::Null,
+            timeout_ms,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn provider_stream_start(
+        &self,
+        kind: JsProviderStreamKind,
+        provider_id: String,
+        model: Value,
+        context: Value,
+        options: Value,
+        timeout_ms: u64,
+    ) -> Result<String> {
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleStart {
+            kind,
             provider_id,
             model,
             context,
@@ -13125,6 +13214,10 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            guard: JsProviderStreamStartGuard {
+                runtime: self.clone(),
+                stream_id: None,
+            },
             reply: reply_tx,
         };
         let fut = async move {
@@ -13149,6 +13242,9 @@ impl JsExtensionRuntimeHandle {
                 "JS extension runtime provider stream start timed out after {timeout_ms}ms"
             )))
         })
+        // Claim ownership only after the timeout wrapper has accepted the
+        // reply. There must be no await between disarming and returning the ID.
+        .and_then(JsProviderStreamStartGuard::into_stream_id)
     }
 
     pub async fn provider_stream_simple_next(
@@ -14935,6 +15031,7 @@ struct JsProviderStreamNext {
 }
 
 struct JsProviderStreamStart<'a> {
+    kind: JsProviderStreamKind,
     shard_index: usize,
     provider_id: &'a str,
     model: Value,
@@ -14951,6 +15048,7 @@ async fn start_extension_provider_stream_simple_sharded(
     start: JsProviderStreamStart<'_>,
 ) -> Result<String> {
     let JsProviderStreamStart {
+        kind,
         shard_index,
         provider_id,
         model,
@@ -14973,19 +15071,29 @@ async fn start_extension_provider_stream_simple_sharded(
         runtime
             .with_ctx(|ctx| {
                 let global = ctx.globals();
-                let start_fn: rquickjs::Function<'_> =
-                    global.get("__pi_provider_stream_simple_start")?;
+                let start_name = match kind {
+                    JsProviderStreamKind::Assistant => "__pi_provider_stream_simple_start",
+                    JsProviderStreamKind::Http => "__pi_virtual_http_start",
+                };
+                let start_fn: rquickjs::Function<'_> = global.get(start_name)?;
                 let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
                 let model_js = json_to_js(&ctx, &model)?;
-                let context_js = json_to_js(&ctx, &context)?;
-                let options_js = json_to_js(&ctx, &options)?;
-                let promise: rquickjs::Value<'_> = start_fn.call((
-                    bridge_secret.as_str(),
-                    provider_id,
-                    model_js,
-                    context_js,
-                    options_js,
-                ))?;
+                let promise: rquickjs::Value<'_> = match kind {
+                    JsProviderStreamKind::Http => {
+                        start_fn.call((bridge_secret.as_str(), provider_id, model_js))?
+                    }
+                    JsProviderStreamKind::Assistant => {
+                        let context_js = json_to_js(&ctx, &context)?;
+                        let options_js = json_to_js(&ctx, &options)?;
+                        start_fn.call((
+                            bridge_secret.as_str(),
+                            provider_id,
+                            model_js,
+                            context_js,
+                            options_js,
+                        ))?
+                    }
+                };
                 let _task: String =
                     task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
                 Ok(())
@@ -15292,6 +15400,10 @@ async fn pump_js_runtime_once_for_owner(
         } else {
             dispatch_hostcall_with_runtime(Some(runtime), host, req).await
         };
+        if runtime.has_deferred_hostcall(&call_id) {
+            runtime.set_deferred_hostcall_deadline(&call_id, root_deadline);
+            return None;
+        }
         let elapsed = dispatch_started.elapsed();
         let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -16362,109 +16474,161 @@ pub async fn dispatch_host_call_shared(
         }
     };
 
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    log_hostcall_end(
-        ctx.runtime_name,
-        call_id,
-        ctx.extension_id,
+    let finalization = HostcallFinalization {
+        runtime_name: ctx.runtime_name.to_string(),
+        extension_id: ctx.extension_id.map(str::to_string),
+        manager: ctx.manager.as_ref().map(ExtensionManagerHandle::new),
+        call_id: call_id.to_string(),
+        method: method.to_string(),
         capability,
-        method,
-        &params_hash,
-        duration_ms,
-        lane_execution.as_ref(),
-        &marshalling_telemetry,
-        &outcome,
-    );
-
-    let outcome_error_code = match &outcome {
-        HostcallOutcome::Error { code, .. } => Some(code.as_str()),
-        _ => None,
+        scheduled_attributes: replay_scheduled_attributes(
+            &call,
+            capability,
+            method,
+            &params_hash,
+            &args_shape_hash,
+            resource_target_class,
+            policy_profile,
+        ),
+        params_hash,
+        started_at,
+        lane_execution,
+        marshalling_telemetry,
+        runtime_risk_decision,
+        decision,
+        reason,
+        resource_target_class,
     };
-
-    if let Some(manager) = ctx.manager.as_ref() {
-        manager.record_budget_recovery_sample(ctx.extension_id, outcome_error_code.is_none());
-    }
-
-    if let (Some(manager), Some(risk_decision)) =
-        (ctx.manager.as_ref(), runtime_risk_decision.as_ref())
+    let result = outcome_to_host_result(call_id, &outcome);
+    if let Some(runtime) = ctx.js_runtime
+        && runtime.has_deferred_hostcall(call_id)
     {
-        manager.record_runtime_risk_outcome(
-            ctx.extension_id,
+        // Admission is not successful completion. Record the actual terminal
+        // connector result, including denial, timeout, and cancellation.
+        runtime.set_deferred_hostcall_finalizer(
             call_id,
-            &reason,
-            risk_decision,
-            outcome_error_code,
+            Box::new(move |outcome| finalization.finish(outcome)),
+        );
+    } else {
+        finalization.finish(&outcome);
+    }
+    result
+}
+
+/// Owned completion metadata; no request body is retained for telemetry.
+struct HostcallFinalization {
+    runtime_name: String,
+    extension_id: Option<String>,
+    // A pending stream must not keep its own runtime actor/channel alive.
+    manager: Option<ExtensionManagerHandle>,
+    call_id: String,
+    method: String,
+    capability: &'static str,
+    scheduled_attributes: BTreeMap<String, String>,
+    params_hash: String,
+    started_at: Instant,
+    lane_execution: Option<HostcallLaneExecution>,
+    marshalling_telemetry: HostcallMarshallingTelemetry,
+    runtime_risk_decision: Option<RuntimeRiskDecision>,
+    decision: PolicyDecision,
+    reason: String,
+    resource_target_class: &'static str,
+}
+
+impl HostcallFinalization {
+    fn finish(self, outcome: &HostcallOutcome) {
+        let manager = self
+            .manager
+            .as_ref()
+            .and_then(ExtensionManagerHandle::upgrade);
+        let duration_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let extension_id = self.extension_id.as_deref();
+        let call_id = self.call_id.as_str();
+        log_hostcall_end(
+            &self.runtime_name,
+            call_id,
+            extension_id,
+            self.capability,
+            &self.method,
+            &self.params_hash,
             duration_ms,
-            lane_execution.as_ref(),
-            &marshalling_telemetry,
+            self.lane_execution.as_ref(),
+            &self.marshalling_telemetry,
+            outcome,
         );
-    }
-
-    // Replay trace recording: if the manager has replay enabled, record this dispatch.
-    if let Some(manager) = ctx.manager.as_ref()
-        && let Some(replay_config) = manager.replay_config()
-    {
-        let ext_id = ctx.extension_id.unwrap_or("unknown");
-        let trace_id = format!("hc-{call_id}");
-        let mut recorder = crate::extension_replay::ReplayRecorder::new(trace_id, replay_config);
-
-        recorder.tick();
-        recorder.record_scheduled(
-            ext_id,
-            call_id,
-            replay_scheduled_attributes(
-                &call,
-                capability,
-                method,
-                &params_hash,
-                &args_shape_hash,
-                resource_target_class,
-                policy_profile,
-            ),
-        );
-        recorder.tick();
-        recorder.record_queue_accepted(
-            ext_id,
-            call_id,
-            replay_queue_attributes(lane_execution.as_ref(), manager),
-        );
-        recorder.tick();
-
-        recorder.record_policy_decision(
-            ext_id,
-            call_id,
-            replay_policy_attributes(decision, &reason, runtime_risk_decision.as_ref()),
-        );
-        recorder.tick();
-
-        let outcome_kind = if outcome_error_code.is_some() {
-            crate::extension_replay::ReplayEventKind::Failed
-        } else {
-            crate::extension_replay::ReplayEventKind::Completed
+        let outcome_error_code = match outcome {
+            HostcallOutcome::Error { code, .. } => Some(code.as_str()),
+            _ => None,
         };
-        recorder.record(
-            ext_id,
-            call_id,
-            outcome_kind,
-            replay_outcome_attributes(&outcome, duration_ms, resource_target_class),
-        );
-
-        let observed_micros = u64::try_from(started_at.elapsed().as_micros())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let observation = crate::extension_replay::ReplayCaptureObservation {
-            baseline_micros: observed_micros,
-            captured_micros: observed_micros,
-            trace_bytes: 0,
-        };
-        if let Ok(result) = recorder.finish(observation)
-            && result.gate_report.capture_allowed
+        if let Some(manager) = manager.as_ref() {
+            manager.record_budget_recovery_sample(extension_id, outcome_error_code.is_none());
+        }
+        if let (Some(manager), Some(risk_decision)) =
+            (manager.as_ref(), self.runtime_risk_decision.as_ref())
         {
-            manager.store_replay_bundle(result.bundle);
+            manager.record_runtime_risk_outcome(
+                extension_id,
+                call_id,
+                &self.reason,
+                risk_decision,
+                outcome_error_code,
+                duration_ms,
+                self.lane_execution.as_ref(),
+                &self.marshalling_telemetry,
+            );
+        }
+        if let Some(manager) = manager.as_ref()
+            && let Some(replay_config) = manager.replay_config()
+        {
+            let ext_id = extension_id.unwrap_or("unknown");
+            let trace_id = format!("hc-{call_id}");
+            let mut recorder =
+                crate::extension_replay::ReplayRecorder::new(trace_id, replay_config);
+            recorder.tick();
+            recorder.record_scheduled(ext_id, call_id, self.scheduled_attributes);
+            recorder.tick();
+            recorder.record_queue_accepted(
+                ext_id,
+                call_id,
+                replay_queue_attributes(self.lane_execution.as_ref(), manager),
+            );
+            recorder.tick();
+            recorder.record_policy_decision(
+                ext_id,
+                call_id,
+                replay_policy_attributes(
+                    self.decision,
+                    &self.reason,
+                    self.runtime_risk_decision.as_ref(),
+                ),
+            );
+            recorder.tick();
+            let outcome_kind = if outcome_error_code.is_some() {
+                crate::extension_replay::ReplayEventKind::Failed
+            } else {
+                crate::extension_replay::ReplayEventKind::Completed
+            };
+            recorder.record(
+                ext_id,
+                call_id,
+                outcome_kind,
+                replay_outcome_attributes(outcome, duration_ms, self.resource_target_class),
+            );
+            let observed_micros = u64::try_from(self.started_at.elapsed().as_micros())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let observation = crate::extension_replay::ReplayCaptureObservation {
+                baseline_micros: observed_micros,
+                captured_micros: observed_micros,
+                trace_bytes: 0,
+            };
+            if let Ok(result) = recorder.finish(observation)
+                && result.gate_report.capture_allowed
+            {
+                manager.store_replay_bundle(result.bundle);
+            }
         }
     }
-
-    outcome_to_host_result(call_id, &outcome)
 }
 
 const REPLAY_CONTEXT_INDEX_KEYS: &[(&str, &str)] = &[
@@ -17802,7 +17966,10 @@ async fn dispatch_shared_allowed_legacy(
             )
             .await
         }
-        "http" => dispatch_hostcall_http(&call.call_id, ctx.http, call.params.clone()).await,
+        "http" => {
+            dispatch_hostcall_http(&call.call_id, ctx.http, call.params.clone(), ctx.js_runtime)
+                .await
+        }
         "session" => {
             let op = call
                 .params
@@ -18619,7 +18786,9 @@ async fn dispatch_hostcall_http(
     call_id: &str,
     connector: &HttpConnector,
     payload: Value,
+    runtime: Option<&PiJsRuntime>,
 ) -> HostcallOutcome {
+    let streaming = payload.get("stream").and_then(Value::as_bool) == Some(true);
     let call = crate::connectors::HostCallPayload {
         call_id: call_id.to_string(),
         capability: "http".to_string(),
@@ -18629,6 +18798,24 @@ async fn dispatch_hostcall_http(
         cancel_token: None,
         context: None,
     };
+
+    if streaming && let Some(runtime) = runtime {
+        if let Err(err) =
+            runtime.defer_hostcall_stream(call_id, http_hostcall_stream(connector.clone(), call))
+        {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: err.to_string(),
+            };
+        }
+        // The runtime owns this operation now. The dispatcher suppresses this
+        // marker; the first externally visible frame contains real headers.
+        return HostcallOutcome::StreamChunk {
+            sequence: 0,
+            chunk: Value::Null,
+            is_final: false,
+        };
+    }
 
     match connector.dispatch(&call).await {
         Ok(result) => {
@@ -18653,6 +18840,322 @@ async fn dispatch_hostcall_http(
             code: "internal".to_string(),
             message: err.to_string(),
         },
+    }
+}
+
+/// A pull-driven HTTP operation. Dropping any state drops the request or body
+/// future, so JS cancellation never leaves a detached network operation.
+enum HttpHostcallStream {
+    Start(HttpConnector, crate::connectors::HostCallPayload),
+    Body {
+        stream: futures::stream::BoxStream<'static, std::io::Result<Vec<u8>>>,
+        sequence: u64,
+        received: usize,
+        limit: usize,
+    },
+    Done,
+}
+
+fn http_hostcall_stream(
+    connector: HttpConnector,
+    call: crate::connectors::HostCallPayload,
+) -> futures::stream::LocalBoxStream<'static, HostcallOutcome> {
+    use base64::Engine as _;
+    use futures::StreamExt as _;
+
+    Box::pin(futures::stream::unfold(
+        HttpHostcallStream::Start(connector, call),
+        |state| async move {
+            match state {
+                HttpHostcallStream::Start(connector, call) => {
+                    let limit = connector.max_response_bytes();
+                    match connector.dispatch_streaming(&call).await {
+                        Ok(response) => {
+                            let mut headers = serde_json::Map::new();
+                            for (key, value) in response.headers() {
+                                let key = key.to_ascii_lowercase();
+                                let entry = headers
+                                    .entry(key)
+                                    .or_insert_with(|| Value::String(String::new()));
+                                if let Value::String(existing) = entry {
+                                    if !existing.is_empty() {
+                                        existing.push_str(", ");
+                                    }
+                                    existing.push_str(value);
+                                }
+                            }
+                            let outcome = HostcallOutcome::StreamChunk {
+                                sequence: 0,
+                                chunk: json!({
+                                    "status": response.status(),
+                                    "headers": headers,
+                                }),
+                                is_final: false,
+                            };
+                            Some((
+                                outcome,
+                                HttpHostcallStream::Body {
+                                    stream: response.bytes_stream(),
+                                    sequence: 1,
+                                    received: 0,
+                                    limit,
+                                },
+                            ))
+                        }
+                        Err(result) => {
+                            let code = result
+                                .error
+                                .as_ref()
+                                .map_or("internal", |err| hostcall_code_to_str(err.code));
+                            let message = result.error.map_or_else(
+                                || "HTTP connector error".to_string(),
+                                |err| err.message,
+                            );
+                            Some((
+                                HostcallOutcome::Error {
+                                    code: code.to_string(),
+                                    message,
+                                },
+                                HttpHostcallStream::Done,
+                            ))
+                        }
+                    }
+                }
+                HttpHostcallStream::Body {
+                    mut stream,
+                    sequence,
+                    received,
+                    limit,
+                } => match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        let received = received.saturating_add(bytes.len());
+                        if limit > 0 && received > limit {
+                            return Some((
+                                HostcallOutcome::Error {
+                                    code: "invalid_request".to_string(),
+                                    message: "response body too large".to_string(),
+                                },
+                                HttpHostcallStream::Done,
+                            ));
+                        }
+                        let chunk = json!({
+                            "body_bytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        });
+                        Some((
+                            HostcallOutcome::StreamChunk {
+                                sequence,
+                                chunk,
+                                is_final: false,
+                            },
+                            HttpHostcallStream::Body {
+                                stream,
+                                sequence: sequence.saturating_add(1),
+                                received,
+                                limit,
+                            },
+                        ))
+                    }
+                    Some(Err(err)) => {
+                        let code = if err.kind() == std::io::ErrorKind::TimedOut
+                            || err.to_string().to_ascii_lowercase().contains("timed out")
+                        {
+                            "timeout"
+                        } else {
+                            "io"
+                        };
+                        Some((
+                            HostcallOutcome::Error {
+                                code: code.to_string(),
+                                message: err.to_string(),
+                            },
+                            HttpHostcallStream::Done,
+                        ))
+                    }
+                    None => Some((
+                        HostcallOutcome::StreamChunk {
+                            sequence,
+                            chunk: Value::Null,
+                            is_final: true,
+                        },
+                        HttpHostcallStream::Done,
+                    )),
+                },
+                HttpHostcallStream::Done => None,
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+mod deferred_http_security_tests {
+    use super::*;
+    use crate::connectors::http::HttpConnectorConfig;
+    use futures::StreamExt as _;
+
+    fn start_reply_fixture() -> (JsProviderStreamStartGuard, mpsc::Receiver<JsRuntimeCommand>) {
+        let (sender, receiver) = mpsc::channel(4);
+        let runtime = JsExtensionRuntimeHandle {
+            sender,
+            manager_ref: Weak::new(),
+            compat_scan_mode: false,
+            exit_signal: Arc::new(Mutex::new(None)),
+        };
+        (
+            JsProviderStreamStartGuard {
+                runtime,
+                stream_id: Some("provider-stream-1".to_string()),
+            },
+            receiver,
+        )
+    }
+
+    fn assert_start_reply_cancelled_once(receiver: &mut mpsc::Receiver<JsRuntimeCommand>) {
+        let command = receiver
+            .try_recv()
+            .expect("enqueue abandoned start cleanup");
+        match command {
+            JsRuntimeCommand::ProviderStreamSimpleCancel {
+                stream_id, reply, ..
+            } => {
+                assert_eq!(stream_id, "provider-stream-1");
+                assert!(reply.is_none(), "cleanup must not require a reply receiver");
+            }
+            other => panic!("expected provider stream cleanup, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "cleanup must be enqueued once"
+        );
+    }
+
+    #[test]
+    fn provider_start_failed_reply_send_cancels_published_route() {
+        let (guard, mut commands) = start_reply_fixture();
+        let (reply, receiver) = oneshot::channel::<Result<JsProviderStreamStartGuard>>();
+        drop(receiver);
+
+        let error = reply
+            .send(&Cx::for_request(), Ok(guard))
+            .expect_err("reply receiver is closed");
+        drop(error);
+
+        assert_start_reply_cancelled_once(&mut commands);
+    }
+
+    #[test]
+    fn provider_start_successful_unread_reply_cancels_on_receiver_drop() {
+        let (guard, mut commands) = start_reply_fixture();
+        let (reply, receiver) = oneshot::channel::<Result<JsProviderStreamStartGuard>>();
+        reply
+            .send(&Cx::for_request(), Ok(guard))
+            .expect("send start reply while receiver is live");
+        assert!(
+            commands.try_recv().is_err(),
+            "a queued reply must retain ownership until it is read or dropped"
+        );
+
+        drop(receiver);
+
+        assert_start_reply_cancelled_once(&mut commands);
+    }
+
+    #[test]
+    fn provider_start_received_unclaimed_reply_still_cancels_on_drop() {
+        futures::executor::block_on(async {
+            let (guard, mut commands) = start_reply_fixture();
+            let (reply, mut receiver) = oneshot::channel::<Result<JsProviderStreamStartGuard>>();
+            let cx = Cx::for_request();
+            reply.send(&cx, Ok(guard)).expect("send start reply");
+            let guard = receiver
+                .recv(&cx)
+                .await
+                .expect("receive start reply")
+                .expect("start succeeded");
+            drop(receiver);
+            assert!(
+                commands.try_recv().is_err(),
+                "receiving the reply must not disarm cleanup before timeout acceptance"
+            );
+
+            drop(guard);
+
+            assert_start_reply_cancelled_once(&mut commands);
+        });
+    }
+
+    #[test]
+    fn provider_start_claimed_reply_transfers_cleanup_ownership() {
+        futures::executor::block_on(async {
+            let (guard, mut commands) = start_reply_fixture();
+            let (reply, mut receiver) = oneshot::channel::<Result<JsProviderStreamStartGuard>>();
+            let cx = Cx::for_request();
+            reply.send(&cx, Ok(guard)).expect("send start reply");
+            let stream_id = receiver
+                .recv(&cx)
+                .await
+                .expect("receive start reply")
+                .and_then(JsProviderStreamStartGuard::into_stream_id)
+                .expect("claim successful start");
+            drop(receiver);
+
+            assert_eq!(stream_id, "provider-stream-1");
+            assert!(
+                commands.try_recv().is_err(),
+                "claiming the ID transfers cleanup responsibility to the caller"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_http_producer_preserves_tls_allowlist_and_denylist_rejections() {
+        futures::executor::block_on(async {
+            let cases = [
+                (
+                    "http://example.com/relay",
+                    HttpConnectorConfig {
+                        require_tls: true,
+                        allow_loopback_http: false,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "https://blocked.example.com/relay",
+                    HttpConnectorConfig {
+                        enforce_allowlist: true,
+                        allowlist: vec!["allowed.example.com".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "https://blocked.example.com/relay",
+                    HttpConnectorConfig {
+                        denylist: vec!["blocked.example.com".to_string()],
+                        ..Default::default()
+                    },
+                ),
+            ];
+            for (url, config) in cases {
+                let call = HostCallPayload {
+                    call_id: "denied-stream".to_string(),
+                    capability: "http".to_string(),
+                    method: "http".to_string(),
+                    params: json!({"url": url, "stream": true}),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                };
+                let mut stream = http_hostcall_stream(HttpConnector::new(config), call);
+                let outcome = stream.next().await.expect("policy result");
+                assert!(
+                    matches!(&outcome, HostcallOutcome::Error { code, .. } if code == "denied"),
+                    "streaming request must preserve connector denial: {outcome:?}"
+                );
+                assert!(
+                    stream.next().await.is_none(),
+                    "denial must terminate producer"
+                );
+            }
+        });
     }
 }
 
@@ -20158,7 +20661,6 @@ pub struct ExtensionManager {
     snapshot_version: Arc<AtomicU64>,
 }
 
-#[cfg(feature = "wasm-host")]
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionManagerHandle {
     inner: Weak<Mutex<ExtensionManagerInner>>,
@@ -20166,7 +20668,6 @@ pub(crate) struct ExtensionManagerHandle {
     snapshot_version: Option<Arc<AtomicU64>>,
 }
 
-#[cfg(feature = "wasm-host")]
 impl ExtensionManagerHandle {
     fn new(manager: &ExtensionManager) -> Self {
         Self {

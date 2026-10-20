@@ -123,6 +123,11 @@ impl HttpConnector {
     pub fn with_defaults() -> Self {
         Self::new(HttpConnectorConfig::default())
     }
+
+    #[must_use]
+    pub(crate) const fn max_response_bytes(&self) -> usize {
+        self.config.max_response_bytes
+    }
 }
 
 fn invalid_request(call_id: &str, message: impl Into<String>) -> HostResultPayload {

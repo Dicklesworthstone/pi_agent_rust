@@ -11,7 +11,8 @@ mod common;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
-use pi::extensions_js::PiJsRuntimeConfig;
+use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};
+use pi::scheduler::{DeterministicClock, HostcallOutcome};
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
 
@@ -773,12 +774,12 @@ fn response_destroy_before_body_suppresses_data_and_end() {
             events.push('response');
             res.on('data', () => events.push('data'));
             res.on('end', () => events.push('end'));
-            res.on('close', () => events.push('close'));
+            res.on('close', () => {
+                events.push('close');
+                Promise.resolve().then(() => resolve({ result: events.join(',') }));
+            });
             res.destroy();
         });
-        Promise.resolve().then(() => Promise.resolve().then(() => {
-            resolve({ result: events.join(',') });
-        }));
         "#,
     );
     assert_eq!(result, "response,close");
@@ -796,11 +797,11 @@ fn response_destroy_during_data_suppresses_end() {
                 res.destroy();
             });
             res.on('end', () => events.push('end'));
-            res.on('close', () => events.push('close'));
+            res.on('close', () => {
+                events.push('close');
+                Promise.resolve().then(() => resolve({ result: events.join(',') }));
+            });
         });
-        Promise.resolve().then(() => Promise.resolve().then(() => {
-            resolve({ result: events.join(',') });
-        }));
         "#,
     );
     assert_eq!(result, "data,close");
@@ -981,10 +982,10 @@ fn abort_in_response_callback_suppresses_body_delivery() {
             req.abort();
         });
         req.on('abort', () => events.push('abort'));
-        req.on('close', () => events.push('close'));
-        Promise.resolve().then(() => Promise.resolve().then(() => {
-            resolve({ result: events.join(',') });
-        }));
+        req.on('close', () => {
+            events.push('close');
+            Promise.resolve().then(() => resolve({ result: events.join(',') }));
+        });
         "#,
     );
     assert_eq!(result, "response,abort,close");
@@ -1066,4 +1067,385 @@ fn end_with_chunk_writes_before_send() {
         ",
     );
     assert_eq!(result, "before-after");
+}
+
+// Fetch uses the same capability-gated HTTP bridge as the Node client APIs.
+// These deterministic tests deliberately complete real PiJS hostcall records;
+// Promise rejection alone would not prove cancellation reached that bridge.
+
+#[test]
+fn fetch_abort_signal_composition_keeps_first_reason_and_ignores_synthetic_events() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                const first = new AbortController();
+                const second = new AbortController();
+                const combined = AbortSignal.any([first.signal, second.signal, first.signal]);
+                let calls = 0;
+                combined.addEventListener('abort', () => { throw new Error('listener failure'); });
+                combined.addEventListener('abort', () => { calls++; }, { once: true });
+                first.signal.dispatchEvent(new Event('abort'));
+                const syntheticAborted = combined.aborted;
+                const reason = new Error('first reason');
+                first.abort(reason);
+                second.abort('second reason');
+                first.abort('third reason');
+                let invalid = false;
+                try { AbortSignal.any([AbortSignal.abort(), {}]); }
+                catch (error) { invalid = error instanceof TypeError; }
+                globalThis.result = {
+                    syntheticAborted,
+                    sameReason: combined.reason === reason && first.signal.reason === reason,
+                    calls,
+                    nullReason: AbortSignal.any([AbortSignal.abort(null), second.signal]).reason,
+                    emptyAborted: AbortSignal.any([]).aborted,
+                    invalid,
+                    eventTarget: combined instanceof EventTarget,
+                };
+                ",
+            )
+            .await
+            .expect("evaluate signals");
+        assert_eq!(
+            runtime.get_global_json("result").await.expect("result"),
+            serde_json::json!({
+                "syntheticAborted": false,
+                "sameReason": true,
+                "calls": 1,
+                "nullReason": null,
+                "emptyAborted": false,
+                "invalid": true,
+                "eventTarget": true,
+            })
+        );
+    });
+}
+
+#[test]
+fn fetch_preabort_and_unsupported_dispatcher_do_not_enqueue_http() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.result = [];
+                (async () => {
+                    const before = new AbortController();
+                    before.abort('already cancelled');
+                    try { await fetch('https://example.com/never', { signal: before.signal }); }
+                    catch (error) { result.push(error); }
+                    try { await fetch('https://example.com/never', { dispatcher: { dispatch() {} } }); }
+                    catch (error) { result.push(error.name); }
+                    const during = new AbortController();
+                    const headers = { get test() { during.abort('normalization cancelled'); return 'value'; } };
+                    try { await fetch('https://example.com/never', { signal: during.signal, headers }); }
+                    catch (error) { result.push(error); }
+                })();
+                ",
+            )
+            .await
+            .expect("evaluate fetch rejection");
+        runtime.drain_microtasks().await.expect("settle rejections");
+        assert!(runtime.drain_hostcall_requests().is_empty());
+        assert_eq!(
+            runtime.get_global_json("result").await.expect("result"),
+            serde_json::json!(["already cancelled", "TypeError", "normalization cancelled"])
+        );
+    });
+}
+
+#[test]
+fn fetch_resolves_at_headers_and_streams_binary_bytes_to_both_clones() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.status = null;
+                globalThis.result = null;
+                fetch('https://example.com/relay', {
+                    method: 'POST',
+                    headers: new Headers({ 'X-Relay-Target': 'https://upstream.example.com' }),
+                    body: new Uint8Array([0, 255, 65]),
+                }).then(async response => {
+                    globalThis.status = response.status;
+                    const copy = response.clone();
+                    const bodies = await Promise.all([response.arrayBuffer(), copy.arrayBuffer()]);
+                    globalThis.result = bodies.map(body => Array.from(new Uint8Array(body)));
+                });
+                ",
+            )
+            .await
+            .expect("start fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.payload["stream"], true);
+        assert_eq!(request.payload["body_bytes"], "AP9B");
+        assert!(request.payload.get("body").is_none());
+        assert_eq!(
+            request.payload["headers"]["x-relay-target"],
+            "https://upstream.example.com"
+        );
+        runtime.complete_hostcall(
+            &request.call_id,
+            HostcallOutcome::StreamChunk {
+                sequence: 0,
+                chunk: serde_json::json!({ "status": 200, "headers": {} }),
+                is_final: false,
+            },
+        );
+        runtime.tick().await.expect("deliver headers");
+        assert_eq!(
+            runtime.get_global_json("status").await.expect("status"),
+            200
+        );
+        assert_eq!(
+            runtime
+                .get_global_json("result")
+                .await
+                .expect("pending body"),
+            serde_json::Value::Null
+        );
+        for (sequence, encoded) in [(1, "AP9B"), (2, "w6k=")] {
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk: serde_json::json!({ "body_bytes": encoded }),
+                    is_final: false,
+                },
+            );
+            runtime.tick().await.expect("deliver bytes");
+        }
+        runtime.complete_hostcall(
+            &request.call_id,
+            HostcallOutcome::StreamChunk {
+                sequence: 3,
+                chunk: serde_json::Value::Null,
+                is_final: true,
+            },
+        );
+        runtime.tick().await.expect("finish stream");
+        runtime
+            .drain_microtasks()
+            .await
+            .expect("settle body readers");
+        assert_eq!(
+            runtime.get_global_json("result").await.expect("bodies"),
+            serde_json::json!([[0, 255, 65, 195, 169], [0, 255, 65, 195, 169]])
+        );
+    });
+}
+
+#[test]
+fn fetch_abort_before_headers_cancels_the_pending_hostcall() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.controller = new AbortController();
+                globalThis.result = null;
+                fetch('https://example.com/slow', { signal: controller.signal })
+                    .then(() => { result = 'unexpected response'; }, error => { result = error.name; });
+                ",
+            )
+            .await
+            .expect("start fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(runtime.is_hostcall_active(&requests[0].call_id));
+        runtime
+            .eval("controller.signal.dispatchEvent(new Event('abort'));")
+            .await
+            .expect("dispatch synthetic abort");
+        assert!(runtime.is_hostcall_active(&requests[0].call_id));
+        runtime
+            .eval("controller.abort(); controller.abort();")
+            .await
+            .expect("abort");
+        runtime.drain_microtasks().await.expect("settle abort");
+        assert!(!runtime.is_hostcall_active(&requests[0].call_id));
+        assert_eq!(
+            runtime
+                .get_global_json("result")
+                .await
+                .expect("abort result"),
+            "AbortError"
+        );
+        assert!(runtime.drain_hostcall_requests().is_empty());
+    });
+}
+
+#[test]
+fn fetch_abort_after_headers_rejects_body_read_and_stops_transport() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.controller = new AbortController();
+                globalThis.result = null;
+                fetch('https://example.com/stream', { signal: controller.signal })
+                    .then(response => response.text())
+                    .then(() => { result = 'unexpected body'; }, error => { result = error.name; });
+                ",
+            )
+            .await
+            .expect("start fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.complete_hostcall(
+            &requests[0].call_id,
+            HostcallOutcome::StreamChunk {
+                sequence: 0,
+                chunk: serde_json::json!({ "status": 200, "headers": {} }),
+                is_final: false,
+            },
+        );
+        runtime.tick().await.expect("deliver headers");
+        runtime
+            .eval("controller.abort();")
+            .await
+            .expect("abort body");
+        runtime.drain_microtasks().await.expect("settle body error");
+        assert!(!runtime.is_hostcall_active(&requests[0].call_id));
+        assert_eq!(
+            runtime.get_global_json("result").await.expect("body error"),
+            "AbortError"
+        );
+    });
+}
+
+#[test]
+fn fetch_cancel_clones_keeps_transport_until_last_consumer_cancels() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.original = null;
+                globalThis.copy = null;
+                fetch('https://example.com/stream').then(response => {
+                    original = response;
+                    copy = response.clone();
+                });
+                ",
+            )
+            .await
+            .expect("start fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.complete_hostcall(
+            &requests[0].call_id,
+            HostcallOutcome::StreamChunk {
+                sequence: 0,
+                chunk: serde_json::json!({ "status": 200, "headers": {} }),
+                is_final: false,
+            },
+        );
+        runtime.tick().await.expect("deliver headers");
+        runtime
+            .eval("copy.body.cancel();")
+            .await
+            .expect("cancel copy");
+        runtime
+            .drain_microtasks()
+            .await
+            .expect("settle copy cancellation");
+        assert!(runtime.is_hostcall_active(&requests[0].call_id));
+        runtime
+            .eval("original.body.cancel();")
+            .await
+            .expect("cancel original");
+        runtime
+            .drain_microtasks()
+            .await
+            .expect("settle final cancellation");
+        assert!(!runtime.is_hostcall_active(&requests[0].call_id));
+    });
+}
+
+#[test]
+fn fetch_timeout_signal_cancels_transport_and_preserves_caller_signal() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.caller = new AbortController();
+                globalThis.result = null;
+                const signal = AbortSignal.any([caller.signal, AbortSignal.timeout(25)]);
+                fetch('https://example.com/slow', { signal })
+                    .catch(error => { result = { name: error.name, callerAborted: caller.signal.aborted }; });
+                ",
+            )
+            .await
+            .expect("start timed fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        clock.advance(25);
+        runtime.tick().await.expect("fire timeout");
+        runtime.drain_microtasks().await.expect("settle timeout");
+        assert!(!runtime.is_hostcall_active(&requests[0].call_id));
+        assert_eq!(
+            runtime
+                .get_global_json("result")
+                .await
+                .expect("timeout result"),
+            serde_json::json!({ "name": "TimeoutError", "callerAborted": false })
+        );
+    });
+}
+
+#[test]
+fn fetch_preserves_http_policy_denial_without_an_alternate_transport() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r"
+                globalThis.result = null;
+                fetch('https://blocked.example.com/relay')
+                    .catch(error => { result = { code: error.code, message: error.message }; });
+                ",
+            )
+            .await
+            .expect("start fetch");
+        let requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.complete_hostcall(
+            &requests[0].call_id,
+            HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: "HTTP host is denied".to_string(),
+            },
+        );
+        runtime.tick().await.expect("deliver denial");
+        assert_eq!(
+            runtime.get_global_json("result").await.expect("denial"),
+            serde_json::json!({ "code": "denied", "message": "HTTP host is denied" })
+        );
+        assert!(runtime.drain_hostcall_requests().is_empty());
+    });
 }

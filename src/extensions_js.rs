@@ -7950,6 +7950,28 @@ fn read_proc_uid_gid() -> Option<(u32, u32)> {
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
 
+    // Some extensions import Agent unconditionally but feature-detect native
+    // Undici before using it. Keep that import resolvable without advertising
+    // a socket/dispatcher implementation or loading arbitrary npm packages.
+    modules.insert(
+        "undici".to_string(),
+        compressed_js_literal!(r#"
+export class Agent {
+  constructor() {
+    const error = new Error('Custom Undici dispatchers are not available in PiJS; use global fetch through the host HTTP capability');
+    error.code = 'ERR_PIJS_UNSUPPORTED_DISPATCHER';
+    throw error;
+  }
+}
+export const fetch = globalThis.fetch;
+export const Headers = globalThis.Headers;
+export const Response = globalThis.Response;
+export default { Agent, fetch, Headers, Response };
+"#)
+        .trim()
+        .to_string(),
+    );
+
     modules.insert(
         "@sinclair/typebox".to_string(),
         compressed_js_literal!(r#"
@@ -15026,50 +15048,85 @@ class Readable extends Stream {
     const stream = this;
     const queue = [];
     const waiters = [];
-    let done = false;
+    let queuedBytes = 0;
+    let done = stream.destroyed || stream._readableState.ended;
     let failure = null;
 
     const settleDone = () => {
       done = true;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().resolve({ value: undefined, done: true });
       }
     };
     const settleError = (err) => {
       failure = __streamToError(err);
+      done = true;
+      queue.length = 0;
+      queuedBytes = 0;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().reject(failure);
       }
     };
     const onData = (value) => {
+      if (done) return;
       if (waiters.length > 0) {
         waiters.shift().resolve({ value, done: false });
       } else {
-        queue.push(value);
+        const size = typeof value === 'string' ? value.length * 2 : (value && value.byteLength) || 1;
+        if (queue.length >= 1024 || queuedBytes + size > 1024 * 1024) {
+          settleError(new Error('Readable async iterator buffer exceeds its limit'));
+          stream.destroy();
+          return;
+        }
+        queue.push({ value, size });
+        queuedBytes += size;
       }
+      if (waiters.length === 0 && typeof stream.pause === 'function') stream.pause();
     };
     const onEnd = () => settleDone();
-    const onError = (err) => settleError(err);
+    const onError = (err) => {
+      settleError(err);
+      if (!stream.destroyed) stream.destroy();
+    };
+    const onClose = () => settleDone();
     const cleanup = () => {
       stream.removeListener("data", onData);
       stream.removeListener("end", onEnd);
       stream.removeListener("error", onError);
+      stream.removeListener("close", onClose);
     };
 
-    stream.on("data", onData);
-    stream.on("end", onEnd);
-    stream.on("error", onError);
+    if (!done) {
+      stream.on("data", onData);
+      stream.on("end", onEnd);
+      stream.on("error", onError);
+      stream.on("close", onClose);
+      if (typeof stream.pause === 'function') stream.pause();
+    }
 
     return {
       async next() {
-        if (queue.length > 0) return { value: queue.shift(), done: false };
         if (failure) throw failure;
+        if (queue.length > 0) {
+          const item = queue.shift();
+          queuedBytes -= item.size;
+          if (queue.length === 0 && !done && typeof stream.resume === 'function') stream.resume();
+          return { value: item.value, done: false };
+        }
         if (done) return { value: undefined, done: true };
-        return await new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        const pending = new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        if (typeof stream.resume === 'function') stream.resume();
+        return await pending;
       },
       async return() {
-        cleanup();
+        queue.length = 0;
+        queuedBytes = 0;
         settleDone();
+        // Node's default iterator owns the stream. A for-await break must
+        // cancel a live Web reader instead of leaving its HTTP request running.
+        if (!stream.destroyed) stream.destroy();
         return { value: undefined, done: true };
       },
       [Symbol.asyncIterator]() { return this; },
@@ -15097,16 +15154,52 @@ class Readable extends Stream {
     }
     const reader = webReadable.getReader();
     const readable = new Readable(opts);
+    let resumeRead = null;
+    const originalDestroy = readable.destroy.bind(readable);
+    readable.pause = () => {
+      readable._readableState.flowing = false;
+      return readable;
+    };
+    readable.resume = () => {
+      readable._readableState.flowing = true;
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return readable;
+    };
+    readable.destroy = (error) => {
+      if (readable.destroyed) return readable;
+      try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return originalDestroy(error);
+    };
     (async () => {
       try {
-        while (true) {
+        while (!readable.destroyed) {
+          if (readable._readableState.flowing === false) {
+            await new Promise((resolve) => { resumeRead = resolve; });
+          }
+          if (readable.destroyed) break;
           const { done, value } = await reader.read();
-          if (done) break;
-          readable.push(value);
+          if (done || readable.destroyed) break;
+          const normalized = __normalizeChunk(value, readable._readableState.encoding);
+          const chunk = !opts.objectMode && typeof normalized !== 'string' &&
+              typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
+            ? Buffer.from(normalized)
+            : normalized;
+          // Event consumers already receive the bytes. Retaining another copy
+          // in Readable._queue leaks an entire long-lived SSE response.
+          if (readable.listenerCount('data') > 0) {
+            readable.emit('data', chunk);
+          } else {
+            const retained = readable._queue.reduce((size, part) => size + (part.byteLength || part.length || 0), 0);
+            if (retained + (chunk.byteLength || chunk.length || 0) > 1024 * 1024) {
+              throw new Error('Readable.fromWeb buffer exceeds 1 MiB without a consumer');
+            }
+            readable._queue.push(chunk);
+          }
         }
-        readable.push(null);
+        if (!readable.destroyed) readable.push(null);
       } catch (err) {
-        readable.emit("error", __streamToError(err));
+        if (!readable.destroyed) readable.destroy(__streamToError(err));
       } finally {
         try { reader.releaseLock(); } catch (_) {}
       }
@@ -15694,10 +15787,48 @@ export default {
     modules.insert(
         "node:string_decoder".to_string(),
         r"
+import { Buffer } from 'node:buffer';
+
 export class StringDecoder {
-  constructor(encoding) { this.encoding = encoding || 'utf8'; }
-  write(buf) { return typeof buf === 'string' ? buf : String(buf ?? ''); }
-  end(buf) { return buf ? this.write(buf) : ''; }
+  constructor(encoding = 'utf8') {
+    const name = String(encoding).toLowerCase().replace(/[-_]/g, '');
+    this.encoding = name === 'ucs2' ? 'utf16le' : name === 'binary' ? 'latin1' : name;
+    if (!['utf8', 'utf16le', 'latin1', 'ascii', 'hex', 'base64', 'base64url'].includes(this.encoding)) {
+      throw new TypeError('Unknown encoding: ' + String(encoding));
+    }
+    this._pending = Buffer.alloc(0);
+  }
+  write(buf) {
+    if (typeof buf === 'string') return buf;
+    if (buf === undefined || buf === null) return '';
+    const input = ArrayBuffer.isView(buf)
+      ? Buffer.from(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength))
+      : Buffer.from(buf);
+    const bytes = this._pending.length ? Buffer.concat([this._pending, input]) : input;
+    let end = bytes.length;
+    if (this.encoding === 'utf8' && end > 0) {
+      let lead = end - 1;
+      while (lead > 0 && (bytes[lead] & 0xc0) === 0x80 && end - lead < 4) lead--;
+      const first = bytes[lead];
+      const needed = first >= 0xc2 && first <= 0xdf ? 2
+        : first >= 0xe0 && first <= 0xef ? 3
+        : first >= 0xf0 && first <= 0xf4 ? 4 : 1;
+      if (end - lead < needed) end = lead;
+    } else if (this.encoding === 'utf16le') {
+      end -= end % 2;
+      if (end >= 2 && bytes[end - 1] >= 0xd8 && bytes[end - 1] <= 0xdb) end -= 2;
+    } else if (this.encoding === 'base64' || this.encoding === 'base64url') {
+      end -= end % 3;
+    }
+    this._pending = Buffer.from(bytes.subarray(end));
+    return Buffer.from(bytes.subarray(0, end)).toString(this.encoding);
+  }
+  end(buf) {
+    const head = buf === undefined ? '' : this.write(buf);
+    const tail = this._pending.toString(this.encoding);
+    this._pending = Buffer.alloc(0);
+    return head + tail;
+  }
 }
 export default { StringDecoder };
 "
@@ -17378,6 +17509,30 @@ pub fn available_virtual_module_names() -> std::collections::BTreeSet<String> {
 /// while avoiding per-tick full-heap scans.
 const UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS: u64 = 32;
 
+struct DeferredHostcall {
+    stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    credit: bool,
+    deadline: Option<std::time::Instant>,
+    finalizer: Option<Box<dyn FnOnce(&HostcallOutcome)>>,
+}
+
+impl DeferredHostcall {
+    fn finish(&mut self, outcome: &HostcallOutcome) {
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer(outcome);
+        }
+    }
+}
+
+impl Drop for DeferredHostcall {
+    fn drop(&mut self) {
+        self.finish(&HostcallOutcome::Error {
+            code: "cancelled".to_string(),
+            message: "HTTP stream cancelled before completion".to_string(),
+        });
+    }
+}
+
 /// Integrated PiJS runtime combining QuickJS, scheduler, and Promise bridge.
 ///
 /// This is the main entry point for running JavaScript extensions with
@@ -17419,6 +17574,9 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     hostcall_queue: HostcallQueue,
     trace_seq: Arc<AtomicU64>,
     hostcall_tracker: Rc<RefCell<HostcallTracker>>,
+    // Poll owned network futures between JS turns. One credit permits one
+    // response frame, keeping timers, cancellation, and slow consumers live.
+    deferred_hostcalls: Rc<RefCell<HashMap<String, DeferredHostcall>>>,
     active_session_action_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
     user_timer_origins: Rc<RefCell<HashMap<u64, SessionActionOrigin>>>,
     hostcalls_total: Arc<AtomicU64>,
@@ -17468,6 +17626,8 @@ struct JsRuntimeRegistrySnapshot {
     pending_event_listener_lists: u64,
     event_batch_contexts: u64,
     provider_streams: u64,
+    virtual_http_servers: u64,
+    virtual_http_requests: u64,
     api_providers: u64,
     child_processes: u64,
     vfs_files: u64,
@@ -17676,6 +17836,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             hostcall_queue,
             trace_seq,
             hostcall_tracker,
+            deferred_hostcalls: Rc::new(RefCell::new(HashMap::new())),
             active_session_action_origin,
             user_timer_origins,
             hostcalls_total,
@@ -17822,6 +17983,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.pending_event_listener_lists
             + reset_payload.after.event_batch_contexts
             + reset_payload.after.provider_streams
+            + reset_payload.after.virtual_http_servers
+            + reset_payload.after.virtual_http_requests
             + reset_payload.after.api_providers
             + reset_payload.after.child_processes
             + reset_payload.after.vfs_files
@@ -17831,6 +17994,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.residual_entries_after = residual_after;
 
         self.hostcall_queue.borrow_mut().clear();
+        self.deferred_hostcalls.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
         self.active_session_action_origin.replace(None);
         self.user_timer_origins.borrow_mut().clear();
@@ -18198,6 +18362,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Cancel a pending hostcall and enqueue a final sentinel stream chunk if applicable.
     pub fn cancel_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow_mut().remove(call_id);
         let (timer_id, next_seq) = {
             let mut tracker = self.hostcall_tracker.borrow_mut();
             let Some(cancelled) = tracker.cancel(call_id) else {
@@ -18220,6 +18385,119 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             );
         }
         true
+    }
+
+    pub(crate) fn defer_hostcall_stream(
+        &self,
+        call_id: &str,
+        stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    ) -> Result<()> {
+        let mut pending = self.deferred_hostcalls.borrow_mut();
+        if pending.len() >= 64 || pending.contains_key(call_id) {
+            return Err(Error::extension("Too many pending HTTP streams"));
+        }
+        pending.insert(
+            call_id.to_string(),
+            DeferredHostcall {
+                stream,
+                credit: true,
+                deadline: None,
+                finalizer: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn has_deferred_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow().contains_key(call_id)
+    }
+
+    pub(crate) fn set_deferred_hostcall_finalizer(
+        &self,
+        call_id: &str,
+        finalizer: Box<dyn FnOnce(&HostcallOutcome)>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.finalizer = Some(finalizer);
+        }
+    }
+
+    fn finish_deferred_hostcall(&self, call_id: &str, outcome: &HostcallOutcome) {
+        let pending = self.deferred_hostcalls.borrow_mut().remove(call_id);
+        if let Some(mut pending) = pending {
+            pending.finish(outcome);
+        }
+    }
+
+    pub(crate) fn set_deferred_hostcall_deadline(
+        &self,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.deadline = deadline;
+        }
+    }
+
+    async fn poll_deferred_hostcalls(&self) {
+        use std::task::Poll;
+        let completions = futures::future::poll_fn(|cx| {
+            let mut completions = Vec::new();
+            self.deferred_hostcalls
+                .borrow_mut()
+                .retain(|call_id, pending| {
+                    if !self.is_hostcall_active(call_id) {
+                        return false;
+                    }
+                    if pending
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        let outcome = HostcallOutcome::Error {
+                            code: "timeout".to_string(),
+                            message: "Root JavaScript task deadline elapsed during HTTP stream"
+                                .to_string(),
+                        };
+                        pending.finish(&outcome);
+                        completions.push((call_id.clone(), outcome));
+                        return false;
+                    }
+                    if !pending.credit {
+                        return true;
+                    }
+                    match pending.stream.as_mut().poll_next(cx) {
+                        Poll::Pending => true,
+                        Poll::Ready(None) => {
+                            let outcome = HostcallOutcome::Error {
+                                code: "io".to_string(),
+                                message: "HTTP stream ended without a terminal response frame"
+                                    .to_string(),
+                            };
+                            pending.finish(&outcome);
+                            completions.push((call_id.clone(), outcome));
+                            false
+                        }
+                        Poll::Ready(Some(outcome)) => {
+                            let finished = !matches!(
+                                &outcome,
+                                HostcallOutcome::StreamChunk {
+                                    is_final: false,
+                                    ..
+                                }
+                            );
+                            if finished {
+                                pending.finish(&outcome);
+                            }
+                            pending.credit = false;
+                            completions.push((call_id.clone(), outcome));
+                            !finished
+                        }
+                    }
+                });
+            Poll::Ready(completions)
+        })
+        .await;
+        self.complete_hostcalls_batch(completions);
     }
 
     /// Enter a causal Session-action origin for synchronous JS work and all
@@ -18309,6 +18587,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     ///
     /// Returns statistics about what was executed.
     pub async fn tick(&self) -> Result<PiJsTickStats> {
+        self.poll_deferred_hostcalls().await;
         // Get the next macrotask from scheduler
         let macrotask = self.scheduler.borrow_mut().tick();
 
@@ -18449,6 +18728,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }
                 } else {
                     // Final chunk or non-stream outcome: complete the hostcall.
+                    // Drop a deferred request now, even if this completion was
+                    // injected externally and the actor has no later tick.
+                    self.finish_deferred_hostcall(call_id, outcome);
                     let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
                     let timer_id = match completion {
                         HostcallCompletion::Delivered { timer_id } => timer_id,
@@ -18494,6 +18776,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         code: "timeout".to_string(),
                         message: "Hostcall timed out".to_string(),
                     };
+                    // A watchdog can be the last pending actor task. Finish
+                    // accounting and release the network future in this tick.
+                    self.finish_deferred_hostcall(&call_id, &outcome);
                     self.deliver_hostcall_completion(ctx, &call_id, &outcome)?;
                     return Ok(());
                 }
@@ -18737,6 +19022,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let hostcall_queue = self.hostcall_queue.clone();
         let scheduler = Rc::clone(&self.scheduler);
         let hostcall_tracker = Rc::clone(&self.hostcall_tracker);
+        let deferred_hostcalls = Rc::clone(&self.deferred_hostcalls);
         let active_session_action_origin = Rc::clone(&self.active_session_action_origin);
         let user_timer_origins = Rc::clone(&self.user_timer_origins);
         let hostcalls_total = Arc::clone(&self.hostcalls_total);
@@ -19187,11 +19473,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                 // __pi_cancel_hostcall_native(call_id) -> bool
                 global.set(
+                    "__pi_http_stream_pull_native",
+                    Func::from({
+                        let pending = Rc::clone(&deferred_hostcalls);
+                        move |call_id: String| {
+                            if let Some(stream) = pending.borrow_mut().get_mut(&call_id) {
+                                stream.credit = true;
+                            }
+                        }
+                    }),
+                )?;
+
+                global.set(
                     "__pi_cancel_hostcall_native",
                     Func::from({
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let pending = Rc::clone(&deferred_hostcalls);
                         move |_ctx: Ctx<'_>, call_id: String| -> rquickjs::Result<bool> {
+                            pending.borrow_mut().remove(&call_id);
                             let (timer_id, next_seq) = {
                                 let mut tracker = tracker.borrow_mut();
                                 let Some(cancelled) = tracker.cancel(&call_id) else {
@@ -20931,6 +21231,8 @@ function __pi_runtime_registry_snapshot() {
             __pi_provider_streams
                 ? optionalCount(() => __pi_map_size_primordial(__pi_provider_streams))
                 : 0,
+        virtualHttpServers: __pi_map_size_primordial(__pi_virtual_http_servers),
+        virtualHttpRequests: __pi_set_size_primordial(__pi_virtual_http_requests),
         apiProviders: optionalCount(globalThis.__pi_api_provider_registry_size),
         childProcesses: optionalCount(globalThis.__pi_child_process_registry_size),
         vfsFiles: Number(vfsCounts.files) || 0,
@@ -20943,6 +21245,12 @@ function __pi_runtime_registry_snapshot() {
 
 function __pi_reset_extension_runtime_state(bridge_secret) {
     const before = __pi_runtime_registry_snapshot();
+
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        __pi_virtual_http_close(server);
+    }
+    __pi_map_clear_primordial(__pi_virtual_http_servers);
+    __pi_set_clear_primordial(__pi_virtual_http_requests);
 
     if (
         typeof __pi_provider_streams !== 'undefined' &&
@@ -21021,6 +21329,8 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.pendingEventListenerLists === 0 &&
         after.eventBatchContexts === 0 &&
         after.providerStreams === 0 &&
+        after.virtualHttpServers === 0 &&
+        after.virtualHttpRequests === 0 &&
         after.apiProviders === 0 &&
         after.childProcesses === 0 &&
         after.vfsFiles === 0 &&
@@ -21338,6 +21648,10 @@ function __pi_register_provider(provider_id, spec) {
         models: models,
         hasStreamSimple: effectiveHasStreamSimple,
     };
+    // This transport capability comes only from an owned in-memory listener.
+    // An extension-supplied virtualHttpServer field never grants authority.
+    const virtualServer = __pi_virtual_http_find(ext.id, providerSpec.baseUrl);
+    if (virtualServer) providerSpec.virtualHttpServer = virtualServer.id;
     if (spec.headers && typeof spec.headers === 'object') {
         providerSpec.headers = Object.assign({}, spec.headers);
     }
@@ -21481,34 +21795,201 @@ function __pi_register_mcp_server_for_extension(extension_id, name, spec) {
 // Provider Streaming (streamSimple bridge)
 // ============================================================================
 
+// Virtual loopback HTTP routes live entirely inside this realm. They expose no
+// listener to the OS or other extensions. Native providers capture an owned
+// route at registration; all actual egress continues through pi.http policy.
+const __pi_virtual_http_servers = new __pi_original_Map();
+const __pi_virtual_http_requests = new __pi_original_Set();
+const __pi_virtual_http_server_get = Function.prototype.call.bind(__pi_original_Map.prototype.get);
+const __pi_virtual_http_server_set = Function.prototype.call.bind(__pi_original_Map.prototype.set);
+const __pi_virtual_http_server_delete = Function.prototype.call.bind(__pi_original_Map.prototype.delete);
+const __pi_virtual_http_server_values = Function.prototype.call.bind(__pi_original_Map.prototype.values);
+const __pi_virtual_http_request_values = Function.prototype.call.bind(__pi_original_Set.prototype.values);
+const __pi_virtual_http_request_delete = Function.prototype.call.bind(__pi_original_Set.prototype.delete);
+let __pi_virtual_http_server_seq = 0;
+
+function __pi_virtual_http_origin(value) {
+    try {
+        const url = new URL(String(value));
+        if (url.protocol !== 'http:' || url.username || url.password) return null;
+        const host = String(url.hostname).toLowerCase();
+        if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(host)) return null;
+        const port = Number(url.port || 80);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+        return 'http://' + (host === '::1' ? '[::1]' : host) + ':' + String(port);
+    } catch (_) { return null; }
+}
+
+function __pi_virtual_http_find(extensionId, url) {
+    const origin = __pi_virtual_http_origin(url);
+    if (!origin) return null;
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        if (server.extensionId === extensionId && server.origin === origin) return server;
+    }
+    return null;
+}
+
+function __pi_virtual_http_close(server) {
+    if (!__pi_virtual_http_server_delete(__pi_virtual_http_servers, server.id)) return;
+    for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+        if (request.server === server) request.cancel(new Error('Virtual HTTP server closed'));
+    }
+    try { server.closed(); } catch (_) {}
+}
+
+globalThis.__pi_virtual_http_listen = (host, port, dispatch, closed) => {
+    const owner = __pi_current_extension_or_throw().id;
+    const address = typeof host === 'string' ? host.toLowerCase() : '';
+    const number = Number(port);
+    if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(address) ||
+        !Number.isInteger(number) || number < 1 || number > 65535) {
+        throw new Error('PiJS virtual HTTP servers require an explicit loopback host and port (1-65535)');
+    }
+    if (typeof dispatch !== 'function' || typeof closed !== 'function') {
+        throw new TypeError('Virtual HTTP server requires request and close handlers');
+    }
+    const origin = __pi_virtual_http_origin('http://' + (address === '::1' ? '[::1]' : address) + ':' + String(number));
+    if (__pi_virtual_http_find(owner, origin)) {
+        const error = new Error('Virtual HTTP address is already in use by this extension');
+        error.code = 'EADDRINUSE';
+        throw error;
+    }
+    if (__pi_map_size_primordial(__pi_virtual_http_servers) >= 16) {
+        throw new Error('PiJS virtual HTTP server limit reached');
+    }
+    const id = 'virtual-http-server-' + String(++__pi_virtual_http_server_seq);
+    const server = { id, extensionId: owner, origin, dispatch, closed };
+    __pi_virtual_http_server_set(__pi_virtual_http_servers, id, server);
+    const requireOwner = () => {
+        if (__pi_current_extension_or_throw().id !== owner) {
+            throw new Error('Virtual HTTP server belongs to another extension');
+        }
+    };
+    return {
+        host: address === '[::1]' ? '::1' : address,
+        port: number,
+        close() { requireOwner(); __pi_virtual_http_close(server); },
+        cancelRequests() {
+            requireOwner();
+            for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+                if (request.server === server) request.cancel(new Error('Virtual HTTP connections closed'));
+            }
+        },
+    };
+};
+
+function __pi_virtual_http_open(server, request) {
+    if (__pi_set_size_primordial(__pi_virtual_http_requests) >= 64) {
+        throw new Error('PiJS virtual HTTP request limit reached');
+    }
+    if (__pi_virtual_http_origin(request && request.url) !== server.origin) {
+        throw new Error('Virtual HTTP request origin does not match the registered listener');
+    }
+    let channel = null;
+    let failure = null;
+    let cancelled = false;
+    let reading = false;
+    let readyResolve;
+    const ready = new Promise((resolve) => { readyResolve = resolve; });
+    const active = {
+        server,
+        cancel(reason) {
+            if (cancelled) return;
+            cancelled = true;
+            try { if (channel) channel.cancel(reason); } catch (_) {}
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+            readyResolve();
+        },
+    };
+    __pi_set_add_primordial(__pi_virtual_http_requests, active);
+    const task = __pi_with_extension_async(server.extensionId, async () => {
+        try {
+            channel = server.dispatch(request);
+            if (!channel || typeof channel.poll !== 'function' ||
+                typeof channel.next !== 'function' || typeof channel.cancel !== 'function') {
+                throw new Error('Invalid virtual HTTP response channel');
+            }
+            if (cancelled) channel.cancel();
+            readyResolve();
+            await channel.finished;
+        } catch (error) {
+            failure = error;
+            readyResolve();
+        } finally {
+            // Completed producers no longer need cancellation bookkeeping.
+            // A caller that discards a completed Response must not leave its
+            // body retained by the runtime's global request set.
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        }
+    });
+    Promise.resolve(task).catch((error) => { failure = error; readyResolve(); });
+    const finish = (result) => {
+        if (result && result.done) __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        return result;
+    };
+    const poll = () => {
+        if (cancelled) return { done: true };
+        if (failure) { active.cancel(failure); throw failure; }
+        if (!channel) return { done: false, value: { pending: true } };
+        try { return finish(channel.poll()); }
+        catch (error) { active.cancel(error); throw error; }
+    };
+    return {
+        poll,
+        async next() {
+            if (reading) throw new Error('Concurrent virtual HTTP reads are not supported');
+            reading = true;
+            try {
+                await ready;
+                if (cancelled) return { done: true };
+                if (failure) throw failure;
+                return finish(await channel.next());
+            } catch (error) { active.cancel(error); throw error; }
+            finally { reading = false; }
+        },
+        return() { active.cancel(); return { done: true }; },
+        [Symbol.asyncIterator]() { return this; },
+    };
+}
+
+// Safe extension-facing entrypoint: there is deliberately no server-id argument.
+// An unavailable owned route is distinguishable from a failed owned request;
+// callers must never retry a failed in-memory request against a real listener.
+globalThis.__pi_virtual_http_dispatch = (request) => {
+    // Embedders can use ordinary fetch outside an extension activation. Such
+    // calls have no authority to dispatch an extension-owned in-memory route.
+    if (!__pi_current_extension_id) return null;
+    const owner = __pi_current_extension_id;
+    const server = __pi_virtual_http_find(owner, request && request.url);
+    return server ? __pi_virtual_http_open(server, request) : null;
+};
+
+function __pi_virtual_http_start(provider_id, request) {
+    const provider = __pi_provider_index.get(String(provider_id));
+    const id = provider && provider.spec && provider.spec.virtualHttpServer;
+    const server = id ? __pi_virtual_http_server_get(__pi_virtual_http_servers, id) : null;
+    if (!server || server.extensionId !== provider.extensionId) {
+        throw new Error('Provider has no active owned virtual HTTP server');
+    }
+    const stream = __pi_virtual_http_open(server, request);
+    const controller = __pi_make_abort_controller();
+    const streamId = 'provider-stream-' + String(++__pi_provider_stream_seq);
+    // Native callers poll this iterator instead of holding the runtime actor
+    // inside an HTTP await. Cancellation can therefore run before headers too.
+    __pi_provider_streams.set(streamId, {
+        iterator: { next: stream.poll, return: stream.return },
+        controller,
+    });
+    return streamId;
+}
+
 let __pi_provider_stream_seq = 0;
 const __pi_provider_streams = new Map(); // stream_id -> { iterator, controller }
 
 function __pi_make_abort_controller() {
-    const listeners = new Set();
-    const signal = {
-        aborted: false,
-        addEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            if (typeof cb === 'function') listeners.add(cb);
-        },
-        removeEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            listeners.delete(cb);
-        },
-    };
-    return {
-        signal,
-        abort: () => {
-            if (signal.aborted) return;
-            signal.aborted = true;
-            for (const cb of listeners) {
-                try {
-                    cb();
-                } catch (_) {}
-            }
-        },
-    };
+    // Provider cancellation must compose with the same branded signals used
+    // by fetch and AbortSignal.any; a signal-shaped object cannot do so.
+    return new globalThis.AbortController();
 }
 
 async function __pi_provider_stream_simple_start(provider_id, model, context, options) {
@@ -22972,6 +23453,9 @@ class __pi_HostcallStream {
         }
     }
     next() {
+        if (!this.done && typeof __pi_http_stream_pull_native === 'function') {
+            __pi_http_stream_pull_native(this.callId);
+        }
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift();
             if (!this.done) {
@@ -23075,6 +23559,14 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
         const error = new Error(outcome.message);
         error.code = outcome.code;
         pending.stream.pushError(error);
+        __pi_pending_hostcalls.delete(call_id);
+        return;
+    }
+
+    if (outcome.ok && pending.stream) {
+        // Embedders may complete a streamed request with one buffered result.
+        // Its iterator must receive that result and then finish normally.
+        pending.stream.pushChunk(outcome.value, true);
         __pi_pending_hostcalls.delete(call_id);
         return;
     }
@@ -25276,7 +25768,7 @@ if (typeof globalThis.fetch !== 'function') {
 
     class Headers {
         constructor(init) {
-            this._map = {};
+            this._map = Object.create(null);
             if (init && typeof init === 'object') {
                 if (Array.isArray(init)) {
                     for (const pair of init) {
@@ -25302,48 +25794,240 @@ if (typeof globalThis.fetch !== 'function') {
             this._map[key] = String(value === undefined || value === null ? '' : value);
         }
 
-        entries() {
-            return Object.entries(this._map);
+        append(name, value) {
+            const previous = this.get(name);
+            this.set(name, previous === null ? value : previous + ', ' + value);
         }
+
+        has(name) { return this.get(name) !== null; }
+        delete(name) { delete this._map[String(name || '').toLowerCase()]; }
+        forEach(callback, thisArg) {
+            for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
+        }
+        keys() { return Object.keys(this._map)[Symbol.iterator](); }
+        values() { return Object.values(this._map)[Symbol.iterator](); }
+        entries() {
+            return Object.entries(this._map)[Symbol.iterator]();
+        }
+        [Symbol.iterator]() { return this.entries(); }
     }
 
+    // A pull-driven byte stream for fetch and Node's Readable.fromWeb bridge.
+    // It never owns a socket: cancellation is delegated to the hostcall source.
+    if (typeof globalThis.ReadableStream !== 'function') {
+        class ReadableStream {
+            constructor(source = {}) {
+                this._queue = [];
+                this._pending = [];
+                this._closed = false;
+                this._errored = false;
+                this._error = undefined;
+                this._locked = false;
+                this._disturbed = false;
+                this._pulling = false;
+                this._pullAgain = false;
+                this._started = false;
+                this._source = source;
+                this._controller = {
+                    enqueue: (value) => {
+                        if (this._closed || this._errored) throw new TypeError('ReadableStream is closed');
+                        const pending = this._pending.shift();
+                        if (pending) pending.resolve({ value, done: false });
+                        else this._queue.push(value);
+                        this._pull();
+                    },
+                    close: () => {
+                        if (this._closed || this._errored) return;
+                        this._closed = true;
+                        for (const pending of this._pending.splice(0)) pending.resolve({ value: undefined, done: true });
+                    },
+                    error: (error) => {
+                        if (this._closed || this._errored) return;
+                        this._errored = true;
+                        this._error = error;
+                        this._queue = [];
+                        for (const pending of this._pending.splice(0)) pending.reject(error);
+                    },
+                };
+                Object.defineProperty(this._controller, 'desiredSize', {
+                    get: () => this._errored ? null : (this._closed ? 0 : 1 - this._queue.length),
+                });
+                Promise.resolve(typeof source.start === 'function' ? source.start(this._controller) : undefined)
+                    .then(() => { this._started = true; this._pull(); }, (error) => this._controller.error(error));
+            }
+            get locked() { return this._locked; }
+            _pull() {
+                if (!this._started || this._closed || this._errored || this._pending.length === 0) return;
+                if (this._pulling) { this._pullAgain = true; return; }
+                if (typeof this._source.pull !== 'function') return;
+                this._pulling = true;
+                this._pullAgain = false;
+                const count = this._pending.length;
+                Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+                    this._pulling = false;
+                    if (this._pullAgain || this._pending.length < count) this._pull();
+                }, (error) => { this._pulling = false; this._controller.error(error); });
+            }
+            _read() {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                if (this._queue.length > 0) return Promise.resolve({ value: this._queue.shift(), done: false });
+                if (this._closed) return Promise.resolve({ value: undefined, done: true });
+                return new Promise((resolve, reject) => { this._pending.push({ resolve, reject }); this._pull(); });
+            }
+            _cancel(reason) {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                this._queue = [];
+                if (this._closed) return Promise.resolve();
+                this._controller.close();
+                return Promise.resolve().then(() => {
+                    if (typeof this._source.cancel === 'function') return this._source.cancel(reason);
+                });
+            }
+            cancel(reason) {
+                return this._locked ? Promise.reject(new TypeError('ReadableStream is locked')) : this._cancel(reason);
+            }
+            getReader() {
+                if (this._locked) throw new TypeError('ReadableStream is locked');
+                this._locked = true;
+                let released = false;
+                return {
+                    read: () => released ? Promise.reject(new TypeError('Reader lock was released')) : this._read(),
+                    cancel: (reason) => released ? Promise.reject(new TypeError('Reader lock was released')) : this._cancel(reason),
+                    releaseLock: () => {
+                        if (released) return;
+                        if (this._pending.length > 0) throw new TypeError('Reader has pending reads');
+                        released = true;
+                        this._locked = false;
+                    },
+                };
+            }
+            tee() {
+                const reader = this.getReader();
+                const controllers = [];
+                const cancelled = [false, false];
+                const reasons = [];
+                let pending = null;
+                let ended = false;
+                const pull = () => {
+                    if (ended) return;
+                    if (!pending) {
+                        pending = reader.read().then((result) => {
+                            pending = null;
+                            if (result.done) {
+                                ended = true;
+                                for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].close();
+                                reader.releaseLock();
+                            } else {
+                                for (let i = 0; i < 2; i++) {
+                                    if (!cancelled[i]) controllers[i].enqueue(result.value instanceof Uint8Array ? result.value.slice() : result.value);
+                                }
+                            }
+                        }, (error) => {
+                            ended = true;
+                            for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].error(error);
+                            reader.releaseLock();
+                        });
+                    }
+                    return pending;
+                };
+                return [0, 1].map((index) => new ReadableStream({
+                    start(controller) { controllers[index] = controller; },
+                    pull,
+                    cancel(reason) {
+                        cancelled[index] = true;
+                        reasons[index] = reason;
+                        if (cancelled[0] && cancelled[1] && !ended) {
+                            ended = true;
+                            return reader.cancel(reasons).finally(() => reader.releaseLock());
+                        }
+                    },
+                }));
+            }
+            values(options = {}) {
+                const reader = this.getReader();
+                let ended = false;
+                return {
+                    async next() {
+                        if (ended) return { value: undefined, done: true };
+                        try {
+                            const result = await reader.read();
+                            if (result.done) { ended = true; reader.releaseLock(); }
+                            return result;
+                        } catch (error) { ended = true; reader.releaseLock(); throw error; }
+                    },
+                    async return() {
+                        if (!ended) {
+                            ended = true;
+                            try { if (!options.preventCancel) await reader.cancel(); }
+                            finally { reader.releaseLock(); }
+                        }
+                        return { value: undefined, done: true };
+                    },
+                    [Symbol.asyncIterator]() { return this; },
+                };
+            }
+            [Symbol.asyncIterator]() { return this.values(); }
+        }
+        globalThis.ReadableStream = ReadableStream;
+    }
+
+    const __pi_fetch_bytes = (value) => {
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView && ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return new TextEncoder().encode(String(value));
+    };
+
     class Response {
-        constructor(bodyBytes, init) {
+        constructor(body, init) {
             const options = init && typeof init === 'object' ? init : {};
-            this.status = Number(options.status || 0);
+            this.status = Number(options.status === undefined ? 200 : options.status);
+            this.statusText = String(options.statusText || '');
             this.ok = this.status >= 200 && this.status < 300;
             this.headers = new Headers(options.headers || {});
-            this._bytes = bodyBytes || new Uint8Array();
-            this.body = {
-                getReader: () => {
-                    let done = false;
-                    return {
-                        read: async () => {
-                            if (done) return { done: true, value: undefined };
-                            done = true;
-                            return { done: false, value: this._bytes };
-                        },
-                        cancel: async () => {
-                            done = true;
-                        },
-                        releaseLock: () => {},
-                    };
-                },
-            };
+            this.url = String(options.url || '');
+            this.redirected = !!options.redirected;
+            this._bodyUsed = false;
+            this.body = body === undefined || body === null ? null
+                : typeof body.getReader === 'function' ? body
+                : new globalThis.ReadableStream({ start(controller) { controller.enqueue(__pi_fetch_bytes(body)); controller.close(); } });
         }
-
-        async text() {
-            return new TextDecoder().decode(this._bytes);
+        get bodyUsed() { return this._bodyUsed || !!(this.body && this.body._disturbed); }
+        async _consume() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            if (!this.body) return new Uint8Array();
+            this._bodyUsed = true;
+            const reader = this.body.getReader();
+            const chunks = [];
+            let size = 0;
+            try {
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    const bytes = __pi_fetch_bytes(result.value);
+                    chunks.push(bytes);
+                    size += bytes.byteLength;
+                }
+            } finally { reader.releaseLock(); }
+            const bytes = new Uint8Array(size);
+            let offset = 0;
+            for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+            return bytes;
         }
-
-        async json() {
-            return JSON.parse(await this.text());
-        }
-
-        async arrayBuffer() {
-            const copy = new Uint8Array(this._bytes.length);
-            copy.set(this._bytes);
-            return copy.buffer;
+        async text() { return new TextDecoder().decode(await this._consume()); }
+        async json() { return JSON.parse(await this.text()); }
+        async arrayBuffer() { return (await this._consume()).buffer; }
+        clone() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            let body = null;
+            if (this.body) {
+                const branches = this.body.tee();
+                this.body = branches[0];
+                body = branches[1];
+            }
+            return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
         }
     }
 
@@ -25462,80 +26146,260 @@ if (typeof globalThis.fetch !== 'function') {
         globalThis.TransformStream = TransformStream;
     }
 
-    // AbortController / AbortSignal polyfill — many npm packages check for these
+    const __pi_fetch_abort_error = () => {
+        const error = new Error('This operation was aborted');
+        error.name = 'AbortError';
+        return error;
+    };
+
+    // Abort state is private, immutable after the first abort, and shared by
+    // any() without letting a cancelled hedge abort its siblings.
     if (typeof globalThis.AbortController === 'undefined') {
-        // Web semantics: aborting without an explicit reason yields an AbortError.
-        const abortError = () => { const e = new Error('This operation was aborted'); e.name = 'AbortError'; return e; };
-        class AbortSignal {
-            constructor() { this.aborted = false; this._listeners = []; }
-            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : abortError()) : undefined; }
-            addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
-            removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
+        const states = new WeakMap();
+        const token = {};
+        const abort = (signal, reason) => {
+            const state = states.get(signal);
+            if (state.aborted) return;
+            state.aborted = true;
+            state.reason = reason === undefined ? __pi_fetch_abort_error() : reason;
+            if (state.cleanup) { state.cleanup(); state.cleanup = null; }
+            for (const dependent of Array.from(state.dependents)) dependent(state.reason);
+            state.dependents.clear();
+            signal.dispatchEvent(new Event('abort'));
+        };
+        class AbortSignal extends globalThis.EventTarget {
+            constructor(key) {
+                super();
+                if (key !== token) throw new TypeError('Illegal AbortSignal constructor');
+                states.set(this, { aborted: false, reason: undefined, listeners: [], dependents: new Set(), cleanup: null });
+                this.onabort = null;
+            }
+            get aborted() { return states.get(this).aborted; }
+            get reason() { return states.get(this).reason; }
+            addEventListener(type, listener, options) {
+                if (type !== 'abort' || !listener) return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                if (state.listeners.some((entry) => entry.listener === listener && entry.capture === capture)) return;
+                state.listeners.push({ listener, capture, once: !!(options && options.once) });
+            }
+            removeEventListener(type, listener, options) {
+                if (type !== 'abort') return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                state.listeners = state.listeners.filter((entry) => entry.listener !== listener || entry.capture !== capture);
+            }
+            dispatchEvent(event) {
+                if (!event || event.type !== 'abort') return true;
+                const state = states.get(this);
+                try { event.target = this; event.currentTarget = this; } catch (_) {}
+                for (const entry of state.listeners.slice()) {
+                    if (!state.listeners.includes(entry)) continue;
+                    if (entry.once) this.removeEventListener('abort', entry.listener, entry.capture);
+                    try {
+                        if (typeof entry.listener === 'function') entry.listener.call(this, event);
+                        else if (typeof entry.listener.handleEvent === 'function') entry.listener.handleEvent(event);
+                    } catch (_) {}
+                }
+                if (typeof this.onabort === 'function') { try { this.onabort.call(this, event); } catch (_) {} }
+                return !event.defaultPrevented;
+            }
             throwIfAborted() { if (this.aborted) throw this.reason; }
-            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : abortError(); return s; }
-            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._reason = new Error('The operation was aborted due to timeout'); s._listeners.forEach(fn => fn()); }, ms); return s; }
+            static abort(reason) {
+                const signal = new AbortSignal(token);
+                abort(signal, reason);
+                return signal;
+            }
+            static timeout(ms) {
+                const delay = Number(ms);
+                if (!Number.isSafeInteger(delay) || delay < 0) throw new RangeError('AbortSignal.timeout requires a non-negative safe integer');
+                const signal = new AbortSignal(token);
+                const timer = setTimeout(() => {
+                    const error = new Error('The operation was aborted due to timeout');
+                    error.name = 'TimeoutError';
+                    abort(signal, error);
+                }, delay);
+                states.get(signal).cleanup = () => clearTimeout(timer);
+                return signal;
+            }
+            static any(signals) {
+                if (signals === null || signals === undefined || typeof signals[Symbol.iterator] !== 'function') throw new TypeError('AbortSignal.any requires an iterable');
+                const sources = Array.from(signals);
+                for (const source of sources) if (!states.has(source)) throw new TypeError('AbortSignal.any requires AbortSignals');
+                const signal = new AbortSignal(token);
+                for (const source of sources) {
+                    const state = states.get(source);
+                    if (state.aborted) { abort(signal, state.reason); return signal; }
+                }
+                const links = [];
+                states.get(signal).cleanup = () => {
+                    for (const [source, listener] of links) states.get(source).dependents.delete(listener);
+                    links.length = 0;
+                };
+                for (const source of new Set(sources)) {
+                    const listener = (reason) => abort(signal, reason);
+                    links.push([source, listener]);
+                    // Internal abort algorithms cannot be triggered by a
+                    // synthetic dispatchEvent or hidden by a user listener.
+                    states.get(source).dependents.add(listener);
+                }
+                return signal;
+            }
         }
         class AbortController {
-            constructor() { this.signal = new AbortSignal(); }
-            abort(reason) { this.signal.aborted = true; this.signal._reason = reason; this.signal._listeners.forEach(fn => fn()); }
+            constructor() { Object.defineProperty(this, 'signal', { value: new AbortSignal(token), enumerable: true }); }
+            abort(reason) { abort(this.signal, reason); }
         }
         globalThis.AbortController = AbortController;
         globalThis.AbortSignal = AbortSignal;
     }
 
-    globalThis.fetch = async (input, init) => {
+    const __pi_fetch = async (input, init, nodeResponse = false) => {
         const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
         const options = init && typeof init === 'object' ? init : {};
-        const method = options.method ? String(options.method) : 'GET';
-
-        const headers = {};
-        if (options.headers && typeof options.headers === 'object') {
-            if (options.headers instanceof Headers) {
-                for (const [k, v] of options.headers.entries()) headers[k] = v;
-            } else if (Array.isArray(options.headers)) {
-                for (const pair of options.headers) {
-                    if (pair && pair.length >= 2) headers[String(pair[0])] = String(pair[1]);
-                }
-            } else {
-                for (const k of Object.keys(options.headers)) {
-                    headers[k] = String(options.headers[k]);
-                }
-            }
+        const inputRequest = input && typeof input === 'object' && typeof input.url === 'string' ? input : null;
+        const option = (name) => options[name] === undefined && inputRequest ? inputRequest[name] : options[name];
+        const method = option('method') === undefined ? 'GET' : String(option('method'));
+        const signal = option('signal');
+        const abortReason = () => signal.reason === undefined ? __pi_fetch_abort_error() : signal.reason;
+        if (signal !== undefined && signal !== null) {
+            if (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function') throw new TypeError('fetch signal must be an AbortSignal');
+            if (signal.aborted) throw abortReason();
         }
+        if (option('dispatcher') !== undefined && option('dispatcher') !== null) throw new TypeError('Custom fetch dispatchers are not available in PiJS; use the capability-gated fetch transport');
+        if (inputRequest && inputRequest.bodyUsed) throw new TypeError('Request body is already used');
+        const headers = Object.create(null);
+        for (const [key, value] of new Headers(option('headers'))) headers[key] = value;
 
         let body = undefined;
         let body_bytes = undefined;
-        if (options.body !== undefined && options.body !== null) {
-            const encoded = __pi_fetch_body_bytes_to_base64(options.body);
+        const requestBody = option('body');
+        if (requestBody !== undefined && requestBody !== null) {
+            if (typeof requestBody.getReader === 'function') throw new TypeError('Streaming request bodies are not available in PiJS');
+            const encoded = __pi_fetch_body_bytes_to_base64(requestBody);
             if (encoded !== null) {
                 body_bytes = encoded;
             } else {
-                body = typeof options.body === 'string' ? options.body : String(options.body);
+                body = typeof requestBody === 'string' ? requestBody : String(requestBody);
             }
         }
 
-        const request = { url, method, headers };
+        const request = { url, method, headers, stream: true };
         if (body !== undefined) request.body = body;
         if (body_bytes !== undefined) request.body_bytes = body_bytes;
-
-        const resp = await pi.http(request);
-        const status = resp && resp.status !== undefined ? Number(resp.status) : 0;
-        const respHeaders = resp && resp.headers && typeof resp.headers === 'object' ? resp.headers : {};
-
-        let bytes = new Uint8Array();
-        if (resp && resp.body_bytes) {
-            const bin = __pi_base64_decode_native(String(resp.body_bytes));
-            const out = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) {
-                out[i] = bin.charCodeAt(i) & 0xff;
+        // node:http already supports a host-enforced timeout. Keep that
+        // option on the same capability-gated transport and native deadline.
+        if (nodeResponse && options.timeout !== undefined) request.timeout = options.timeout;
+        const chunkBytes = (chunk) => {
+            if (chunk && chunk.body_bytes !== undefined) {
+                const binary = __pi_base64_decode_native(String(chunk.body_bytes));
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+                return bytes;
             }
-            bytes = out;
-        } else if (resp && resp.body !== undefined && resp.body !== null) {
-            bytes = new TextEncoder().encode(String(resp.body));
-        }
+            return chunk && chunk.body !== undefined && chunk.body !== null ? new TextEncoder().encode(String(chunk.body)) : null;
+        };
 
-        return new Response(bytes, { status, headers: respHeaders });
+        let iterator = null;
+        let controller = null;
+        let stopped = false;
+        let ended = false;
+        let cancellation = null;
+        let stopReason;
+        let rejectStopped;
+        const interrupted = new Promise((_, reject) => { rejectStopped = reject; });
+        // Abort can occur after headers but before the consumer asks for a byte.
+        interrupted.catch(() => {});
+        const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+        const cancelHost = () => {
+            if (cancellation) return cancellation;
+            if (!iterator) return Promise.resolve();
+            try { cancellation = Promise.resolve(typeof iterator.return === 'function' ? iterator.return() : undefined).catch(() => {}); }
+            catch (_) { cancellation = Promise.resolve(); }
+            return cancellation;
+        };
+        const stop = (reason) => {
+            if (stopped || ended) return;
+            stopped = true;
+            stopReason = reason;
+            cleanup();
+            rejectStopped(reason);
+            if (controller) controller.error(reason);
+            void cancelHost();
+        };
+        const onAbort = () => { if (signal.aborted) stop(abortReason()); };
+        const next = async () => {
+            if (stopped) throw stopReason;
+            const result = await Promise.race([iterator.next(), interrupted]);
+            if (stopped) throw stopReason;
+            return result;
+        };
+
+        try {
+            // A synthetic abort event must neither cancel a request nor remove
+            // the listener that will observe the controller's genuine abort.
+            if (signal) signal.addEventListener('abort', onAbort);
+            // Input/header getters can themselves abort during normalization.
+            if (signal && signal.aborted) onAbort();
+            if (stopped) throw stopReason;
+            const virtual = typeof globalThis.__pi_virtual_http_dispatch === 'function' ? globalThis.__pi_virtual_http_dispatch(request) : null;
+            const stream = virtual === null ? pi.http(request) : virtual;
+            if (stream && typeof stream.next === 'function') iterator = stream;
+            else {
+                // Keep embedding/test hosts that return one buffered response
+                // usable. The production bridge always returns a host iterator.
+                let delivered = false;
+                iterator = {
+                    async next() {
+                        if (delivered) return { value: undefined, done: true };
+                        delivered = true;
+                        return { value: await stream, done: false };
+                    },
+                    async return() { delivered = true; return { value: undefined, done: true }; },
+                };
+            }
+            if (stopped) { await cancelHost(); throw stopReason; }
+            const first = await next();
+            let head = first.value;
+            if (nodeResponse) {
+                if (first.done || !head || typeof head !== 'object') throw new TypeError('Invalid HTTP response from hostcall');
+                // Buffered embedding hosts historically accept statusCode,
+                // a missing status (200), and data as the text-body alias.
+                head = { ...head, status: head.status || head.statusCode || 200 };
+                if (head.body === undefined && head.data !== undefined) head.body = head.data;
+            }
+            if (first.done || !head || !Number.isFinite(Number(head.status))) throw new TypeError('HTTP stream ended before response headers');
+            let initialBytes = chunkBytes(head);
+            const responseBody = new globalThis.ReadableStream({
+                start(value) { controller = value; },
+                async pull(value) {
+                    try {
+                        if (initialBytes !== null) {
+                            const bytes = initialBytes;
+                            initialBytes = null;
+                            if (bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                        while (true) {
+                            const result = await next();
+                            if (result.done) { ended = true; cleanup(); value.close(); return; }
+                            const bytes = chunkBytes(result.value);
+                            if (bytes !== null && bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                    } catch (error) { stop(error); value.error(error); }
+                },
+                cancel(reason) {
+                    stop(reason === undefined ? __pi_fetch_abort_error() : reason);
+                    return cancelHost();
+                },
+            });
+            return new Response(responseBody, { status: Number(head.status), headers: head.headers || {}, url });
+        } catch (error) {
+            stop(error);
+            throw error;
+        }
     };
+    globalThis.fetch = (input, init) => __pi_fetch(input, init);
+    globalThis.__pi_fetch_for_node_http = (input, init) => __pi_fetch(input, init, true);
 }
 
 const __pi_export_privileged = (name, fn, forwardSecret = false) => {
@@ -25580,6 +26444,7 @@ for (const [name, fn] of Object.entries({
     __pi_execute_command,
     __pi_execute_shortcut,
     __pi_provider_stream_simple_start,
+    __pi_virtual_http_start,
     __pi_provider_stream_simple_next,
     __pi_provider_stream_simple_cancel,
     // These controls are exclusively for host-side lifecycle orchestration and
@@ -25732,11 +26597,17 @@ mod tests {
     /// 204_796 (+152 bytes, sha `604f528a…` -> `68c0c0e6…`). The
     /// `AbortSignal` polyfill now gives a reasonless abort an `AbortError`
     /// (Web semantics), which `ctx.compact()` pre-abort rejection relies on.
+    ///
+    /// Re-pinned 2026-10-20 for gh #270: the bridge adds cancellation-aware
+    /// streaming fetch and owned virtual HTTP routes (+30_379 bytes), and
+    /// node:stream adds bounded Web-reader backpressure and iterator cleanup
+    /// (+3_271 bytes). These are deliberate source edits, covered by the
+    /// fetch, deferred HTTP, and virtual_http_server regression cases.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            204_796,
-            "68c0c0e6f90a6a671128024f17bf1e39dff877c100cfd3390fa4846cbc7e52eb",
+            235_175,
+            "8a30e70718753ea059ba56694d0ad533e2020058d08ecfcdff41799ee0e87c3e",
         ),
         (
             "node:fs",
@@ -25755,8 +26626,8 @@ mod tests {
         ),
         (
             "node:stream",
-            17_837,
-            "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
+            21_108,
+            "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
         ),
         // Re-pinned with public compaction options and the nine-argument API.
         (
@@ -30321,6 +31192,346 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             }
 
             unreachable!("did not observe a width-change reflow frame");
+        });
+    }
+
+    struct DeferredHttpTestStream {
+        frames: std::collections::VecDeque<HostcallOutcome>,
+        pending_after_frames: bool,
+        polls: Rc<std::cell::Cell<usize>>,
+        drops: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl DeferredHttpTestStream {
+        fn new(frames: Vec<HostcallOutcome>, pending_after_frames: bool) -> Self {
+            Self {
+                frames: frames.into(),
+                pending_after_frames,
+                polls: Rc::new(std::cell::Cell::new(0)),
+                drops: Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+    }
+
+    impl futures::Stream for DeferredHttpTestStream {
+        type Item = HostcallOutcome;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            if let Some(frame) = this.frames.pop_front() {
+                std::task::Poll::Ready(Some(frame))
+            } else if this.pending_after_frames {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for DeferredHttpTestStream {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pijs_deferred_http_waits_for_consumer_credit_between_frames() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue streaming request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![
+                    HostcallOutcome::StreamChunk {
+                        sequence: 0,
+                        chunk: json!({"status": 200, "headers": {}}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 1,
+                        chunk: json!({"body_bytes": "aGVsbG8="}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 2,
+                        chunk: serde_json::Value::Null,
+                        is_final: true,
+                    },
+                ],
+                false,
+            );
+            let polls = Rc::clone(&producer.polls);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("initial header credit");
+            runtime.tick().await.expect("idle without a consumer");
+            assert_eq!(polls.get(), 1, "body must remain unpolled");
+            runtime
+                .eval("response.next().then(frame => { globalThis.head = frame.value; });")
+                .await
+                .expect("consume header");
+            runtime.tick().await.expect("one body credit");
+            runtime.tick().await.expect("idle without more demand");
+            assert_eq!(polls.get(), 2);
+            assert_eq!(get_global_json(&runtime, "head").await["status"], 200);
+            runtime
+                .eval("response.next().then(frame => { globalThis.body = frame.value; });")
+                .await
+                .expect("consume body");
+            runtime.tick().await.expect("terminal credit");
+            assert_eq!(polls.get(), 3);
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            assert_eq!(
+                get_global_json(&runtime, "body").await["body_bytes"],
+                "aGVsbG8="
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_cancel_drops_pending_future_immediately() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("poll pending headers");
+            assert_eq!(drops.get(), 0);
+            runtime
+                .eval("response.return(); response.return();")
+                .await
+                .expect("cancel twice");
+            assert_eq!(drops.get(), 1, "cancel must drop without a later tick");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime.tick().await.expect("deliver cancellation sentinel");
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_watchdog_drops_idle_stream_in_same_tick() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_timeout_ms = Some(25);
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            clock.set(25);
+            runtime.tick().await.expect("fire host watchdog");
+            assert_eq!(
+                drops.get(),
+                1,
+                "no idle actor may retain a timed-out request"
+            );
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe timeout");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_root_deadline_applies_without_body_credit() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"status": 200, "headers": {}}),
+                    is_final: false,
+                }],
+                true,
+            );
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("deliver header");
+            runtime.set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now()));
+            runtime.tick().await.expect("expire root deadline");
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().then(() => response.next()).catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe root timeout after buffered header");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_unexpected_eof_rejects_and_releases_tracker() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            runtime
+                .defer_hostcall_stream(
+                    call_id,
+                    Box::pin(DeferredHttpTestStream::new(Vec::new(), false)),
+                )
+                .expect("defer malformed stream");
+            runtime.tick().await.expect("deliver EOF error");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe error");
+            assert_eq!(get_global_json(&runtime, "code").await, "io");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_finalizes_actual_outcome_exactly_once() {
+        futures::executor::block_on(async {
+            for (cause, expected) in [
+                ("producer_error", "denied"),
+                ("cancel", "cancelled"),
+                ("root_deadline", "timeout"),
+                ("watchdog", "timeout"),
+                ("complete", "success"),
+            ] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let mut config = PiJsRuntimeConfig::default();
+                config.limits.hostcall_timeout_ms = Some(25);
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("runtime");
+                runtime
+                    .eval(
+                        "globalThis.response = pi.http({url:'https://example.com/',stream:true});",
+                    )
+                    .await
+                    .expect("enqueue request");
+                let requests = runtime.drain_hostcall_requests();
+                let call_id = &requests[0].call_id;
+                let producer = DeferredHttpTestStream::new(Vec::new(), true);
+                let drops = Rc::clone(&producer.drops);
+                runtime
+                    .defer_hostcall_stream(call_id, Box::pin(producer))
+                    .expect("defer stream");
+                let outcomes = Rc::new(RefCell::new(Vec::<String>::new()));
+                let observed = Rc::clone(&outcomes);
+                runtime.set_deferred_hostcall_finalizer(
+                    call_id,
+                    Box::new(move |outcome| {
+                        observed.borrow_mut().push(match outcome {
+                            HostcallOutcome::Error { code, .. } => code.clone(),
+                            _ => "success".to_string(),
+                        });
+                    }),
+                );
+                match cause {
+                    "producer_error" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Error {
+                            code: "denied".to_string(),
+                            message: "HTTP host is denied".to_string(),
+                        },
+                    ),
+                    "cancel" => assert!(runtime.cancel_hostcall(call_id)),
+                    "root_deadline" => runtime
+                        .set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now())),
+                    "watchdog" => clock.set(25),
+                    "complete" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::StreamChunk {
+                            sequence: 0,
+                            chunk: serde_json::Value::Null,
+                            is_final: true,
+                        },
+                    ),
+                    _ => unreachable!("known termination cause"),
+                }
+                runtime.tick().await.expect("deliver termination");
+                runtime
+                    .tick()
+                    .await
+                    .expect("settle duplicate opportunities");
+                assert_eq!(drops.get(), 1, "producer release for {cause}");
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "outcome for {cause}"
+                );
+                assert!(!runtime.has_deferred_hostcall(call_id));
+                assert!(
+                    !runtime.cancel_hostcall(call_id),
+                    "late cancellation for {cause}"
+                );
+                drop(runtime);
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "drop must not duplicate {cause}"
+                );
+            }
         });
     }
 

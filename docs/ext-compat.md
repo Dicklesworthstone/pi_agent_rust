@@ -44,7 +44,7 @@ for the API subset that extensions actually use.
 | `node:crypto` | `createHash`, `createHmac`, `randomUUID`, `randomBytes`, `randomInt`, `timingSafeEqual`, `getHashes`, Ed25519 `sign`/`verify` | 56 tests | SHA-256/SHA-384/SHA-512, SHA-1, MD5, HMAC, KDFs; ciphers and RSA/ECDSA fail closed |
 | `node:buffer` | `Buffer.from`, `Buffer.alloc`, `Buffer.concat`, `Buffer.isBuffer`, `Buffer.byteLength`, `.toString()`, `.slice()`, `.subarray()`, `.compare()`, `.equals()`, `.indexOf()`, `.copy()` | 41 tests | Full Buffer protocol |
 | `node:child_process` | `spawnSync`, `execSync`, `execFileSync`, `spawn`, `exec`, `execFile` | 53 tests | Capability-gated (`exec`) |
-| `node:http` | `request`, `get`, `createServer`, `STATUS_CODES`, `METHODS`, `Agent` | 40 tests | `createServer` throws (sandbox) |
+| `node:http` | `request`, `get`, `createServer`, `STATUS_CODES`, `METHODS`, `Agent` | HTTP shim and virtual server regressions | Outbound requests use the HTTP capability; explicit loopback servers are private in-memory routes, never OS listeners |
 | `node:https` | `request`, `get` | Shared with http | Same as `node:http` |
 | `node:events` | `EventEmitter`, `on`, `emit`, `once`, `removeListener`, `removeAllListeners`, `listenerCount` | 26 tests | Full EventEmitter pattern |
 | `node:os` | `platform`, `hostname`, `tmpdir`, `homedir`, `cpus`, `arch`, `type`, `release`, `userInfo`, `EOL` | Included | Returns host values |
@@ -128,10 +128,55 @@ without runtime errors, even when the real package is not installed.
 | `ms` | Duration parsing |
 | `diff` | `diffChars`, `diffLines`, `createPatch` |
 | `glob` | `glob`, `globSync` |
+| `undici` | `fetch`, `Headers`, `Response`; explicit unsupported `Agent` constructor |
 
 `jsonwebtoken` support is intentionally bounded to HMAC JWTs. RSA/ECDSA
 algorithms and unsupported verification options fail closed with explicit
 diagnostics instead of silently accepting tokens.
+
+### pi-freeflow 1.39.0 and optional Undici dispatchers
+
+The current pi-freeflow release imports `Agent` from `undici`, even though
+connection pooling is optional. PiJS registers a narrow `undici` compatibility
+module so this import resolves. Its fetch exports use the same capability-gated
+transport as global `fetch`. PiJS does not advertise `process.versions.undici`:
+Freeflow's version check therefore selects its built-in-fetch fallback.
+Constructing an `Agent` or passing a custom fetch dispatcher fails explicitly;
+there is no npm package loading, custom socket transport, or alternate TLS
+authority behind this module.
+
+Import resolution alone is insufficient for this extension. Freeflow also
+starts a local proxy and registers an OpenAI-compatible provider against it.
+PiJS implements `http.createServer(listener).listen(port, host)` as a private
+in-memory route when `host` is explicitly `127.0.0.1`, `localhost`, or `::1`.
+Routes belong to the extension that registered them. A provider registered by
+that same extension can use its route through the existing native provider
+request/response codecs; no real port is bound and other extensions cannot
+intercept the route. Unsupported listen forms and non-loopback hosts fail.
+Freeflow's detached daemon spawn options remain unsupported, allowing its
+existing in-process fallback to run.
+
+Outbound fetch and Node HTTP calls still require the extension's HTTP
+capability and the connector's TLS/host policy. Responses expose headers before
+streaming body bytes; reader cancellation, request destruction, abort signals,
+header deadlines, body idle timeouts, and runtime task deadlines retain owned
+transport cleanup. `AbortSignal.any()` composes caller and timeout signals.
+`Readable.fromWeb()` and `StringDecoder` preserve byte and split UTF-8 behavior.
+Limits include 16 virtual servers and 64 active virtual requests per realm,
+1 MiB of queued virtual response data, a 10 MiB virtual request body, and the
+configured connector response limit. Custom TLS/socket overrides and streaming
+fetch uploads are rejected rather than acquiring additional authority.
+
+Regression coverage is in `tests/node_http_shim.rs`,
+`tests/virtual_http_server.rs`, and the provider/runtime unit tests. The optional
+`scripts/freeflow_compat_probe.mjs` reads the actual embedded JavaScript and
+loads a pinned, clean upstream checkout at
+`c4370df7fd4d186d00a33e4fc177ea340abf08d3` with controlled HTTP responses.
+It covers the import, dispatcher fallback, activation, relay behavior, proxy
+streaming, and Windows/POSIX path projections. The script documents setup and
+usage. These V8-based diagnostics do not replace QuickJS/Rust execution or a
+native Windows run; use `dsr quality --tool pi_agent_rust` for the authoritative
+repository gate.
 
 ### Runtime API Compatibility Modules
 

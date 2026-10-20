@@ -125,6 +125,14 @@ for optional features.
 | `ms` | Functional | Duration parsing (`ms("2h")` -> `7200000`) |
 | `glob` | Partial | `globSync`, `glob`, `Glob` class (basic `*`, `?`, `**` over VFS-known files) |
 | `jsonwebtoken` | Partial | `decode()`, HS256/HS384/HS512 `sign()`/`verify()`; asymmetric algorithms fail closed |
+| `undici` | Partial | Capability-gated `fetch`, `Headers`, `Response`; importing `Agent` works, constructing a custom dispatcher fails explicitly |
+
+PiJS leaves `process.versions.undici` unset so pi-freeflow 1.39.0 selects its
+global-fetch dispatcher fallback. Its local proxy runs as an extension-owned
+in-memory HTTP route, and its registered provider reaches that route through a
+scoped native transport. No OS listener or arbitrary npm resolution is added.
+See [the Freeflow compatibility contract](ext-compat.md#pi-freeflow-1390-and-optional-undici-dispatchers)
+for ownership, cancellation, resource limits, and regression-test details.
 
 ### No-op Stubs (Extension Loads, Feature Unavailable)
 

@@ -18,6 +18,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
@@ -211,11 +212,31 @@ fn timeout_error_message(url: &str, duration: std::time::Duration) -> String {
     msg
 }
 
+pub(crate) type TransportResponse = (
+    u16,
+    Vec<(String, String)>,
+    BoxStream<'static, std::io::Result<Vec<u8>>>,
+);
+
+/// A host-selected provider transport. Extensions cannot install one on the
+/// general HTTP client; their outbound requests still use the policy bridge.
+#[async_trait::async_trait]
+pub(crate) trait HttpTransport: std::fmt::Debug + Send + Sync {
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<TransportResponse>;
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     tls: std::result::Result<TlsConnector, String>,
     user_agent: String,
     vcr: Option<VcrRecorder>,
+    transport: Option<Arc<dyn HttpTransport>>,
 }
 
 /// Process-global cache of the built TLS connector.
@@ -319,6 +340,7 @@ impl Client {
             tls,
             user_agent,
             vcr: None,
+            transport: None,
         }
     }
 
@@ -342,6 +364,12 @@ impl Client {
 
     pub const fn vcr(&self) -> Option<&VcrRecorder> {
         self.vcr.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn with_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
+        self.transport = Some(transport);
+        self
     }
 }
 
@@ -602,6 +630,39 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
+    if let Some(transport) = &client.transport {
+        // Match native request framing while keeping proxy credentials and
+        // caller-supplied transport headers out of the extension handler.
+        let mut effective_headers = Vec::with_capacity(headers.len() + 3);
+        for (name, value) in headers {
+            validate_request_header(name, value)?;
+            if [
+                "host",
+                "content-length",
+                "transfer-encoding",
+                "proxy-authorization",
+                "user-agent",
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            {
+                continue;
+            }
+            effective_headers.push((name.clone(), value.clone()));
+        }
+        effective_headers.push(("Host".to_string(), host_header_value(&parsed)));
+        effective_headers.push(("Content-Length".to_string(), body.len().to_string()));
+        effective_headers.push((
+            "User-Agent".to_string(),
+            sanitize_header_value(
+                header_value(headers, "user-agent").unwrap_or(&client.user_agent),
+            ),
+        ));
+        // A scoped transport failure is final; it never falls back to a socket.
+        return transport
+            .send(method.as_str(), url, &effective_headers, body)
+            .await;
+    }
     // The same resolved endpoint governs connection establishment and HTTP
     // serialization. SOCKS5 tunnels both schemes; only a plain HTTP proxy
     // uses absolute-form requests and Proxy-Authorization on the HTTP hop.
