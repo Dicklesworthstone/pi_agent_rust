@@ -26,6 +26,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
+mod input;
 mod verification;
 
 /// An explicit host decision after a successful native prompt. Evidence text
@@ -82,7 +83,6 @@ struct ControlState {
     paused: bool,
     finished: bool,
     turn: Option<SessionControlHandle>,
-    pending: Vec<PendingInput>,
     verification_waker: Option<std::task::Waker>,
 }
 
@@ -101,7 +101,6 @@ impl GoalControl {
                 paused: false,
                 finished: false,
                 turn: None,
-                pending: Vec::new(),
                 verification_waker: None,
             })),
         }
@@ -167,12 +166,7 @@ impl GoalControl {
     /// dropped run. This is also a live retraction operation. Inputs returned
     /// here cannot later appear in the run report; ownership transfers once.
     pub fn take_pending(&self) -> Vec<PendingInput> {
-        let mut state = self.lock();
-        let mut pending = std::mem::take(&mut state.pending);
-        if let Some(turn) = &state.turn {
-            pending.extend(turn.take_pending());
-        }
-        pending
+        self.lock().turn.as_ref().map_or_else(Vec::new, SessionControlHandle::take_pending)
     }
 
     /// Install before polling, then honor any pause racing this publication.
@@ -192,15 +186,19 @@ impl GoalControl {
     }
 
     fn finish(&self) {
-        let waker = {
+        let (turn, waker) = {
             let mut state = self.lock();
             state.finished = true;
-            if let Some(turn) = state.turn.take() {
-                turn.abort();
-                state.pending.extend(turn.take_pending());
-            }
-            state.verification_waker.take()
+            // On abandonment retain the native mailbox, not a flattened copy.
+            // Recovery and targeted retraction share its single ownership lock.
+            // A normally awaited turn was already retired into its run report.
+            (state.turn.clone(), state.verification_waker.take())
         };
+        // Abort can wake arbitrary host/executor code. Never wake it while
+        // holding the goal mutex: the waker may inspect this same control.
+        if let Some(turn) = turn {
+            turn.abort();
+        }
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -213,7 +211,7 @@ impl fmt::Debug for GoalControl {
         f.debug_struct("GoalControl")
             .field("paused", &state.paused)
             .field("finished", &state.finished)
-            .field("prompt_live", &state.turn.is_some())
+            .field("prompt_live", &state.turn.as_ref().is_some_and(|turn| !turn.snapshot().finished))
             .finish()
     }
 }

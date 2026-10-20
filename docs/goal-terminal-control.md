@@ -31,6 +31,50 @@ commands. The default terminal still needs that separate keyboard-control
 integration. The native controller and its existing SDK APIs do support pause
 and live input for hosts that explicitly retain the published handle.
 
+## Attachment-aware SDK goal input
+
+`GoalControl` now exposes the current native turn's input operations directly:
+
+- `steer_with_content` and `follow_up_with_content` accept `UserContent` plus
+  original authored prose. Ordered text, image and audio/video blocks are not
+  flattened, decoded, expanded or fetched by the control layer.
+- `enqueue_batch_with_content` admits `(InputKind, UserContent, String)` tuples
+  all-or-nothing to one turn. This makes admission atomic, not execution; a
+  native turn may consume only part of an accepted batch before stopping.
+- `replace_pending` and `replace_pending_with_content` correct one unclaimed
+  input in place. Its lane and queue position are preserved, and its new ID
+  retires the old ID. Failure leaves the original untouched. `None` means no
+  pending match, not permission to resend already-delivered input.
+- `retract` recovers one input by ID without draining its neighbours.
+  `turn_snapshot` reports current native queue counts/bytes, acceptance and
+  handoff counts without exposing text. These are per-turn observations,
+  not goal-lifetime totals or durable receipts.
+
+These methods reuse the existing native mailbox and all its validation,
+count/byte limits, authored-keyword boundaries and ownership rules. They do
+not grant tool permissions or promise any provider's image/audio/video support.
+Before a native turn is installed, and during verifier gaps, input fails with
+`GOAL_INPUT_IDLE` rather than being silently queued for some future prompt.
+Paused or finished goals reject admission and correction. Snapshot observations
+can race completion; operation results are authoritative.
+
+Pause and abandonment still allow recovery. A dropped goal retains its closed
+native mailbox through the retained control handle, so `retract`/`take_pending`
+return complete payloads once, without making a second recovery queue or
+allocating payload copies during drop. Abandonment requests native abort after
+releasing the goal mutex; a host/executor waker can inspect the same control
+without reentering a held goal lock. Awaiting remains necessary for completed
+async cleanup or persistence.
+
+After an awaited run, unclaimed payloads belong to `GoalRunReport::pending`,
+not simultaneously to its control handle. After an abandoned run, recover them
+from the retained `GoalControl`. An old ID or control cannot retract, correct
+or cancel a replacement run's input. No recovery operation automatically
+resends anything or resets the goal's prompt/token allowances.
+
+This SDK input surface is a prerequisite for terminal queue editing and native
+attachments during goals; it does not itself wire the default terminal's keys.
+
 ## Reports preserve native outcomes
 
 The final report distinguishes the goal driver's stop from the native turn's
@@ -65,3 +109,12 @@ behavior. The implementation host attempted `dsr quality --tool pi_agent_rust`,
 but `dsr` was absent (exit 127). All ten new Rust tests are authored, not compiled
 or executed; formatting, Clippy, native runtime and cross-platform acceptance
 remain pending.
+
+Seven further tests in `src/goal/driver/input.rs` cover native mailbox sharing,
+attachment preservation, atomic invalid/full-batch refusal, in-place correction,
+closed/stale controls, concurrent recovery, retained goal-report payloads and
+actual native follow-up delivery through a controlled Provider boundary.
+The image/audio data in mailbox fixtures is structural test input, not live
+media-decoding evidence. The required DSR command was retried for this change
+and again could not start (`dsr: command not found`, exit 127). These seven
+Rust tests, compilation, formatting and Clippy remain unexecuted.
