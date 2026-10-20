@@ -4,6 +4,8 @@
 //! shared with the classic stack (`interactive::workspace_reports`); this
 //! module routes them through the driver and renders the result.
 
+mod goal_progress;
+
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
@@ -93,10 +95,18 @@ pub async fn run(
             }
         }
         WorkspaceCommand::Approval => run_approval(handle, args).await,
-        WorkspaceCommand::Goal => match Box::pin(crate::goal::terminal::run(handle, args)).await {
-            Ok(text) => PiMsg::System(text),
-            Err(error) => PiMsg::AgentError(format!("goal: {error}")),
-        },
+        WorkspaceCommand::Goal => {
+            // Observe only this command's existing SDK events. The guard
+            // unsubscribes on success, error or future drop; it has no goal
+            // execution, input, approval or continuation authority.
+            let progress = goal_progress::Observation::attach(handle.listeners(), agent_tx);
+            let result = Box::pin(crate::goal::terminal::run(handle, args)).await;
+            progress.finish();
+            match result {
+                Ok(text) => PiMsg::System(text),
+                Err(error) => PiMsg::AgentError(format!("goal: {error}")),
+            }
+        }
     };
     let _ = agent_tx.send(msg);
 }
