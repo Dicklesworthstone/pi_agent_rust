@@ -35,12 +35,15 @@ pub(super) struct Catalog {
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
+    name: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
     main: Option<String>,
     // Absent exports allow legacy entry paths. Explicit null seals a package.
     #[serde(default, deserialize_with = "present_exports")]
     exports: Option<Export>,
+    #[serde(default, deserialize_with = "present_exports")]
+    imports: Option<Export>,
 }
 
 #[derive(Debug)]
@@ -177,9 +180,11 @@ fn manifest(files: &ModuleFiles, root: &Path, path: &Path, generation: u32) -> A
         }
         let parsed: Manifest = serde_json::from_str(&loaded.code)
             .map_err(|_| error("MANIFEST", "invalid package.json; source content is not included"))?;
-        if let Some(exports) = &parsed.exports {
-            let mut remaining = MAX_MAP_NODES;
-            check_map(exports, 0, &mut remaining)?;
+        // The two maps share one metadata structure allowance, not separate
+        // budgets that double merely because imports and exports coexist.
+        let mut remaining = MAX_MAP_NODES;
+        for map in [&parsed.exports, &parsed.imports].into_iter().flatten() {
+            check_map(map, 0, &mut remaining)?;
         }
         Some(Rc::new(parsed))
     } else { None };
@@ -235,11 +240,82 @@ fn target_path(root: &Path, target: &str) -> Admission<PathBuf> {
     Ok(path)
 }
 
+/// A leading hash is a private package name, never a URL fragment. The rest
+/// keeps the ordinary portable path spelling and per-specifier byte limit.
+pub(super) fn private_specifier(name: &str) -> bool {
+    name.len() <= MAX_PATH_BYTES
+        && name.strip_prefix('#').is_some_and(|tail| !tail.starts_with('/') && valid_segments(tail))
+}
+
+fn nearest_scope(files: &ModuleFiles, root: &Path, parent: &Path, generation: u32) -> Admission<Option<(PathBuf, Rc<Manifest>)>> {
+    let mut directory = parent;
+    for _ in 0..MAX_ANCESTORS {
+        files.0.borrow().check()?;
+        if !directory.starts_with(root) { return Err(error("PATH", "package scope is outside the workspace")); }
+        // A dependency without its own manifest never inherits its consumer's
+        // private imports or name across the node_modules boundary.
+        if directory.file_name().is_some_and(|name| name == "node_modules") { return Ok(None); }
+        if let Some(metadata) = manifest(files, root, &directory.join("package.json"), generation)? {
+            return Ok(Some((directory.to_path_buf(), metadata)));
+        }
+        if directory == root { return Ok(None); }
+        directory = directory.parent().ok_or_else(|| error("PATH", "package scope has no parent"))?;
+    }
+    Err(error("LIMIT", "package scope search exceeds 64 directories"))
+}
+
+fn admitted_target(files: &ModuleFiles, package_root: &Path, target: &str) -> Admission<(PathBuf, PathBuf)> {
+    let path = target_path(package_root, target)?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|_| error("PATH", "exported package file is unavailable"))?;
+    if !canonical.starts_with(package_root) {
+        return Err(error("PATH", "exported file escapes its package directory"));
+    }
+    let mut state = files.0.borrow_mut();
+    state.check()?;
+    state.packages.roots.insert(package_root.to_path_buf());
+    Ok((path, package_root.to_path_buf()))
+}
+
+fn resolve_private(files: &ModuleFiles, root: &Path, parent: &Path, name: &str, generation: u32) -> Admission<(PathBuf, PathBuf)> {
+    if !private_specifier(name) { return Err(error("IMPORTS", "invalid private import name")); }
+    let (scope, metadata) = nearest_scope(files, root, parent, generation)?
+        .ok_or_else(|| error("IMPORT_NOT_DEFINED", "private import has no package scope"))?;
+    let imports = metadata.imports.as_ref()
+        .ok_or_else(|| error("IMPORT_NOT_DEFINED", "nearest package has no imports map"))?;
+    let mut name = name.to_owned();
+    let mut visited = BTreeSet::new();
+    for _ in 0..32 {
+        files.0.borrow().check()?;
+        if !visited.insert(name.clone()) { return Err(error("IMPORT_CYCLE", "private import aliases contain a cycle")); }
+        let target = maps::imported_target(imports, &name)?;
+        if target.starts_with("./") { return admitted_target(files, &scope, &target); }
+        if private_specifier(&target) {
+            name = target;
+        } else {
+            // External targets resolve from the map's package, not from a
+            // nested caller directory. They still use the installed-package
+            // boundary, self exports, formats and the same graph generation.
+            return resolve(files, root, &scope, &target, generation);
+        }
+    }
+    Err(error("LIMIT", "private import chain exceeds 32 aliases"))
+}
+
 /// Resolve only installed packages found at or below the workspace boundary.
 /// An existing nearer package is authoritative even when broken or sealed.
 pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &str, generation: u32) -> Admission<(PathBuf, PathBuf)> {
+    if name.starts_with('#') { return resolve_private(files, root, parent, name, generation); }
     let (package, tail) = split_package(name)?;
     let subpath = format!(".{tail}");
+    if let Some((scope, metadata)) = nearest_scope(files, root, parent, generation)?
+        && metadata.name.as_deref() == Some(package)
+        && let Some(exports) = &metadata.exports
+    {
+        // Self-reference uses the same public export map, including null
+        // barriers. A denied self subpath cannot fall back to node_modules.
+        return admitted_target(files, &scope, &exported_target(exports, &subpath)?);
+    }
     let mut directory = parent;
     for _ in 0..MAX_ANCESTORS {
         files.0.borrow().check()?;
@@ -262,16 +338,7 @@ pub(super) fn resolve(files: &ModuleFiles, root: &Path, parent: &Path, name: &st
                         let main = manifest.main.as_deref().unwrap_or("./index.js");
                         if main.starts_with("./") { main.to_owned() } else { format!("./{main}") }
                     } else { subpath.clone() };
-                    let path = target_path(&package_root, &target)?;
-                    let canonical = std::fs::canonicalize(&path)
-                        .map_err(|_| error("PATH", "exported package file is unavailable"))?;
-                    if !canonical.starts_with(&package_root) {
-                        return Err(error("PATH", "exported file escapes its package directory"));
-                    }
-                    let mut state = files.0.borrow_mut();
-                    state.check()?;
-                    state.packages.roots.insert(package_root.clone());
-                    return Ok((path, package_root));
+                    return admitted_target(files, &package_root, &target);
                 }
             }
         }

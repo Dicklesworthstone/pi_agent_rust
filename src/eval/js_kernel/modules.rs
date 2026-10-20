@@ -152,7 +152,7 @@ impl ModuleFiles {
         let relative = name.starts_with("./") || name.starts_with("../");
         // Package spelling has its own strict admission. Neither route is a
         // URL decoder, external directory search or implicit package installer.
-        if !valid_spelling(name)
+        if !(valid_spelling(name) || packages::private_specifier(name))
             || relative && module_language(Path::new(name)).is_none()
         {
             return Err(

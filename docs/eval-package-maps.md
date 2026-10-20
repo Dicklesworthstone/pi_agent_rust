@@ -52,9 +52,55 @@ old graph's snapshots. Reload does not reclaim realm limits. Existing 64 KiB
 manifest, depth/node, 128 metadata-lookup and 2 MiB metadata allowances apply;
 module identity, compilation, source and path bounds are unchanged.
 
-Package-private `#imports`, self-reference and CommonJS are not implemented by
-this export-map change. Regression tests in `packages/maps.rs` cover map
-selection and the actual public EvalTool, including typed/data imports, reloads,
-sealed entries, missing files and canonical symlink containment. Rust acceptance
+## Private imports and package self-reference
+
+The nearest containing `package.json` may define private `#` imports:
+
+```json
+{
+  "name": "analysis-app",
+  "type": "module",
+  "exports": {".": "./src/main.mts", "./internal": null},
+  "imports": {
+    "#helpers/*": "./src/helpers/*.mts",
+    "#data": "./data.json",
+    "#dependency": {"import": "installed-package/entry"},
+    "#shortcut": "#helpers/summary"
+  }
+}
+```
+
+`import('#shortcut')`, static private imports inside modules, and imports of
+`analysis-app` use the same native linker/cache. Self-references select the
+containing package's exports before looking for an installed namesake. They do
+not expose unexported subpaths; a sealed self export cannot fall back elsewhere.
+Self-reference requires a matching `name` and an explicit `exports` field.
+
+Private maps support exact/pattern keys and the same condition/array semantics
+as exports. Unlike export targets, private targets may name an already-installed
+package or another private alias, as well as a local `./` file. Alias chains
+are bounded to 32 selections and cycles fail explicitly. A missing selected
+alias/dependency is an error, not an invitation to try the next alternative.
+Alias-to-alias resolution is a Pi extension, not a Node compatibility claim.
+No URL schemes, absolute paths, fragments or encoded path escapes are admitted.
+Data imports still require explicit attributes even when an alias has no suffix.
+
+Scope follows the physical importer, not the last loaded script or a process
+global. Search stops at the nearest manifest, the workspace root or a
+`node_modules` boundary. A nested package cannot inherit a missing private alias
+from its consumer. External targets resolve from the defining package directory;
+local targets stay canonically inside that package. All access still checks the
+current invocation's I/O authority and deadline. Package `.js` targets need an
+explicit `type: module` scope; CommonJS is not enabled.
+
+Private maps and self names are cached with their graph generation, including
+missing manifests. New reloads see current maps; old functions retain their
+original snapshots. Private/public maps share the metadata node allowance and
+existing cumulative lookup/byte limits. No namespace reset or separate cache is
+introduced, and reload cannot evade admission limits.
+
+Regression tests in `packages/maps.rs` cover map selection and the actual public
+EvalTool, including typed/data imports, reloads, scope isolation, cycles, sealed
+entries, missing files and canonical symlink containment. Rust acceptance
 requires `dsr quality --tool pi_agent_rust`; reference probes in another runtime
 are not evidence that the Rust implementation compiles or passes its tests.
