@@ -1,4 +1,4 @@
-//! Typed, tool-free decisions over bounded JSON state.
+//! Tool-free judgments and completions through one explicit provider binding.
 //!
 //! The caller binds the provider and credentials explicitly. A judgment never
 //! selects another provider, retries, executes tools, or treats a stream preview
@@ -13,11 +13,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod completion;
 mod contract;
 #[cfg(test)]
 mod tests;
 
 pub use contract::JudgmentRequest;
+pub use completion::CompletionRequest;
 
 pub(crate) type Protect<'p> = dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync + 'p;
 
@@ -59,33 +61,68 @@ impl Judge {
         request: JudgmentRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
+        let encoded = request.encoded()?;
+        // Screen all state, labels and rubrics in one projection, before any
+        // clipping or provider admission. The fallback applies the auxiliary
+        // privacy floor even for a direct library call with primary mode off.
+        let [system, protected] = self.screen(SYSTEM, &encoded, protect)?;
+        let screened = JudgmentRequest::parse_encoded(&protected)?;
+        if !request.same_answer_keys(&screened) {
+            return Err(failure("PI_JUDGE_PRIVACY: redaction changed question IDs or choice labels"));
+        }
+        let (answer, usage) = self.request_text(system, screened.encoded()?, None).await?;
+        let answers = screened.answers(&answer)?;
+        Ok(self.reply("pi.judgment.v1", "answers", answers, usage))
+    }
+
+    /// One privacy projection covers every field before either operation can
+    /// admit a provider. The borrowed callback is never retained by this binding.
+    fn screen(&self, system: &str, prompt: &str, protect: Option<&Protect<'_>>) -> Result<[String; 2]> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
             return Err(failure("PI_JUDGE_PERMISSION: I/O and timer capabilities required"));
         }
-        let encoded = request.encoded()?;
-        // Screen all state, labels and rubrics in one projection, before any
-        // clipping or provider admission. The fallback applies the auxiliary
-        // privacy floor even for a direct library call with primary mode off.
+        let limit = crate::text_completion::MAX_INPUT_BYTES;
+        if system.len().saturating_add(prompt.len()) > limit {
+            return Err(failure("PI_AUXILIARY_INPUT_LIMIT"));
+        }
         let direct = |parts: &[&str]| redact_inputs(parts, &self.privacy);
-        let protected = protect.unwrap_or(&direct)(&[SYSTEM, &encoded])?;
-        let [system, protected]: [String; 2] = protected.try_into()
+        let parts = protect.unwrap_or(&direct)(&[system, prompt])?;
+        let parts: [String; 2] = parts.try_into()
             .map_err(|_| failure("PI_JUDGE_PRIVACY: projection changed field count"))?;
-        let screened = JudgmentRequest::parse_encoded(&protected)?;
-        if !request.same_answer_keys(&screened) {
-            return Err(failure("PI_JUDGE_PRIVACY: redaction changed question IDs or choice labels"));
+        if parts.iter().map(String::len).try_fold(0_usize, usize::checked_add)
+            .is_none_or(|bytes| bytes > limit)
+        {
+            return Err(failure("PI_AUXILIARY_INPUT_LIMIT"));
+        }
+        Ok(parts)
+    }
+
+    /// Both judgments and general completions use this exact terminal-stream
+    /// path. Callers supply screened text; no tools, history, retry or fallback.
+    async fn request_text(
+        &self,
+        system: String,
+        prompt: String,
+        requested_tokens: Option<u32>,
+    ) -> Result<(String, Option<Usage>)> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
+        if !owner.capabilities().io || !owner.capabilities().time {
+            return Err(failure("PI_JUDGE_PERMISSION: I/O and timer capabilities required"));
         }
         let context = Context::owned(
             Some(system),
             vec![Message::User(UserMessage {
-                content: UserContent::Text(screened.encoded()?),
+                content: UserContent::Text(prompt),
                 timestamp: chrono::Utc::now().timestamp_millis(),
             })],
             Vec::new(),
         );
         let mut options = self.options.clone();
-        options.max_tokens = Some(options.max_tokens.unwrap_or(4096).clamp(1, 4096));
+        let ceiling = options.max_tokens.unwrap_or(4096).clamp(1, 4096);
+        options.max_tokens = Some(requested_tokens.unwrap_or(ceiling).min(ceiling));
         let mut usage: Option<Usage> = None;
         let answer = with_timeout(JUDGMENT_TIMEOUT, async {
             owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
@@ -105,19 +142,23 @@ impl Judge {
             RequestStop::TimeUnavailable => failure("PI_JUDGE_PERMISSION: timer capability required"),
         })??;
         owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
-        let answers = screened.answers(&answer)?;
         if let (Some(rates), Some(usage)) = (self.provider.model_cost(), usage.as_mut()) {
             rates.price_usage(usage);
         }
-        Ok(json!({
-            "schema": "pi.judgment.v1",
-            "answers": answers,
+        Ok((answer, usage))
+    }
+
+    fn reply(&self, schema: &str, field: &str, value: Value, usage: Option<Usage>) -> Value {
+        let mut reply = json!({
+            "schema": schema,
             "model": format!("{}/{}", self.provider.name(), self.provider.model_id()),
             "provider": self.provider.name(),
             "modelId": self.provider.model_id(),
             "api": self.provider.api(),
             "usage": usage,
-        }))
+        });
+        reply[field] = value;
+        reply
     }
 }
 

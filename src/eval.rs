@@ -222,7 +222,7 @@ impl EvalTool {
         }
     }
 
-    /// Bind typed eval judgments to a host-owned provider and request options.
+    /// Bind eval judgments and completions to a host-owned provider and options.
     /// Cells cannot override this binding or access its credentials. Ordinary
     /// eval instances require an explicit judge_model on each requesting cell.
     #[must_use]
@@ -646,7 +646,13 @@ impl Tool for EvalTool {
          Single judgments and batch items share 16 reserved attempts per cell; \
          batches keep the original cell deadline and do not run in the background. \
          No model fallback or tools within a judgment request. \
-         Native attempt/usage receipts are included in result details."
+         General one-shot text completion uses __pi_complete through tool.call \
+         with {prompt,system?,max_tokens?}, returning JSON with text and usage. \
+         It uses the same judge_model/host binding, privacy and original cell \
+         deadline; max_tokens may only lower the host ceiling (at most 4096). \
+         Completions and judgments share the 16-attempt allowance. No history \
+         or tools are passed to these completions. Native attempt/usage receipts \
+         are included in result details."
     }
 
     fn parameters(&self) -> Value {
@@ -685,7 +691,7 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's __pi_judge and __pi_judge_batch bridge calls; host registry credentials only, no fallback. Omit when the host already binds a Judge. Both operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
+                    "description": "Explicit model for this cell's __pi_judge, __pi_judge_batch and __pi_complete bridge calls; host registry credentials only, no fallback. Omit when the host already binds a Judge. All operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
                     "properties": {
                         "provider": {"type":"string", "minLength":1, "maxLength":256},
                         "model": {"type":"string", "minLength":1, "maxLength":256}

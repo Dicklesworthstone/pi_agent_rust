@@ -19,6 +19,7 @@ use crate::provider::StreamOptions;
 use crate::tools::{ToolInvocationHost, ToolOutput};
 
 mod batch;
+mod completion;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
@@ -156,6 +157,8 @@ impl<'p> Invocation<'p> {
             self.evaluate(&tool.cwd, input).await
         } else if name == batch::BRIDGE_NAME {
             self.evaluate_batch(&tool.cwd, input).await
+        } else if name == completion::BRIDGE_NAME {
+            self.complete(&tool.cwd, input).await
         } else if let Some(host) = self.host {
             self.call_host(host, name, input).await
         } else {

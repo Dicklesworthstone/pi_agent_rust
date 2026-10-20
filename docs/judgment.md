@@ -65,8 +65,10 @@ retained task handle. For example, this JavaScript cell can be supplied to eval:
 Python uses `json.loads(await tool.call('__pi_judge', {'state': evidence,
 'questions': questions}))`. An SDK host may instead construct
 `EvalTool::new(cwd).with_judge(judge)` with an already authenticated `Judge`.
-Neither path adds general tool re-entry: the normal bridge remains restricted
-to read/grep/find/ls, and nesting the operation inside `tool.result` is denied.
+Neither auxiliary operation grants new tool rights. Agent-owned cells use the
+owning Agent's enabled tools and current policy; standalone embeddings retain
+the local read/grep/find/ls bridge. `tool.result` does not select this auxiliary
+model operation; it projects results from the ordinary tool dispatcher.
 
 `judge_model` selects exactly one model from the host registry and applies
 trusted configuration, configured disabled providers and normal host credential
@@ -185,3 +187,76 @@ completion, privacy, partial failures, cancellation, and the public Python and
 QuickJS EvalTool paths. They were authored, not compiled or executed in the
 implementation environment: `dsr quality --tool pi_agent_rust` could not start
 because `dsr` was unavailable. No independent fixture check is native acceptance.
+
+## General one-shot completions inside eval
+
+`__pi_complete` uses the same explicit auxiliary model binding as judgments,
+without requiring a bool/choice/score rubric. It accepts `prompt` and optional
+`system` and `max_tokens`. It returns JSON with schema `pi.completion.v1`, the
+terminal `text`, provider/model/API identity and reported `usage`. It never
+replays the conversation or advertises or executes tools. This is an awaited
+completion within the current cell, not OMP's retained completion handle.
+
+```json
+{
+  "kernel": "js",
+  "judge_model": {"provider": "your-registered-provider", "model": "your-model-id"},
+  "code": "globalThis.summary = JSON.parse(await tool.call('__pi_complete', {prompt: 'Summarize the following findings: ...', system: 'Write a concise technical summary.', max_tokens: 512})); display(summary.text);"
+}
+```
+
+Python uses the same native path:
+
+```python
+import json
+summary = json.loads(await tool.call('__pi_complete', {
+    'prompt': 'Summarize the following findings: ...',
+    'system': 'Write a concise technical summary.',
+    'max_tokens': 512,
+}))
+display(summary['text'])
+```
+
+`judge_model` is the existing per-cell binding shared with `__pi_judge` and
+`__pi_judge_batch`; an SDK host can instead use `with_judge`. There is no
+additional model selection inside a completion, no ambient model fallback,
+and no guest-supplied endpoint, key, header, history or tool list. The native
+library equivalent is `Judge::complete(CompletionRequest::parse(input)?)`.
+
+Prompt and system must be nonempty strings, at most 64 KiB and 16 KiB of UTF-8
+respectively. Whitespace and literal content are otherwise preserved; prompt
+text is not a template or executable input. Omitted system uses a tool-free
+answer instruction. Both fields are screened together through the invocation's
+borrowed privacy projection, or the binding's auxiliary privacy floor for a
+direct library call. The callback is not retained between cells. Oversized or
+malformed projections fail before provider admission, rather than clipping
+unscreened content.
+
+`max_tokens` is an integer from 1 to 4096 and can only lower the bound host
+ceiling. The terminal response is capped at 32 KiB. Only a clean `stop` event
+and terminal message supply an answer: missing completion events, truncation,
+tool-use stops, tool calls, empty text and provider errors fail. There is no
+heuristic partial answer or automatic replay. The ordinary 60-second auxiliary
+request limit remains inside the original eval deadline; waiting does not
+pause or renew it. Dropping or cancelling the call drops the active request.
+Completed provider work and possible costs cannot be undone.
+
+Completions, individual judgments and all batch items share **16 attempts per
+cell**. A completion reserves one slot before any await. Invalid input and an
+unbound request do not allocate a slot. An admitted failed or interrupted
+request retains its slot. The existing `details.judgments.attempts` container
+also records completions with `operation: "completion"`; prompts and returned
+text are not copied into those receipts. They survive caught guest failures
+or discarded answers. Unknown usage stays null, not an invented zero cost;
+these receipts are neither aggregate session accounting nor a durable ledger.
+Standalone `tool.result('__pi_complete', ...)` remains denied by the local
+bridge. Agent-owned tool calls retain their native host policy; they do not
+select this auxiliary completion operation. Completion input cannot expand
+tool authority.
+
+Regression coverage in `src/judgment/completion.rs` and
+`src/eval/judgment/completion/tests.rs` covers input bounds, exact text,
+host ceilings, terminal refusal, shared budgets, privacy, ownership, dropped
+streams, the public cell deadline, both kernels and model-facing discovery.
+These Rust regressions were authored, not compiled or run in the implementation
+environment. `dsr quality --tool pi_agent_rust` remains the acceptance command.
