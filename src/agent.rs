@@ -6190,8 +6190,20 @@ impl Agent {
                     self.project_auxiliary_inputs(parts, &privacy)
                 };
                 let host = AgentToolInvocationHost::new(self, on_event);
+                let snapshot_privacy = || {
+                    crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+                        crate::text_completion::AuxiliaryPrivacy::from_settings(
+                            self.config.secrets.as_ref(),
+                        ),
+                        &self.secrets_vault,
+                    )
+                };
                 let mut output = inner
-                    .execute_with_host(&tool_call.id, inner_args, None, &protect, &host)
+                    .execute_with_invocation(&tool_call.id, inner_args, None, crate::tools::ToolInvocationContext {
+                        protect: &protect,
+                        host: Some(&host),
+                        snapshot_privacy: &snapshot_privacy,
+                    })
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
@@ -6375,25 +6387,27 @@ impl Agent {
             self.project_auxiliary_inputs(parts, &privacy)
         };
         let host = AgentToolInvocationHost::new(self, on_event);
-        let outcome = if expected_session.is_some() {
-            // Do not recursively hand the host to a tool entered by eval.
-            // In particular, wrapper tools cannot renew this invocation's
-            // delegation budget or recursively acquire the eval kernel lease.
-            tool.execute_with_auxiliary_privacy(
-                &tool_call.id,
-                tool_call.arguments.clone(),
-                Some(Box::new(update_callback)),
-                &protect,
-            ).await
-        } else {
-            tool.execute_with_host(
-                &tool_call.id,
-                tool_call.arguments.clone(),
-                Some(Box::new(update_callback)),
-                &protect,
-                &host,
-            ).await
+        let snapshot_privacy = || {
+            crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+                crate::text_completion::AuxiliaryPrivacy::from_settings(
+                    self.config.secrets.as_ref(),
+                ),
+                &self.secrets_vault,
+            )
         };
+        // Nested calls may capture a read-only privacy snapshot but never
+        // renew eval's tool-call authority or acquire its kernel recursively.
+        let context = crate::tools::ToolInvocationContext {
+            protect: &protect,
+            host: if expected_session.is_none() { Some(&host) } else { None },
+            snapshot_privacy: &snapshot_privacy,
+        };
+        let outcome = tool.execute_with_invocation(
+            &tool_call.id,
+            tool_call.arguments.clone(),
+            Some(Box::new(update_callback)),
+            context,
+        ).await;
         match outcome {
             Ok(output) => {
                 let is_error = output.is_error;

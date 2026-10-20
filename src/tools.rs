@@ -243,6 +243,16 @@ pub trait ToolInvocationHost: Send + Sync {
     ) -> Result<ToolOutput>;
 }
 
+/// Authority borrowed for one native invocation. A background-capable tool
+/// may ask for an owned privacy projection, but cannot retain this context or
+/// use it to extend the lifetime of Agent tool-call authority.
+pub struct ToolInvocationContext<'a> {
+    pub protect: &'a (dyn for<'p, 's> Fn(&'p [&'s str]) -> Result<Vec<String>> + Send + Sync),
+    pub host: Option<&'a dyn ToolInvocationHost>,
+    pub snapshot_privacy:
+        &'a (dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync),
+}
+
 /// A tool that can be executed by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -304,6 +314,25 @@ pub trait Tool: Send + Sync {
         let _ = host;
         self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, protect)
             .await
+    }
+
+    /// Execute with the current Agent's scoped authority and a lazy privacy
+    /// snapshot for explicitly backgrounded work. The default preserves the
+    /// existing host/auxiliary dispatch without cloning the secrets vault.
+    async fn execute_with_invocation(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        if let Some(host) = context.host {
+            self.execute_with_host(tool_call_id, input, on_update, context.protect, host)
+                .await
+        } else {
+            self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+                .await
+        }
     }
 
     /// Declare the coarse side effects used by the agent scheduler.
@@ -9241,12 +9270,12 @@ impl Tool for JobsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background bash jobs started explicitly or automatically promoted \
-         from long-running foreground calls. Actions: `list` (every job with \
-         status/pid/artifact), `wait` (block \
-         until the job settles, bounded), `cancel` (kill the whole process \
-         tree). Completion notices also arrive automatically as follow-up \
-         messages."
+        "Manage this session's background bash jobs and async subagent tasks. \
+         Actions: `list` (jobs with status/pid/artifact), `wait` (wait until a job \
+         settles, bounded; timeoutMs:0 polls), `cancel` (stop owned work and its \
+         child process tree). Native task snapshots include their complete \
+         protected ToolOutput in result after settlement. Completion notices \
+         also arrive automatically as follow-up messages."
     }
 
     fn parameters(&self) -> serde_json::Value {

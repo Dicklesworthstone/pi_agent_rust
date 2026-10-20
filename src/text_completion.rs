@@ -38,6 +38,36 @@ pub struct AuxiliaryPrivacy {
     extra_patterns: Vec<regex::Regex>,
 }
 
+/// An owned, read-only projection of the privacy policy at task admission.
+/// Background work may retain this snapshot, never a borrowed Agent or its
+/// mutable vault. Results cannot export restorable secret placeholders.
+#[derive(Clone)]
+pub struct AuxiliaryPrivacySnapshot {
+    privacy: AuxiliaryPrivacy,
+    known_secrets: crate::secrets::SecretVault,
+}
+
+impl AuxiliaryPrivacySnapshot {
+    #[must_use]
+    pub fn from_privacy(privacy: AuxiliaryPrivacy) -> Self {
+        Self { privacy, known_secrets: crate::secrets::SecretVault::default() }
+    }
+
+    #[must_use]
+    pub(crate) fn with_vault(
+        privacy: AuxiliaryPrivacy,
+        known_secrets: &crate::secrets::SecretVault,
+    ) -> Self {
+        Self { privacy, known_secrets: known_secrets.clone() }
+    }
+
+    /// Project a bounded complete native result before any durable output or
+    /// completion notice. The caller owns the serialization-size budget.
+    pub(crate) fn project_json(&self, value: &serde_json::Value) -> Result<serde_json::Value> {
+        redact_json_with_vault(value, &self.privacy, &mut self.known_secrets.clone())
+    }
+}
+
 impl AuxiliaryPrivacy {
     /// Provider-free checkpoints may redact locally even when outbound
     /// requests are blocked. Preserve the same configured detector patterns.

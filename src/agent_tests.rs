@@ -6900,6 +6900,208 @@ mod tests {
         assert_eq!(json["finalError"], "max retries exceeded");
     }
 
+    // === Owned background privacy through native invocation context ===
+
+    struct CapturedInvocationPrivacy {
+        has_host: bool,
+        snapshot: crate::text_completion::AuxiliaryPrivacySnapshot,
+    }
+
+    struct InvocationPrivacyProbeTool {
+        name: &'static str,
+        captures: Arc<StdMutex<Vec<CapturedInvocationPrivacy>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for InvocationPrivacyProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Capture the owned privacy policy of one native invocation"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            Err(Error::tool(self.name, "invocation context was not supplied"))
+        }
+
+        async fn execute_with_invocation(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            context: crate::tools::ToolInvocationContext<'_>,
+        ) -> Result<ToolOutput> {
+            let has_host = context.host.is_some();
+            self.captures.lock().unwrap().push(CapturedInvocationPrivacy { // ubs:ignore serialized test capture must record the invocation snapshot
+                has_host,
+                snapshot: (context.snapshot_privacy)(),
+            });
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("owned privacy captured"))],
+                details: Some(json!({"hasHost": has_host})),
+                is_error: false,
+            })
+        }
+    }
+
+    fn remember_invocation_secret(agent: &mut Agent, secret: &str) {
+        // The fixture must depend on remembered session state, not merely
+        // trigger the generic credential detector again in its bare form.
+        assert_eq!( // ubs:ignore fixture proves this opaque value is not rediscovered by generic credential matching
+            crate::text_completion::redact_inputs(
+                &[secret],
+                &crate::text_completion::AuxiliaryPrivacy::default(),
+            )
+            .unwrap(), // ubs:ignore generic projection must succeed before testing remembered-secret privacy
+            [secret],
+        );
+        let assignment = agent // ubs:ignore fixture must seed the owning Agent's remembered credential
+            .secrets_transform_outbound_text(&format!("API_KEY={secret}"))
+            .expect("remember opaque credential in the owning session"); // ubs:ignore remembered-credential fixture setup must succeed
+        assert!(!assignment.contains(secret)); // ubs:ignore assert the Agent learned and masked the fixture credential
+    }
+
+    fn assert_invocation_snapshot_masks(
+        snapshot: &crate::text_completion::AuxiliaryPrivacySnapshot,
+        secret: &str,
+    ) {
+        let projected = snapshot // ubs:ignore retained snapshot must remain usable after Agent destruction
+            .project_json(&json!({"echo": secret, "nested": [secret, "ordinary text"]}))
+            .expect("project after the owning Agent was dropped"); // ubs:ignore successful post-drop projection is the lifecycle behavior under test
+        assert_eq!(projected, json!({ // ubs:ignore assert exact privacy projection of content and nested details
+            "echo": "<pi-secret:redacted>",
+            "nested": ["<pi-secret:redacted>", "ordinary text"],
+        }));
+    }
+
+    #[test]
+    fn native_invocation_privacy_is_owned_and_fresh_for_each_call() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore native invocation fixture requires its async runtime
+        runtime.block_on(async {
+            let captures = Arc::new(StdMutex::new(Vec::new()));
+            let tools = ToolRegistry::from_tools(vec![Box::new(InvocationPrivacyProbeTool {
+                name: "privacy_probe",
+                captures: Arc::clone(&captures),
+            })]);
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let first = "rememberedCredentialValue123456";
+            let later = "anotherCredentialValue654321";
+            for (index, secret) in [first, later].into_iter().enumerate() {
+                remember_invocation_secret(&mut agent, secret);
+                let (output, failed) = agent
+                    .execute_tool(
+                        ToolCall {
+                            id: format!("capture-{index}"),
+                            name: "privacy_probe".to_string(),
+                            arguments: json!({}),
+                            thought_signature: None,
+                        },
+                        Arc::new(|_| {}),
+                        Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                    )
+                    .await;
+                assert!(!failed && !output.is_error, "{output:?}"); // ubs:ignore assert both calls reach the invocation-aware path successfully
+            }
+            drop(agent);
+            let captures = captures.lock().unwrap(); // ubs:ignore inspect the completed fixture captures after Agent destruction
+            let [first_capture, later_capture] = captures.as_slice() else {
+                panic!("both native calls must reach the invocation entry point"); // ubs:ignore fail the regression if either invocation bypasses the new context seam
+            };
+            assert!(first_capture.has_host && later_capture.has_host); // ubs:ignore direct native invocations must receive scoped host authority
+            assert_invocation_snapshot_masks(&first_capture.snapshot, first);
+            assert_invocation_snapshot_masks(&later_capture.snapshot, first);
+            assert_invocation_snapshot_masks(&later_capture.snapshot, later);
+            assert_eq!( // ubs:ignore assert the first snapshot never shares subsequently learned secrets
+                first_capture.snapshot.project_json(&json!(later)).unwrap(), // ubs:ignore clean later value must project through the earlier immutable snapshot
+                json!(later),
+                "an admitted task must not share the Agent's subsequently mutated vault",
+            );
+        });
+    }
+
+    #[test]
+    fn discoverable_invocation_retains_owning_agent_privacy_after_dispatch() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore xdev invocation fixture requires its async runtime
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap(); // ubs:ignore discoverable registry fixture requires an isolated workspace
+            let captures = Arc::new(StdMutex::new(Vec::new()));
+            let mut tools = ToolRegistry::new(&["ast_grep"], root.path(), None);
+            tools.push(Box::new(InvocationPrivacyProbeTool {
+                name: "ast_grep",
+                captures: Arc::clone(&captures),
+            }));
+            assert!(tools.is_discoverable("ast_grep")); // ubs:ignore assert the fixture really exercises xdev discovery
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let secret = "rememberedCredentialValue123456";
+            remember_invocation_secret(&mut agent, secret);
+            let (output, failed) = agent
+                .execute_tool(
+                    xdev_call("run", Some("ast_grep"), Some(json!({}))),
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
+                .await;
+            assert!(!failed && !output.is_error, "{output:?}"); // ubs:ignore assert the discoverable invocation completes successfully
+            assert_eq!(output.details.as_ref().unwrap()["dispatchedVia"], "xdev"); // ubs:ignore fixture requires the xdev routing field in the returned details
+            drop(agent);
+            let capture = captures.lock().unwrap().pop().expect("dispatched invocation"); // ubs:ignore the completed xdev invocation must retain exactly its privacy capture
+            assert!(capture.has_host); // ubs:ignore assert xdev forwards invocation-scoped host authority
+            assert_invocation_snapshot_masks(&capture.snapshot, secret);
+        });
+    }
+
+    #[test]
+    fn eval_nested_invocation_can_own_privacy_without_retaining_tool_authority() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore eval integration fixture requires its async runtime
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap(); // ubs:ignore eval fixture requires an isolated kernel workspace
+            let captures = Arc::new(StdMutex::new(Vec::new()));
+            let mut tools = ToolRegistry::new(&["eval"], root.path(), None);
+            tools.push(Box::new(InvocationPrivacyProbeTool {
+                name: "privacy_probe",
+                captures: Arc::clone(&captures),
+            }));
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let secret = "rememberedCredentialValue123456";
+            remember_invocation_secret(&mut agent, secret);
+            let (output, failed) = agent
+                .execute_tool(
+                    eval_host_call("js", r#"
+                        const result = await tool.result("privacy_probe", {});
+                        if (result.isError || result.details.hasHost !== false) {
+                          throw new Error("nested invocation renewed tool-call authority");
+                        }
+                        "nested-owned-privacy"
+                    "#),
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
+                .await;
+            assert!(!failed && !output.is_error, "{output:?}"); // ubs:ignore assert the real nested eval invocation succeeds without renewing authority
+            assert!(eval_host_text(&output).contains("nested-owned-privacy")); // ubs:ignore assert the guest completed the host-authority check
+            drop(agent);
+            let capture = captures.lock().unwrap().pop().expect("nested invocation"); // ubs:ignore the completed nested invocation must supply an owned privacy snapshot
+            assert!(!capture.has_host); // ubs:ignore assert nested calls cannot retain or renew eval host authority
+            assert_invocation_snapshot_masks(&capture.snapshot, secret);
+        });
+    }
+
     // === Eval calls through the owning Agent's tool policy ===
 
     fn eval_host_call(kernel: &str, code: &str) -> ToolCall {

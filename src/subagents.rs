@@ -9,7 +9,10 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::{Tool, ToolEffects, ToolModelScope, ToolModelSelection, ToolOutput, ToolUpdate};
+use crate::tools::{
+    Tool, ToolEffects, ToolInvocationContext, ToolModelScope, ToolModelSelection, ToolOutput,
+    ToolUpdate,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod bundled;
+mod background;
 mod deadline;
 #[cfg(test)]
 mod deadline_tests;
@@ -137,6 +141,8 @@ pub struct SubagentTool {
     /// Fallback policy for direct SDK calls; live Agent execution supplies its
     /// own projection so discoveries stay scoped to the invoking session.
     privacy: Option<crate::text_completion::AuxiliaryPrivacy>,
+    /// The same native owner identity used by jobs list/wait/cancel.
+    job_session_scope: crate::jobs::JobSessionScope,
 }
 
 /// Private execution policy retained for an explicit hub revival. In
@@ -258,6 +264,7 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 
@@ -395,6 +402,7 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 
@@ -407,22 +415,31 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
-        let parent_model = self.capture_parent_model();
+        Ok(self.prepare_request(request)?.run(on_update).await)
+    }
+
+    /// Freeze discovery, model affinity and the original deadline before a
+    /// caller transfers execution into a managed background job.
+    fn prepare_request(&self, request: SubagentRequest) -> Result<PreparedRequest> {
         // Capture once, before discovery and queueing. Every parallel task,
         // sequential step and schema-correction retry consumes this budget.
         let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
+        self.prepare_request_with_deadline(request, deadline)
+    }
+
+    fn prepare_request_with_deadline(
+        &self,
+        request: SubagentRequest,
+        deadline: Deadline,
+    ) -> Result<PreparedRequest> {
+        let parent_model = self.capture_parent_model();
         let agents = self.discover(request.scope)?;
         let concurrency = request
             .concurrency
             .unwrap_or(DEFAULT_CONCURRENCY)
             .clamp(1, MAX_PARALLEL_TASKS);
-
-        match request.mode()? {
-            RequestMode::Single(task) => Ok(vec![
-                self.run_one(&agents, task, None, on_update, deadline, parent_model)
-                    .await,
-            ]),
-            RequestMode::Parallel(tasks) => Ok(ChildRunner::new(
+        Ok(PreparedRequest {
+            runner: ChildRunner::new(
                 self.cwd.clone(),
                 self.global_dir.clone(),
                 self.child_binary.clone(),
@@ -430,22 +447,47 @@ impl SubagentTool {
                 crate::agent_hub::ChildKind::Subagent,
                 deadline,
             )
-            .with_parent_model(parent_model)
-            .run_parallel(&agents, tasks, concurrency, on_update)
-            .await),
+            .with_parent_model(parent_model),
+            agents,
+            mode: request.mode()?,
+            concurrency,
+            deadline,
+        })
+    }
+}
+
+/// An admitted delegation contains no borrowed Agent, mutable tool registry or
+/// caller callback. Queued work cannot rediscover a changed agent definition or
+/// silently adopt a new model after the caller receives its job handle.
+struct PreparedRequest {
+    runner: ChildRunner,
+    agents: BTreeMap<String, AgentDefinition>,
+    mode: RequestMode,
+    concurrency: usize,
+    deadline: Deadline,
+}
+
+impl PreparedRequest {
+    async fn run(self, on_update: Option<UpdateCallback>) -> Vec<SubagentResult> {
+        let Self { runner, agents, mode, concurrency, .. } = self;
+        match mode {
+            RequestMode::Single(task) => vec![
+                runner.run_one(&agents, task, None, on_update).await,
+            ],
+            RequestMode::Parallel(tasks) => {
+                runner.run_parallel(&agents, tasks, concurrency, on_update).await
+            }
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
                 let mut results = Vec::with_capacity(tasks.len());
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
-                    let result = self
+                    let result = runner
                         .run_one(
                             &agents,
                             task,
                             Some(step + 1),
                             on_update.clone(),
-                            deadline,
-                            parent_model.clone(),
                         )
                         .await;
                     let failed = result.is_error;
@@ -455,31 +497,9 @@ impl SubagentTool {
                         break;
                     }
                 }
-                Ok(results)
+                results
             }
         }
-    }
-
-    async fn run_one(
-        &self,
-        agents: &BTreeMap<String, AgentDefinition>,
-        task: SubagentTask,
-        step: Option<usize>,
-        on_update: Option<UpdateCallback>,
-        deadline: Deadline,
-        parent_model: Option<ToolModelSelection>,
-    ) -> SubagentResult {
-        ChildRunner::new(
-            self.cwd.clone(),
-            self.global_dir.clone(),
-            self.child_binary.clone(),
-            self.role_model_spec.clone(),
-            crate::agent_hub::ChildKind::Subagent,
-            deadline,
-        )
-        .with_parent_model(parent_model)
-        .run_one(agents, task, step, on_update)
-        .await
     }
 }
 
@@ -497,7 +517,8 @@ impl Tool for SubagentTool {
         concat!(
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
-            " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback."
+            " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
+            " Set async: true on a single, parallel tasks, or chain request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback, and does not support seance or workflow requests."
         )
     }
 
@@ -507,6 +528,7 @@ impl Tool for SubagentTool {
             "properties": {
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
+                "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, or chain request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance or workflow."},
                 "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
                 "model": {"type": "string", "minLength": 1, "description": "Optional model selector override for a single seance consultation. Otherwise use the saved active branch model; task/smol and parent defaults are not substituted."},
                 "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
@@ -547,17 +569,48 @@ impl Tool for SubagentTool {
     ) -> Result<ToolOutput> {
         let privacy = self.privacy.clone()
             .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        if background::requested(&input)? {
+            return background::start(
+                self,
+                input,
+                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
+            )
+            .await;
+        }
         let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
         self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect).await
+    }
+
+    async fn execute_with_invocation(
+        &self,
+        tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        if background::requested(&input)? {
+            return background::start(self, input, (context.snapshot_privacy)()).await;
+        }
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+            .await
     }
 
     async fn execute_with_auxiliary_privacy(
         &self,
         _tool_call_id: &str,
-        input: Value,
+        mut input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
+        if background::requested(&input)? {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_BACKGROUND_PRIVACY: background execution requires an owned invocation privacy snapshot; use execute_with_invocation or the standalone execute entry point",
+            ));
+        }
+        if let Some(fields) = input.as_object_mut() {
+            fields.remove("async");
+        }
         if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
             return Err(Error::tool(
                 "subagent",
@@ -589,22 +642,7 @@ impl Tool for SubagentTool {
         let update = on_update.map(Arc::from);
         let mode = request.mode_name()?;
         let results = self.run_request(request, update).await?;
-        let is_error = results.iter().any(|result| result.is_error);
-        let mut content = render_results(&results);
-        if self.structured_results {
-            content.push_str("\n\n");
-            content.push_str(&structured_result_block(&results));
-        }
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(content))],
-            details: Some(json!({
-                "schema": SUBAGENT_RESULT_SCHEMA,
-                "mode": mode,
-                "sessionIsolation": "ephemeral_no_session",
-                "results": results,
-            })),
-            is_error,
-        })
+        Ok(result_output(results, mode, self.structured_results))
     }
 
     fn effects(&self) -> ToolEffects {
@@ -614,6 +652,33 @@ impl Tool for SubagentTool {
     fn bind_model_scope(&mut self, scope: ToolModelScope) {
         self.model_scope = Some(scope);
         self.parent_model = None;
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+}
+
+fn result_output(
+    results: Vec<SubagentResult>,
+    mode: &str,
+    structured_results: bool,
+) -> ToolOutput {
+    let is_error = results.iter().any(|result| result.is_error);
+    let mut content = render_results(&results);
+    if structured_results {
+        content.push_str("\n\n");
+        content.push_str(&structured_result_block(&results));
+    }
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(content))],
+        details: Some(json!({
+            "schema": SUBAGENT_RESULT_SCHEMA,
+            "mode": mode,
+            "sessionIsolation": "ephemeral_no_session",
+            "results": results,
+        })),
+        is_error,
     }
 }
 

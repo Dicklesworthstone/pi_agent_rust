@@ -1,4 +1,4 @@
-//! Background bash jobs (bd-cv653.3.10).
+//! Session-owned background shell jobs and native tasks (bd-cv653.3.10).
 //!
 //! `bash {background: true}` returns immediately with a job id; the process
 //! runs detached under the same timeout/tree-kill discipline as the
@@ -15,6 +15,8 @@
 //! management operation, and completion notice carries its originating
 //! session id. Cross-session ids fail exactly like unknown ids. `kill_all`
 //! remains the final process-shutdown chokepoint so no child survives exit.
+//! Native tasks share the same admission, cancellation and retention fences;
+//! their complete privacy-protected tool results are available in `result`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -34,6 +36,9 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
+
+mod host_task;
+pub(crate) use host_task::{admit_owned_task, spawn_owned_task};
 
 /// Future returned by the live session-identity resolver shared by the jobs
 /// tools and their completion-notice fetcher.
@@ -215,6 +220,9 @@ impl JobStatus {
 
 /// Live registry entry. The output tail is shared with the pump threads.
 struct JobEntry {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
+    result_bytes: usize,
     owner_session_id: String,
     delivery: JobDelivery,
     id: String,
@@ -267,6 +275,9 @@ pub struct JobSnapshot {
     pub artifact_truncated: bool,
     pub artifact_error: Option<String>,
     pub output_complete: bool,
+    /// Protected native result of a host task; shell jobs omit this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::tools::ToolOutput>,
 }
 
 /// Cleanup performed before this job reserved its artifact file.
@@ -339,7 +350,7 @@ impl JobSnapshot {
         artifact_error: Option<String>,
     ) -> Self {
         Self {
-            schema: JOB_SCHEMA.to_string(),
+            schema: source.schema.to_string(),
             id: source.id.clone(),
             command: source.command.clone(),
             started_at_ms: source.started_at_ms,
@@ -355,12 +366,15 @@ impl JobSnapshot {
             artifact_truncated,
             artifact_error,
             output_complete: source.output_complete,
+            result: source.result.clone(),
         }
     }
 }
 
 #[derive(Clone)]
 struct JobSnapshotSource {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
     delivery: JobDelivery,
     id: String,
     command: String,
@@ -378,6 +392,8 @@ struct JobSnapshotSource {
 impl JobSnapshotSource {
     fn from_entry(entry: &JobEntry) -> Self {
         Self {
+            schema: entry.schema,
+            result: entry.result.clone(),
             delivery: entry.delivery,
             id: entry.id.clone(),
             command: entry.command.clone(),
@@ -1937,6 +1953,9 @@ fn spawn_managed(
             ));
         }
         let entry = JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
             delivery,
             id: id.clone(),
@@ -2677,6 +2696,20 @@ fn record_job_settlement(
 }
 
 fn prune_settled_jobs(reg: &mut JobRegistry) {
+    // Native task results can contain structured data beyond the shell tail.
+    // Bound their aggregate retention independently from descriptor count.
+    const MAX_RETAINED_TASK_RESULT_BYTES: usize = 32 * 1024 * 1024;
+    let mut task_results: Vec<_> = reg.jobs.values()
+        .filter(|job| job.status.settled() && job.result_bytes > 0)
+        .filter_map(|job| job.settled_sequence.map(|sequence| (sequence, job.id.clone(), job.result_bytes)))
+        .collect();
+    task_results.sort();
+    let mut retained_bytes = task_results.iter().fold(0usize, |total, (_, _, bytes)| total.saturating_add(*bytes));
+    for (_, id, bytes) in task_results {
+        if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES { break; }
+        reg.jobs.remove(&id);
+        retained_bytes = retained_bytes.saturating_sub(bytes);
+    }
     let mut settled_by_owner: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     for job in reg.jobs.values().filter(|job| {
         job.status.settled() && job.delivery == JobDelivery::Background
@@ -2969,7 +3002,7 @@ fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
         return Err(Error::tool(
             "jobs",
             format!(
-                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns a live process ({})",
+                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns running work ({})",
                 job.status.as_str()
             ),
         ));
@@ -3424,17 +3457,16 @@ pub fn kill_all() {
 }
 
 #[cfg(test)]
+pub(crate) fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const TEST_SESSION_ID: &str = "jobs-test-session";
-
-    fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     struct SpawnBackgroundTestHookGuard;
 
@@ -3680,6 +3712,9 @@ mod tests {
     ) -> JobEntry {
         let file = std::fs::File::create(&artifact_path).expect("synthetic artifact");
         JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
             owner_session_id: TEST_SESSION_ID.to_string(),
             delivery: JobDelivery::Background,
             id: id.to_string(),
@@ -5187,6 +5222,9 @@ mod tests {
             reg.jobs.insert(
                 id.clone(),
                 JobEntry {
+                    schema: JOB_SCHEMA,
+                    result: None,
+                    result_bytes: 0,
                     owner_session_id: TEST_SESSION_ID.to_string(),
                     delivery: JobDelivery::Background,
                     id,
