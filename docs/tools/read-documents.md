@@ -1,6 +1,6 @@
-# Read documents and JSON data
+# Read documents, JSON, and SQLite data
 
-The same `read` tool handles document text and structured data. For JSON/JSONL filters, see [JSON and JSONL queries](#json-and-jsonl-queries) below.
+The same `read` tool handles document text and structured data. See [JSON and JSONL queries](#json-and-jsonl-queries) and [SQLite queries](#sqlite-queries) below.
 
 The `read` tool extracts saved text from local Word documents, PowerPoint presentations, Excel workbooks, and EPUB books, and from document URLs. Conversion runs natively in the default build; it does not need an installed Office application, a conversion service, or an additional build feature.
 
@@ -143,7 +143,35 @@ Encode a literal `&` inside a filter as `%26` and an encoded percent sign as `%2
 
 To edit source JSON, read the source path without query selectors and request `hashline: true`. Query results have no source edit anchors. The tool property `raw: true` bypasses conversion/query handling entirely; it differs from the query parameter `&raw=true`.
 
-### Query limits and availability
+## SQLite queries
+
+Read a local SQLite database to list its tables and views. Append `:table` for its CREATE statement and five sample rows, or `:table:key` for a row selected by its single-column primary key. Tables without a declared primary key use an available rowid alias. Signed 64-bit integer keys are exact; composite keys and view lookups require `where` or SQL.
+
+```json
+{"path":"app.sqlite"}
+```
+
+```json
+{"path":"app.sqlite:users:9223372036854775807"}
+```
+
+```json
+{"path":"app.sqlite:orders?where=status='open'&order=created_at:desc,id:asc&limit=20&offset=0"}
+```
+
+```json
+{"path":"app.sqlite?q=SELECT customer_id, SUM(total) AS total FROM orders GROUP BY customer_id ORDER BY total DESC LIMIT 25"}
+```
+
+SQLite selectors recognize `.sqlite`, `.sqlite3`, `.db`, and `.db3` case-insensitively. Plain local files also use SQLite's file signature for detection. A text file named `.db` remains an ordinary text read; adding SQLite selectors to it reports an error. Percent-encode `:` in a table name or key as `%3A`. Encode ampersands inside SQL as `%26`; plus signs retain their arithmetic meaning.
+
+Table paging defaults to 20 rows and accepts limits from 1 through 500. `order` accepts comma-separated column names with `:asc` or `:desc`; declared primary keys supply a stable default order. Without a primary key, specify an order when stable pages matter. `where` accepts a row predicate; use `q` for subqueries, joins, grouping, and other complete SELECT/WITH/VALUES queries. SQL queries return at most 1,000 rows. Keep each query to one read-only statement without a trailing semicolon, comments, or unbound parameters. Schema changes, writes, ATTACH, and file-loading functions are rejected.
+
+The reader copies an admitted database and any committed WAL frames into an immutable private image. The query engine never opens, changes, or checkpoints the source database and never creates sidecars next to it. Main-file and WAL content are checked again before querying; a changing snapshot asks the caller to retry. An unrecovered rollback journal is rejected, while a cleared PERSIST journal is accepted. Results bypass the ordinary single-file read cache because WAL commits can change data without changing the main database file.
+
+Rows render as a table, or as individual records for wide results. NULL and BLOB values are explicit, and oversized text cells carry truncation markers. Continuation metadata distinguishes row paging from display-line paging. SQLite results have no hashline edit anchors. Database reading uses the project's native FrankenSQLite engine; unsupported SQL or database structures report an error.
+
+## Structured query limits and availability
 
 Native queries run in a supervised Pi subprocess with a 30-second deadline, a 1 GiB address-space ceiling, and bounded pipe capture. Up to four workers can run concurrently. A worker starts before normal configuration, authentication, or extension loading, receives the already-admitted source bytes, and exits after one query. SDK applications must install the `pi` executable beside their executable for this worker path.
 
@@ -157,5 +185,12 @@ Hard process memory limits currently require a supported Unix platform; Linux an
 | Source nesting | 256 levels |
 | Rendered query output | 5 MiB |
 | Diagnostic tail | 8 KiB |
+| SQLite main file plus WAL | 100 MiB |
+| SQLite SQL/predicate text | 32 KiB |
+| SQLite rendered output | 8 MiB |
+| SQLite columns per result | 256 |
+| SQLite tables/views in a listing | 500 |
+| SQLite displayed cell text | 16 KiB, with truncation marker |
+| SQLite displayed name / CREATE statement | 1 KiB / 64 KiB, with truncation marker |
 
 The normal Read response limit of 2,000 lines or 1,000,000 bytes still applies after query evaluation. Narrow a filter or use result pagination to reduce evaluation work; display-line pagination alone does not change the query.

@@ -29,6 +29,7 @@ pub(super) const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_QUERY_PARAMETERS: usize = 64 * 1024;
 const MAX_JSON_REQUEST: usize = 16 * 1024 * 1024;
+const MAX_SQLITE_REQUEST: usize = 150 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
@@ -163,18 +164,21 @@ impl QueryRequest {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WorkerKind {
     Json,
+    Sqlite,
 }
 
 impl WorkerKind {
     const fn flag(self) -> &'static str {
         match self {
             Self::Json => "--internal-json-query",
+            Self::Sqlite => "--internal-sqlite-query",
         }
     }
 
     const fn input_limit(self) -> usize {
         match self {
             Self::Json => MAX_JSON_REQUEST,
+            Self::Sqlite => MAX_SQLITE_REQUEST,
         }
     }
 }

@@ -35,6 +35,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 mod structured_json;
+mod structured_sqlite;
 
 /// Run an internal, resource-bounded data query before normal Pi startup.
 /// The worker receives admitted bytes and never loads project configuration,
@@ -42,13 +43,18 @@ mod structured_json;
 #[doc(hidden)]
 pub fn run_structured_read_worker_if_requested() -> Option<i32> {
     let mut args = std::env::args_os().skip(1);
-    if args.next()? != "--internal-json-query" {
+    let mode = args.next()?;
+    let worker: fn() -> i32 = if mode == "--internal-json-query" {
+        structured_json::run_json_worker
+    } else if mode == "--internal-sqlite-query" {
+        structured_sqlite::run_sqlite_worker
+    } else {
         return None;
-    }
+    };
     if args.next().is_some() {
         return Some(2);
     }
-    Some(structured_json::run_json_worker())
+    Some(worker())
 }
 
 // ============================================================================
@@ -6822,7 +6828,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
+        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6831,7 +6837,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path, archive.zip:member/path, http(s) document URL, internal resource URL, or JSON/JSONL source?q=<jq filter>. Query parameters include raw, compact, limit, and offset. Encode literal filter ampersands as %26; + remains arithmetic."
+                    "description": "File path, archive.zip:member/path, http(s) URL, internal resource URL, JSON source?q=<jq filter>, or SQLite path[:table[:key]][?q=<SQL>|where=<predicate>&order=column:asc&limit=N&offset=N]. Encode literal query ampersands as %26; + remains arithmetic."
                 },
                 "offset": {
                     "type": "integer",
@@ -6847,7 +6853,7 @@ impl Tool for ReadTool {
                 },
                 "raw": {
                     "type": "boolean",
-                    "description": "Read original source text instead of converting a document or querying JSON. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
+                    "description": "Read original source text instead of converting a document or querying data. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
                 }
             },
             "required": ["path"]
@@ -6901,20 +6907,29 @@ impl Tool for ReadTool {
             return self.execute_scheme_read(&input).await;
         }
 
-        let archive_path = crate::archive_read::parse_path(&input.path)?
+        let sqlite_request = if input.raw {
+            None
+        } else {
+            structured_sqlite::parse_path(&input.path)?
+        };
+        let file_path = sqlite_request
+            .as_ref()
+            .map_or(input.path.as_str(), |request| request.source_path.as_str());
+        let archive_path = crate::archive_read::parse_path(file_path)?
             .filter(|archive| !input.raw || !archive.member.is_empty());
         let source_path = archive_path
             .as_ref()
-            .map_or(input.path.as_str(), |archive| archive.archive_path.as_str());
+            .map_or(file_path, |archive| archive.archive_path.as_str());
         let path = resolve_read_path(source_path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
 
         let path_for_open = path.clone();
         let mut allowed_roots = self.workspace.snapshot_or(&self.cwd).all();
         allowed_roots.push(Config::global_dir());
+        let sqlite_roots = allowed_roots.clone();
         #[cfg(test)]
         let after_open_hook = self.after_open_hook.clone();
-        let (std_file, cache_file, meta, cache_deps) =
+        let (std_file, cache_file, meta, cache_deps, sqlite_magic) =
             asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<_> {
                 let file =
                     open_regular_file_within_roots_with(&path_for_open, &allowed_roots, || {})?;
@@ -6927,10 +6942,50 @@ impl Tool for ReadTool {
                 let cache_deps = cache_file.as_ref().and_then(|cache_file| {
                     cache_dependency_for_open_file(&path_for_open, cache_file)
                 });
-                Ok((file, cache_file, metadata, cache_deps))
+                let mut prefix = [0_u8; 16];
+                let mut prefix_len = 0;
+                while prefix_len < prefix.len() {
+                    let read = positioned_file_read(
+                        &file,
+                        &mut prefix[prefix_len..],
+                        prefix_len as u64,
+                    )?;
+                    if read == 0 {
+                        break;
+                    }
+                    prefix_len += read;
+                }
+                let sqlite_magic = structured_sqlite::is_sqlite(&prefix[..prefix_len]);
+                Ok((file, cache_file, metadata, cache_deps, sqlite_magic))
             })
             .await
             .map_err(|err| Error::tool("read", err.to_string()))?;
+
+        // WAL commits can change results without modifying the main file.
+        // Query the admitted immutable snapshot before the ordinary file cache.
+        if !input.raw && archive_path.is_none() && sqlite_magic {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[SQLITE_HASHLINE] Database rows are read-only projections, not source edit anchors",
+                ));
+            }
+            let request = sqlite_request
+                .unwrap_or_else(|| structured_sqlite::QueryRequest::plain(input.path.clone()));
+            let mut outcome =
+                structured_sqlite::execute(request, std_file, path.clone(), sqlite_roots).await?;
+            outcome.metadata["path"] = serde_json::json!(path.to_string_lossy());
+            return document_read_output(&input, &outcome.content, outcome.metadata, true);
+        }
+        if sqlite_request
+            .as_ref()
+            .is_some_and(structured_sqlite::QueryRequest::has_selectors)
+        {
+            return Err(Error::tool(
+                "read",
+                "[SQLITE_READ] Table and SQL selectors require a SQLite format 3 database",
+            ));
+        }
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {

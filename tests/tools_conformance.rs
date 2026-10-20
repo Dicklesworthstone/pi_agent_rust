@@ -51,6 +51,104 @@ impl Drop for UnixModeGuard {
 mod read_tool {
     use super::*;
 
+    // Captured from stock SQLite 3.53.1, not synthesized by the reader's WAL
+    // checksum implementation. The second row exists only in the WAL.
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    fn stock_sqlite_wal_fixture(root: &Path) -> (Vec<u8>, Vec<u8>) {
+        use base64::Engine as _;
+        // Zero-filled ranges are omitted; offsets and nonzero bytes come
+        // directly from stock SQLite, independently of the WAL reader.
+        let mut image = vec![0_u8; 1024];
+        for (offset, encoded) in [
+            (0, "U1FMaXRlIGZvcm1hdCAzAAIAAgIAQCAgAAAAAwAAAAIAAAAAAAAAAAAAAAEAAAAEAAAAAAAAAAAAAAAB"),
+            (95, "AwAulckNAAAAAQGtAAGt"),
+            (429, "UQEGFxsbAXt0YWJsZXJlY29yZHNyZWNvcmRzAkNSRUFURSBUQUJMRSByZWNvcmRzKGlkIElOVEVHRVIgUFJJTUFSWSBLRVksIG5hbWUgVEVYVCkNAAAAAQH1AAH1"),
+            (1013, "CQEDABliZWZvcmU="),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+            image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        let mut wal = vec![0_u8; 568];
+        for (offset, encoded) in [
+            (0, "N38GggAt4hgAAAIAAAAAAEuCK8XwQS9wmfaFXsH/nvMAAAACAAAAAkuCK8XwQS9wpJUO465LAVMNAAAAAgHjAAH1AeM="),
+            (539, "CL///////////wMAF2FmdGVyCQEDABliZWZvcmU="),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+            wal[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        std::fs::write(root.join("data.sqlite"), &image).unwrap();
+        std::fs::write(root.join("data.sqlite-wal"), &wal).unwrap();
+        (image, wal)
+    }
+
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn sqlite_read_queries_committed_wal_without_mutating_source() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let (image, wal) = stock_sqlite_wal_fixture(directory.path());
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let result = tool.execute("schema", serde_json::json!({"path":"data.sqlite"}), None).await.unwrap();
+            assert!(get_text_content(&result.content).contains("records"));
+            let result = tool.execute("row", serde_json::json!({"path":"data.sqlite:records:9223372036854775807"}), None).await.unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("9223372036854775807"));
+            assert!(text.contains("after"));
+            assert!(!text.contains("before"));
+            assert_eq!(result.details.as_ref().unwrap()["walFrames"], 1);
+            let result = tool.execute("page", serde_json::json!({"path":"data.sqlite:records?order=id:asc&limit=1&offset=1"}), None).await.unwrap();
+            assert!(get_text_content(&result.content).contains("after"));
+            assert_eq!(result.details.as_ref().unwrap()["hasMoreRows"], false);
+            let result = tool.execute("projection", serde_json::json!({"path":"data.sqlite?q=SELECT name FROM records ORDER BY id DESC"}), None).await.unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.find("after").unwrap() < text.find("before").unwrap());
+            assert_eq!(std::fs::read(directory.path().join("data.sqlite")).unwrap(), image);
+            assert_eq!(std::fs::read(directory.path().join("data.sqlite-wal")).unwrap(), wal);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+            assert!(tool.execute("anchors", serde_json::json!({"path":"data.sqlite:records","hashline":true}), None).await.unwrap_err().to_string().contains("SQLITE_HASHLINE"));
+            assert!(tool.execute("write", serde_json::json!({"path":"data.sqlite?q=DELETE FROM records"}), None).await.is_err());
+        });
+    }
+
+    #[test]
+    fn sqlite_selectors_preserve_plain_db_reads_and_enforce_workspace_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("plain.db"),
+                "ordinary text database",
+            )
+            .unwrap();
+            std::fs::write(outside.path().join("private.sqlite"), b"SQLite format 3\0")
+                .unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let output = tool
+                .execute("plain", serde_json::json!({"path":"plain.db"}), None)
+                .await
+                .unwrap();
+            assert!(get_text_content(&output.content).contains("ordinary text database"));
+            let error = tool
+                .execute(
+                    "invalid",
+                    serde_json::json!({"path":"plain.db:records"}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("SQLite format 3"));
+            let path = format!(
+                "{}?q=SELECT name FROM records",
+                outside.path().join("private.sqlite").display()
+            );
+            let error = tool
+                .execute("outside", serde_json::json!({"path":path}), None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        });
+    }
+
     #[cfg(all(unix, not(target_os = "openbsd")))]
     #[test]
     fn json_read_filters_pages_and_keeps_source_edit_anchors_separate() {
