@@ -1092,6 +1092,47 @@ pub enum TurnOutcome<'a> {
     Failed(&'a crate::error::Error),
 }
 
+/// Overflow can justify changing the context, never resending it unchanged.
+/// Keep the ordinary recovery refusals ahead of this separate maintenance path:
+/// a local/session failure or mixed authentication diagnostic must not trigger
+/// summary-provider calls. Byte-size HTTP 413 refusals need token evidence.
+#[must_use]
+pub(crate) fn needs_context_compaction(
+    outcome: TurnOutcome<'_>,
+    context_window: Option<u32>,
+) -> bool {
+    let (error_text, input_tokens) = match outcome {
+        TurnOutcome::Completed(message)
+            if message.stop_reason == crate::model::StopReason::Error =>
+        {
+            (
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Request error")
+                    .to_string(),
+                Some(message.usage.input),
+            )
+        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => {
+            (error.to_string(), None)
+        }
+        _ => return false,
+    };
+    let lower = error_text.to_ascii_lowercase();
+    if marks_session_persistence(&error_text) || is_auth_failure(&lower) {
+        return false;
+    }
+    if recovery_http_status(&lower) == Some(413)
+        && !input_tokens
+            .zip(context_window)
+            .is_some_and(|(tokens, window)| tokens > u64::from(window))
+    {
+        return false;
+    }
+    crate::error::is_context_overflow(&error_text, input_tokens, context_window)
+}
+
 /// Why a turn must end without another provider call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalReason {
@@ -2705,6 +2746,37 @@ mod tests {
                 "window={window:?}"
             );
         }
+    }
+
+    #[test]
+    fn context_compaction_requires_provider_overflow_and_preserves_terminal_refusals() {
+        use crate::error::Error;
+
+        let overflow = Error::api("context_length_exceeded: prompt is too long");
+        assert!(needs_context_compaction(TurnOutcome::Failed(&overflow), None));
+        for error in [
+            Error::session("context_length_exceeded"),
+            Error::Auth("context_length_exceeded".to_string()),
+            Error::api("HTTP 401 unauthorized: context_length_exceeded"),
+            Error::api("HTTP 413: context_length_exceeded"),
+            Error::api(Error::session_persistence("context_length_exceeded").to_string()),
+        ] {
+            assert!(
+                !needs_context_compaction(TurnOutcome::Failed(&error), Some(8_192)),
+                "{error}",
+            );
+        }
+        let silent = errored_message(Some("500 internal server error"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            Some(8_192),
+        ));
+        assert!(!needs_context_compaction(TurnOutcome::Completed(&silent), None));
+        let payload = errored_message(Some("HTTP 413: payload rejected"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&payload),
+            Some(8_192),
+        ));
     }
 
     #[test]

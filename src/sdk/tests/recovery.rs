@@ -2091,6 +2091,622 @@ fn real_tool_work_survives_retry_once_and_terminal_end_follows_persistence() {
     );
 }
 
+struct OverflowRecoveryProvider {
+    calls: AtomicUsize,
+    summaries: AtomicUsize,
+    large_read: std::sync::atomic::AtomicBool,
+    observed: Mutex<Vec<Vec<Message>>>,
+    write_first: bool,
+    repeat_overflow: bool,
+    summary: String,
+    abort_summary: Option<AbortHandle>,
+}
+
+#[async_trait::async_trait]
+impl Provider for OverflowRecoveryProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "overflow-fixture"
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "overflow-model"
+    }
+
+    async fn stream(
+        &self,
+        context: &crate::provider::Context<'_>,
+        _options: &StreamOptions,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        let is_summary = context
+            .system_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("context summarization assistant"));
+        let (content, stop_reason) = if is_summary {
+            self.summaries.fetch_add(1, Ordering::SeqCst);
+            if let Some(abort) = &self.abort_summary {
+                abort.abort();
+                return futures::future::pending().await;
+            }
+            (
+                vec![ContentBlock::Text(TextContent::new(self.summary.clone()))],
+                StopReason::Stop,
+            )
+        } else {
+            self.observed.lock().unwrap().push(context.messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let large_read = self.write_first && self.large_read.load(Ordering::SeqCst);
+            if self.write_first && call == 0 {
+                (
+                    vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "overflow-write-once".to_string(),
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "overflow-result.txt",
+                            "content": "completed before overflow",
+                        }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            } else if large_read && call == 1 {
+                (
+                    vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "overflow-read-once".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "large-result.txt"}),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            } else if call == usize::from(self.write_first) + usize::from(large_read)
+                || self.repeat_overflow
+            {
+                return Err(Error::api("context_length_exceeded: prompt is too long"));
+            } else {
+                (
+                    vec![ContentBlock::Text(TextContent::new(
+                        "continued after compaction",
+                    ))],
+                    StopReason::Stop,
+                )
+            }
+        };
+        let message = AssistantMessage {
+            content,
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            stop_reason,
+            ..Default::default()
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::Start {
+                partial: message.clone(),
+            }),
+            Ok(StreamEvent::Done {
+                reason: stop_reason,
+                message,
+            }),
+        ])))
+    }
+}
+
+fn overflow_recovery_handle(
+    dir: &Path,
+    write_first: bool,
+    repeat_overflow: bool,
+    summary: String,
+    abort_summary: Option<AbortHandle>,
+) -> (AgentSessionHandle, Arc<OverflowRecoveryProvider>) {
+    let provider = Arc::new(OverflowRecoveryProvider {
+        calls: AtomicUsize::new(0),
+        summaries: AtomicUsize::new(0),
+        large_read: std::sync::atomic::AtomicBool::new(false),
+        observed: Mutex::new(Vec::new()),
+        write_first,
+        repeat_overflow,
+        summary,
+        abort_summary,
+    });
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(&["write", "read"], dir, None),
+        AgentConfig::default(),
+    );
+    agent.set_model_accepts_images(true);
+    let mut stored = Session::create_with_dir(Some(dir.join("sessions")));
+    stored.header.provider = Some(provider.name().to_string());
+    stored.header.model_id = Some(provider.model_id().to_string());
+    stored.append_model_message(Message::User(UserMessage {
+        content: UserContent::Text("earlier task with historical details ".repeat(500)),
+        timestamp: 0,
+    }));
+    stored.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+        content: vec![ContentBlock::Text(TextContent::new(
+            "earlier answer with resolved details ".repeat(500),
+        ))],
+        provider: provider.name().to_string(),
+        model: provider.model_id().to_string(),
+        stop_reason: StopReason::Stop,
+        ..Default::default()
+    })));
+    let session = AgentSession::new(
+        agent,
+        Arc::new(AsyncMutex::new(stored)),
+        true,
+        ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 128_000,
+            keep_recent_tokens: 2_000,
+            ..Default::default()
+        },
+    );
+    (
+        AgentSessionHandle::from_session_with_listeners(session, EventListeners::new()),
+        provider,
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn overflow_compaction_preserves_native_input_tools_and_durable_order_without_retry_policy() {
+    let dir = tempdir().unwrap();
+    let (mut handle, provider) = overflow_recovery_handle(
+        dir.path(),
+        true,
+        false,
+        "The earlier task was completed.".to_string(),
+        None,
+    );
+    assert!(handle.retry_policy().is_none());
+    let content = vec![
+        ContentBlock::Text(TextContent::new("write this result exactly once")),
+        ContentBlock::Image(ImageContent {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+    ];
+    let expected_content = serde_json::to_value(&content).unwrap();
+    let (events, callback) = event_log();
+    let store = handle.session_store();
+    let result = run_async(handle.prompt_with_content(content, move |event| {
+        if let AgentEvent::AutoCompactionEnd {
+            result: Some(_), ..
+        } = &event
+        {
+            let stored = store
+                .try_lock()
+                .expect("compaction callback releases session lock");
+            let disk = std::fs::read_to_string(stored.path.as_ref().unwrap()).unwrap();
+            assert!(disk.contains("\"type\":\"compaction\""));
+        }
+        callback(event);
+    }))
+    .expect("overflow recovery");
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert!(provider.summaries.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("overflow-result.txt")).unwrap(),
+        "completed before overflow"
+    );
+    let observed = provider.observed.lock().unwrap();
+    let resumed = observed.last().unwrap();
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|message| matches!(
+                message, Message::ToolResult(result)
+                    if result.tool_call_id == "overflow-write-once"
+            ))
+            .count(),
+        1,
+    );
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|message| matches!(
+                message, Message::User(UserMessage { content: UserContent::Blocks(blocks), .. })
+                    if serde_json::to_value(blocks).unwrap() == expected_content
+            ))
+            .count(),
+        1,
+        "accepted images and user input must not be replayed or flattened",
+    );
+    assert!(
+        crate::compaction::estimate_model_context_tokens(resumed)
+            < crate::compaction::estimate_model_context_tokens(&observed[1])
+    );
+    drop(observed);
+    let events = events.lock().unwrap();
+    let compaction_end = events
+        .iter()
+        .find(|event| event["type"] == "auto_compaction_end")
+        .unwrap();
+    assert_eq!(compaction_end["willRetry"], true);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .count(),
+        1,
+    );
+    assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn overflow_keeps_native_request_and_large_completed_tool_tail_or_stops_without_history() {
+    for older_history in [false, true] {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("large-result.txt"),
+            "large completed result with detailed evidence\n".repeat(1_000),
+        )
+        .unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            true,
+            false,
+            "The earlier task was completed.".to_string(),
+            None,
+        );
+        provider.large_read.store(true, Ordering::SeqCst);
+        if !older_history {
+            let mut fresh = Session::create_with_dir(Some(dir.path().join("sessions")));
+            fresh.header.provider = Some(provider.name().to_string());
+            fresh.header.model_id = Some(provider.model_id().to_string());
+            *handle.session_store().try_lock().unwrap() = fresh;
+        }
+        let content = native_content_fixture();
+        let expected = serde_json::to_value(&content).unwrap();
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt_with_content(content, move |event| callback(event)));
+        if older_history {
+            assert_eq!(
+                result.expect("compacted older prefix").stop_reason,
+                StopReason::Stop
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.summaries.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(result.is_err(), "active-only overflow must stop");
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        }
+        let observed = provider.observed.lock().unwrap();
+        let before_overflow = &observed[2];
+        let input_index = before_overflow
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)))
+            .unwrap();
+        let protected_tail = &before_overflow[input_index..];
+        assert!(
+            crate::compaction::estimate_model_context_tokens(protected_tail)
+                > u64::from(handle.session.compaction_settings().keep_recent_tokens),
+            "the active tool tail must exercise the ordinary split-turn cut",
+        );
+        let messages = run_async(handle.messages()).unwrap();
+        let retained = if older_history {
+            observed.last().unwrap()
+        } else {
+            &messages
+        };
+        let kept_input_index = retained
+            .iter()
+            .rposition(|message| matches!(
+                message, Message::User(UserMessage { content: UserContent::Blocks(blocks), .. })
+                    if serde_json::to_value(blocks).unwrap() == expected
+            ))
+            .expect("exact native user blocks retained");
+        assert_eq!(
+            serde_json::to_value(&retained[kept_input_index..]).unwrap(),
+            serde_json::to_value(protected_tail).unwrap(),
+            "current media and both completed tool pairs must remain byte-for-byte",
+        );
+        for call_id in ["overflow-write-once", "overflow-read-once"] {
+            assert_eq!(
+                retained
+                    .iter()
+                    .filter(|message| matches!(
+                        message, Message::ToolResult(result) if result.tool_call_id == call_id
+                    ))
+                    .count(),
+                1,
+            );
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_start")
+                .count(),
+            2,
+        );
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let path = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .unwrap();
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+            serde_json::to_value(messages).unwrap(),
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn overflow_rejects_extension_cuts_that_discard_current_input_or_name_unknown_entries() {
+    for unknown_cut in [false, true] {
+        let dir = tempdir().unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            false,
+            "unused provider summary".to_string(),
+            None,
+        );
+        let late_cut = {
+            let store = handle.session_store();
+            let mut stored = store.try_lock().unwrap();
+            stored.append_model_message(Message::User(UserMessage {
+                content: UserContent::Blocks(native_content_fixture()),
+                timestamp: 0,
+            }));
+            let late_cut = stored.append_model_message(Message::Assistant(Arc::new(
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "already-completed-write".to_string(),
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "result.txt",
+                            "content": "already saved",
+                        }),
+                        thought_signature: None,
+                    })],
+                    provider: provider.name().to_string(),
+                    model: provider.model_id().to_string(),
+                    stop_reason: StopReason::ToolUse,
+                    ..Default::default()
+                },
+            )));
+            stored.append_model_message(Message::ToolResult(crate::model::ToolResultMessage {
+                tool_call_id: "already-completed-write".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("saved"))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+            late_cut
+        };
+        run_async(handle.session.persist_session()).unwrap();
+        let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+        install_native_event_hooks(
+            &mut handle,
+            &serde_json::json!({
+                "session_before_compact": {
+                    "compaction": {
+                        "summary": "A concise extension summary.",
+                        "firstKeptEntryId": if unknown_cut { "missing-entry" } else { &late_cut },
+                    },
+                },
+            }),
+        );
+        let (events, callback) = event_log();
+        let error = run_async(handle.continue_turn(move |event| callback(event)))
+            .expect_err("unsafe extension cut must be refused");
+        assert!(error.to_string().contains("discard the current user request"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+            before,
+            "refusal must preserve exact native user content and completed tool work",
+        );
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+        let store = handle.session_store();
+        let stored = store.try_lock().unwrap();
+        assert!(stored.entries.iter().all(|entry| !matches!(
+            entry,
+            crate::session::SessionEntry::Compaction(_)
+        )));
+        let path = stored.path.clone().unwrap();
+        drop(stored);
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+            before,
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "auto_compaction_end")
+            .unwrap();
+        assert_eq!(end["willRetry"], false);
+        assert!(end["result"].is_null());
+    }
+}
+
+#[test]
+fn overflow_recovery_is_bounded_and_rejects_a_summary_that_cannot_shrink_context() {
+    for no_progress in [false, true] {
+        let dir = tempdir().unwrap();
+        let summary = if no_progress {
+            "summary adds more context than it removes ".repeat(4_000)
+        } else {
+            "Earlier history summarized.".to_string()
+        };
+        let (mut handle, provider) =
+            overflow_recovery_handle(dir.path(), false, true, summary, None);
+        handle = handle.with_retry(Some(fast_retry_policy(3)));
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("continue the current task", move |event| {
+            callback(event);
+        }));
+        let error = result.expect_err("unrecoverable overflow");
+        if no_progress {
+            assert!(error.to_string().contains("made no progress"), "{error}");
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if no_progress { 1 } else { 2 }
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "auto_compaction_start")
+                .count(),
+            1,
+            "one maintenance attempt per logical turn",
+        );
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let store = handle.session_store();
+        let stored = store.try_lock().unwrap();
+        assert_eq!(
+            stored
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_)))
+                .count(),
+            usize::from(!no_progress),
+            "a no-progress candidate must not replace live or durable history",
+        );
+    }
+}
+
+#[test]
+fn disabled_compaction_and_unsplittable_input_never_reenter_the_provider() {
+    for disabled in [false, true] {
+        let dir = tempdir().unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            true,
+            "Earlier history summarized.".to_string(),
+            None,
+        );
+        handle = handle.with_retry(Some(fast_retry_policy(3)));
+        if disabled {
+            handle.session.set_auto_compaction(false);
+        } else {
+            // Only the upcoming authored request remains: no older prefix or
+            // safe split exists, even when the provider says it is too large.
+            let mut fresh = Session::create_with_dir(Some(dir.path().join("sessions")));
+            fresh.header.provider = Some(provider.name().to_string());
+            fresh.header.model_id = Some(provider.model_id().to_string());
+            *handle.session_store().try_lock().unwrap() = fresh;
+        }
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("one unsplittable current request", move |event| {
+            callback(event);
+        }));
+        assert!(result.is_err(), "disabled={disabled}: {result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        let events = events.lock().unwrap();
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        assert!(events.iter().all(|event| event["type"] != "auto_compaction_start"));
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+    }
+}
+
+#[test]
+fn overflow_compaction_save_failure_quarantines_later_provider_entry() {
+    let dir = tempdir().unwrap();
+    let (mut handle, provider) = overflow_recovery_handle(
+        dir.path(),
+        false,
+        false,
+        "Earlier history summarized.".to_string(),
+        None,
+    );
+    let blocked = dir.path().join("blocked-session");
+    std::fs::create_dir(&blocked).unwrap();
+    let store = handle.session_store();
+    let original = Arc::new(Mutex::new(None));
+    let saved_original = Arc::clone(&original);
+    let result = run_async(handle.prompt("continue after overflow", move |event| {
+        if matches!(event, AgentEvent::AutoCompactionStart { .. }) {
+            let mut session = store.try_lock().unwrap();
+            *saved_original.lock().unwrap() = session.path.clone();
+            session.path = Some(blocked.clone());
+        }
+    }));
+    assert!(
+        result.as_ref().is_err_and(Error::is_session_persistence),
+        "{result:?}"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    handle.session_store().try_lock().unwrap().path = original.lock().unwrap().clone();
+    let result = run_async(handle.continue_turn(|_| {}));
+    assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn overflow_compaction_honors_cancellation_before_and_during_summary() {
+    for during_summary in [false, true] {
+        let dir = tempdir().unwrap();
+        let (abort, signal) = AbortHandle::new();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            false,
+            "Earlier history summarized.".to_string(),
+            during_summary.then(|| abort.clone()),
+        );
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt_with_abort("continue", signal, move |event| {
+            if !during_summary && matches!(event, AgentEvent::AutoCompactionStart { .. }) {
+                abort.abort();
+            }
+            callback(event);
+        }));
+        assert!(matches!(result, Err(Error::Aborted)), "{result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.summaries.load(Ordering::SeqCst),
+            usize::from(during_summary)
+        );
+        let events = events.lock().unwrap();
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "auto_compaction_end")
+            .unwrap();
+        assert_eq!(end["aborted"], true);
+        assert_eq!(end["willRetry"], false);
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+    }
+}
+
 struct TransportDropProvider;
 
 #[async_trait::async_trait]

@@ -16546,7 +16546,9 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false).await
+        self.compact_synchronous(Arc::new(on_event), false, None)
+            .await
+            .map(|_| ())
     }
 
     /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
@@ -16556,7 +16558,24 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous(Arc::new(on_event), true).await
+        self.compact_synchronous(Arc::new(on_event), true, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Recover an overflowing request using the same durable compaction
+    /// transaction as manual maintenance. The caller first restores the failed
+    /// assistant tail and resumes only when this returns true. No-op cuts,
+    /// disabled compaction, cancellation, and summaries that do not shrink the
+    /// active context never authorize another provider request.
+    pub(crate) async fn compact_after_context_overflow(
+        &mut self,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.ensure_provider_reentry_allowed()?;
+        self.compact_synchronous(Arc::new(on_event), false, Some(abort))
+            .await
     }
 
     pub async fn execute_extension_command(
@@ -16711,8 +16730,13 @@ impl AgentSession {
                         });
                         return Err(err);
                     }
-                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-                        .await?;
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        provider_admission,
+                        None,
+                    )
+                    .await?;
                     self.compaction_worker.mark_applied_success();
                 }
                 Err(e) => {
@@ -16835,6 +16859,7 @@ impl AgentSession {
                         compaction.details.clone(),
                         true,
                         provider_admission,
+                        false,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -16996,7 +17021,7 @@ impl AgentSession {
             }
         };
 
-        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
+        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission, None)
             .await
     }
 
@@ -17037,9 +17062,10 @@ impl AgentSession {
 
     /// Append the compaction entry to the session and return the estimated
     /// token count of the context the next provider request will see (the
-    /// post-compaction current path). The estimate uses the char-based
-    /// heuristic and ignores retained assistant `usage`, so stale
+    /// post-compaction current path). The estimate ignores retained assistant
+    /// `usage`, so stale
     /// pre-compaction usage never inflates it.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_compaction_entry(
         &self,
         summary: String,
@@ -17048,12 +17074,23 @@ impl AgentSession {
         details: Option<Value>,
         from_extension: bool,
         provider_admission: OwnedMutexGuard<()>,
+        require_reduction: bool,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         self.provider_admission.ensure_allowed()?;
+        if require_reduction
+            && !compaction::overflow_compaction_preserves_current_turn(
+                &session.entries_for_current_path(),
+                &first_kept_entry_id,
+            )
+        {
+            return Err(Error::api(
+                "Context overflow compaction would discard the current user request or completed tool work; the cut was not applied",
+            ));
+        }
         let mut candidate = session.clone();
 
         let from_hook = if from_extension { Some(true) } else { None };
@@ -17064,6 +17101,20 @@ impl AgentSession {
             details,
             from_hook,
         );
+
+        // Count the context actually sent next, not the archived tree entries
+        // or pre-compaction usage. Refuse a no-progress overflow recovery
+        // before writing or installing its candidate.
+        let tokens_after =
+            compaction::estimate_model_context_tokens(&candidate.to_messages_for_current_path());
+        if require_reduction
+            && tokens_after
+                >= compaction::estimate_model_context_tokens(&session.to_messages_for_current_path())
+        {
+            return Err(Error::api(
+                "Context overflow recovery made no progress; compaction did not reduce the active context",
+            ));
+        }
 
         if self.save_enabled {
             self.provider_admission.block(
@@ -17080,12 +17131,6 @@ impl AgentSession {
                 return Err(Error::session_persistence(reason));
             }
         }
-
-        // Estimate the context the *next* provider request will see now that the
-        // compacted history is written: the post-compaction current path via the
-        // shared char-based heuristic, ignoring any retained assistant `usage`.
-        let tokens_after =
-            compaction::estimate_entries_context_tokens(&candidate.entries_for_current_path());
 
         let compaction_entry = candidate.get_entry(&entry_id).and_then(|entry| {
             if let crate::session::SessionEntry::Compaction(compaction) = entry {
@@ -17126,7 +17171,9 @@ impl AgentSession {
         result: compaction::CompactionResult,
         on_event: AgentEventHandler,
         provider_admission: OwnedMutexGuard<()>,
+        overflow_abort: Option<&AbortSignal>,
     ) -> Result<()> {
+        let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
             Ok(details) => Some(details),
             Err(err) => {
@@ -17147,6 +17194,7 @@ impl AgentSession {
                 details.clone(),
                 false,
                 provider_admission,
+                overflow,
             )
             .await
         {
@@ -17173,7 +17221,7 @@ impl AgentSession {
         on_event(AgentEvent::AutoCompactionEnd {
             result: result_value,
             aborted: false,
-            will_retry: false,
+            will_retry: overflow && !overflow_abort.is_some_and(AbortSignal::is_aborted),
             error_message: None,
         });
 
@@ -17186,10 +17234,15 @@ impl AgentSession {
         &mut self,
         on_event: AgentEventHandler,
         shake: bool,
-    ) -> Result<()> {
+        overflow_abort: Option<&AbortSignal>,
+    ) -> Result<bool> {
         if !self.compaction_settings.enabled {
-            return Ok(());
+            return Ok(false);
         }
+        if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
+        let overflow = overflow_abort.is_some();
 
         let (entries, preparation) = {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -17204,25 +17257,44 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let mut settings = self.compaction_settings.clone();
+            let prep = if overflow {
+                // A provider may reject a request smaller than the configured
+                // keep-recent budget. Aim to retain at most half the observed
+                // input while preserving the complete current authored turn,
+                // without inventing a different model capacity.
+                let tokens = compaction::estimate_model_context_tokens(
+                    &session.to_messages_for_current_path(),
+                );
+                settings.keep_recent_tokens = settings
+                    .keep_recent_tokens
+                    .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
+                compaction::prepare_overflow_compaction(&entries, settings)
+            } else {
+                compaction::prepare_compaction(&entries, settings)
+            };
             (entries, prep)
         };
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
-                reason: "threshold".to_string(),
+                reason: if overflow { "overflow" } else { "threshold" }.to_string(),
             });
             let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
             let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
-            if before_outcome.cancel {
+            if before_outcome.cancel || overflow_abort.is_some_and(AbortSignal::is_aborted) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: true,
                     will_retry: false,
                     error_message: None,
                 });
-                return Err(Error::extension("Compaction cancelled".to_string()));
+                return Err(if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+                    Error::Aborted
+                } else {
+                    Error::extension("Compaction cancelled".to_string())
+                });
             }
 
             if let Some(compaction) = before_outcome.compaction {
@@ -17247,6 +17319,7 @@ impl AgentSession {
                         compaction.details.clone(),
                         true,
                         provider_admission,
+                        overflow,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -17271,10 +17344,11 @@ impl AgentSession {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
-                    will_retry: false,
+                    will_retry: overflow
+                        && !overflow_abort.is_some_and(AbortSignal::is_aborted),
                     error_message: None,
                 });
-                return Ok(());
+                return Ok(true);
             }
 
             let provider = self.agent.provider();
@@ -17303,39 +17377,49 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            let compaction_result = if shake {
-                Ok(compaction::compact_shake(
-                    prep,
-                    &self.agent.compaction_privacy(),
-                ))
+            let privacy = self.agent.compaction_privacy();
+            let compaction_result = if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+                Err(Error::Aborted)
+            } else if shake {
+                Ok(compaction::compact_shake(prep, &privacy))
             } else {
-                compaction::compact(
-                    prep,
-                    provider,
-                    &stream_options,
-                    None,
-                    &self.agent.compaction_privacy(),
-                )
-                .await
+                let compact =
+                    compaction::compact(prep, provider, &stream_options, None, &privacy);
+                if let Some(abort) = overflow_abort {
+                    let cancelled = abort.wait();
+                    futures::pin_mut!(compact, cancelled);
+                    match futures::future::select(cancelled, compact).await {
+                        futures::future::Either::Left(_) => Err(Error::Aborted),
+                        futures::future::Either::Right((result, _)) => result,
+                    }
+                } else {
+                    compact.await
+                }
             };
 
             match compaction_result {
                 Ok(result) => {
-                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-                        .await?;
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        provider_admission,
+                        overflow_abort,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
                         result: None,
-                        aborted: false,
+                        aborted: matches!(e, Error::Aborted),
                         will_retry: false,
                         error_message: Some(e.to_string()),
                     });
                     return Err(e);
                 }
             }
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn resolve_extension_policy_for_enable(

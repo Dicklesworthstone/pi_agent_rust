@@ -859,14 +859,15 @@ impl AgentSessionHandle {
         shared: &EventCallback,
         turn: &LogicalTurn,
     ) -> Result<AssistantMessage> {
-        let Some(policy) = self.retry else {
-            return first;
-        };
         let mut progress = TurnProgress {
             retry_count: 0,
             failovers_this_turn: 0,
             stream_can_retry: true,
         };
+        // Compaction changes the request and has its own enablement. It must
+        // remain available even when transient retries are disabled, and may
+        // happen only once across all retries/fallbacks of this logical turn.
+        let mut overflow_compaction_attempted = false;
         let mut failed_over = false;
         let mut current = first;
         loop {
@@ -880,6 +881,31 @@ impl AgentSessionHandle {
             let outcome = match &current {
                 Ok(message) => TurnOutcome::Completed(message),
                 Err(error) => TurnOutcome::Failed(error),
+            };
+            if !overflow_compaction_attempted
+                && self.session.compaction_settings().enabled
+                && crate::failover::needs_context_compaction(outcome, window)
+            {
+                overflow_compaction_attempted = true;
+                let recovered = self
+                    .prepare_context_overflow_recovery(&current, abort_signal, shared, turn)
+                    .await;
+                match recovered {
+                    Ok(true) => {
+                        current = self
+                            .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                            .await;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => current = Err(error),
+                }
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
+            }
+            let Some(policy) = self.retry else {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
             };
             let decision = crate::failover::decide(outcome, &progress, &policy, window);
             if matches!(
@@ -946,6 +972,37 @@ impl AgentSessionHandle {
                 .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
                 .await;
         }
+    }
+
+    async fn prepare_context_overflow_recovery(
+        &mut self,
+        current: &Result<AssistantMessage>,
+        abort_signal: &AbortSignal,
+        shared: &EventCallback,
+        turn: &LogicalTurn,
+    ) -> Result<bool> {
+        ensure_not_aborted(abort_signal)?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        // Rewind only the incomplete assistant response. Accepted user/media
+        // input and every completed tool result stay in the durable transcript.
+        self.session
+            .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
+            .await?;
+        admission.ensure_allowed()?;
+        turn.restored_tail();
+        ensure_not_aborted(abort_signal)?;
+        let forwarded = Arc::clone(shared);
+        let compacted = self
+            .session
+            .compact_after_context_overflow(abort_signal, move |event| forwarded(event))
+            .await?;
+        // Never race cancellation against the compaction save. Its durable
+        // transaction settles first; cancellation then forbids continuation.
+        admission.ensure_allowed()?;
+        ensure_not_aborted(abort_signal)?;
+        Ok(compacted)
     }
 
     async fn prepare_same_provider_retry(

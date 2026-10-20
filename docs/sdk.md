@@ -156,6 +156,17 @@ the media again or repeating input hooks. Media-only prompts are supported;
 an empty block list or an assistant-only block is rejected before appending
 the user message.
 
+In-process turns can also recover once from a provider context-window overflow
+when session compaction is enabled. The SDK removes the failed response, compacts
+and saves the active context, then continues with the accepted input and completed
+tool results. It only summarizes older history: the current request's native media
+and all completed tool pairs remain intact even when they exceed the usual
+keep-recent budget. With no safely older prefix, recovery stops. This maintenance
+path remains enabled when transient retries are disabled. It emits
+`auto_compaction_start` with reason `overflow` and a successful
+`auto_compaction_end` with `willRetry: true`. Cancellation, failed persistence,
+an ineffective summary, or a second overflow ends recovery without replaying tools.
+
 `SessionTransport::prompt_with_content(content, on_event)` provides this input
 over either backend. `RpcTransportClient::prompt_with_content(content)` and
 `prompt_with_content_streaming(content, streaming_behavior, on_event)` send

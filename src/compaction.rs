@@ -18,6 +18,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -1731,6 +1732,19 @@ pub fn estimate_entries_context_tokens(entries: &[&SessionEntry]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+/// Estimate the actual provider-visible context, ignoring usage from earlier
+/// requests. A session's full entry path also contains history hidden by
+/// compaction, so it cannot measure whether a recovery made the input smaller.
+#[must_use]
+pub(crate) fn estimate_model_context_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .cloned()
+        .map(SessionMessage::from)
+        .map(|message| estimate_tokens(&message))
+        .fold(0u64, u64::saturating_add)
+}
+
 fn should_compact(
     context_tokens: u64,
     context_window: u32,
@@ -2464,10 +2478,63 @@ fn build_fallback_summary(preparation: &CompactionPreparation) -> String {
 // Public API
 // =============================================================================
 
-#[allow(clippy::too_many_lines)]
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_impl(path_entries, settings, false)
+}
+
+/// Provider overflow is stronger evidence than the local threshold estimate.
+/// Keep the real model capacity and summary budgets while allowing a safe cut
+/// below that threshold. Never summarize the current authored user or its tool
+/// tail: native image/audio/video blocks cannot survive a text-only summary.
+/// Empty history and turns without an older safe prefix remain no-ops.
+pub(crate) fn prepare_overflow_compaction(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_impl(path_entries, settings, true)
+}
+
+fn overflow_compaction_user_index<E: Borrow<SessionEntry>>(path_entries: &[E]) -> Option<usize> {
+    for (index, entry) in path_entries.iter().enumerate().rev() {
+        match entry.borrow() {
+            SessionEntry::Compaction(_) => return None,
+            SessionEntry::Message(message)
+                if matches!(&message.message, SessionMessage::User { .. }) =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Validate extension overrides at the durable boundary as well as native
+/// preparation. Unknown cuts, cuts inside the current authored turn, and cuts
+/// that would resurrect history before the latest compaction are refused.
+pub(crate) fn overflow_compaction_preserves_current_turn<E: Borrow<SessionEntry>>(
+    path_entries: &[E],
+    first_kept_entry_id: &str,
+) -> bool {
+    let Some(user_index) = overflow_compaction_user_index(path_entries) else {
+        return false;
+    };
+    path_entries[..=user_index]
+        .iter()
+        .rev()
+        .map(Borrow::borrow)
+        .take_while(|entry| !matches!(entry, SessionEntry::Compaction(_)))
+        .any(|entry| entry.base_id().is_some_and(|id| id == first_kept_entry_id))
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_compaction_impl(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+    force: bool,
 ) -> Option<CompactionPreparation> {
     let settings = settings.with_mode_applied();
     if path_entries.is_empty() {
@@ -2505,16 +2572,33 @@ pub fn prepare_compaction(
     // of the history prior to the new cut point.
     let tokens_before = estimate_context_tokens(&usage_messages).tokens;
 
-    if !should_compact(tokens_before, settings.context_window_tokens, &settings) {
+    if !force && !should_compact(tokens_before, settings.context_window_tokens, &settings) {
         return None;
     }
 
-    let cut_point = find_cut_point(
+    let mut cut_point = find_cut_point(
         path_entries,
         boundary_start,
         boundary_end,
         settings.keep_recent_tokens,
     );
+    if force {
+        // An overflowing current tool result may exceed keep_recent_tokens by
+        // itself. The ordinary split-turn cut then lands at its assistant call,
+        // moving the authored request (and native attachments) into a text-only
+        // prefix summary. Overflow may compact older history only. An actual
+        // User entry is required; BashExecution/BranchSummary pseudo-turns do
+        // not supersede the authored request. If that user predates the latest
+        // compaction, do not resurrect archived context to find another cut.
+        let user_index = overflow_compaction_user_index(path_entries)?;
+        if cut_point.first_kept_entry_index > user_index {
+            cut_point = CutPointResult {
+                first_kept_entry_index: user_index,
+                turn_start_index: None,
+                is_split_turn: false,
+            };
+        }
+    }
 
     let first_kept_entry = &path_entries[cut_point.first_kept_entry_index];
     let first_kept_entry_id = first_kept_entry.base_id()?.clone();
@@ -5103,6 +5187,96 @@ mod tests {
         assert!(!p.messages_to_summarize.is_empty());
         assert!(p.tokens_before > 0);
         assert!(p.previous_summary.is_none());
+    }
+
+    #[test]
+    fn overflow_preparation_bypasses_threshold_without_changing_model_capacity() {
+        let entries = vec![
+            user_entry("1", "Earlier task with details to summarize."),
+            assistant_entry("2", "Earlier task completed.", 0, 0),
+            user_entry("3", "Continue the current task."),
+        ];
+        let settings = ResolvedCompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        let prepared = prepare_overflow_compaction(&entries, settings.clone()).unwrap();
+        assert_eq!(prepared.first_kept_entry_id, "3");
+        assert_eq!(
+            prepared.settings.context_window_tokens,
+            settings.context_window_tokens
+        );
+        assert_eq!(prepared.settings.reserve_tokens, settings.reserve_tokens);
+        assert!(prepare_overflow_compaction(&[], settings).is_none());
+    }
+
+    #[test]
+    fn overflow_cut_preserves_authored_media_before_large_tools_and_pseudo_turns() {
+        let current = SessionEntry::Message(MessageEntry {
+            base: test_base("current-user"),
+            message: SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Image(crate::model::ImageContent {
+                        data: "aGVsbG8=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                    ContentBlock::Media(crate::model::MediaContent {
+                        data: "YXVkaW8=".to_string(),
+                        mime_type: "audio/wav".to_string(),
+                        name: Some("voice.wav".to_string()),
+                    }),
+                ]),
+                timestamp: Some(0),
+            },
+        });
+        let entries = vec![
+            user_entry("old-user", "Earlier task."),
+            assistant_entry("old-answer", "Earlier work completed.", 0, 0),
+            current.clone(),
+            tool_call_entry("write-call", "write", "result.txt"),
+            tool_result_entry("write-result", "saved"),
+            bash_entry("bash-pseudo-turn"),
+            branch_entry("branch-pseudo-turn", "local metadata"),
+            tool_call_entry("read-call", "read", "large.txt"),
+            tool_result_entry("read-result", &"large completed tool output ".repeat(2_000)),
+        ];
+        let settings = ResolvedCompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        let ordinary_cut = find_cut_point(&entries, 0, entries.len(), 1);
+        assert!(ordinary_cut.first_kept_entry_index > 2);
+        let prepared = prepare_overflow_compaction(&entries, settings.clone()).unwrap();
+        assert_eq!(prepared.first_kept_entry_id, "current-user");
+        assert!(!prepared.is_split_turn);
+        assert!(prepared.turn_prefix_messages.is_empty());
+        assert_eq!(prepared.messages_to_summarize.len(), 2);
+        assert!(overflow_compaction_preserves_current_turn(
+            &entries,
+            "current-user",
+        ));
+        assert!(!overflow_compaction_preserves_current_turn(
+            &entries,
+            "read-call",
+        ));
+        assert!(!overflow_compaction_preserves_current_turn(
+            &entries,
+            "missing",
+        ));
+        assert!(prepare_overflow_compaction(&entries[2..], settings.clone()).is_none());
+
+        let archived_user = vec![
+            current,
+            compact_entry("previous-compaction", "prior summary", 100),
+            tool_call_entry("later-call", "read", "large.txt"),
+            tool_result_entry("later-result", "large output"),
+        ];
+        assert!(prepare_overflow_compaction(&archived_user, settings).is_none());
+        assert!(!overflow_compaction_preserves_current_turn(
+            &archived_user,
+            "current-user",
+        ));
     }
 
     /// bd-cv653.3.18: shake-first auto mode takes the no-LLM shortcut on a

@@ -3224,7 +3224,9 @@ impl AgentSessionHandle {
     }
 
     /// The recovery policy used by the next turn. `None` disables both
-    /// automatic retries and fallback-provider requests.
+    /// transient-error retries and fallback-provider requests. Automatic
+    /// context-overflow compaction is controlled by the session's compaction
+    /// settings and may still shrink the context and continue once.
     pub const fn retry_policy(&self) -> Option<crate::failover::RetryPolicy> {
         self.retry
     }
