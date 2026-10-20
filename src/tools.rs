@@ -5743,6 +5743,12 @@ impl ToolRegistry {
                 )),
                 "grep" => tools.push(Box::new(
                     GrepTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_url_policy(
+                            config
+                                .and_then(|c| c.read.as_ref())
+                                .and_then(|r| r.url_allow_private_targets)
+                                .unwrap_or(false),
+                        )
                         .with_workspace(workspace.clone()),
                 )),
                 "find" => tools.push(Box::new(
@@ -12177,10 +12183,57 @@ struct GrepInput {
     hashline: bool,
 }
 
+const MAX_GREP_RESOURCE_PATHS: usize = 16;
+const MAX_GREP_RESOURCE_PATH_BYTES: usize = 64 * 1024;
+const MAX_GREP_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_GREP_RESOURCE_MATCHES: usize = 10_000;
+
+/// Only internal URL operands use semicolon lists. A semicolon in an HTTP
+/// URL or an ordinary filename keeps its normal meaning. Validate list syntax
+/// before resolving anything, so a malformed suffix cannot be skipped.
+fn grep_resource_paths(path: Option<&str>) -> Result<Option<Vec<&str>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !crate::url_router::has_scheme(path) {
+        return Ok(None);
+    }
+    if path.len() > MAX_GREP_RESOURCE_PATH_BYTES {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_PATH_LIMIT] Resource paths exceed 64 KiB",
+        ));
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Ok(Some(vec![path]));
+    }
+    let paths: Vec<_> = path.split(';').map(str::trim).collect();
+    if paths.len() > MAX_GREP_RESOURCE_PATHS {
+        return Err(Error::tool(
+            "grep",
+            format!(
+                "[GREP_RESOURCE_COUNT] Search at most {MAX_GREP_RESOURCE_PATHS} internal URLs per call"
+            ),
+        ));
+    }
+    if paths.iter().any(|path| {
+        !crate::url_router::has_scheme(path)
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+    }) {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_LIST] Separate internal URLs with semicolons; search HTTP URLs and filesystem paths in separate calls",
+        ));
+    }
+    Ok(Some(paths))
+}
+
 pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
     backend: SearchBackend,
+    allow_private_urls: bool,
     workspace: WorkspaceHandle,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -12198,11 +12251,19 @@ impl GrepTool {
         self
     }
 
+    /// Apply the same explicit private-target override used by URL reads.
+    #[must_use]
+    pub const fn with_url_policy(mut self, allow_private_urls: bool) -> Self {
+        self.allow_private_urls = allow_private_urls;
+        self
+    }
+
     pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend,
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             #[cfg(test)]
             after_scope_hook: None,
@@ -12215,6 +12276,7 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
             backend: SearchBackend::default(),
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             after_scope_hook: None,
         }
@@ -12229,10 +12291,347 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend: SearchBackend::default(),
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
+
+    /// Resolve through the same admitted document surfaces as ReadTool. The
+    /// worker retains the caller's restricted context and cancellation budget;
+    /// agent results still use the authenticated immediate-parent resolver.
+    async fn resolve_grep_resource(&self, path: &str) -> Result<GrepResource> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let process_backed = matches!(
+            path.split_once("://").map(|(scheme, _)| scheme),
+            Some("pr" | "issue" | "ssh" | "conflict")
+        );
+        let capabilities = owner.capabilities();
+        if !capabilities.io || (process_backed && !capabilities.spawn) {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_PERMISSION] Resource searches require I/O authority; process-backed documents also require spawn authority",
+            ));
+        }
+        if path.starts_with("http://") || path.starts_with("https://") {
+            let (url, mode) = path.strip_suffix(":raw").map_or(
+                (path, crate::url_read::UrlReadMode::Reader),
+                |url| (url, crate::url_read::UrlReadMode::Raw),
+            );
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome = crate::url_read::fetch(url, policy, mode).await?;
+            return Ok(GrepResource {
+                content: outcome.content,
+                details: serde_json::json!({
+                    "path": path,
+                    "url": outcome.final_url,
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceTruncated": outcome.download_truncated,
+                }),
+                source_truncated: outcome.download_truncated,
+            });
+        }
+        let path_owned = path.to_string();
+        let cwd = self.cwd.clone();
+        let resolved = asupersync::runtime::spawn_blocking_io(move || {
+            let _guard = owner.cx().clone().set_current_restricted();
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            crate::url_router::resolve(&path_owned, &cwd)
+        })
+        .await?;
+        let source_truncated = resolved
+            .metadata
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || resolved
+                .metadata
+                .get("cappedAt")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|cap| resolved.content.len() as u64 >= cap);
+        Ok(GrepResource {
+            content: resolved.content,
+            details: serde_json::json!({
+                "path": path,
+                "scheme": resolved.scheme,
+                "reference": resolved.reference,
+                "contentType": resolved.content_type,
+                "sourceTruncated": source_truncated,
+            }),
+            source_truncated,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_resource_grep(
+        &self,
+        tool_call_id: &str,
+        input: &GrepInput,
+        paths: &[&str],
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "grep",
+                "[DOCUMENT_HASHLINE] Virtual document lines are search locations, not source edit anchors; save source text locally before using hashline edits",
+            ));
+        }
+        if input.glob.is_some() {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_GLOB] glob applies to filesystem searches; select the internal document or URL directly",
+            ));
+        }
+        let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT);
+        if effective_limit > MAX_GREP_RESOURCE_MATCHES {
+            return Err(Error::tool(
+                "grep",
+                format!("[GREP_RESOURCE_MATCH_LIMIT] Resource searches support at most {MAX_GREP_RESOURCE_MATCHES} matches; narrow the pattern or resource list"),
+            ));
+        }
+        let pattern = if input.literal.unwrap_or(false) {
+            regex::escape(&input.pattern)
+        } else {
+            input.pattern.clone()
+        };
+        // Compile before doing network or subprocess work.
+        let matcher = Arc::new(
+            grep_regex::RegexMatcherBuilder::new()
+                .case_insensitive(input.ignore_case.unwrap_or(false))
+                .build(&pattern)
+                .map_err(|error| Error::tool("grep", format!("regex parse error: {error}")))?,
+        );
+        let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
+        let mut artifact_source = String::new();
+        let mut resources = Vec::new();
+        let mut match_count = 0usize;
+        let mut match_limit_reached = false;
+        let mut lines_truncated = false;
+        let mut source_truncated = false;
+        let owner = AgentCx::for_current_or_request();
+
+        for path in paths {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            let mut resource = self.resolve_grep_resource(path).await?;
+            if resource.content.len() > MAX_GREP_RESOURCE_BYTES {
+                return Err(Error::tool(
+                    "grep",
+                    "[GREP_RESOURCE_BYTES] A resource exceeds the 10 MiB search limit; select a smaller document or agent JSON field",
+                ));
+            }
+            source_truncated |= resource.source_truncated;
+            let scan_limit = effective_limit.saturating_sub(match_count).saturating_add(1);
+            let scan_matcher = Arc::clone(&matcher);
+            let scan_owner = owner.clone();
+            let (content, mut match_lines) = asupersync::runtime::spawn_blocking_io(move || {
+                grep_resource_match_lines(resource.content, &scan_matcher, scan_limit, &scan_owner)
+            })
+            .await?;
+            let remaining = effective_limit.saturating_sub(match_count);
+            if match_lines.len() > remaining {
+                match_limit_reached = true;
+                match_lines.truncate(remaining);
+            }
+            match_count += match_lines.len();
+            let total_lines = content.lines().count();
+            resource.details["totalLines"] = serde_json::json!(total_lines);
+            resource.details["matches"] = serde_json::json!(match_lines.len());
+            resources.push(resource.details);
+            lines_truncated |= render_grep_resource(
+                path,
+                &content,
+                &match_lines,
+                input.context.unwrap_or(0),
+                total_lines,
+                &owner,
+                &mut output_builder,
+                &mut artifact_source,
+            )?;
+            if match_limit_reached {
+                break;
+            }
+        }
+
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let mut truncation = output_builder.finish();
+        let mut output = if match_count == 0 {
+            "No matches found".to_string()
+        } else {
+            std::mem::take(&mut truncation.content)
+        };
+        let skipped = paths.len().saturating_sub(resources.len());
+        let mut details = serde_json::json!({
+            "resources": resources,
+            "matches": match_count,
+            "resourcesSkipped": skipped,
+        });
+        let mut notices = Vec::new();
+        if match_limit_reached {
+            details["matchLimitReached"] = serde_json::json!(effective_limit);
+            notices.push(format!(
+                "{effective_limit} matches limit reached. Increase limit or refine pattern"
+            ));
+        }
+        if skipped > 0 {
+            notices.push(format!(
+                "{skipped} remaining resources were not searched after the match limit"
+            ));
+        }
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details["truncation"] = serde_json::to_value(truncation)?;
+        }
+        if lines_truncated {
+            details["linesTruncated"] = serde_json::json!(true);
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
+        }
+        if source_truncated {
+            notices.push("A source document was truncated by its resolver; unreturned source content was not searched".to_string());
+        }
+        if !notices.is_empty() {
+            let _ = write!(output, "\n\n[{}]", notices.join(". "));
+        }
+        let mut details = Some(details);
+        attach_text_artifact_if_needed_with_root(
+            self.artifact_root.as_deref(),
+            &mut output,
+            &mut details,
+            "grep",
+            tool_call_id,
+            "searchResults",
+            &artifact_source,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output))],
+            details,
+            is_error: false,
+        })
+    }
+}
+
+struct GrepResource {
+    content: String,
+    details: serde_json::Value,
+    source_truncated: bool,
+}
+
+fn grep_resource_match_lines(
+    content: String,
+    matcher: &grep_regex::RegexMatcher,
+    scan_limit: usize,
+    owner: &AgentCx,
+) -> Result<(String, Vec<usize>)> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder, sinks};
+
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    let mut matches = Vec::new();
+    SearcherBuilder::new()
+        .line_number(true)
+        // These are already decoded, size-bounded documents. Binary file
+        // heuristics must not hide later matches in a JSON string or raw URL.
+        .binary_detection(BinaryDetection::none())
+        .bom_sniffing(false)
+        .build()
+        .search_reader(
+            matcher,
+            content.as_bytes(),
+            sinks::UTF8(|line_number, _| {
+                if owner.checkpoint().is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "scan cancelled",
+                    ));
+                }
+                let line_number = usize::try_from(line_number)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                matches.push(line_number);
+                Ok(matches.len() < scan_limit)
+            }),
+        )
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))?;
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    Ok((content, matches))
+}
+
+/// Render context by walking the document once. Do not allocate a reference
+/// per source line: small newline-only documents can contain millions of them.
+#[allow(clippy::too_many_arguments)]
+fn render_grep_resource(
+    path: &str,
+    content: &str,
+    matches: &[usize],
+    context: usize,
+    total_lines: usize,
+    owner: &AgentCx,
+    output: &mut HeadTruncatingLineWriter,
+    artifact: &mut String,
+) -> Result<bool> {
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for &line in matches {
+        let start = line.saturating_sub(context).max(1);
+        let end = line.saturating_add(context).min(total_lines);
+        if let Some(last) = blocks.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            blocks.push((start, end));
+        }
+    }
+    let path = escape_bytes_for_line_output(path.as_bytes());
+    let mut block = 0;
+    let mut lines_truncated = false;
+    for (index, line) in content.lines().enumerate() {
+        if index % 1024 == 0 {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        }
+        let current = index + 1;
+        while blocks.get(block).is_some_and(|(_, end)| current > *end) {
+            block += 1;
+        }
+        let Some(&(start, _)) = blocks.get(block) else {
+            break;
+        };
+        if current < start {
+            continue;
+        }
+        if block > 0 && current == start {
+            output.push_line("--");
+            append_artifact_source_line(artifact, "--");
+        }
+        let sanitized = line.replace('\r', "");
+        let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+        lines_truncated |= truncated.was_truncated;
+        let line = if matches.binary_search(&current).is_ok() {
+            format!("{path}:{current}: {}", truncated.text)
+        } else {
+            format!("{path}-{current}- {}", truncated.text)
+        };
+        output.push_line(&line);
+        append_artifact_source_line(artifact, &line);
+    }
+    Ok(lines_truncated)
 }
 
 /// Result of truncating a single grep output line.
@@ -12718,7 +13117,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 1MB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
+        "Search files, internal documents (agent://, skill://, local://, pr://, and other read URLs), or an HTTP(S) URL for a pattern. Separate up to 16 internal URLs with semicolons. HTTP URLs use reader text; append :raw for source. Returns matching lines with source paths and line numbers. Filesystem searches respect .gitignore. Output defaults to 100 matches or 1MB; long lines are truncated to 500 chars. Use hashline=true for filesystem edit anchors only."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -12731,7 +13130,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search (default: current directory)"
+                    "description": "Directory/file (default: current directory), internal document URL, semicolon-separated internal URLs, or one HTTP(S) URL (optional :raw suffix)"
                 },
                 "glob": {
                     "type": "string",
@@ -12751,7 +13150,7 @@ impl Tool for GrepTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of matches to return (default: 100)"
+                    "description": "Maximum number of matches to return across all sources (default: 100; at most 10000 for resource URLs)"
                 },
                 "hashline": {
                     "type": "boolean",
@@ -12764,6 +13163,39 @@ impl Tool for GrepTool {
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::read()
+            .union(ToolEffects::network())
+            .union(ToolEffects::process())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Ok(input) = serde_json::from_value::<GrepInput>(input.clone()) else {
+            return self.effects();
+        };
+        let paths = match grep_resource_paths(input.path.as_deref()) {
+            Ok(Some(paths)) => paths,
+            Ok(None) => {
+                return if self.backend == SearchBackend::External {
+                    ToolEffects::read().union(ToolEffects::process())
+                } else {
+                    ToolEffects::read()
+                };
+            }
+            Err(_) => return self.effects(),
+        };
+        paths.into_iter().fold(ToolEffects::read(), |effects, path| {
+            let scheme = path.split_once("://").map_or("", |(scheme, _)| scheme);
+            let resource_effects = match scheme {
+                "http" | "https" => ToolEffects::network(),
+                "pr" | "issue" | "ssh" => ToolEffects::process().union(ToolEffects::network()),
+                "conflict" => ToolEffects::process(),
+                "agent" if crate::agent_hub::ipc::inherited_channel_present() => {
+                    ToolEffects::network()
+                }
+                "agent" | "skill" | "prompt" | "local" => ToolEffects::read(),
+                _ => self.effects(),
+            };
+            effects.union(resource_effects)
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12781,6 +13213,10 @@ impl Tool for GrepTool {
             return Err(Error::validation(
                 "`limit` must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(paths) = grep_resource_paths(input.path.as_deref())? {
+            return self.execute_resource_grep(tool_call_id, &input, &paths).await;
         }
 
         if self.backend == SearchBackend::External && !rg_available() {
@@ -21550,6 +21986,112 @@ mod tests {
     // ========================================================================
     // Grep Tool Tests
     // ========================================================================
+
+    #[test]
+    fn grep_agent_resources_use_accepted_results_and_reject_provisional_output() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent_hub::ChildStatus;
+
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-agent-{}", uuid::Uuid::new_v4());
+            let (accepted, pending, rejected) = {
+                let mut hub = crate::agent_hub::registry().lock().unwrap();
+                let accepted = hub.register(&format!("{prefix}-accepted"), "accepted fixture").unwrap();
+                let pending = hub.register(&format!("{prefix}-pending"), "pending fixture").unwrap();
+                let rejected = hub.register(&format!("{prefix}-rejected"), "cancelled fixture").unwrap();
+                hub.settle(&accepted.id, ChildStatus::Done);
+                hub.settle(&rejected.id, ChildStatus::Cancelled);
+                (
+                    hub.get(&accepted.id).unwrap(),
+                    pending,
+                    hub.get(&rejected.id).unwrap(),
+                )
+            };
+            crate::url_router::agent::publish(
+                &accepted,
+                "accepted prose",
+                Some(&serde_json::json!({"findings":[{"path":"src/needle.rs"}]})),
+                Some(true),
+                None,
+            );
+            crate::url_router::agent::publish(
+                &rejected,
+                "provisional src/needle.rs",
+                None,
+                None,
+                Some("cancelled"),
+            );
+            let tool = GrepTool::new(temp.path());
+            let path = format!("agent://{}/findings/0/path", accepted.id);
+            let output = tool.execute("accepted-result", serde_json::json!({
+                "pattern":"src/needle.rs", "literal":true, "path":path,
+            }), None).await.unwrap();
+            assert_eq!(get_text(&output.content), format!("{path}:1: src/needle.rs"));
+            for (entry, code) in [
+                (pending, "PI_URL_AGENT_OUTPUT_PENDING"),
+                (rejected, "PI_URL_AGENT_OUTPUT_REJECTED"),
+            ] {
+                let error = tool.execute("unaccepted-result", serde_json::json!({
+                    "pattern":"needle", "path":format!("agent://{}/findings/0/path", entry.id),
+                }), None).await.unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_virtual_search_is_native_even_when_the_filesystem_backend_is_external() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("grep-external-{}", uuid::Uuid::new_v4());
+            crate::url_router::write_local(&name, "prefix\0is still text\nneedle\n").unwrap();
+            let output = GrepTool::with_backend(temp.path(), SearchBackend::External).execute(
+                "virtual-native", serde_json::json!({
+                    "pattern":"needle", "path":format!("local://{name}"),
+                }), None,
+            ).await.unwrap();
+            assert_eq!(get_text(&output.content), format!("local://{name}:2: needle"));
+        });
+    }
+
+    #[test]
+    fn grep_resource_cancellation_is_checked_before_resolution() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let owner = AgentCx::for_request();
+            owner.cx().set_cancel_requested(true);
+            let tool = GrepTool::new(temp.path());
+            let error = owner.with_current(tool.execute(
+                "cancelled-resource", serde_json::json!({
+                    "pattern":"needle", "path":"local://must-not-resolve-after-cancel",
+                }), None,
+            )).await.unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(!error.to_string().contains("PI_URL_UNRESOLVABLE"));
+        });
+    }
+
+    #[test]
+    fn grep_remote_resources_cannot_use_the_polling_callers_spawn_authority() {
+        asupersync::test_utils::run_test(|| async {
+            type WithoutSpawn = asupersync::cx::cap::CapSet<false, true, true, true, true>;
+            let temp = tempfile::tempdir().unwrap();
+            let tool = GrepTool::new(temp.path());
+            let owner = {
+                let restricted = asupersync::Cx::for_request().restrict::<WithoutSpawn>();
+                let _guard = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            assert!(owner.capabilities().io);
+            assert!(!owner.capabilities().spawn);
+            for path in ["pr://1/diff", "issue://owner/repo/1", "ssh://must-not-connect/tmp/file", "conflict://*"] {
+                let error = owner.with_current(tool.execute(
+                    "spawn-denied", serde_json::json!({"pattern":"needle","path":path}), None,
+                )).await.unwrap_err();
+                assert!(error.to_string().contains("GREP_RESOURCE_PERMISSION"), "{path}: {error}");
+            }
+        });
+    }
 
     /// bd-cv653.1.5: the in-process and external search backends must render
     /// byte-identical tool output for the same corpus. Skips silently when

@@ -5249,12 +5249,7 @@ impl Agent {
         // Phase 2: Execute tools in contiguous compatible-effect batches.
         let effect_plan = tool_calls
             .iter()
-            .map(|tool_call| {
-                self.tools
-                    .snapshot()
-                    .get(&tool_call.name)
-                    .map_or_else(ToolEffects::write, Tool::effects)
-            })
+            .map(|tool_call| self.effects_for_call(tool_call))
             .collect::<Vec<_>>();
         let effect_batches = plan_tool_effect_batches(&effect_plan);
         let mut recorded_results: Vec<Option<Arc<ToolResultMessage>>> =

@@ -1378,6 +1378,202 @@ mod grep_tool {
     use super::*;
 
     #[test]
+    fn grep_internal_documents_merge_context_and_share_the_match_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-documents-{}", uuid::Uuid::new_v4());
+            let first = format!("{prefix}-first");
+            let second = format!("{prefix}-second");
+            pi::url_router::write_local(&first, "before\nTARGET.one\nbetween\nTARGET.two\nafter\n").unwrap();
+            pi::url_router::write_local(&second, "other\nTARGET.three\nlast\n").unwrap();
+            let paths = format!("local://{first}; local://{second}");
+            let tool = pi::tools::GrepTool::new(temp.path());
+            let output = tool.execute("virtual-context", serde_json::json!({
+                "pattern": "target.", "literal": true, "ignoreCase": true,
+                "path": paths, "context": 1, "limit": 3,
+            }), None).await.unwrap();
+            let text = get_text_content(&output.content);
+            assert_eq!(text, format!(
+                "local://{first}-1- before\nlocal://{first}:2: TARGET.one\nlocal://{first}-3- between\nlocal://{first}:4: TARGET.two\nlocal://{first}-5- after\nlocal://{second}-1- other\nlocal://{second}:2: TARGET.three\nlocal://{second}-3- last"
+            ));
+            let details = output.details.unwrap();
+            assert_eq!(details["matches"], 3);
+            assert_eq!(details["resources"].as_array().unwrap().len(), 2);
+            assert!(details.get("matchLimitReached").is_none());
+            assert!(details["resources"][0].get("content").is_none());
+
+            pi::url_router::write_local(&second, "updated contents\n").unwrap();
+            let fresh = tool.execute("virtual-fresh", serde_json::json!({
+                "pattern": "TARGET", "path": format!("local://{second}"),
+            }), None).await.unwrap();
+            assert_eq!(get_text_content(&fresh.content), "No matches found");
+        });
+    }
+
+    #[test]
+    fn grep_internal_resource_limit_reports_unsearched_sources() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-limit-{}", uuid::Uuid::new_v4());
+            pi::url_router::write_local(&format!("{prefix}-one"), "needle first\n").unwrap();
+            pi::url_router::write_local(&format!("{prefix}-two"), "needle second\nneedle overflow\n").unwrap();
+            let output = pi::tools::GrepTool::new(temp.path()).execute(
+                "virtual-limit", serde_json::json!({
+                    "pattern": "needle",
+                    "path": format!("local://{prefix}-one;local://{prefix}-two;local://{prefix}-not-resolved"),
+                    "limit": 2,
+                }), None,
+            ).await.unwrap();
+            let text = get_text_content(&output.content);
+            assert!(text.contains("needle first"));
+            assert!(text.contains("needle second"));
+            assert!(!text.contains("needle overflow"));
+            assert!(text.contains("1 remaining resources were not searched"));
+            let details = output.details.unwrap();
+            assert_eq!(details["matchLimitReached"], 2);
+            assert_eq!(details["resourcesSkipped"], 1);
+        });
+    }
+
+    #[test]
+    fn grep_resource_validation_precedes_resolution_and_never_falls_back() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let tool = pi::tools::GrepTool::new(temp.path());
+            for (extra, expected) in [
+                (serde_json::json!({"hashline":true}), "DOCUMENT_HASHLINE"),
+                (serde_json::json!({"glob":"*.rs"}), "GREP_RESOURCE_GLOB"),
+                (serde_json::json!({"limit":10001}), "GREP_RESOURCE_MATCH_LIMIT"),
+            ] {
+                let mut input = serde_json::json!({"pattern":"needle","path":"local://unresolved-validation-fixture"});
+                input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                let error = tool.execute("invalid-options", input, None).await.unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+            for path in ["local://missing;", "local://missing;README.md", "local://missing;https://example.com"] {
+                let error = tool.execute("invalid-list", serde_json::json!({
+                    "pattern":"needle", "path":path,
+                }), None).await.unwrap_err();
+                assert!(error.to_string().contains("GREP_RESOURCE_LIST"), "{error}");
+            }
+            let too_many = std::iter::repeat_n("local://missing", 17).collect::<Vec<_>>().join(";");
+            let error = tool.execute("too-many-resources", serde_json::json!({
+                "pattern":"needle", "path":too_many,
+            }), None).await.unwrap_err();
+            assert!(error.to_string().contains("GREP_RESOURCE_COUNT"));
+            for (path, code) in [
+                ("unregistered://document", "PI_URL_UNKNOWN_SCHEME"),
+                ("agent://unknown-grep-child/findings/0/path", "PI_URL_AGENT_NOT_FOUND"),
+            ] {
+                let error = tool.execute("unknown-resource", serde_json::json!({
+                    "pattern":"needle", "path":path,
+                }), None).await.unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_resource_size_and_unicode_line_limits_are_explicit() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("grep-sized-{}", uuid::Uuid::new_v4());
+            let path = format!("local://{name}");
+            let tool = pi::tools::GrepTool::new(temp.path());
+            pi::url_router::write_local(&name, &"🦀".repeat(600)).unwrap();
+            let output = tool.execute("unicode-line", serde_json::json!({
+                "pattern":"🦀", "path":path,
+            }), None).await.unwrap();
+            let text = get_text_content(&output.content);
+            assert_eq!(text.matches('🦀').count(), 500);
+            assert_eq!(output.details.as_ref().unwrap()["linesTruncated"], true);
+
+            pi::url_router::write_local(&name, &"x".repeat(10 * 1024 * 1024 + 1)).unwrap();
+            let error = tool.execute("oversized-source", serde_json::json!({
+                "pattern":"x", "path":path,
+            }), None).await.unwrap_err();
+            assert!(error.to_string().contains("GREP_RESOURCE_BYTES"), "{error}");
+            pi::url_router::write_local(&name, "released fixture bytes").unwrap();
+        });
+    }
+
+    #[test]
+    fn grep_skill_supporting_documents_keep_the_skill_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_skill_supporting_documents");
+            harness.create_file(".pi/skills/grep-review/SKILL.md", b"---\nname: grep-review\ndescription: Search fixture\n---\nReview the references.\n");
+            harness.create_file(".pi/skills/grep-review/references/checklist.md", b"first\nreview needle\nlast\n");
+            harness.create_file(".pi/skills/outside.md", b"outside needle\n");
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let output = tool.execute("skill-grep", serde_json::json!({
+                "pattern":"needle", "path":"skill://grep-review/references/checklist.md",
+            }), None).await.unwrap();
+            assert_eq!(get_text_content(&output.content), "skill://grep-review/references/checklist.md:2: review needle");
+            let error = tool.execute("skill-escape", serde_json::json!({
+                "pattern":"needle", "path":"skill://grep-review/../outside.md",
+            }), None).await.unwrap_err();
+            assert!(error.to_string().contains("PI_URL_SKILL_"), "{error}");
+        });
+    }
+
+    #[test]
+    fn grep_http_reader_raw_and_private_target_policy_share_the_read_fetcher() {
+        use common::harness::MockHttpResponse;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_http_reader_raw_policy");
+            let server = harness.start_mock_http_server();
+            server.add_route("GET", "/document;version=1", MockHttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/html".to_string())],
+                body: b"<html><body><main><p>Visible document text.</p><script>hiddenNeedle</script></main></body></html>".to_vec(),
+            });
+            let url = format!("{}/document;version=1", server.base_url());
+            let denied = pi::tools::GrepTool::new(harness.temp_dir()).execute(
+                "private-denied", serde_json::json!({"pattern":"hiddenNeedle","path":url}), None,
+            ).await.unwrap_err();
+            assert!(denied.to_string().contains("SSRF"), "{denied}");
+            assert!(server.requests().is_empty());
+
+            let config = serde_json::from_value::<pi::config::Config>(serde_json::json!({
+                "read":{"urlAllowPrivateTargets":true},
+            })).unwrap();
+            let registry = pi::tools::ToolRegistry::new(&["grep"], harness.temp_dir(), Some(&config));
+            let tool = registry.get("grep").unwrap();
+            let reader = tool.execute("reader", serde_json::json!({
+                "pattern":"hiddenNeedle", "path":url,
+            }), None).await.unwrap();
+            assert_eq!(get_text_content(&reader.content), "No matches found");
+            let raw = tool.execute("raw", serde_json::json!({
+                "pattern":"hiddenNeedle", "path":format!("{url}:raw"),
+            }), None).await.unwrap();
+            assert!(get_text_content(&raw.content).contains("<script>hiddenNeedle</script>"));
+            assert_eq!(raw.details.as_ref().unwrap()["resources"][0]["url"], url);
+            assert_eq!(server.requests().len(), 2);
+            assert!(server.requests().iter().all(|request| request.path == "/document;version=1"));
+        });
+    }
+
+    #[test]
+    fn grep_remote_resources_declare_their_process_and_network_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = pi::tools::GrepTool::new(temp.path());
+        for path in ["pr://12/diff", "issue://owner/repo/12", "ssh://host/var/log/app", "local://notes;pr://12/diff"] {
+            let effects = tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":path}));
+            assert!(effects.processes(), "{path}");
+            assert!(effects.networks(), "{path}");
+        }
+        let web = tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":"https://example.com:raw"}));
+        assert!(web.networks());
+        assert!(!web.processes());
+        let local = tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":"local://notes"}));
+        assert_eq!(local, pi::tools::ToolEffects::read());
+        let invalid = tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":7}));
+        assert!(invalid.processes());
+        assert!(invalid.networks());
+    }
+
+    #[test]
     fn test_grep_basic_pattern() {
         asupersync::test_utils::run_test(|| async {
             let temp_dir = tempfile::tempdir().unwrap();

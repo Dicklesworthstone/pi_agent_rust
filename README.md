@@ -2105,15 +2105,21 @@ Input: { "path": "src/lib.rs", "old": "fn foo()", "new": "fn bar()" }
 
 ### grep
 
-Search file contents:
+Search files, internal documents, or a web page:
 
-```
-Input: { "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+```json
+{ "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+{ "pattern": "critical|warning", "path": "agent://reviewer/findings;local://review-notes", "ignoreCase": true }
+{ "pattern": "migration", "path": "skill://release/references/checklist.md" }
+{ "pattern": "deprecated", "path": "https://example.com/changelog" }
+{ "pattern": "data-version", "path": "https://example.com/changelog:raw", "literal": true }
 ```
 
-- Regex patterns supported
-- Context lines before/after matches
-- Respects .gitignore
+- Regex and literal matching, case folding, and merged context lines work across all sources. Each result identifies its source and line number.
+- Filesystem searches respect `.gitignore` and workspace boundaries. `hashline: true` provides edit anchors for filesystem results.
+- Internal documents use the same resolver as `read`, including accepted `agent://` results and JSON fields, skills, prompts, scratch notes, merge conflicts, PRs, issues, and SSH documents. Pending or rejected child output retains its normal access restrictions. Separate up to 16 internal URLs with semicolons; filesystem paths and HTTP URLs use separate calls.
+- HTTP(S) searches use reader text by default; append `:raw` to search the fetched source. Semicolons inside an HTTP URL remain part of that URL. The existing `read.urlAllowPrivateTargets` setting governs private-network access, with the same redirect checks as `read`. PR, issue, SSH, and conflict lookups retain their process effects for execution approval.
+- The match limit applies across the entire resource list. Resource searches accept up to 10,000 matches and 10 MiB per document; output still truncates at 1 MiB and 500 characters per line. Results report skipped resources and partial source documents. `glob` and `hashline` apply to filesystem searches; virtual document line numbers are search locations.
 
 ### find
 
