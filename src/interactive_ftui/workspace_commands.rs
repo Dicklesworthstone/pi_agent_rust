@@ -5,6 +5,7 @@
 //! module routes them through the driver and renders the result.
 
 mod goal_progress;
+mod model_handoff;
 
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -88,6 +89,12 @@ pub async fn run(
             || PiMsg::System(String::from("The package manager is not available here.")),
             |manager| render(workspace_reports::plugins(manager)),
         ),
+        WorkspaceCommand::Handoff if model_handoff::is_option_command(args) => {
+            match Box::pin(model_handoff::run(handle, args)).await {
+                Ok(preview) => PiMsg::System(preview),
+                Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+            }
+        }
         WorkspaceCommand::Handoff => {
             match handle
                 .with_session(|session| workspace_reports::handoff(session, args))
