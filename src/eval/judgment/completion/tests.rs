@@ -288,3 +288,197 @@ fn completed_and_caught_requests_remain_in_host_receipts() {
     assert!(tool.description().contains("__pi_complete"));
     assert!(tool.parameters()["properties"]["judge_model"]["description"].as_str().unwrap().contains("__pi_complete"));
 }
+
+fn extraction_request() -> Value {
+    json!({"prompt":"Find the relevant path and count from the supplied evidence.",
+        "schema":{"type":"object","required":["path","count"],"additionalProperties":false,
+            "properties":{"path":{"type":"string"},"count":{"type":"integer","minimum":0}}}})
+}
+
+#[test]
+fn typed_extraction_feeds_native_reads_and_retains_data_in_both_kernels() {
+    for kernel in ["js","python"] {
+        if kernel == "python" && !python() { eprintln!("python3 unavailable"); continue; }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("evidence.txt"),"schema-payload").unwrap();
+        let answer = "  {\"path\":\"evidence.txt\",\"count\":7}\n";
+        let provider = fixture([Reply::Text(answer.into())]);
+        let tool = EvalTool::new(dir.path()).with_judge(binding(&provider));
+        let request = extraction_request();
+        let source = if kernel == "js" {
+            format!("globalThis.typed = JSON.parse(await tool.call('__pi_complete', {request})); \
+                const body = await tool.call('read', {{path:typed.data.path}}); \
+                typed.schemaValid && typed.data.count === 7 && body.includes('schema-payload')")
+        } else {
+            let encoded = serde_json::to_string(&request.to_string()).unwrap();
+            format!("import json\ntyped = json.loads(await tool.call('__pi_complete', json.loads({encoded})))\n\
+                body = await tool.call('read', {{'path': typed['data']['path']}})\n\
+                typed['schemaValid'] and typed['data']['count'] == 7 and 'schema-payload' in body")
+        };
+        runtime().block_on(async {
+            let out = tool.execute("typed",json!({"kernel":kernel,"code":source}),None).await.unwrap();
+            assert!(!out.is_error,"{}",text(&out));
+            assert_eq!(text(&out).trim().to_ascii_lowercase(),"true");
+            assert_eq!(out.details.unwrap()["judgments"]["attempts"][0]["status"],"completed");
+            let out = tool.execute("reuse",json!({"kernel":kernel,"code":if kernel=="js" {
+                "typed.data.count" } else { "typed['data']['count']" }}),None).await.unwrap();
+            assert_eq!(text(&out).trim(),"7");
+            assert!(out.details.unwrap().get("judgments").is_none());
+        });
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(),1,"the read/reuse must not regenerate data");
+        let envelope: Value = serde_json::from_str(&requests[0].1).unwrap();
+        assert_eq!(envelope["prompt"],request["prompt"]);
+        assert_eq!(envelope["schema"],request["schema"]);
+        assert!(requests[0].0.contains("exactly one JSON value"));
+    }
+}
+
+#[test]
+fn invalid_schema_and_expansion_are_refused_before_attempt_reservation() {
+    let provider = fixture([]);
+    let mut invocation = Invocation::new(Some(binding(&provider)),&json!({}),None).unwrap();
+    runtime().block_on(async {
+        for schema in [Value::Null,json!([]),json!({"type":"CANARY"}),
+            json!({"$ref":"https://schema.invalid/CANARY"}),
+            json!({"description":"x".repeat(16*1024)})] {
+            let error = invocation.complete(Path::new("."),json!({"prompt":"x","schema":schema})).await.unwrap_err();
+            assert!(error.contains("PI_COMPLETION_SCHEMA"),"{error}");
+            assert!(!error.contains("CANARY"));
+        }
+        let error = invocation.complete(Path::new("."),json!({"prompt":"\0".repeat(64*1024),"schema":true})).await.unwrap_err();
+        assert!(error.contains("PI_COMPLETION_INPUT"));
+    });
+    assert!(invocation.receipts.is_empty());
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn schema_failures_consume_one_attempt_without_echoing_or_repairing_data() {
+    let provider = fixture([
+        Reply::Text(r#"{"path":false,"count":7,"secret":"OUTPUT-CANARY"}"#.into()),
+        Reply::Text(r#"{"path":"a","path":"b","count":7}"#.into()),
+        Reply::Text("```json\n{\"path\":\"a\",\"count\":7}\n```".into()),
+        Reply::Text(r#"{"path":"a","count":7}"#.into()),
+    ]);
+    let mut invocation = Invocation::new(Some(binding(&provider)),&json!({}),None).unwrap();
+    runtime().block_on(async {
+        for _ in 0..3 {
+            let error = invocation.complete(Path::new("."),extraction_request()).await.unwrap_err();
+            assert!(error.contains("PI_COMPLETION_RESPONSE"),"{error}");
+            assert!(!error.contains("OUTPUT-CANARY"));
+        }
+        let reply: Value = serde_json::from_str(&invocation.complete(Path::new("."),extraction_request()).await.unwrap()).unwrap();
+        assert_eq!(reply["data"],json!({"path":"a","count":7}));
+        assert_eq!(reply["schemaValid"],true);
+        assert_eq!(reply["usage"]["input"],13);
+    });
+    assert_eq!(provider.requests.lock().unwrap().len(),4,"no corrective generation");
+    assert_eq!(invocation.receipts.len(),4);
+    assert!(invocation.receipts[..3].iter().all(|receipt|receipt["status"]=="failed" && receipt["usageKnown"]==false));
+    assert!(!serde_json::to_string(&invocation.receipts).unwrap().contains("OUTPUT-CANARY"));
+}
+
+#[test]
+fn structured_null_and_scalar_results_are_distinct_from_unrequested_data() {
+    let provider = fixture([Reply::Text("null".into()),Reply::Text("false".into()),
+        Reply::Text("  7 \n".into()),Reply::Text("{not JSON}".into())]);
+    let judge = binding(&provider);
+    runtime().block_on(async {
+        for (schema, expected) in [(json!({"type":"null"}),Value::Null),
+            (json!(true),json!(false)),(json!({"type":"integer"}),json!(7))] {
+            let reply = judge.complete(CompletionRequest::parse(json!({"prompt":"x","schema":schema})).unwrap()).await.unwrap();
+            assert_eq!(reply.get("data"),Some(&expected));
+            assert_eq!(reply["schemaValid"],true);
+            if expected==json!(7) { assert_eq!(reply["text"],"  7 \n"); }
+        }
+        let reply = judge.complete(CompletionRequest::parse(json!({"prompt":"x"})).unwrap()).await.unwrap();
+        assert_eq!(reply["text"],"{not JSON}");
+        assert!(reply.get("data").is_none() && reply.get("schemaValid").is_none());
+    });
+}
+
+#[test]
+fn privacy_screens_schema_annotations_and_refuses_any_contract_change() {
+    let provider = fixture([Reply::Text("\"valid\"".into())]);
+    let judge = binding(&provider);
+    runtime().block_on(async {
+        let request = json!({"prompt":"PROMPT-CANARY","system":"SYSTEM-CANARY",
+            "schema":{"type":"string","description":"SCHEMA-CANARY"}});
+        let protect = |parts:&[&str]| -> crate::error::Result<Vec<String>> {
+            assert_eq!(parts.len(),2);
+            assert!(parts[0].contains("SYSTEM-CANARY"));
+            assert!(parts[1].contains("SCHEMA-CANARY") && parts[1].contains("PROMPT-CANARY"));
+            Ok(parts.iter().map(|part|part.replace("CANARY","redacted")).collect())
+        };
+        let mut invocation = Invocation::new(Some(judge.clone()),&json!({}),Some(&protect)).unwrap();
+        let error = invocation.complete(Path::new("."),request).await.unwrap_err();
+        assert!(error.contains("PI_COMPLETION_PRIVACY"));
+        assert!(!error.contains("CANARY"));
+        assert_eq!(invocation.receipts[0]["status"],"failed");
+        assert!(provider.requests.lock().unwrap().is_empty());
+
+        let protect = |parts:&[&str]| -> crate::error::Result<Vec<String>> {
+            Ok(parts.iter().map(|part|part.replace("PROMPT-CANARY","redacted evidence")).collect())
+        };
+        let mut invocation = Invocation::new(Some(judge),&json!({}),Some(&protect)).unwrap();
+        let reply: Value = serde_json::from_str(&invocation.complete(Path::new("."),
+            json!({"prompt":"PROMPT-CANARY","schema":{"type":"string"}})).await.unwrap()).unwrap();
+        assert_eq!(reply["data"],"valid");
+    });
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(),1);
+    assert!(!requests[0].1.contains("CANARY"));
+    assert_eq!(serde_json::from_str::<Value>(&requests[0].1).unwrap()["prompt"],"redacted evidence");
+}
+
+#[test]
+fn caught_schema_failure_retains_kernel_state_and_failed_native_receipt() {
+    for kernel in ["js","python"] {
+        if kernel=="python" && !python() { eprintln!("python3 unavailable"); continue; }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = fixture([Reply::Text("not JSON".into())]);
+        let tool = EvalTool::new(dir.path()).with_judge(binding(&provider));
+        let source = if kernel=="js" {
+            "globalThis.kept=41; try { await tool.call('__pi_complete',{prompt:'x',schema:true}); } catch(e) { if(!String(e).includes('PI_COMPLETION_RESPONSE')) throw e; } kept+1"
+        } else {
+            "kept=41\ntry:\n await tool.call('__pi_complete',{'prompt':'x','schema':True})\nexcept Exception as e:\n assert 'PI_COMPLETION_RESPONSE' in str(e)\nkept+1"
+        };
+        runtime().block_on(async {
+            let out = tool.execute("caught",json!({"kernel":kernel,"code":source}),None).await.unwrap();
+            assert!(!out.is_error,"{}",text(&out));
+            assert_eq!(text(&out).trim(),"42");
+            assert_eq!(out.details.unwrap()["judgments"]["attempts"][0]["status"],"failed");
+            let out = tool.execute("kept",json!({"kernel":kernel,"code":"kept"}),None).await.unwrap();
+            assert_eq!(text(&out).trim(),"41");
+        });
+        assert_eq!(provider.requests.lock().unwrap().len(),1);
+    }
+}
+
+#[test]
+fn dropping_structured_generation_releases_the_same_owned_stream() {
+    let provider = fixture([Reply::Pending]);
+    let mut invocation = Invocation::new(Some(binding(&provider)),&json!({}),None).unwrap();
+    runtime().block_on(async {
+        let mut pending = Box::pin(invocation.complete(Path::new("."),extraction_request()));
+        assert!(matches!(futures::poll!(pending.as_mut()),Poll::Pending));
+        assert_eq!(provider.requests.lock().unwrap().len(),1);
+        drop(pending);
+        assert!(provider.dropped.load(Ordering::Acquire));
+    });
+    assert_eq!(invocation.receipts[0]["status"],"incomplete");
+    assert_eq!(invocation.receipts[0]["usageKnown"],false);
+}
+
+#[test]
+fn model_facing_guidance_exposes_typed_completion_data_without_new_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = EvalTool::new(dir.path());
+    for term in ["schema?","schemaValid=true","typed extraction","External schema resources"] {
+        assert!(tool.description().contains(term),"{term}");
+    }
+    assert!(tool.parameters()["properties"]["judge_model"]["description"].as_str().unwrap().contains("schema-validated"));
+    assert!(!tool.effects_for_input(&json!({"code":"42"})).networks());
+    assert!(tool.effects_for_input(&json!({"code":"42","judge_model":{"provider":"p","model":"m"}})).networks());
+}

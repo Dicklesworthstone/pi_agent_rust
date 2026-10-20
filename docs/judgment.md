@@ -260,3 +260,85 @@ host ceilings, terminal refusal, shared budgets, privacy, ownership, dropped
 streams, the public cell deadline, both kernels and model-facing discovery.
 These Rust regressions were authored, not compiled or run in the implementation
 environment. `dsr quality --tool pi_agent_rust` remains the acceptance command.
+
+## Schema-validated completion data
+
+`CompletionRequest::parse` and `__pi_complete` also accept an optional `schema`
+containing a JSON Schema object or boolean. The host compiles it before reserving
+an attempt, resolving credentials or sending a model request. An omitted
+`$schema` uses Draft 2020-12; an explicit declaration must be recognized by the
+existing `jsonschema` engine. Local definitions and references work. A dedicated
+retriever refuses external resources, including HTTP and local files, even if
+another dependency enables those retrieval features. No schema grants I/O.
+
+With a schema, the provider receives a screened JSON envelope containing the
+prompt and schema, plus a fixed JSON-output instruction. This is host-validated
+JSON generation, not a claim that every provider offers constrained decoding.
+The prompt, system, schema descriptions, examples and constants all pass through
+the same invocation privacy projection. If that projection changes the schema
+or damages the envelope, the call fails before provider admission. It never
+sends the unscreened original or validates against a weakened contract.
+
+Only a clean terminal response containing exactly one JSON value is accepted.
+Markdown fences, prose wrappers, extra trailing values and duplicate keys at any
+object depth are errors; the host does not extract, repair or retry them. The
+parsed value must pass the original compiled schema without coercion. A valid
+response adds `data` and `schemaValid: true` to the existing `pi.completion.v1`
+reply, retaining the exact terminal `text`, model identity and reported usage.
+JSON null is a valid `data` value when allowed by the schema. Without a schema,
+`data` and `schemaValid` remain absent and text behavior is unchanged. Failure
+never yields an invented null or a partial successful data result.
+
+Schema input is limited to 16 KiB encoded, and the combined prompt/schema JSON
+envelope to 128 KiB. The existing common JSON limits apply: depth at most 32
+and at most 65,536 values. The original 64/16 KiB prompt/system limits and
+32 KiB terminal-response limit remain in force. JSON escaping counts toward
+encoded limits. Schema compilation and validation are bounded-input synchronous
+library operations, not a preemptible sandbox or a promised CPU-time bound.
+Formats and annotation keywords follow the selected engine draft's semantics;
+a schema validates structure, not the factual truth of a model's output.
+
+Malformed contracts report `PI_COMPLETION_SCHEMA`; malformed or nonconforming
+terminal JSON reports `PI_COMPLETION_RESPONSE`. Diagnostics do not echo schema
+values, prompt fragments or failed data. A rejected terminal result consumes
+its original attempt and retains a failed host receipt with unknown usage,
+consistent with other completion failures. There is no automatic schema repair,
+extra attempt, provider fallback or extension of the cell deadline.
+
+For example, supply this JavaScript cell to Eval with an explicit model:
+
+```json
+{
+  "kernel": "js",
+  "judge_model": {"provider": "your-registered-provider", "model": "your-model-id"},
+  "code": "globalThis.extraction = JSON.parse(await tool.call('__pi_complete', {prompt: 'Extract the file paths from these findings: src/api.rs and src/ui.rs require review.', schema: {type: 'object', required: ['files'], additionalProperties: false, properties: {files: {type: 'array', items: {type: 'string'}}}}})); display(extraction.data.files);"
+}
+```
+
+Python uses the same native validation and can consume the returned data:
+
+```python
+import json
+extraction = json.loads(await tool.call('__pi_complete', {
+    'prompt': 'Extract the file paths from these findings: src/api.rs requires review.',
+    'schema': {
+        'type': 'object', 'required': ['files'], 'additionalProperties': False,
+        'properties': {'files': {'type': 'array', 'items': {'type': 'string'}}},
+    },
+}))
+display(extraction['data']['files'])
+```
+
+The result can stay in the current kernel for later cells or become input to
+ordinary native tools. Such tool calls still use the current cell's normal host
+policy; schema validation is not approval of a path or authorization to act.
+An extraction error can be caught without resetting an otherwise healthy
+kernel. The failed model attempt remains in native receipts, and retrying is
+always an explicit additional request under the remaining shared allowance.
+
+Schema regressions are in `src/judgment/completion/schema.rs` and the existing
+`src/eval/judgment/completion/tests.rs`. They cover strict data acceptance,
+preflight, privacy integrity, native file-read composition and retained state
+in both kernels, failed receipts and dropped streams. These added Rust tests
+were authored, not compiled or executed in the implementation environment:
+`dsr quality --tool pi_agent_rust` could not start because `dsr` was missing.

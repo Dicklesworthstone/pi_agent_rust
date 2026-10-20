@@ -653,8 +653,13 @@ impl Tool for EvalTool {
          Single judgments and batch items share 16 reserved attempts per cell; \
          batches keep the original cell deadline and do not run in the background. \
          No model fallback or tools within a judgment request. \
-         General one-shot text completion uses __pi_complete through tool.call \
-         with {prompt,system?,max_tokens?}, returning JSON with text and usage. \
+         General one-shot completion uses __pi_complete through tool.call \
+         with {prompt,system?,max_tokens?,schema?}, returning JSON with text and \
+         usage. Optional schema is a bounded object/boolean JSON Schema; valid \
+         terminal JSON also returns data and schemaValid=true. Use data for \
+         typed extraction. Invalid schemas fail before model admission; bad \
+         output, duplicate keys and prose wrappers fail without repair/retry. \
+         External schema resources are refused; privacy must preserve the schema. \
          It uses the same judge_model/host binding, privacy and original cell \
          deadline; max_tokens may only lower the host ceiling (at most 4096). \
          Completions and judgments share the 16-attempt allowance. No history \
@@ -698,7 +703,7 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's __pi_judge, __pi_judge_batch and __pi_complete bridge calls; host registry credentials only, no fallback. Omit when the host already binds a Judge. All operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
+                    "description": "Explicit model for this cell's __pi_judge, __pi_judge_batch and __pi_complete bridge calls, including schema-validated completion data; host registry credentials only, no fallback. Omit when the host already binds a Judge. All operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
                     "properties": {
                         "provider": {"type":"string", "minLength":1, "maxLength":256},
                         "model": {"type":"string", "minLength":1, "maxLength":256}
