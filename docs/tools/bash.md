@@ -1,4 +1,4 @@
-# Bash commands and automatic background jobs
+# Bash commands, persistent shell state, and background jobs
 
 The `bash` tool runs a command in the agent's current working directory, streams
 progress while it waits, and returns the command's output and exit status. It
@@ -105,6 +105,59 @@ The `capture` details report `outputComplete`, `artifactTruncated`,
 the retained artifact for its prefix and the result/job tail for its latest
 output.
 
-Each Bash call still starts a shell invocation. This automatic-backgrounding
-support does not persist shell-local variables, functions, aliases, or
-working-directory changes into later calls.
+## Persistent shell state
+
+On Unix, native Bash calls retain shell state within the agent session by
+default. This applies to direct foreground calls, PTY calls, and commands
+that automatically become background jobs. A new call can use variables,
+indexed and associative arrays supported by the configured Bash version,
+functions, aliases, shell options, umask, and the working directory saved
+by the preceding call. For example, these two tool calls share state:
+
+```json
+{"command":"BUILD_TARGET=release; build_target() { printf '%s' \"$BUILD_TARGET\"; }; cd src","background":false}
+```
+
+```json
+{"command":"build_target; pwd","background":false}
+```
+
+State is scoped to the captured agent session, configured Bash binary,
+command prefix, and initial workspace directory. Rebuilding a tool registry
+does not discard it. A session switch cannot import another session's state.
+Other file tools continue to use their own workspace directory. If a saved
+directory is renamed or removed, the next Bash call returns to its initial
+workspace directory and retains the other saved state.
+
+Only one call owns a session's shell state at a time. An automatically
+promoted command keeps that ownership until it settles, and its final state
+is published before `jobs.wait` reports completion. Calls that overlap it
+run in temporary shells at the initial workspace directory. Their results
+include a warning and `details.shellState.mode: "temporary"`; saved session
+variables and functions are unavailable, and those calls do not change the
+saved state. Explicit `background:true` jobs always use independent shells
+and do not occupy the session shell.
+
+The implementation transfers native Bash declarations between supervised
+processes. It executes each user command once; it does not replay earlier
+commands to reconstruct state. A completed command saves state even when
+its final command returns nonzero. A shell that terminates before reaching
+normal completion—for example through `exit`, `exec`, `set -e`, or a
+`set -u` error—retains the previous committed state. Timeout and cancellation
+also retain the previous state. This differs from OMP's embedded interpreter,
+which can retain changes made before interpreter-level `exit` or errexit.
+The configured command prefix still runs for each call.
+
+State is held in process memory and transferred through private temporary
+files, separate from tool output artifacts. Each snapshot is capped at
+1 MiB; incomplete or oversized snapshots preserve the preceding snapshot.
+The pool retains at most 32 session/configuration combinations, evicting
+the oldest idle combination when needed. State is not serialized into saved
+agent transcripts, and restarting Pi starts a fresh shell state. Process
+IDs, open file descriptors, traps, and shell job tables do not carry across
+calls. Bash's special runtime variables are regenerated for each process.
+Windows and explicitly configured non-Bash shells retain their existing
+execution behavior.
+
+Set `"bash": {"persistent": false}` to run independent foreground shells.
+This leaves previously saved state available if persistence is re-enabled.

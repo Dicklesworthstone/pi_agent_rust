@@ -325,6 +325,13 @@ Accessor defaults:
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.
 - `shell_command_prefix` (string): Default `set -e`.
 - `gh_path` (string): Override path to `gh` for `/share`. Alias: `ghPath`.
+- `bash.persistent` (bool): Retain native Bash variables, arrays, functions,
+  aliases, options, umask, and working directory between foreground calls on
+  Unix. Default `true`; explicit background jobs remain isolated. State is
+  saved after normal completion, including an ordinary nonzero result.
+  `exit`, shell abort, timeout, and cancellation retain the previous state.
+  Overlapping calls use temporary shells and report that their changes will
+  not persist. See [Bash shell state](tools/bash.md#persistent-shell-state).
 - `bash.auto_background.enabled` (bool): Automatically promote eligible
   non-PTY Bash commands to managed background jobs. Default `true`.
   Alias for the object: `autoBackground`.
@@ -337,6 +344,7 @@ Accessor defaults:
   "shell_path": "/bin/bash",
   "shell_command_prefix": "set -e",
   "bash": {
+    "persistent": true,
     "autoBackground": {
       "enabled": true,
       "thresholdMs": 60000

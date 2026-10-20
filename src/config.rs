@@ -608,6 +608,9 @@ pub struct BashSettings {
     /// PTY allocation for isatty-requiring commands: `off`, `auto`
     /// (default), or `always` (bd-cv653.1.7).
     pub pty: Option<String>,
+    /// Keep native Bash variables, functions, aliases, options, and cwd across
+    /// foreground calls on Unix (default true). Explicit jobs stay isolated.
+    pub persistent: Option<bool>,
     /// Promote long-running non-PTY calls without restarting the command.
     #[serde(alias = "autoBackground")]
     pub auto_background: Option<BashAutoBackgroundSettings>,
@@ -2016,6 +2019,7 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_forced: other.mediation_forced.or(base.mediation_forced),
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
+            persistent: other.persistent.or(base.persistent),
             auto_background: merge_bash_auto_background(base.auto_background, other.auto_background),
         }),
         (None, Some(other)) => Some(other),
@@ -2558,6 +2562,7 @@ mod tests {
         let global: Config = serde_json::from_value(json!({
             "bash": {
                 "mediation": "block-high",
+                "persistent": false,
                 "autoBackground": {"enabled": false, "thresholdMs": 400}
             }
         })).expect("global settings");
@@ -2567,6 +2572,7 @@ mod tests {
         let merged = Config::merge(global, project);
         let bash = merged.bash.expect("merged bash");
         assert_eq!(bash.mediation.as_deref(), Some("block-high"));
+        assert_eq!(bash.persistent, Some(false));
         let auto = bash.auto_background.expect("merged auto background");
         assert_eq!(auto.enabled, Some(true));
         assert_eq!(auto.threshold_ms, Some(400));

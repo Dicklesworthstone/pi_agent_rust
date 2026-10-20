@@ -34,6 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+pub(crate) mod bash_session;
 mod structured_json;
 mod structured_sqlite;
 
@@ -7609,6 +7610,7 @@ fn bash_cancellation_details(
 
 /// Dispatch to the pipe or PTY spawn path (bd-cv653.1.7) with an identical
 /// call shape, so the mediation gate's arms don't duplicate the branch.
+#[allow(clippy::too_many_arguments)]
 async fn execute_bash_spawn(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -7617,6 +7619,7 @@ async fn execute_bash_spawn(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     use_pty: bool,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     if use_pty {
         run_bash_command_pty(
@@ -7626,16 +7629,18 @@ async fn execute_bash_spawn(
             command,
             timeout_secs,
             on_update,
+            shell_state,
         )
         .await
     } else {
-        run_bash_command(
+        run_bash_command_with_state(
             cwd,
             shell_path,
             command_prefix,
             command,
             timeout_secs,
             on_update,
+            shell_state,
         )
         .await
     }
@@ -7896,7 +7901,6 @@ fn find_windows_bash(env: &WindowsShellEnv, is_file: impl Fn(&Path) -> bool) -> 
         .find(|candidate| is_wsl_bash_launcher(candidate) && is_file(candidate))
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -7904,6 +7908,28 @@ pub(crate) async fn run_bash_command(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        on_update,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_bash_command_with_state(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -7951,7 +7977,8 @@ pub(crate) async fn run_bash_command(
 
     let child = spawn_command_with_job_discipline(&mut cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
-    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
+    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
+        .with_shell_state(shell_state);
 
     let stdout = guard
         .child
@@ -8270,6 +8297,7 @@ pub(crate) async fn run_bash_command_pty(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -8319,10 +8347,11 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(pty_cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
+    let mut child = PtyProcessGuard::new(child, shell_state);
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -8367,7 +8396,7 @@ pub(crate) async fn run_bash_command_pty(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                exit_code = Some(pty_exit_status_code(&status));
                 break;
             }
             Ok(None) => {}
@@ -8383,7 +8412,7 @@ pub(crate) async fn run_bash_command_pty(
             if now >= deadline {
                 let _ = child.kill();
                 if let Ok(status) = child.wait() {
-                    exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                    exit_code = Some(pty_exit_status_code(&status));
                 }
                 break;
             }
@@ -8452,7 +8481,7 @@ pub(crate) async fn run_bash_command_pty(
 
     // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
     if let Ok(status) = child.wait() {
-        exit_code.get_or_insert_with(|| i32::try_from(status.exit_code()).unwrap_or(-1));
+        exit_code.get_or_insert_with(|| pty_exit_status_code(&status));
     }
 
     Ok(assemble_bash_run_result(
@@ -8519,6 +8548,7 @@ impl BashTool {
         input: &BashInput,
         threshold_ms: u64,
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+        shell_state: Option<&bash_session::ShellTransaction>,
     ) -> Result<Option<ToolOutput>> {
         let owner = AgentCx::for_current_or_request();
         owner
@@ -8526,12 +8556,13 @@ impl BashTool {
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
         let job = match crate::jobs::spawn_foreground(
             session_id,
-            &self.cwd,
+            shell_state.map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd),
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
             &input.command,
             input.timeout,
             self.artifact_root.as_deref(),
+            shell_state,
         ) {
             Ok(job) => job,
             // This named refusal precedes OS spawn, so falling back cannot
@@ -8792,6 +8823,20 @@ impl BashTool {
         output
     }
 
+    fn annotate_shell_state(mut output: ToolOutput, notice: Option<&str>) -> ToolOutput {
+        if let Some(notice) = notice {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                let _ = write!(text.text, "\n\n[Shell state] {notice}");
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["shellState"] = serde_json::json!({
+                "mode": "temporary",
+                "notice": notice,
+            });
+        }
+        output
+    }
+
     #[cfg(test)]
     fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
@@ -8815,7 +8860,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable."
+        "Execute a bash command. On Unix, foreground calls retain Bash variables, arrays, functions, aliases, options, and working directory within this session, including after automatic promotion. State is saved when a command returns normally; exit, shell abort, timeout, or cancellation retain the previously saved state. Overlapping calls use a temporary shell and report that their state will not persist; explicit background jobs are isolated. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -8886,11 +8931,36 @@ impl Tool for BashTool {
                 .and_then(|settings| settings.enabled)
                 .unwrap_or(true)
             && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
-        let background_session_id = if input.background == Some(true) || auto_background {
+        let persistent = cfg!(unix)
+            && input.background != Some(true)
+            && self.mediation.as_ref().and_then(|settings| settings.persistent).unwrap_or(true);
+        let background_session_id = if input.background == Some(true) || auto_background || persistent {
             Some(self.job_session_scope.session_id().await?)
         } else {
             None
         };
+        let mut shell_state = None;
+        let mut shell_notice = None;
+        if persistent {
+            let shell = self.shell_path.clone().map_or_else(default_bash_shell, Ok)?;
+            // Shell snapshots use native Bash declarations. An explicitly
+            // selected non-Bash shell continues using its existing runner.
+            if Path::new(&shell).file_name().is_some_and(|name| name == "bash") {
+                match bash_session::acquire(
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                    &self.cwd,
+                    &shell,
+                    self.command_prefix.as_deref(),
+                    &input.command,
+                )? {
+                    bash_session::Acquisition::Persistent(transaction) => shell_state = Some(transaction),
+                    bash_session::Acquisition::Temporary(notice) => shell_notice = Some(notice),
+                }
+            }
+        }
+        let execution_cwd = shell_state.as_ref().map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd);
         let mut mediation_warning = None;
 
         // Mediation gate (bd-cv653.1.7): classify before spawn against
@@ -8907,7 +8977,7 @@ impl Tool for BashTool {
                 // (project + global) win over every classifier hit — users
                 // maintain ONE rule set.
                 let allows = crate::bash_mediation::import_dcg_overrides(
-                    &self.cwd,
+                    execution_cwd,
                     &crate::config::Config::global_dir(),
                 );
                 if crate::bash_mediation::covered_by_allow(&input.command, &allows) {
@@ -8915,7 +8985,7 @@ impl Tool for BashTool {
                     let _ = verdict;
                 } else {
                     let verdict =
-                        crate::bash_mediation::assess(&input.command, mediation, mode, &self.cwd);
+                        crate::bash_mediation::assess(&input.command, mediation, mode, execution_cwd);
                     match verdict {
                         crate::bash_mediation::MediationVerdict::Allow { hits } => {
                             if !hits.is_empty() {
@@ -9016,6 +9086,19 @@ impl Tool for BashTool {
                 .map(|output| Self::annotate_bash_mediation(output, &mediation_warning));
         }
 
+        if shell_state.is_some()
+            && !self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                )
+                .await?
+        {
+            return Err(Error::tool("bash", "Command cancelled before the session shell could start"));
+        }
+
         if auto_background
             && let Some(output) = self
                 .execute_auto_background(
@@ -9026,25 +9109,44 @@ impl Tool for BashTool {
                     &input,
                     threshold_ms,
                     on_update.as_deref(),
+                    shell_state.as_ref(),
                 )
                 .await?
         {
-            return Ok(Self::annotate_bash_mediation(output, &mediation_warning));
+            return Ok(Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                &mediation_warning,
+            ));
         }
 
         let result = execute_bash_spawn(
-            &self.cwd,
+            execution_cwd,
             self.shell_path.as_deref(),
-            self.command_prefix.as_deref(),
-            &input.command,
+            if shell_state.is_some() { None } else { self.command_prefix.as_deref() },
+            shell_state.as_ref().map_or(input.command.as_str(), bash_session::ShellTransaction::command),
             input.timeout,
             on_update.as_deref(),
             use_pty,
+            shell_state.as_ref(),
         )
         .await?;
 
+        if let Some(shell_state) = &shell_state {
+            let owns_session = self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().unwrap_or_default(),
+                )
+                .await
+                .unwrap_or(false);
+            shell_state.finish(!result.cancelled && result.exit_code >= 0 && owns_session);
+        }
+
         self.bash_result_output(tool_call_id, result)
-            .map(|output| Self::annotate_bash_mediation(output, &mediation_warning))
+            .map(|output| Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                &mediation_warning,
+            ))
     }
 }
 
@@ -14931,6 +15033,7 @@ fn emit_bash_update(
 pub(crate) struct ProcessGuard {
     child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
+    shell_process: Option<bash_session::ShellProcessLease>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14944,7 +15047,13 @@ impl ProcessGuard {
         Self {
             child: Some(child),
             cleanup_mode,
+            shell_process: None,
         }
+    }
+
+    fn with_shell_state(mut self, state: Option<&bash_session::ShellTransaction>) -> Self {
+        self.shell_process = state.map(bash_session::ShellTransaction::retain_process);
+        self
     }
 
     pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
@@ -14964,20 +15073,25 @@ impl ProcessGuard {
             .child
             .as_mut()
             .map_or(Ok(None), std::process::Child::try_wait)?;
-        #[cfg(windows)]
         if status.is_some()
             && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
             && let Some(child) = &self.child
         {
             // Descendants can retain stdout after their root exits. Close the
             // retained Job before the output-drain phase waits for pipe EOF.
             terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
+        }
+        if status.is_some() {
+            drop(self.shell_process.take());
         }
         Ok(status)
     }
 
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
+            let shell_process = self.shell_process.take();
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
@@ -15001,8 +15115,9 @@ impl ProcessGuard {
                     }
                 }
             }
-            std::thread::spawn(move || {
+            dispatch_process_cleanup(move || {
                 let _ = child.wait();
+                drop(shell_process);
             });
             // A live or unconfirmed child is reaped without blocking callers.
             return None;
@@ -15041,11 +15156,14 @@ impl ProcessGuard {
         // Keep ownership on wait errors so a later retry or Drop still has
         // the child handle and its registered Windows Job available.
         let status = child.wait()?;
-        #[cfg(windows)]
-        if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+        if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
+        {
             terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
         }
         drop(self.child.take());
+        drop(self.shell_process.take());
         Ok(status)
     }
 }
@@ -15062,14 +15180,151 @@ impl Drop for ProcessGuard {
                 // Do not infer that the root was reaped or walk its PID.
                 let _ = win_job::terminate(child.id());
             }
-            if !matches!(status, Ok(None)) {
+            if matches!(status, Ok(Some(_))) {
+                if !cfg!(windows)
+                    && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+                    && self.shell_process.is_some()
+                {
+                    terminate_reaped_child_discipline(child.id());
+                }
                 return;
             }
             let cleanup_mode = self.cleanup_mode;
-            std::thread::spawn(move || {
-                cleanup_child(Some(child.id()), cleanup_mode);
-                let _ = child.kill();
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(Some(child.id()), cleanup_mode);
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
+                drop(shell_process);
+            });
+        }
+    }
+}
+
+/// The caller retains ownership until a cleanup thread takes its task. If the
+/// OS refuses another thread, reap synchronously instead of dropping a live
+/// child and releasing its shell lease through a failed spawn closure.
+fn dispatch_process_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    let pending = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let worker = Arc::clone(&pending);
+    if thread::Builder::new()
+        .name("pi-process-reaper".to_string())
+        .spawn(move || {
+            let cleanup = worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+        })
+        .is_err()
+    {
+        let cleanup = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+    }
+}
+
+fn pty_exit_status_code(status: &portable_pty::ExitStatus) -> i32 {
+    if status.signal().is_some() {
+        -1
+    } else {
+        i32::try_from(status.exit_code()).unwrap_or(-1)
+    }
+}
+
+/// PTY children need the same ownership as piped children: dropping a tool
+/// future must kill and reap its process tree before releasing session state.
+struct PtyProcessGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_id: Option<u32>,
+    group_active: bool,
+    shell_process: Option<bash_session::ShellProcessLease>,
+}
+
+impl PtyProcessGuard {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        shell_state: Option<&bash_session::ShellTransaction>,
+    ) -> Self {
+        Self {
+            process_id: child.process_id(),
+            child: Some(child),
+            group_active: true,
+            shell_process: shell_state.map(bash_session::ShellTransaction::retain_process),
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    fn retire_reaped_group(&mut self) {
+        if self.group_active {
+            if let Some(pid) = self.process_id {
+                terminate_reaped_child_discipline(pid);
+            }
+            self.group_active = false;
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        let status = self.child.as_mut().map_or(Ok(None), |child| child.try_wait())?;
+        if status.is_some() {
+            self.retire_reaped_group();
+            drop(self.shell_process.take());
+        }
+        Ok(status)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            cleanup_child(self.process_id, ProcessCleanupMode::ProcessGroupTree);
+            child.kill()?;
+        }
+        Ok(())
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        let status = child.wait()?;
+        self.retire_reaped_group();
+        drop(self.child.take());
+        drop(self.shell_process.take());
+        Ok(status)
+    }
+}
+
+impl Drop for PtyProcessGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let status = child.try_wait();
+            if matches!(status, Ok(Some(_))) {
+                self.retire_reaped_group();
+                return;
+            }
+            let process_id = self.process_id;
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(process_id, ProcessCleanupMode::ProcessGroupTree);
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+                drop(shell_process);
             });
         }
     }

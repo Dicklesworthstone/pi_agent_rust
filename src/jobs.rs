@@ -1537,6 +1537,7 @@ pub fn spawn_background(
         timeout_secs,
         artifact_root,
         JobDelivery::Background,
+        None,
     )
     .map(|(snapshot, _)| snapshot)
 }
@@ -1660,6 +1661,9 @@ impl Drop for ForegroundJob {
     }
 }
 
+// The optional state transaction travels with the same execution description
+// used by explicit jobs, without changing their public spawn contract.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_foreground(
     owner_session_id: &str,
     cwd: &Path,
@@ -1668,6 +1672,7 @@ pub(crate) fn spawn_foreground(
     command: &str,
     timeout_secs: Option<u64>,
     artifact_root: Option<&Path>,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
 ) -> Result<ForegroundJob> {
     let (_, handle) = spawn_managed(
         owner_session_id,
@@ -1680,6 +1685,7 @@ pub(crate) fn spawn_foreground(
         Some(timeout_secs.unwrap_or(crate::tools::DEFAULT_BASH_TIMEOUT_SECS)),
         artifact_root,
         JobDelivery::Foreground,
+        shell_state,
     )?;
     Ok(ForegroundJob { handle, armed: true })
 }
@@ -1699,6 +1705,7 @@ fn spawn_managed(
     timeout_secs: Option<u64>,
     artifact_root: Option<&Path>,
     delivery: JobDelivery,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
 ) -> Result<(JobSnapshot, JobWaitHandle)> {
     if owner_session_id.trim().is_empty() {
         return Err(Error::tool(
@@ -1737,9 +1744,12 @@ fn spawn_managed(
     };
 
     let retained_command = truncate_utf8_bytes(command, MAX_RETAINED_COMMAND_BYTES);
-    let shell_command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
-        || command.to_string(),
-        |prefix| format!("{prefix}\n{command}"),
+    let shell_command = shell_state.map_or_else(
+        || command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+            || command.to_string(),
+            |prefix| format!("{prefix}\n{command}"),
+        ),
+        |state| state.command().to_owned(),
     );
     let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
 
@@ -1978,6 +1988,7 @@ fn spawn_managed(
         tail: Arc::clone(&tail),
         monitor_started: false,
         settlement_published: false,
+        shell_state: shell_state.cloned(),
     })));
     let thread_resources = Arc::clone(&monitor_resources);
     #[cfg(test)]
@@ -2322,6 +2333,7 @@ struct MonitorResources {
     tail: Arc<Mutex<TailBuffer>>,
     monitor_started: bool,
     settlement_published: bool,
+    shell_state: Option<crate::tools::bash_session::ShellTransaction>,
 }
 
 impl MonitorResources {
@@ -2351,6 +2363,9 @@ impl Drop for MonitorResources {
         let _ = self.stop_pumps(deadline);
         self.seal_output_best_effort();
         if !self.settlement_published {
+            if let Some(shell_state) = &self.shell_state {
+                shell_state.finish(false);
+            }
             if self.monitor_started {
                 settle_job_and_enqueue_notice(&self.id, JobStatus::Failed, None, false);
             } else {
@@ -2518,6 +2533,11 @@ fn monitor_job(
             exit_code,
         ),
     };
+    if let Some(shell_state) = &resources.shell_state {
+        shell_state.finish(
+            termination_status.is_none() && exit_code.is_some_and(|code| code >= 0),
+        );
+    }
     settle_job_and_enqueue_notice(id, status, code, output_complete);
     resources.settlement_published = true;
 }
@@ -6229,6 +6249,7 @@ mod tests {
             "printf done",
             Some(10),
             Some(&root),
+            None,
         )
         .expect("spawn foreground command");
         let id = foreground.handle.id.clone();

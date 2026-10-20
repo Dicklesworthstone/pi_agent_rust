@@ -156,6 +156,244 @@ fn automatic_foreground_completion_preserves_output_and_exit_status() {
 
 #[cfg(unix)]
 #[test]
+fn session_shell_restores_native_state_across_tool_rebuilds_without_replay() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "session_shell_restores_native_state_across_tool_rebuilds_without_replay";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    std::fs::create_dir(root.join("nested")).expect("working directory");
+    let owner = format!("shell-state-{}", uuid::Uuid::new_v4().simple());
+    let output = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"background": false, "command": r#"
+PI_STATE_SCALAR=$'one\nquoted\047 $(touch replay-marker)'
+PI_STATE_ARRAY=([2]='two words' [9]=$'nine\nlines')
+if (( BASH_VERSINFO[0] >= 4 )); then
+    declare -A PI_STATE_MAP=(["key with spaces"]="mapped value")
+fi
+shopt -s expand_aliases extglob
+pi_state_fn() { printf '<%s>' "$PI_STATE_SCALAR"; }
+pi_state_pattern() { case "$1" in +(x)) printf extglob-ok ;; esac; }
+alias pi_state_alias=$'printf alias-first\nprintf alias-second'
+alias declare='printf poisoned-alias'
+set -u -o pipefail
+set +B
+export -n PATH
+umask 077
+printf once >> starts
+cd nested
+"#}),
+    );
+    assert!(!output.is_error, "{}", first_text(&output));
+    assert_eq!(first_text(&output), "(no output)");
+
+    // Real surfaces rebuild their registry. A new BashTool with the same live
+    // session id must see the state, not an instance-local cache.
+    let restored = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"background": false, "command": r#"
+pi_state_fn
+printf '|%s|%s|' "${PI_STATE_ARRAY[2]}" "${PI_STATE_ARRAY[9]}"
+if (( BASH_VERSINFO[0] >= 4 )); then printf '%s|' "${PI_STATE_MAP["key with spaces"]}"; fi
+pi_state_pattern xxx
+pi_state_alias
+printf '|%s|%s|' "${SHELLOPTS}" "{a,b}"
+printf '%s|' {a,b}
+builtin declare -p PATH
+pwd
+umask
+unset PI_STATE_SCALAR
+unset -f pi_state_fn
+unalias pi_state_alias
+unset HOME
+set +u
+"#}),
+    );
+    assert!(!restored.is_error, "{}", first_text(&restored));
+    let text = first_text(&restored);
+    assert!(text.contains("<one\nquoted' $(touch replay-marker)>"), "{text}");
+    assert!(text.contains("|two words|nine\nlines|"), "{text}");
+    assert!(text.contains("extglob-okalias-firstalias-second"), "{text}");
+    assert!(text.contains("nounset") && text.contains("pipefail"), "{text}");
+    assert!(text.contains("|{a,b}|{a,b}|"), "brace expansion must stay disabled: {text}");
+    assert!(text.contains("declare -- PATH="), "export -n must persist: {text}");
+    assert!(!text.contains("poisoned-alias"), "aliases must not rewrite state restoration");
+    assert!(text.contains("/nested\n0077"), "cwd and umask must persist: {text}");
+    assert_eq!(std::fs::read_to_string(root.join("starts")).expect("one side effect"), "once");
+    assert!(!root.join("replay-marker").exists());
+    assert!(!root.join("nested/replay-marker").exists());
+
+    let removed = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"background": false, "command": r#"
+printf '%s|%s|' "${PI_STATE_SCALAR-unset}" "${HOME-unset}"
+if ! type pi_state_fn >/dev/null 2>&1; then printf function-removed; fi
+if ! alias pi_state_alias >/dev/null 2>&1; then printf alias-removed; fi
+"#}),
+    );
+    assert_eq!(first_text(&removed), "unset|unset|function-removedalias-removed");
+    let isolated = execute(
+        &bash_tool_for_session(&root, &format!("{owner}-other")),
+        json!({"background": false, "command": "printf '%s' \"${PI_STATE_ARRAY[2]-isolated}\""}),
+    );
+    assert_eq!(first_text(&isolated), "isolated");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn promoted_session_shell_keeps_its_lease_until_state_is_committed() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "promoted_session_shell_keeps_its_lease_until_state_is_committed";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("shell-promoted-{}", uuid::Uuid::new_v4().simple());
+    let seeded = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"command": "PI_PROMOTED_VALUE=before", "background": false}),
+    );
+    assert!(!seeded.is_error);
+    let promoted = execute(
+        &auto_bash_tool(&root, &owner, 0),
+        json!({"timeout": 30, "command": "printf once >> starts; while [ ! -f release ]; do sleep 0.025; done; PI_PROMOTED_VALUE=after; pi_promoted_fn() { printf kept-function; }; printf completed"}),
+    );
+    let id = job_id(&promoted);
+    assert_eq!(promoted.details.as_ref().expect("job details")["autoBackgrounded"], true);
+
+    let overlap = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"background": false, "command": "printf '%s' \"${PI_PROMOTED_VALUE-unavailable}\"; PI_PROMOTED_VALUE=must-not-persist"}),
+    );
+    assert!(!overlap.is_error);
+    assert!(first_text(&overlap).starts_with("unavailable"));
+    assert!(first_text(&overlap).contains("session shell is busy"));
+    assert_eq!(overlap.details.as_ref().expect("temporary shell details")["shellState"]["mode"], "temporary");
+
+    std::fs::write(root.join("release"), "continue").expect("release command");
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("promoted shell settles");
+    assert_eq!(settled.status, "exited");
+    let after = execute(
+        &bash_tool_for_session(&root, &owner),
+        json!({"background": false, "command": "printf '%s|' \"$PI_PROMOTED_VALUE\"; pi_promoted_fn"}),
+    );
+    assert_eq!(first_text(&after), "after|kept-function");
+    assert_eq!(std::fs::read_to_string(root.join("starts")).expect("one spawn"), "once");
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_background_shell_is_isolated_without_holding_session_state() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "explicit_background_shell_is_isolated_without_holding_session_state";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("shell-explicit-{}", uuid::Uuid::new_v4().simple());
+    let tool = bash_tool_for_session(&root, &owner);
+    execute(&tool, json!({"command": "PI_EXPLICIT_VALUE=seed", "background": false}));
+    let background = execute(
+        &tool,
+        json!({"background": true, "timeout": 30, "command": "printf '%s' \"${PI_EXPLICIT_VALUE-isolated}\"; PI_EXPLICIT_VALUE=background; while [ ! -f release ]; do sleep 0.025; done"}),
+    );
+    let id = job_id(&background);
+    let foreground = execute(
+        &tool,
+        json!({"background": false, "command": "printf '%s' \"$PI_EXPLICIT_VALUE\"; PI_EXPLICIT_VALUE=foreground"}),
+    );
+    assert_eq!(first_text(&foreground), "seed");
+    assert!(foreground.details.is_none(), "an explicit job must not occupy the session lease");
+    std::fs::write(root.join("release"), "continue").expect("release command");
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("explicit job settles");
+    assert_eq!(settled.output_tail, "isolated");
+    let after = execute(&tool, json!({"background": false, "command": "printf '%s' \"$PI_EXPLICIT_VALUE\""}));
+    assert_eq!(first_text(&after), "foreground");
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_shell_commits_normal_nonzero_and_rolls_back_terminated_calls() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "session_shell_commits_normal_nonzero_and_rolls_back_terminated_calls";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let owner = format!("shell-rollback-{}", uuid::Uuid::new_v4().simple());
+    let tool = bash_tool_for_session(&root, &owner);
+    let nonzero = execute(&tool, json!({"background": false, "command": "PI_ROLLBACK_VALUE=committed; false"}));
+    assert!(nonzero.is_error);
+    let early_exit = execute(&tool, json!({"background": false, "command": "PI_ROLLBACK_VALUE=discarded; exit 7"}));
+    assert!(early_exit.is_error);
+    let errexit = execute(&tool, json!({"background": false, "command": "set -e; PI_ROLLBACK_VALUE=discarded; false; printf unreachable"}));
+    assert!(errexit.is_error);
+    assert!(!first_text(&errexit).contains("unreachable"));
+    let after = execute(&tool, json!({"background": false, "command": "printf '%s' \"$PI_ROLLBACK_VALUE\""}));
+    assert_eq!(first_text(&after), "committed");
+
+    let timed_out = execute(
+        &auto_bash_tool(&root, &owner, 0),
+        json!({"timeout": 1, "command": "PI_ROLLBACK_VALUE=timed-out; sleep 30"}),
+    );
+    let id = job_id(&timed_out);
+    let settled = block_on_local(pi::jobs::wait_async(&owner, &id, Duration::from_secs(10)))
+        .expect("timed-out command settles");
+    assert_eq!(settled.status, "timedOut");
+    let after_timeout = execute(&tool, json!({"background": false, "command": "printf '%s' \"$PI_ROLLBACK_VALUE\""}));
+    assert_eq!(first_text(&after_timeout), "committed");
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+
+    let cancelled = execute(
+        &auto_bash_tool(&root, &owner, 0),
+        json!({"timeout": 30, "command": "PI_ROLLBACK_VALUE=cancelled; printf ready > cancel-ready; sleep 30"}),
+    );
+    let cancelled_id = job_id(&cancelled);
+    let wait_started = std::time::Instant::now();
+    while !root.join("cancel-ready").exists() && wait_started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(root.join("cancel-ready").exists(), "cancellation must follow the shell-state mutation");
+    let cancelled = execute_jobs_for_session(&owner, "cancel", Some(&cancelled_id), None);
+    assert_eq!(cancelled.details.as_ref().expect("cancel details")["status"], "killed");
+    let after_cancel = execute(&tool, json!({"background": false, "command": "printf '%s' \"$PI_ROLLBACK_VALUE\""}));
+    assert_eq!(first_text(&after_cancel), "committed");
+    assert_eq!(pi::jobs::take_completion_notices(&owner).len(), 1);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_shell_state_can_be_disabled_and_recovers_a_removed_working_directory() {
+    let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
+    let case = "session_shell_state_can_be_disabled_and_recovers_a_removed_working_directory";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    std::fs::create_dir(root.join("old-directory")).expect("working directory");
+    let owner = format!("shell-disabled-{}", uuid::Uuid::new_v4().simple());
+    let tool = bash_tool_for_session(&root, &owner);
+    execute(&tool, json!({"background": false, "command": "PI_DIRECTORY_VALUE=kept; cd old-directory"}));
+    // A rename removes the saved path without discarding fixture data.
+    std::fs::rename(root.join("old-directory"), root.join("moved-directory")).expect("move directory");
+    let restored = execute(&tool, json!({"background": false, "command": "printf '%s|' \"$PI_DIRECTORY_VALUE\"; pwd"}));
+    assert!(first_text(&restored).starts_with("kept|"));
+    assert!(!first_text(&restored).contains("old-directory"));
+    assert!(!restored.is_error);
+
+    let disabled = bash_tool_for_session(&root, &owner).with_mediation(Some(pi::config::BashSettings {
+        persistent: Some(false),
+        ..Default::default()
+    }));
+    let isolated = execute(&disabled, json!({"background": false, "command": "printf '%s' \"${PI_DIRECTORY_VALUE-disabled}\"; PI_DIRECTORY_VALUE=discarded"}));
+    assert_eq!(first_text(&isolated), "disabled");
+    let preserved = execute(&tool, json!({"background": false, "command": "printf '%s' \"$PI_DIRECTORY_VALUE\""}));
+    assert_eq!(first_text(&preserved), "kept");
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
 fn automatic_foreground_reports_the_partial_job_artifact_honestly() {
     if !std::path::Path::new("/dev/zero").exists() {
         return;
