@@ -26,7 +26,9 @@ the watchdog as it does in OMP. Fractional seconds are not accepted. These
 aliases do not add backend sniffing or multiple cells. Agent-owned eval now
 supports [policy-checked tool orchestration](eval-structured-results.md#agent-scoped-tool-orchestration)
 through `tool.call` and `tool.result`, plus the explicit typed-judgment bridge.
-OMP's retained subagent/workpool API remains separate and is not implemented.
+The [retained `agent()` and `wait()` helpers](eval-structured-results.md#retained-background-agent-jobs)
+launch and manage native background subagent jobs across cells. Warm agents
+with follow-up `send()` and OMP's keepalive `workpool()` remain separate work.
 
 ## JavaScript images
 

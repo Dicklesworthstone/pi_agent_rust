@@ -903,6 +903,125 @@ class _PiTools:
 NAMESPACE["tool"] = _PiTools()
 
 
+def _agent_wait_ms(timeout):
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 <= timeout <= 600:
+        raise ValueError("EVAL_AGENT_INPUT: timeout must be finite seconds between 0 and 600")
+    return int(timeout * 1000)
+
+
+def _agent_result_text(result):
+    return "\n".join(block.get("text", "") for block in result["content"]
+                     if type(block) is dict and block.get("type") == "text")
+
+
+async def _agent_native_result(name, arguments):
+    result = await _PiTools.result(name, arguments)
+    if result["isError"]:
+        raise ToolBridgeError(_agent_result_text(result) or "Agent job operation failed")
+    return result["details"]
+
+
+async def _agent_read_job(job_id, action, timeout_ms=None):
+    arguments = {"action": action, "jobId": job_id}
+    if timeout_ms is not None:
+        arguments["timeoutMs"] = timeout_ms
+    snapshot = await _agent_native_result("jobs", arguments)
+    if (type(snapshot) is not dict or snapshot.get("schema") != "pi.host_job.v1"
+            or snapshot.get("id") != job_id or type(snapshot.get("status")) is not str):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid native job snapshot")
+    return snapshot
+
+
+async def _agent_wait_one(job, timeout_ms, raise_errors):
+    snapshot = await _agent_read_job(job.id, "wait", timeout_ms)
+    if snapshot["status"] == "running":
+        raise TimeoutError("EVAL_AGENT_TIMEOUT: job is still running; it remains available through jobs")
+    result = snapshot.get("result")
+    if (type(result) is not dict or type(result.get("content")) is not list
+            or "details" not in result or type(result.get("isError", False)) is not bool):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: settled job has no native result")
+    if raise_errors and (snapshot["status"] != "exited" or result.get("isError", False)):
+        raise ToolBridgeError(_agent_result_text(result) or f"Agent job {snapshot['status']}")
+    return result
+
+
+class _AgentJob:
+    """An opaque native job id; every operation uses the active cell's host."""
+
+    __slots__ = ("_id", "agent")
+
+    def __init__(self, job_id, selected_agent):
+        self._id = job_id
+        self.agent = selected_agent
+
+    @property
+    def id(self):
+        return self._id
+
+    async def status(self):
+        return await _agent_read_job(self.id, "wait", 0)
+
+    async def done(self):
+        return (await self.status())["status"] != "running"
+
+    async def output(self):
+        return (await self.status()).get("result")
+
+    async def cancel(self):
+        return await _agent_read_job(self.id, "cancel")
+
+    async def wait(self, timeout=30):
+        return await _agent_wait_one(self, _agent_wait_ms(timeout), True)
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
+async def _agent(prompt, **options):
+    if type(prompt) is not str or not prompt.strip():
+        raise TypeError("EVAL_AGENT_INPUT: agent requires a nonempty prompt")
+    fields = {
+        "agent": "agent", "cwd": "cwd", "isolation": "isolation", "iso_apply": "isoApply",
+        "output_schema": "outputSchema", "schema_mode": "schemaMode",
+        "timeout_seconds": "timeoutSeconds", "scope": "scope",
+    }
+    arguments = {"agent": "task"}
+    for name, value in options.items():
+        if name not in fields:
+            raise TypeError(f"EVAL_AGENT_INPUT: unknown option {name}")
+        arguments[fields[name]] = value
+    if type(arguments["agent"]) is not str or not arguments["agent"]:
+        raise TypeError("EVAL_AGENT_INPUT: agent must be a nonempty name")
+    # No caller-controlled field can replace the operation or select foreground.
+    arguments["task"] = prompt
+    arguments["async"] = True
+    started = await _agent_native_result("subagent", arguments)
+    if (type(started) is not dict or started.get("schema") != "pi.subagent.background.v1"
+            or type(started.get("jobId")) is not str or not started["jobId"]):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid background acknowledgment")
+    return _AgentJob(started["jobId"], arguments["agent"])
+
+
+_AGENT_CLOCK = time.monotonic
+
+
+async def _agent_wait(handles, timeout=30, raise_errors=True):
+    if (type(handles) not in (list, tuple) or len(handles) > 32
+            or any(type(handle) is not _AgentJob for handle in handles)
+            or type(raise_errors) is not bool):
+        raise TypeError("EVAL_AGENT_INPUT: wait requires up to 32 agent handles and boolean raise_errors")
+    deadline = _AGENT_CLOCK() + _agent_wait_ms(timeout) / 1000
+    results = []
+    for handle in handles:
+        remaining = max(0, int((deadline - _AGENT_CLOCK()) * 1000))
+        results.append(await _agent_wait_one(handle, remaining, raise_errors))
+    return results
+
+
+NAMESPACE["agent"] = _agent
+NAMESPACE["wait"] = _agent_wait
+
+
 def _script_stamp(metadata):
     return (
         metadata.st_dev,

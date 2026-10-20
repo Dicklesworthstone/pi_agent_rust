@@ -160,6 +160,68 @@ class StructuredReaderTests(unittest.TestCase):
         self.assertEqual(self.value(response), 42)
         self.assertEqual(len(self.kernel.calls), 1)
 
+    def launch_agent(self, variable="saved", job_id="job-native"):
+        def bridge(frame):
+            self.assertEqual(frame["bridge"]["input"], {
+                "name": "subagent", "args": {
+                    "agent": "scout", "task": "inspect the code", "async": True,
+                },
+            })
+            self.kernel.reply(frame, json.dumps(envelope({
+                "schema": "pi.subagent.background.v1", "jobId": job_id,
+            })))
+        response = self.kernel.cell(
+            f"{variable} = await agent('inspect the code', agent='scout'); {variable}.id", bridge,
+        )
+        self.assertEqual(self.value(response), job_id)
+
+    def test_agent_handle_survives_cells_and_uses_native_result_without_stored_authority(self):
+        self.launch_agent()
+        native = {"content": [{"type": "text", "text": "completed"}],
+                  "details": {"results": [{"data": {"count": 7}}]}}
+        snapshot = {"schema": "pi.host_job.v1", "id": "job-native", "status": "exited", "result": native}
+        response = self.kernel.cell("await saved", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), native)
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "name": "jobs", "args": {"action": "wait", "jobId": "job-native", "timeoutMs": 30000},
+        })
+        response = self.kernel.cell("await saved.status()",
+                                    lambda frame: self.kernel.reply(frame, error="PI_JOBS_UNKNOWN_ID"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_JOBS_UNKNOWN_ID", response["error"])
+
+    def test_agent_options_cannot_override_operation_or_select_foreground(self):
+        for option in ("op", "async", "task", "model"):
+            with self.subTest(option=option):
+                response = self.kernel.cell(f"await agent('inspect', **{{{option!r}: 'override'}})")
+                self.assertFalse(response["ok"])
+                self.assertIn("unknown option", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_agent_wait_timeout_does_not_cancel_or_replay_the_job(self):
+        self.launch_agent()
+        snapshot = {"schema": "pi.host_job.v1", "id": "job-native", "status": "running"}
+        response = self.kernel.cell("await saved.wait(0)", self.reply_with(envelope(snapshot)))
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_AGENT_TIMEOUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 2)
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["action"], "wait")
+
+    def test_wait_keeps_input_order_and_can_return_failed_native_results(self):
+        self.launch_agent("first", "job-first")
+        self.launch_agent("second", "job-second")
+        def bridge(frame):
+            job_id = frame["bridge"]["input"]["args"]["jobId"]
+            failed = job_id == "job-second"
+            native = {"content": [], "details": {"id": job_id}, "isError": failed}
+            self.kernel.reply(frame, json.dumps(envelope({"schema": "pi.host_job.v1",
+                "id": job_id, "status": "failed" if failed else "exited", "result": native})))
+        response = self.kernel.cell("await wait([second, first], timeout=10, raise_errors=False)", bridge)
+        results = self.value(response)
+        self.assertEqual([result["details"]["id"] for result in results], ["job-second", "job-first"])
+        self.assertTrue(results[0]["isError"])
+        self.assertFalse(results[1]["isError"])
+
     def test_malformed_arguments_never_dispatch(self):
         for args in ("4, {}", "'', {}", "'read', None", "'read', []", "'é' * 65, {}",
                      "'read', {'bad': object()}", "'read', {'not-finite': float('nan')}"):

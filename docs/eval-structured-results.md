@@ -80,8 +80,9 @@ successful; effects already performed by a tool are not rolled back.
 `EVAL_BRIDGE_RECURSION`. Call a discoverable tool by its own name. This avoids
 reacquiring the same kernel lease or obtaining a fresh host budget through a
 wrapper. The host is borrowed only by the active invocation, never retained in
-the kernel or forwarded to a nested tool. This adds sequential tool
-orchestration, not OMP's retained workpool API or an eval background scheduler.
+the kernel or forwarded to a nested tool. Native calls are serialized, but an
+explicit background subagent launch returns while its owned task keeps running.
+The retained helpers below use this same bridge for launch and management.
 
 Native result details include `toolCalls` with schema `pi.eval.tool_calls.v1`.
 Each entry records `toolCallId`, `tool`, and `status` (`completed`, `failed` or
@@ -97,6 +98,105 @@ Agent call. Typed model judgments use the separate explicit `__pi_judge` and
 `__pi_judge_batch` operations with their own selection and privacy policies.
 Single judgments and batch items share a 16-reserved-attempt limit.
 
+## Retained background agent jobs
+
+Agent-owned cells can launch native subagents and retain their job handles for
+later cells. Both `subagent` and `jobs` must be enabled on the owning Agent.
+The launch passes the ordinary subagent approval and plan policy; every later
+status, wait or cancellation request passes the current policy for `jobs`.
+There is no separate worker registry or retained permission grant.
+
+For example, launch two independent tasks in JavaScript:
+
+```javascript
+globalThis.work = [];
+work.push(await agent('Inspect the parser for correctness issues.', {agent: 'task'}));
+work.push(await agent('Inspect the tests for missing failure cases.', {agent: 'task'}));
+work.map(handle => handle.id);
+```
+
+The native jobs run concurrently after their individual launch calls return.
+Use `globalThis` for handles that must survive JavaScript's top-level-await
+cell. In a later cell, collect their complete native results in input order:
+
+```javascript
+const results = await wait(work, {timeout: 20, raiseErrors: false});
+for (const result of results) {
+    console.log(result.content.filter(block => block.type === 'text')
+        .map(block => block.text).join('\n'));
+}
+```
+
+Python retains ordinary namespace assignments and supports the same workflow:
+
+```python
+work = [
+    await agent('Inspect the parser for correctness issues.', agent='task'),
+    await agent('Inspect the tests for missing failure cases.', agent='task'),
+]
+```
+
+```python
+results = await wait(work, timeout=20, raise_errors=False)
+for result in results:
+    print('\n'.join(block['text'] for block in result['content']
+                    if block['type'] == 'text'))
+```
+
+The returned handle exposes `id` and the selected `agent` name. Its methods
+are asynchronous in both languages:
+
+| Method | Result |
+| --- | --- |
+| `status()` | Current native job snapshot, using a zero-duration wait. |
+| `done()` | Whether the job has settled. |
+| `output()` | Settled native `ToolOutput`, or null/`None` while running. |
+| `wait(seconds=30)` | Settled native `ToolOutput`; raises on failure or timeout. |
+| `cancel()` | Native snapshot after cancellation and owned child cleanup. |
+
+In Python, `await handle` also waits with the default 30-second budget.
+`wait(handles, ...)` accepts up to 32 handles and applies one shared timeout
+across the collection. The jobs are already running; waiting in input order
+does not serialize their execution. `raiseErrors: false` / `raise_errors=False`
+returns failed native outputs as data. It does not suppress a timeout, host
+denial, missing job or malformed reply.
+
+Wait timeouts accept finite numeric seconds from 0 through 600. A zero wait
+only polls. A timeout leaves the job running and available through its handle
+or the ordinary `jobs` tool. Waiting uses the current cell's watchdog, so set
+the eval cell timeout longer than the requested wait when appropriate. A
+kernel reset loses guest variables; it does not cancel the native jobs, which
+remain discoverable through `jobs list`. Session shutdown cancels owned jobs.
+
+Launch options map directly to native subagent fields. JavaScript accepts
+`agent`, `cwd`, `isolation`, `isoApply`, `outputSchema`, `schemaMode`,
+`timeoutSeconds` and `scope`; Python uses `iso_apply`, `output_schema`,
+`schema_mode` and `timeout_seconds` for the corresponding compound names.
+The default agent is `task`; definitions must already be discoverable by the
+native subagent tool. Unknown options are rejected before a host call.
+
+`outputSchema` / `output_schema` and strict schema mode preserve native typed
+results: access `result.details.results[0].data` in JavaScript or
+`result['details']['results'][0]['data']` in Python. Native content blocks,
+errors, hub references and isolation metadata remain available in the same
+output. Successful native outputs may omit `isError`; use `result.isError`
+or `result.get('isError', False)` when checking it.
+
+The shared jobs limits apply: eight active jobs across bash and host tasks
+in the process, a 1 MiB encoded final-result limit and a 32 MiB retained host-result
+budget. A result that cannot be safely protected or retained is withheld as
+an explicit error. The subagent's definition, model and execution deadline
+are captured at launch. Its final result is privacy-protected before job
+retention or completion delivery. See [native background delegation](subagent-builtins.md#background-delegation)
+for cancellation, isolation and lifecycle details.
+
+These handles cover independent native tasks. They do not keep a child agent
+alive for `send()` or provide OMP's warm-worker `workpool()`. Waiting does not
+consume the normal session completion notice or pause the eval watchdog.
+Each handle operation still counts toward the active cell's 64 host-call
+limit; possession of an old handle never supplies authority to a standalone
+eval invocation or a replacement session.
+
 ## Validation
 
 `tests/eval_structured_reader.test.cjs` exercises the actual embedded JS factory
@@ -105,7 +205,10 @@ claim. `tests/eval_structured_reader_test.py` exercises the actual Python kernel
 in subprocesses with a controlled protocol host, including queued/active
 cancellation, reply draining and retained cells. It does not execute Rust
 tools. `src/eval/bridge_result.rs` includes native reader, Python and QuickJS
-regressions, plus serialization, malformed-input and whitelist tests. The
+regressions, plus serialization, malformed-input and whitelist tests. Its
+retained-agent regression launches a real native child from both kernels,
+checks typed output in a later cell, and rejects a retained handle when that
+cell has no Agent host. The
 `eval_host_*` tests in `src/agent_tests.rs` exercise the actual Agent and kernels,
 including native writes and reads, approvals, live plan changes, extension
 hooks, disabled tools, recursive wrappers, call budgets and session changes.

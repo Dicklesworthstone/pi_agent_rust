@@ -181,11 +181,14 @@ can use JSON-object arguments:
 {"kernel":"python","code":"text = await tool.call('read', {'path': 'README.md'})\ntext[:200]"}
 ```
 
-The Rust host still permits only `read`, `grep`, `find`, and `ls` on this bridge.
-`tool.call` does not expose arbitrary tools, MCP, writes, or subagent delegation.
-Exchanges are serialized even when wrapped in `asyncio.gather`; the coroutine
-API is not parallel host-tool execution. Host read/path errors are raised back
-into the cell. The eval tool itself executes arbitrary code and is not a sandbox.
+Standalone eval permits `read`, `grep`, `find`, and `ls`. Agent-owned cells can
+call that Agent's enabled native, extension and MCP tools through the normal
+plan, approval and privacy policy. `tool.result` preserves structured output;
+the [agent job helpers](eval-structured-results.md#retained-background-agent-jobs)
+launch native background subagents and retain handles across cells. Bridge
+exchanges are serialized even when wrapped in `asyncio.gather`; admitted
+background jobs run independently. Host errors are raised back into the cell.
+The eval tool itself executes arbitrary code and is not a sandbox.
 
 ## Reusable Python scripts with `%load`
 
@@ -294,12 +297,15 @@ including failed `JSON.parse` calls, never re-execute the cell's earlier work.
 ```
 
 `tool.call(name, args)` returns a promise for the same content string returned
-by the existing synchronous helpers. It accepts object arguments. Host policy
-still permits only `read`, `grep`, `find`, and `ls`; rejected calls reject an
-`Error` that can be caught with `try`/`catch` or `.catch()`. `Promise.all` can
-compose calls, but the asynchronous bridge dispatches them one at a time and
-the host still executes them serially. `tool.read(path)` and the other positional
-synchronous helpers keep their existing return types.
+by the existing synchronous helpers. It accepts object arguments. Agent-owned
+calls use the Agent's current tool availability and execution policy;
+standalone calls expose only `read`, `grep`, `find`, and `ls`. Rejected calls
+reject an `Error` that can be caught with `try`/`catch` or `.catch()`.
+`Promise.all` can compose calls, but the asynchronous bridge dispatches them
+one at a time. Native background subagents keep running after launch returns;
+see [retained agent jobs](eval-structured-results.md#retained-background-agent-jobs).
+`tool.read(path)` and the other positional synchronous helpers keep their
+existing return types.
 
 `sleep(milliseconds)`, `setTimeout(callback, milliseconds, ...args)`,
 `clearTimeout(id)`, `setInterval`, and `clearInterval` are available. Timers run
@@ -378,8 +384,10 @@ is shared in `tests/eval_display.rs`, with native sink/bootstrap tests under
 
 These additions target the persistent-async and file-backed-cell capabilities
 in OMP v18.10.4's `docs/tools/eval.md`; they do not claim complete OMP eval parity.
-Tracked auto-backgrounding, general session-tool and subagent bridges, and the
-Bun runtime remain separate work. Python and JavaScript rich-output
+Tracked auto-backgrounding, keepalive subagent workpools and the Bun runtime
+remain separate work. Agent-owned tool orchestration and retained native
+subagent job handles are described in [structured results](eval-structured-results.md).
+Python and JavaScript rich-output
 coverage is in `tests/eval_display.rs` and `src/eval/display.rs`.
 
 Regression coverage is in `tests/eval.rs`, through the actual Rust `EvalTool`.

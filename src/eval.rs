@@ -635,6 +635,13 @@ impl Tool for EvalTool {
          calls per cell, all within this cell's deadline; eval and xdev cannot \
          be called recursively. Call discoverable tools by their actual names. \
          Standalone embeddings retain only the local read/grep/find/ls bridge. \
+         When subagent and jobs are enabled, await agent(prompt, options) in JS \
+         or await agent(prompt, **options) in Python starts a native background \
+         subagent. Retain its handle across cells to check status, read output, \
+         wait or cancel; await wait(handles) returns ordered native results. \
+         Each operation uses the current cell's host and policy. JS handles \
+         can be retained on globalThis. These are independent child jobs, not \
+         reusable workers; all waits remain within the current cell's deadline. \
          Native call receipts are included in result details. For typed judgments, \
          set judge_model={provider,model} for this cell, then call \
          __pi_judge through tool.call with {state,questions} and parse its JSON. \
