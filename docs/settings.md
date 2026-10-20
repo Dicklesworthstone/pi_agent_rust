@@ -111,6 +111,21 @@ With `--model` alone, a matching `default_provider` is preferred; if that
 provider does not supply the requested model, Pi warns before using another
 provider that does.
 
+The same declared-provider lookup applies to extension model switches, RPC
+`set_model`, the classic `/model` command, and saved-model restoration. Pi
+resolves explicit destinations against the complete runtime catalog before
+checking credentials. A provider omitted from the ready-model picker still
+owns its name, so its missing credentials cannot redirect an explicit request
+to another declared provider with an alias-like name.
+
+Unlisted native model IDs can still use the native provider's routing defaults.
+If a separately declared provider owns a built-in alias such as `open-router`
+or `gemini`, its missing models do not inherit the built-in route. Register the
+requested model under that provider, or select a registered pair shown by
+`pi --list-models` (or `/model` in the classic UI). Rejected explicit runtime
+switches preserve the current model and session history. Native aliases that
+are not separately declared continue to select the registered native provider.
+
 An active model scope still controls automatic selection. If a valid
 configured default or default role is outside that scope, Pi uses the first
 allowed scoped model and warns with both destinations. Check
@@ -141,9 +156,10 @@ model returns an error to the editor.
 
 Startup records a switch between separately declared providers even when they
 share the same model ID or their names are built-in aliases. Continuing the
-session therefore restores the selected provider. Reopening an ACP session
-preserves its selected branch's saved model and thinking level ahead of new
-launch defaults.
+session therefore restores the selected provider. Runtime model switches also
+retain those identities in selection, cycling, and session history. Reopening
+an ACP session preserves its selected branch's saved model and thinking level
+ahead of new launch defaults.
 
 Example:
 

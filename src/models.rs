@@ -1038,7 +1038,7 @@ pub struct CompatConfig {
     pub thinking_format: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelRegistry {
     models: Vec<ModelEntry>,
     error: Option<String>,
@@ -1788,58 +1788,7 @@ impl ModelRegistry {
     }
 
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
-        let provider = provider.trim();
-        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let trimmed_id = id.trim();
-        let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
-        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
-        let openrouter_ids = if is_openrouter {
-            openrouter_model_lookup_ids(id)
-        } else {
-            Vec::new()
-        };
-        let builtin_model_id_matches = |candidate: &str| {
-            if is_openrouter {
-                let canonical_candidate = canonicalize_openrouter_model_id(candidate);
-                openrouter_ids.iter().any(|lookup_id| {
-                    candidate.eq_ignore_ascii_case(lookup_id)
-                        || canonical_candidate.eq_ignore_ascii_case(lookup_id)
-                })
-            } else {
-                candidate.eq_ignore_ascii_case(trimmed_id)
-            }
-        };
-        // Declared provider IDs are authoritative when they match directly.
-        // Only fall back to built-in alias equivalence when no exact provider
-        // row exists, otherwise two distinct extension IDs such as `azure`
-        // and `azure-openai` become insertion-order dependent.
-        if let Some(entry) = self.models.iter().find(|entry| {
-            entry.model.provider.trim().eq_ignore_ascii_case(provider)
-                && builtin_model_id_matches(&entry.model.id)
-        }) {
-            return Some(entry.clone());
-        }
-        if self
-            .models
-            .iter()
-            .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
-        {
-            return None;
-        }
-
-        self.models
-            .iter()
-            .find(|m| {
-                let model_provider = m.model.provider.as_str();
-                let model_provider_canonical =
-                    canonical_provider_id(model_provider).unwrap_or(model_provider);
-                let provider_matches = model_provider.eq_ignore_ascii_case(provider)
-                    || model_provider.eq_ignore_ascii_case(canonical_provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
-                provider_matches && builtin_model_id_matches(&m.model.id)
-            })
-            .cloned()
+        find_model_entry(&self.models, provider, id).cloned()
     }
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
@@ -2059,6 +2008,131 @@ impl ModelRegistry {
         }
         Ok(())
     }
+}
+
+/// Find a catalog entry, preferring its exact declared provider over built-in
+/// alias equivalence. Pass the full catalog before filtering by credentials so
+/// an unavailable declared provider cannot be replaced by an alias's route.
+pub fn find_model_entry<'a>(
+    models: &'a [ModelEntry],
+    provider: &str,
+    id: &str,
+) -> Option<&'a ModelEntry> {
+    let provider = provider.trim();
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let trimmed_id = id.trim();
+    let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
+    // Avoid Vec + String allocation for the common (non-OpenRouter) path.
+    let openrouter_ids = if is_openrouter {
+        openrouter_model_lookup_ids(id)
+    } else {
+        Vec::new()
+    };
+    let builtin_model_id_matches = |candidate: &str| {
+        if is_openrouter {
+            let canonical_candidate = canonicalize_openrouter_model_id(candidate);
+            openrouter_ids.iter().any(|lookup_id| {
+                candidate.eq_ignore_ascii_case(lookup_id)
+                    || canonical_candidate.eq_ignore_ascii_case(lookup_id)
+            })
+        } else {
+            candidate.eq_ignore_ascii_case(trimmed_id)
+        }
+    };
+    // Declared provider IDs are authoritative when they match directly.
+    // Only fall back to built-in alias equivalence when no exact provider row
+    // exists, otherwise distinct extension IDs become insertion-order dependent.
+    if let Some(entry) = models.iter().find(|entry| {
+        entry.model.provider.trim().eq_ignore_ascii_case(provider)
+            && builtin_model_id_matches(&entry.model.id)
+    }) {
+        return Some(entry);
+    }
+    if models
+        .iter()
+        .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
+    {
+        return None;
+    }
+
+    models.iter().find(|entry| {
+        let model_provider = entry.model.provider.as_str();
+        let model_provider_canonical =
+            canonical_provider_id(model_provider).unwrap_or(model_provider);
+        let provider_matches = model_provider.eq_ignore_ascii_case(provider)
+            || model_provider.eq_ignore_ascii_case(canonical_provider)
+            || model_provider_canonical.eq_ignore_ascii_case(provider)
+            || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
+        provider_matches && builtin_model_id_matches(&entry.model.id)
+    })
+}
+
+/// Resolve a registered destination, allowing unlisted native model IDs.
+///
+/// A separately declared provider can own a name that is also a built-in alias,
+/// such as `open-router` or `gemini`. If that provider does not declare the
+/// requested model, synthesizing the built-in alias's route would discard its
+/// configured endpoint and credentials. Keep the same declared-provider boundary
+/// as [`find_model_entry`] in that case. Native provider IDs and undeclared
+/// aliases retain their ad-hoc behavior. Pass the full catalog before filtering
+/// by credentials.
+pub fn resolve_model_entry(models: &[ModelEntry], provider: &str, id: &str) -> Option<ModelEntry> {
+    let provider = provider.trim();
+    if let Some(entry) = find_model_entry(models, provider, id) {
+        return Some(entry.clone());
+    }
+    if canonical_provider_id(provider)
+        .is_some_and(|canonical| !canonical.eq_ignore_ascii_case(provider))
+        && models
+            .iter()
+            .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
+    {
+        return None;
+    }
+    ad_hoc_model_entry(provider, id)
+}
+
+/// Compare resolved destinations without merging separately declared providers.
+/// Native aliases remain equivalent when the catalog does not declare both
+/// spellings independently, including unlisted native model IDs.
+pub fn model_identities_match(
+    models: &[ModelEntry],
+    left_provider: &str,
+    left_model: &str,
+    right_provider: &str,
+    right_model: &str,
+) -> bool {
+    let same_model_id = left_model.trim().eq_ignore_ascii_case(right_model.trim());
+    if same_model_id
+        && left_provider
+            .trim()
+            .eq_ignore_ascii_case(right_provider.trim())
+    {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (
+        find_model_entry(models, left_provider, left_model),
+        find_model_entry(models, right_provider, right_model),
+    ) {
+        return left
+            .model
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(right.model.provider.trim())
+            && left.model.id.eq_ignore_ascii_case(&right.model.id);
+    }
+    let provider_is_declared = |provider: &str| {
+        models.iter().any(|entry| {
+            entry
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(provider.trim())
+        })
+    };
+    same_model_id
+        && crate::provider_metadata::provider_ids_match(left_provider, right_provider)
+        && !(provider_is_declared(left_provider) && provider_is_declared(right_provider))
 }
 
 /// Returns `true` when `provider` is the canonical/primary source for a model
@@ -6393,6 +6467,136 @@ mod tests {
                 .id,
             "openai/gpt-4o-mini"
         );
+    }
+
+    #[test]
+    fn model_registry_ad_hoc_resolution_keeps_declared_alias_destinations() {
+        for (declared_provider, native_provider) in
+            [("open-router", "openrouter"), ("gemini", "google")]
+        {
+            let native = ad_hoc_model_entry_with_sap_resolver(native_provider, "shared", || None)
+                .expect("native model template");
+            let mut native_only = native.clone();
+            native_only.model.id = "native-only".to_string();
+            let mut declared = native.clone();
+            declared.model.provider = declared_provider.to_string();
+            declared.model.base_url = "https://declared.example.test/v1".to_string();
+            declared
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+
+            for api_key in [None, Some(String::new()), Some("declared-key".to_string())] {
+                declared.api_key.clone_from(&api_key);
+                for reverse in [false, true] {
+                    let mut entries = vec![native.clone(), native_only.clone(), declared.clone()];
+                    if reverse {
+                        entries.reverse();
+                    }
+                    let registry = ModelRegistry::from_entries_for_tests(entries);
+                    let request = format!(" {} ", declared_provider.to_ascii_uppercase());
+                    let selected = resolve_model_entry(registry.models(), &request, "shared")
+                        .expect("registered declared destination");
+                    assert_eq!(selected.model.provider, declared_provider);
+                    assert_eq!(selected.model.base_url, declared.model.base_url);
+                    assert_eq!(selected.api_key, api_key);
+                    assert_eq!(selected.headers, declared.headers);
+                    assert!(
+                        resolve_model_entry(registry.models(), &request, "native-only").is_none()
+                    );
+                    assert!(resolve_model_entry(registry.models(), &request, "unlisted").is_none());
+                    let native_selected =
+                        resolve_model_entry(registry.models(), native_provider, "native-only")
+                            .expect("explicit native destination");
+                    assert_eq!(native_selected.model.provider, native_provider);
+                    assert_eq!(native_selected.model.base_url, native.model.base_url);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_registry_ad_hoc_resolution_preserves_native_models_and_undeclared_aliases() {
+        let entries = ["openai", "openrouter", "google", "ollama"]
+            .into_iter()
+            .map(|provider| {
+                ad_hoc_model_entry_with_sap_resolver(provider, "registered", || None)
+                    .expect("native model template")
+            })
+            .collect();
+        let registry = ModelRegistry::from_entries_for_tests(entries);
+        for (provider, canonical) in [
+            ("openai", "openai"),
+            ("openrouter", "openrouter"),
+            ("open-router", "openrouter"),
+            ("gemini", "google"),
+            ("ollama", "ollama"),
+        ] {
+            let registered = resolve_model_entry(registry.models(), provider, "registered")
+                .expect("registered native model");
+            assert_eq!(registered.model.provider, canonical);
+            let unlisted = resolve_model_entry(registry.models(), provider, "vendor/new-model")
+                .expect("unlisted native model");
+            assert_eq!(unlisted.model.provider, provider);
+            assert_eq!(unlisted.model.id, "vendor/new-model");
+            assert_eq!(unlisted.model.base_url, registered.model.base_url);
+            if provider == "ollama" {
+                assert!(!unlisted.auth_header);
+                assert!(model_entry_is_ready(&unlisted));
+            }
+        }
+        assert!(resolve_model_entry(registry.models(), "unregistered-provider", "model").is_none());
+    }
+
+    #[test]
+    fn model_identity_comparison_keeps_declared_aliases_distinct() {
+        let native = ad_hoc_model_entry_with_sap_resolver("openrouter", "shared", || None)
+            .expect("native model template");
+        let mut declared = native.clone();
+        declared.model.provider = "open-router".to_string();
+        for entries in [
+            vec![native.clone(), declared.clone()],
+            vec![declared, native.clone()],
+        ] {
+            assert!(model_identities_match(
+                &entries,
+                " OPEN-ROUTER ",
+                " SHARED ",
+                "open-router",
+                "shared",
+            ));
+            for model in ["shared", "unlisted"] {
+                assert!(!model_identities_match(
+                    &entries,
+                    "open-router",
+                    model,
+                    "openrouter",
+                    model,
+                ));
+                assert!(!model_identities_match(
+                    &entries,
+                    "openrouter",
+                    model,
+                    "open-router",
+                    model,
+                ));
+            }
+        }
+        for model in ["shared", "unlisted"] {
+            assert!(model_identities_match(
+                std::slice::from_ref(&native),
+                "open-router",
+                model,
+                "openrouter",
+                model,
+            ));
+        }
+        assert!(!model_identities_match(
+            std::slice::from_ref(&native),
+            "open-router",
+            "shared",
+            "openrouter",
+            "different",
+        ));
     }
 
     #[test]

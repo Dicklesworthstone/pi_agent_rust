@@ -35,6 +35,7 @@ use crate::model::{
 use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::plan::replayed_plan_mode;
 use crate::provider::InputType;
+#[cfg(test)]
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
@@ -2009,12 +2010,22 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     clippy::significant_drop_in_scrutinee
 )]
 pub async fn run(
-    session: AgentSession,
+    mut session: AgentSession,
     mut options: RpcOptions,
     mut in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
+    // The available list can omit unready declared providers. Retain the full
+    // catalog and admit option-only entries without replacing registry routes.
+    // This snapshot also lets get_state avoid the outer lock held by a stream.
+    let model_registry = session.model_registry().cloned().map(|mut registry| {
+        registry.merge_missing_entries(options.available_models.clone());
+        registry
+    });
+    if let Some(registry) = &model_registry {
+        session.set_model_registry(registry.clone());
+    }
     let requested_cwd = options
         .working_directory
         .clone()
@@ -3124,7 +3135,10 @@ pub async fn run(
                         })?;
                     session_state(
                         &inner_session,
-                        &options,
+                        model_registry.as_ref().map_or(
+                            options.available_models.as_slice(),
+                            crate::models::ModelRegistry::models,
+                        ),
                         &snapshot,
                         is_streaming.load(Ordering::SeqCst),
                         is_compacting.load(Ordering::SeqCst),
@@ -3210,37 +3224,29 @@ pub async fn run(
                     continue;
                 };
 
-                let Some(entry) = options
-                    .available_models
-                    .iter()
-                    .find(|m| {
-                        provider_ids_match(&m.model.provider, provider)
-                            && m.model.id.eq_ignore_ascii_case(model_id)
-                    })
-                    .cloned()
-                else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_model",
-                        format!("Model not found: {provider}/{model_id}"),
-                    ));
-                    continue;
-                };
-
-                let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
-                if model_requires_configured_credential(&entry) && key.is_none() {
-                    let err = Error::auth(format!(
-                        "Missing credentials for {}/{}",
-                        entry.model.provider, entry.model.id
-                    ));
-                    let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
-                    continue;
-                }
-
-                let result: Result<()> = async {
+                let result: Result<ModelEntry> = async {
                     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let entry = model_entry_for_provider_and_id(
+                        provider,
+                        model_id,
+                        rpc_model_catalog(&guard, &options),
+                    )
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Model not found: {provider}/{model_id}. Use get_available_models to choose a registered provider/model."
+                        ))
+                    })?;
+                    let key =
+                        resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
+                    if model_requires_configured_credential(&entry) && key.is_none() {
+                        return Err(Error::auth(format!(
+                            "Missing credentials for {}/{}",
+                            entry.model.provider, entry.model.id
+                        )));
+                    }
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -3288,12 +3294,12 @@ pub async fn run(
                     }
                     state.clear_failover_lifecycle();
                     state.provider_admission.clear();
-                    Ok(())
+                    Ok(entry)
                 }
                 .await;
 
                 match result {
-                    Ok(()) => {
+                    Ok(entry) => {
                         let _ = out_tx.send(response_ok(
                             id,
                             "set_model",
@@ -3380,7 +3386,7 @@ pub async fn run(
                         &inner_session,
                         &runtime_provider,
                         &runtime_model_id,
-                        &options,
+                        rpc_model_catalog(&guard, &options),
                     )
                     .map_or(level, |entry| entry.clamp_thinking_level(level))
                 };
@@ -3421,7 +3427,7 @@ pub async fn run(
                             &inner_session,
                             &runtime_provider,
                             &runtime_model_id,
-                            &options,
+                            rpc_model_catalog(&guard, &options),
                         )
                         .cloned()
                     };
@@ -4773,24 +4779,17 @@ pub async fn run(
                                         provider.model_id().to_string(),
                                     )
                                 });
-                            let entry = model_entry_for_provider_and_id(
+                            let entry = crate::models::resolve_model_entry(
+                                rpc_model_catalog(&guard, &options),
                                 &requested_model.0,
                                 &requested_model.1,
-                                &options,
                             )
-                                .cloned()
-                                .or_else(|| {
-                                    crate::models::ad_hoc_model_entry(
-                                        &requested_model.0,
-                                        &requested_model.1,
-                                    )
-                                })
-                                .ok_or_else(|| {
-                                    Error::validation(format!(
-                                        "Unable to switch Session runtime to {}/{}",
-                                        requested_model.0, requested_model.1
-                                    ))
-                                })?;
+                            .ok_or_else(|| {
+                                Error::validation(format!(
+                                    "Unable to switch Session runtime to {}/{}. Use get_available_models to inspect registered provider/model pairs.",
+                                    requested_model.0, requested_model.1
+                                ))
+                            })?;
                             let key = resolve_model_key(
                                 options.cli_api_key.as_deref(),
                                 &options.auth,
@@ -5045,21 +5044,14 @@ pub async fn run(
                                     provider.model_id().to_string(),
                                 )
                             });
-                        let entry = model_entry_for_provider_and_id(
+                        let entry = crate::models::resolve_model_entry(
+                            rpc_model_catalog(&guard, &options),
                             &requested_model.0,
                             &requested_model.1,
-                            &options,
                         )
-                        .cloned()
-                        .or_else(|| {
-                            crate::models::ad_hoc_model_entry(
-                                &requested_model.0,
-                                &requested_model.1,
-                            )
-                        })
                         .ok_or_else(|| {
                             Error::validation(format!(
-                                "Unable to install forked Session runtime {}/{}",
+                                "Unable to install forked Session runtime {}/{}. Use get_available_models to inspect registered provider/model pairs.",
                                 requested_model.0, requested_model.1
                             ))
                         })?;
@@ -6227,7 +6219,7 @@ async fn run_prompt_with_retry(
                                     &inner,
                                     &runtime_provider,
                                     &runtime_model_id,
-                                    &options,
+                                    rpc_model_catalog(&guard, &options),
                                 )
                                 .map(|e| e.model.context_window)
                             })
@@ -6646,7 +6638,7 @@ async fn sync_runtime_before_rpc_ack(
 async fn reconcile_rpc_failover_state(
     guard: &AgentSession,
     state: &mut RpcSharedState,
-    configured_cooldown_secs: u64,
+    options: &RpcOptions,
     cx: &AgentCx,
 ) -> Result<bool> {
     let inner = guard
@@ -6659,10 +6651,19 @@ async fn reconcile_rpc_failover_state(
         inner
             .effective_model_for_current_path()
             .is_none_or(|(provider, model)| {
-                provider_ids_match(runtime.name(), &provider)
-                    && runtime.model_id().eq_ignore_ascii_case(&model)
+                crate::models::model_identities_match(
+                    rpc_model_catalog(guard, options),
+                    runtime.name(),
+                    runtime.model_id(),
+                    &provider,
+                    &model,
+                )
             });
-    state.reconstruct_failover_from_session(&inner, configured_cooldown_secs, chrono::Utc::now());
+    state.reconstruct_failover_from_session(
+        &inner,
+        options.config.failover_cooldown_secs(),
+        chrono::Utc::now(),
+    );
     Ok(runtime_matches_session)
 }
 
@@ -6691,14 +6692,7 @@ async fn maybe_restore_primary(
         .map_err(|err| Error::session(format!("primary restore state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
-    if !reconcile_rpc_failover_state(
-        &guard,
-        &mut state,
-        options.config.failover_cooldown_secs(),
-        cx,
-    )
-    .await?
-    {
+    if !reconcile_rpc_failover_state(&guard, &mut state, options, cx).await? {
         return Ok(());
     }
     let Some((active_provider, active_model)) = state.active_failover_model.clone() else {
@@ -6798,14 +6792,7 @@ async fn try_failover_to_next_chain_entry(
         .map_err(|err| Error::session(format!("failover state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
-    if !reconcile_rpc_failover_state(
-        &guard,
-        &mut state,
-        options.config.failover_cooldown_secs(),
-        cx,
-    )
-    .await?
-    {
+    if !reconcile_rpc_failover_state(&guard, &mut state, options, cx).await? {
         return Ok(false);
     }
     let provider = guard.agent.provider();
@@ -6825,8 +6812,13 @@ async fn try_failover_to_next_chain_entry(
                 .unwrap_or_default(),
         },
         (Some((active_provider, active_model)), Some(primary))
-            if crate::provider_metadata::provider_ids_match(&current_provider, active_provider)
-                && current_model.eq_ignore_ascii_case(active_model) =>
+            if crate::models::model_identities_match(
+                rpc_model_catalog(&guard, options),
+                &current_provider,
+                &current_model,
+                active_provider,
+                active_model,
+            ) =>
         {
             primary.clone()
         }
@@ -14046,7 +14038,7 @@ async fn maybe_auto_compact(
                 &inner_session,
                 &runtime_provider,
                 &runtime_model_id,
-                &options,
+                rpc_model_catalog(&guard, &options),
             ) else {
                 return;
             };
@@ -14273,7 +14265,7 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
 
 fn session_state(
     session: &crate::session::Session,
-    options: &RpcOptions,
+    models: &[ModelEntry],
     snapshot: &RpcStateSnapshot,
     is_streaming: bool,
     is_compacting: bool,
@@ -14284,10 +14276,7 @@ fn session_state(
         .as_deref()
         .zip(session.header.model_id.as_deref())
         .and_then(|(provider, model_id)| {
-            options.available_models.iter().find(|m| {
-                provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
+            model_entry_for_provider_and_id(provider, model_id, models)
         })
         .map(rpc_model_from_entry);
 
@@ -15485,32 +15474,37 @@ fn normalize_resumed_session_model(
     )
 }
 
+fn rpc_model_catalog<'a>(guard: &'a AgentSession, options: &'a RpcOptions) -> &'a [ModelEntry] {
+    guard.model_registry().map_or(
+        options.available_models.as_slice(),
+        crate::models::ModelRegistry::models,
+    )
+}
+
 fn current_model_entry<'a>(
     session: &crate::session::Session,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
     let (provider, model_id) = session.effective_model_for_current_path()?;
-    model_entry_for_provider_and_id(&provider, &model_id, options)
+    model_entry_for_provider_and_id(&provider, &model_id, models)
 }
 
 fn current_or_runtime_model_entry<'a>(
     session: &crate::session::Session,
     runtime_provider: &str,
     runtime_model_id: &str,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
-    current_model_entry(session, options)
-        .or_else(|| model_entry_for_provider_and_id(runtime_provider, runtime_model_id, options))
+    current_model_entry(session, models)
+        .or_else(|| model_entry_for_provider_and_id(runtime_provider, runtime_model_id, models))
 }
 
 fn model_entry_for_provider_and_id<'a>(
     provider: &str,
     model_id: &str,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
-    options.available_models.iter().find(|m| {
-        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
-    })
+    crate::models::find_model_entry(models, provider, model_id)
 }
 
 async fn apply_thinking_level(
@@ -15714,7 +15708,7 @@ async fn cycle_model_for_rpc(
             &inner_session,
             &runtime_provider,
             &runtime_model_id,
-            options,
+            rpc_model_catalog(guard, options),
         )
         .map_or_else(
             || {
@@ -15733,17 +15727,31 @@ async fn cycle_model_for_rpc(
     };
 
     let current_index = candidates.iter().position(|entry| {
-        current_provider
+        current_provider.as_deref().is_some_and(|provider| {
+            provider
+                .trim()
+                .eq_ignore_ascii_case(entry.model.provider.trim())
+        }) && current_model_id
             .as_deref()
-            .is_some_and(|provider| provider_ids_match(provider, &entry.model.provider))
-            && current_model_id
-                .as_deref()
-                .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
+            .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
     });
 
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
 
-    let next_entry = candidates[next_index].clone();
+    // Candidate lists admit identities and determine cycling order. The full
+    // catalog owns their current route, credentials and provider metadata.
+    let candidate = &candidates[next_index];
+    let next_entry = crate::models::resolve_model_entry(
+        rpc_model_catalog(guard, options),
+        &candidate.model.provider,
+        &candidate.model.id,
+    )
+    .ok_or_else(|| {
+        Error::validation(format!(
+            "Model not found: {}/{}. Use get_available_models to choose a registered provider/model before cycling.",
+            candidate.model.provider, candidate.model.id
+        ))
+    })?;
     let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &next_entry);
     if model_requires_configured_credential(&next_entry) && key.is_none() {
         return Err(Error::auth(format!(
@@ -24805,7 +24813,8 @@ export default function init(pi) {
         session.header.provider = Some("open-router".to_string());
         session.header.model_id = Some("GPT-4O-MINI".to_string());
 
-        let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
+        let resolved = current_model_entry(&session, &options.available_models)
+            .expect("resolve aliased model");
         assert_eq!(resolved.model.provider, "openrouter");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
     }
@@ -24866,9 +24875,13 @@ export default function init(pi) {
         session.header.provider = Some("missing-provider".to_string());
         session.header.model_id = Some("missing-model".to_string());
 
-        let resolved =
-            current_or_runtime_model_entry(&session, "test-provider", "test-model", &options)
-                .expect("resolve runtime fallback");
+        let resolved = current_or_runtime_model_entry(
+            &session,
+            "test-provider",
+            "test-model",
+            &options.available_models,
+        )
+        .expect("resolve runtime fallback");
         assert_eq!(resolved.model.provider, "test-provider");
         assert_eq!(resolved.model.id, "test-model");
         assert_eq!(
@@ -24964,6 +24977,108 @@ export default function init(pi) {
                 session.header.model_id.as_deref(),
                 Some(current.model.id.as_str())
             );
+        });
+    }
+
+    #[test]
+    fn cycle_model_for_rpc_uses_authoritative_route_and_stream_metadata() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                for (provider, key) in [
+                    ("acme-route", Some("authoritative-key")),
+                    ("acme-cycle", None),
+                ] {
+                    let temp = tempfile::tempdir().expect("tempdir");
+                    let mut current = dummy_entry("shared", false);
+                    current.model.provider = "openrouter".to_string();
+                    current.model.api = "openai-completions".to_string();
+                    current.model.base_url = "https://current.example.test/v1".to_string();
+                    current.api_key = Some("current-key".to_string());
+                    current.auth_header = true;
+                    let mut next = current.clone();
+                    next.model.provider = provider.to_string();
+                    next.model.base_url = "https://authoritative.example.test/v1".to_string();
+                    next.model.max_tokens = 4321;
+                    next.api_key = key.map(str::to_string);
+                    next.headers
+                        .insert("x-route".to_string(), "authoritative".to_string());
+                    let mut catalog = vec![current.clone(), next.clone()];
+                    let mut stale = next.clone();
+                    stale.model.base_url = "https://stale.example.test/v1".to_string();
+                    stale.model.max_tokens = 1234;
+                    stale.api_key = Some("stale-key".to_string());
+                    stale
+                        .headers
+                        .insert("x-route".to_string(), "stale".to_string());
+                    let mut candidates = vec![current.clone(), stale];
+                    if reverse {
+                        catalog.reverse();
+                        candidates.reverse();
+                    }
+                    let mut stored = Session::in_memory();
+                    stored.header.provider = Some(current.model.provider.clone());
+                    stored.header.model_id = Some(current.model.id.clone());
+                    let running = crate::providers::create_provider(&current, None)
+                        .expect("current provider");
+                    let mut agent_session =
+                        build_test_agent_session_with_provider(stored, Arc::clone(&running));
+                    agent_session.set_model_registry(
+                        crate::models::ModelRegistry::from_entries_for_tests(catalog),
+                    );
+                    let mut options =
+                        build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                    options.available_models = candidates;
+                    let mut state = RpcSharedState::new(&options.config);
+                    let result =
+                        cycle_model_for_rpc(&mut agent_session, &mut state, &options).await;
+
+                    if key.is_none() {
+                        let error = result.expect_err("stale credentials cannot admit the model");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Missing credentials for acme-cycle")
+                        );
+                        assert!(Arc::ptr_eq(&running, &agent_session.agent.provider()));
+                        assert!(agent_session.agent.stream_options().api_key.is_none());
+                        assert!(agent_session.agent.stream_options().headers.is_empty());
+                        let stored = agent_session
+                            .session
+                            .lock(&AgentCx::for_request())
+                            .await
+                            .expect("session lock");
+                        assert!(stored.entries.is_empty());
+                        assert_eq!(stored.header.provider.as_deref(), Some("openrouter"));
+                        continue;
+                    }
+
+                    let (selected, _, scoped) = result
+                        .expect("cycle authoritative destination")
+                        .expect("second candidate");
+                    assert!(!scoped);
+                    assert_eq!(selected.model.provider, next.model.provider);
+                    assert_eq!(selected.model.base_url, next.model.base_url);
+                    assert_eq!(selected.api_key, next.api_key);
+                    assert_eq!(selected.headers, next.headers);
+                    assert_eq!(agent_session.agent.provider().name(), provider);
+                    let stream = agent_session.agent.stream_options();
+                    assert_eq!(stream.api_key, next.api_key);
+                    assert_eq!(stream.headers, next.headers);
+                    assert_eq!(stream.max_tokens, Some(next.model.max_tokens));
+                    let stored = agent_session
+                        .session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("session lock");
+                    assert_eq!(stored.header.provider.as_deref(), Some(provider));
+                    assert_eq!(stored.header.model_id.as_deref(), Some("shared"));
+                }
+            }
         });
     }
 
@@ -25285,6 +25400,274 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_set_model_and_cycle_keep_declared_provider_routes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut shared = ["openrouter", "open-router"]
+                    .into_iter()
+                    .map(|provider| {
+                        let mut entry = dummy_entry("shared", false);
+                        entry.model.provider = provider.to_string();
+                        entry.model.api = "openai-completions".to_string();
+                        entry.model.base_url =
+                            format!("https://authoritative-{provider}.example.test/v1");
+                        entry.api_key = Some(format!("authoritative-{provider}-key"));
+                        entry
+                            .headers
+                            .insert("x-route".to_string(), format!("authoritative-{provider}"));
+                        entry.auth_header = true;
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    shared.reverse();
+                }
+                let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                let stale_shared = shared
+                    .iter()
+                    .map(|entry| {
+                        let mut stale = entry.clone();
+                        stale.model.base_url =
+                            format!("https://stale-{}.example.test/v1", entry.model.provider);
+                        stale.api_key = Some("stale-key".to_string());
+                        stale
+                            .headers
+                            .insert("x-route".to_string(), "stale".to_string());
+                        stale
+                    })
+                    .collect::<Vec<_>>();
+                options.available_models.clone_from(&stale_shared);
+                options.scoped_models = stale_shared
+                    .into_iter()
+                    .map(|entry| RpcScopedModel {
+                        model: entry,
+                        thinking_level: None,
+                    })
+                    .collect();
+                let mut native_only = shared
+                    .iter()
+                    .find(|entry| entry.model.provider == "openrouter")
+                    .expect("native provider")
+                    .clone();
+                native_only.model.id = "native-only".to_string();
+                native_only.model.base_url = "https://option-only.example.test/v1".to_string();
+                options.available_models.push(native_only.clone());
+                options.scoped_models.push(RpcScopedModel {
+                    model: native_only.clone(),
+                    thinking_level: None,
+                });
+                let mut agent_session = build_test_agent_session(Session::in_memory());
+                // Existing registry routes are authoritative; the native-only
+                // model is admitted solely through the RPC options merge.
+                agent_session.set_model_registry(
+                    crate::models::ModelRegistry::from_entries_for_tests(shared.clone()),
+                );
+                let session_handle = Arc::clone(&agent_session.session);
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+
+                let mut routes = shared;
+                routes.push(native_only);
+                for (index, requested) in routes.iter().enumerate() {
+                    let response = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &json!({
+                            "type": "set_model",
+                            "provider": requested.model.provider,
+                            "modelId": requested.model.id,
+                        })
+                        .to_string(),
+                        "set declared provider",
+                    )
+                    .await;
+                    assert_ok(&response, "set_model");
+                    assert_eq!(response["data"]["provider"], requested.model.provider);
+                    assert_eq!(response["data"]["id"], requested.model.id);
+                    assert_eq!(response["data"]["baseUrl"], requested.model.base_url);
+                    let state = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"get_state"}"#,
+                        "read declared provider",
+                    )
+                    .await;
+                    assert_ok(&state, "get_state");
+                    assert_eq!(state["data"]["model"]["provider"], requested.model.provider);
+                    assert_eq!(state["data"]["model"]["id"], requested.model.id);
+                    assert_eq!(state["data"]["model"]["baseUrl"], requested.model.base_url);
+
+                    let expected = &routes[(index + 1) % routes.len()];
+                    let cycled = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"cycle_model"}"#,
+                        "cycle declared providers",
+                    )
+                    .await;
+                    assert_ok(&cycled, "cycle_model");
+                    assert_eq!(cycled["data"]["model"]["provider"], expected.model.provider);
+                    assert_eq!(cycled["data"]["model"]["id"], expected.model.id);
+                    assert_eq!(cycled["data"]["model"]["baseUrl"], expected.model.base_url);
+                    let state = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"get_state"}"#,
+                        "read cycled authoritative provider",
+                    )
+                    .await;
+                    assert_ok(&state, "get_state");
+                    assert_eq!(state["data"]["model"]["provider"], expected.model.provider);
+                    assert_eq!(state["data"]["model"]["id"], expected.model.id);
+                    assert_eq!(state["data"]["model"]["baseUrl"], expected.model.base_url);
+                }
+
+                let before = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock")
+                    .clone();
+                let missing = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_model","provider":"open-router","modelId":"native-only"}"#,
+                    "reject another provider's model",
+                )
+                .await;
+                assert_err(&missing, "set_model");
+                assert!(
+                    missing["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("get_available_models")
+                );
+                drop(in_tx);
+                let result = server.await;
+                assert!(result.is_ok(), "rpc server error: {result:?}");
+                let after = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock");
+                assert_eq!(
+                    after.effective_model_for_current_path(),
+                    before.effective_model_for_current_path()
+                );
+                assert_eq!(after.entries.len(), before.entries.len());
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_set_model_checks_full_registry_before_credentials() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut current = dummy_entry("test-model", false);
+                current.model.provider = "test-provider".to_string();
+                current.model.api = "test-api".to_string();
+                let mut ready = dummy_entry("shared", false);
+                ready.model.provider = "openai-codex".to_string();
+                ready.model.api = "openai-codex-responses".to_string();
+                ready.model.base_url = "https://native.example.test/v1".to_string();
+                ready.api_key = Some("native-only-key".to_string());
+                ready.auth_header = true;
+                let mut requested = ready.clone();
+                requested.model.provider = "codex".to_string();
+                requested.model.base_url = "https://declared.example.test/v1".to_string();
+                requested.api_key = None;
+                let mut entries = vec![current.clone(), ready.clone(), requested];
+                if reverse {
+                    entries.reverse();
+                }
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some(current.model.provider.clone());
+                stored.header.model_id = Some(current.model.id.clone());
+                let mut agent_session = build_test_agent_session(stored);
+                agent_session.set_model_registry(
+                    crate::models::ModelRegistry::from_entries_for_tests(entries),
+                );
+                let session_handle = Arc::clone(&agent_session.session);
+                let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                // Codex has no ambient API-key variables, and this private
+                // auth path disables external credential discovery.
+                assert!(options.auth.resolve_api_key("codex", None).is_none());
+                options.available_models = vec![ready];
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_model","provider":"codex","modelId":"shared"}"#,
+                    "reject missing credentials on declared provider",
+                )
+                .await;
+                assert_err(&response, "set_model");
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Missing credentials for codex/shared")
+                );
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_state"}"#,
+                    "retain previous destination",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["model"]["provider"], current.model.provider);
+                assert_eq!(state["data"]["model"]["id"], current.model.id);
+                let available = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_available_models"}"#,
+                    "retain admitted model listing",
+                )
+                .await;
+                assert_ok(&available, "get_available_models");
+                assert_eq!(available["data"]["models"].as_array().unwrap().len(), 1);
+                assert_eq!(available["data"]["models"][0]["provider"], "openai-codex");
+                drop(in_tx);
+                let result = server.await;
+                assert!(result.is_ok(), "rpc server error: {result:?}");
+                let stored = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock");
+                assert_eq!(stored.header.provider.as_deref(), Some("test-provider"));
+                assert_eq!(stored.header.model_id.as_deref(), Some("test-model"));
+                assert!(
+                    stored
+                        .entries
+                        .iter()
+                        .all(|entry| !matches!(entry, SessionEntry::ModelChange(_)))
+                );
+            }
+        });
+    }
+
+    #[test]
     fn rpc_set_model_persists_clamped_thinking_header_even_when_runtime_is_already_off() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -25547,7 +25930,7 @@ export default function init(pi) {
             auto_retry_enabled: false,
         };
 
-        let state = session_state(&session, &options, &snapshot, false, false);
+        let state = session_state(&session, &options.available_models, &snapshot, false, false);
         assert_eq!(state["model"]["provider"], "openrouter");
         assert_eq!(state["model"]["id"], "gpt-4o-mini");
     }

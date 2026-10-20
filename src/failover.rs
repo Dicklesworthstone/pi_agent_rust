@@ -293,8 +293,8 @@ pub fn chain_for<S: std::hash::BuildHasher>(
         })
 }
 
-/// Use the same identity relation as `resolve_chain_spec`, including provider
-/// aliases and nested model ids. Raw string equality is not model identity.
+/// Match a per-model policy key using built-in aliases and nested model IDs.
+/// Runtime chain walking additionally consults the declared model catalog.
 fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
     crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
         |(candidate_provider, candidate_model)| {
@@ -304,11 +304,22 @@ fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
     )
 }
 
-fn model_specs_match(left: &str, right: &str) -> bool {
-    crate::provider_metadata::split_provider_model_spec(right).map_or_else(
-        || left.eq_ignore_ascii_case(right),
-        |(provider, model_id)| model_spec_matches(left, provider, model_id),
-    )
+fn model_specs_match(left: &str, right: &str, models: &[crate::models::ModelEntry]) -> bool {
+    match (
+        crate::provider_metadata::split_provider_model_spec(left),
+        crate::provider_metadata::split_provider_model_spec(right),
+    ) {
+        (Some((left_provider, left_model)), Some((right_provider, right_model))) => {
+            crate::models::model_identities_match(
+                models,
+                left_provider,
+                left_model,
+                right_provider,
+                right_model,
+            )
+        }
+        _ => left.eq_ignore_ascii_case(right),
+    }
 }
 
 /// Cooldown FSM for the primary after a failover.
@@ -899,15 +910,27 @@ impl<'a> FailoverWalk<'a> {
     /// The next candidate spec and the chain index it occupies, advancing past
     /// it. The index is captured BEFORE the advance: reporting the post-advance
     /// cursor as the chain index is off by one (bd-oqo03).
-    pub fn next_spec(&mut self) -> Option<(usize, &'a str)> {
+    /// Pass the full catalog so separately declared providers are not skipped
+    /// as aliases of the live model or of earlier entries.
+    pub fn next_spec(&mut self, models: &[crate::models::ModelEntry]) -> Option<(usize, &'a str)> {
         while self.position < self.entries.len() {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = model_spec_matches(spec, self.current_provider, self.current_model);
+            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+                |(provider, model)| {
+                    crate::models::model_identities_match(
+                        models,
+                        provider,
+                        model,
+                        self.current_provider,
+                        self.current_model,
+                    )
+                },
+            );
             let is_duplicate = self.entries[..index]
                 .iter()
-                .any(|earlier| model_specs_match(earlier, spec));
+                .any(|earlier| model_specs_match(earlier, spec, models));
             if is_current || is_duplicate {
                 continue;
             }
@@ -925,23 +948,16 @@ impl<'a> FailoverWalk<'a> {
 
 /// Resolve one `provider/model` chain spec against the configured model list.
 ///
-/// A well-formed pair that is simply not configured falls back to an ad-hoc
-/// entry. `None` means the spec names nothing usable and the walk should move
-/// on.
+/// Native providers can resolve unlisted models from their routing defaults.
+/// A separately declared provider keeps its own identity and cannot borrow
+/// a built-in alias's route. `None` lets the walk try its next configured spec.
 #[must_use]
 pub fn resolve_chain_spec(
     spec: &str,
-    available_models: &[crate::models::ModelEntry],
+    models: &[crate::models::ModelEntry],
 ) -> Option<crate::models::ModelEntry> {
     let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
-    available_models
-        .iter()
-        .find(|entry| {
-            crate::provider_metadata::provider_ids_match(&entry.model.provider, provider)
-                && entry.model.id.eq_ignore_ascii_case(model_id)
-        })
-        .cloned()
-        .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+    crate::models::resolve_model_entry(models, provider, model_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,9 +1908,9 @@ mod tests {
             "google/gemini-z",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1907,10 +1923,10 @@ mod tests {
             "google/gemini-next",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-next")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((0, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-next")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1923,9 +1939,9 @@ mod tests {
             "anthropic/claude-x",
         ]);
         let mut walk = FailoverWalk::new(&chain, 2, "openai", "gpt-y");
-        assert_eq!(walk.next_spec(), Some((3, "anthropic/claude-x")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "anthropic/claude-x")));
         assert_eq!(walk.position(), 4);
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1939,9 +1955,9 @@ mod tests {
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "openai", "gpt-y");
         for (index, spec) in chain.entries[..4].iter().enumerate() {
-            assert_eq!(walk.next_spec(), Some((index, spec.as_str())));
+            assert_eq!(walk.next_spec(&[]), Some((index, spec.as_str())));
         }
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 5);
     }
 
@@ -1951,7 +1967,7 @@ mod tests {
         // off by one, and that index is what reaches the failover event.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        let (index, spec) = walk.next_spec().expect("first candidate");
+        let (index, spec) = walk.next_spec(&[]).expect("first candidate");
         assert_eq!((index, spec), (0, "openai/gpt-y"));
         assert_eq!(
             walk.position(),
@@ -1966,8 +1982,8 @@ mod tests {
         // one must still reach entry two on the next turn.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 1, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1976,9 +1992,9 @@ mod tests {
         // caller; the walk only decides what is worth looking at.
         let chain = chain(&["not-a-spec", "openai/gpt-y"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "not-a-spec")));
+        assert_eq!(walk.next_spec(&[]), Some((0, "not-a-spec")));
         assert!(resolve_chain_spec("not-a-spec", &[]).is_none());
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
     }
 
     #[test]
@@ -1990,6 +2006,39 @@ mod tests {
             "openai"
         ));
         assert!(entry.model.id.eq_ignore_ascii_case("gpt-y"));
+    }
+
+    #[test]
+    fn chain_resolution_keeps_declared_provider_routes_in_either_catalog_order() {
+        let mut native = crate::models::ad_hoc_model_entry("openrouter", "vendor/shared")
+            .expect("native model fixture");
+        native.api_key = Some("native-fixture-key".to_string());
+        let mut custom = native.clone();
+        custom.model.provider = "open-router".to_string();
+        custom.model.base_url = "https://declared.example.test/v1".to_string();
+        custom.api_key = Some("declared-fixture-key".to_string());
+        custom
+            .headers
+            .insert("x-route".to_string(), "declared".to_string());
+        let mut unlisted = native.clone();
+        unlisted.model.id = "vendor/unlisted".to_string();
+        for reverse in [false, true] {
+            let mut catalog = vec![native.clone(), unlisted.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            let entry = resolve_chain_spec("open-router/vendor/shared", &catalog)
+                .expect("declared failover destination");
+            assert_eq!(entry.model.provider, "open-router");
+            assert_eq!(entry.model.id, "vendor/shared");
+            assert_eq!(entry.model.base_url, custom.model.base_url);
+            assert_eq!(entry.api_key, custom.api_key);
+            assert_eq!(entry.headers, custom.headers);
+            assert!(resolve_chain_spec("open-router/vendor/unlisted", &catalog).is_none());
+        }
+        let alias = resolve_chain_spec("open-router/vendor/shared", &[native])
+            .expect("undeclared alias remains supported");
+        assert_eq!(alias.model.provider, "openrouter");
     }
 
     // -- shared retry policy (bd-u2qv4) ------------------------------------

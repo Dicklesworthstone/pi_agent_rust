@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::models::{
-    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings,
-    model_requires_configured_credential, normalize_api_key_opt,
+    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings, find_model_entry,
+    model_requires_configured_credential, normalize_api_key_opt, resolve_model_entry,
 };
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
@@ -1012,12 +1012,12 @@ pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    let left_provider = crate::provider_metadata::canonical_provider_id(&left.model.provider)
-        .unwrap_or(&left.model.provider);
-    let right_provider = crate::provider_metadata::canonical_provider_id(&right.model.provider)
-        .unwrap_or(&right.model.provider);
-
-    left_provider.eq_ignore_ascii_case(right_provider)
+    // Entries already carry their resolved provider identity. Canonicalizing
+    // them here hides separately declared providers from switching/cycling.
+    left.model
+        .provider
+        .trim()
+        .eq_ignore_ascii_case(right.model.provider.trim())
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
@@ -1641,21 +1641,25 @@ impl PiApp {
 
         let session_model = session_guard.effective_model_for_current_path();
         let session_thinking = session_guard.effective_thinking_level_for_current_path();
+        let catalog = agent_guard.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
 
         let (target_entry, sync_model) = match session_model.as_ref() {
             Some((provider, model_id)) => {
-                if provider_ids_match(&self.model_entry.model.provider, provider)
+                if self
+                    .model_entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
                     && self.model_entry.model.id.eq_ignore_ascii_case(model_id)
                 {
                     (self.model_entry.clone(), true)
                 } else {
                     (
-                        self.available_models
-                            .iter()
-                            .find(|entry| {
-                                provider_ids_match(&entry.model.provider, provider)
-                                    && entry.model.id.eq_ignore_ascii_case(model_id)
-                            })
+                        find_model_entry(catalog, provider, model_id)
                             .cloned()
                             .ok_or_else(|| {
                                 format!("Unable to switch provider/model to {provider}/{model_id}")
@@ -1679,10 +1683,18 @@ impl PiApp {
 
         let provider = agent_guard.provider();
         let runtime_matches_target =
-            provider_ids_match(provider.name(), &target_entry.model.provider)
-                && provider
-                    .model_id()
-                    .eq_ignore_ascii_case(&target_entry.model.id);
+            find_model_entry(catalog, provider.name(), provider.model_id()).map_or_else(
+                || {
+                    provider
+                        .name()
+                        .trim()
+                        .eq_ignore_ascii_case(target_entry.model.provider.trim())
+                        && provider
+                            .model_id()
+                            .eq_ignore_ascii_case(&target_entry.model.id)
+                },
+                |entry| model_entry_matches(entry, &target_entry),
+            );
         if !runtime_matches_target {
             let resolved_key_opt = target_entry
                 .api_key
@@ -3021,6 +3033,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    /// Resolve explicit commands against the complete runtime catalog. The
+    /// picker list may omit unready providers, but their names remain owned.
+    fn requested_model_entry(
+        &self,
+        provider: &str,
+        model_id: &str,
+        allow_unlisted_native_model: bool,
+    ) -> Result<Option<ModelEntry>, String> {
+        let agent = self
+            .agent
+            .try_lock()
+            .map_err(|_| "Agent busy; try again".to_string())?;
+        let catalog = agent.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
+        Ok(if allow_unlisted_native_model {
+            resolve_model_entry(catalog, provider, model_id)
+        } else {
+            find_model_entry(catalog, provider, model_id).cloned()
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
         // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
@@ -3073,21 +3108,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let pattern_lower = pattern.to_ascii_lowercase();
         let provider_scoped_pattern = split_provider_model_spec(pattern);
 
-        let mut exact_matches = Vec::new();
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || provider_scoped_pattern.is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                exact_matches.push(entry.clone());
+        let qualified = match provider_scoped_pattern {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
+            None => None,
+        };
+        let mut exact_matches: Vec<_> = qualified.into_iter().collect();
+        if exact_matches.is_empty() {
+            exact_matches.extend(
+                self.available_models
+                    .iter()
+                    .filter(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                    .cloned(),
+            );
         }
 
-        let mut matches = if exact_matches.is_empty() {
+        let mut matches = if exact_matches.is_empty() && provider_scoped_pattern.is_none() {
             let mut fuzzy = Vec::new();
             for entry in &self.available_models {
                 let full = format!("{}/{}", entry.model.provider, entry.model.id);
@@ -3111,20 +3154,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         matches.dedup_by(|a, b| model_entry_matches(a, b));
 
         if matches.is_empty()
-            && let Some((provider, model_id)) = pattern.split_once('/')
+            && let Some((provider, model_id)) = provider_scoped_pattern
         {
-            let provider = normalize_auth_provider_input(provider);
-            let model_id = model_id.trim();
-            if !provider.is_empty()
-                && !model_id.is_empty()
-                && let Some(entry) = crate::models::ad_hoc_model_entry(&provider, model_id)
-            {
-                matches.push(entry);
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => matches.extend(entry),
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
 
         if matches.is_empty() {
-            self.status_message = Some(format!("Model not found: {pattern}"));
+            self.status_message = Some(format!(
+                "Model not found: {pattern}. Use /model to inspect registered provider/model pairs."
+            ));
             return None;
         }
         if matches.len() > 1 {
@@ -3197,26 +3241,33 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// bd-cv653.3.1). Records the override in app state and appends a
     /// role-tagged `ModelChange` entry so the assignment replays.
     fn assign_model_to_role(&mut self, role: ModelRole, pattern: &str) -> Option<Cmd> {
-        let mut found: Option<ModelEntry> = None;
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || split_provider_model_spec(pattern).is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                found = Some(entry.clone());
-                break;
+        let qualified = match split_provider_model_spec(pattern) {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
-        }
+            None => None,
+        };
+        let mut found = qualified.or_else(|| {
+            self.available_models
+                .iter()
+                .find(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                .cloned()
+        });
         if found.is_none()
             && let Some((provider, model_id)) = split_provider_model_spec(pattern)
         {
-            let provider = normalize_auth_provider_input(provider);
-            if !provider.is_empty() && !model_id.trim().is_empty() {
-                found = crate::models::ad_hoc_model_entry(&provider, model_id.trim());
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => found = entry,
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
         let Some(entry) = found else {
@@ -3759,28 +3810,25 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     /// Switch the active model to a role-resolved spec when one is configured.
-    fn switch_to_role_spec(&mut self, spec: &str, source: &str) {
-        let Some((provider, model_id)) = crate::provider_metadata::split_provider_model_spec(spec)
-        else {
-            return;
-        };
+    fn switch_to_role_spec(&mut self, spec: &str, source: &str) -> Result<(), String> {
+        let (provider, model_id) = split_provider_model_spec(spec).ok_or_else(|| {
+            format!("Invalid model {spec}. Use /model to choose a provider/model pair")
+        })?;
         let entry = self
-            .available_models
-            .iter()
-            .find(|m| {
-                crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-            .cloned()
-            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
-        if let Some(entry) = entry {
-            let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
-            if let Ok(provider_impl) =
-                create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
-            {
-                let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
-            }
+            .requested_model_entry(provider, model_id, true)?
+            .ok_or_else(|| {
+                format!("Model not found: {spec}. Use /model to inspect registered models")
+            })?;
+        let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
+        if model_requires_configured_credential(&entry) && key.is_none() {
+            return Err(format!(
+                "Missing credentials for provider {}. Run /login {}",
+                entry.model.provider, entry.model.provider
+            ));
         }
+        let provider_impl = create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
+            .map_err(|error| error.to_string())?;
+        self.switch_active_model(&entry, provider_impl, key.as_deref(), source)
     }
 
     fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
@@ -3794,15 +3842,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         plan_state.enter_planning();
         plan_state
             .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
-        if let Some(spec) = self
+        let model_warning = if let Some(spec) = self
             .config
             .model_roles
             .as_ref()
             .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
             .map(str::to_string)
         {
-            self.switch_to_role_spec(&spec, "plan-role");
-        }
+            self.switch_to_role_spec(&spec, "plan-role").err()
+        } else {
+            None
+        };
         Self::log_plan_transition(&self.session, "planning");
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -3810,7 +3860,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             thinking: None,
             collapsed: false,
         });
-        self.status_message = Some("Plan mode: planning (read-only)".to_string());
+        self.status_message = Some(model_warning.map_or_else(
+            || "Plan mode: planning (read-only)".to_string(),
+            |error| {
+                format!(
+                    "Plan mode: planning (read-only). {error}. Continuing with {}",
+                    session_model_line(&self.model_entry)
+                )
+            },
+        ));
         self.scroll_to_bottom();
     }
 
@@ -3828,11 +3886,26 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
                     )));
                 }
-                if let Some((provider, model_id)) = plan_state.take_previous_model() {
-                    self.switch_to_role_spec(&format!("{provider}/{model_id}"), "plan-restore");
-                }
+                let model_warning =
+                    plan_state
+                        .take_previous_model()
+                        .and_then(|(provider, model_id)| {
+                            self.switch_to_role_spec(
+                                &format!("{provider}/{model_id}"),
+                                "plan-restore",
+                            )
+                            .err()
+                        });
                 Self::log_plan_transition(&self.session, "approved");
-                self.status_message = Some("Plan approved — execute it.".to_string());
+                self.status_message = Some(model_warning.map_or_else(
+                    || "Plan approved — execute it.".to_string(),
+                    |error| {
+                        format!(
+                            "Plan approved. {error}. Continuing with {}",
+                            session_model_line(&self.model_entry)
+                        )
+                    },
+                ));
             }
             None => {
                 self.status_message = Some("No submitted plan to approve".to_string());
@@ -5643,6 +5716,167 @@ mod tests {
     }
 
     #[test]
+    fn classic_model_commands_switch_declared_aliases_without_losing_the_route() {
+        for reverse in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            app.save_enabled = false;
+            let mut native = test_model_entry("openrouter", "vendor/shared");
+            native.model.api = "openai-completions".to_string();
+            native
+                .headers
+                .insert("x-route".to_string(), "native".to_string());
+            let mut custom = native.clone();
+            custom.model.provider = "open-router".to_string();
+            custom.model.base_url = "https://declared.example.test/v1".to_string();
+            custom
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+            let mut catalog = vec![native.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            app.available_models = catalog.clone();
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .handle
+                .session_mut()
+                .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                    catalog,
+                ));
+            for target in [&native, &custom, &native] {
+                let spec = format!("{}/{}", target.model.provider, target.model.id);
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(app.model_entry.model.provider, target.model.provider);
+                assert_eq!(app.model_entry.model.base_url, target.model.base_url);
+                assert_eq!(app.model_entry.headers, target.headers);
+                let running = {
+                    let agent = app.agent.try_lock().expect("running agent");
+                    assert_eq!(agent.provider().name(), target.model.provider);
+                    assert_eq!(agent.provider().model_id(), target.model.id);
+                    assert_eq!(agent.stream_options().headers, target.headers);
+                    agent.provider()
+                };
+                let before = session.try_lock().expect("session").entries.len();
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(session.try_lock().expect("session").entries.len(), before);
+                assert!(Arc::ptr_eq(
+                    &running,
+                    &app.agent.try_lock().expect("agent").provider()
+                ));
+                assert_eq!(
+                    session
+                        .try_lock()
+                        .expect("session")
+                        .effective_model_for_current_path(),
+                    Some((target.model.provider.clone(), target.model.id.clone())),
+                );
+            }
+            let _ = app.handle_slash_model("plan open-router/vendor/shared");
+            assert_eq!(
+                app.role_model_overrides.get(&ModelRole::Plan),
+                Some(&("open-router".to_string(), "vendor/shared".to_string())),
+            );
+            app.switch_to_role_spec("open-router/vendor/shared", "plan-role")
+                .expect("switch to the declared plan model");
+            assert_eq!(app.model_entry.model.provider, "open-router");
+            assert_eq!(app.model_entry.headers, custom.headers);
+
+            // A branch/extension selection must reach the same runtime route.
+            session
+                .try_lock()
+                .expect("session")
+                .append_model_change(native.model.provider.clone(), native.model.id.clone());
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore exact provider");
+            assert_eq!(app.model_entry.model.provider, "openrouter");
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .headers,
+                native.headers
+            );
+        }
+    }
+
+    #[test]
+    fn classic_explicit_resolution_keeps_providers_hidden_from_the_ready_picker() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let native = test_model_entry("openrouter", "vendor/shared");
+        let mut custom = test_model_entry("open-router", "vendor/shared");
+        custom.api_key = None;
+        custom.model.base_url = "https://unready-declared.example.test/v1".to_string();
+        let mut native_only = native.clone();
+        native_only.model.id = "vendor/unlisted".to_string();
+        app.available_models = vec![native.clone(), native_only.clone()];
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+                native_only,
+                custom,
+            ]));
+        let resolved = app
+            .requested_model_entry("open-router", "vendor/shared", true)
+            .expect("catalog lookup")
+            .expect("unready declared entry");
+        assert_eq!(resolved.model.provider, "open-router");
+        assert_eq!(
+            resolved.model.base_url,
+            "https://unready-declared.example.test/v1"
+        );
+        assert!(resolved.api_key.is_none());
+        let before = session.try_lock().expect("session").entries.len();
+        let _ = app.handle_slash_model("open-router/vendor/unlisted");
+        assert!(
+            app.status_message
+                .as_deref()
+                .expect("diagnostic")
+                .contains("Model not found")
+        );
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        let error = app
+            .switch_to_role_spec("open-router/vendor/unlisted", "plan-role")
+            .expect_err("a missing role model must return an actionable failure");
+        assert!(error.contains("open-router/vendor/unlisted"));
+        assert!(error.contains("/model"));
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+    }
+
+    #[test]
+    fn classic_undeclared_native_alias_is_an_idempotent_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut native = test_model_entry("openrouter", "vendor/shared");
+        native.model.api = "openai-completions".to_string();
+        app.available_models = vec![native];
+        let _ = app.handle_slash_model("openrouter/vendor/shared");
+        let before = session.try_lock().expect("session").entries.len();
+        let running = app.agent.try_lock().expect("agent").provider();
+        let _ = app.handle_slash_model("open-router/vendor/shared");
+        assert_eq!(app.model_entry.model.provider, "openrouter");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        assert!(Arc::ptr_eq(
+            &running,
+            &app.agent.try_lock().expect("agent").provider()
+        ));
+    }
+
+    #[test]
     fn plan_session_thinking_sync_repairs_missing_header_when_model_clamps_runtime_level() {
         let mut target = test_model_entry("acme", "plain-model");
         target.model.reasoning = false;
@@ -5906,10 +6140,12 @@ mod tests {
     }
 
     #[test]
-    fn model_entry_matches_provider_aliases_case_insensitively() {
+    fn resolved_model_entries_keep_declared_aliases_distinct() {
         let left = test_model_entry("openrouter", "openai/gpt-4o-mini");
         let right = test_model_entry("open-router", "openai/gpt-4o-mini");
-        assert!(super::model_entry_matches(&left, &right));
+        assert!(!super::model_entry_matches(&left, &right));
+        let same = test_model_entry(" OpenRouter ", "OPENAI/GPT-4O-MINI");
+        assert!(super::model_entry_matches(&left, &same));
     }
 
     #[test]
@@ -5929,7 +6165,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scoped_model_entries_dedupes_provider_alias_variants() {
+    fn resolve_scoped_model_entries_preserves_separately_declared_aliases() {
         let available = vec![
             test_model_entry("openrouter", "openai/gpt-4o-mini"),
             test_model_entry("open-router", "openai/gpt-4o-mini"),
@@ -5938,7 +6174,11 @@ mod tests {
         let resolved = super::resolve_scoped_model_entries(&patterns, &available)
             .expect("resolve scoped models");
         assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model.provider, "openrouter");
         assert_eq!(resolved[0].model.id, "openai/gpt-4o-mini");
+        let resolved = super::resolve_scoped_model_entries(&["*".to_string()], &available)
+            .expect("both declared providers remain in the scope");
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]

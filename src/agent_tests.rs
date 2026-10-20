@@ -3718,6 +3718,836 @@ mod tests {
         agent_session
     }
 
+    fn extension_switch_entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: format!("https://{provider}.example.test/v1"),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: Some(format!("{provider}-key")),
+            headers: HashMap::from([("x-route".to_string(), provider.to_string())]),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn build_catalog_switch_session(
+        entries: Vec<ModelEntry>,
+        initial: (&str, &str),
+        cwd: &Path,
+    ) -> AgentSession {
+        let registry = ModelRegistry::from_entries_for_tests(entries);
+        let initial_entry = registry.find(initial.0, initial.1).expect("initial entry");
+        let provider =
+            crate::providers::create_provider(&initial_entry, None).expect("initial provider");
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], cwd, None),
+            AgentConfig {
+                stream_options: StreamOptions {
+                    api_key: initial_entry.api_key.clone(),
+                    headers: initial_entry.headers.clone(),
+                    thinking_level: Some(crate::model::ThinkingLevel::Off),
+                    ..StreamOptions::default()
+                },
+                ..AgentConfig::default()
+            },
+        );
+        let mut session = Session::in_memory();
+        session.append_model_change(initial.0.to_string(), initial.1.to_string());
+        session.append_thinking_level_change("off".to_string());
+        session.set_model_header(
+            Some(initial.0.to_string()),
+            Some(initial.1.to_string()),
+            Some("off".to_string()),
+        );
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(session)),
+            false,
+            ResolvedCompactionSettings::default(),
+        )
+        .with_model_registry(registry)
+    }
+
+    async fn build_extension_switch_session(
+        entries: Vec<ModelEntry>,
+        initial: (&str, &str),
+        cwd: &Path,
+        extension_source: &str,
+    ) -> AgentSession {
+        let mut agent_session = build_catalog_switch_session(entries, initial, cwd);
+        let extension_path = cwd.join("model-switch.mjs");
+        std::fs::write(&extension_path, extension_source).expect("write model switch extension");
+        agent_session
+            .enable_extensions(&[], cwd, None, &[extension_path])
+            .await
+            .expect("enable model switch extension");
+        agent_session
+    }
+
+    async fn try_catalog_failover(
+        agent_session: &mut AgentSession,
+        available_models: &[ModelEntry],
+        auth: &AuthStorage,
+        specs: &[&str],
+        start_position: usize,
+        cli_api_key: Option<&str>,
+    ) -> FailoverSwapOutcome {
+        let chain = crate::failover::FailoverChain {
+            entries: specs.iter().map(|spec| (*spec).to_string()).collect(),
+        };
+        let attempt = FailoverSwapAttempt {
+            chain: &chain,
+            start_position,
+            available_models,
+            auth,
+            cli_api_key,
+            class: crate::failover::FailoverClass::Quota,
+            thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+            require_incomplete_tail: false,
+            primary: None,
+            cooldown_secs: Some(0),
+            lifecycle_id: Some("catalog-routing-test"),
+        };
+        agent_session
+            .try_failover(&crate::agent_cx::AgentCx::for_request(), &attempt)
+            .await
+            .expect("failover decision")
+    }
+
+    #[test]
+    fn extension_model_switch_preserves_declared_provider_through_runtime_and_reopen() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (previous, requested) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
+                for reversed in [false, true] {
+                    for requested_model in ["shared", "vendor/other-model"] {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let mut entries = vec![
+                            extension_switch_entry(previous, "shared"),
+                            extension_switch_entry(requested, "shared"),
+                            extension_switch_entry(requested, "vendor/other-model"),
+                        ];
+                        if reversed {
+                            entries.reverse();
+                        }
+                        let mut agent_session = build_extension_switch_session(
+                            entries,
+                            (previous, "shared"),
+                            dir.path(),
+                            r#"export default function init(pi) {
+                                pi.registerCommand("select-route", {
+                                    handler: async (args) => {
+                                        await pi.events("setModel", JSON.parse(args));
+                                        return "selected";
+                                    }
+                                });
+                            }"#,
+                        )
+                        .await;
+                        let request = json!({
+                            "provider": requested,
+                            "modelId": requested_model,
+                        })
+                        .to_string();
+                        for _ in 0..2 {
+                            agent_session
+                                .execute_extension_command(
+                                    "select-route",
+                                    &request,
+                                    5_000,
+                                    |_| {},
+                                )
+                                .await
+                                .expect("select registered destination through JS hostcall");
+                            agent_session
+                                .sync_runtime_selection_from_session_header()
+                                .await
+                                .expect("install selected runtime route");
+                        }
+                        let active = agent_session.agent.provider();
+                        assert_eq!(active.name(), requested);
+                        assert_eq!(active.model_id(), requested_model);
+                        let entry = agent_session.current_model_entry().expect("active entry");
+                        assert_eq!(
+                            entry.model.base_url,
+                            format!("https://{requested}.example.test/v1")
+                        );
+                        assert_eq!(agent_session.agent.stream_options().api_key, entry.api_key);
+                        assert_eq!(agent_session.agent.stream_options().headers, entry.headers);
+
+                        let cx = crate::agent_cx::AgentCx::for_request();
+                        let mut session = agent_session
+                            .session
+                            .lock(cx.cx())
+                            .await
+                            .expect("session");
+                        let model_changes = session
+                            .entries
+                            .iter()
+                            .filter(|entry| {
+                                matches!(entry, crate::session::SessionEntry::ModelChange(_))
+                            })
+                            .count();
+                        assert_eq!(model_changes, 2, "repeat selection must be idempotent");
+                        let path = dir.path().join("selected.jsonl");
+                        session.path = Some(path.clone());
+                        session.save().await.expect("save selected route");
+                        drop(session);
+                        let reopened = Session::open(path.to_str().expect("session path"))
+                            .await
+                            .expect("reopen selected route");
+                        assert_eq!(reopened.header.provider.as_deref(), Some(requested));
+                        assert_eq!(
+                            reopened.effective_model_for_current_path(),
+                            Some((requested.to_string(), requested_model.to_string()))
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn extension_model_switch_resolves_native_alias_and_refreshed_catalog() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let canonical = extension_switch_entry("openrouter", "shared");
+            let custom = extension_switch_entry("open-router", "other");
+            let mut agent_session = build_extension_switch_session(
+                vec![canonical.clone()],
+                ("openrouter", "shared"),
+                dir.path(),
+                "export default function init() {}",
+            )
+            .await;
+            let bridge = agent_session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager()
+                .session_handle()
+                .expect("session bridge");
+            let origin = agent_session.session_action_admission.capture_origin();
+            bridge
+                .set_model(
+                    "open-router".to_string(),
+                    "SHARED".to_string(),
+                    Some(origin.clone()),
+                )
+                .await
+                .expect("undeclared native alias resolves");
+            let before = bridge.get_branch().await;
+            assert_eq!(
+                bridge.get_model().await,
+                (Some("openrouter".to_string()), Some("shared".to_string()))
+            );
+            assert_eq!(
+                before
+                    .iter()
+                    .filter(|entry| entry["type"] == "model_change")
+                    .count(),
+                1
+            );
+
+            // A bridge created before registration must see the newly declared
+            // provider boundary, including a missing model on that provider.
+            agent_session.set_model_registry(ModelRegistry::from_entries_for_tests(vec![
+                canonical, custom,
+            ]));
+            let error = bridge
+                .set_model(
+                    "open-router".to_string(),
+                    "shared".to_string(),
+                    Some(origin.clone()),
+                )
+                .await
+                .expect_err("declared custom provider cannot borrow the native model");
+            assert!(error.to_string().contains("open-router/shared"));
+            assert!(error.to_string().contains("ctx.modelRegistry.find"));
+            assert_eq!(bridge.get_branch().await, before);
+            for (provider, model) in
+                [("missing", "shared"), (" ", "shared"), ("openrouter", "\t")]
+            {
+                bridge
+                    .set_model(
+                        provider.to_string(),
+                        model.to_string(),
+                        Some(origin.clone()),
+                    )
+                    .await
+                    .expect_err("unresolvable selection must not mutate session");
+                assert_eq!(bridge.get_branch().await, before);
+            }
+            bridge
+                .set_model("open-router".to_string(), "other".to_string(), Some(origin))
+                .await
+                .expect("newly registered model resolves through existing bridge");
+            agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect("install custom destination");
+            assert_eq!(agent_session.agent.provider().name(), "open-router");
+            assert_eq!(agent_session.agent.provider().model_id(), "other");
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("open-router-key")
+            );
+        });
+    }
+
+    #[test]
+    fn extension_startup_hook_uses_the_registered_model_catalog() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut agent_session = build_extension_switch_session(
+                vec![
+                    extension_switch_entry("openrouter", "shared"),
+                    extension_switch_entry("open-router", "shared"),
+                ],
+                ("openrouter", "shared"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.on("session_start", async () => {
+                        await pi.events("setModel", { provider: "open-router", modelId: "shared" });
+                    });
+                }"#,
+            )
+            .await;
+            agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect("install startup hook selection");
+            assert_eq!(agent_session.agent.provider().name(), "open-router");
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("open-router-key")
+            );
+        });
+    }
+
+    #[test]
+    fn extension_startup_hook_can_select_its_newly_registered_provider() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut agent_session = build_extension_switch_session(
+                vec![extension_switch_entry("openrouter", "shared")],
+                ("openrouter", "shared"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.registerProvider("open-router", {
+                        api: "openai-completions",
+                        baseUrl: "https://newly-registered.example.test/v1",
+                        apiKey: "newly-registered-key",
+                        models: [{ id: "shared", name: "Shared", contextWindow: 64000, maxTokens: 4096 }]
+                    });
+                    pi.on("session_start", async (_event, ctx) => {
+                        if (!ctx.modelRegistry.find("open-router", "shared")) {
+                            throw new Error("registered provider missing from startup catalog");
+                        }
+                        await pi.events("setModel", { provider: "open-router", modelId: "shared" });
+                    });
+                }"#,
+            )
+            .await;
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extension region")
+                .manager();
+            let bridge = manager.session_handle().expect("session bridge");
+            assert_eq!(
+                bridge.get_model().await,
+                (Some("open-router".to_string()), Some("shared".to_string()))
+            );
+
+            // The caller's final registration merge remains authoritative for
+            // live routing, just as main and SDK startup complete this step.
+            let bindings =
+                crate::models::extension_provider_bindings(&manager.extension_providers())
+                    .expect("registered provider bindings");
+            let mut registry = agent_session.model_registry().expect("registry").clone();
+            registry
+                .merge_extension_registry(&bindings, manager.extension_model_entries())
+                .expect("final registration merge");
+            agent_session.set_model_registry(registry);
+            agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect("install newly registered destination");
+            assert_eq!(agent_session.agent.provider().name(), "open-router");
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("newly-registered-key")
+            );
+            assert_eq!(
+                agent_session
+                    .current_model_entry()
+                    .expect("active entry")
+                    .model
+                    .base_url,
+                "https://newly-registered.example.test/v1"
+            );
+        });
+    }
+
+    #[test]
+    fn failover_keeps_full_catalog_identity_and_exact_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for reversed in [false, true] {
+                for (ready, admitted, override_key, should_select_declared) in [
+                    (false, false, None, false),
+                    (false, false, Some(" "), false),
+                    (false, false, Some(" explicit-key "), true),
+                    (false, true, None, true),
+                    (true, false, None, false),
+                    (true, false, Some("explicit-key"), false),
+                    (true, true, None, true),
+                ] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let native = extension_switch_entry("openrouter", "shared");
+                    let initial = extension_switch_entry("initial-route", "shared");
+                    let rescue = extension_switch_entry("rescue-route", "shared");
+                    let mut declared = extension_switch_entry("open-router", "shared");
+                    if !ready {
+                        declared.api_key = None;
+                    }
+                    let mut catalog = vec![
+                        native.clone(),
+                        declared.clone(),
+                        initial.clone(),
+                        rescue.clone(),
+                    ];
+                    if reversed {
+                        catalog.reverse();
+                    }
+                    let mut available = vec![native, initial, rescue];
+                    if admitted {
+                        available.push(declared);
+                    }
+                    let mut agent_session = build_catalog_switch_session(
+                        catalog,
+                        ("initial-route", "shared"),
+                        dir.path(),
+                    );
+                    let mut auth =
+                        AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                    for provider in ["openrouter", "open-router", "rescue-route"] {
+                        auth.set(
+                            provider,
+                            AuthCredential::BearerToken {
+                                token: format!("{provider}-token"),
+                            },
+                        );
+                    }
+                    let outcome = try_catalog_failover(
+                        &mut agent_session,
+                        &available,
+                        &auth,
+                        &["open-router/shared", "rescue-route/shared"],
+                        0,
+                        override_key,
+                    )
+                    .await;
+                    let committed = outcome.committed.expect("usable fallback");
+                    let expected = if should_select_declared {
+                        "open-router"
+                    } else {
+                        "rescue-route"
+                    };
+                    let expected_index = usize::from(!should_select_declared);
+                    assert_eq!(committed.entry_index, expected_index);
+                    assert_eq!(outcome.next_position, expected_index + 1);
+                    assert_eq!(committed.to_provider, expected);
+                    assert_eq!(agent_session.agent.provider().name(), expected);
+                    assert_eq!(agent_session.agent.provider().model_id(), "shared");
+                    let expected_key = override_key
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                        .map_or_else(|| format!("{expected}-token"), str::to_string);
+                    assert_eq!(
+                        agent_session.agent.stream_options().api_key.as_deref(),
+                        Some(expected_key.as_str())
+                    );
+                    assert_eq!(
+                        agent_session.agent.stream_options().headers.get("x-route"),
+                        Some(&expected.to_string())
+                    );
+                    let entry = agent_session.current_model_entry().expect("selected entry");
+                    assert_eq!(
+                        entry.model.base_url,
+                        format!("https://{expected}.example.test/v1")
+                    );
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let session = agent_session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("session");
+                    assert_eq!(session.header.provider.as_deref(), Some(expected));
+                    assert_eq!(
+                        session.effective_model_for_current_path(),
+                        Some((expected.to_string(), "shared".to_string()))
+                    );
+                    let provenance = session
+                        .active_failover_provenance_for_current_path()
+                        .expect("committed failover provenance");
+                    assert_eq!(provenance.primary_provider, "initial-route");
+                    assert_eq!(provenance.fallback_provider, expected);
+                    assert_eq!(provenance.chain_position, Some(expected_index + 1));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn failover_walk_keeps_distinct_declared_aliases_and_resumed_entries() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (previous, requested) in [
+                ("openrouter", "open-router"),
+                ("open-router", "openrouter"),
+            ] {
+                for reversed in [false, true] {
+                    for resumed in [false, true] {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let mut entries = vec![
+                            extension_switch_entry(previous, "shared"),
+                            extension_switch_entry(requested, "shared"),
+                            extension_switch_entry("intermediate-route", "shared"),
+                        ];
+                        if reversed {
+                            entries.reverse();
+                        }
+                        let initial = if resumed {
+                            "intermediate-route"
+                        } else {
+                            previous
+                        };
+                        let mut agent_session = build_catalog_switch_session(
+                            entries.clone(),
+                            (initial, "shared"),
+                            dir.path(),
+                        );
+                        let mut auth =
+                            AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                        auth.set(
+                            requested,
+                            AuthCredential::BearerToken {
+                                token: format!("{requested}-token"),
+                            },
+                        );
+                        let previous_spec = format!("{previous}/shared");
+                        let requested_spec = format!("{requested}/shared");
+                        let mut specs = vec![previous_spec.as_str()];
+                        if resumed {
+                            specs.push("intermediate-route/shared");
+                        }
+                        specs.push(&requested_spec);
+                        let expected_index = specs.len() - 1;
+                        let outcome = try_catalog_failover(
+                            &mut agent_session,
+                            &entries,
+                            &auth,
+                            &specs,
+                            if resumed { expected_index } else { 0 },
+                            None,
+                        )
+                        .await;
+                        let committed = outcome.committed.expect("distinct provider fallback");
+                        assert_eq!(committed.entry_index, expected_index);
+                        assert_eq!(outcome.next_position, specs.len());
+                        assert_eq!(committed.to_provider, requested);
+                        assert_eq!(agent_session.agent.provider().name(), requested);
+                        assert_eq!(agent_session.agent.provider().model_id(), "shared");
+                        assert_eq!(
+                            agent_session.agent.stream_options().api_key.as_deref(),
+                            Some(format!("{requested}-token").as_str())
+                        );
+                        assert_eq!(
+                            agent_session.agent.stream_options().headers.get("x-route"),
+                            Some(&requested.to_string())
+                        );
+                        let cx = crate::agent_cx::AgentCx::for_request();
+                        let session = agent_session
+                            .session
+                            .lock(cx.cx())
+                            .await
+                            .expect("session");
+                        assert_eq!(session.header.provider.as_deref(), Some(requested));
+                        assert_eq!(
+                            session
+                                .active_failover_provenance_for_current_path()
+                                .expect("failover provenance")
+                                .fallback_provider,
+                            requested
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn failover_preserves_native_alias_dedup_and_unlisted_destinations() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (spec, provider, override_key) in [
+                ("ollama/vendor/unlisted", "ollama", None),
+                (
+                    "openrouter/vendor/unlisted",
+                    "openrouter",
+                    Some("unlisted-key"),
+                ),
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let entries = vec![extension_switch_entry("openrouter", "shared")];
+                let mut agent_session = build_catalog_switch_session(
+                    entries.clone(),
+                    ("openrouter", "shared"),
+                    dir.path(),
+                );
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let no_op = try_catalog_failover(
+                    &mut agent_session,
+                    &entries,
+                    &auth,
+                    &["open-router/shared", " OPENROUTER / SHARED "],
+                    0,
+                    None,
+                )
+                .await;
+                assert!(no_op.committed.is_none());
+                assert_eq!(no_op.next_position, 2);
+                assert_eq!(agent_session.agent.provider().name(), "openrouter");
+                {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let session = agent_session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("session");
+                    assert!(session.active_failover_provenance_for_current_path().is_none());
+                    assert_eq!(session.entries.len(), 2);
+                }
+                let outcome = try_catalog_failover(
+                    &mut agent_session,
+                    &entries,
+                    &auth,
+                    &["open-router/shared", "openrouter/shared", spec],
+                    0,
+                    override_key,
+                )
+                .await;
+                let committed = outcome.committed.expect("unlisted native fallback");
+                assert_eq!(committed.entry_index, 2);
+                assert_eq!(outcome.next_position, 3);
+                assert_eq!(agent_session.agent.provider().name(), provider);
+                assert_eq!(agent_session.agent.provider().model_id(), "vendor/unlisted");
+                if let Some(key) = override_key {
+                    assert_eq!(
+                        agent_session.agent.stream_options().api_key.as_deref(),
+                        Some(key)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn primary_restore_keeps_full_catalog_identity_and_respects_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for reversed in [false, true] {
+                for (ready, admitted, override_key, should_restore) in [
+                    (true, true, None, true),
+                    (false, false, None, false),
+                    (false, false, Some(" "), false),
+                    (false, false, Some("explicit-key"), true),
+                    (true, false, None, false),
+                    (true, false, Some("explicit-key"), false),
+                ] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let native = extension_switch_entry("openrouter", "shared");
+                    let fallback = extension_switch_entry("fallback-route", "shared");
+                    let mut primary_entry = extension_switch_entry("open-router", "shared");
+                    primary_entry.model.base_url =
+                        "https://declared-primary.example.test/v1".to_string();
+                    if !ready {
+                        primary_entry.api_key = None;
+                    }
+                    let mut full_catalog =
+                        vec![native.clone(), primary_entry.clone(), fallback.clone()];
+                    if reversed {
+                        full_catalog.reverse();
+                    }
+                    let mut allowed = vec![native, fallback];
+                    if admitted {
+                        allowed.push(primary_entry);
+                    }
+                    let mut agent_session = build_catalog_switch_session(
+                        full_catalog,
+                        ("fallback-route", "shared"),
+                        dir.path(),
+                    );
+                    let mut auth =
+                        AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                    auth.set(
+                        "open-router",
+                        AuthCredential::BearerToken {
+                            token: "declared-provider-token".to_string(),
+                        },
+                    );
+                    auth.set(
+                        "openrouter",
+                        AuthCredential::BearerToken {
+                            token: "competing-provider-token".to_string(),
+                        },
+                    );
+                    let primary = crate::failover::FailoverPrimary {
+                        provider: "open-router".to_string(),
+                        model_id: "shared".to_string(),
+                        requested_thinking_level: crate::model::ThinkingLevel::Off,
+                    };
+                    let active = ("fallback-route".to_string(), "shared".to_string());
+                    let request = PrimaryRestoreRequest {
+                        primary: &primary,
+                        active: &active,
+                        cooldown_elapsed: true,
+                        available_models: &allowed,
+                        auth: &auth,
+                        cli_api_key: override_key,
+                        strict_invariants: false,
+                        invalidate_background_compaction: true,
+                    };
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let restored = agent_session
+                        .restore_primary(&cx, &request)
+                        .await
+                        .expect("restore decision");
+                    assert_eq!(restored.is_some(), should_restore);
+                    if should_restore {
+                        assert_eq!(agent_session.agent.provider().name(), "open-router");
+                        assert_eq!(agent_session.agent.provider().model_id(), "shared");
+                        assert_eq!(
+                            agent_session.agent.stream_options().api_key.as_deref(),
+                            Some(override_key.unwrap_or("declared-provider-token"))
+                        );
+                        assert_eq!(
+                            agent_session
+                                .current_model_entry()
+                                .expect("restored entry")
+                                .model
+                                .base_url,
+                            "https://declared-primary.example.test/v1"
+                        );
+                    } else {
+                        assert_eq!(agent_session.agent.provider().name(), "fallback-route");
+                    }
+                    let session = agent_session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("session");
+                    let expected_provider = if should_restore {
+                        "open-router"
+                    } else {
+                        "fallback-route"
+                    };
+                    assert_eq!(session.header.provider.as_deref(), Some(expected_provider));
+                    assert_eq!(
+                        session.effective_model_for_current_path(),
+                        Some((expected_provider.to_string(), "shared".to_string()))
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn primary_restore_rejects_stale_declared_alias_fallback_identity() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for runtime_provider in ["open-router", "openrouter"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let entries = vec![
+                    extension_switch_entry("openrouter", "shared"),
+                    extension_switch_entry("open-router", "shared"),
+                    extension_switch_entry("primary-route", "shared"),
+                ];
+                let mut agent_session = build_catalog_switch_session(
+                    entries.clone(),
+                    (runtime_provider, "shared"),
+                    dir.path(),
+                );
+                let cx = crate::agent_cx::AgentCx::for_request();
+                // One case has drifted runtime identity, the other has a
+                // branch-local Session change despite the runtime still matching.
+                {
+                    let mut session = agent_session
+                        .session
+                        .lock(cx.cx())
+                        .await
+                        .expect("session");
+                    session.select_model("open-router".to_string(), "shared".to_string());
+                }
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let primary = crate::failover::FailoverPrimary {
+                    provider: "primary-route".to_string(),
+                    model_id: "shared".to_string(),
+                    requested_thinking_level: crate::model::ThinkingLevel::Off,
+                };
+                let active = ("openrouter".to_string(), "shared".to_string());
+                let request = PrimaryRestoreRequest {
+                    primary: &primary,
+                    active: &active,
+                    cooldown_elapsed: true,
+                    available_models: &entries,
+                    auth: &auth,
+                    cli_api_key: None,
+                    strict_invariants: false,
+                    invalidate_background_compaction: true,
+                };
+                assert!(
+                    agent_session
+                        .restore_primary(&cx, &request)
+                        .await
+                        .expect("decline stale restore")
+                        .is_none()
+                );
+                assert_eq!(agent_session.agent.provider().name(), runtime_provider);
+                let session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session");
+                assert_eq!(session.header.provider.as_deref(), Some("open-router"));
+            }
+        });
+    }
+
     #[test]
     fn compaction_runtime_handle_creates_fallback_runtime() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -803,11 +803,13 @@ pub(crate) fn select_model_and_thinking_with_fallback(
     let mut keep_selected_destination = false;
 
     if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
-        let found = registry
-            .find(provider, model_id)
-            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
+        let found = crate::models::resolve_model_entry(registry.models(), provider, model_id);
         if found.is_none() {
-            bail!("Model {provider}/{model_id} not found");
+            bail!(
+                "Model {provider}/{model_id} not found. Run pi --list-models and check the \
+                 provider's registered model IDs. A separately declared provider cannot use \
+                 another provider's built-in route for an unregistered model."
+            );
         }
         selected_model = found;
     } else if let Some(provider) = cli.provider.as_deref() {
@@ -859,8 +861,9 @@ pub(crate) fn select_model_and_thinking_with_fallback(
                     .map(|_| id)
             });
             let default_model = configured_default.or_else(|| provider_default_model_id(provider));
-            selected_model = default_model
-                .and_then(|model_id| crate::models::ad_hoc_model_entry(provider, model_id));
+            selected_model = default_model.and_then(|model_id| {
+                crate::models::resolve_model_entry(registry.models(), provider, model_id)
+            });
             configured_default_used = configured_default.is_some() && selected_model.is_some();
             if selected_model.is_none() {
                 bail!("No models available for provider {provider}");
@@ -926,9 +929,8 @@ pub(crate) fn select_model_and_thinking_with_fallback(
         }
     } else if let Some(model_id) = cli.model.as_deref() {
         if let Some((provider, scoped_model_id)) = split_provider_model_spec(model_id) {
-            selected_model = registry
-                .find(provider, scoped_model_id)
-                .or_else(|| crate::models::ad_hoc_model_entry(provider, scoped_model_id));
+            selected_model =
+                crate::models::resolve_model_entry(registry.models(), provider, scoped_model_id);
         }
 
         if selected_model.is_none() {
@@ -939,7 +941,10 @@ pub(crate) fn select_model_and_thinking_with_fallback(
                 .cloned()
                 .collect();
             if matches.is_empty() {
-                bail!("Model {model_id} not found");
+                bail!(
+                    "Model {model_id} not found. Run pi --list-models and use a registered \
+                     provider/model pair, or correct --provider/--model."
+                );
             }
             if let Some(default_provider) = config.default_provider.as_deref() {
                 selected_model = registry.find(default_provider, model_id);
@@ -1229,9 +1234,7 @@ fn resolve_role_spec(
         return None;
     }
     let entry = if let Some((provider, model_id)) = split_provider_model_spec(model_part) {
-        registry
-            .find(provider, model_id)
-            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+        crate::models::resolve_model_entry(registry.models(), provider, model_id)
     } else {
         registry.find_by_id(model_part)
     };
@@ -1478,9 +1481,8 @@ fn restore_model_from_session(
     registry: &ModelRegistry,
     use_registry_fallback: bool,
 ) -> RestoreResult {
-    let restored = registry
-        .find(saved_provider, saved_model_id)
-        .or_else(|| crate::models::ad_hoc_model_entry(saved_provider, saved_model_id));
+    let restored =
+        crate::models::resolve_model_entry(registry.models(), saved_provider, saved_model_id);
 
     if restored.is_some() {
         return RestoreResult {
@@ -1844,9 +1846,7 @@ pub fn resolve_startup_model_scope(
         // the normal selector can actually restore from this branch, before
         // its unrelated-default fallback. Match restore_model_from_session.
         && !model_from_session_state(session).is_some_and(|(provider, model_id)| {
-            registry
-                .find(&provider, &model_id)
-                .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id))
+            crate::models::resolve_model_entry(registry.models(), &provider, &model_id)
                 .is_some()
         })
     {
@@ -1925,12 +1925,15 @@ pub fn resolve_model_scope(
             continue;
         }
 
-        let parsed = parse_model_pattern(pattern, &available_models);
+        let parsed = parse_model_pattern(pattern, &available_models, registry);
         if let Some(warning) = parsed.warning {
             eprintln!("Warning: {warning}");
         }
 
-        if let Some(model) = parsed.model {
+        if let Some(model) = parsed
+            .model
+            .filter(|entry| allow_missing_keys || model_entry_is_ready(entry))
+        {
             if !scoped_models
                 .iter()
                 .any(|sm| scoped_models_equal(&sm.model, &model, registry))
@@ -1948,14 +1951,18 @@ pub fn resolve_model_scope(
     scoped_models
 }
 
-fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> ParsedModelResult {
+fn parse_model_pattern(
+    pattern: &str,
+    available_models: &[ModelEntry],
+    registry: &ModelRegistry,
+) -> ParsedModelResult {
     // Try stripping a valid thinking-level suffix FIRST. This prevents
     // `provider/model:high` from being swallowed by `ad_hoc_model_entry`
     // which would create a model with id `model:high` instead of `model`.
     if let Some((prefix, suffix)) = pattern.rsplit_once(':')
         && let Some(thinking_level) = parse_thinking_level_opt(suffix)
     {
-        let result = parse_model_pattern(prefix, available_models);
+        let result = parse_model_pattern(prefix, available_models, registry);
         if result.model.is_some() {
             return ParsedModelResult {
                 model: result.model,
@@ -1969,7 +1976,7 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
         }
     }
 
-    if let Some(model) = try_match_model(pattern, available_models) {
+    if let Some(model) = try_match_model(pattern, available_models, registry) {
         return ParsedModelResult {
             model: Some(model),
             thinking_level: None,
@@ -1986,7 +1993,7 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     };
 
     // Invalid thinking level suffix — still match the model but warn
-    let result = parse_model_pattern(prefix, available_models);
+    let result = parse_model_pattern(prefix, available_models, registry);
     if result.model.is_some() {
         return ParsedModelResult {
             model: result.model,
@@ -2000,31 +2007,19 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     result
 }
 
-fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<ModelEntry> {
+fn try_match_model(
+    pattern: &str,
+    available_models: &[ModelEntry],
+    registry: &ModelRegistry,
+) -> Option<ModelEntry> {
     if let Some((provider, model_id)) = split_provider_model_spec(pattern) {
-        let exact_provider_exists = available_models.iter().any(|entry| {
-            entry
-                .model
-                .provider
-                .trim()
-                .eq_ignore_ascii_case(provider.trim())
-        });
-        if let Some(found) = available_models.iter().find(|m| {
-            let provider_matches = if exact_provider_exists {
-                m.model
-                    .provider
-                    .trim()
-                    .eq_ignore_ascii_case(provider.trim())
-            } else {
-                provider_ids_match(&m.model.provider, provider)
-            };
-            provider_matches && m.model.id.eq_ignore_ascii_case(model_id)
-        }) {
-            return Some(found.clone());
-        }
-
-        if let Some(ad_hoc) = crate::models::ad_hoc_model_entry(provider, model_id) {
-            return Some(ad_hoc);
+        // Resolve the destination before filtering credentials. Removing an
+        // unready declared provider first can turn its name into a native
+        // alias and silently select another provider or fabricate its route.
+        if let Some(entry) =
+            crate::models::resolve_model_entry(registry.models(), provider, model_id)
+        {
+            return Some(entry);
         }
     }
 
@@ -2035,6 +2030,13 @@ fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<Mod
         .collect();
     if let Some(found) = select_preferred_exact_id_match(&exact_matches) {
         return Some(found);
+    }
+
+    // A complete registered bare ID may contain a slash. Once that exact
+    // interpretation also fails, a provider/model request must not fuzzily
+    // select a different model with a similar name.
+    if split_provider_model_spec(pattern).is_some() {
+        return None;
     }
 
     let pattern_lower = pattern.to_lowercase();
@@ -2851,7 +2853,8 @@ mod tests {
             test_model_entry("gpt-5.1-codex-latest", "openai", true),
         ];
 
-        let parsed = parse_model_pattern("gpt-5.1-codex", &available);
+        let registry = registry_with_entries(available.clone());
+        let parsed = parse_model_pattern("gpt-5.1-codex", &available, &registry);
         let model = parsed.model.expect("model should match");
 
         assert_eq!(model.model.id, "gpt-5.1-codex-latest");
@@ -2866,8 +2869,13 @@ mod tests {
             .headers
             .insert("x-test".to_string(), "1".to_string());
 
-        let matched = try_match_model("open-router/openai/gpt-4o-mini", &[openrouter.clone()])
-            .expect("provider alias should match existing entry");
+        let registry = registry_with_entries(vec![openrouter]);
+        let matched = try_match_model(
+            "open-router/openai/gpt-4o-mini",
+            registry.models(),
+            &registry,
+        )
+        .expect("provider alias should match existing entry");
 
         assert_eq!(matched.model.provider, "openrouter");
         assert_eq!(matched.model.id, "openai/gpt-4o-mini");
@@ -2876,6 +2884,169 @@ mod tests {
             Some("1"),
             "must preserve existing model metadata instead of falling back to ad-hoc"
         );
+    }
+
+    #[test]
+    fn explicit_model_requests_keep_declared_alias_routes_and_reject_missing_models() {
+        for (declared, native) in [("open-router", "openrouter"), ("gemini", "google")] {
+            for reverse in [false, true] {
+                let mut custom = test_model_entry("shared", declared, true);
+                custom.model.base_url = "https://declared.example.test/v1".to_string();
+                custom
+                    .headers
+                    .insert("x-route".to_string(), "declared".to_string());
+                let mut entries = vec![
+                    test_model_entry("shared", native, true),
+                    test_model_entry("unlisted", native, true),
+                    custom,
+                ];
+                if reverse {
+                    entries.reverse();
+                }
+                let registry = registry_with_entries(entries);
+                for separate_flags in [false, true] {
+                    for id in ["shared", "unlisted"] {
+                        let spec = format!("{declared}/{id}");
+                        let cli = if separate_flags {
+                            cli::Cli::parse_from(["pi", "--provider", declared, "--model", id])
+                        } else {
+                            cli::Cli::parse_from(["pi", "--model", spec.as_str()])
+                        };
+                        let selected = select_model_and_thinking(
+                            &cli,
+                            &Config::default(),
+                            &Session::in_memory(),
+                            &registry,
+                            &[],
+                            Path::new("/tmp"),
+                        );
+                        if id == "shared" {
+                            let selected = selected.expect("declared model resolves");
+                            assert_eq!(selected.model_entry.model.provider, declared);
+                            assert_eq!(selected.model_entry.model.id, "shared");
+                            assert_eq!(
+                                selected.model_entry.model.base_url,
+                                "https://declared.example.test/v1"
+                            );
+                            assert_eq!(
+                                selected
+                                    .model_entry
+                                    .headers
+                                    .get("x-route")
+                                    .map(String::as_str),
+                                Some("declared")
+                            );
+                            assert!(selected.fallback_message.is_none());
+                        } else {
+                            let error = selected
+                                .expect_err("missing declared model must fail")
+                                .to_string();
+                            assert!(error.contains(&spec));
+                            assert!(error.contains("--list-models"));
+                        }
+                    }
+                }
+                assert!(
+                    resolve_role_spec(&format!("{declared}/unlisted:high"), &registry).is_none()
+                );
+                let restore = restore_model_from_session(declared, "unlisted", &registry, false);
+                assert!(restore.model.is_none());
+                assert!(
+                    restore
+                        .deferred_warning
+                        .expect("missing saved destination warning")
+                        .contains(&format!("{declared}/unlisted"))
+                );
+                let fallback = restore_model_from_session(declared, "unlisted", &registry, true);
+                assert!(fallback.model.is_some());
+                assert!(
+                    fallback
+                        .fallback_message
+                        .expect("permitted restore fallback is visible")
+                        .contains("Could not restore model")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_scope_resolves_declared_identity_before_credentials() {
+        for reverse in [false, true] {
+            for missing_key in [None, Some(" \t ")] {
+                let mut custom = test_model_entry("vendor/shared", "open-router", true);
+                custom.api_key = missing_key.map(str::to_string);
+                custom.model.base_url = "https://declared.example.test/v1".to_string();
+                custom
+                    .headers
+                    .insert("x-route".to_string(), "declared".to_string());
+                let mut entries = vec![
+                    test_model_entry("vendor/shared", "openrouter", true),
+                    test_model_entry("vendor/unlisted", "openrouter", true),
+                    custom,
+                ];
+                if reverse {
+                    entries.reverse();
+                }
+                let registry = registry_with_entries(entries);
+                let patterns = vec!["open-router/vendor/shared:high".to_string()];
+                assert!(resolve_model_scope(&patterns, &registry, false).is_empty());
+                let error = resolve_startup_model_scope(
+                    &cli::Cli::parse_from(["pi"]),
+                    &Session::in_memory(),
+                    &patterns,
+                    &registry,
+                    &Config::default(),
+                    Path::new("/tmp"),
+                )
+                .expect_err("unready requested scope cannot borrow a ready alias")
+                .to_string();
+                assert!(error.contains("[MODEL_SCOPE_EMPTY]"));
+                assert!(error.contains("credentials"));
+                let scoped = resolve_model_scope(&patterns, &registry, true);
+                assert_eq!(scoped.len(), 1);
+                assert_eq!(scoped[0].model.model.provider, "open-router");
+                assert_eq!(scoped[0].model.model.id, "vendor/shared");
+                assert_eq!(
+                    scoped[0].model.model.base_url,
+                    "https://declared.example.test/v1"
+                );
+                assert_eq!(
+                    scoped[0].model.headers.get("x-route").map(String::as_str),
+                    Some("declared")
+                );
+                assert_eq!(scoped[0].thinking_level, Some(model::ThinkingLevel::High));
+                assert!(
+                    resolve_model_scope(
+                        &["open-router/vendor/unlisted".to_string()],
+                        &registry,
+                        true,
+                    )
+                    .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_scope_keeps_exact_namespaced_ids_without_fuzzy_substitution() {
+        let registry = registry_with_entries(vec![
+            test_model_entry("known", "open-router", true),
+            test_model_entry("open-router/unlisted-latest", "polza", true),
+            test_model_entry("open-router/exact", "polza", true),
+        ]);
+        assert!(
+            resolve_model_scope(&["open-router/unlisted".to_string()], &registry, false).is_empty()
+        );
+        let scoped = resolve_model_scope(&["open-router/exact".to_string()], &registry, false);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].model.model.provider, "polza");
+        assert_eq!(scoped[0].model.model.id, "open-router/exact");
+
+        let local =
+            resolve_model_scope(&["ollama/unlisted-local:low".to_string()], &registry, false);
+        assert_eq!(local.len(), 1, "native local models retain ad-hoc routing");
+        assert_eq!(local[0].model.model.provider, "ollama");
+        assert_eq!(local[0].model.model.id, "unlisted-local");
     }
 
     #[test]
@@ -4908,7 +5079,8 @@ mod tests {
             test_model_entry("gpt-5.1-codex-20250601", "openai", true),
         ];
 
-        let parsed = parse_model_pattern("gpt-5.1-codex", &available);
+        let registry = registry_with_entries(available.clone());
+        let parsed = parse_model_pattern("gpt-5.1-codex", &available, &registry);
         let model = parsed.model.expect("model should match");
 
         assert_eq!(model.model.id, "gpt-5.1-codex-20250601");
@@ -4930,7 +5102,8 @@ mod tests {
 
     #[test]
     fn try_match_model_supports_openrouter_dynamic_provider_model_ids() {
-        let matched = try_match_model("openrouter/google/gemini-2.5-pro", &[])
+        let registry = registry_with_entries(Vec::new());
+        let matched = try_match_model("openrouter/google/gemini-2.5-pro", &[], &registry)
             .expect("openrouter ad-hoc fallback should resolve");
         assert_eq!(matched.model.provider, "openrouter");
         assert_eq!(matched.model.id, "google/gemini-2.5-pro");
@@ -4940,14 +5113,12 @@ mod tests {
 
     #[test]
     fn try_match_model_prefers_openai_codex_for_duplicate_exact_id_matches() {
-        let matched = try_match_model(
-            "gpt-5.4",
-            &[
-                test_model_entry("gpt-5.4", "openai", true),
-                test_model_entry("gpt-5.4", "openai-codex", true),
-            ],
-        )
-        .expect("duplicate exact-id matches should honor preferred provider ordering");
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-5.4", "openai", true),
+            test_model_entry("gpt-5.4", "openai-codex", true),
+        ]);
+        let matched = try_match_model("gpt-5.4", registry.models(), &registry)
+            .expect("duplicate exact-id matches should honor preferred provider ordering");
 
         assert_eq!(matched.model.provider, "openai-codex");
         assert_eq!(matched.model.id, "gpt-5.4");
@@ -4963,7 +5134,8 @@ mod tests {
     #[test]
     fn parse_model_pattern_parses_thinking_suffix() {
         let available = vec![test_model_entry("gpt-5.1-codex", "openai", true)];
-        let parsed = parse_model_pattern("openai/gpt-5.1-codex:high", &available);
+        let registry = registry_with_entries(available.clone());
+        let parsed = parse_model_pattern("openai/gpt-5.1-codex:high", &available, &registry);
 
         let model = parsed.model.expect("model should match");
         assert_eq!(model.model.id, "gpt-5.1-codex");
@@ -4974,7 +5146,8 @@ mod tests {
     #[test]
     fn parse_model_pattern_warns_for_invalid_thinking_suffix() {
         let available = vec![test_model_entry("gpt-5.1-codex", "openai", true)];
-        let parsed = parse_model_pattern("gpt-5.1-codex:extreme", &available);
+        let registry = registry_with_entries(available.clone());
+        let parsed = parse_model_pattern("gpt-5.1-codex:extreme", &available, &registry);
 
         assert!(parsed.model.is_some());
         assert!(parsed.thinking_level.is_none());

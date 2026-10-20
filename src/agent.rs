@@ -1644,7 +1644,8 @@ pub struct FailoverSwapAttempt<'a> {
     pub chain: &'a crate::failover::FailoverChain,
     /// Where to resume the walk, from the caller's cross-turn state.
     pub start_position: usize,
-    /// Models a chain spec can resolve against.
+    /// Admitted destinations after availability and provider filtering. The
+    /// session's full registry, when present, establishes provider identity.
     pub available_models: &'a [crate::models::ModelEntry],
     /// Credential store consulted for each candidate.
     pub auth: &'a crate::auth::AuthStorage,
@@ -10570,6 +10571,16 @@ mod extensions_integration_tests {
         });
     }
 
+    fn extension_session_model_state() -> Arc<StdMutex<ExtensionAiCompletionHostState>> {
+        Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+            provider: Arc::new(NoopProvider),
+            stream_options: StreamOptions::default(),
+            models: Vec::new(),
+            compaction_models: ExtensionCompactionModelState::default(),
+            compaction_privacy: Arc::new(StdMutex::new(compaction::CompactionPrivacy::default())),
+        }))
+    }
+
     #[test]
     fn agent_extension_session_get_state_reports_agent_runtime_state() {
         let runtime = RuntimeBuilder::current_thread()
@@ -10591,6 +10602,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                ai_completion: extension_session_model_state(),
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(true)),
                 is_compacting: Arc::new(AtomicBool::new(true)),
@@ -10652,6 +10664,7 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                ai_completion: extension_session_model_state(),
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -10685,6 +10698,7 @@ mod extensions_integration_tests {
             let session_action_admission = SessionActionAdmissionGate::default();
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                ai_completion: extension_session_model_state(),
                 session_action_admission: session_action_admission.clone(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -14435,6 +14449,7 @@ mod turn_event_tests {
 #[derive(Clone)]
 struct AgentExtensionSession {
     handle: SessionHandle,
+    ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
     session_action_admission: SessionActionAdmissionGate,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
@@ -14574,13 +14589,64 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let _session_action_permit = self.acquire_session_action_admission(origin).await?;
-        <SessionHandle as crate::extensions::ExtensionSession>::set_model(
-            &self.handle,
-            provider,
-            model_id,
-            None,
-        )
-        .await
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "setModel: provider and modelId must be non-empty strings",
+            ));
+        }
+        let (registry, active_provider) = {
+            let state = self
+                .ai_completion
+                .lock()
+                .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
+            (
+                state.compaction_models.registry.clone(),
+                Arc::clone(&state.provider),
+            )
+        };
+        let resolved = registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider, model_id));
+        let (mut provider, mut model_id) = if let Some(entry) = resolved {
+            (entry.model.provider, entry.model.id)
+        } else if active_provider.name().eq_ignore_ascii_case(provider)
+            && active_provider.model_id().eq_ignore_ascii_case(model_id)
+        {
+            // Embedders can supply an active ad-hoc provider without a catalog.
+            // Re-selecting that same destination remains a valid explicit action.
+            (
+                active_provider.name().to_string(),
+                active_provider.model_id().to_string(),
+            )
+        } else {
+            return Err(Error::validation(format!(
+                "setModel: unknown provider/model {provider}/{model_id}. Check the provider and model ID with ctx.modelRegistry.find(provider, modelId) before switching."
+            )));
+        };
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let mut session = self
+            .handle
+            .0
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        if let Some(registry) = registry
+            && let Some((current_provider, current_model)) =
+                session.effective_model_for_current_path()
+            && let Some(current_entry) = registry.find(&current_provider, &current_model)
+            && current_entry.model.provider.eq_ignore_ascii_case(&provider)
+            && current_entry.model.id.eq_ignore_ascii_case(&model_id)
+        {
+            // The catalog proved that both names resolve to one destination.
+            // Preserve historical alias spelling without merging separately
+            // declared providers that happen to share a built-in alias family.
+            provider = current_provider;
+            model_id = current_model;
+        }
+        session.select_model(provider, model_id);
+        Ok(())
     }
 
     async fn get_model(&self) -> (Option<String>, Option<String>) {
@@ -15788,14 +15854,20 @@ impl AgentSession {
     ) -> Result<Option<RestoredPrimary>> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let (active_provider, active_model) = request.active;
+        let catalog = self
+            .model_registry
+            .as_ref()
+            .map_or(request.available_models, ModelRegistry::models);
 
         // The runtime must still be on the fallback the caller recorded.
         let runtime_provider = self.agent.provider();
-        if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), active_provider)
-            || !runtime_provider
-                .model_id()
-                .eq_ignore_ascii_case(active_model)
-        {
+        if !crate::models::model_identities_match(
+            catalog,
+            runtime_provider.name(),
+            runtime_provider.model_id(),
+            active_provider,
+            active_model,
+        ) {
             return Self::refuse_restore(
                 request,
                 gate,
@@ -15813,8 +15885,13 @@ impl AgentSession {
             .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
         let session_matches_active = inner.effective_model_for_current_path().is_some_and(
             |(session_provider, session_model)| {
-                crate::provider_metadata::provider_ids_match(&session_provider, active_provider)
-                    && session_model.eq_ignore_ascii_case(active_model)
+                crate::models::model_identities_match(
+                    catalog,
+                    &session_provider,
+                    &session_model,
+                    active_provider,
+                    active_model,
+                )
             },
         );
         if !session_matches_active {
@@ -15833,7 +15910,7 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let Some((entry, key)) = Self::resolve_restore_target(request)? else {
+        let Some((entry, key)) = self.resolve_restore_target(request)? else {
             return Ok(None);
         };
         let provider_impl = match crate::providers::create_provider_with_auth(
@@ -15904,18 +15981,16 @@ impl AgentSession {
     /// under `strict_invariants`, with the error kinds RPC has always returned
     /// for them.
     fn resolve_restore_target(
+        &self,
         request: &PrimaryRestoreRequest<'_>,
     ) -> Result<Option<(crate::models::ModelEntry, Option<String>)>> {
         let primary = request.primary;
-        let Some(entry) = request
-            .available_models
-            .iter()
-            .find(|m| {
-                crate::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
-                    && m.model.id.eq_ignore_ascii_case(&primary.model_id)
-            })
-            .cloned()
-            .or_else(|| crate::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
+        let catalog = self
+            .model_registry
+            .as_ref()
+            .map_or(request.available_models, ModelRegistry::models);
+        let Some(entry) =
+            crate::models::resolve_model_entry(catalog, &primary.provider, &primary.model_id)
         else {
             if request.strict_invariants {
                 return Err(Error::validation(format!(
@@ -15925,6 +16000,34 @@ impl AgentSession {
             }
             return Ok(None);
         };
+
+        let registered =
+            crate::models::find_model_entry(catalog, &primary.provider, &primary.model_id)
+                .is_some();
+        let admitted = request.available_models.iter().any(|candidate| {
+            candidate
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(entry.model.provider.trim())
+                && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
+        });
+        let explicit_key_recovers_unready = request
+            .cli_api_key
+            .is_some_and(|key| !key.trim().is_empty())
+            && !crate::models::model_entry_is_ready(&entry);
+        if registered && !admitted && !explicit_key_recovers_unready {
+            // Availability and disabled-provider filtering happen after the
+            // full catalog establishes identity. A ready alias's row cannot
+            // admit a separately configured primary that was filtered out.
+            if request.strict_invariants {
+                return Err(Error::validation(format!(
+                    "Unable to restore primary provider/model {}/{}: the requested destination is not in the admitted model catalog",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        }
 
         let key = crate::models::resolve_model_key(request.cli_api_key, request.auth, &entry);
         if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
@@ -16066,12 +16169,39 @@ impl AgentSession {
             &from_provider,
             &from_model,
         );
-        while let Some((entry_index, spec)) = walk.next_spec() {
+        loop {
+            let catalog = self
+                .model_registry
+                .as_ref()
+                .map_or(attempt.available_models, ModelRegistry::models);
+            let Some((entry_index, spec)) = walk.next_spec(catalog) else {
+                break;
+            };
             let next_position = walk.position();
-            let Some(entry) = crate::failover::resolve_chain_spec(spec, attempt.available_models)
-            else {
+            let Some(entry) = crate::failover::resolve_chain_spec(spec, catalog) else {
                 continue;
             };
+            let registered =
+                crate::models::find_model_entry(catalog, &entry.model.provider, &entry.model.id)
+                    .is_some();
+            let admitted = attempt.available_models.iter().any(|candidate| {
+                candidate
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(entry.model.provider.trim())
+                    && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
+            });
+            let explicit_key_recovers_unready = attempt
+                .cli_api_key
+                .is_some_and(|key| !key.trim().is_empty())
+                && !crate::models::model_entry_is_ready(&entry);
+            if registered && !admitted && !explicit_key_recovers_unready {
+                // Filtering cannot erase a declared provider's identity. Keep
+                // ready excluded routes out, while allowing an explicit key
+                // to make an otherwise unready configured route usable.
+                continue;
+            }
             let api_key =
                 crate::models::resolve_model_key(attempt.cli_api_key, attempt.auth, &entry);
             if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
@@ -17397,8 +17527,19 @@ impl AgentSession {
             follow_up_mode,
         )));
         manager.set_session_action_origin_source(self.session_action_admission.origin_source());
+        {
+            let mut state = self
+                .extension_ai_completion
+                .lock()
+                .map_err(|_| Error::extension("Failed to initialize the live model catalog"))?;
+            // Startup hooks can select models before `self.extensions` is
+            // installed. Seed the same catalog that subsequent registry refreshes
+            // keep current for runtime model selection and compaction.
+            state.compaction_models.registry = self.model_registry.clone().map(Arc::new);
+        }
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
+            ai_completion: Arc::clone(&self.extension_ai_completion),
             session_action_admission: self.session_action_admission.clone(),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_compacting: Arc::clone(&self.extensions_is_compacting),
@@ -17498,6 +17639,21 @@ impl AgentSession {
         // but startup hooks may read their resolved values. Apply the parsed
         // host values in that narrow interval rather than after startup.
         crate::extensions::apply_cli_flags(&manager, &host.cli_flags).await?;
+
+        // A startup hook may select a provider registered by the extension
+        // that just loaded. Validate a private registration snapshot for those
+        // hooks; the caller still owns final credential refresh and selection.
+        let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
+        let mut hook_registry = self.model_registry.clone().unwrap_or_default();
+        hook_registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
+        manager.set_extension_models(pi_ai_model_registry_values(&hook_registry));
+        {
+            let mut state = self
+                .extension_ai_completion
+                .lock()
+                .map_err(|_| Error::extension("Failed to publish the startup model catalog"))?;
+            state.compaction_models.registry = Some(Arc::new(hook_registry));
+        }
 
         // Fire the `startup` lifecycle hook once extensions are loaded.
         // Fail-open: extension errors must not prevent the agent from running.

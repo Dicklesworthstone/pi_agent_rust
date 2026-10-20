@@ -1761,13 +1761,15 @@ fn resolve_acp_selection(
     let mut registry = acp_model_registry(options);
     let mut scoped_models = Vec::new();
     if let Some((provider, model)) = session.effective_model_for_current_path() {
-        let entry = registry
-            .find(&provider, &model)
-            .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model))
+        let entry = crate::models::resolve_model_entry(registry.models(), &provider, &model)
             .ok_or_else(|| {
                 Error::provider(
                     "acp",
-                    format!("Saved session model is not registered: {provider}/{model}"),
+                    format!(
+                        "Saved session model is not registered: {provider}/{model}. \
+                         Restore that provider's model registration or choose a registered \
+                         model in a new session; use pi --list-models to inspect the catalog."
+                    ),
                 )
             })?;
         cli.provider = Some(provider);
@@ -4375,6 +4377,38 @@ mod tests {
         .to_string();
         assert!(error.contains("Saved session model is not registered"));
         assert!(error.contains("missing-acp-provider/shared"));
+    }
+
+    #[test]
+    fn acp_saved_declared_alias_cannot_synthesize_a_native_route() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for reverse in [false, true] {
+            let mut entries = vec![
+                ready_selection_model("openrouter", "unlisted"),
+                ready_selection_model("open-router", "known"),
+            ];
+            if reverse {
+                entries.reverse();
+            }
+            let options = selection_options(Config::default(), entries, runtime.handle());
+            let mut session = Session::in_memory();
+            session.append_model_change("open-router".to_string(), "unlisted".to_string());
+            let previous = session.effective_model_for_current_path();
+            let mut cli = options.launch.selection_cli().expect("launch CLI");
+            let error = resolve_acp_selection(
+                &session,
+                std::path::Path::new("/tmp/acp-selection"),
+                &options,
+                &mut cli,
+            )
+            .expect_err("missing saved declared model must not use native routing")
+            .to_string();
+            assert!(error.contains("open-router/unlisted"));
+            assert!(error.contains("--list-models"));
+            assert_eq!(session.effective_model_for_current_path(), previous);
+            assert!(cli.provider.is_none());
+            assert!(cli.model.is_none());
+        }
     }
 
     #[test]

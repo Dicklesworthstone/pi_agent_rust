@@ -16,7 +16,6 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ToolResultMessage,
     UserContent, UserMessage,
 };
-use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 use crate::session_index::{
     SessionIndex, SessionIndexRefreshSummary, begin_session_index_namespace_change,
     enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
@@ -2497,36 +2496,20 @@ impl ExtensionSession for SessionHandle {
         model_id: String,
         _origin: Option<SessionActionOrigin>,
     ) -> Result<()> {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "setModel: provider and modelId must be non-empty strings",
+            ));
+        }
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        let normalized_provider = canonical_provider_id(&provider)
-            .unwrap_or(&provider)
-            .to_string();
-        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(&session) {
-            Some((current_provider, current_model_id))
-                if provider_ids_match(&current_provider, &provider)
-                    && current_model_id.eq_ignore_ascii_case(&model_id) =>
-            {
-                (current_provider, current_model_id, false)
-            }
-            _ => (normalized_provider, model_id.clone(), true),
-        };
-        if changed
-            || session
-                .active_failover_provenance_for_current_path()
-                .is_some()
-        {
-            // Selecting the current fallback explicitly retires automatic
-            // restoration just like selecting a different model. Keep one
-            // ordinary model-change record to distinguish that intent from
-            // continuing the existing failover cycle.
-            session.append_model_change(stored_provider.clone(), stored_model_id.clone());
-        }
-        session.set_model_header(Some(stored_provider), Some(stored_model_id), None);
+        session.select_model(provider.to_string(), model_id.to_string());
         Ok(())
     }
 
@@ -5626,6 +5609,29 @@ impl Session {
             )));
         }
         Ok(html)
+    }
+
+    /// Record an explicit selection using an already resolved provider identity.
+    /// A session has no catalog, so it cannot decide whether different provider
+    /// names denote a built-in alias or independently configured destinations.
+    pub(crate) fn select_model(&mut self, provider: String, model_id: String) {
+        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(self) {
+            Some((current_provider, current_model_id))
+                if current_provider.trim().eq_ignore_ascii_case(&provider)
+                    && current_model_id.trim().eq_ignore_ascii_case(&model_id) =>
+            {
+                (current_provider, current_model_id, false)
+            }
+            _ => (provider, model_id, true),
+        };
+        if changed || self.active_failover_provenance_for_current_path().is_some() {
+            // Selecting the current fallback explicitly retires automatic
+            // restoration just like selecting a different model. Keep one
+            // ordinary model-change record to distinguish that intent from
+            // continuing the existing failover cycle.
+            self.append_model_change(stored_provider.clone(), stored_model_id.clone());
+        }
+        self.set_model_header(Some(stored_provider), Some(stored_model_id), None);
     }
 
     /// Update header model info.
@@ -10739,54 +10745,66 @@ mod tests {
     }
 
     #[test]
-    fn test_session_handle_preserves_alias_equivalent_model_state() {
-        let mut session = Session::in_memory();
-        session.append_model_change("google".to_string(), "gemini-2.5-pro".to_string());
-        session.set_model_header(
-            Some("google".to_string()),
-            Some("gemini-2.5-pro".to_string()),
-            None,
-        );
-        let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
+    fn test_session_handle_preserves_explicit_provider_without_a_catalog() {
+        for (previous, selected) in [
+            ("google", "gemini"),
+            ("gemini", "google"),
+            ("azure-openai", "azure"),
+            ("azure", "azure-openai"),
+        ] {
+            let mut session = Session::in_memory();
+            session.append_model_change(previous.to_string(), "shared-model".to_string());
+            session.set_model_header(
+                Some(previous.to_string()),
+                Some("shared-model".to_string()),
+                None,
+            );
+            let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
 
-        run_async(async {
-            handle
-                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string(), None)
-                .await
-        })
-        .expect("alias-equivalent model should dedupe");
-
-        let branch = run_async(async { handle.get_branch().await });
-        let model_changes: Vec<_> = branch
-            .iter()
-            .filter_map(|entry| {
-                if entry
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|entry_type| entry_type.eq("model_change"))
-                {
-                    Some((
-                        entry.get("provider").and_then(Value::as_str),
-                        entry.get("modelId").and_then(Value::as_str),
-                    ))
-                } else {
-                    None
-                }
+            run_async(async {
+                handle
+                    .set_model(format!(" {selected} "), "shared-model".to_string(), None)
+                    .await
             })
-            .collect();
-        assert_eq!(
-            model_changes,
-            vec![(Some("google"), Some("gemini-2.5-pro"))],
-            "alias-equivalent set_model should not append duplicate history"
-        );
+            .expect("explicit provider selection");
+            run_async(async {
+                handle
+                    .set_model(selected.to_uppercase(), "SHARED-MODEL".to_string(), None)
+                    .await
+            })
+            .expect("repeated identity should dedupe");
 
-        let (provider, model_id) = run_async(async { handle.get_model().await });
-        assert_eq!(provider.as_deref(), Some("google"));
-        assert_eq!(model_id.as_deref(), Some("gemini-2.5-pro"));
+            let branch = run_async(async { handle.get_branch().await });
+            let model_changes: Vec<_> = branch
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .map(|entry| entry["provider"].as_str().expect("provider"))
+                .collect();
+            assert_eq!(model_changes, vec![previous, selected]);
 
-        let state = run_async(async { handle.get_state().await });
-        assert_eq!(state["model"]["provider"], "google");
-        assert_eq!(state["model"]["id"], "gemini-2.5-pro");
+            let (provider, model_id) = run_async(async { handle.get_model().await });
+            assert_eq!(provider.as_deref(), Some(selected));
+            assert_eq!(model_id.as_deref(), Some("shared-model"));
+            let state = run_async(async { handle.get_state().await });
+            assert_eq!(state["model"]["provider"], selected);
+            assert_eq!(state["model"]["id"], "shared-model");
+        }
+    }
+
+    #[test]
+    fn test_session_handle_rejects_blank_model_selection_without_mutation() {
+        let handle = SessionHandle(Arc::new(AsyncMutex::new(Session::in_memory())));
+        for (provider, model) in [(" ", "shared"), ("custom", "\t"), ("", "")] {
+            let error = run_async(async {
+                handle
+                    .set_model(provider.to_string(), model.to_string(), None)
+                    .await
+            })
+            .expect_err("blank destination must fail");
+            assert!(error.to_string().contains("non-empty"));
+        }
+        assert!(run_async(async { handle.get_branch().await }).is_empty());
+        assert_eq!(run_async(async { handle.get_model().await }), (None, None));
     }
 
     #[test]
