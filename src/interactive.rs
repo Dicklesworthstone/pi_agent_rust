@@ -2066,6 +2066,12 @@ pub enum PiMsg {
         owner_session_id: String,
         message: String,
     },
+    /// Classic terminal review completion, scoped to its session and request.
+    ReviewFinished {
+        owner_session_id: String,
+        request_id: String,
+        message: String,
+    },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
     /// Display driver-submitted input that did not pass through the editor.
@@ -2865,6 +2871,7 @@ pub struct PiApp {
     agent: Arc<Mutex<InteractiveAgent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    review_request_id: Option<String>,
     bash_running: bool,
 
     // Token tracking
@@ -3401,6 +3408,7 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            review_request_id: None,
             bash_running: false,
             pending_oauth: None,
             extensions,

@@ -1708,7 +1708,7 @@ async fn run(
         } else {
             false
         };
-        handle_subcommand(command, &cwd, project_trusted).await?;
+        handle_subcommand(command, &cwd, project_trusted, &mut cli).await?;
         return Ok(());
     }
 
@@ -3246,6 +3246,7 @@ const fn subcommand_uses_package_manager(command: &cli::Commands) -> bool {
             | cli::Commands::Remove { .. }
             | cli::Commands::Update { .. }
             | cli::Commands::List
+            | cli::Commands::Review { offline: false, .. }
             | cli::Commands::Config {
                 show: true,
                 paths: false,
@@ -3298,6 +3299,7 @@ async fn handle_subcommand(
     command: cli::Commands,
     cwd: &Path,
     project_trusted: bool,
+    cli: &mut cli::Cli,
 ) -> Result<()> {
     let manager = PackageManager::new(cwd.to_path_buf()).with_project_trust(project_trusted);
     match command {
@@ -3401,6 +3403,7 @@ async fn handle_subcommand(
         }
         cli::Commands::Review {
             target,
+            offline,
             fail_on,
             format,
             confidence_threshold,
@@ -3415,7 +3418,10 @@ async fn handle_subcommand(
                 confidence_threshold,
                 max_findings,
                 out,
-            )?;
+                offline,
+                project_trusted,
+                cli,
+            ).await?;
         }
         cli::Commands::Gc {
             older_than,
@@ -6088,7 +6094,8 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
 }
 
 /// `pi review [TARGET]` (bd-cv653.3.11): prioritized code review with ship verdict.
-fn handle_review(
+#[allow(clippy::too_many_arguments)]
+async fn handle_review(
     cwd: &Path,
     target: Option<&str>,
     fail_on: Option<&str>,
@@ -6096,6 +6103,9 @@ fn handle_review(
     confidence_threshold: f64,
     max_findings: usize,
     out: Option<PathBuf>,
+    offline: bool,
+    project_trusted: bool,
+    cli: &mut cli::Cli,
 ) -> Result<()> {
     // An unparseable --fail-on must not silently disable the gate (CI would
     // pass with P0 findings present).
@@ -6115,8 +6125,14 @@ fn handle_review(
         max_findings,
         out_file: out,
     };
+    options.validate()?;
 
-    let report = pi::review::CodeReviewer::review(cwd, &options)?;
+    let report = if offline {
+        pi::review::CodeReviewer::review(cwd, &options)?
+    } else {
+        let client = review_model_client(cli, cwd, project_trusted).await?;
+        client.review(cwd, &options, None).await?
+    };
 
     match format {
         "json" => {
@@ -6131,11 +6147,7 @@ fn handle_review(
     }
 
     if let Some(threshold_sev) = fail_severity {
-        let has_failing = report
-            .findings
-            .iter()
-            .any(|f| f.severity <= threshold_sev && f.confidence >= confidence_threshold);
-        if has_failing {
+        if report.failing_findings > 0 {
             return Err(anyhow::anyhow!(
                 "Review failed: findings met or exceeded severity threshold {threshold_sev}"
             ));
@@ -6143,6 +6155,57 @@ fn handle_review(
     }
 
     Ok(())
+}
+
+/// Reuse the normal headless model/credential resolver without constructing a
+/// second agent, loading tools/extensions, or creating a durable conversation.
+async fn review_model_client(
+    cli: &mut cli::Cli,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<pi::review::ModelReviewer> {
+    let global = Config::global_dir();
+    let config_path = Config::config_path_override_from_env(cwd);
+    let config = Config::load_with_roots_and_project_trust(
+        config_path.as_deref(), &global, cwd, project_trusted,
+    )?;
+    for warning in pi::http::proxy::configure(config.http.as_ref()) {
+        tracing::warn!("{warning}");
+    }
+    if cli.request_timeout.is_none()
+        && let Some(seconds) = config.request_timeout_secs
+    {
+        pi::http::client::set_request_timeout_override(seconds);
+    }
+    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
+    let refresh = if startup_oauth_refresh_required(cli) {
+        auth.refresh_expired_oauth_tokens_report().await
+    } else {
+        pi::auth::OAuthRefreshReport::default()
+    };
+    let models_path = default_models_path(&global);
+    let mut registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    if let Some(error) = registry.error() {
+        return Err(anyhow::anyhow!("Cannot load review model catalog: {error}"));
+    }
+    let scope = config.model_scope_overrides.as_deref()
+        .and_then(|overrides| pi::failover::best_scope_override(overrides, cwd));
+    let patterns = cli.models.as_deref().map(pi::app::parse_models_arg)
+        .or_else(|| scope.and_then(|scope| scope.enabled_models.clone()))
+        .unwrap_or_else(|| config.enabled_models.clone().unwrap_or_default());
+    validate_startup_api_key_scope(cli, &patterns)?;
+    let session = Session::in_memory();
+    let (selection, key) = resolve_selection_with_auth(
+        cli, &config, &session, cwd, &mut registry, &patterns, &mut auth,
+        &models_path, false, &[], &[],
+    ).await?.ok_or_else(|| anyhow::anyhow!("No review model selected"))?;
+    validate_startup_oauth_refresh(cli, &refresh, &selection.model_entry.model.provider, &[], false)?;
+    if let Some(warning) = &selection.fallback_message {
+        eprintln!("{warning}");
+    }
+    let provider = pi::providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))?;
+    let stream_options = pi::app::build_stream_options(&config, key, &selection, &session);
+    Ok(pi::review::ModelReviewer::new(provider, stream_options, config.secrets.as_ref()))
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.

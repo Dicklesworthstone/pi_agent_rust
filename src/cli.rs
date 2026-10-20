@@ -2636,12 +2636,15 @@ pub enum Commands {
         check: bool,
     },
 
-    /// Prioritized parallel code review with ship verdict (bd-cv653.3.11)
+    /// Parallel model code review with prioritized findings and a ship verdict
     #[command(name = "review")]
     Review {
-        /// Target to review: uncommitted (default), commit range (e.g. main..HEAD), or branch
+        /// Target: uncommitted (default), staged, commit:REF, branch:REF, or a commit range
         #[arg(value_name = "TARGET")]
         target: Option<String>,
+        /// Run only local heuristics; do not send code to a model
+        #[arg(long)]
+        offline: bool,
         /// Fail with non-zero exit code if findings meet or exceed severity (P0, P1, P2)
         #[arg(long, value_name = "SEVERITY")]
         fail_on: Option<String>,

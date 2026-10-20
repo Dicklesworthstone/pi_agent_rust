@@ -3000,6 +3000,10 @@ impl PiFtuiModel {
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
+            } | PiMsg::ReviewFinished {
+                owner_session_id,
+                message,
+                ..
             } => {
                 if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
                     let text = sanitize(&message).into_owned();
@@ -9489,6 +9493,15 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::Workspace { command, args }) => {
+                            if command == workspace_commands::WorkspaceCommand::Review {
+                                let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
+                                *driver_turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
+                                Box::pin(workspace_commands::run_review(
+                                    &args, &handle, &bash_cwd, Some(&abort_signal), &agent_tx,
+                                )).await;
+                                *driver_turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                                continue;
+                            }
                             let advisor = resume_template
                                 .advisor
                                 .as_ref()

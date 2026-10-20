@@ -1224,6 +1224,26 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
             }
+            PiMsg::ReviewFinished { owner_session_id, request_id, message } => {
+                if self.review_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => {
+                        self.review_request_id = None;
+                        return None;
+                    }
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::ReviewFinished { owner_session_id, request_id, message },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                self.review_request_id = None;
+                return self.handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
@@ -3018,6 +3038,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.pending_inputs_paused_by_time_cap = false;
         let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = None;
         self.abort_handle = Some(abort_handle);
         self.agent_state = AgentState::Processing;
         // Extensions may send steering while the first request is in backoff
@@ -5503,6 +5524,43 @@ mod stream_delta_batcher_tests {
         batcher.flush(true);
         let second = rx.try_recv().expect("expected retained agent_done event");
         assert!(matches!(second, PiMsg::AgentDone { .. }));
+    }
+
+    #[test]
+    fn review_completion_is_bound_to_its_session_and_active_request() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let owner = app.session.try_lock().expect("session").header.id.clone(); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The idle fixture session must be available to capture its owner ID.
+        let original_messages = app.messages.len();
+        app.agent_state = AgentState::Processing;
+        app.review_request_id = Some("current-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner.clone(),
+            request_id: "replaced-review".to_string(),
+            message: "stale request".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- A stale request completion must not settle the active review.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- A stale request must not append a report card.
+        assert_eq!(app.review_request_id.as_deref(), Some("current-review")); // ubs:ignore[rust.panic.assert-macros] -- Request ownership must remain with the current review.
+
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: "replaced-session".to_string(),
+            request_id: "current-review".to_string(),
+            message: "stale session".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- An old session's completion cannot idle its replacement.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- Session ownership must prevent stale transcript publication.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A confirmed stale owner retires that review request ID.
+
+        app.review_request_id = Some("accepted-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner,
+            request_id: "accepted-review".to_string(),
+            message: "current review report".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- A current owned completion must settle the review.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Successful completion retires request ownership.
+        assert!(matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
+        eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"}));
     }
 
     #[test]

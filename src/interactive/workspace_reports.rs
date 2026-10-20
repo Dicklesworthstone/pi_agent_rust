@@ -284,24 +284,57 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
     Report::card(card, format!("Generated commit plan with {units} units"))
 }
 
-/// `/review [target]`: heuristic code review of the working tree (or target).
-pub fn review(cwd: &Path, args: &str) -> Report {
+/// A review owns its screened input and provider while the UI remains responsive.
+pub enum PreparedWorkspaceReview {
+    Offline(Report),
+    Model(crate::review::ModelReviewer, crate::review::PreparedReview),
+}
+
+impl PreparedWorkspaceReview {
+    pub async fn run(self, abort: Option<&crate::agent::AbortSignal>) -> Report {
+        match self {
+            Self::Offline(report) => report,
+            Self::Model(client, request) => match client.review_prepared(request, abort).await {
+                Ok(report) => review_report(report),
+                Err(error) => Report::status(format!("Review failed: {error}")),
+            },
+        }
+    }
+}
+
+fn review_report(report: crate::review::ReviewReport) -> Report {
+    Report::card(report.format_markdown(), format!("{}: {}", report.verdict.badge(), report.summary))
+}
+
+/// `/review [--offline] [target]`: prepare a model review, or explicitly request
+/// the local heuristic scan. No provider call happens before preparation succeeds.
+pub fn prepare_review(
+    cwd: &Path,
+    args: &str,
+    agent: &crate::agent::Agent,
+) -> crate::error::Result<PreparedWorkspaceReview> {
     let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let offline = first == "--offline";
+    let target = if offline { rest.trim() } else { args };
+    if target.starts_with('-') {
+        return Err(crate::error::Error::validation("Usage: /review [--offline] [uncommitted|staged|commit:REF|branch:REF|RANGE]"));
+    }
     let options = crate::review::ReviewOptions {
-        target: (!args.is_empty()).then(|| args.to_string()),
+        target: (!target.is_empty()).then(|| target.to_string()),
         fail_on: None,
         confidence_threshold: 0.70,
         format: "markdown".to_string(),
         max_findings: 15,
         out_file: None,
     };
-    match crate::review::CodeReviewer::review(cwd, &options) {
-        Ok(report) => Report::card(
-            report.format_markdown(),
-            format!("{}: {}", report.verdict.badge(), report.summary),
-        ),
-        Err(e) => Report::status(format!("Review failed: {e}")),
+    if offline {
+        return crate::review::CodeReviewer::review(cwd, &options)
+            .map(review_report).map(PreparedWorkspaceReview::Offline);
     }
+    let client = crate::review::ModelReviewer::for_agent(agent);
+    let request = client.prepare_with_agent(cwd, &options, agent)?;
+    Ok(PreparedWorkspaceReview::Model(client, request))
 }
 
 /// `/handoff [human|agent|<target>] [path]`: a handoff brief of the session.
