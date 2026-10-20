@@ -122,7 +122,7 @@ impl Prepared {
 
 /// Identity resolvers may wait on a session lock. Waiting is part of the
 /// original delegation budget and cannot conceal caller cancellation.
-async fn resolve_session(
+pub(super) async fn resolve_session(
     scope: &crate::jobs::JobSessionScope,
     owner: &AgentCx,
     deadline: Deadline,

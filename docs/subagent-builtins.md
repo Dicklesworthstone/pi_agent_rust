@@ -170,3 +170,82 @@ Accepted filesystem effects may remain. The existing privacy projection and
 1 MiB complete-result limit apply to graph reports too. Native regression
 coverage is in `src/subagents/workflow/background_tests.rs`; it is not a claim
 that the DSR lane has run in a source-only editing environment.
+
+## Reusable workers
+
+Use `worker_start` when successive tasks should share one live child agent's
+conversation. The child stays in RPC mode between turns, preserving its process,
+provider setup and message history. Initial discovery captures the agent
+definition, model, tool selection and working directory for the worker's lifetime.
+
+```json
+{"operation":"worker_start","agent":"scout","task":"Map the provider retry path","timeoutSeconds":300}
+```
+
+The acknowledgment has `details.schema: "pi.subagent.worker.v1"`, a stable
+`workerId`, a carrier `jobId` and `turnId: 1`. A later task uses the same worker:
+
+```json
+{"operation":"worker_send","workerId":"worker-…","task":"Use that context to find the cancellation race"}
+```
+
+Each accepted send returns a new numbered turn. Busy workers queue follow-ups
+in admission order; sends do not steer or interrupt the running task. Keep the
+returned turn ID when several callers share a worker. Observe its exact result:
+
+```json
+{"operation":"worker_wait","workerId":"worker-…","turnId":2,"timeoutMs":30000}
+```
+
+The selected `details.turn` contains its `id`, `status` and `result`. Pending
+states are `queued` and `running`; terminal states are `completed`, `failed` and
+`cancelled`. A terminal result is the native `ToolOutput`, including the ordinary
+subagent result at `details.turn.result.details.results[0]`. Worker results name
+`sessionIsolation: "persistent_rpc_worker"` and retain the stable child PID and
+hub identity. Omitting `turnId` selects the latest turn once when the observation
+begins. New sends cannot retarget an existing wait.
+
+`worker_status` polls without waiting. `worker_wait` accepts 0–600,000 ms and
+defaults to 30,000; its timeout returns the pending snapshot and leaves execution
+running. A screened completion also enters the owning session's background
+follow-up queue. Explicit waits do not consume that queued notice.
+
+```json
+{"operation":"worker_close","workerId":"worker-…"}
+```
+
+Close cancels the running turn and all queued turns, then retires the process
+tree. Repeated close is safe. The carrier job owns the entire worker lifetime,
+including idle time: ordinary `jobs wait` waits for worker closure, while
+`worker_wait` waits for a task. `jobs cancel`, hub cancellation and session
+shutdown also retire the worker. Completed results remain inspectable until
+their closed handle is evicted. Existing filesystem effects are not rolled back.
+
+### Limits and supported controls
+
+- Each worker admits at most 32 turns, with at most 64 KiB of task text per turn.
+- One original lifetime deadline covers startup, execution, idle time and every
+  queued follow-up. The host limit defaults to 900 seconds; `timeoutSeconds` can
+  shorten it. Sending another task never renews the deadline.
+- Workers share the global eight-job capacity with shell and other native jobs.
+  Close idle workers to release their slots.
+- Each turn retains at most 128 KiB of encoded native output. A worker retains
+  less than 1 MiB of results, reserving space for cancellation/errors. An oversized
+  or unprojectable answer becomes an explicit failure with its payload withheld.
+  The registry retains at most 32 workers and evicts the oldest closed handle
+  when another is admitted; active workers are never evicted.
+- Every operation rechecks the current session. Every send captures the current
+  privacy policy and known secrets; completed output is screened before retention
+  and notices, and observations are screened again under the caller's current
+  policy. A canceled or closing job cannot accept another turn or a late result.
+- `worker_start` accepts `agent`, `task`, `cwd`, `scope`, `timeoutSeconds` and
+  `isolation: "none"`. Follow-ups cannot change frozen launch options. This first
+  worker implementation requires Unix nonblocking pipes and refuses worktree
+  isolation, output schemas, schema-bearing definitions and historical `seance`
+  consultation. Ordinary delegation continues to provide those workflows.
+
+The native regression suite includes a controlled RPC child that remembers a
+first prompt in its second response while keeping one PID, queued turn ordering,
+the post-turn streaming/compaction barrier, idle cancellation and session ownership.
+Rust acceptance remains the DSR quality lane; guest-language diagnostics alone
+do not establish native execution correctness.

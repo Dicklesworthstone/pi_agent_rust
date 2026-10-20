@@ -34,6 +34,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod ownership;
+pub(super) mod worker;
 #[cfg(unix)]
 mod pipes;
 use ownership::{HubLease, ProcessLease};

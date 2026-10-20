@@ -155,6 +155,26 @@ impl HubLease {
         Self { id: None }
     }
 
+    /// A persistent RPC worker owns process control but has no one-shot
+    /// revival policy. Replacing it would lose the conversation it promises
+    /// to retain, so ordinary native revival must remain unavailable.
+    #[cfg(unix)]
+    pub(super) fn register_worker(
+        &mut self,
+        name: &str,
+        kind: ChildKind,
+    ) -> Result<ChildEntry> {
+        if self.id.is_some() {
+            return Err(Error::tool("subagent", "PI_SUBAGENT_HUB: child lease already registered"));
+        }
+        let entry = registry()
+            .lock()
+            .map_err(|_| Error::tool("subagent", HUB_POISONED))?
+            .register_worker(name, kind)?;
+        self.id = Some(entry.id.clone());
+        Ok(entry)
+    }
+
     pub(super) fn register(
         &mut self,
         name: &str,

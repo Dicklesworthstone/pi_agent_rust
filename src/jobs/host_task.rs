@@ -42,6 +42,44 @@ pub(crate) fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> 
     Ok(admission)
 }
 
+/// Commit a live native task's bounded progress and optional screened notice.
+///
+/// The jobs lock remains held through the callback and notice enqueue, so a
+/// cancellation or session shutdown cannot interleave with accepting work or
+/// publishing a completed turn. The callback must be synchronous and bounded:
+/// it may acquire private task state, but must never await, enter any jobs API,
+/// or dispatch provider/tool work. Callers must never enter this function while
+/// holding that private state lock. Privacy projection and other expensive or
+/// fallible preparation belong before this boundary; any returned notice must
+/// already be screened. A rejected owner or stopped task never runs the callback.
+#[allow(clippy::significant_drop_tightening)] // The lock covers both commit and notice.
+pub(crate) fn with_owned_task_progress<T>(
+    owner_session_id: &str,
+    id: &str,
+    commit: impl FnOnce() -> Result<(T, Option<String>)>,
+) -> Result<T> {
+    let stopped = || Error::tool(
+        "jobs",
+        "PI_JOBS_TASK_STOPPED: native task is not accepting progress",
+    );
+    let mut reg = registry().lock().map_err(|_| stopped())?;
+    let live = reg.jobs.get(id).is_some_and(|job| {
+        job.owner_session_id == owner_session_id
+            && job.schema == TASK_SCHEMA
+            && matches!(job.status, JobStatus::Running)
+            && job.process_live
+            && !job.cancel_requested
+    });
+    if !live || reg.closing_owners.contains_key(owner_session_id) {
+        return Err(stopped());
+    }
+    let (value, notice) = commit()?;
+    if let Some(notice) = notice {
+        super::enqueue_completion_notice(&mut reg, owner_session_id, &notice);
+    }
+    Ok(value)
+}
+
 /// Launch admitted native work under its original capabilities and budget.
 /// The caller must finish input validation, approval and owner selection
 /// before calling. The future must own its inputs and clean up on drop.
@@ -468,6 +506,80 @@ mod tests {
         let artifact: ToolOutput = serde_json::from_slice(&std::fs::read(&settled.artifact_path).expect("artifact")).expect("cancelled JSON"); // ubs:ignore cancellation artifact must remain valid complete JSON
         assert!(artifact.is_error); // ubs:ignore assert cancellation artifact agrees with terminal state
         assert!(settled.output_tail.contains("CANCELLED")); // ubs:ignore assert tail reports cancellation
+    }
+
+    #[test]
+    fn owned_progress_requires_a_live_matching_owner_and_stops_at_cancellation() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore isolated artifacts are required for this progress-fence fixture
+        let owner = owner_id();
+        let started = spawn_owned_task(
+            &owner,
+            "progress task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            futures::future::pending(),
+        ).expect("start task"); // ubs:ignore a live owned task is required to exercise the progress boundary
+        let value = with_owned_task_progress(&owner, &started.id, || {
+            Ok((42, Some("screened turn progress".to_string())))
+        }).expect("live progress"); // ubs:ignore the live matching owner must be admitted
+        assert_eq!(value, 42); // ubs:ignore assert the commit value is returned to the caller
+        let notices = super::super::take_completion_notices(&owner);
+        assert_eq!(notices.len(), 1); // ubs:ignore successful progress must enqueue exactly one notice
+        assert!(serde_json::to_string(&notices).expect("notices").contains("screened turn progress")); // ubs:ignore verify the screened notice reaches its owner
+
+        for (scope, id) in [("foreign-owner", started.id.as_str()), (owner.as_str(), "missing-task")] {
+            let mut called = false;
+            let error = with_owned_task_progress(scope, id, || {
+                called = true;
+                Ok(((), Some("forbidden progress marker".to_string())))
+            }).expect_err("foreign or missing task"); // ubs:ignore unknown and foreign tasks must reject the callback
+            assert!(!called); // ubs:ignore rejected ownership must never mutate private task state
+            let message = error.to_string();
+            assert!(message.contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore all unavailable tasks use the same non-disclosing error
+            assert!(!message.contains(&started.id) && !message.contains(&owner)); // ubs:ignore ownership errors must not expose another task's metadata
+        }
+
+        let _cancelling = super::super::request_cancel(&owner, &started.id).expect("request cancellation"); // ubs:ignore install the real cancellation fence before checking further progress
+        let mut called = false;
+        let error = with_owned_task_progress(&owner, &started.id, || {
+            called = true;
+            Ok(((), Some("forbidden progress marker".to_string())))
+        }).expect_err("cancelled task"); // ubs:ignore cancellation must win whether or not the monitor has already settled
+        assert!(!called); // ubs:ignore cancelled work cannot enqueue another turn or publish a result
+        assert!(error.to_string().contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore verify the named stopped-task error
+        assert_eq!(settle(&owner, &started.id).status, "killed"); // ubs:ignore the fixture's pending task must retire after cancellation
+        let notices = super::super::take_completion_notices(&owner);
+        assert!(!serde_json::to_string(&notices).expect("notices").contains("forbidden progress marker")); // ubs:ignore rejected callbacks must not deliver their notices
+    }
+
+    #[test]
+    fn owner_shutdown_fences_progress_before_jobs_are_marked_cancelled() {
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore shutdown progress fixture requires isolated artifacts
+        let owner = owner_id();
+        let started = spawn_owned_task(
+            &owner,
+            "shutdown progress task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            futures::future::pending(),
+        ).expect("start task"); // ubs:ignore a live task is required before installing the owner shutdown fence
+        let shutdown = super::super::SessionShutdownAttempt::begin(&owner).expect("shutdown fence"); // ubs:ignore reproduce the closing fence that precedes lifecycle-lock acquisition
+        let mut called = false;
+        let error = with_owned_task_progress(&owner, &started.id, || {
+            called = true;
+            Ok(((), Some("late shutdown progress".to_string())))
+        }).expect_err("closing owner"); // ubs:ignore closing alone must refuse progress even before cancellation reaches each task
+        assert!(!called); // ubs:ignore shutdown must prevent the private-state commit
+        assert!(error.to_string().contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore shutdown uses the same stopped-task error
+        assert!(super::super::take_completion_notices(&owner).is_empty()); // ubs:ignore rejected progress must not publish a late notice
+        super::super::cancel(&owner, &started.id).expect("retire fixture task"); // ubs:ignore cleanup retires the still-pending task through normal cancellation
+        shutdown.finish_success().expect("finish shutdown"); // ubs:ignore release the fixture's owner fence only after settlement
     }
 
     #[test]

@@ -37,6 +37,7 @@ mod protocol;
 mod seance;
 mod workspace;
 mod workflow;
+mod worker;
 
 use deadline::Deadline;
 use execution::ChildRunner;
@@ -518,7 +519,8 @@ impl Tool for SubagentTool {
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
-            " Set async: true on a single, parallel tasks, or chain request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback, and does not support seance or workflow requests."
+            " Set async: true on a single, parallel tasks, chain, or workflow request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent or workflow result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback. Seance remains foreground.",
+            " Reusable workers: operation worker_start launches a persistent RPC child with agent/task; worker_send queues another task on its retained conversation. worker_status/worker_wait select workerId and optional turnId; worker_close cancels the entire worker and its queued turns. Each worker has one fixed lifetime deadline and at most 32 total turns; wait timeout does not cancel work. Workers currently require Unix, isolation none and schema-free agents. Their jobId owns the whole process lifetime; use worker_wait for individual turn results."
         )
     }
 
@@ -526,9 +528,13 @@ impl Tool for SubagentTool {
         workflow::schema(json!({
             "type": "object",
             "properties": {
+                "operation": {"type": "string", "enum": ["worker_start", "worker_send", "worker_status", "worker_wait", "worker_close"], "description": "Persistent RPC worker control. Omit for ordinary one-shot delegation. Each operation rejects unrelated fields."},
+                "workerId": {"type": "string", "minLength": 1, "description": "Stable session-owned worker identity returned by worker_start."},
+                "turnId": {"type": "integer", "minimum": 1, "maximum": 32, "description": "worker_status/worker_wait: select a specific admitted turn; defaults to the latest."},
+                "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 600000, "description": "worker_wait only: bounded observation time, default 30000. Zero polls; expiration leaves the worker running."},
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
-                "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, or chain request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance or workflow."},
+                "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},
                 "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
                 "model": {"type": "string", "minLength": 1, "description": "Optional model selector override for a single seance consultation. Otherwise use the saved active branch model; task/smol and parent defaults are not substituted."},
                 "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
@@ -569,6 +575,13 @@ impl Tool for SubagentTool {
     ) -> Result<ToolOutput> {
         let privacy = self.privacy.clone()
             .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        if worker::requested(&input)? {
+            return worker::execute(
+                self,
+                input,
+                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
+            ).await;
+        }
         if background::requested(&input)? {
             return background::start(
                 self,
@@ -588,6 +601,9 @@ impl Tool for SubagentTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         context: ToolInvocationContext<'_>,
     ) -> Result<ToolOutput> {
+        if worker::requested(&input)? {
+            return worker::execute(self, input, (context.snapshot_privacy)()).await;
+        }
         if background::requested(&input)? {
             return background::start(self, input, (context.snapshot_privacy)()).await;
         }
@@ -602,6 +618,12 @@ impl Tool for SubagentTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
+        if worker::requested(&input)? {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKER_PRIVACY: worker operations require an owned invocation privacy snapshot; use execute_with_invocation or standalone execute",
+            ));
+        }
         if background::requested(&input)? {
             return Err(Error::tool(
                 "subagent",
@@ -1015,10 +1037,29 @@ fn child_args(
     parent_model: Option<&ToolModelSelection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
+    let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
+    args.extend(child_options(agent, role_model_spec, parent_model, output_schema));
+    args.push(format!("Task: {task}").into());
+    args
+}
+
+fn worker_args(
+    agent: &AgentDefinition,
+    role_model_spec: Option<&str>,
+    parent_model: Option<&ToolModelSelection>,
+) -> Vec<OsString> {
+    let mut args = vec!["--mode".into(), "rpc".into()];
+    args.extend(child_options(agent, role_model_spec, parent_model, None));
+    args
+}
+
+fn child_options(
+    agent: &AgentDefinition,
+    role_model_spec: Option<&str>,
+    parent_model: Option<&ToolModelSelection>,
+    output_schema: Option<&Value>,
+) -> Vec<OsString> {
     let mut args = vec![
-        "--mode".into(),
-        "json".into(),
-        "--print".into(),
         "--no-session".into(),
         "--tools".into(),
         agent
@@ -1085,7 +1126,6 @@ fn child_args(
         let flag = if consultant { "--system-prompt" } else { "--append-system-prompt" };
         args.extend([flag.into(), prompt.into()]);
     }
-    args.push(format!("Task: {task}").into());
     args
 }
 
