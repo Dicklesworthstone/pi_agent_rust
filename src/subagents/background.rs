@@ -8,7 +8,7 @@
 use super::{
     Deadline, Error, MAX_SUBAGENT_DEPTH, PreparedRequest, RequestMode, Result, SubagentRequest,
     SubagentTool, Value, compile_output_schema, current_subagent_depth, result_output,
-    seance, workspace,
+    seance, workspace, workflow,
 };
 use crate::agent_cx::AgentCx;
 use crate::model::{ContentBlock, TextContent};
@@ -55,6 +55,68 @@ impl PreparedRequest {
             }
         }
         self.deadline.check().map_err(|error| Error::tool("subagent", error))
+    }
+}
+
+/// Parse all graph controls before owner lookup, then freeze definitions
+/// under the same admission fence as ordinary single/batch delegation.
+enum Request {
+    Delegation(SubagentRequest),
+    Workflow(workflow::Plan),
+}
+
+impl Request {
+    fn parse(input: Value) -> Result<Self> {
+        if let Some(plan) = workflow::Plan::parse(&input)? {
+            return Ok(Self::Workflow(plan));
+        }
+        workspace::validate_request(&input)?;
+        let request: SubagentRequest = serde_json::from_value(input)
+            .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
+        request.mode_name()?;
+        Ok(Self::Delegation(request))
+    }
+
+    fn deadline(&self, tool: &SubagentTool) -> Result<Deadline> {
+        match self {
+            Self::Delegation(request) => Deadline::for_request(tool.timeout, request.timeout_seconds),
+            Self::Workflow(plan) => plan.deadline(tool),
+        }
+    }
+
+    fn prepare(self, tool: &SubagentTool, deadline: Deadline) -> Result<Prepared> {
+        match self {
+            Self::Delegation(request) => {
+                let mode = request.mode_name()?;
+                let prepared = tool.prepare_request_with_deadline(request, deadline)?;
+                prepared.validate_background()?;
+                Ok(Prepared::Delegation { request: prepared, mode })
+            }
+            Self::Workflow(plan) => Ok(Prepared::Workflow(plan.prepare(tool, deadline)?)),
+        }
+    }
+}
+
+enum Prepared {
+    Delegation { request: PreparedRequest, mode: &'static str },
+    Workflow(workflow::PreparedWorkflow),
+}
+
+impl Prepared {
+    const fn mode(&self) -> &'static str {
+        match self {
+            Self::Delegation { mode, .. } => *mode,
+            Self::Workflow(_) => "workflow",
+        }
+    }
+
+    async fn run(self, structured_results: bool) -> Result<ToolOutput> {
+        match self {
+            Self::Delegation { request, mode } => {
+                Ok(result_output(request.run(None).await, mode, structured_results))
+            }
+            Self::Workflow(plan) => plan.run(None).await,
+        }
     }
 }
 
@@ -107,10 +169,10 @@ pub(super) async fn start(
             "subagent", format!("Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}"),
         ));
     }
-    if seance::is_request(&input)? || input.get("workflow").is_some() {
+    if seance::is_request(&input)? {
         return Err(Error::tool(
             "subagent",
-            "PI_SUBAGENT_BACKGROUND_INPUT: async supports single, tasks or chain delegation; seance and workflow remain foreground",
+            "PI_SUBAGENT_BACKGROUND_INPUT: seance remains foreground; async supports single, tasks, chain or workflow delegation",
         ));
     }
     if input.get("timeoutSeconds").is_some_and(|value| value.as_u64().is_none()) {
@@ -122,15 +184,12 @@ pub(super) async fn start(
     if let Some(fields) = input.as_object_mut() {
         fields.remove("async");
     }
-    workspace::validate_request(&input)?;
-    let request: SubagentRequest = serde_json::from_value(input)
-        .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
-    let mode = request.mode_name()?;
-    let deadline = Deadline::for_request(tool.timeout, request.timeout_seconds)?;
+    let request = Request::parse(input)?;
+    let deadline = request.deadline(tool)?;
     let session_id = resolve_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&session_id)?;
-    let prepared = tool.prepare_request_with_deadline(request, deadline)?;
-    prepared.validate_background()?;
+    let prepared = request.prepare(tool, deadline)?;
+    let mode = prepared.mode();
     if resolve_session(&tool.job_session_scope, &owner, deadline).await? != session_id {
         return Err(Error::tool(
             "subagent",
@@ -140,7 +199,7 @@ pub(super) async fn start(
     owner.checkpoint().map_err(|_| Error::tool(
         "subagent", "PI_SUBAGENT_CANCELLED: caller cancelled before background admission",
     ))?;
-    let timeout = prepared.deadline.remaining();
+    let timeout = deadline.remaining();
     let structured_results = tool.structured_results;
     let artifacts = tool.global_dir.join("tool-output-artifacts");
     let job = crate::jobs::spawn_owned_task(
@@ -150,10 +209,7 @@ pub(super) async fn start(
         timeout,
         Some(&artifacts),
         privacy,
-        async move {
-            let results = prepared.run(None).await;
-            Ok(result_output(results, mode, structured_results))
-        },
+        prepared.run(structured_results),
     )?;
     Ok(ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(format!(

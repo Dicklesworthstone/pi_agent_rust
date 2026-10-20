@@ -68,7 +68,7 @@ checks do not add path confinement or change authored-agent discovery roots.
 
 ## Background delegation
 
-Add `"async": true` to a single, `tasks`, or `chain` request to release the
+Add `"async": true` to a single, `tasks`, `chain`, or `workflow` request to release the
 calling turn while the same native child runner continues:
 
 ```json
@@ -115,10 +115,58 @@ unprojectable result is replaced by a named failure, never a successful partial
 result. These jobs do not publish live partial tool output; child progress and
 transcripts remain available through the agent hub after children register.
 
-The `async` field must be boolean. `seance` and dependency-graph `workflow`
-requests currently remain foreground and explicitly refuse `async: true`.
+The `async` field must be boolean. `seance` remains foreground and explicitly
+refuses `async: true`.
 No callback, borrowed Agent or eval interpreter is retained by the background
 job. Native tests in `src/subagents/background.rs` cover early return, typed
 results, child reaping, whole-batch refusal, frozen definitions/models and
 session changes/cancellation during admission. Rust acceptance remains
 `dsr quality --tool pi_agent_rust`.
+
+### Background dependency workflows
+
+Use one job for a complete dependency graph, rather than manually starting and
+polling each child. The workflow's `call`, `needs`, typed `inputs`, conditions,
+selected-branch joins and bounded `forEach` expansion keep their foreground
+semantics:
+
+```json
+{
+  "async": true,
+  "workflow": [
+    {"id": "scan", "call": {"agent": "scout", "task": "Map the parser entry points"}},
+    {"id": "review", "needs": ["scan"], "call": {"agent": "reviewer", "task": "Review the parser for correctness"}},
+    {"id": "independent", "call": {"agent": "scout", "task": "Locate the cancellation tests"}}
+  ],
+  "concurrency": 2,
+  "timeoutSeconds": 300
+}
+```
+
+`needs` specifies execution order; it does not automatically insert predecessor
+text into another assignment. Use explicit `inputs` from schema-validated
+predecessor data when a dependent needs those values. Workspace options belong
+inside each node's `call`, not on the top-level graph.
+
+The initial receipt has `details.mode: "workflow"`. A settled `jobs wait` result
+retains `result.details.schema: "pi.subagent.workflow.v1"` and the authored-order
+`nodes` array, including state, wave, blocked dependencies, native result,
+schema verdict, hub ID and any fan-out item reports. The graph's result is not
+flattened into the ordinary single/batch `results` array. Failed branches remain
+errors; skipped descendants do not execute, and independent branches can finish.
+
+The full graph is parsed and all agent definitions and required schemas are
+validated before publication. Definition/model selection freezes once; one
+absolute request deadline spans owner lookup, discovery, queueing, every wave
+and all native retries. Every wave still uses the native runner's shared
+worktree baseline and ordered acceptance barrier. Baselines are captured when
+the wave begins, not at the initial acknowledgment.
+
+Cancellation and session shutdown drop the same owned graph future and its
+unfinished native child leases. There is no graph replay, restart persistence,
+graph-wide rollback or automatic resume. Interrupted jobs use the jobs runtime's
+explicit failure result; a partially completed graph report is not promised.
+Accepted filesystem effects may remain. The existing privacy projection and
+1 MiB complete-result limit apply to graph reports too. Native regression
+coverage is in `src/subagents/workflow/background_tests.rs`; it is not a claim
+that the DSR lane has run in a source-only editing environment.

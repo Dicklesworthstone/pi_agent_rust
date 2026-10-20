@@ -183,6 +183,22 @@ pub(super) struct Plan {
     scope: AgentScope,
 }
 
+/// A complete graph with frozen definitions, model selection and deadline.
+/// This owns no borrowed tool, callback or request context. Execution obtains
+/// the context installed by its foreground caller or native jobs owner.
+pub(super) struct PreparedWorkflow {
+    plan: Plan,
+    runner: ChildRunner,
+    agents: BTreeMap<String, AgentDefinition>,
+    deadline: Deadline,
+}
+
+impl PreparedWorkflow {
+    pub(super) async fn run(self, update: Option<UpdateCallback>) -> Result<ToolOutput> {
+        self.plan.run(self.runner, self.agents, self.deadline, update).await
+    }
+}
+
 impl Plan {
     /// Every graph edge, task shape and workspace option is checked before
     /// discovery, snapshot I/O or launch. Forward references are permitted;
@@ -286,8 +302,14 @@ impl Plan {
         Ok(())
     }
 
-    pub(super) async fn execute(self, tool: &SubagentTool, update: Option<UpdateCallback>) -> Result<ToolOutput> {
-        let deadline = Deadline::for_request(tool.timeout, self.timeout_seconds)?;
+    pub(super) fn deadline(&self, tool: &SubagentTool) -> Result<Deadline> {
+        Deadline::for_request(tool.timeout, self.timeout_seconds)
+    }
+
+    /// Preflight the entire graph before any job handle or child is published.
+    /// Keep the caller's original deadline across owner lookup and discovery;
+    /// an asynchronous launch must not buy a fresh budget or rediscover files.
+    pub(super) fn prepare(self, tool: &SubagentTool, deadline: Deadline) -> Result<PreparedWorkflow> {
         let parent_model = tool.capture_parent_model();
         let owner = AgentCx::for_current_or_request();
         check_authority(&owner)?;
@@ -298,6 +320,25 @@ impl Plan {
             tool.cwd.clone(), tool.global_dir.clone(), tool.child_binary.clone(),
             tool.role_model_spec.clone(), crate::agent_hub::ChildKind::Subagent, deadline,
         ).with_parent_model(parent_model);
+        check_authority(&owner)?;
+        deadline.check().map_err(|message| Error::tool("subagent", message))?;
+        Ok(PreparedWorkflow { plan: self, runner, agents, deadline })
+    }
+
+    pub(super) async fn execute(self, tool: &SubagentTool, update: Option<UpdateCallback>) -> Result<ToolOutput> {
+        let deadline = self.deadline(tool)?;
+        self.prepare(tool, deadline)?.run(update).await
+    }
+
+    async fn run(
+        self,
+        runner: ChildRunner,
+        agents: BTreeMap<String, AgentDefinition>,
+        deadline: Deadline,
+        update: Option<UpdateCallback>,
+    ) -> Result<ToolOutput> {
+        let owner = AgentCx::for_current_or_request();
+        check_authority(&owner)?;
         let mut records: Vec<_> = self.nodes.iter().map(|node| Record::pending(node, &self.nodes)).collect();
         let mut waves_run = 0;
         let mut stop_reason = None;
@@ -557,6 +598,9 @@ pub(super) fn schema(mut schema: Value) -> Value {
     task_schema["additionalProperties"] = json!(false);
     task_schema["properties"]["outputSchema"]["type"] = json!(["object", "boolean"]);
     schema["definitions"]["workflowTask"] = task_schema;
+    schema["properties"]["async"]["description"] = json!(
+        "Return a managed background job for a single, tasks, chain or workflow request. jobs wait returns the complete native result (workflow nodes for a graph); cancellation and session shutdown retire unfinished children. Definitions, model and one deadline freeze before acknowledgment. seance remains foreground."
+    );
     schema["properties"]["workflow"] = json!({
         "type":"array", "minItems":1, "maxItems":MAX_NODES,
         "description":"Dependency graph, mutually exclusive with agent/task, tasks or chain. Each node has id, a native call and optional needs IDs. Forward references are allowed; cycles fail before launch. Ready nodes run in deterministic waves with concurrency 1-8. Native schema and worktree acceptance finish before dependants run. Failed or schema-invalid dependencies skip descendants; independent branches continue. One original timeout and parent-model snapshot cover the entire graph; no replay or graph-wide rollback. Results are in authored node order with hub IDs and explicit skipped reasons.",
@@ -585,3 +629,6 @@ pub(super) fn schema(mut schema: Value) -> Value {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod background_tests;
