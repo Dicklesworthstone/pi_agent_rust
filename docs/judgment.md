@@ -104,3 +104,84 @@ unit fixtures, plus native Python/QuickJS eval integrations with controlled
 providers in `src/eval/judgment/tests.rs`. They are not live-model tests.
 The authoritative acceptance
 command remains `dsr quality --tool pi_agent_rust`.
+
+## Bounded judgment batches inside eval
+
+`__pi_judge_batch` evaluates several independent states against one shared
+rubric, using the same native Judge as `__pi_judge`. It is an invocation-bound
+batch, not OMP's background batch handle or a retained workpool. Requests contain
+`states`, `questions`, and optionally `concurrency` (1-8; default 4). Use either
+an array of 1-16 states or an object with 1-16 literal keys. Object keys must be
+nonempty, at most 128 UTF-8 bytes, and contain no control characters. Each state
+and the shared questions follow the ordinary single-judgment contract.
+
+```json
+{
+  "kernel": "js",
+  "judge_model": {"provider": "your-registered-provider", "model": "your-model-id"},
+  "code": "globalThis.reviews = JSON.parse(await tool.call('__pi_judge_batch', {states: [{change: 'adds regression tests'}, {change: 'removes input checks'}], questions: {safe: {type: 'bool', instructions: 'Does the change improve robustness?'}}, concurrency: 2})); display({allOk: reviews.allOk, items: reviews.items});"
+}
+```
+
+Python uses the same bridge and native behavior:
+
+```python
+import json
+reviews = json.loads(await tool.call('__pi_judge_batch', {
+    'states': {'api': {'change': 'adds validation'}, 'ui': {'change': 'adds tests'}},
+    'questions': {'safe': {'type': 'bool', 'instructions': 'Does this improve robustness?'}},
+    'concurrency': 2,
+}))
+display({'allOk': reviews['allOk'], 'items': reviews['items']})
+```
+
+The response has schema `pi.eval.judgment-batch.v1`, `total`, `succeeded`,
+`failed`, `allOk`, and `items`. Every item has its original `key` and `ok`.
+Array keys are zero-based numeric indices; array results retain input order
+regardless of completion order. Object keys are preserved literally, not parsed
+as paths or expressions; object traversal order is not a scheduling contract.
+A successful item has the complete native `verdict`, including `answers` and
+reported usage. A failed item has a payload-free `error`, never a substitute
+verdict. Other items continue after an ordinary item failure. Check `allOk` or
+each item's `ok` before using results. The cell may deliberately process a
+successful subset, so a handled partial batch does not itself mark the whole
+eval tool result unsuccessful. Failed attempts remain visible in host receipts.
+
+The complete batch shape and every state/rubric are validated before credential
+resolution or provider admission. Both encoded input and the sum of expanded
+state/rubric requests are capped at 256 KiB; the single-request limit still
+applies. The completed result is capped at 1 MiB. There is no truncation,
+implicit splitting, provider fallback or automatic retry. Syntax admission is
+all-or-nothing; privacy screening still occurs per item immediately before its
+ordinary native request. Thus a later privacy refusal can coexist with earlier
+successful results, but the refused payload is never sent to the provider.
+
+Single calls and batch items **share the existing 16-slot cell allowance**.
+The entire batch reserves its slots before any asynchronous work. A batch that
+does not fit the remaining allowance is rejected without submitting a prefix.
+Reserved but unstarted items keep their slots; a caught failure cannot reclaim
+capacity or reset the cell budget. Concurrency bounds active evaluations in
+this batch, not all calls across unrelated EvalTool instances.
+
+The original cell deadline continues to run during queueing, model resolution
+and all evaluations. It is not paused or extended for a batch. Cancellation,
+conversation changes and dropped calls use the existing owned bridge; no
+background task or result handle survives. Cancellation does not return a
+partially completed collection as a complete batch, replay requests, or undo
+completed requests and their possible costs.
+
+`details.judgments.attempts` adds `batch` (the first reserved attempt number)
+and zero-based `item` correlation. Keys, states and rubrics are not copied into
+receipts. `not_started` means a reserved item was never admitted to native
+evaluation; `incomplete` means it entered evaluation but no terminal outcome
+was retained. Neither proves a provider request was sent or billed. Completed
+and failed entries retain the existing usage semantics. Interrupted batches
+may contain all four statuses. A binding failure leaves `not_started` entries
+with a sanitized `admissionError`. This is not a durable billing ledger.
+
+Batch regressions live in `src/eval/judgment/batch/tests.rs`, covering admission,
+shared budgets, actual concurrent controlled-provider streams, out-of-order
+completion, privacy, partial failures, cancellation, and the public Python and
+QuickJS EvalTool paths. They were authored, not compiled or executed in the
+implementation environment: `dsr quality --tool pi_agent_rust` could not start
+because `dsr` was unavailable. No independent fixture check is native acceptance.

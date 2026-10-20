@@ -632,7 +632,13 @@ impl Tool for EvalTool {
          same read/grep/find/ls bridge as tool.call. For typed model judgments, \
          set judge_model={provider,model} for this cell, then call \
          __pi_judge through tool.call with {state,questions} and parse its JSON. \
-         Questions use bool/choice/score rubrics. At most 16 attempts per cell; \
+         Questions use bool/choice/score rubrics. For independent states call \
+         __pi_judge_batch through tool.call with {states,questions,concurrency?}. \
+         states is an array or keyed object of 1-16 states; concurrency is 1-8 \
+         (default 4). Parse the JSON and check allOk or each items entry's ok \
+         before using its verdict; ordinary item failures retain successful peers. \
+         Single judgments and batch items share 16 reserved attempts per cell; \
+         batches keep the original cell deadline and do not run in the background. \
          no model fallback, tool execution, or automatic permission expansion. \
          Native attempt/usage receipts are included in result details."
     }
@@ -673,7 +679,7 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's typed judgments; host registry credentials only, no fallback. Omit when the host already binds a Judge. Not retained by later cells.",
+                    "description": "Explicit model for this cell's __pi_judge and __pi_judge_batch bridge calls; host registry credentials only, no fallback. Omit when the host already binds a Judge. Both operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
                     "properties": {
                         "provider": {"type":"string", "minLength":1, "maxLength":256},
                         "model": {"type":"string", "minLength":1, "maxLength":256}

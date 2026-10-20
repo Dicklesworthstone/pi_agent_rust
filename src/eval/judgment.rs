@@ -18,6 +18,8 @@ use crate::models::ModelRegistry;
 use crate::provider::StreamOptions;
 use crate::tools::ToolOutput;
 
+mod batch;
+
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
 
@@ -136,6 +138,8 @@ impl<'p> Invocation<'p> {
     ) -> std::result::Result<String, String> {
         if name == BRIDGE_NAME {
             self.evaluate(&tool.cwd, input).await
+        } else if name == batch::BRIDGE_NAME {
+            self.evaluate_batch(&tool.cwd, input).await
         } else {
             // Check the raw operation before structured-result unwrapping.
             // Nested tool.result calls cannot expand the normal tool whitelist.
@@ -187,6 +191,13 @@ impl<'p> Invocation<'p> {
     }
 
     async fn evaluate_one(&mut self, cwd: &Path, request: JudgmentRequest) -> Result<Value> {
+        self.bound_judge(cwd).await?
+            .evaluate_protected(request, self.protect).await
+    }
+
+    // Resolve once per invocation, not once per batch item. Cloning a Judge
+    // shares the existing provider, never credentials or privacy with a guest.
+    async fn bound_judge(&mut self, cwd: &Path) -> Result<Judge> {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
@@ -210,8 +221,7 @@ impl<'p> Invocation<'p> {
             owner.checkpoint().map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
             self.judge = Some(judge);
         }
-        self.judge.as_ref().ok_or_else(binding_error)?
-            .evaluate_protected(request, self.protect).await
+        self.judge.clone().ok_or_else(binding_error)
     }
 
     /// Keep receipts outside guest stdout. A cell may discard a verdict or
