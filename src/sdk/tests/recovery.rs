@@ -2274,6 +2274,249 @@ fn an_old_provider_error_cannot_fail_over_an_extension_model_selection() {
     assert!(events.lock().unwrap().is_empty());
 }
 
+fn recovery_route_entry(provider: &str, model: &str) -> crate::models::ModelEntry {
+    let mut entry = crate::models::ad_hoc_model_entry("openai", model).unwrap();
+    entry.model.provider = provider.to_string();
+    entry.model.api = "openai-completions".to_string();
+    entry.model.base_url = format!("https://{provider}.example.test/v1");
+    entry.api_key = Some(format!("{provider}-fixture-key"));
+    entry
+        .headers
+        .insert("x-recovery-route".to_string(), provider.to_string());
+    entry
+}
+
+#[test]
+fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
+    for (current, other) in [("openrouter", "open-router"), ("open-router", "openrouter")] {
+        for reverse in [false, true] {
+            let (mut handle, _) = flaky_handle_as(0, current, "vendor/shared");
+            let mut native = recovery_route_entry("openrouter", "vendor/shared");
+            let mut declared = recovery_route_entry("open-router", "vendor/shared");
+            native.api_key = None;
+            declared.api_key = None;
+            let accepted = recovery_route_entry("policy-owner-fallback", "accepted");
+            let wrong = recovery_route_entry("policy-other-fallback", "wrong");
+            let mut catalog = vec![native, declared, accepted.clone(), wrong.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            let mut registry = ModelRegistry::default();
+            registry
+                .merge_extension_entries(catalog)
+                .expect("separately declared provider catalog");
+            handle.session.set_model_registry(registry);
+            let store = handle.session_store();
+            store.try_lock().unwrap().set_model_header(
+                Some(current.to_string()),
+                Some("vendor/shared".to_string()),
+                None,
+            );
+            let before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+            let mut options = FailoverOptions {
+                chains: HashMap::from([(
+                    format!("{other}/vendor/shared"),
+                    vec!["policy-other-fallback/wrong".to_string()],
+                )]),
+                // The primary names are intentionally absent from the admitted
+                // pool. Their full-catalog declarations still own their policies.
+                available_models: vec![accepted.clone(), wrong],
+                auth: AuthStorage::empty_at(PathBuf::from("unused-policy-auth.json")),
+                cli_api_key: None,
+                cooldown_secs: 300,
+            };
+            handle = handle.with_failover(Some(options.clone()));
+            let (events, callback) = event_log();
+            let failure = Err(Error::provider(current, "503 service unavailable"));
+            assert!(
+                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+                "{current} cannot use {other}'s policy (reverse={reverse})"
+            );
+            assert_eq!(
+                handle.model(),
+                (current.to_string(), "vendor/shared".to_string())
+            );
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                before
+            );
+            assert!(events.lock().unwrap().is_empty());
+
+            options.chains.insert(
+                format!(" {} / VENDOR/SHARED ", current.to_ascii_uppercase()),
+                vec!["policy-owner-fallback/accepted".to_string()],
+            );
+            handle = handle.with_failover(Some(options));
+            assert!(
+                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap()
+            );
+            assert_eq!(
+                handle.model(),
+                (accepted.model.provider.clone(), accepted.model.id.clone())
+            );
+            let installed = handle.session.current_model_entry().unwrap();
+            assert_eq!(installed.model.base_url, accepted.model.base_url);
+            assert_eq!(installed.headers, accepted.headers);
+            assert_eq!(handle.session.agent.provider().api(), accepted.model.api);
+            assert_eq!(
+                handle.session.agent.stream_options().headers,
+                accepted.headers
+            );
+            assert_eq!(
+                handle.session.agent.stream_options().api_key,
+                accepted.api_key
+            );
+            let stored = store.try_lock().unwrap();
+            let provenance = stored
+                .active_failover_provenance_for_current_path()
+                .unwrap();
+            assert_eq!(provenance.primary_provider, current);
+            assert_eq!(provenance.primary_model_id, "vendor/shared");
+            assert_eq!(provenance.fallback_provider, accepted.model.provider);
+            assert_eq!(provenance.fallback_model_id, accepted.model.id);
+            assert_eq!(events.lock().unwrap()[0]["type"], "failover_start");
+        }
+    }
+}
+
+fn saving_alias_recovery_handle(
+    dir: &Path,
+    current: &str,
+    catalog: Vec<crate::models::ModelEntry>,
+    fallback: &crate::models::ModelEntry,
+    with_registry: bool,
+) -> AgentSessionHandle {
+    let mut handle = saving_handle(dir);
+    handle
+        .session
+        .agent
+        .set_provider(Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(AtomicUsize::new(0)),
+            name: current.to_string(),
+            model: "vendor/shared".to_string(),
+            input_tokens: 0,
+        }));
+    let available_models = if with_registry {
+        let mut registry = ModelRegistry::default();
+        registry
+            .merge_extension_entries(catalog)
+            .expect("separately declared provider catalog");
+        handle.session.set_model_registry(registry);
+        vec![fallback.clone()]
+    } else {
+        catalog
+    };
+    handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec![format!("{}/{}", fallback.model.provider, fallback.model.id)],
+        )]),
+        available_models,
+        auth: AuthStorage::empty_at(dir.join("auth.json")),
+        cli_api_key: None,
+        cooldown_secs: 300,
+    }))
+}
+
+#[test]
+fn sdk_recovery_preserves_pending_declared_alias_selection_and_native_aliases() {
+    use crate::extensions::ExtensionSession as _;
+
+    for separately_declared in [false, true] {
+        for with_registry in [false, true] {
+            for reverse in [false, true] {
+                for (current, selected) in
+                    [("openrouter", "open-router"), ("open-router", "openrouter")]
+                {
+                    let dir = tempdir().unwrap();
+                    let mut native = recovery_route_entry("openrouter", "vendor/shared");
+                    native.api_key = None;
+                    let mut catalog = vec![native];
+                    if separately_declared {
+                        let mut declared = recovery_route_entry("open-router", "vendor/shared");
+                        declared.api_key = None;
+                        catalog.push(declared);
+                    }
+                    let fallback = recovery_route_entry("selection-fallback", "accepted");
+                    catalog.push(fallback.clone());
+                    if reverse {
+                        catalog.reverse();
+                    }
+                    let mut handle = saving_alias_recovery_handle(
+                        dir.path(),
+                        current,
+                        catalog,
+                        &fallback,
+                        with_registry,
+                    );
+                    let original_runtime = handle.session.agent.provider();
+                    let store = handle.session_store();
+                    store.try_lock().unwrap().set_model_header(
+                        Some(current.to_string()),
+                        Some("vendor/shared".to_string()),
+                        None,
+                    );
+                    let extension = crate::session::SessionHandle(Arc::clone(&store));
+                    run_async(extension.set_model(
+                        selected.to_string(),
+                        "vendor/shared".to_string(),
+                        None,
+                    ))
+                    .unwrap();
+                    run_async(handle.session.persist_session()).unwrap();
+                    let before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+                    let path = store.try_lock().unwrap().path.clone().unwrap();
+                    let bytes_before = std::fs::read(&path).unwrap();
+                    let (events, callback) = event_log();
+                    let failure = Err(Error::provider(current, "503 service unavailable"));
+                    let swapped =
+                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback))
+                            .unwrap();
+                    assert_eq!(
+                        swapped, !separately_declared,
+                        "current={current}, selected={selected}, full registry={with_registry}, reverse={reverse}"
+                    );
+                    if separately_declared {
+                        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+                        assert!(Arc::ptr_eq(
+                            &original_runtime,
+                            &handle.session.agent.provider()
+                        ));
+                        assert_eq!(
+                            serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                            before
+                        );
+                        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+                        let reopened =
+                            run_async(Session::open(&path.display().to_string())).unwrap();
+                        assert_eq!(
+                            reopened.effective_model_for_current_path(),
+                            Some((selected.to_string(), "vendor/shared".to_string()))
+                        );
+                        assert!(handle.failover_state.primary().is_none());
+                        assert!(events.lock().unwrap().is_empty());
+                    } else {
+                        assert_eq!(
+                            handle.model(),
+                            (fallback.model.provider.clone(), fallback.model.id.clone())
+                        );
+                        assert_eq!(
+                            handle.session.agent.stream_options().headers,
+                            fallback.headers
+                        );
+                        assert_eq!(
+                            handle.session.agent.stream_options().api_key,
+                            fallback.api_key
+                        );
+                        assert_eq!(events.lock().unwrap()[0]["type"], "failover_start");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn install_reconciliation_provenance(
     handle: &mut AgentSessionHandle,
     provenance: crate::session::ModelChangeFailover,

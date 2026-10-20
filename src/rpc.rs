@@ -6926,6 +6926,7 @@ async fn try_failover_to_next_chain_entry(
         "default",
         &primary_model.provider,
         &primary_model.model_id,
+        rpc_model_catalog(&guard, options),
     ) else {
         return Ok(false);
     };
@@ -9259,6 +9260,129 @@ mod retry_tests {
                 "the fallback turn fails: {}",
                 events[agent_end]
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_failover_policy_uses_full_catalog_before_ready_models() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let entry = |provider: &str, model_id: &str| {
+                let mut entry = dummy_entry(model_id, false);
+                entry.model.provider = provider.to_string();
+                entry.model.api = "openai-completions".to_string();
+                entry.model.base_url = format!("https://{provider}.example.test/v1");
+                entry.api_key = Some("routing-fixture-key".to_string());
+                entry.auth_header = true;
+                entry
+            };
+            for (provider, other_provider) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
+                for reverse in [false, true] {
+                    for own_policy in [false, true] {
+                        let primary = entry(provider, "vendor/shared");
+                        let mut other = entry(other_provider, "vendor/shared");
+                        other.api_key = None;
+                        let fallback = entry("pi268-rescue", "fallback");
+                        let mut catalog = vec![primary.clone(), other, fallback.clone()];
+                        if reverse {
+                            catalog.reverse();
+                        }
+                        let agent = Agent::new(
+                            providers::create_provider(&primary, None).expect("provider"),
+                            ToolRegistry::new(&[], Path::new("."), None),
+                            AgentConfig::default(),
+                        );
+                        let mut stored = Session::in_memory();
+                        stored.set_model_header(
+                            Some(provider.to_string()),
+                            Some("vendor/shared".to_string()),
+                            None,
+                        );
+                        let store = Arc::new(Mutex::new(stored));
+                        let mut agent_session = AgentSession::new(
+                            agent,
+                            Arc::clone(&store),
+                            false,
+                            crate::compaction::ResolvedCompactionSettings::default(),
+                        );
+                        agent_session.set_model_registry(
+                            crate::models::ModelRegistry::from_entries_for_tests(catalog),
+                        );
+                        let session = Arc::new(Mutex::new(agent_session));
+                        let policy_provider = if own_policy { provider } else { other_provider };
+                        let config = Config {
+                            retry: Some(crate::config::RetrySettings {
+                                fallback_chains: Some(HashMap::from([(
+                                    format!(" {policy_provider} / VENDOR/SHARED "),
+                                    vec!["pi268-rescue/fallback".to_string()],
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Config::default()
+                        };
+                        let state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                        let options = RpcOptions {
+                            config,
+                            working_directory: None,
+                            resources: ResourceLoader::empty(false),
+                            available_models: vec![primary, fallback],
+                            scoped_models: Vec::new(),
+                            cli_api_key: None,
+                            auth: AuthStorage::empty_at(PathBuf::from("pi268-policy-auth.json")),
+                            runtime_handle: runtime_handle.clone(),
+                            ask_tool: None,
+                        };
+                        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+                        let cx = AgentCx::for_request();
+                        let swapped = try_failover_to_next_chain_entry(
+                            Arc::clone(&session),
+                            Arc::clone(&state),
+                            out_tx,
+                            &options,
+                            Some("503 service unavailable"),
+                            false,
+                            None,
+                            0,
+                            &cx,
+                        )
+                        .await
+                        .expect("resolve policy");
+                        assert_eq!(swapped, own_policy);
+                        let guard = session.lock(&cx).await.expect("agent session");
+                        let expected = if own_policy { "pi268-rescue" } else { provider };
+                        assert_eq!(guard.agent.provider().name(), expected);
+                        drop(guard);
+                        let stored = store.lock(cx.cx()).await.expect("stored session");
+                        assert_eq!(stored.header.provider.as_deref(), Some(expected));
+                        if !own_policy {
+                            assert!(stored.entries.is_empty());
+                            assert!(out_rx.try_recv().is_err());
+                            assert!(
+                                state
+                                    .lock(&cx)
+                                    .await
+                                    .expect("state")
+                                    .failover_primary
+                                    .is_none()
+                            );
+                        } else {
+                            let events: Vec<Value> = out_rx
+                                .try_iter()
+                                .map(|line| serde_json::from_str(&line).expect("event JSON"))
+                                .collect();
+                            assert_eq!(events.len(), 1);
+                            assert_eq!(events[0]["type"], "failover_start");
+                            assert_eq!(events[0]["toProvider"], "pi268-rescue");
+                        }
+                    }
+                }
+            }
         });
     }
 

@@ -6818,6 +6818,91 @@ struct ExtensionAiCompletionHostState {
     compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
+/// Live model selection state shared by extension session adapters. Reading this
+/// handle never acquires the outer AgentSession lock held during a turn.
+#[derive(Clone)]
+pub(crate) struct ExtensionModelCatalog {
+    state: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+}
+
+pub(crate) struct ExtensionModelCatalogSnapshot {
+    registry: Option<Arc<ModelRegistry>>,
+    active_provider: Arc<dyn Provider>,
+}
+
+impl ExtensionModelCatalog {
+    pub(crate) fn snapshot(&self) -> Result<ExtensionModelCatalogSnapshot> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
+        Ok(ExtensionModelCatalogSnapshot {
+            registry: state.compaction_models.registry.clone(),
+            active_provider: Arc::clone(&state.provider),
+        })
+    }
+}
+
+impl ExtensionModelCatalogSnapshot {
+    pub(crate) fn find(&self, provider: &str, model_id: &str) -> Option<ModelEntry> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider, model_id))
+    }
+
+    pub(crate) fn resolve_selection(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<(String, String)> {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "setModel: provider and modelId must be non-empty strings",
+            ));
+        }
+        if let Some(entry) = self.find(provider, model_id) {
+            return Ok((entry.model.provider, entry.model.id));
+        }
+        if self.active_provider.name().eq_ignore_ascii_case(provider)
+            && self
+                .active_provider
+                .model_id()
+                .eq_ignore_ascii_case(model_id)
+        {
+            // Embedders can supply an active ad-hoc provider without a catalog.
+            // Re-selecting that exact destination remains a valid explicit action.
+            return Ok((
+                self.active_provider.name().to_string(),
+                self.active_provider.model_id().to_string(),
+            ));
+        }
+        Err(Error::validation(format!(
+            "setModel: unknown provider/model {provider}/{model_id}. Check the provider and model ID with ctx.modelRegistry.find(provider, modelId) before switching."
+        )))
+    }
+
+    pub(crate) fn select_resolved(
+        &self,
+        session: &mut Session,
+        mut provider: String,
+        mut model_id: String,
+    ) {
+        if let Some((current_provider, current_model)) = session.effective_model_for_current_path()
+            && let Some(current_entry) = self.find(&current_provider, &current_model)
+            && current_entry.model.provider.eq_ignore_ascii_case(&provider)
+            && current_entry.model.id.eq_ignore_ascii_case(&model_id)
+        {
+            // Preserve historical spelling only after the catalog proves that
+            // both names resolve to the same declared destination.
+            provider = current_provider;
+            model_id = current_model;
+        }
+        session.select_model(provider, model_id);
+    }
+}
+
 #[derive(Clone, Default)]
 struct ExtensionCompactionModelState {
     registry: Option<Arc<ModelRegistry>>,
@@ -10602,7 +10687,9 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                ai_completion: extension_session_model_state(),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(true)),
                 is_compacting: Arc::new(AtomicBool::new(true)),
@@ -10664,7 +10751,9 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                ai_completion: extension_session_model_state(),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -10698,7 +10787,9 @@ mod extensions_integration_tests {
             let session_action_admission = SessionActionAdmissionGate::default();
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
-                ai_completion: extension_session_model_state(),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: session_action_admission.clone(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -14449,7 +14540,7 @@ mod turn_event_tests {
 #[derive(Clone)]
 struct AgentExtensionSession {
     handle: SessionHandle,
-    ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+    model_catalog: ExtensionModelCatalog,
     session_action_admission: SessionActionAdmissionGate,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
@@ -14589,42 +14680,8 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let _session_action_permit = self.acquire_session_action_admission(origin).await?;
-        let provider = provider.trim();
-        let model_id = model_id.trim();
-        if provider.is_empty() || model_id.is_empty() {
-            return Err(Error::validation(
-                "setModel: provider and modelId must be non-empty strings",
-            ));
-        }
-        let (registry, active_provider) = {
-            let state = self
-                .ai_completion
-                .lock()
-                .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
-            (
-                state.compaction_models.registry.clone(),
-                Arc::clone(&state.provider),
-            )
-        };
-        let resolved = registry
-            .as_ref()
-            .and_then(|registry| registry.find(provider, model_id));
-        let (mut provider, mut model_id) = if let Some(entry) = resolved {
-            (entry.model.provider, entry.model.id)
-        } else if active_provider.name().eq_ignore_ascii_case(provider)
-            && active_provider.model_id().eq_ignore_ascii_case(model_id)
-        {
-            // Embedders can supply an active ad-hoc provider without a catalog.
-            // Re-selecting that same destination remains a valid explicit action.
-            (
-                active_provider.name().to_string(),
-                active_provider.model_id().to_string(),
-            )
-        } else {
-            return Err(Error::validation(format!(
-                "setModel: unknown provider/model {provider}/{model_id}. Check the provider and model ID with ctx.modelRegistry.find(provider, modelId) before switching."
-            )));
-        };
+        let catalog = self.model_catalog.snapshot()?;
+        let (provider, model_id) = catalog.resolve_selection(&provider, &model_id)?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let mut session = self
             .handle
@@ -14632,20 +14689,7 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        if let Some(registry) = registry
-            && let Some((current_provider, current_model)) =
-                session.effective_model_for_current_path()
-            && let Some(current_entry) = registry.find(&current_provider, &current_model)
-            && current_entry.model.provider.eq_ignore_ascii_case(&provider)
-            && current_entry.model.id.eq_ignore_ascii_case(&model_id)
-        {
-            // The catalog proved that both names resolve to one destination.
-            // Preserve historical alias spelling without merging separately
-            // declared providers that happen to share a built-in alias family.
-            provider = current_provider;
-            model_id = current_model;
-        }
-        session.select_model(provider, model_id);
+        catalog.select_resolved(&mut session, provider, model_id);
         Ok(())
     }
 
@@ -15062,8 +15106,18 @@ impl AgentSession {
         self.refresh_extension_completion_host_state();
     }
 
-    pub(crate) const fn model_registry(&self) -> Option<&ModelRegistry> {
+    /// The complete configured catalog, including models whose credentials are
+    /// not currently available. Use it to resolve identity before filtering
+    /// destinations for readiness or admission.
+    #[must_use]
+    pub const fn model_registry(&self) -> Option<&ModelRegistry> {
         self.model_registry.as_ref()
+    }
+
+    pub(crate) fn extension_model_catalog(&self) -> ExtensionModelCatalog {
+        ExtensionModelCatalog {
+            state: Arc::clone(&self.extension_ai_completion),
+        }
     }
 
     #[must_use]
@@ -17539,7 +17593,7 @@ impl AgentSession {
         }
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
-            ai_completion: Arc::clone(&self.extension_ai_completion),
+            model_catalog: self.extension_model_catalog(),
             session_action_admission: self.session_action_admission.clone(),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_compacting: Arc::clone(&self.extensions_is_compacting),

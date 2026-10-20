@@ -558,6 +558,7 @@ impl AgentSessionHandle {
     async fn reconcile_failover_state(
         &mut self,
         configured_cooldown_secs: u64,
+        available_models: &[crate::models::ModelEntry],
         cx: &crate::agent_cx::AgentCx,
     ) -> Result<bool> {
         let session = self
@@ -571,8 +572,15 @@ impl AgentSessionHandle {
             session
                 .effective_model_for_current_path()
                 .is_none_or(|(provider, model)| {
-                    crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
-                        && runtime.model_id().eq_ignore_ascii_case(&model)
+                    crate::models::model_identities_match(
+                        self.session
+                            .model_registry()
+                            .map_or(available_models, crate::models::ModelRegistry::models),
+                        runtime.name(),
+                        runtime.model_id(),
+                        &provider,
+                        &model,
+                    )
                 });
         self.failover_state.reconcile_from_session(
             &session,
@@ -617,7 +625,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(false);
@@ -641,6 +649,10 @@ impl AgentSessionHandle {
             "default",
             &primary.provider,
             &primary.model_id,
+            self.session.model_registry().map_or(
+                options.available_models.as_slice(),
+                crate::models::ModelRegistry::models,
+            ),
         ) else {
             return Ok(false);
         };
@@ -729,7 +741,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(());

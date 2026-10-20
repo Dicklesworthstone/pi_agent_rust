@@ -261,13 +261,16 @@ pub struct FailoverChain {
 ///
 /// Looks up fallback chains from `retry.fallbackChains`. Role keys take precedence
 /// over exact model specs. Provider aliases and surrounding spec whitespace follow
-/// model resolution. An exact key wins over equivalent spellings; otherwise the
-/// lexicographically first matching key wins, independent of `HashMap` iteration order.
+/// model resolution in the full catalog, before credential filtering. Separately
+/// declared providers cannot borrow each other's policy through a built-in alias.
+/// An exact key wins over equivalent spellings; otherwise the lexicographically
+/// first matching key wins, independent of `HashMap` iteration order.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
     provider: &str,
     model_id: &str,
+    models: &[crate::models::ModelEntry],
 ) -> Option<FailoverChain> {
     if let Some(entries) = chains.get(role)
         && !entries.is_empty()
@@ -286,20 +289,31 @@ pub fn chain_for<S: std::hash::BuildHasher>(
     }
     chains
         .iter()
-        .filter(|(key, entries)| !entries.is_empty() && model_spec_matches(key, provider, model_id))
+        .filter(|(key, entries)| {
+            !entries.is_empty() && model_spec_matches(key, provider, model_id, models)
+        })
         .min_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, entries)| FailoverChain {
             entries: entries.clone(),
         })
 }
 
-/// Match a per-model policy key using built-in aliases and nested model IDs.
-/// Runtime chain walking additionally consults the declared model catalog.
-fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
+/// Policy ownership uses the same declared destinations as chain walking.
+fn model_spec_matches(
+    spec: &str,
+    provider: &str,
+    model_id: &str,
+    models: &[crate::models::ModelEntry],
+) -> bool {
     crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
         |(candidate_provider, candidate_model)| {
-            crate::provider_metadata::provider_ids_match(provider, candidate_provider)
-                && model_id.eq_ignore_ascii_case(candidate_model)
+            crate::models::model_identities_match(
+                models,
+                provider,
+                model_id,
+                candidate_provider,
+                candidate_model,
+            )
         },
     )
 }
@@ -1454,21 +1468,21 @@ mod tests {
             vec!["google/gemini-3-pro".to_string()],
         );
         assert_eq!(
-            chain_for(&chains, "default", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "default", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-5-mini".to_string()]
         );
         // Non-default role name that is not configured: falls to the exact model key.
         assert_eq!(
-            chain_for(&chains, "task", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "task", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["google/gemini-3-pro".to_string()]
         );
         // The "default" role key matches any model by design; an UNCONFIGURED
         // role + unconfigured exact model yields no chain.
-        assert!(chain_for(&chains, "task", "openai", "gpt-5.5").is_none());
+        assert!(chain_for(&chains, "task", "openai", "gpt-5.5", &[]).is_none());
     }
 
     #[test]
@@ -1478,7 +1492,7 @@ mod tests {
             vec!["openai/gpt-y".to_string()],
         )]);
         for provider in ["google", "gemini", "GOOGLE"] {
-            let resolved = chain_for(&chains, "task", provider, "gemini-z")
+            let resolved = chain_for(&chains, "task", provider, "gemini-z", &[])
                 .expect("configured aliases must resolve like model selection");
             assert_eq!(resolved.entries, vec!["openai/gpt-y".to_string()]);
         }
@@ -1502,13 +1516,13 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["role/winner".to_string()]
         );
         assert_eq!(
-            chain_for(&chains, "unconfigured", "google", "gemini-z")
+            chain_for(&chains, "unconfigured", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["exact/winner".to_string()]
@@ -1526,7 +1540,7 @@ mod tests {
                 .map(|key| (key.to_string(), vec![key.to_string()]))
                 .collect();
             assert_eq!(
-                chain_for(&chains, "task", "google", "gemini-z")
+                chain_for(&chains, "task", "google", "gemini-z", &[])
                     .unwrap()
                     .entries,
                 vec!["GEMINI/GEMINI-Z".to_string()]
@@ -1545,11 +1559,101 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-y".to_string()]
         );
+    }
+
+    #[test]
+    fn chain_policies_belong_to_declared_providers_in_either_catalog_order() {
+        for (native_provider, declared_provider) in
+            [("openrouter", "open-router"), ("google", "gemini")]
+        {
+            let native = crate::models::ad_hoc_model_entry(native_provider, "vendor/shared")
+                .expect("native policy fixture");
+            let mut declared = native.clone();
+            declared.model.provider = declared_provider.to_string();
+            declared.model.base_url = "https://declared.example.test/v1".to_string();
+            // An unavailable declaration still owns its policy namespace.
+            declared.api_key = None;
+            for reverse in [false, true] {
+                let mut catalog = vec![native.clone(), declared.clone()];
+                if reverse {
+                    catalog.reverse();
+                }
+                for (current, other) in [
+                    (native_provider, declared_provider),
+                    (declared_provider, native_provider),
+                ] {
+                    let mut chains = HashMap::from([(
+                        format!("{other}/vendor/shared"),
+                        vec!["wrong/policy".to_string()],
+                    )]);
+                    assert!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog).is_none(),
+                        "{current} cannot borrow {other}'s policy (reverse={reverse})"
+                    );
+                    chains.insert(
+                        format!(" {} / VENDOR/SHARED ", current.to_ascii_uppercase()),
+                        vec!["own/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("own normalized policy")
+                            .entries,
+                        vec!["own/policy".to_string()]
+                    );
+                    chains.insert(
+                        format!("{current}/vendor/shared"),
+                        vec!["exact/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("exact policy takes precedence")
+                            .entries,
+                        vec!["exact/policy".to_string()]
+                    );
+                    chains.insert("task".to_string(), vec!["role/policy".to_string()]);
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("role policy takes precedence")
+                            .entries,
+                        vec!["role/policy".to_string()]
+                    );
+                }
+            }
+            // Declaring a different model still reserves the provider identity;
+            // removing an unavailable model from the pool cannot grant its policy.
+            declared.model.id = "vendor/other".to_string();
+            let chains = HashMap::from([(
+                format!("{native_provider}/vendor/shared"),
+                vec!["native/policy".to_string()],
+            )]);
+            assert!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native.clone(), declared],
+                )
+                .is_none()
+            );
+            assert_eq!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native],
+                )
+                .expect("an undeclared native alias retains its policy")
+                .entries,
+                vec!["native/policy".to_string()]
+            );
+        }
     }
 
     #[test]

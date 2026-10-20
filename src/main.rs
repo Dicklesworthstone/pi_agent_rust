@@ -9882,9 +9882,16 @@ async fn try_print_failover(
             .thinking_level
             .unwrap_or_default(),
     });
-    let Some(chain) =
-        pi::failover::chain_for(chains, "default", &primary.provider, &primary.model_id)
-    else {
+    let catalog = session
+        .model_registry()
+        .map_or(ctx.available_models, ModelRegistry::models);
+    let Some(chain) = pi::failover::chain_for(
+        chains,
+        "default",
+        &primary.provider,
+        &primary.model_id,
+        catalog,
+    ) else {
         return Ok(None);
     };
     // The walk, the credential check, the provider construction and the
@@ -13946,6 +13953,103 @@ mod tests {
                             )
                     ))
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_policy_keeps_declared_provider_ownership() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let entry = |provider: &str, model_id: &str| {
+                let mut entry =
+                    pi::models::ad_hoc_model_entry("openrouter", model_id).expect("fixture model");
+                entry.model.provider = provider.to_string();
+                entry.model.base_url = format!("https://{provider}.example.test/v1");
+                entry.api_key = Some("routing-fixture-key".to_string());
+                entry
+            };
+            for (provider, other_provider) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
+                for reverse in [false, true] {
+                    for own_policy in [false, true] {
+                        let primary = entry(provider, "vendor/shared");
+                        let mut other = entry(other_provider, "vendor/shared");
+                        other.api_key = None;
+                        let fallback = entry("pi268-rescue", "fallback");
+                        let mut catalog = vec![primary.clone(), other, fallback.clone()];
+                        if reverse {
+                            catalog.reverse();
+                        }
+                        let mut registry = ModelRegistry::default();
+                        registry.merge_extension_entries(catalog).expect("catalog");
+                        let available_models = vec![primary.clone(), fallback];
+                        let runtime_provider =
+                            providers::create_provider(&primary, None).expect("provider");
+                        let agent = Agent::new(
+                            runtime_provider,
+                            ToolRegistry::new(&[], Path::new("."), None),
+                            AgentConfig::default(),
+                        );
+                        let mut stored = Session::in_memory();
+                        stored.set_model_header(
+                            Some(provider.to_string()),
+                            Some("vendor/shared".to_string()),
+                            None,
+                        );
+                        let store = Arc::new(Mutex::new(stored));
+                        let mut session = AgentSession::new(
+                            agent,
+                            Arc::clone(&store),
+                            false,
+                            ResolvedCompactionSettings::default(),
+                        );
+                        session.set_model_registry(registry);
+                        let policy_provider = if own_policy { provider } else { other_provider };
+                        let config = Config {
+                            retry: Some(pi::config::RetrySettings {
+                                fallback_chains: Some(std::collections::HashMap::from([(
+                                    format!(" {policy_provider} / VENDOR/SHARED "),
+                                    vec!["pi268-rescue/fallback".to_string()],
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Config::default()
+                        };
+                        let auth = AuthStorage::empty_at(PathBuf::from("pi268-policy-auth.json"));
+                        let mut state = PrintFailoverState::new(&config);
+                        let result = try_print_failover(
+                            &mut session,
+                            &config,
+                            Some(FailoverResolution {
+                                available_models: &available_models,
+                                auth: &auth,
+                                cli_api_key: None,
+                            }),
+                            &mut state,
+                            Some("503 service unavailable"),
+                            false,
+                            false,
+                            None,
+                            0,
+                        )
+                        .await
+                        .expect("resolve policy");
+                        assert_eq!(result.is_some(), own_policy);
+                        let expected = if own_policy { "pi268-rescue" } else { provider };
+                        assert_eq!(session.agent.provider().name(), expected);
+                        let cx = pi::agent_cx::AgentCx::for_request();
+                        let stored = store.lock(cx.cx()).await.expect("stored session");
+                        assert_eq!(stored.header.provider.as_deref(), Some(expected));
+                        assert_eq!(state.primary().is_some(), own_policy);
+                        if !own_policy {
+                            assert!(stored.entries.is_empty());
+                            assert_eq!(state.chain_position(), 0);
+                        }
+                    }
+                }
+            }
         });
     }
 

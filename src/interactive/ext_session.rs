@@ -1,6 +1,5 @@
 use super::conversation::extension_model_from_entry;
 use super::*;
-use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 
 #[derive(Clone)]
 pub(super) struct InteractiveExtensionHostActions {
@@ -190,6 +189,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
 pub(super) struct InteractiveExtensionSession {
     pub(super) session: Arc<Mutex<Session>>,
     pub(super) model_entry: Arc<StdMutex<ModelEntry>>,
+    pub(super) model_catalog: crate::agent::ExtensionModelCatalog,
     pub(super) is_streaming: Arc<AtomicBool>,
     pub(super) is_compacting: Arc<AtomicBool>,
     pub(super) config: Config,
@@ -231,14 +231,38 @@ fn current_path_thinking_level(session: &Session) -> Option<String> {
     session.effective_thinking_level_for_current_path()
 }
 
-fn session_model_state_value(shared_model: &ModelEntry, session: &Session) -> Value {
+fn session_model_entry(
+    shared_model: &ModelEntry,
+    catalog: Option<&crate::agent::ExtensionModelCatalogSnapshot>,
+    session: &Session,
+) -> Option<ModelEntry> {
+    let (provider, model_id) = current_path_model_pair(session)?;
+    catalog
+        .and_then(|catalog| catalog.find(&provider, &model_id))
+        .or_else(|| {
+            (shared_model
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(provider.trim())
+                && shared_model
+                    .model
+                    .id
+                    .trim()
+                    .eq_ignore_ascii_case(model_id.trim()))
+            .then(|| shared_model.clone())
+        })
+}
+
+fn session_model_state_value(
+    shared_model: &ModelEntry,
+    catalog: Option<&crate::agent::ExtensionModelCatalogSnapshot>,
+    session: &Session,
+) -> Value {
+    if let Some(entry) = session_model_entry(shared_model, catalog, session) {
+        return extension_model_from_entry(&entry);
+    }
     match current_path_model_pair(session) {
-        Some((provider, model_id))
-            if provider_ids_match(&shared_model.model.provider, &provider)
-                && shared_model.model.id.eq_ignore_ascii_case(&model_id) =>
-        {
-            extension_model_from_entry(shared_model)
-        }
         Some((provider, model_id)) => json!({
             "provider": provider,
             "id": model_id,
@@ -283,6 +307,7 @@ impl ExtensionSession for InteractiveExtensionSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let fallback_model = extension_model_from_entry(&shared_model);
+        let catalog = self.model_catalog.snapshot().ok();
 
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let (
@@ -316,7 +341,7 @@ impl ExtensionSession for InteractiveExtensionSession {
                 )
             },
             |guard| {
-                let model = session_model_state_value(&shared_model, &guard);
+                let model = session_model_state_value(&shared_model, catalog.as_ref(), &guard);
                 let message_count = guard
                     .entries_for_current_path()
                     .iter()
@@ -484,30 +509,13 @@ impl ExtensionSession for InteractiveExtensionSession {
         origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let _session_action_permit = self.acquire_session_action_admission(origin).await?;
+        let catalog = self.model_catalog.snapshot()?;
+        let (provider, model_id) = catalog.resolve_selection(&provider, &model_id)?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
             .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
-        let normalized_provider = canonical_provider_id(&provider)
-            .unwrap_or(&provider)
-            .to_string();
-        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(&guard) {
-            Some((current_provider, current_model_id))
-                if provider_ids_match(&current_provider, &provider)
-                    && current_model_id.eq_ignore_ascii_case(&model_id) =>
-            {
-                (current_provider, current_model_id, false)
-            }
-            _ => (normalized_provider, model_id.clone(), true),
-        };
-        if changed
-            || guard
-                .active_failover_provenance_for_current_path()
-                .is_some()
-        {
-            guard.append_model_change(stored_provider.clone(), stored_model_id.clone());
-        }
-        guard.set_model_header(Some(stored_provider), Some(stored_model_id), None);
+        catalog.select_resolved(&mut guard, provider, model_id);
         self.persist_mutations(&mut guard).await?;
         Ok(())
     }
@@ -528,20 +536,24 @@ impl ExtensionSession for InteractiveExtensionSession {
         let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let shared_model = self.model_entry.lock().map(|entry| entry.clone()).ok();
+        let catalog = self.model_catalog.snapshot().ok();
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
             .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         let effective_level = level.parse::<crate::model::ThinkingLevel>().map_or_else(
             |_| level.clone(),
-            |parsed| match (shared_model.as_ref(), current_path_model_pair(&guard)) {
-                (Some(entry), Some((provider, model_id)))
-                    if provider_ids_match(&entry.model.provider, &provider)
-                        && entry.model.id.eq_ignore_ascii_case(&model_id) =>
-                {
-                    entry.clamp_thinking_level(parsed).to_string()
-                }
-                (Some(entry), None) => entry.clamp_thinking_level(parsed).to_string(),
-                _ => level.clone(),
+            |parsed| {
+                let target = shared_model.as_ref().and_then(|shared| {
+                    if current_path_model_pair(&guard).is_none() {
+                        Some(shared.clone())
+                    } else {
+                        session_model_entry(shared, catalog.as_ref(), &guard)
+                    }
+                });
+                target.map_or_else(
+                    || level.clone(),
+                    |entry| entry.clamp_thinking_level(parsed).to_string(),
+                )
             },
         );
         let changed =
@@ -899,6 +911,312 @@ mod tests {
         }
     }
 
+    fn agent_session_with_catalog(
+        session: Arc<Mutex<Session>>,
+        entries: Vec<ModelEntry>,
+    ) -> AgentSession {
+        let agent = Agent::new(
+            Arc::new(NoopProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        agent_session.extensions = Some(crate::extensions::ExtensionRegion::new(
+            ExtensionManager::new(),
+        ));
+        agent_session.set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+            entries,
+        ));
+        agent_session
+    }
+
+    fn test_model_catalog() -> crate::agent::ExtensionModelCatalog {
+        let mut entries = vec![dummy_model_entry()];
+        for (provider, id) in [
+            ("openai", "gpt-4o"),
+            ("openai", "fallback"),
+            ("openai", "other"),
+            ("anthropic", "claude-sonnet-4-5"),
+            ("google", "gemini-2.5-pro"),
+        ] {
+            let mut entry = dummy_model_entry();
+            entry.model.provider = provider.to_string();
+            entry.model.id = id.to_string();
+            entry.model.reasoning = true;
+            entries.push(entry);
+        }
+        agent_session_with_catalog(Arc::new(Mutex::new(Session::in_memory())), entries)
+            .extension_model_catalog()
+    }
+
+    fn route_entry(provider: &str, reasoning: bool) -> ModelEntry {
+        let mut entry = dummy_model_entry();
+        entry.model.provider = provider.to_string();
+        entry.model.id = "vendor/shared".to_string();
+        entry.model.api = "openai-completions".to_string();
+        entry.model.base_url = format!("https://{provider}.invalid/v1");
+        entry.model.reasoning = reasoning;
+        entry.model.max_tokens = if reasoning { 2048 } else { 1024 };
+        entry.api_key = Some(format!("fixture-{provider}"));
+        entry
+            .headers
+            .insert("x-route".to_string(), provider.to_string());
+        entry
+    }
+
+    fn model_selection_app(
+        entries: Vec<ModelEntry>,
+        available: Vec<ModelEntry>,
+        runtime_handle: RuntimeHandle,
+        cwd: &Path,
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        let current = dummy_model_entry();
+        let mut state = Session::in_memory();
+        state.select_model(current.model.provider.clone(), current.model.id.clone());
+        let agent_session = agent_session_with_catalog(Arc::new(Mutex::new(state)), entries);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let app = PiApp::from_agent_session(
+            agent_session,
+            Config {
+                last_changelog_version: Some(crate::platform::VERSION.to_string()),
+                ..Config::default()
+            },
+            ResourceLoader::empty(false),
+            ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            },
+            cwd.to_path_buf(),
+            current,
+            Vec::new(),
+            available,
+            None,
+            Vec::new(),
+            event_tx,
+            runtime_handle,
+            false,
+            false,
+            Some(KeyBindings::new()),
+            Vec::new(),
+            Usage::default(),
+            None,
+            None,
+        );
+        (app, event_rx)
+    }
+
+    #[test]
+    fn classic_extension_model_selection_keeps_declared_routes_and_metadata() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for reverse in [false, true] {
+                let temp = tempfile::TempDir::new().expect("tempdir");
+                let native = route_entry("openrouter", false);
+                let custom = route_entry("open-router", true);
+                let mut entries = vec![native.clone(), custom.clone()];
+                if reverse {
+                    entries.reverse();
+                }
+                let mut available = entries.clone();
+                for entry in &mut available {
+                    entry.model.base_url = "https://stale.invalid/v1".to_string();
+                    entry.headers.clear();
+                    entry.model.max_tokens = 1;
+                }
+                let (mut app, _events) =
+                    model_selection_app(entries, available, runtime.handle(), temp.path());
+                let extension = app
+                    .extensions
+                    .as_ref()
+                    .expect("extension manager")
+                    .session_handle()
+                    .expect("installed classic adapter");
+                for target in [&custom, &native, &custom] {
+                    let origin = app.session_action_admission.capture_origin();
+                    let held_agent = app.agent.try_lock().expect("hold outer agent lock");
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(100),
+                        extension.set_model(
+                            target.model.provider.clone(),
+                            target.model.id.clone(),
+                            Some(origin.clone()),
+                        ),
+                    )
+                    .await
+                    .expect("model selection must not wait for the outer agent lock")
+                    .expect("select declared route");
+                    drop(held_agent);
+                    let state = extension.get_state().await;
+                    assert_eq!(state["model"]["provider"], target.model.provider);
+                    assert_eq!(state["model"]["baseUrl"], target.model.base_url);
+                    assert_eq!(state["model"]["maxTokens"], target.model.max_tokens);
+                    extension
+                        .set_thinking_level("high".to_string(), Some(origin.clone()))
+                        .await
+                        .expect("set target thinking level");
+                    assert_eq!(
+                        extension.get_thinking_level().await.as_deref(),
+                        Some(if target.model.reasoning {
+                            "high"
+                        } else {
+                            "off"
+                        }),
+                    );
+                    app.sync_runtime_selection_from_session_header()
+                        .expect("install selected route");
+                    assert_eq!(app.model_entry.model.base_url, target.model.base_url);
+                    {
+                        let agent = app.agent.try_lock().expect("selected runtime");
+                        assert_eq!(agent.provider().name(), target.model.provider);
+                        assert_eq!(agent.provider().model_id(), target.model.id);
+                        assert_eq!(agent.stream_options().headers, target.headers);
+                        assert_eq!(
+                            agent.stream_options().max_tokens,
+                            Some(target.model.max_tokens),
+                        );
+                    }
+                    let before = app.session.try_lock().expect("session").entries.len();
+                    extension
+                        .set_model(
+                            format!(" {} ", target.model.provider.to_ascii_uppercase()),
+                            format!(" {} ", target.model.id.to_ascii_uppercase()),
+                            Some(origin),
+                        )
+                        .await
+                        .expect("reselect the same declared route");
+                    assert_eq!(
+                        app.session.try_lock().expect("session").entries.len(),
+                        before
+                    );
+                    assert_eq!(
+                        extension.get_model().await,
+                        (
+                            Some(target.model.provider.clone()),
+                            Some(target.model.id.clone()),
+                        ),
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn classic_extension_selection_rejects_missing_targets_and_sees_catalog_refresh() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let native = route_entry("openrouter", false);
+            let mut unavailable = route_entry("open-router", true);
+            unavailable.model.id = "vendor/other".to_string();
+            unavailable.api_key = None;
+            let (mut app, _events) = model_selection_app(
+                vec![unavailable, native.clone()],
+                vec![native.clone()],
+                runtime.handle(),
+                temp.path(),
+            );
+            let extension = app
+                .extensions
+                .as_ref()
+                .expect("extension manager")
+                .session_handle()
+                .expect("installed classic adapter");
+            let origin = app.session_action_admission.capture_origin();
+            extension
+                .set_model(
+                    native.model.provider.clone(),
+                    native.model.id.clone(),
+                    Some(origin.clone()),
+                )
+                .await
+                .expect("select native route");
+            app.sync_runtime_selection_from_session_header()
+                .expect("install native route");
+            let before = {
+                let session = app.session.try_lock().expect("session");
+                json!({ "header": session.header, "entries": session.entries })
+            };
+            for (provider, model) in [
+                ("open-router", "vendor/shared"),
+                ("open-router", "vendor/missing"),
+                (" ", "vendor/shared"),
+                ("open-router", " "),
+            ] {
+                let error = extension
+                    .set_model(
+                        provider.to_string(),
+                        model.to_string(),
+                        Some(origin.clone()),
+                    )
+                    .await
+                    .expect_err("missing and blank targets must fail");
+                let diagnostic = error.to_string();
+                assert!(
+                    diagnostic.contains("non-empty")
+                        || diagnostic.contains("ctx.modelRegistry.find"),
+                );
+                let session = app.session.try_lock().expect("session");
+                assert_eq!(
+                    json!({ "header": session.header, "entries": session.entries }),
+                    before,
+                );
+                assert_eq!(
+                    app.agent.try_lock().expect("runtime").provider().name(),
+                    "openrouter",
+                );
+            }
+            let custom = route_entry("open-router", true);
+            {
+                let mut agent = app.agent.try_lock().expect("agent");
+                let mut registry = agent
+                    .handle
+                    .session()
+                    .model_registry()
+                    .expect("catalog")
+                    .clone();
+                registry
+                    .merge_extension_entries(vec![custom.clone()])
+                    .expect("add a declared provider model");
+                agent.handle.session_mut().set_model_registry(registry);
+            }
+            extension
+                .set_model(
+                    custom.model.provider.clone(),
+                    custom.model.id.clone(),
+                    Some(origin),
+                )
+                .await
+                .expect("existing adapter sees the refreshed catalog");
+            assert_eq!(
+                extension.get_state().await["model"]["baseUrl"],
+                custom.model.base_url,
+            );
+            app.sync_runtime_selection_from_session_header()
+                .expect("install newly registered route");
+            let agent = app.agent.try_lock().expect("selected runtime");
+            assert_eq!(agent.provider().name(), "open-router");
+            assert_eq!(agent.stream_options().headers, custom.headers);
+            assert_eq!(
+                agent.stream_options().max_tokens,
+                Some(custom.model.max_tokens),
+            );
+        });
+    }
+
     #[test]
     fn format_generic_confirm_sanitizes_hostile_title_on_one_line() {
         let request = ExtensionUiRequest::new(
@@ -961,6 +1279,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session,
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1003,6 +1322,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1333,6 +1653,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(entry)),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1392,6 +1713,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1433,6 +1755,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1499,6 +1822,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1588,6 +1912,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1661,6 +1986,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session,
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1715,6 +2041,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session,
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1771,6 +2098,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -1825,6 +2153,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session,
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config {
@@ -1873,6 +2202,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -2010,6 +2340,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
@@ -2168,6 +2499,7 @@ mod tests {
             let ext_session = InteractiveExtensionSession {
                 session: Arc::clone(&session),
                 model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                model_catalog: test_model_catalog(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),

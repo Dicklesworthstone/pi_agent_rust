@@ -126,6 +126,14 @@ requested model under that provider, or select a registered pair shown by
 switches preserve the current model and session history. Native aliases that
 are not separately declared continue to select the registered native provider.
 
+Per-model `retry.fallbackChains` keys use the same complete catalog to identify
+their provider. A separately declared provider cannot borrow another provider's
+chain merely because their names are built-in aliases, even when one is absent
+from the ready-model list. Role keys still take precedence over per-model keys;
+native aliases continue to share a chain when they resolve to the same provider.
+If an extension selects a different declared provider after a request fails,
+recovery leaves that selection in place for the next request.
+
 An active model scope still controls automatic selection. If a valid
 configured default or default role is outside that scope, Pi uses the first
 allowed scoped model and warns with both destinations. Check

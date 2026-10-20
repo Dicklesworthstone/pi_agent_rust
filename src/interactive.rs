@@ -3156,12 +3156,19 @@ impl PiApp {
         failover: Option<crate::sdk::FailoverOptions>,
     ) -> Self {
         let session = Arc::clone(&agent_session.session);
+        // Keep the authoritative routes, including unready models, and admit
+        // entries supplied by embedders before extensions receive this catalog.
+        let mut registry = agent_session.model_registry().cloned().unwrap_or_default();
+        registry.merge_missing_entries(available_models.clone());
+        registry.merge_missing_entries(vec![model_entry.clone()]);
+        agent_session.set_model_registry(registry);
         let extensions = agent_session
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
         let session_action_admission = agent_session.session_action_admission_gate();
         let provider_admission = agent_session.provider_admission_gate();
+        let extension_model_catalog = agent_session.extension_model_catalog();
         if let Some(manager) = &mcp_manager {
             agent_session.set_mcp_manager(Arc::clone(manager));
         }
@@ -3431,6 +3438,7 @@ impl PiApp {
             let session_handle = Arc::new(InteractiveExtensionSession {
                 session: Arc::clone(&app.session),
                 model_entry: model_entry_shared,
+                model_catalog: extension_model_catalog,
                 is_streaming: extension_streaming,
                 is_compacting: extension_compacting,
                 config: app.config.clone(),
