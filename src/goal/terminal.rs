@@ -1,19 +1,20 @@
-//! Idle terminal controls over the native branch-scoped goal journal.
+//! Terminal controls over the native branch-scoped goal journal.
 //!
 //! A revision receipt binds even creation to the displayed session/branch.
 //! Receipt verification and journal mutation share the same owned store lock.
 //! Lifecycle changes do not dispatch provider work. Explicit step/run commands
 //! use the bounded native driver and pause on absent or repeated tool progress.
-//! No command grants additional tool permissions or infers goal completion.
+//! Their host acquires the run control before the first poll, without new rights.
 
 use super::{
-    GoalBudget, GoalPersistence, GoalStatus, MAX_TEXT_BYTES, Record,
-    Transition, append, check_owner, failure, latest, persist, snapshot, transition, validate_text,
+    GoalBudget, GoalControl, GoalPersistence, GoalRunReport, GoalStatus, MAX_TEXT_BYTES,
+    Record, Transition, append, check_owner, failure, latest, persist, snapshot,
+    transition, validate_text,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
+use crate::model::{AssistantMessage, ContentBlock};
 use crate::plan::PlanMode;
-use crate::model::ContentBlock;
 use crate::sdk::AgentSessionHandle;
 use crate::session::Session;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | run <review> --steps N | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
 const RECEIPT_PREFIX: &str = "g1-";
+const MAX_REPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 enum Action<'a> {
@@ -183,12 +185,25 @@ fn receipt(
 
 fn require_no_plan(session: &Session, live: PlanMode) -> Result<()> {
     if live != PlanMode::Off || crate::plan::replayed_plan_mode(session) != PlanMode::Off {
-        return Err(failure("GOAL_PLAN_MODE", "exit plan mode before creating or resuming a goal"));
+        return Err(failure("GOAL_PLAN_MODE", "exit plan mode before creating, resuming or running a goal"));
     }
     Ok(())
 }
 
+/// Lifecycle-only tests need no control sink. Production supplies one below.
+#[cfg(test)]
 pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<String> {
+    run_with_control(handle, args, |_| {}).await
+}
+
+/// Publish exactly this invocation's control before polling its native driver.
+/// Invalid/lifecycle commands never publish a control. The host must not treat
+/// this as a durable session control: the handle retires with the run.
+pub(crate) async fn run_with_control(
+    handle: &mut AgentSessionHandle,
+    args: &str,
+    publish_control: impl FnOnce(GoalControl) + Send,
+) -> Result<String> {
     let command = parse(args)?;
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner, false)?;
@@ -216,6 +231,8 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
             _ => unreachable!(),
         };
         drop(session);
+        // Preserve the shared progress policy: the user's step count is an
+        // upper bound, not permission to replay absent/repeated tool activity.
         let run = handle.run_goal_until_review(
             &owner,
             &reviewed,
@@ -223,33 +240,16 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
             Duration::from_secs(15 * 60),
             |_control, _event| {},
         )?;
+        publish_control(run.control());
         let report = run.await;
-        let mut output = String::new();
-        let _ = writeln!(output, "Goal {label} stopped: {:?}", report.stop);
-        if let Some(Ok(message)) = &report.completion {
-            let mut wrote = false;
-            for block in &message.content {
-                if let ContentBlock::Text(text) = block
-                    && !text.text.trim().is_empty()
-                {
-                    if !wrote {
-                        output.push_str("Assistant result:\n");
-                        wrote = true;
-                    }
-                    quoted(&mut output, &text.text);
-                }
-            }
-        }
-        if let Some(error) = &report.error {
-            output.push_str("Step error:\n");
-            quoted(&mut output, &error.to_string());
-        }
-        if let Some(persistence) = &report.persistence {
-            let _ = writeln!(output, "{}", persistence_text(persistence));
-        }
+        let mut output = execution_report(label, &report);
+        // A native prompt or host hook may have changed plan state. The new
+        // receipt must describe the state actually shown after settlement.
+        let live_plan = handle.session().agent.plan_state().mode();
+        let persistent = handle.session().save_enabled();
         let store = handle.session_store();
         let session = store.try_lock_owned()
-            .map_err(|_| failure("GOAL_BUSY", "session is busy after goal step"))?;
+            .map_err(|_| failure("GOAL_BUSY", "session is busy after goal execution"))?;
         let current = latest(&session)?;
         let review = receipt(&session, &current, live_plan, persistent)?;
         let _ = write!(output, "{}", render(current.as_ref().map(|(_, record)| record), &review));
@@ -302,6 +302,74 @@ pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<S
     let persistence = persist(&mut session, &owner, persistent).await;
     let review = receipt(&session, &current, live_plan, persistent)?;
     Ok(format!("{}\n{}", persistence_text(&persistence), render(current.as_ref().map(|(_, record)| record), &review)))
+}
+
+/// Quote a bounded amount of native output; never truncate the final review
+/// receipt or the separate journal/persistence summary. At most 10 escaped
+/// ASCII bytes plus line prefixes are emitted per source scalar.
+fn report_text(output: &mut String, text: &str) {
+    let available = MAX_REPORT_BYTES.saturating_sub(output.len());
+    if available < 128 { return; }
+    let bounded: String = text.chars().take((available - 128) / 16).collect();
+    quoted(output, &bounded);
+    if bounded.len() < text.len() {
+        output.push_str("[native output truncated; inspect the session history before replaying work]\n");
+    }
+}
+
+fn report_message(output: &mut String, message: &AssistantMessage) {
+    let _ = writeln!(output, "Native stop reason: {:?}", message.stop_reason);
+    if let Some(error) = &message.error_message {
+        output.push_str("Native diagnostic:\n");
+        report_text(output, error);
+    }
+    for block in &message.content {
+        if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) { break; }
+        if let ContentBlock::Text(text) = block
+            && !text.text.trim().is_empty()
+        {
+            output.push_str("Assistant result (may be partial):\n");
+            report_text(output, &text.text);
+        }
+    }
+}
+
+fn execution_report(label: &str, report: &GoalRunReport) -> String {
+    let mut output = format!("Goal {label} stopped: {:?}\n", report.stop);
+    match &report.completion {
+        Some(Ok(message)) => report_message(&mut output, message),
+        Some(Err(error)) => {
+            output.push_str("Native turn error:\n");
+            report_text(&mut output, &error.to_string());
+            // Deadline/owner cancellation can contain a partial result or a
+            // typed native error AFTER abort-and-drain. Do not hide either.
+            if let Some(completion) = error.completion() {
+                match completion {
+                    Ok(message) => report_message(&mut output, message),
+                    Err(error) => {
+                        output.push_str("Native cleanup/completion error:\n");
+                        report_text(&mut output, &error.to_string());
+                    }
+                }
+            }
+        }
+        None => output.push_str("No native prompt result was produced.\n"),
+    }
+    if let Some(error) = &report.error {
+        output.push_str("Goal journal/verification error:\n");
+        report_text(&mut output, &error.to_string());
+    }
+    if !report.pending.is_empty() {
+        let _ = writeln!(output, "{} unsent input(s) were NOT replayed. Review before resubmitting:", report.pending.len());
+        for input in &report.pending {
+            if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) { break; }
+            report_text(&mut output, &input.text);
+        }
+    }
+    if let Some(persistence) = &report.persistence {
+        let _ = writeln!(output, "{}", persistence_text(persistence));
+    }
+    output
 }
 
 fn escaped(text: &str) -> String {
@@ -378,6 +446,8 @@ fn render(record: Option<&Record>, review: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod control_tests;
 
 #[cfg(test)]
 mod progress_contract_tests {

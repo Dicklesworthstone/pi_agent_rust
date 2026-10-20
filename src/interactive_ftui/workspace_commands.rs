@@ -99,11 +99,13 @@ pub async fn run(
         }
         WorkspaceCommand::Approval => run_approval(handle, args).await,
         WorkspaceCommand::Goal => {
-            // Observe only this command's existing SDK events. The guard
-            // unsubscribes on success, error or future drop; it has no goal
-            // execution, input, approval or continuation authority.
+            // Bind only this invocation's control before native dispatch.
+            // Observed receiver loss or abandoned observation seals further
+            // continuation; native abort-and-drain still owns cleanup.
             let progress = goal_progress::Observation::attach(handle.listeners(), agent_tx);
-            let result = Box::pin(crate::goal::terminal::run(handle, args)).await;
+            let result = Box::pin(crate::goal::terminal::run_with_control(
+                handle, args, progress.control_publisher(),
+            )).await;
             progress.finish();
             match result {
                 Ok(text) => PiMsg::System(text),
