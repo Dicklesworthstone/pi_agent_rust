@@ -16,6 +16,8 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 
 use super::{Admission, ModuleFiles, MAX_PATH_BYTES, module_language, source, valid_spelling};
 
+mod maps;
+
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_LOOKUPS: usize = 128;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -43,6 +45,7 @@ struct Manifest {
 
 #[derive(Debug)]
 enum Export {
+    Invalid,
     Blocked,
     Target(String),
     Conditions(Vec<(String, Self)>),
@@ -63,6 +66,18 @@ impl<'de> Deserialize<'de> for Export {
             }
             fn visit_unit<E: serde::de::Error>(self) -> Result<Export, E> {
                 Ok(Export::Blocked)
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Export, E> {
+                Ok(Export::Invalid)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Export, E> {
+                Ok(Export::Invalid)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Export, E> {
+                Ok(Export::Invalid)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Export, E> {
+                Ok(Export::Invalid)
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Export, E> {
                 Ok(Export::Target(value.to_owned()))
@@ -202,51 +217,8 @@ fn split_package(name: &str) -> Admission<(&str, &str)> {
     Ok((package, &name[end..]))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Selection { Unmatched, Blocked, Path(String) }
-
-fn select(value: &Export) -> Admission<Selection> {
-    match value {
-        Export::Blocked => Ok(Selection::Blocked),
-        Export::Target(path) => Ok(Selection::Path(path.clone())),
-        Export::Conditions(entries) => {
-            if entries.iter().any(|(condition, _)| {
-                condition.starts_with('.') || condition.parse::<u32>().is_ok()
-            }) {
-                return Err(error("EXPORTS", "invalid conditional-export key"));
-            }
-            for (condition, value) in entries {
-                // Neither Node nor browser globals are supplied by this realm.
-                // Evaluate matching conditions in author order, not key order.
-                if matches!(condition.as_str(), "import" | "default") {
-                    match select(value)? {
-                        Selection::Unmatched => {}
-                        selected => return Ok(selected),
-                    }
-                }
-            }
-            Ok(Selection::Unmatched)
-        }
-        Export::Alternatives(_) => Err(error("EXPORTS", "array export alternatives are not supported")),
-    }
-}
-
 fn exported_target(exports: &Export, subpath: &str) -> Admission<String> {
-    let selected = if let Export::Conditions(entries) = exports
-        && entries.iter().any(|(key, _)| key.starts_with('.'))
-    {
-        if entries.iter().any(|(key, _)| key != "." && !key.starts_with("./")) {
-            return Err(error("EXPORTS", "exports cannot mix subpaths with conditions"));
-        }
-        match entries.iter().find(|(key, _)| key == subpath) {
-            Some((_, value)) => select(value)?,
-            None => Selection::Unmatched,
-        }
-    } else if subpath == "." { select(exports)? } else { Selection::Unmatched };
-    match selected {
-        Selection::Path(path) => Ok(path),
-        _ => Err(error("NOT_EXPORTED", "package does not export this entry for import/default conditions")),
-    }
+    maps::exported_target(exports, subpath)
 }
 
 fn target_path(root: &Path, target: &str) -> Admission<PathBuf> {
