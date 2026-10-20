@@ -221,6 +221,19 @@ policy. A summary error or privacy refusal leaves the span intact. If an
 extension changes the session during summarization, the stale report is
 rejected without overwriting that change.
 
+### Stream rules
+
+SDK sessions load global stream rules from the configured agent directory and
+project rules when `SessionOptions.workspace_trusted` is true. Ambient rules
+are omitted when context-file loading is disabled. The shared agent enforces
+the rules across provider streams, cancels a matching draft before its tools
+execute, and records a bounded corrective retry in the transcript. The newest
+active-branch correction per rule survives compaction.
+
+Hosts constructing `Agent` directly can use `set_stream_rules` for an explicit
+validated set, or `set_stream_rule_source` for refreshable project/global files.
+See [Live stream rules](stream-rules.md) for limits, trust, and retry behavior.
+
 ## Recipe 2: Session-Level Subscribers and Typed Hooks
 
 ```rust

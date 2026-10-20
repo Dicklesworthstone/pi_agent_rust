@@ -3429,6 +3429,206 @@ impl PathRebuildState {
     }
 }
 
+/// Track surviving stream reminders without cloning historical message bodies.
+/// Checkpoint offsets use model-message counts, just like `PathRebuildState`.
+#[derive(Default)]
+struct StreamReminderProjection<'a> {
+    message_count: usize,
+    /// Source path index and surviving model-message position.
+    reminders: Vec<(usize, usize)>,
+    /// A later compaction can retain part of a collapsed span while dropping
+    /// its checkpoint. Those reminders must not become active again.
+    rewound_reminders: HashSet<usize>,
+    checkpoint_positions: HashMap<&'a str, usize>,
+}
+
+fn stream_reminder_rule_id(entry: &SessionEntry) -> Option<&str> {
+    let SessionEntry::Message(message) = entry else {
+        return None;
+    };
+    let SessionMessage::Custom {
+        custom_type,
+        details,
+        ..
+    } = &message.message
+    else {
+        return None;
+    };
+    if custom_type != crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE {
+        return None;
+    }
+    details
+        .as_ref()?
+        .get("ruleId")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+}
+
+impl<'a> StreamReminderProjection<'a> {
+    fn append(&mut self, index: usize, entry: &'a SessionEntry) {
+        match entry {
+            SessionEntry::Message(message) => {
+                if matches!(
+                    &message.message,
+                    SessionMessage::BashExecution { extra, .. }
+                        if extra.get("excludeFromContext").and_then(Value::as_bool) == Some(true)
+                ) {
+                    return;
+                }
+                if stream_reminder_rule_id(entry).is_some() {
+                    self.reminders.push((index, self.message_count));
+                }
+                self.message_count += 1;
+            }
+            SessionEntry::BranchSummary(_) => self.message_count += 1,
+            SessionEntry::Custom(custom) if custom.custom_type == "checkpoint" => {
+                if let Some(id) = &custom.base.id {
+                    self.checkpoint_positions
+                        .insert(id.as_str(), self.message_count);
+                }
+            }
+            SessionEntry::Custom(custom) if custom.custom_type == "rewind" => {
+                let Some(data) = &custom.data else { return };
+                let Some(boundary) = data
+                    .get("checkpointEntryId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.checkpoint_positions.get(id))
+                    .copied()
+                else {
+                    return;
+                };
+                let rewound = &mut self.rewound_reminders;
+                self.reminders.retain(|(index, position)| {
+                    if *position < boundary {
+                        true
+                    } else {
+                        rewound.insert(*index);
+                        false
+                    }
+                });
+                self.checkpoint_positions
+                    .retain(|_, position| *position <= boundary);
+                self.message_count = boundary;
+                if data
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| !summary.is_empty())
+                {
+                    self.message_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn newest_before<F>(&self, keep_from: usize, entry_at: &F) -> Vec<usize>
+    where
+        F: Fn(usize) -> &'a SessionEntry,
+    {
+        let mut rule_ids = HashSet::new();
+        let mut reminders = Vec::new();
+        for &(index, _) in self.reminders.iter().rev() {
+            if self.rewound_reminders.contains(&index) {
+                continue;
+            }
+            let Some(rule_id) = stream_reminder_rule_id(entry_at(index)) else {
+                continue;
+            };
+            if !rule_ids.insert(rule_id) {
+                continue;
+            }
+            if index < keep_from {
+                reminders.push(index);
+            }
+            if rule_ids.len() >= crate::stream_rules::MAX_STREAM_RULES {
+                break;
+            }
+        }
+        reminders.reverse();
+        reminders
+    }
+
+    fn remove_rewound_messages(
+        &self,
+        rebuild: &mut PathRebuildState,
+        rewound_reminders: &HashSet<usize>,
+    ) {
+        // A raw cut point can fall inside an already rewound span. If its
+        // checkpoint was compacted away, the retained rewind is a no-op and
+        // would revive the span's reminders. Filter after replay so checkpoint
+        // invalidation uses the original positions, then translate boundaries.
+        let removed_positions: Vec<usize> = self
+            .reminders
+            .iter()
+            .filter(|(index, _)| rewound_reminders.contains(index))
+            .map(|(_, position)| *position)
+            .collect();
+        if removed_positions.is_empty() {
+            return;
+        }
+        let mut position = 0;
+        rebuild.messages.retain(|_| {
+            let keep = removed_positions.binary_search(&position).is_err();
+            position += 1;
+            keep
+        });
+        for boundary in rebuild.checkpoint_positions.values_mut() {
+            *boundary -= removed_positions.partition_point(|position| *position < *boundary);
+        }
+    }
+}
+
+fn preserved_stream_reminders<'a, F>(path_len: usize, entry_at: &F) -> (Vec<usize>, HashSet<usize>)
+where
+    F: Fn(usize) -> &'a SessionEntry,
+{
+    // Only compaction boundaries need an index: storing every message id
+    // would make this metadata-only pass expensive on long linear sessions.
+    let kept_ids: HashSet<&str> = (0..path_len)
+        .filter_map(|index| match entry_at(index) {
+            SessionEntry::Compaction(compaction) => Some(compaction.first_kept_entry_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let kept_positions: HashMap<&str, usize> = (0..path_len)
+        .filter_map(|index| {
+            let id = entry_at(index).base_id()?.as_str();
+            kept_ids.contains(id).then_some((id, index))
+        })
+        .collect();
+    let mut projection = StreamReminderProjection::default();
+    let mut keep_from = 0;
+    for index in 0..path_len {
+        let entry = entry_at(index);
+        if let SessionEntry::Compaction(compaction) = entry {
+            keep_from = kept_positions
+                .get(compaction.first_kept_entry_id.as_str())
+                .copied()
+                .unwrap_or(index);
+            let reminders = projection.newest_before(keep_from, entry_at);
+            projection = StreamReminderProjection {
+                message_count: 1, // The compaction summary.
+                rewound_reminders: std::mem::take(&mut projection.rewound_reminders),
+                ..StreamReminderProjection::default()
+            };
+            for reminder in reminders {
+                projection.append(reminder, entry_at(reminder));
+            }
+            // Rebuild retained checkpoints as well as reminders. A rewind
+            // targeting a checkpoint already compacted away must stay inert.
+            for retained in keep_from..index {
+                projection.append(retained, entry_at(retained));
+            }
+        } else if index >= keep_from {
+            projection.append(index, entry);
+        }
+    }
+    (
+        projection.newest_before(keep_from, entry_at),
+        projection.rewound_reminders,
+    )
+}
+
 impl Session {
     /// Create a new session from CLI args and config.
     pub async fn new(cli: &Cli, config: &Config) -> Result<Self> {
@@ -6224,6 +6424,21 @@ impl Session {
                     .is_some_and(|id| id.eq(&compaction.first_kept_entry_id))
             });
 
+            // A summary is not an exact record of the constraints that have
+            // already corrected this conversation. Keep the newest reminder
+            // per rule on this branch, including reminders before the kept
+            // boundary. A newer reminder in the ordinary retained tail wins
+            // without adding a second copy. Never read sibling branches here.
+            let (preserved_reminders, rewound_reminders) =
+                preserved_stream_reminders(path_len, &entry_at);
+            for idx in preserved_reminders {
+                rebuild.append(entry_at(idx));
+            }
+
+            let mut retained_projection = StreamReminderProjection {
+                message_count: rebuild.messages.len(),
+                ..StreamReminderProjection::default()
+            };
             let mut keep = false;
             let mut past_compaction = false;
             for idx in 0..path_len {
@@ -6251,8 +6466,11 @@ impl Session {
                         continue;
                     }
                 }
+                retained_projection.append(idx, entry);
                 rebuild.append(entry);
             }
+
+            retained_projection.remove_rewound_messages(&mut rebuild, &rewound_reminders);
 
             return rebuild;
         }
@@ -9427,6 +9645,31 @@ mod tests {
             content: UserContent::Text(text.to_string()),
             timestamp: Some(0),
         }
+    }
+
+    fn make_stream_reminder(rule_id: &str, body: &str) -> SessionMessage {
+        SessionMessage::Custom {
+            custom_type: crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE.to_string(),
+            content: body.to_string(),
+            display: true,
+            details: Some(serde_json::json!({ "ruleId": rule_id })),
+            timestamp: Some(17),
+        }
+    }
+
+    fn stream_reminder_bodies(session: &Session) -> Vec<String> {
+        session
+            .to_messages_for_current_path()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Custom(custom)
+                    if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE =>
+                {
+                    Some(custom.content)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -13234,6 +13477,207 @@ mod tests {
         assert!(
             all_text.contains("kept message C") || all_text.contains("new message D"),
             "kept messages should appear in context"
+        );
+    }
+
+    #[test]
+    fn stream_rule_reminders_survive_compaction_and_session_reopen() {
+        let temp = tempfile::tempdir().expect("session directory");
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("original request"));
+        session.append_message(make_stream_reminder("ownership", "Keep ownership scoped."));
+        let first_kept = session.append_message(make_test_message("first retained request"));
+        session.append_compaction("first summary".to_string(), first_kept, 1000, None, None);
+        let second_kept = session.append_message(make_test_message("second retained request"));
+        session.append_compaction("second summary".to_string(), second_kept, 2000, None, None);
+        session.append_message(make_test_assistant_message("finished", 12));
+
+        assert_eq!(stream_reminder_bodies(&session), ["Keep ownership scoped."]);
+        run_async(async { session.save().await }).expect("save compacted session");
+        let path = session.path.as_ref().expect("session path");
+        let loaded = run_async(Session::open(path.to_string_lossy().as_ref()))
+            .expect("reopen compacted session");
+        assert_eq!(stream_reminder_bodies(&loaded), ["Keep ownership scoped."]);
+        assert_eq!(loaded.entries.len(), session.entries.len());
+    }
+
+    #[test]
+    fn stream_rule_compaction_keeps_newest_per_rule_without_duplicating_tail() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Old ownership directive.",
+        ));
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Current ownership directive.",
+        ));
+        session.append_message(make_stream_reminder("testing", "Run meaningful tests."));
+        let kept = session.append_message(make_test_message("continue"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Current ownership directive.", "Run meaningful tests."]
+        );
+
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Updated directive in tail.",
+        ));
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Run meaningful tests.", "Updated directive in tail."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_ignores_reminders_on_sibling_branches() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder("shared", "Shared instruction."));
+        let branch_point = session.append_message(make_test_message("choose a direction"));
+        session.append_message(make_stream_reminder("branch", "Left branch instruction."));
+        session.append_message(make_stream_reminder("left-only", "Left-only instruction."));
+        session.append_message(make_test_message("left branch finish"));
+
+        assert!(session.create_branch_from(&branch_point));
+        session.append_message(make_stream_reminder("branch", "Right branch instruction."));
+        let kept = session.append_message(make_test_message("right branch finish"));
+        session.append_compaction("right summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Shared instruction.", "Right branch instruction."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_does_not_resurrect_rewound_reminders() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("original request"));
+        session.append_message(make_stream_reminder("ownership", "Surviving directive."));
+        let checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Discarded newer directive.",
+        ));
+        let discarded_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Discarded unique directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint,
+                "summary": "Abandoned the exploration."
+            })),
+        );
+        session.append_message(make_stream_reminder("later", "Post-rewind directive."));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": discarded_checkpoint,
+                "summary": "An invalidated checkpoint cannot hide later work."
+            })),
+        );
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+        let kept = session.append_message(make_test_message("continue after rewind"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_replays_only_retained_checkpoint_rewinds() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("original request"));
+        let obsolete_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let first_kept = session.append_message(make_test_message("first retained request"));
+        session.append_compaction("first summary".to_string(), first_kept, 1000, None, None);
+        session.append_message(make_stream_reminder("survives", "Keep this directive."));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": obsolete_checkpoint,
+                "summary": "The old checkpoint was compacted away."
+            })),
+        );
+        let second_kept = session.append_message(make_test_message("second retained request"));
+        let retained_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Do not revive this directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": retained_checkpoint,
+                "summary": "This exploration was collapsed."
+            })),
+        );
+        assert_eq!(stream_reminder_bodies(&session), ["Keep this directive."]);
+        session.append_compaction("second summary".to_string(), second_kept, 2000, None, None);
+        assert_eq!(stream_reminder_bodies(&session), ["Keep this directive."]);
+    }
+
+    #[test]
+    fn stream_rule_compaction_cannot_revive_reminders_inside_a_rewound_tail() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder("ownership", "Surviving directive."));
+        let checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let kept = session.append_message(make_test_message("discarded exploration"));
+        session.append_message(make_stream_reminder("ownership", "Discarded replacement."));
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Discarded unique directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint,
+                "summary": "The exploration was collapsed."
+            })),
+        );
+        session.append_message(make_stream_reminder("later", "Post-rewind directive."));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+
+        let current_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let (context, boundary) = session
+            .context_for_checkpoint(&current_checkpoint)
+            .expect("retained checkpoint");
+        assert_eq!(
+            boundary,
+            context.len(),
+            "filtered reminders must not inflate the checkpoint"
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_bounds_preserved_historical_rules() {
+        let mut session = Session::in_memory();
+        for index in 0..crate::stream_rules::MAX_STREAM_RULES + 2 {
+            let id = format!("rule-{index}");
+            session.append_message(make_stream_reminder(&id, &id));
+        }
+        let kept = session.append_message(make_test_message("continue"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        let bodies = stream_reminder_bodies(&session);
+        assert_eq!(bodies.len(), crate::stream_rules::MAX_STREAM_RULES);
+        assert_eq!(bodies.first().map(String::as_str), Some("rule-2"));
+        assert_eq!(
+            bodies.last(),
+            Some(&format!(
+                "rule-{}",
+                crate::stream_rules::MAX_STREAM_RULES + 1
+            ))
         );
     }
 

@@ -2654,6 +2654,15 @@ async fn run(
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
     }
+    if !test_mode && !cli.no_context_files {
+        agent_session
+            .agent
+            .set_stream_rule_source(pi::stream_rules::StreamRuleSource::new(
+                cwd.clone(),
+                global_dir.clone(),
+                workspace_trusted,
+            ))?;
+    }
     // The todo tool needs the live session for todo_list.v1 persistence, so
     // it joins after construction (opt-in via --tools ...todo, like subagent).
     if enabled_tools.contains(&"todo") {
@@ -5764,7 +5773,7 @@ fn handle_stats(
 /// `pi rules list|add|remove|test|export|import` (bd-cv653.3.4):
 /// user-facing stream rules manager.
 fn handle_rules(cwd: &Path, command: &cli::RulesCommands) -> Result<()> {
-    let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+    let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd)?;
 
     match command {
         cli::RulesCommands::List { global } => {
@@ -5882,7 +5891,7 @@ fn handle_grievances(cwd: &Path, command: &cli::GrievancesCommands) -> Result<()
             println!("  Pattern: {}", candidate.pattern);
             println!("  Body: {}", candidate.body);
 
-            let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+            let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd)?;
             store.add_rule(candidate, false)?;
             println!("Saved candidate rule to project .pi/stream-rules.json");
         }

@@ -143,7 +143,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
     };
     let project_root = tmp.path();
 
-    let mut store = StreamRuleStore::load_for_project(project_root);
+    let mut store = StreamRuleStore::load_for_project(project_root).expect("load rules");
     assert_eq!(store.list_all_rules().len(), 0);
 
     let rule = StreamRule {
@@ -170,7 +170,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
     assert!(exported_json.contains("no-magic-numbers"));
 
     // Reload from disk to verify persistence
-    let reloaded = StreamRuleStore::load_for_project(project_root);
+    let reloaded = StreamRuleStore::load_for_project(project_root).expect("reload rules");
     assert_eq!(reloaded.list_project_rules().len(), 1);
 
     // Record grievance

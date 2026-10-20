@@ -879,6 +879,520 @@ mod tests {
         }
     }
 
+    struct RuleScriptProvider {
+        scripts: Vec<Vec<StreamEvent>>,
+        calls: std::sync::atomic::AtomicUsize,
+        requests: StdMutex<Vec<Vec<Message>>>,
+        active_streams: Arc<std::sync::atomic::AtomicUsize>,
+        polls: Vec<Arc<std::sync::atomic::AtomicUsize>>,
+    }
+
+    impl RuleScriptProvider {
+        fn new(scripts: Vec<Vec<StreamEvent>>) -> Self {
+            let polls = scripts
+                .iter()
+                .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+                .collect();
+            Self {
+                scripts,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: StdMutex::new(Vec::new()),
+                active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                polls,
+            }
+        }
+    }
+
+    struct RuleScriptStream {
+        events: VecDeque<StreamEvent>,
+        active_streams: Arc<std::sync::atomic::AtomicUsize>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Stream for RuleScriptStream {
+        type Item = Result<StreamEvent>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(this.events.pop_front().map(Ok))
+        }
+    }
+
+    impl Drop for RuleScriptStream {
+        fn drop(&mut self) {
+            self.active_streams.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for RuleScriptProvider {
+        fn name(&self) -> &str {
+            "rule-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            self.requests
+                .lock()
+                .expect("request capture")
+                .push(context.messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let script = self
+                .scripts
+                .get(call)
+                .ok_or_else(|| Error::api("unexpected stream-rule provider request"))?;
+            self.active_streams
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| Error::api("previous provider stream was not dropped"))?;
+            Ok(Box::pin(RuleScriptStream {
+                events: script.clone().into(),
+                active_streams: Arc::clone(&self.active_streams),
+                polls: Arc::clone(&self.polls[call]),
+            }))
+        }
+    }
+
+    fn rule_fixture() -> crate::stream_rules::StreamRule {
+        crate::stream_rules::StreamRule {
+            id: "native-api".to_string(),
+            name: "Native API".to_string(),
+            pattern: "FORBIDDEN".to_string(),
+            body: "Use the supported API instead.".to_string(),
+            enabled: true,
+            created_from: None,
+            cooldown_turns: None,
+        }
+    }
+
+    fn rule_done(text: &str) -> Vec<StreamEvent> {
+        vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message(text),
+        }]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stream_rules_discard_tool_drafts_before_execution_and_persist_the_directive() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let call = batch_write_call("discarded", "target.txt", "must not run");
+            let mut terminal = assistant_message("FORBIDDEN");
+            terminal.content.push(ContentBlock::ToolCall(call.clone()));
+            let provider = Arc::new(RuleScriptProvider::new(vec![
+                vec![
+                    StreamEvent::Start {
+                        partial: assistant_message(""),
+                    },
+                    StreamEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: call,
+                    },
+                    StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "FORB".to_string(),
+                    },
+                    StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "IDDEN".to_string(),
+                    },
+                    StreamEvent::Done {
+                        reason: StopReason::ToolUse,
+                        message: terminal,
+                    },
+                ],
+                rule_done("Completed the supported approach."),
+            ]));
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&["write"], temp.path(), None),
+                AgentConfig::default(),
+            );
+            agent.set_stream_rules(vec![rule_fixture()]).expect("rules");
+            let saved = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            ))));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::clone(&saved),
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let capture = Arc::clone(&events);
+            let result = session
+                .run_text_with_abort("Make the change".to_string(), None, move |event| {
+                    capture.lock().expect("events").push(event);
+                })
+                .await
+                .expect("corrected turn");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert!(!temp.path().join("target.txt").exists());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.polls[0].load(Ordering::SeqCst), 4);
+            assert_eq!(provider.active_streams.load(Ordering::SeqCst), 0);
+            {
+                let requests = provider.requests.lock().expect("requests");
+                let retry = serde_json::to_string(&requests[1]).expect("serialize request");
+                assert!(retry.contains("Use the supported API instead."));
+                assert!(!retry.contains("FORB"));
+                assert!(!retry.contains("discarded\""));
+                assert!(requests[1].iter().all(|message| !matches!(
+                    message,
+                    Message::Assistant(_) | Message::ToolResult(_)
+                )));
+            }
+            {
+                let events = events.lock().expect("events");
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::ToolExecutionStart { .. } | AgentEvent::ProviderError { .. }
+                )));
+                assert_eq!(
+                    events.iter().filter(|event| matches!(event, AgentEvent::AgentEnd { .. })).count(),
+                    1
+                );
+                let starts = events.iter().filter(|event| matches!(event,
+                    AgentEvent::MessageStart { message: Message::Assistant(_) }
+                )).count();
+                let ends = events.iter().filter(|event| matches!(event,
+                    AgentEvent::MessageEnd { message: Message::Assistant(_) }
+                )).count();
+                assert_eq!((starts, ends), (2, 2));
+                assert!(events.iter().any(|event| matches!(event,
+                    AgentEvent::AgentEnd { messages, error: None, .. }
+                        if messages.iter().any(|message| matches!(message,
+                            Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
+                        ))
+                )));
+            }
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                saved.lock(cx.cx()).await.expect("saved session").path.clone().expect("path")
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref()).await.expect("reopen");
+            let history = reopened.to_messages_for_current_path();
+            assert_eq!(history.len(), 3);
+            let Message::Custom(reminder) = &history[1] else {
+                panic!("durable stream-rule directive missing");
+            };
+            assert_eq!(reminder.custom_type, crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE);
+            assert_eq!(reminder.details.as_ref().expect("provenance")["ruleId"], "native-api");
+            assert!(!serde_json::to_string(&history).expect("history").contains("FORB"));
+        });
+    }
+
+    #[test]
+    fn stream_rule_cap_survives_continuation_but_a_new_prompt_gets_an_allowance() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let mut scripts = vec![rule_done("FORBIDDEN"); 6];
+            scripts.push(rule_done("Completed."));
+            let provider = Arc::new(RuleScriptProvider::new(scripts));
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_stream_rules(vec![rule_fixture()]).expect("rules");
+            let stopped = agent.run("first prompt", |_| {}).await.expect("bounded turn");
+            assert_eq!(stopped.stop_reason, StopReason::Aborted);
+            assert!(stopped.error_message.as_deref().expect("cap diagnostic").contains("PI_STREAM_RULE_LIMIT"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+            let continued = agent.run_continue_with_abort(None, |_| {}).await.expect("continuation");
+            assert_eq!(continued.stop_reason, StopReason::Aborted);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+            let next = agent.run("new authored prompt", |_| {}).await.expect("fresh turn");
+            assert_eq!(next.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
+            assert_eq!(agent.messages().iter().filter(|message| matches!(message,
+                Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
+            )).count(), 4);
+        });
+    }
+
+    #[test]
+    fn abort_after_a_stream_rule_reminder_does_not_open_a_retry_stream() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let provider = Arc::new(RuleScriptProvider::new(vec![rule_done("FORBIDDEN")]));
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_stream_rules(vec![rule_fixture()]).expect("rules");
+            let (abort, signal) = AbortHandle::new();
+            let result = agent.run_with_abort("prompt", Some(signal), move |event| {
+                if matches!(event, AgentEvent::MessageEnd { message: Message::Custom(_) }) {
+                    abort.abort();
+                }
+            }).await.expect("cooperative abort");
+            assert_eq!(result.stop_reason, StopReason::Aborted);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.active_streams.load(Ordering::SeqCst), 0);
+            assert!(agent.messages().iter().any(|message| matches!(message,
+                Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
+            )));
+        });
+    }
+
+    #[test]
+    fn stream_rules_inspect_terminal_and_thinking_text_without_inspecting_tool_arguments() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for thinking in [false, true] {
+                let mut message = assistant_message("FORBIDDEN");
+                if thinking {
+                    message.content = vec![ContentBlock::Thinking(ThinkingContent {
+                        thinking: "FORBIDDEN".to_string(),
+                        thinking_signature: None,
+                    })];
+                }
+                let provider = Arc::new(RuleScriptProvider::new(vec![
+                    vec![StreamEvent::Done { reason: StopReason::Stop, message }],
+                    rule_done("Completed."),
+                ]));
+                let mut agent = Agent::new(provider.clone(), ToolRegistry::from_tools(Vec::new()), AgentConfig::default());
+                agent.set_stream_rules(vec![rule_fixture()]).expect("rules");
+                assert_eq!(agent.run("prompt", |_| {}).await.expect("turn").stop_reason, StopReason::Stop);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            }
+
+            let temp = tempfile::tempdir().expect("workspace");
+            let mut message = assistant_message("Write the requested text.");
+            message.content.push(ContentBlock::ToolCall(batch_write_call("allowed", "target.txt", "FORBIDDEN")));
+            let provider = Arc::new(RuleScriptProvider::new(vec![
+                vec![StreamEvent::Done { reason: StopReason::ToolUse, message }],
+                rule_done("Completed."),
+            ]));
+            let mut agent = Agent::new(provider.clone(), ToolRegistry::new(&["write"], temp.path(), None), AgentConfig::default());
+            agent.set_stream_rules(vec![rule_fixture()]).expect("rules");
+            agent.run("write the literal", |_| {}).await.expect("tool turn");
+            assert_eq!(std::fs::read_to_string(temp.path().join("target.txt")).expect("tool output"), "FORBIDDEN");
+            assert!(!agent.messages().iter().any(|message| matches!(message,
+                Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
+            )));
+        });
+    }
+
+    #[test]
+    fn stream_rule_source_reloads_between_prompts_and_refuses_invalid_replacements() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let global = temp.path().join("global");
+            std::fs::create_dir_all(&global).expect("global directory");
+            let provider = Arc::new(RuleScriptProvider::new(vec![
+                rule_done("FORBIDDEN"), rule_done("FORBIDDEN"), rule_done("Completed."),
+            ]));
+            let mut agent = Agent::new(provider.clone(), ToolRegistry::from_tools(Vec::new()), AgentConfig::default());
+            agent.set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                temp.path().to_path_buf(), global.clone(), false,
+            )).expect("source");
+            agent.run("before configuration", |_| {}).await.expect("unconfigured turn");
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let file = global.join("stream-rules.json");
+            std::fs::write(&file, serde_json::to_vec(&json!({"version":1,"rules":[rule_fixture()]})).expect("serialize rules")).expect("write rules");
+            agent.run("after configuration", |_| {}).await.expect("reloaded turn");
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            std::fs::write(&file, "{ broken").expect("invalid replacement");
+            assert!(agent.run("after invalid edit", |_| {}).await.is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn stream_rule_source_reloads_at_authored_follow_up_boundaries() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let global = temp.path().join("global");
+            std::fs::create_dir_all(&global).expect("global directory");
+            let file = global.join("stream-rules.json");
+            let rules = serde_json::to_vec(&json!({"version": 1, "rules": [rule_fixture()]}))
+                .expect("serialize rules");
+            let provider = Arc::new(RuleScriptProvider::new(vec![
+                rule_done("Initial response."),
+                rule_done("FORBIDDEN"),
+                rule_done("FORBIDDEN"),
+                rule_done("Completed."),
+            ]));
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent
+                .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                    temp.path().to_path_buf(),
+                    global,
+                    false,
+                ))
+                .expect("source");
+            agent.set_queue_modes(QueueMode::All, QueueMode::OneAtATime);
+            agent
+                .message_queue
+                .push_follow_up(QueuedAgentMessage::generated(user_message("generated notice")));
+            agent.queue_follow_up(user_message("authored follow-up"));
+
+            let result = agent
+                .run("initial prompt", move |event| {
+                    if matches!(event, AgentEvent::TurnEnd { turn_index: 0, .. }) {
+                        std::fs::write(&file, &rules).expect("edit rules during the run");
+                    }
+                })
+                .await
+                .expect("queued turns");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(agent.stream_rule_turn, 2, "only authored input renews the cap");
+            let requests = provider.requests.lock().expect("requests");
+            assert_user_text(requests[1].last().expect("notice"), "generated notice");
+            assert_user_text(requests[2].last().expect("follow-up"), "authored follow-up");
+            assert!(requests[3].iter().any(|message| matches!(message,
+                Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
+            )));
+            assert!(agent.message_queue.follow_up.is_empty());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invalid_stream_rule_reload_preserves_queued_follow_ups_for_recovery() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let global = temp.path().join("global");
+            std::fs::create_dir_all(&global).expect("global directory");
+            let file = global.join("stream-rules.json");
+            let provider = Arc::new(RuleScriptProvider::new(vec![
+                rule_done("Initial response."),
+                rule_done("FORBIDDEN"),
+                rule_done("Queued work completed."),
+            ]));
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent
+                .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                    temp.path().to_path_buf(),
+                    global,
+                    false,
+                ))
+                .expect("source");
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            for text in ["first queued task", "second queued task"] {
+                let delivery = queued_user_message(text);
+                delivery.bind_persistence_identity(None);
+                agent.message_queue.push_follow_up(delivery);
+            }
+            let accepted = agent.message_queue.follow_up.clone();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let edited_file = file.clone();
+            let result = agent
+                .run("initial prompt", move |event| {
+                    if matches!(&event, AgentEvent::TurnEnd { turn_index: 0, .. }) {
+                        std::fs::write(&edited_file, "{ broken")
+                            .expect("invalid edit during the run");
+                    }
+                    captured.lock().expect("capture events").push(event);
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(agent.stream_rule_turn, 1);
+            assert_eq!(agent.messages().len(), 2, "queued input was not delivered");
+            assert_eq!(agent.message_queue.follow_up.len(), accepted.len());
+            for (pending, original) in agent.message_queue.follow_up.iter().zip(&accepted) {
+                assert_eq!(pending.seq, original.seq);
+                assert_eq!(pending.enqueued_at, original.enqueued_at);
+                assert_eq!(pending.job_owner_session_id, original.job_owner_session_id);
+                assert_eq!(
+                    pending.delivery.keyword_scan_source(),
+                    original.delivery.keyword_scan_source()
+                );
+                assert!(
+                    pending
+                        .delivery
+                        .shares_persistence_identity(&original.delivery)
+                );
+            }
+            {
+                let events = events.lock().expect("events");
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnStart { .. }))
+                        .count(),
+                    1
+                );
+                let ends = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::AgentEnd {
+                            messages, error, ..
+                        } => Some((messages, error)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ends.len(), 1);
+                assert_eq!(ends[0].0.len(), 2);
+                assert!(ends[0].1.is_some());
+            }
+
+            let rules = serde_json::to_vec(&json!({"version": 1, "rules": [rule_fixture()]}))
+                .expect("serialize rules");
+            std::fs::write(&file, rules).expect("repair rules");
+            let recovered = agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("resume accepted batch after repair");
+            assert_eq!(recovered.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(agent.stream_rule_turn, 2);
+            assert!(agent.message_queue.follow_up.is_empty());
+            let users = agent
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                users,
+                ["initial prompt", "first queued task", "second queued task"]
+            );
+        });
+    }
+
     #[test]
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn invalid_terminal_tool_peer_withholds_the_whole_batch_before_approval() {
@@ -6472,7 +6986,7 @@ mod tests {
                 Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
             );
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                 .await;
             assert!(!is_error, "run must succeed: {:?}", output.content);
             let text = match &output.content[0] {
@@ -6519,7 +7033,7 @@ mod tests {
 
             let call = xdev_call("promote", Some("ast_grep"), None);
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                 .await;
             assert!(!is_error);
 
@@ -6545,7 +7059,7 @@ mod tests {
             let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
             let call = xdev_call("run", Some("nosuch_tool"), Some(json!({})));
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                 .await;
             assert!(is_error, "unknown discoverable tool must error");
             let text = match &output.content[0] {
@@ -6702,7 +7216,7 @@ mod tests {
                     // Verify the real gate only after the effect assertions;
                     // this test never dispatches a CASS search.
                     let (output, is_error) = agent
-                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                        .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                         .await;
                     assert!(is_error);
                     let ContentBlock::Text(text) = &output.content[0] else {
@@ -6750,7 +7264,7 @@ mod tests {
                     };
                     assert_eq!(agent.effects_for_call(&call), ToolEffects::read());
                     let (output, is_error) = agent
-                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                        .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                         .await;
                     assert!(!is_error, "read-only recall failed: {:?}", output.content);
                     let ContentBlock::Text(text) = &output.content[0] else {
@@ -6796,7 +7310,7 @@ mod tests {
                 thought_signature: None,
             };
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}), None)
                 .await;
             assert!(is_error, "write must be blocked while planning");
             let text = match &output.content[0] {
@@ -6818,7 +7332,7 @@ mod tests {
                 thought_signature: None,
             };
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&read_call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&read_call, Arc::new(|_| {}), None)
                 .await;
             assert!(!is_error, "read must pass the gate");
             let text = match &output.content[0] {
@@ -6835,7 +7349,7 @@ mod tests {
                 thought_signature: None,
             };
             let (_output, is_error) = agent
-                .execute_tool_without_hooks(&bash_call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&bash_call, Arc::new(|_| {}), None)
                 .await;
             assert!(is_error, "bash is blocked while planning");
 
@@ -6851,7 +7365,7 @@ mod tests {
                 thought_signature: None,
             };
             let (_output, is_error) = agent
-                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}), None)
                 .await;
             assert!(!is_error, "write allowed after approval");
             assert_eq!(
@@ -6896,7 +7410,7 @@ mod tests {
                 thought_signature: None,
             };
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
                 .await;
             assert!(is_error, "github must be blocked while planning");
             let text = match &output.content[0] {
@@ -6940,7 +7454,7 @@ mod tests {
                 thought_signature: None,
             };
             let (_output, is_error) = agent
-                .execute_tool_without_hooks(&run_read, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&run_read, Arc::new(|_| {}), None)
                 .await;
             assert!(
                 !is_error,
@@ -6959,7 +7473,7 @@ mod tests {
                 thought_signature: None,
             };
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&run_write, Arc::new(|_| {}))
+                .execute_tool_without_hooks(&run_write, Arc::new(|_| {}), None)
                 .await;
             assert!(
                 is_error,

@@ -1923,6 +1923,13 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/reload` | Reload skills/prompts/themes/extensions from disk |
 | `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
 
+**Live stream rules:** `/rules` manages corrections enforced during generation
+on every native agent surface. Matching assistant text or thinking interrupts
+the response before its tool calls execute, adds the rule's directive, and
+retries within a three-correction turn budget. Project rules require workspace
+trust; triggered corrections survive compaction on their active branch. See
+[Stream rules](docs/stream-rules.md) for configuration and examples.
+
 ### RPC Protocol
 
 The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin/stdout for programmatic integration. Each line is a self-contained JSON object.

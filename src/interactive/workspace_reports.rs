@@ -34,12 +34,15 @@ impl Report {
 /// `/rules [list|remove <id>|toggle <id>]`: the project's TTSR stream rules.
 pub fn rules(cwd: &Path, args: &str) -> Report {
     let args = args.trim();
-    let mut store = crate::stream_rules::StreamRuleStore::load_for_project(cwd);
+    let mut store = match crate::stream_rules::StreamRuleStore::load_for_project(cwd) {
+        Ok(store) => store,
+        Err(error) => return Report::status(format!("Cannot load stream rules: {error}")),
+    };
     if args.is_empty() || args == "list" {
         let rules = store.list_all_rules();
         let mut text = format!("### 🛡️ Active Stream Rules ({})\n\n", rules.len());
         if rules.is_empty() {
-            text.push_str("No stream rules configured. Use `/rules add <id> <pattern> <body>` or `/omfg <complaint>` to create one.\n");
+            text.push_str("No stream rules configured. Use `pi rules add --id ID --name NAME --pattern REGEX --body DIRECTIVE` or `/omfg <complaint>` to create one.\n");
         } else {
             for r in &rules {
                 let status = if r.enabled {
@@ -92,8 +95,21 @@ pub fn omfg(cwd: &Path, args: &str) -> Report {
     match crate::stream_rules::GrievancesLedger::record_complaint(cwd, args, None) {
         Ok(g) => {
             let candidate = crate::stream_rules::GrievancesLedger::forge_candidate_rule(&g);
-            let mut store = crate::stream_rules::StreamRuleStore::load_for_project(cwd);
-            let _ = store.add_rule(candidate.clone(), false);
+            let mut store = match crate::stream_rules::StreamRuleStore::load_for_project(cwd) {
+                Ok(store) => store,
+                Err(error) => {
+                    return Report::status(format!(
+                        "Grievance {} saved, but its stream rule could not be loaded: {error}",
+                        g.id
+                    ));
+                }
+            };
+            if let Err(error) = store.add_rule(candidate.clone(), false) {
+                return Report::status(format!(
+                    "Grievance {} saved, but its stream rule could not be saved: {error}",
+                    g.id
+                ));
+            }
             let card = format!(
                 "### 📝 Grievance Logged & Stream Rule Forged\n\n\
                  - **Grievance ID:** `{gid}`\n\

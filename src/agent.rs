@@ -1310,6 +1310,13 @@ impl MessageQueue {
         }
     }
 
+    fn follow_up_batch_has_authored_input(&self) -> bool {
+        self.follow_up
+            .iter()
+            .take(self.follow_up_batch_len())
+            .any(|entry| entry.delivery.keyword_scan_source().is_some())
+    }
+
     fn pop_kind(&mut self, kind: QueueKind) -> Vec<QueuedAgentMessage> {
         let (queue, mode) = match kind {
             QueueKind::Steering => (&mut self.steering, self.steering_mode),
@@ -1852,6 +1859,15 @@ pub struct Agent {
     /// steering messages the first time a tool call touches a matching path.
     scoped_rules: Option<ScopedRuleState>,
 
+    /// Dormant stream rules are evaluated by the common provider path, so
+    /// CLI, interactive, SDK and protocol sessions enforce the same policy.
+    stream_rules: Vec<crate::stream_rules::StreamRule>,
+    stream_rule_source: Option<crate::stream_rules::StreamRuleSource>,
+    stream_rule_coordinator: crate::stream_rules::TtsrCoordinator,
+    /// Logical user turns, rather than provider attempts or tool iterations.
+    /// Automatic retry/failover must not replenish the injection allowance.
+    stream_rule_turn: usize,
+
     /// Discoverable tools promoted into the live schema mid-session via
     /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
     /// execution takes `&self`.
@@ -1939,6 +1955,18 @@ struct ScopedRuleState {
     activated: std::collections::HashSet<usize>,
 }
 
+/// A rule interruption is distinct from a provider failure or user abort.
+/// Its transient assistant is closed for observers but never authorizes tool
+/// execution or enters the next provider request's conversation history.
+enum AssistantStreamAttempt {
+    Complete(AssistantMessage),
+    RuleInterrupted {
+        rule: crate::stream_rules::StreamRule,
+        retry: bool,
+        message: AssistantMessage,
+    },
+}
+
 /// JSON keys of tool inputs that name filesystem paths, used to decide when
 /// a scoped rule's globs are touched. Budget-capped: only string values and
 /// first-level arrays of strings are inspected.
@@ -2017,6 +2045,14 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scoped_rules: None,
+            stream_rules: Vec::new(),
+            stream_rule_source: None,
+            stream_rule_coordinator: crate::stream_rules::TtsrCoordinator::new(
+                &[],
+                crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+                crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
+            ),
+            stream_rule_turn: 0,
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
@@ -2126,6 +2162,12 @@ impl Agent {
         self.secrets_vault = crate::secrets::SecretVault::default();
         self.refresh_compaction_privacy();
         self.plan_state.reset_for_session(plan_mode);
+        self.stream_rule_coordinator = crate::stream_rules::TtsrCoordinator::new(
+            &self.stream_rules,
+            crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+            crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
+        );
+        self.stream_rule_turn = 0;
     }
 
     /// The shared tool approval state (bd-cv653.3.19).
@@ -2160,6 +2202,48 @@ impl Agent {
     /// to persist as Custom entries.
     pub fn drain_keyword_ledger(&mut self) -> Vec<crate::magic_keywords::KeywordActivation> {
         std::mem::take(&mut self.keyword_ledger)
+    }
+
+    /// Install explicitly supplied stream rules. Invalid rules leave the
+    /// current policy intact. This replaces filesystem discovery for callers
+    /// that own their configuration, without resetting an active turn's cap.
+    pub fn set_stream_rules(&mut self, rules: Vec<crate::stream_rules::StreamRule>) -> Result<()> {
+        crate::stream_rules::validate_stream_rules(&rules)?;
+        self.install_stream_rules(rules);
+        self.stream_rule_source = None;
+        Ok(())
+    }
+
+    /// Configure trusted project/global rule discovery. The initial load is
+    /// validated before installation. Further loads happen at authored prompt
+    /// boundaries, never during a provider retry or tool batch.
+    pub fn set_stream_rule_source(
+        &mut self,
+        source: crate::stream_rules::StreamRuleSource,
+    ) -> Result<()> {
+        let rules = source.load()?;
+        self.install_stream_rules(rules);
+        self.stream_rule_source = Some(source);
+        Ok(())
+    }
+
+    fn install_stream_rules(&mut self, rules: Vec<crate::stream_rules::StreamRule>) {
+        self.stream_rule_coordinator.replace_rules(&rules);
+        self.stream_rules = rules;
+    }
+
+    fn refresh_stream_rules(&mut self) -> Result<()> {
+        if let Some(source) = &self.stream_rule_source {
+            let rules = source.load()?;
+            self.install_stream_rules(rules);
+        }
+        Ok(())
+    }
+
+    fn begin_stream_rule_turn(&mut self) {
+        self.stream_rule_turn = self.stream_rule_turn.saturating_add(1);
+        self.stream_rule_coordinator
+            .advance_turn(self.stream_rule_turn);
     }
 
     /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
@@ -3289,6 +3373,12 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        if !prompts.is_empty() || initial_follow_up || self.stream_rule_turn == 0 {
+            self.refresh_stream_rules()?;
+        }
+        if !prompts.is_empty() || (!initial_follow_up && self.stream_rule_turn == 0) {
+            self.begin_stream_rule_turn();
+        }
         if !prompts.is_empty() || initial_follow_up {
             self.retry_keyword_activations.clear();
         }
@@ -3547,7 +3637,24 @@ impl Agent {
 
                 let delivering_follow_up = follow_up_staged;
                 if delivering_follow_up {
-                    let current_follow_up = self.pop_follow_up_for_current_session().await;
+                    self.refresh_follow_up_session_ownership().await;
+                    let authored_follow_up =
+                        self.message_queue.follow_up_batch_has_authored_input();
+                    if authored_follow_up && let Err(err) = self.refresh_stream_rules() {
+                        // Validate before taking the accepted batch. Its order,
+                        // persistence identities and job ownership must survive
+                        // an invalid edit so the user can fix it and resume.
+                        let agent_end_event = AgentEvent::AgentEnd {
+                            session_id: session_id.clone(),
+                            messages: std::mem::take(&mut new_messages),
+                            error: Some(err.to_string()),
+                        };
+                        self.dispatch_extension_lifecycle_event(&agent_end_event)
+                            .await;
+                        on_event(agent_end_event);
+                        return Err(err);
+                    }
+                    let current_follow_up = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
                     required_initial_follow_up_pending = false;
                     if current_follow_up.is_empty() {
@@ -3556,6 +3663,9 @@ impl Agent {
                         // normal idle restaging boundary without emitting a
                         // lifecycle start or invoking the provider empty.
                         break;
+                    }
+                    if authored_follow_up {
+                        self.begin_stream_rule_turn();
                     }
                     // Follow-ups are new logical user turns. Restore the
                     // caller's baseline before scanning their keywords so
@@ -3634,7 +3744,12 @@ impl Agent {
 
                 let provider_streaming_started_at = Instant::now();
                 let assistant_result = self
-                    .stream_assistant_response(Arc::clone(&on_event), abort.clone(), &loop_cx)
+                    .stream_assistant_response(
+                        Arc::clone(&on_event),
+                        abort.clone(),
+                        &loop_cx,
+                        &mut new_messages,
+                    )
                     .await;
                 record_provider_streaming_latency(
                     &turn_latency,
@@ -4245,9 +4360,13 @@ impl Agent {
     }
 
     async fn pop_follow_up_for_current_session(&mut self) -> Vec<QueuedAgentMessage> {
+        self.refresh_follow_up_session_ownership().await;
+        self.message_queue.pop_follow_up()
+    }
+
+    async fn refresh_follow_up_session_ownership(&mut self) {
         let owner_session_id = self.job_session_scope.session_id().await.ok();
         self.restore_job_follow_ups_except(owner_session_id.as_deref());
-        self.message_queue.pop_follow_up()
     }
 
     fn restore_job_follow_ups_except(&mut self, owner_session_id: Option<&str>) {
@@ -4284,7 +4403,191 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         checkpoint_cx: &crate::agent_cx::AgentCx,
+        new_messages: &mut Vec<Message>,
     ) -> Result<AssistantMessage> {
+        loop {
+            self.stream_rule_coordinator.reset_attempt();
+            let attempt_start = self.messages.len();
+            match self
+                .stream_assistant_attempt(Arc::clone(&on_event), abort.clone(), checkpoint_cx)
+                .await?
+            {
+                AssistantStreamAttempt::Complete(message) => return Ok(message),
+                AssistantStreamAttempt::RuleInterrupted {
+                    rule,
+                    retry,
+                    message,
+                } => {
+                    // Only the current attempt can have appended a partial
+                    // assistant. Already completed tools and earlier messages
+                    // are untouched. In particular, no abandoned tool call
+                    // can leak into a retry's provider context or executor.
+                    self.messages.truncate(attempt_start);
+                    if !retry {
+                        // The interruption already emitted its paired terminal
+                        // message. Retain the named cap refusal once, and let
+                        // the normal loop settle TurnEnd/AgentEnd without a
+                        // provider retry, failover or advisor continuation.
+                        self.messages.push(Message::assistant(message.clone()));
+                        return Ok(message);
+                    }
+
+                    let reminder = Message::Custom(CustomMessage {
+                        custom_type: crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE.to_string(),
+                        content: format!(
+                            "[Stream rule: {}]\n\n{}\n\n\
+                             The interrupted draft was discarded. Continue from the prior \
+                             conversation and follow this directive.",
+                            rule.name,
+                            rule.body.trim(),
+                        ),
+                        display: true,
+                        details: Some(json!({
+                            "ruleId": rule.id,
+                            "ruleName": rule.name,
+                            "turn": self.stream_rule_turn,
+                            "injection": self.stream_rule_coordinator.current_turn_injections(),
+                            "maxInjections": crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+                            "discardedUsage": message.usage,
+                        })),
+                        timestamp: Utc::now().timestamp_millis(),
+                    });
+                    // The ordinary session transcript transaction owns this
+                    // record. Do not persist the offending excerpt or partial
+                    // tool arguments: they may contain generated credentials.
+                    self.messages.push(reminder.clone());
+                    on_event(AgentEvent::MessageStart {
+                        message: reminder.clone(),
+                    });
+                    on_event(AgentEvent::MessageEnd {
+                        message: reminder.clone(),
+                    });
+                    new_messages.push(reminder);
+                    // The next attempt checks the same owner's cancellation
+                    // before opening a provider stream. A rule match never
+                    // clears a user abort or replenishes a turn allowance.
+                }
+            }
+        }
+    }
+
+    fn stream_rule_interruption(
+        &mut self,
+        event: &StreamEvent,
+    ) -> Option<(crate::stream_rules::StreamRule, bool)> {
+        use crate::stream_rules::{StreamChannel, TtsrAction};
+        if self.stream_rules.is_empty() {
+            return None;
+        }
+        let action = match event {
+            StreamEvent::TextDelta { delta, .. } => self
+                .stream_rule_coordinator
+                .process_chunk(delta, StreamChannel::AssistantText),
+            StreamEvent::ThinkingDelta { delta, .. } => self
+                .stream_rule_coordinator
+                .process_chunk(delta, StreamChannel::Thinking),
+            StreamEvent::Start { partial } => self.check_stream_rule_snapshot(partial),
+            StreamEvent::Done { reason, message }
+                if !matches!(reason, StopReason::Error | StopReason::Aborted | StopReason::Refusal)
+                    && !matches!(
+                        message.stop_reason,
+                        StopReason::Error | StopReason::Aborted | StopReason::Refusal
+                    ) =>
+            {
+                // A provider may send only a terminal snapshot, or replace its
+                // streamed text at the terminal. Check that authoritative
+                // content before any tool is eligible to execute. Resetting
+                // avoids joining a full snapshot onto its own earlier deltas.
+                self.check_stream_rule_snapshot(message)
+            }
+            // Tool argument JSON is deliberately excluded. End-of-block text
+            // is covered by the terminal snapshot without double-feeding the
+            // rolling matcher and inventing matches across duplicated text.
+            _ => TtsrAction::Continue,
+        };
+        match action {
+            TtsrAction::Continue => None,
+            TtsrAction::AbortAndInject { rule, .. } => Some((rule, true)),
+            TtsrAction::CapExceeded { rule, .. } => Some((rule, false)),
+        }
+    }
+
+    fn check_stream_rule_snapshot(
+        &mut self,
+        message: &AssistantMessage,
+    ) -> crate::stream_rules::TtsrAction {
+        use crate::stream_rules::{StreamChannel, TtsrAction};
+        self.stream_rule_coordinator.reset_attempt();
+        for block in &message.content {
+            let action = match block {
+                ContentBlock::Text(text) => self
+                    .stream_rule_coordinator
+                    .process_chunk(&text.text, StreamChannel::AssistantText),
+                ContentBlock::Thinking(thinking) => self
+                    .stream_rule_coordinator
+                    .process_chunk(&thinking.thinking, StreamChannel::Thinking),
+                _ => TtsrAction::Continue,
+            };
+            if !matches!(action, TtsrAction::Continue) {
+                return action;
+            }
+        }
+        TtsrAction::Continue
+    }
+
+    fn close_stream_rule_attempt(
+        &self,
+        rule: &crate::stream_rules::StreamRule,
+        retry: bool,
+        partial: Option<&AssistantMessage>,
+        sent_start: bool,
+        on_event: &AgentEventHandler,
+    ) -> AssistantMessage {
+        let mut message = self.build_abort_message(partial);
+        let diagnostic = if retry {
+            format!(
+                "PI_STREAM_RULE_RETRY: discarded a response matching stream rule '{}'",
+                rule.name
+            )
+        } else {
+            format!(
+                "PI_STREAM_RULE_LIMIT: stream rule '{}' still matched after {} corrections; \
+                 stopped without executing this response's tool calls",
+                rule.name,
+                crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+            )
+        };
+        message.content = vec![ContentBlock::Text(TextContent::new(diagnostic.clone()))];
+        message.error_message = Some(diagnostic);
+        message.stop_details = None;
+        if let Some(rates) = self.provider.model_cost() {
+            rates.price_usage(&mut message.usage);
+        }
+        let shared = Arc::new(message);
+        if !sent_start {
+            on_event(AgentEvent::MessageStart {
+                message: Message::Assistant(Arc::clone(&shared)),
+            });
+        }
+        on_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(Arc::clone(&shared)),
+            assistant_message_event: AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: Arc::clone(&shared),
+            },
+        });
+        on_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(Arc::clone(&shared)),
+        });
+        Arc::unwrap_or_clone(shared)
+    }
+
+    async fn stream_assistant_attempt(
+        &mut self,
+        on_event: AgentEventHandler,
+        abort: Option<AbortSignal>,
+        checkpoint_cx: &crate::agent_cx::AgentCx,
+    ) -> Result<AssistantStreamAttempt> {
         // Refresh admitted MCP catalogs before capturing the provider's tool
         // schema, under the same owner and cancellation as this request.
         crate::mcp::refresh_agent_tools(&self.tools, abort.as_ref(), checkpoint_cx).await;
@@ -4531,6 +4834,37 @@ impl Agent {
                     return Ok(self.finalize_assistant_message(msg, &on_event, added_partial));
                 }
             };
+
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
+                continue 'stream;
+            }
+            if let Some((rule, retry)) = self.stream_rule_interruption(&event) {
+                let partial = match &event {
+                    StreamEvent::Start { partial } => Some(partial),
+                    StreamEvent::Done { message, .. } => Some(message),
+                    _ if added_partial => match self.messages.last() {
+                        Some(Message::Assistant(message)) => Some(message.as_ref()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let message = self.close_stream_rule_attempt(
+                    &rule,
+                    retry,
+                    partial,
+                    sent_start,
+                    &on_event,
+                );
+                // Returning drops the provider stream before the next attempt
+                // can open. No terminal tool snapshot reaches the executor.
+                return Ok(AssistantStreamAttempt::RuleInterrupted {
+                    rule,
+                    retry,
+                    message,
+                });
+            }
 
             match event {
                 StreamEvent::Start { partial } => {
@@ -5126,7 +5460,7 @@ impl Agent {
         mut message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
-    ) -> AssistantMessage {
+    ) -> AssistantStreamAttempt {
         // Repair before the execution check and terminal publication so the
         // persisted message, MessageEnd, and local executor see one batch.
         message = self.maybe_repair_dialect_tool_calls(message);
@@ -5171,7 +5505,7 @@ impl Agent {
         on_event(AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&arc)),
         });
-        Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+        AssistantStreamAttempt::Complete(Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
     }
 
     async fn execute_tool_batch(

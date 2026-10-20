@@ -3878,6 +3878,15 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
     }
+    if !sdk_test_mode && !cli.no_context_files {
+        agent_session
+            .agent
+            .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                cwd.clone(),
+                global_dir.clone(),
+                options.workspace_trusted,
+            ))?;
+    }
     // Session-coupled todo tool joins after construction (opt-in), matching
     // the CLI wiring in main.rs.
     if enabled_tools.contains(&"todo") {

@@ -9,10 +9,10 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -27,6 +27,14 @@ pub const DEFAULT_MAX_INJECTIONS_PER_TURN: usize = 3;
 pub const DEFAULT_ROLLING_LOOKBACK_BYTES: usize = 4096;
 
 const MAX_MATCHED_EXCERPT_BYTES: usize = 4096;
+
+/// Bound configured rules and their retained reminders independently of the
+/// provider's context window. These limits also apply to SDK supplied rules.
+pub const MAX_STREAM_RULES: usize = 128;
+const MAX_RULE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_RULE_BODY_BYTES: usize = 16 * 1024;
+const MAX_RULE_PATTERN_BYTES: usize = 4096;
+const MAX_COMPILED_RULE_BYTES: usize = 256 * 1024;
 
 /// Custom session entry type name for TTSR stream rule injections.
 pub const TTSR_CUSTOM_ENTRY_TYPE: &str = "stream_rule_injection";
@@ -56,6 +64,175 @@ pub struct StreamRule {
 
 const fn default_true() -> bool {
     true
+}
+
+fn compile_rule(pattern: &str) -> std::result::Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
+        .size_limit(MAX_COMPILED_RULE_BYTES)
+        .build()
+}
+
+/// Validate a complete rule scope before installing or saving any of it.
+pub fn validate_stream_rules(rules: &[StreamRule]) -> Result<()> {
+    if rules.len() > MAX_STREAM_RULES {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_LIMIT: at most {MAX_STREAM_RULES} effective stream rules are supported"
+        )));
+    }
+    let mut ids = HashSet::new();
+    for rule in rules {
+        for (field, value, limit) in [
+            ("id", rule.id.as_str(), 128),
+            ("name", rule.name.as_str(), 512),
+            ("pattern", rule.pattern.as_str(), MAX_RULE_PATTERN_BYTES),
+            ("body", rule.body.as_str(), MAX_RULE_BODY_BYTES),
+        ] {
+            if value.trim().is_empty() || value.len() > limit {
+                return Err(Error::validation(format!(
+                    "PI_STREAM_RULES_INVALID: rule {field} must be nonempty and at most {limit} bytes"
+                )));
+            }
+        }
+        if !ids.insert(rule.id.as_str()) {
+            return Err(Error::validation(format!(
+                "PI_STREAM_RULES_DUPLICATE: duplicate rule id {:?}",
+                rule.id
+            )));
+        }
+        compile_rule(&rule.pattern).map_err(|error| {
+            Error::validation(format!(
+                "PI_STREAM_RULES_PATTERN: invalid or oversized regex for {:?}: {error}",
+                rule.id
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// A host-selected source of ambient stream rules. Workspace instructions are
+/// read only after the host grants project trust; the global directory is the
+/// same explicit root used for settings, including PI_CODING_AGENT_DIR.
+#[derive(Debug, Clone)]
+pub struct StreamRuleSource {
+    project_root: PathBuf,
+    global_root: PathBuf,
+    project_trusted: bool,
+}
+
+impl StreamRuleSource {
+    #[must_use]
+    pub const fn new(project_root: PathBuf, global_root: PathBuf, project_trusted: bool) -> Self {
+        Self {
+            project_root,
+            global_root,
+            project_trusted,
+        }
+    }
+
+    /// Read a fresh, validated snapshot. A project rule overrides the global
+    /// rule with the same id, including an explicitly disabled project rule.
+    /// Missing files mean no rules; unreadable or malformed files are errors.
+    pub fn load(&self) -> Result<Vec<StreamRule>> {
+        let mut effective: HashMap<String, StreamRule> =
+            load_rule_file(&self.global_root.join("stream-rules.json"))?
+                .into_iter()
+                .map(|rule| (rule.id.clone(), rule))
+                .collect();
+        if self.project_trusted {
+            for rule in load_rule_file(&self.project_root.join(".pi/stream-rules.json"))? {
+                effective.insert(rule.id.clone(), rule);
+            }
+        }
+        let mut rules: Vec<StreamRule> = effective.into_values().collect();
+        rules.sort_by(|left, right| left.id.cmp(&right.id));
+        validate_stream_rules(&rules)?;
+        Ok(rules)
+    }
+}
+
+fn load_rule_file(path: &Path) -> Result<Vec<StreamRule>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(Error::validation(format!(
+                "PI_STREAM_RULES_READ: cannot inspect {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_RULE_FILE_BYTES {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_READ: {} must be a regular file of at most {MAX_RULE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let file = fs::File::open(path).map_err(|error| {
+        Error::validation(format!(
+            "PI_STREAM_RULES_READ: cannot open {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_READ: {} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RULE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RULE_FILE_BYTES {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_LIMIT: {} exceeds {MAX_RULE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let config: StreamRulesConfigFile = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::validation(format!(
+            "PI_STREAM_RULES_INVALID: {}: {error}",
+            path.display()
+        ))
+    })?;
+    if config.version != 1 {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_VERSION: {} uses unsupported version {} (expected 1)",
+            path.display(),
+            config.version
+        )));
+    }
+    validate_stream_rules(&config.rules)?;
+    Ok(config.rules)
+}
+
+fn save_rule_file(path: &Path, rules: &[StreamRule]) -> Result<()> {
+    validate_stream_rules(rules)?;
+    let config = StreamRulesConfigFile {
+        version: 1,
+        rules: rules.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&config)?;
+    if bytes.len() as u64 > MAX_RULE_FILE_BYTES {
+        return Err(Error::validation(format!(
+            "PI_STREAM_RULES_LIMIT: {} would exceed {MAX_RULE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| {
+        Error::validation(format!(
+            "PI_STREAM_RULES_WRITE: cannot save {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    Ok(())
 }
 
 /// Recorded match event when a stream rule triggers.
@@ -167,7 +344,7 @@ impl RollingStreamMatcher {
         let compiled = rules
             .iter()
             .filter(|r| r.enabled)
-            .filter_map(|r| Regex::new(&r.pattern).ok().map(|re| (r.clone(), re)))
+            .filter_map(|r| compile_rule(&r.pattern).ok().map(|re| (r.clone(), re)))
             .collect();
 
         Self {
@@ -290,6 +467,22 @@ impl TtsrCoordinator {
         self.matcher.reset();
     }
 
+    /// Refresh file-backed rules between logical turns without resetting the
+    /// cooldowns of unchanged rules. A changed directive is a new constraint.
+    pub fn replace_rules(&mut self, rules: &[StreamRule]) {
+        self.cooldown_history.retain(|id, _| {
+            rules
+                .iter()
+                .any(|rule| rule.id == *id && self.rules_by_id.get(id) == Some(rule))
+        });
+        self.matcher = RollingStreamMatcher::new(rules, self.matcher.lookback_limit);
+        self.rules_by_id = rules
+            .iter()
+            .cloned()
+            .map(|rule| (rule.id.clone(), rule))
+            .collect();
+    }
+
     /// Format a system reminder message for a matched stream rule.
     #[must_use]
     pub fn format_reminder(rule: &StreamRule, matched_excerpt: &str) -> String {
@@ -389,34 +582,16 @@ pub struct StreamRuleStore {
 
 impl StreamRuleStore {
     /// Load stream rules for the given project directory and user home directory.
-    pub fn load_for_project(project_root: &Path) -> Self {
+    pub fn load_for_project(project_root: &Path) -> Result<Self> {
         let project_path = project_root.join(".pi").join("stream-rules.json");
-        let global_path =
-            dirs::home_dir().map(|h| h.join(".pi").join("agent").join("stream-rules.json"));
+        let global_path = crate::config::Config::global_dir().join("stream-rules.json");
 
-        let mut store = Self {
-            project_rules: Vec::new(),
-            global_rules: Vec::new(),
-            project_file_path: Some(project_path.clone()),
-            global_file_path: global_path.clone(),
-        };
-
-        if project_path.exists()
-            && let Ok(content) = fs::read_to_string(&project_path)
-            && let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content)
-        {
-            store.project_rules = cfg.rules;
-        }
-
-        if let Some(ref gp) = global_path
-            && gp.exists()
-            && let Ok(content) = fs::read_to_string(gp)
-            && let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content)
-        {
-            store.global_rules = cfg.rules;
-        }
-
-        store
+        Ok(Self {
+            project_rules: load_rule_file(&project_path)?,
+            global_rules: load_rule_file(&global_path)?,
+            project_file_path: Some(project_path),
+            global_file_path: Some(global_path),
+        })
     }
 
     /// List all effective rules (project rules take precedence over global rules with the same ID).
@@ -448,26 +623,29 @@ impl StreamRuleStore {
 
     /// Add or update a stream rule.
     pub fn add_rule(&mut self, rule: StreamRule, is_global: bool) -> Result<()> {
-        // Validate regex compilation
-        Regex::new(&rule.pattern)
-            .map_err(|e| Error::Validation(format!("Invalid regex pattern: {e}")))?;
-
-        if is_global {
-            if let Some(target) = self.global_rules.iter_mut().find(|r| r.id == rule.id) {
-                *target = rule;
-            } else {
-                self.global_rules.push(rule);
-            }
-            self.save_global()?;
+        validate_stream_rules(std::slice::from_ref(&rule))?;
+        let mut candidate = self.clone();
+        let destination = if is_global {
+            &mut candidate.global_rules
         } else {
-            if let Some(target) = self.project_rules.iter_mut().find(|r| r.id == rule.id) {
-                *target = rule;
-            } else {
-                self.project_rules.push(rule);
-            }
-            self.save_project()?;
+            &mut candidate.project_rules
+        };
+        if let Some(target) = destination
+            .iter_mut()
+            .find(|existing| existing.id == rule.id)
+        {
+            *target = rule;
+        } else {
+            destination.push(rule);
         }
-
+        validate_stream_rules(destination)?;
+        validate_stream_rules(&candidate.list_all_rules())?;
+        if is_global {
+            candidate.save_global()?;
+        } else {
+            candidate.save_project()?;
+        }
+        *self = candidate;
         Ok(())
     }
 
@@ -549,64 +727,54 @@ impl StreamRuleStore {
 
     /// Import rules from a JSON string.
     pub fn import_json(&mut self, json_str: &str, is_global: bool) -> Result<usize> {
+        if json_str.len() as u64 > MAX_RULE_FILE_BYTES {
+            return Err(Error::validation(
+                "PI_STREAM_RULES_LIMIT: import exceeds 1 MiB",
+            ));
+        }
         let cfg: StreamRulesConfigFile = serde_json::from_str(json_str)
             .map_err(|e| Error::Validation(format!("Invalid JSON format: {e}")))?;
-
-        let count = cfg.rules.len();
-        for rule in cfg.rules {
-            self.add_rule(rule, is_global)?;
+        if cfg.version != 1 {
+            return Err(Error::validation(
+                "PI_STREAM_RULES_VERSION: expected version 1",
+            ));
         }
+        validate_stream_rules(&cfg.rules)?;
+        let count = cfg.rules.len();
+        let mut candidate = self.clone();
+        let destination = if is_global {
+            &mut candidate.global_rules
+        } else {
+            &mut candidate.project_rules
+        };
+        for rule in cfg.rules {
+            if let Some(existing) = destination.iter_mut().find(|item| item.id == rule.id) {
+                *existing = rule;
+            } else {
+                destination.push(rule);
+            }
+        }
+        validate_stream_rules(destination)?;
+        validate_stream_rules(&candidate.list_all_rules())?;
+        if is_global {
+            candidate.save_global()?;
+        } else {
+            candidate.save_project()?;
+        }
+        *self = candidate;
         Ok(count)
     }
 
     fn save_project(&self) -> Result<()> {
         if let Some(ref path) = self.project_file_path {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    Error::Io(Box::new(std::io::Error::other(format!(
-                        "Failed to create directory {}: {e}",
-                        parent.display()
-                    ))))
-                })?;
-            }
-            let cfg = StreamRulesConfigFile {
-                version: 1,
-                rules: self.project_rules.clone(),
-            };
-            let json = serde_json::to_string_pretty(&cfg)
-                .map_err(|e| Error::Validation(format!("Serialization failure: {e}")))?;
-            fs::write(path, json).map_err(|e| {
-                Error::Io(Box::new(std::io::Error::other(format!(
-                    "Failed to write {}: {e}",
-                    path.display()
-                ))))
-            })?;
+            save_rule_file(path, &self.project_rules)?;
         }
         Ok(())
     }
 
     fn save_global(&self) -> Result<()> {
         if let Some(ref path) = self.global_file_path {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    Error::Io(Box::new(std::io::Error::other(format!(
-                        "Failed to create directory {}: {e}",
-                        parent.display()
-                    ))))
-                })?;
-            }
-            let cfg = StreamRulesConfigFile {
-                version: 1,
-                rules: self.global_rules.clone(),
-            };
-            let json = serde_json::to_string_pretty(&cfg)
-                .map_err(|e| Error::Validation(format!("Serialization failure: {e}")))?;
-            fs::write(path, json).map_err(|e| {
-                Error::Io(Box::new(std::io::Error::other(format!(
-                    "Failed to write {}: {e}",
-                    path.display()
-                ))))
-            })?;
+            save_rule_file(path, &self.global_rules)?;
         }
         Ok(())
     }
@@ -764,6 +932,254 @@ mod tests {
             enabled: true,
             created_from: None,
             cooldown_turns: None,
+        }
+    }
+
+    fn write_rule_scope(path: &Path, rules: Vec<StreamRule>) {
+        let parent = path.parent().expect("rules parent");
+        fs::create_dir_all(parent).expect("create rule directory");
+        fs::write(
+            path,
+            serde_json::to_vec(&StreamRulesConfigFile { version: 1, rules })
+                .expect("serialize rules"),
+        )
+        .expect("write rule file");
+    }
+
+    #[test]
+    fn live_rule_source_obeys_project_trust_and_explicit_global_root() {
+        let directory = tempfile::tempdir().expect("rule roots");
+        let project = directory.path().join("project");
+        let global = directory.path().join("configured-agent-dir");
+        write_rule_scope(
+            &global.join("stream-rules.json"),
+            vec![
+                stream_rule("same", "GLOBAL"),
+                stream_rule("global", "OTHER"),
+            ],
+        );
+        let mut override_rule = stream_rule("same", "PROJECT");
+        override_rule.enabled = false;
+        write_rule_scope(&project.join(".pi/stream-rules.json"), vec![override_rule]);
+
+        let untrusted = StreamRuleSource::new(project.clone(), global.clone(), false)
+            .load()
+            .expect("load global rules without project trust");
+        let inherited = untrusted
+            .iter()
+            .find(|rule| rule.id == "same")
+            .expect("global rule is inherited");
+        assert!(inherited.enabled);
+        assert_eq!(inherited.pattern, "GLOBAL");
+
+        let trusted = StreamRuleSource::new(project, global, true)
+            .load()
+            .expect("load trusted project overrides");
+        assert_eq!(trusted.len(), 2);
+        let effective = trusted
+            .iter()
+            .find(|rule| rule.id == "same")
+            .expect("project override is retained");
+        assert!(
+            !effective.enabled,
+            "disabled project overrides must suppress global rules"
+        );
+        assert_eq!(effective.pattern, "PROJECT");
+    }
+
+    #[test]
+    fn live_rule_source_reloads_and_never_turns_invalid_rules_into_an_empty_policy() {
+        let directory = tempfile::tempdir().expect("rule roots");
+        let project = directory.path().join("project");
+        let global = directory.path().join("global");
+        let source = StreamRuleSource::new(project.clone(), global.clone(), true);
+        assert!(source.load().expect("missing scopes").is_empty());
+        let path = project.join(".pi/stream-rules.json");
+        write_rule_scope(&path, vec![stream_rule("first", "FIRST")]);
+        assert_eq!(source.load().expect("first load")[0].pattern, "FIRST");
+        write_rule_scope(&path, vec![stream_rule("first", "CHANGED")]);
+        assert_eq!(source.load().expect("fresh load")[0].pattern, "CHANGED");
+        fs::write(&path, b"{broken").expect("invalid rule fixture");
+        let error = source.load().expect_err("invalid policy must fail");
+        assert!(error.to_string().contains("PI_STREAM_RULES_INVALID"));
+        assert!(
+            StreamRuleSource::new(project, global, false)
+                .load()
+                .expect("untrusted project is never read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rule_scopes_reject_duplicates_invalid_patterns_and_unsupported_versions() {
+        let directory = tempfile::tempdir().expect("rules directory");
+        let path = directory.path().join("stream-rules.json");
+        write_rule_scope(
+            &path,
+            vec![stream_rule("same", "A"), stream_rule("same", "B")],
+        );
+        assert!(
+            load_rule_file(&path)
+                .expect_err("duplicate rule IDs")
+                .to_string()
+                .contains("DUPLICATE")
+        );
+        write_rule_scope(&path, vec![stream_rule("broken", "[")]);
+        assert!(
+            load_rule_file(&path)
+                .expect_err("invalid regex")
+                .to_string()
+                .contains("PATTERN")
+        );
+        fs::write(&path, br#"{"version":2,"rules":[]}"#).expect("future version fixture");
+        assert!(
+            load_rule_file(&path)
+                .expect_err("unsupported version")
+                .to_string()
+                .contains("VERSION")
+        );
+        let mut empty_directive = stream_rule("empty", "BAD");
+        empty_directive.body = " ".to_string();
+        assert!(validate_stream_rules(&[empty_directive]).is_err());
+    }
+
+    #[test]
+    fn live_rule_source_bounds_files_and_combined_scope_before_installing() {
+        let directory = tempfile::tempdir().expect("rule roots");
+        let project = directory.path().join("project");
+        let global = directory.path().join("global");
+        let source = StreamRuleSource::new(project.clone(), global.clone(), true);
+        write_rule_scope(
+            &global.join("stream-rules.json"),
+            (0..MAX_STREAM_RULES)
+                .map(|id| stream_rule(&format!("global-{id}"), "A"))
+                .collect(),
+        );
+        write_rule_scope(
+            &project.join(".pi/stream-rules.json"),
+            vec![stream_rule("one-more", "B")],
+        );
+        assert!(
+            source
+                .load()
+                .expect_err("effective scope exceeds limit")
+                .to_string()
+                .contains("LIMIT")
+        );
+        let path = project.join(".pi/stream-rules.json");
+        fs::write(&path, vec![b' '; (MAX_RULE_FILE_BYTES + 1) as usize])
+            .expect("oversized fixture");
+        assert!(
+            load_rule_file(&path)
+                .expect_err("oversized file")
+                .to_string()
+                .contains("regular file")
+        );
+        assert!(load_rule_file(directory.path()).is_err());
+    }
+
+    #[test]
+    fn refreshing_rules_keeps_unchanged_cooldowns_and_current_attempt_budget() {
+        let mut rule = stream_rule("bounded", "BAD");
+        rule.cooldown_turns = Some(2);
+        let mut coordinator = TtsrCoordinator::new(std::slice::from_ref(&rule), 3, 4096);
+        coordinator.advance_turn(1);
+        assert!(matches!(
+            coordinator.process_chunk("BAD", StreamChannel::AssistantText),
+            TtsrAction::AbortAndInject { .. }
+        ));
+        coordinator.replace_rules(std::slice::from_ref(&rule));
+        assert_eq!(coordinator.current_turn_injections(), 1);
+        coordinator.advance_turn(2);
+        assert!(matches!(
+            coordinator.process_chunk("BAD", StreamChannel::AssistantText),
+            TtsrAction::Continue
+        ));
+        rule.body = "A newly revised directive applies immediately.".to_string();
+        coordinator.replace_rules(std::slice::from_ref(&rule));
+        assert!(matches!(
+            coordinator.process_chunk("BAD", StreamChannel::AssistantText),
+            TtsrAction::AbortAndInject { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_import_never_installs_an_earlier_valid_rule() {
+        let directory = tempfile::tempdir().expect("rules directory");
+        let path = directory.path().join("stream-rules.json");
+        let original = stream_rule("original", "KEEP");
+        write_rule_scope(&path, vec![original.clone()]);
+        let original_bytes = fs::read(&path).expect("original rule file");
+        let mut store = StreamRuleStore {
+            project_rules: vec![original],
+            project_file_path: Some(path.clone()),
+            ..StreamRuleStore::default()
+        };
+        let input = serde_json::to_string(&StreamRulesConfigFile {
+            version: 1,
+            rules: vec![stream_rule("valid", "NEW"), stream_rule("invalid", "[")],
+        })
+        .expect("import fixture");
+        assert!(store.import_json(&input, false).is_err());
+        assert_eq!(store.list_project_rules().len(), 1);
+        assert_eq!(fs::read(path).expect("unchanged rule file"), original_bytes);
+    }
+
+    #[test]
+    fn oversized_saved_scope_preserves_the_previous_file_and_active_rules() {
+        let directory = tempfile::tempdir().expect("rules directory");
+        for is_global in [false, true] {
+            let path = directory.path().join(format!("rules-{is_global}.json"));
+            let rules: Vec<_> = (0..60)
+                .map(|index| {
+                    let mut rule = stream_rule(&format!("rule-{index}"), "BAD");
+                    rule.body = "x".repeat(MAX_RULE_BODY_BYTES);
+                    rule
+                })
+                .collect();
+            save_rule_file(&path, &rules).expect("initial scope fits");
+            let previous = fs::read(&path).expect("saved initial scope");
+            let mut store = if is_global {
+                StreamRuleStore {
+                    global_rules: rules,
+                    global_file_path: Some(path.clone()),
+                    ..StreamRuleStore::default()
+                }
+            } else {
+                StreamRuleStore {
+                    project_rules: rules,
+                    project_file_path: Some(path.clone()),
+                    ..StreamRuleStore::default()
+                }
+            };
+            let mut escaped = stream_rule("escaped", "BAD");
+            escaped.body = "\u{1}".repeat(MAX_RULE_BODY_BYTES);
+            let error = store
+                .add_rule(escaped, is_global)
+                .expect_err("serialized escaping exceeds file limit");
+            assert!(error.to_string().contains("PI_STREAM_RULES_LIMIT"));
+            assert_eq!(store.list_all_rules().len(), 60);
+            assert_eq!(fs::read(&path).expect("unchanged scope"), previous);
+            assert_eq!(
+                load_rule_file(&path).expect("old scope still loads").len(),
+                60
+            );
+
+            let additions = (60..70)
+                .map(|index| {
+                    let mut rule = stream_rule(&format!("rule-{index}"), "BAD");
+                    rule.body = "x".repeat(MAX_RULE_BODY_BYTES);
+                    rule
+                })
+                .collect();
+            let input = serde_json::to_string(&StreamRulesConfigFile {
+                version: 1,
+                rules: additions,
+            })
+            .expect("small import fixture");
+            assert!(store.import_json(&input, is_global).is_err());
+            assert_eq!(store.list_all_rules().len(), 60);
+            assert_eq!(fs::read(&path).expect("unchanged imported scope"), previous);
         }
     }
 
@@ -1155,7 +1571,7 @@ mod tests {
         };
         let project_dir = tmp.path();
 
-        let mut store = StreamRuleStore::load_for_project(project_dir);
+        let mut store = StreamRuleStore::load_for_project(project_dir).expect("load stream rules");
         let rule = StreamRule {
             id: "my-rule".to_string(),
             name: "My Rule".to_string(),
