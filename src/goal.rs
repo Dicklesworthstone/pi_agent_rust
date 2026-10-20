@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::{Arc, Weak};
 
+mod continuation;
 mod driver;
 mod rpc;
 #[cfg(feature = "ftui")]
