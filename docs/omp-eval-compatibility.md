@@ -23,8 +23,10 @@ precedence rule. A rejected reset request does not discard either kernel.
 Timeout values retain Pi's native policy: nonnegative integer seconds,
 default 30, clamped to 1–600. In particular, `timeout: 0` does **not** disable
 the watchdog as it does in OMP. Fractional seconds are not accepted. These
-aliases do not add backend sniffing, multiple cells, unrestricted tool re-entry,
-or OMP's retained subagent/workpool and judge APIs.
+aliases do not add backend sniffing or multiple cells. Agent-owned eval now
+supports [policy-checked tool orchestration](eval-structured-results.md#agent-scoped-tool-orchestration)
+through `tool.call` and `tool.result`, plus the explicit typed-judgment bridge.
+OMP's retained subagent/workpool API remains separate and is not implemented.
 
 ## JavaScript images
 

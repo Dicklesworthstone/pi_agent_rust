@@ -41,7 +41,7 @@ not retained.
 
 ## Execution and results
 
-The private executor uses the ordinary compiler, source loader, read-only tool
+The private executor uses the ordinary compiler, source loader, invocation-owned tool
 bridge, native output capture, protocol validation, deadlines and process/worker
 ownership. Calls still share the original EvalTool's execution admission,
 including SDK calls: per-call does not enable uncontrolled parallel spawning.

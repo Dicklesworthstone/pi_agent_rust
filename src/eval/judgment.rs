@@ -1,4 +1,4 @@
-//! Invocation-owned typed judgments over the ordinary eval bridge.
+//! Invocation-owned host calls and typed judgments over the eval bridge.
 //!
 //! A model must be selected explicitly by the host or by this cell's
 //! judge_model field. Neither interpreter holds credentials, a privacy vault,
@@ -16,12 +16,13 @@ use crate::error::{Error, Result};
 use crate::judgment::{Judge, JudgmentRequest, Protect};
 use crate::models::ModelRegistry;
 use crate::provider::StreamOptions;
-use crate::tools::ToolOutput;
+use crate::tools::{ToolInvocationHost, ToolOutput};
 
 mod batch;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
+const MAX_TOOL_CALLS: usize = 64;
 
 #[derive(Clone, Debug, Serialize)]
 struct Selection {
@@ -115,6 +116,9 @@ pub(super) struct Invocation<'p> {
     selection: Option<Selection>,
     protect: Option<&'p Protect<'p>>,
     receipts: Vec<Value>,
+    host: Option<&'p dyn ToolInvocationHost>,
+    host_session: Option<String>,
+    tool_receipts: Vec<Value>,
 }
 
 impl<'p> Invocation<'p> {
@@ -127,7 +131,19 @@ impl<'p> Invocation<'p> {
         if judge.is_some() && selection.is_some() {
             return Err(Error::tool("eval", "EVAL_INPUT: judge_model cannot replace a host-bound Judge"));
         }
-        Ok(Self { judge, selection, protect, receipts: Vec::new() })
+        Ok(Self {
+            judge, selection, protect, receipts: Vec::new(),
+            host: None, host_session: None, tool_receipts: Vec::new(),
+        })
+    }
+
+    pub(super) fn with_host(mut self, host: Option<&'p dyn ToolInvocationHost>) -> Self {
+        self.host = host;
+        self
+    }
+
+    pub(super) fn bind_host_session(&mut self, session: &str) {
+        self.host_session = Some(session.to_owned());
     }
 
     pub(super) async fn dispatch(
@@ -140,10 +156,66 @@ impl<'p> Invocation<'p> {
             self.evaluate(&tool.cwd, input).await
         } else if name == batch::BRIDGE_NAME {
             self.evaluate_batch(&tool.cwd, input).await
+        } else if let Some(host) = self.host {
+            self.call_host(host, name, input).await
         } else {
             // Check the raw operation before structured-result unwrapping.
             // Nested tool.result calls cannot expand the normal tool whitelist.
             tool.run_bridge_call_parts(name, input).await
+        }
+    }
+
+    async fn call_host(
+        &mut self,
+        host: &dyn ToolInvocationHost,
+        name: &str,
+        input: Value,
+    ) -> std::result::Result<String, String> {
+        let request = super::bridge_result::Request::parse(name, input)?;
+        if request.name.is_empty() || request.name.len() > 128
+            || request.name.chars().any(char::is_control) || !request.args.is_object()
+        {
+            return Err("EVAL_BRIDGE_INPUT: expected a bounded tool name and object arguments".into());
+        }
+        if self.tool_receipts.len() >= MAX_TOOL_CALLS {
+            return Err("EVAL_BRIDGE_LIMIT: at most 64 host tool calls per cell".into());
+        }
+        let call = crate::model::ToolCall {
+            id: format!("eval-{}", uuid::Uuid::new_v4().simple()),
+            name: request.name,
+            arguments: request.args,
+            thought_signature: None,
+        };
+        let index = self.tool_receipts.len();
+        // Native receipts survive a caught guest error and partial evaluation.
+        // No arguments, output bodies, credentials or host handles are retained.
+        self.tool_receipts.push(json!({
+            "toolCallId": call.id,
+            "tool": call.name,
+            "status": "incomplete",
+        }));
+        let session = self.host_session.as_deref().ok_or_else(|| {
+            "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
+        })?;
+        let outcome = host.call_tool(call, session).await;
+        let receipt = self.tool_receipts.get_mut(index)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| "EVAL_TOOL_RECEIPT: native call receipt was unavailable".to_string())?;
+        match outcome {
+            Ok(output) => {
+                receipt.insert("status".into(), json!(if output.is_error { "failed" } else { "completed" }));
+                receipt.insert("isError".into(), json!(output.is_error));
+                if request.structured {
+                    super::bridge_result::structured(&output)
+                } else {
+                    super::bridge_result::text(&output)
+                }
+            }
+            Err(error) => {
+                receipt.insert("status".into(), json!("failed"));
+                receipt.insert("isError".into(), json!(true));
+                Err(error.to_string())
+            }
         }
     }
 
@@ -228,20 +300,35 @@ impl<'p> Invocation<'p> {
     /// catch its error; neither should conceal the auxiliary request. Failed
     /// and cancelled calls have unknown usage, never an invented zero bill.
     pub(super) fn finish(&self, outcome: Result<ToolOutput>) -> Result<ToolOutput> {
-        if self.receipts.is_empty() {
+        if self.receipts.is_empty() && self.tool_receipts.is_empty() {
             return outcome;
         }
         let receipts = json!({"schema":"pi.eval.judgments.v1", "attempts":self.receipts});
+        let tool_receipts = json!({"schema":"pi.eval.tool_calls.v1", "calls":self.tool_receipts});
         match outcome {
             Ok(mut output) => {
                 let details = output.details.get_or_insert_with(|| json!({}));
                 let details = details.as_object_mut().ok_or_else(|| {
                     Error::tool("eval", "EVAL_JUDGE_RECEIPT: result details are not an object")
                 })?;
-                details.insert("judgments".into(), receipts);
+                if !self.receipts.is_empty() {
+                    details.insert("judgments".into(), receipts);
+                }
+                if !self.tool_receipts.is_empty() {
+                    details.insert("toolCalls".into(), tool_receipts);
+                }
                 Ok(output)
             }
-            Err(error) => Err(Error::tool("eval", format!("{error}; EVAL_JUDGMENTS: {receipts}"))),
+            Err(error) => {
+                let mut message = error.to_string();
+                if !self.receipts.is_empty() {
+                    message.push_str(&format!("; EVAL_JUDGMENTS: {receipts}"));
+                }
+                if !self.tool_receipts.is_empty() {
+                    message.push_str(&format!("; EVAL_TOOL_CALLS: {tool_receipts}"));
+                }
+                Err(Error::tool("eval", message))
+            }
         }
     }
 }

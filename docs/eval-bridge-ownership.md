@@ -1,9 +1,11 @@
 # Python tool-bridge ownership
 
 The retained Python kernel allows synchronous `tool.read`, `tool.grep`,
-`tool.find`, `tool.ls`, and `await tool.call(name, arguments)`. These reuse the
-existing native host whitelist and native tool implementations. This change
-does not expand tool permissions or add subagent, mutation, or network tools.
+`tool.find`, `tool.ls`, and `await tool.call(name, arguments)`. Agent-owned cells
+call the enabled registry through the owning Agent's approval, plan, extension
+and privacy policies. Standalone embeddings retain the local reader whitelist.
+See [Agent-scoped orchestration](eval-structured-results.md#agent-scoped-tool-orchestration)
+for tool availability, call budgets and native receipts.
 
 ## Live cell, not whichever cell runs next
 

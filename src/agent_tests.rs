@@ -6900,6 +6900,435 @@ mod tests {
         assert_eq!(json["finalError"], "max retries exceeded");
     }
 
+    // === Eval calls through the owning Agent's tool policy ===
+
+    fn eval_host_call(kernel: &str, code: &str) -> ToolCall {
+        ToolCall {
+            id: format!("outer-eval-{kernel}"),
+            name: "eval".to_string(),
+            arguments: json!({"kernel": kernel, "code": code}),
+            thought_signature: None,
+        }
+    }
+
+    fn eval_host_text(output: &ToolOutput) -> String {
+        output.content.iter().filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn eval_host_calls_use_live_tools_approvals_and_events_in_both_kernels() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for (kernel, code) in [
+                ("js", r#"
+                    await tool.call("write", {path:"allowed.txt",content:"native eval write"});
+                    const read = await tool.result("read", {path:"allowed.txt"});
+                    if (read.isError || !read.content[0].text.includes("native eval write")) {
+                      throw new Error("native read did not observe the write");
+                    }
+                    const denied = await tool.result("write", {path:"blocked.txt",content:"forbidden"});
+                    if (!denied.isError || !denied.content[0].text.includes("denied by eval test")) {
+                      throw new Error("nested approval was bypassed");
+                    }
+                    "eval-host-ok"
+                "#),
+                ("python", r#"
+await tool.call("write", {"path":"allowed.txt","content":"native eval write"})
+read = await tool.result("read", {"path":"allowed.txt"})
+assert not read["isError"] and "native eval write" in read["content"][0]["text"]
+denied = await tool.result("write", {"path":"blocked.txt","content":"forbidden"})
+assert denied["isError"] and "denied by eval test" in denied["content"][0]["text"]
+"eval-host-ok"
+                "#),
+            ] {
+                if kernel == "python" && !std::process::Command::new("python3")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status().is_ok_and(|status| status.success())
+                {
+                    eprintln!("Skipping Python eval-host case: python3 not available");
+                    continue;
+                }
+                let root = tempfile::tempdir().unwrap();
+                let approvals = Arc::new(StdMutex::new(Vec::new()));
+                let approval_sink = Arc::clone(&approvals);
+                let agent = Agent::new(
+                    Arc::new(SilentProvider),
+                    ToolRegistry::new(&["eval", "read", "write"], root.path(), None),
+                    AgentConfig {
+                        tool_approval: Some(Arc::new(move |request| {
+                            let denied = request.tool_name == "write"
+                                && request.arguments["path"] == "blocked.txt";
+                            approval_sink.lock().unwrap().push(request);
+                            Box::pin(async move {
+                                if denied {
+                                    ToolApprovalDecision::deny("denied by eval test")
+                                } else {
+                                    ToolApprovalDecision::Allow
+                                }
+                            })
+                        })),
+                        ..AgentConfig::default()
+                    },
+                );
+                let events = Arc::new(StdMutex::new(Vec::new()));
+                let event_sink = Arc::clone(&events);
+                let (output, failed) = agent.execute_tool(
+                    eval_host_call(kernel, code),
+                    Arc::new(move |event| event_sink.lock().unwrap().push(event)),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                ).await;
+                assert!(!failed && !output.is_error, "{kernel}: {output:?}");
+                assert!(eval_host_text(&output).contains("eval-host-ok"));
+                assert_eq!(std::fs::read_to_string(root.path().join("allowed.txt")).unwrap(), "native eval write");
+                assert!(!root.path().join("blocked.txt").exists());
+                let calls = output.details.as_ref().unwrap()["toolCalls"]["calls"].as_array().unwrap();
+                assert_eq!(calls.len(), 3);
+                assert_eq!(calls.iter().map(|call| call["status"].as_str().unwrap()).collect::<Vec<_>>(),
+                    ["completed", "completed", "failed"]);
+                let ids: BTreeSet<_> = calls.iter().map(|call| call["toolCallId"].as_str().unwrap()).collect();
+                assert_eq!(ids.len(), 3, "each nested call needs its own identity");
+                assert!(ids.iter().all(|id| id.starts_with("eval-")));
+                let approvals = approvals.lock().unwrap();
+                assert_eq!(approvals.iter().map(|request| request.tool_name.as_str()).collect::<Vec<_>>(),
+                    ["eval", "write", "read", "write"]);
+                assert!(approvals.iter().skip(1).all(|request| ids.contains(request.tool_call_id.as_str())));
+                drop(approvals);
+                let events = events.lock().unwrap();
+                assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. })).count(), 3);
+                assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. })).count(), 3);
+            }
+        });
+    }
+
+    #[test]
+    fn eval_host_disabled_tools_cannot_fall_back_to_standalone_readers() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data.txt"), "standalone-reader-proof").unwrap();
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::new(&["eval"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let (output, failed) = agent.execute_tool(
+                eval_host_call("js", r#"
+                    let unavailable = "";
+                    try { await tool.call("read", {path:"data.txt"}); }
+                    catch (error) { unavailable = String(error); }
+                    unavailable
+                "#),
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(!failed, "{output:?}");
+            assert!(eval_host_text(&output).contains("EVAL_BRIDGE_UNAVAILABLE"));
+            assert_eq!(output.details.as_ref().unwrap()["toolCalls"]["calls"][0]["status"], "failed");
+
+            // Reuse the exact same retained kernel through the standalone
+            // API. Its previous Agent host must not remain in the realm.
+            let registry = agent.tools.snapshot();
+            let eval = registry.get("eval").unwrap();
+            let standalone = eval.execute("standalone", json!({
+                "kernel":"js", "code":r#"
+                    const local = await tool.call("read", {path:"data.txt"});
+                    let denied = "";
+                    try { await tool.call("write", {path:"blocked.txt",content:"forbidden"}); }
+                    catch (error) { denied = String(error); }
+                    [local.includes("standalone-reader-proof"), denied.includes("EVAL_BRIDGE_DENIED")]
+                "#,
+            }), None).await.unwrap();
+            assert!(!standalone.is_error, "{standalone:?}");
+            assert!(eval_host_text(&standalone).contains("true,true"));
+            assert!(!root.path().join("blocked.txt").exists());
+        });
+    }
+
+    #[test]
+    fn eval_host_rejects_recursive_dispatch_and_bounds_native_calls() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data.txt"), "bounded").unwrap();
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::new(&["eval", "read"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let (output, failed) = agent.execute_tool(
+                eval_host_call("js", r#"
+                    const questions = {safe:{type:"bool",instructions:"Is this safe?"}};
+                    let unboundBatch = "";
+                    try { await tool.call("__pi_judge_batch", {states:[{value:1}],questions}); }
+                    catch (error) { unboundBatch = String(error); }
+                    if (!unboundBatch.includes("PI_JUDGE_UNBOUND")) {
+                      throw new Error("raw judgment batch did not reach its own policy");
+                    }
+                    const refusals = [];
+                    for (const [name,args] of [
+                      ["eval",{kernel:"js",code:"42"}],
+                      ["xdev",{action:"run",name:"eval",args:{kernel:"js",code:"42"}}],
+                      ["xdev",{action:"run",name:"xdev",args:{action:"run",name:"eval"}}],
+                      ["__pi_tool_result",{name:"eval",args:{kernel:"js",code:"42"}}],
+                      ["__pi_judge",{state:{value:1},questions}],
+                      ["__pi_judge_batch",{states:[{value:1}],questions}]
+                    ]) {
+                      try { await tool.result(name,args); }
+                      catch (error) { refusals.push(String(error)); }
+                    }
+                    if (refusals.length !== 6 || refusals.some(x => !x.includes("EVAL_BRIDGE_RECURSION"))) {
+                      throw new Error("recursive dispatch was admitted");
+                    }
+                    for (let i = 0; i < 58; i++) {
+                      const result = await tool.result("read",{path:"data.txt"});
+                      if (result.isError) throw new Error("native read failed");
+                    }
+                    let limit = "";
+                    try { await tool.call("read",{path:"data.txt"}); }
+                    catch (error) { limit = String(error); }
+                    limit
+                "#),
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(!failed, "{output:?}");
+            assert!(eval_host_text(&output).contains("EVAL_BRIDGE_LIMIT"));
+            let calls = output.details.as_ref().unwrap()["toolCalls"]["calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 64);
+            assert_eq!(calls.iter().filter(|call| call["status"] == "completed").count(), 58);
+        });
+    }
+
+    #[test]
+    fn eval_host_rechecks_plan_state_before_each_nested_action() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data.txt"), "planning transition").unwrap();
+            let approvals = Arc::new(StdMutex::new(Vec::new()));
+            let approval_sink = Arc::clone(&approvals);
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::new(&["eval", "read", "write"], root.path(), None),
+                AgentConfig {
+                    tool_approval: Some(Arc::new(move |request| {
+                        approval_sink.lock().unwrap().push(request.tool_name);
+                        Box::pin(async { ToolApprovalDecision::Allow })
+                    })),
+                    ..AgentConfig::default()
+                },
+            );
+            let plan = agent.plan_state.clone();
+            let (output, failed) = agent.execute_tool(
+                eval_host_call("js", r#"
+                    await tool.call("read", {path:"data.txt"});
+                    const blocked = await tool.result("write",{path:"blocked.txt",content:"forbidden"});
+                    if (!blocked.isError) throw new Error("plan gate bypassed");
+                    blocked.content[0].text
+                "#),
+                Arc::new(move |event| {
+                    if matches!(event, AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "read") {
+                        plan.enter_planning();
+                    }
+                }),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(!failed, "{output:?}");
+            assert!(eval_host_text(&output).contains("PLAN_MODE_BLOCKED"));
+            assert!(!root.path().join("blocked.txt").exists());
+            assert_eq!(*approvals.lock().unwrap(), ["eval", "read"]);
+        });
+    }
+
+    #[test]
+    fn eval_host_session_switch_during_approval_prevents_hooks_and_native_execution() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let extension = root.path().join("observe-nested-hook.mjs");
+            std::fs::write(&extension, r#"
+                import { complete } from "@mariozechner/pi-ai";
+                export default function init(pi) {
+                  pi.on("tool_call", async event => {
+                    if (event.toolName === "write") {
+                      await complete({id:"capture-model"},
+                        [{role:"user",content:"a replaced session must not run this hook"}],
+                        {maxTokens:16});
+                    }
+                  });
+                }
+            "#).unwrap();
+            let provider_calls = Arc::new(StdMutex::new(Vec::new()));
+            let agent = Agent::new(
+                Arc::new(PiAiCaptureProvider { calls: Arc::clone(&provider_calls) }),
+                ToolRegistry::new(&["eval", "write"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent, Arc::new(Mutex::new(Session::in_memory())), false,
+                ResolvedCompactionSettings::default(),
+            );
+            session.enable_extensions(&[], root.path(), None, &[extension]).await.unwrap();
+            let scope = session.agent.job_session_scope.clone();
+            session.agent.config.tool_approval = Some(Arc::new(move |request| {
+                if request.tool_name == "write" {
+                    scope.bind(Arc::new(|| Box::pin(async { Some("replacement-session".to_string()) })));
+                }
+                Box::pin(async { ToolApprovalDecision::Allow })
+            }));
+            let (output, failed) = session.agent.execute_tool(
+                eval_host_call("js", "await tool.call('write',{path:'blocked.txt',content:'forbidden'})"),
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(failed && output.is_error, "{output:?}");
+            assert!(eval_host_text(&output).contains("EVAL_SESSION_CHANGED"));
+            assert!(!root.path().join("blocked.txt").exists());
+            assert!(provider_calls.lock().unwrap().is_empty(), "a replacement session must not run the nested tool hook");
+        });
+    }
+
+    #[test]
+    fn eval_host_discoverable_eval_keeps_agent_authority() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let config = crate::config::Config {
+                tools: Some(crate::config::ToolSettings {
+                    load_mode: Some(HashMap::from([("eval".to_string(), "discoverable".to_string())])),
+                }),
+                ..crate::config::Config::default()
+            };
+            let tools = ToolRegistry::new(&["eval", "write"], root.path(), Some(&config));
+            assert!(tools.is_discoverable("eval"));
+            let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig {
+                tool_approval: Some(Arc::new(|request| Box::pin(async move {
+                    if request.tool_name == "write" {
+                        ToolApprovalDecision::deny("nested xdev approval")
+                    } else {
+                        ToolApprovalDecision::Allow
+                    }
+                }))),
+                ..AgentConfig::default()
+            });
+            let (output, failed) = agent.execute_tool(
+                xdev_call("run", Some("eval"), Some(json!({
+                    "kernel":"js",
+                    "code":"(await tool.result('write',{path:'blocked.txt',content:'forbidden'})).content[0].text"
+                }))),
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(!failed && !output.is_error, "{output:?}");
+            assert!(eval_host_text(&output).contains("nested xdev approval"));
+            assert_eq!(output.details.as_ref().unwrap()["dispatchedVia"], "xdev");
+            assert_eq!(output.details.as_ref().unwrap()["toolCalls"]["calls"][0]["status"], "failed");
+            assert!(!root.path().join("blocked.txt").exists());
+        });
+    }
+
+    #[test]
+    fn eval_host_first_lookup_cannot_adopt_a_replacement_session() {
+        use crate::tools::ToolInvocationHost;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::new(&["write"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let original_owner = agent.job_session_scope.session_id().await.unwrap();
+            let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&lookups);
+            agent.job_session_scope.bind(Arc::new(move || {
+                let observed = Arc::clone(&observed);
+                Box::pin(async move {
+                    // The replacement is first observed while resolving the
+                    // host's first bridge call, after cell ownership froze.
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Some("replacement-session".to_string())
+                })
+            }));
+            let host = AgentToolInvocationHost::new(&agent, Arc::new(|_| {
+                panic!("a replaced session must not admit a nested tool")
+            }));
+            let call = ToolCall {
+                id: "first-host-call".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"path":"blocked.txt","content":"forbidden"}),
+                thought_signature: None,
+            };
+            let error = host.call_tool(call.clone(), &original_owner).await.unwrap_err();
+            assert!(error.to_string().contains("EVAL_SESSION_CHANGED"));
+            assert_eq!(lookups.load(Ordering::SeqCst), 1);
+            assert!(!root.path().join("blocked.txt").exists());
+            agent.job_session_scope.bind(Arc::new(move || {
+                let owner = original_owner.clone();
+                Box::pin(async move { Some(owner) })
+            }));
+            let error = host.call_tool(call, "replacement-session").await.unwrap_err();
+            assert!(error.to_string().contains("revoked"), "{error}");
+            assert_eq!(lookups.load(Ordering::SeqCst), 1, "revocation is sticky");
+        });
+    }
+
+    #[test]
+    fn eval_host_nested_tools_pass_through_extension_hooks() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data.txt"), "original data").unwrap();
+            let extension = root.path().join("eval-policy.mjs");
+            std::fs::write(&extension, r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async event => {
+                    if (event.toolName === "write") return {block:true,reason:"nested hook veto"};
+                  });
+                  pi.on("tool_result", async event => {
+                    if (event.toolName === "read") return {
+                      content:[{type:"text",text:"nested hook replacement"}],
+                      details:{source:"nested result hook"}
+                    };
+                  });
+                }
+            "#).unwrap();
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::new(&["eval", "read", "write"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent, Arc::new(Mutex::new(Session::in_memory())), false,
+                ResolvedCompactionSettings::default(),
+            );
+            session.enable_extensions(&[], root.path(), None, &[extension]).await.unwrap();
+            let (output, failed) = session.agent.execute_tool(
+                eval_host_call("js", r#"
+                    const read = await tool.result("read",{path:"data.txt"});
+                    if (read.content[0].text !== "nested hook replacement"
+                        || read.details.source !== "nested result hook") throw new Error("missing result hook");
+                    const write = await tool.result("write",{path:"blocked.txt",content:"forbidden"});
+                    if (!write.isError || !write.content[0].text.includes("nested hook veto")) {
+                      throw new Error("missing call hook");
+                    }
+                    "nested-hooks-ok"
+                "#),
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            ).await;
+            assert!(!failed && !output.is_error, "{output:?}");
+            assert!(eval_host_text(&output).contains("nested-hooks-ok"));
+            assert!(!root.path().join("blocked.txt").exists());
+        });
+    }
+
     // === Tool load modes / xdev dispatcher (bd-cv653.1.6) ===
 
     fn xdev_test_agent(enabled: &[&str], cwd: &Path) -> Agent {

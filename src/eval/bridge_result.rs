@@ -1,7 +1,7 @@
 //! Explicit, bounded native result projection over the ordinary eval bridge.
 //!
 //! `__pi_tool_result` is a protocol operation, never a mounted tool name. Its
-//! inner name still passes the same host whitelist and execution policy.
+//! inner name still passes the same host tool availability and execution policy.
 
 use std::io::{self, Write};
 
@@ -41,7 +41,7 @@ impl Request {
             return Err("EVAL_BRIDGE_INPUT: unknown structured request fields".into());
         }
         // No recursive unwrapping. Even a deliberately nested operation must
-        // be denied by the same concrete tool-name whitelist in the caller.
+        // be denied by the same concrete tool-name policy in the caller.
         Ok(Self { name, args, structured: true })
     }
 }

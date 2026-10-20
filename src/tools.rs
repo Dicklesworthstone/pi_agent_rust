@@ -226,6 +226,23 @@ impl ToolModelScope {
     }
 }
 
+/// Borrowed authority to call tools through the owning Agent's execution path.
+///
+/// Implementations must enforce the live registry, approval, plan, cancellation
+/// and privacy policies. A tool receives this only for the current invocation;
+/// it must never retain it in an interpreter, registry snapshot or background
+/// task. Standalone tools do not acquire this authority implicitly.
+#[async_trait]
+pub trait ToolInvocationHost: Send + Sync {
+    /// `expected_session` is captured by the native caller before admission,
+    /// never supplied by guest code or resolved afresh at the first tool call.
+    async fn call_tool(
+        &self,
+        call: crate::model::ToolCall,
+        expected_session: &str,
+    ) -> Result<ToolOutput>;
+}
+
 /// A tool that can be executed by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -270,6 +287,23 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolOutput> {
         let _ = protect;
         self.execute(tool_call_id, input, on_update).await
+    }
+
+    /// Execute with an invocation-scoped host for policy-checked tool re-entry.
+    /// Ordinary tools keep their existing privacy-aware execution path. Eval
+    /// borrows the host while servicing its kernel's tool requests; the kernel
+    /// receives only serialized results, never a host or credential handle.
+    async fn execute_with_host(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+        host: &dyn ToolInvocationHost,
+    ) -> Result<ToolOutput> {
+        let _ = host;
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, protect)
+            .await
     }
 
     /// Declare the coarse side effects used by the agent scheduler.

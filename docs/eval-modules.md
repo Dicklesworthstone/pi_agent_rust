@@ -16,7 +16,7 @@ await. Type-only imports/exports and type annotations are removed; runtime
 imports remain native ES-module edges. TypeScript enums and other syntax lowered
 by SWC execute in QuickJS. TSX/JSX is deliberately not enabled.
 
-All modules use the same timers, read-only tool bridge, rich displays and console
+All modules use the same timers, invocation-owned tool bridge, rich displays and console
 capture as ordinary cells. Importing a module does not grant new tool
 permissions. For example, `analysis/math.mts` can contain:
 

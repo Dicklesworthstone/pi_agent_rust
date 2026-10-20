@@ -156,11 +156,13 @@ impl EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: Option<&crate::judgment::Protect<'_>>,
+        host: Option<&dyn crate::tools::ToolInvocationHost>,
     ) -> Result<ToolOutput> {
         // Validate before waiting, spawning, or destroying any retained state.
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
-        let mut judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?;
+        let mut judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?
+            .with_host(host);
         let archive_path = super::output::Archive::requested_path(&input)?;
         let cell: Cell = serde_json::from_value(input)
             .map_err(|error| Error::tool("eval", format!("EVAL_INPUT: {error}")))?;
@@ -186,6 +188,7 @@ impl EvalTool {
         // or reset into whichever session happens to be current on admission.
         let requested_session = wait_owned(&owner, None, self.eval_session_id())
             .await.map_err(before_execution_stop)??;
+        judgments.bind_host_session(&requested_session);
         // Waiting is asynchronous and consumes no cell runtime budget. The
         // guard releases on success, error, panic, or future abandonment.
         // No FIFO ordering is promised between simultaneous callers.

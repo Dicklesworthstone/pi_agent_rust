@@ -5776,6 +5776,37 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
     ) -> (ToolOutput, bool) {
+        self.execute_tool_in_session(tool_call, on_event, latency, None)
+            .await
+    }
+
+    async fn check_invocation_session(&self, expected: Option<&str>) -> Result<()> {
+        if let Some(expected) = expected {
+            crate::agent_cx::AgentCx::for_current_or_request().checkpoint()
+                .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+            let current = self.job_session_scope.session_id().await.map_err(|_| {
+                Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: nested tool owner unavailable")
+            })?;
+            if current != expected {
+                return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: nested tool no longer owns the current session"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Both top-level and eval-host calls enter the same policy/hook path.
+    /// Nested calls additionally pin the session across approval and hook
+    /// awaits; a session-switching prompt cannot authorize the replacement.
+    async fn execute_tool_in_session(
+        &self,
+        tool_call: ToolCall,
+        on_event: AgentEventHandler,
+        latency: SharedTurnLatencyAccumulator,
+        expected_session: Option<&str>,
+    ) -> (ToolOutput, bool) {
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         let extensions = self.extensions.clone();
 
         // Inbound secrets restore (bd-cv653.7.9): placeholders in tool-call
@@ -5808,6 +5839,9 @@ impl Agent {
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
 
         let (mut output, is_error) = if let Some(output) = approval_denied_output {
             (output, true)
@@ -5820,13 +5854,16 @@ impl Agent {
             )
             .await;
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+            if let Err(error) = self.check_invocation_session(expected_session).await {
+                return (Self::xdev_text_output(&error.to_string(), true), true);
+            }
 
             if let Some(blocked_output) = hook_outcome {
                 (blocked_output, true)
             } else {
                 let tool_started_at = Instant::now();
                 let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
                     .await;
                 record_local_tool_latency(&latency, tool_started_at.elapsed());
                 outcome
@@ -5834,12 +5871,15 @@ impl Agent {
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
-                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
                 .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
         };
 
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         if let Some(extensions) = &extensions {
             let hook_started_at = Instant::now();
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
@@ -6116,7 +6156,7 @@ impl Agent {
     /// validation produces the named errors); `promote` moves the tool into
     /// the live schema and invalidates the def cache. Returns `None` for
     /// `list`/`describe` (the XdevTool handles those itself).
-    async fn dispatch_xdev(&self, tool_call: &ToolCall) -> Option<ToolOutput> {
+    async fn dispatch_xdev(&self, tool_call: &ToolCall, on_event: AgentEventHandler) -> Option<ToolOutput> {
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
@@ -6149,8 +6189,9 @@ impl Agent {
                     );
                     self.project_auxiliary_inputs(parts, &privacy)
                 };
+                let host = AgentToolInvocationHost::new(self, on_event);
                 let mut output = inner
-                    .execute_with_auxiliary_privacy(&tool_call.id, inner_args, None, &protect)
+                    .execute_with_host(&tool_call.id, inner_args, None, &protect, &host)
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
@@ -6259,7 +6300,11 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        expected_session: Option<&str>,
     ) -> (ToolOutput, bool) {
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set. For
         // xdev run calls the INNER tool's effects decide, not the union.
@@ -6280,7 +6325,7 @@ impl Agent {
         // run/promote actions so the inner tool executes through the normal
         // path (effects/approval already applied to this outer call).
         if tool_call.name == "xdev"
-            && let Some(output) = self.dispatch_xdev(tool_call).await
+            && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
         {
             let is_error = output.is_error;
             return (output, is_error);
@@ -6296,10 +6341,10 @@ impl Agent {
         let tool_name = tool_call.name.clone();
         let tool_id = tool_call.id.clone();
         let tool_args = tool_call.arguments.clone();
-        let on_event = Arc::clone(&on_event);
+        let update_event = Arc::clone(&on_event);
 
         let update_callback = move |update: ToolUpdate| {
-            on_event(AgentEvent::ToolExecutionUpdate {
+            update_event(AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_id.clone(),
                 tool_name: tool_name.clone(),
                 args: tool_args.clone(),
@@ -6329,15 +6374,27 @@ impl Agent {
             );
             self.project_auxiliary_inputs(parts, &privacy)
         };
-        match tool
-            .execute_with_auxiliary_privacy(
+        let host = AgentToolInvocationHost::new(self, on_event);
+        let outcome = if expected_session.is_some() {
+            // Do not recursively hand the host to a tool entered by eval.
+            // In particular, wrapper tools cannot renew this invocation's
+            // delegation budget or recursively acquire the eval kernel lease.
+            tool.execute_with_auxiliary_privacy(
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 Some(Box::new(update_callback)),
                 &protect,
-            )
-            .await
-        {
+            ).await
+        } else {
+            tool.execute_with_host(
+                &tool_call.id,
+                tool_call.arguments.clone(),
+                Some(Box::new(update_callback)),
+                &protect,
+                &host,
+            ).await
+        };
+        match outcome {
             Ok(output) => {
                 let is_error = output.is_error;
                 (output, is_error)
@@ -6509,6 +6566,111 @@ impl Agent {
         on_event(AgentEvent::MessageEnd { message: msg });
 
         tool_result
+    }
+}
+
+/// A borrowed bridge into this Agent, never an interpreter-owned registry.
+/// Native eval admission supplies the original session even for the first
+/// nested call. No host is forwarded to a nested tool invocation.
+struct AgentToolInvocationHost<'a> {
+    agent: &'a Agent,
+    on_event: AgentEventHandler,
+    revoked: AtomicBool,
+}
+
+impl<'a> AgentToolInvocationHost<'a> {
+    fn new(agent: &'a Agent, on_event: AgentEventHandler) -> Self {
+        Self {
+            agent,
+            on_event,
+            revoked: AtomicBool::new(false),
+        }
+    }
+
+    async fn check_session(&self, expected: &str) -> Result<()> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: invocation host was revoked"));
+        }
+        let current = self.agent.job_session_scope.session_id().await.map_err(|_| {
+            self.revoked.store(true, Ordering::Release);
+            Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: invocation host owner unavailable")
+        })?;
+        if current != expected {
+            self.revoked.store(true, Ordering::Release);
+            return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: invocation host cannot follow a session switch"));
+        }
+        Ok(())
+    }
+}
+
+/// Complete the live nested card even when cancellation drops its future.
+/// An interrupted action is indeterminate, never a fabricated successful call.
+struct NestedToolEvent {
+    call: ToolCall,
+    on_event: AgentEventHandler,
+    completed: bool,
+}
+
+impl NestedToolEvent {
+    fn finish(&mut self, output: &ToolOutput) {
+        self.completed = true;
+        (self.on_event)(AgentEvent::ToolExecutionEnd {
+            tool_call_id: self.call.id.clone(),
+            tool_name: self.call.name.clone(),
+            result: output.clone(),
+            is_error: output.is_error,
+        });
+    }
+}
+
+impl Drop for NestedToolEvent {
+    fn drop(&mut self) {
+        if !self.completed {
+            let output = Agent::xdev_text_output(
+                "EVAL_HOST_INTERRUPTED: nested tool did not return; side effects may have occurred",
+                true,
+            );
+            self.finish(&output);
+        }
+    }
+}
+
+#[async_trait]
+impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
+    async fn call_tool(&self, call: ToolCall, expected_session: &str) -> Result<ToolOutput> {
+        // Eval owns an exclusive kernel lease. The dispatcher is unnecessary:
+        // registered discoverable tools can be called by their actual names.
+        // Rejecting all wrappers here also prevents xdev -> xdev -> eval.
+        if matches!(call.name.as_str(), "eval" | "xdev") || call.name.starts_with("__pi_") {
+            return Err(Error::tool("eval", "EVAL_BRIDGE_RECURSION: eval and dispatch wrappers cannot be called from a cell; call the target tool directly"));
+        }
+        if self.agent.tools.snapshot().get(&call.name).is_none() {
+            return Err(Error::tool("eval", "EVAL_BRIDGE_UNAVAILABLE: tool is not enabled in this Agent"));
+        }
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        self.check_session(expected_session).await?;
+        let mut event = NestedToolEvent {
+            call: call.clone(), on_event: Arc::clone(&self.on_event), completed: false,
+        };
+        (self.on_event)(AgentEvent::ToolExecutionStart {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            args: call.arguments.clone(),
+        });
+        // The start callback can switch sessions or cancel the owning turn.
+        self.agent.check_invocation_session(Some(expected_session)).await?;
+        // The outer eval already measures this entire interval. Do not add
+        // nested samples to its accumulator and double-count tool latency.
+        let latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
+        let (mut output, is_error) = self.agent.execute_tool_in_session(
+            call, Arc::clone(&self.on_event), latency, Some(expected_session),
+        ).await;
+        owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        self.check_session(expected_session).await?;
+        output.is_error = is_error;
+        event.finish(&output);
+        Ok(output)
     }
 }
 

@@ -5,7 +5,8 @@
 //! Cells on one tool instance execute exclusively, including SDK callers that
 //! bypass agent scheduling. Explicit reset discards only the selected language.
 //! Timeout/crash state loss is reported; neither language silently substitutes
-//! for the other. Both retain the host's read-only tool bridge policy.
+//! for the other. Agent-owned cells re-enter the owning Agent's live tool
+//! policy; standalone tools retain a read-only local bridge.
 
 use crate::error::{Error, Result};
 #[cfg(test)]
@@ -627,9 +628,14 @@ impl Tool for EvalTool {
          JavaScript can await import('./helper.js') for local .js/.mjs ES modules \
          inside this workspace; imports in %load scripts resolve beside the script. \
          Module state is cached until reset. No package, network or Node imports. \
-         JavaScript await tool.result(name, args) returns native content blocks, \
-         details and isError without flattening images or metadata. It uses the \
-         same read/grep/find/ls bridge as tool.call. For typed model judgments, \
+         In either language await tool.call(name, args) calls an enabled Agent \
+         tool and returns text; await tool.result(name, args) preserves native \
+         content blocks, details and isError. Every nested call uses the current \
+         approval, plan, extension-hook and secrets policies. At most 64 host \
+         calls per cell, all within this cell's deadline; eval and xdev cannot \
+         be called recursively. Call discoverable tools by their actual names. \
+         Standalone embeddings retain only the local read/grep/find/ls bridge. \
+         Native call receipts are included in result details. For typed judgments, \
          set judge_model={provider,model} for this cell, then call \
          __pi_judge through tool.call with {state,questions} and parse its JSON. \
          Questions use bool/choice/score rubrics. For independent states call \
@@ -639,7 +645,7 @@ impl Tool for EvalTool {
          before using its verdict; ordinary item failures retain successful peers. \
          Single judgments and batch items share 16 reserved attempts per cell; \
          batches keep the original cell deadline and do not run in the background. \
-         no model fallback, tool execution, or automatic permission expansion. \
+         No model fallback or tools within a judgment request. \
          Native attempt/usage receipts are included in result details."
     }
 
@@ -702,7 +708,7 @@ impl Tool for EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, None).await
+        self.execute_with_mode(input, on_update, None, None).await
     }
 
     async fn execute_with_auxiliary_privacy(
@@ -712,7 +718,18 @@ impl Tool for EvalTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, Some(protect)).await
+        self.execute_with_mode(input, on_update, Some(protect), None).await
+    }
+
+    async fn execute_with_host(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+        host: &dyn crate::tools::ToolInvocationHost,
+    ) -> Result<ToolOutput> {
+        self.execute_with_mode(input, on_update, Some(protect), Some(host)).await
     }
 
     fn effects(&self) -> ToolEffects {

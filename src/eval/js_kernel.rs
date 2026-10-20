@@ -12,7 +12,7 @@
 //!
 //! The tool re-entry bridge mirrors the Python design: `tool.read(...)` etc.
 //! block the kernel thread on a channel round-trip that the host resolves
-//! through the same whitelisted tool implementations. `tool.call` is awaitable;
+//! through the invocation's host policy. `tool.call` is awaitable;
 //! timers and promise replies advance while the cell awaits its result.
 
 use serde_json::{Value, json};

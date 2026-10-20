@@ -52,9 +52,10 @@ impl EvalTool {
         input: Value,
         on_update: Option<Update>,
         protect: Option<&crate::judgment::Protect<'_>>,
+        host: Option<&dyn crate::tools::ToolInvocationHost>,
     ) -> Result<ToolOutput> {
         if KernelMode::parse(&input)? == KernelMode::Session {
-            return self.execute_cell(input, on_update, protect).await;
+            return self.execute_cell(input, on_update, protect, host).await;
         }
         let owner = AgentCx::for_current_or_request();
         let private = self.isolated_executor();
@@ -64,7 +65,7 @@ impl EvalTool {
                 callback(update);
             }) as Update
         });
-        let outcome = private.execute_cell(input, on_update, protect).await;
+        let outcome = private.execute_cell(input, on_update, protect, host).await;
         // Retire even a successful or ordinary-error kernel before handing
         // out the result. Abandonment drops the private executor and checked-
         // out runner too; neither has access to the parent's kernel slots.
