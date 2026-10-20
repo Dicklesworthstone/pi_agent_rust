@@ -27,8 +27,20 @@ aliases do not add backend sniffing or multiple cells. Agent-owned eval now
 supports [policy-checked tool orchestration](eval-structured-results.md#agent-scoped-tool-orchestration)
 through `tool.call` and `tool.result`, plus the explicit typed-judgment bridge.
 The [retained `agent()` and `wait()` helpers](eval-structured-results.md#retained-background-agent-jobs)
-launch and manage native background subagent jobs across cells. Warm agents
-with follow-up `send()` and OMP's keepalive `workpool()` remain separate work.
+launch and manage native background subagent jobs across cells. Set
+`keepAlive: true` / `keep_alive=True` for a [reusable agent](eval-structured-results.md#reusable-agents-and-queued-turns)
+with queued `send()` follow-ups in the same live child conversation.
+[Reusable `workpool()` helpers](eval-structured-results.md#reusable-workpools)
+distribute up to 32 items across 1–8 native workers, retain per-turn handles,
+and support inspection and explicit cleanup across cells.
+
+Pi's default `agent()` remains one-shot; warm reuse is explicit. The bounded
+pool uses idle/admitted-item scheduling and explicit result collection.
+OMP's context-load scheduling, keyed yield batches, aggregate pool completion
+delivery and automatic close after draining remain separate work. Pi's
+`pool.close()` cancels running and queued work; worker lifetimes remain fixed
+from their launch. See the linked contracts for supported isolation, schemas,
+partial admission and cleanup behavior.
 
 ## JavaScript images
 

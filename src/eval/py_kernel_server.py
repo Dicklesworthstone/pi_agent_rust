@@ -933,6 +933,8 @@ async def _agent_read_job(job_id, action, timeout_ms=None):
 
 
 async def _agent_wait_one(job, timeout_ms, raise_errors):
+    if type(job) is _AgentTurn:
+        return await _agent_wait_turn(job, timeout_ms, raise_errors)
     snapshot = await _agent_read_job(job.id, "wait", timeout_ms)
     if snapshot["status"] == "running":
         raise TimeoutError("EVAL_AGENT_TIMEOUT: job is still running; it remains available through jobs")
@@ -977,6 +979,180 @@ class _AgentJob:
         return self.wait().__await__()
 
 
+def _agent_worker_snapshot(snapshot, worker_id=None, turn_id=None):
+    if (type(snapshot) is not dict or snapshot.get("schema") != "pi.subagent.worker.v1"
+            or type(snapshot.get("workerId")) is not str or not snapshot["workerId"]
+            or (worker_id is not None and snapshot["workerId"] != worker_id)
+            or type(snapshot.get("jobId")) is not str or not snapshot["jobId"]
+            or type(snapshot.get("agent")) is not str or not snapshot["agent"]
+            or snapshot.get("status") not in ("starting", "running", "idle", "closed", "failed")
+            or type(snapshot.get("turnId")) is not int or not 1 <= snapshot["turnId"] <= 32
+            or (turn_id is not None and snapshot["turnId"] != turn_id)):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid native worker snapshot")
+    turn = snapshot.get("turn")
+    if (type(turn) is not dict or type(turn.get("id")) is not int
+            or turn["id"] != snapshot["turnId"] or "result" not in turn
+            or turn.get("status") not in ("queued", "running", "completed", "failed", "cancelled")):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid native worker snapshot")
+    result = turn["result"]
+    if result is None and turn["status"] not in ("queued", "running"):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: settled worker turn has no native result")
+    if result is not None and (type(result) is not dict or type(result.get("content")) is not list
+                              or "details" not in result or type(result.get("isError", False)) is not bool):
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid native worker result")
+    return snapshot
+
+
+async def _agent_read_worker(turn, operation, timeout_ms=None):
+    arguments = {"operation": operation, "workerId": turn.worker_id}
+    if operation != "worker_close":
+        arguments["turnId"] = turn.turn_id
+    if timeout_ms is not None:
+        arguments["timeoutMs"] = timeout_ms
+    snapshot = _agent_worker_snapshot(await _agent_native_result("subagent", arguments),
+                                     turn.worker_id, None if operation == "worker_close" else turn.turn_id)
+    if snapshot["jobId"] != turn.job_id or snapshot["agent"] != turn.agent:
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: native worker identity changed")
+    return snapshot
+
+
+def _agent_turn_done(turn):
+    return turn["status"] not in ("queued", "running")
+
+
+async def _agent_wait_turn(turn, timeout_ms, raise_errors):
+    snapshot = await _agent_read_worker(turn, "worker_wait", timeout_ms)
+    if not _agent_turn_done(snapshot["turn"]):
+        raise TimeoutError("EVAL_AGENT_TIMEOUT: worker turn is still pending; the worker remains available")
+    result = snapshot["turn"]["result"]
+    if result is None:
+        raise ToolBridgeError("EVAL_AGENT_PROTOCOL: settled worker turn has no native result")
+    if raise_errors and (snapshot["turn"]["status"] != "completed" or result.get("isError", False)):
+        raise ToolBridgeError(_agent_result_text(result) or f"Agent turn {snapshot['turn']['status']}")
+    return result
+
+
+class _AgentTurn:
+    """A fixed turn in a native worker. Cancellation closes its whole worker."""
+
+    __slots__ = ("_worker_id", "_turn_id", "_job_id", "_agent")
+
+    def __init__(self, worker, turn_id):
+        self._worker_id = worker.id
+        self._turn_id = turn_id
+        self._job_id = worker.job_id
+        self._agent = worker.agent
+
+    @property
+    def id(self):
+        return self._turn_id
+
+    @property
+    def turn_id(self):
+        return self._turn_id
+
+    @property
+    def worker_id(self):
+        return self._worker_id
+
+    @property
+    def job_id(self):
+        return self._job_id
+
+    @property
+    def agent(self):
+        return self._agent
+
+    async def status(self):
+        return await _agent_read_worker(self, "worker_status")
+
+    async def done(self):
+        return _agent_turn_done((await self.status())["turn"])
+
+    async def output(self):
+        return (await self.status())["turn"]["result"]
+
+    async def wait(self, timeout=30):
+        return await _agent_wait_turn(self, _agent_wait_ms(timeout), True)
+
+    async def close(self):
+        return await _agent_read_worker(self, "worker_close")
+
+    async def cancel(self):
+        return await self.close()
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
+class _AgentWorker:
+    """A retained native child session; send returns a separately waitable turn."""
+
+    __slots__ = ("_id", "_job_id", "_agent", "_turn_id")
+
+    def __init__(self, snapshot):
+        self._id = snapshot["workerId"]
+        self._job_id = snapshot["jobId"]
+        self._agent = snapshot["agent"]
+        self._turn_id = snapshot["turnId"]
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def worker_id(self):
+        return self._id
+
+    @property
+    def job_id(self):
+        return self._job_id
+
+    @property
+    def agent(self):
+        return self._agent
+
+    @property
+    def turn_id(self):
+        return self._turn_id
+
+    async def send(self, prompt):
+        if type(prompt) is not str or not prompt.strip():
+            raise TypeError("EVAL_AGENT_INPUT: send requires a nonempty prompt")
+        previous = self._turn_id
+        snapshot = _agent_worker_snapshot(await _agent_native_result("subagent", {
+            "operation": "worker_send", "workerId": self.id, "task": prompt,
+        }), self.id)
+        if (snapshot["jobId"] != self.job_id or snapshot["agent"] != self.agent
+                or snapshot["turnId"] <= previous):
+            raise ToolBridgeError("EVAL_AGENT_PROTOCOL: invalid worker send acknowledgment")
+        # Responses to concurrent sends may arrive out of order. Keep the
+        # newest native selection without changing earlier fixed turn handles.
+        self._turn_id = max(self._turn_id, snapshot["turnId"])
+        return _AgentTurn(self, snapshot["turnId"])
+
+    async def status(self):
+        return await _AgentTurn(self, self._turn_id).status()
+
+    async def done(self):
+        return await _AgentTurn(self, self._turn_id).done()
+
+    async def output(self):
+        return await _AgentTurn(self, self._turn_id).output()
+
+    async def wait(self, timeout=30):
+        return await _AgentTurn(self, self._turn_id).wait(timeout)
+
+    async def close(self):
+        return await _AgentTurn(self, self._turn_id).close()
+
+    async def cancel(self):
+        return await self.close()
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
 async def _agent(prompt, **options):
     if type(prompt) is not str or not prompt.strip():
         raise TypeError("EVAL_AGENT_INPUT: agent requires a nonempty prompt")
@@ -987,6 +1163,10 @@ async def _agent(prompt, **options):
     }
     arguments = {"agent": "task"}
     for name, value in options.items():
+        if name == "keep_alive":
+            if type(value) is not bool:
+                raise TypeError("EVAL_AGENT_INPUT: keep_alive must be boolean")
+            continue
         if name not in fields:
             raise TypeError(f"EVAL_AGENT_INPUT: unknown option {name}")
         arguments[fields[name]] = value
@@ -994,6 +1174,15 @@ async def _agent(prompt, **options):
         raise TypeError("EVAL_AGENT_INPUT: agent must be a nonempty name")
     # No caller-controlled field can replace the operation or select foreground.
     arguments["task"] = prompt
+    if options.get("keep_alive", False):
+        if (("isolation" in arguments and arguments["isolation"] != "none")
+                or any(field in arguments for field in ("isoApply", "outputSchema", "schemaMode"))):
+            raise TypeError("EVAL_AGENT_INPUT: warm workers require isolation none and do not accept schema or iso_apply options")
+        arguments["operation"] = "worker_start"
+        started = _agent_worker_snapshot(await _agent_native_result("subagent", arguments), turn_id=1)
+        if started["agent"] != arguments["agent"]:
+            raise ToolBridgeError("EVAL_AGENT_PROTOCOL: native worker agent changed")
+        return _AgentWorker(started)
     arguments["async"] = True
     started = await _agent_native_result("subagent", arguments)
     if (type(started) is not dict or started.get("schema") != "pi.subagent.background.v1"
@@ -1007,19 +1196,230 @@ _AGENT_CLOCK = time.monotonic
 
 async def _agent_wait(handles, timeout=30, raise_errors=True):
     if (type(handles) not in (list, tuple) or len(handles) > 32
-            or any(type(handle) is not _AgentJob for handle in handles)
+            or any(type(handle) not in (_AgentJob, _AgentWorker, _AgentTurn) for handle in handles)
             or type(raise_errors) is not bool):
         raise TypeError("EVAL_AGENT_INPUT: wait requires up to 32 agent handles and boolean raise_errors")
     deadline = _AGENT_CLOCK() + _agent_wait_ms(timeout) / 1000
+    # Freeze each worker's current turn before the first await so concurrent
+    # sends cannot retarget a mixed wait already in progress.
+    selected = [_AgentTurn(handle, handle.turn_id) if type(handle) is _AgentWorker else handle
+                for handle in handles]
     results = []
-    for handle in handles:
+    for handle in selected:
         remaining = max(0, int((deadline - _AGENT_CLOCK()) * 1000))
         results.append(await _agent_wait_one(handle, remaining, raise_errors))
     return results
 
 
+def _pool_bounded_text(value, maximum):
+    if type(value) is not str or not value.strip() or "\0" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= maximum
+    except UnicodeError:
+        return False
+
+
+class _AgentPool:
+    """Bounded native FIFO turns on reusable workers; close cancels all work."""
+
+    __slots__ = ("_options", "_name", "_concurrency", "_workers", "_items", "_closed", "_last_error",
+                 "_unknown_admission", "_start_pending", "_lock")
+
+    def __init__(self, options, name, concurrency):
+        self._options = options
+        self._name = name
+        self._concurrency = concurrency
+        self._workers = []
+        self._items = []
+        self._closed = False
+        self._unknown_admission = False
+        self._start_pending = False
+        self._last_error = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def concurrency(self):
+        return self._concurrency
+
+    @property
+    def closed(self):
+        return self._closed
+
+    @property
+    def items(self):
+        return tuple(self._items)
+
+    async def push(self, tasks):
+        if type(tasks) not in (list, tuple) or len(tasks) > 32:
+            raise TypeError("EVAL_POOL_INPUT: push requires a list or tuple of up to 32 task strings")
+        batch = tuple(tasks)
+        if any(not _pool_bounded_text(task, 65536) for task in batch):
+            raise TypeError("EVAL_POOL_INPUT: every task must be nonempty UTF-8 text of at most 65536 bytes without NUL")
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            if self._closed:
+                raise ToolBridgeError("EVAL_POOL_CLOSED: pool admission is closed; inspect items or close existing workers")
+            if len(self._items) + len(batch) > 32:
+                raise ValueError("EVAL_POOL_CAPACITY: at most 32 items may be admitted per pool")
+            if not batch:
+                return []
+            admitted = []
+            try:
+                # At most eight status requests per push, followed by one
+                # acknowledgment per item. No background guest tasks survive.
+                for entry in self._workers:
+                    entry["status"] = (await entry["worker"].status())["status"]
+                for task in batch:
+                    idle = [entry for entry in self._workers if entry["status"] == "idle"]
+                    chosen = min(idle, key=lambda entry: entry["admitted"]) if idle else None
+                    if chosen is None and len(self._workers) < self._concurrency:
+                        self._start_pending = True
+                        worker = await _agent(task, **self._options)
+                        chosen = {"worker": worker, "admitted": 0, "status": "running", "closeAcknowledged": False}
+                        self._workers.append(chosen)
+                        self._start_pending = False
+                        handle = _AgentTurn(worker, worker.turn_id)
+                    else:
+                        if chosen is None:
+                            live = [entry for entry in self._workers if entry["status"] in ("running", "starting")]
+                            chosen = min(live, key=lambda entry: entry["admitted"]) if live else None
+                        if chosen is None:
+                            raise ToolBridgeError("EVAL_POOL_UNAVAILABLE: no live worker remains; create a new pool")
+                        handle = await chosen["worker"].send(task)
+                    chosen["admitted"] += 1
+                    chosen["status"] = "running"
+                    self._items.append(handle)
+                    admitted.append(handle)
+                self._last_error = None
+                return admitted
+            except BaseException as cause:
+                # Cancellation or a lost acknowledgment may follow a native
+                # admission. Keep acknowledged handles and never retry it.
+                self._closed = True
+                self._unknown_admission |= self._start_pending
+                self._start_pending = False
+                self._last_error = str(cause) or type(cause).__name__
+                if not isinstance(cause, Exception):
+                    raise
+                error = ToolBridgeError(
+                    f"EVAL_POOL_ADMISSION: acknowledged {len(admitted)} of {len(batch)} items; admission closed. "
+                    f"Handles remain in pool.items and peek(). {self._last_error}"
+                )
+                error.admitted = tuple(admitted)
+                error.requested = len(batch)
+                raise error from cause
+
+    async def _peek_locked(self):
+        items = []
+        for index, handle in enumerate(self._items):
+            identity = {"index": index, "workerId": handle.worker_id,
+                        "jobId": handle.job_id, "turnId": handle.turn_id}
+            try:
+                snapshot = await handle.status()
+                items.append({**identity, "status": snapshot["turn"]["status"],
+                              "result": snapshot["turn"]["result"], "workerStatus": snapshot["status"]})
+            except Exception as error:
+                items.append({**identity, "status": "unavailable", "result": None, "error": str(error)})
+        return {"schema": "pi.eval.workpool.v1", "name": self._name, "closed": self._closed,
+                "unknownAdmission": self._unknown_admission,
+                "concurrency": self._concurrency, "workerCount": len(self._workers),
+                "items": items, "lastError": self._last_error}
+
+    async def peek(self):
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            return await self._peek_locked()
+
+    async def status(self):
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            snapshot = await self._peek_locked()
+            counts = {status: 0 for status in ("queued", "running", "completed", "failed", "cancelled", "unavailable")}
+            for item in snapshot["items"]:
+                counts[item["status"]] += 1
+            return {"schema": snapshot["schema"], "name": self._name, "closed": self._closed,
+                    "unknownAdmission": self._unknown_admission,
+                    "concurrency": self._concurrency, "workerCount": len(self._workers),
+                    "total": len(snapshot["items"]), "counts": counts, "lastError": self._last_error}
+
+    async def close(self):
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            self._closed = True
+            workers = []
+            for entry in self._workers:
+                if not entry["closeAcknowledged"]:
+                    try:
+                        snapshot = await entry["worker"].close()
+                        entry["status"] = snapshot["status"]
+                        entry["closeAcknowledged"] = snapshot["status"] in ("closed", "failed")
+                        entry["closeError"] = (None if entry["closeAcknowledged"]
+                                               else "EVAL_POOL_CLOSE: worker did not acknowledge termination")
+                    except Exception as error:
+                        entry["closeError"] = str(error)
+                workers.append({"workerId": entry["worker"].id, "jobId": entry["worker"].job_id,
+                                "closed": entry["closeAcknowledged"], "error": entry.get("closeError")})
+            all_known_closed = all(worker["closed"] for worker in workers)
+            return {"schema": "pi.eval.workpool.close.v1", "name": self._name, "closed": True,
+                    "allClosed": all_known_closed and not self._unknown_admission,
+                    "allKnownClosed": all_known_closed, "unknownAdmission": self._unknown_admission,
+                    "workers": workers}
+
+
+async def _workpool(**options):
+    native = {"agent": "task", "keep_alive": True}
+    name = "workpool"
+    concurrency = 4
+    for key, value in options.items():
+        if key == "name":
+            if not _pool_bounded_text(value, 128):
+                raise TypeError("EVAL_POOL_INPUT: name must be nonempty text of at most 128 UTF-8 bytes without NUL")
+            name = value
+        elif key == "concurrency":
+            if type(value) is not int or not 1 <= value <= 8:
+                raise ValueError("EVAL_POOL_INPUT: concurrency must be an integer from 1 to 8")
+            concurrency = value
+        elif key == "agent":
+            if not _pool_bounded_text(value, 128):
+                raise TypeError("EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL")
+            native[key] = value
+        elif key == "cwd":
+            if type(value) is not str or not value or "\0" in value:
+                raise TypeError("EVAL_POOL_INPUT: cwd must be a nonempty path without NUL")
+            native[key] = value
+        elif key == "scope":
+            if value not in ("user", "project", "both"):
+                raise TypeError("EVAL_POOL_INPUT: scope must be user, project or both")
+            native[key] = value
+        elif key == "isolation":
+            if value != "none":
+                raise TypeError("EVAL_POOL_INPUT: workpool requires isolation none")
+            native[key] = value
+        elif key == "timeout_seconds":
+            if type(value) is not int or not 1 <= value <= 86400:
+                raise ValueError("EVAL_POOL_INPUT: timeout_seconds must be an integer from 1 to 86400")
+            native[key] = value
+        else:
+            raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
+    return _AgentPool(native, name, concurrency)
+
+
 NAMESPACE["agent"] = _agent
 NAMESPACE["wait"] = _agent_wait
+NAMESPACE["workpool"] = _workpool
 
 
 def _script_stamp(metadata):

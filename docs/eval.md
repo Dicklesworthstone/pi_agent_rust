@@ -185,9 +185,13 @@ Standalone eval permits `read`, `grep`, `find`, and `ls`. Agent-owned cells can
 call that Agent's enabled native, extension and MCP tools through the normal
 plan, approval and privacy policy. `tool.result` preserves structured output;
 the [agent job helpers](eval-structured-results.md#retained-background-agent-jobs)
-launch native background subagents and retain handles across cells. Bridge
-exchanges are serialized even when wrapped in `asyncio.gather`; admitted
-background jobs run independently. Host errors are raised back into the cell.
+launch native background subagents and retain handles across cells.
+`agent(..., keep_alive=True)` retains one child conversation for queued
+`send()` follow-ups; [reusable workpools](eval-structured-results.md#reusable-workpools)
+distribute prompts across bounded native workers. Await each pool command and
+close workers when finished. Bridge exchanges are serialized even when
+wrapped in `asyncio.gather`; admitted background jobs and worker queues run
+independently. Host errors are raised back into the cell.
 The eval tool itself executes arbitrary code and is not a sandbox.
 
 ## Reusable Python scripts with `%load`
@@ -304,6 +308,10 @@ reject an `Error` that can be caught with `try`/`catch` or `.catch()`.
 `Promise.all` can compose calls, but the asynchronous bridge dispatches them
 one at a time. Native background subagents keep running after launch returns;
 see [retained agent jobs](eval-structured-results.md#retained-background-agent-jobs).
+`agent(prompt, {keepAlive: true})` keeps a child conversation available for
+`send()` follow-ups. [Reusable workpools](eval-structured-results.md#reusable-workpools)
+queue prompts on bounded native workers; retain their handles on `globalThis`,
+await each pool command, and close the workers when finished.
 `tool.read(path)` and the other positional synchronous helpers keep their
 existing return types.
 

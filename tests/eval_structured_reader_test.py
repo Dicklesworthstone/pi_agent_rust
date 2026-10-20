@@ -26,6 +26,59 @@ def envelope(details=None, *, failed=False):
             "details": details, "isError": failed}
 
 
+def worker_snapshot(worker_id="worker-native", turn_id=1, status="running", result=None):
+    return {
+        "schema": "pi.subagent.worker.v1", "workerId": worker_id,
+        "jobId": f"carrier-{worker_id}", "agent": "scout",
+        "status": "idle" if status == "completed" else "closed" if status == "cancelled" else "running",
+        "turnId": turn_id, "turn": {"id": turn_id, "status": status, "result": result},
+    }
+
+
+def turn_result(turn_id):
+    return {"content": [{"type": "text", "text": f"turn {turn_id}"}], "details": {"turn": turn_id}}
+
+
+class PoolHost:
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.workers = {}
+        self.operations = []
+
+    def __call__(self, frame):
+        request = frame["bridge"]["input"]
+        if request["name"] != "subagent":
+            raise AssertionError("pool must use native subagent operations")
+        args = request["args"]
+        operation = args["operation"]
+        self.operations.append(operation)
+        if operation == "worker_start":
+            worker_id = f"pool-worker-{len(self.workers) + 1}"
+            worker = {"id": worker_id, "agent": args["agent"], "status": "running", "latest": 1,
+                      "turns": {1: {"task": args["task"], "status": "running", "result": None}}}
+            self.workers[worker_id] = worker
+        else:
+            worker = self.workers[args["workerId"]]
+            if operation == "worker_send":
+                worker["latest"] += 1
+                worker["status"] = "running"
+                worker["turns"][worker["latest"]] = {"task": args["task"], "status": "queued", "result": None}
+            elif operation == "worker_close":
+                worker["status"] = "closed"
+                for turn in worker["turns"].values():
+                    if turn["result"] is None:
+                        turn["status"] = "cancelled"
+                        turn["result"] = {"content": [], "details": {"cancelled": True}, "isError": True}
+            elif operation not in ("worker_status", "worker_wait"):
+                raise AssertionError(f"unexpected operation {operation}")
+        turn_id = args.get("turnId", worker["latest"])
+        turn = worker["turns"][turn_id]
+        snapshot = {"schema": "pi.subagent.worker.v1", "workerId": worker["id"],
+                    "jobId": f"carrier-{worker['id']}", "agent": worker["agent"], "status": worker["status"],
+                    "turnId": turn_id, "turn": {"id": turn_id, "status": turn["status"], "result": turn["result"]}}
+        self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+
+
 class Kernel:
     def __init__(self):
         self.directory = tempfile.TemporaryDirectory(prefix="pi-structured-protocol-")
@@ -191,7 +244,7 @@ class StructuredReaderTests(unittest.TestCase):
         self.assertIn("PI_JOBS_UNKNOWN_ID", response["error"])
 
     def test_agent_options_cannot_override_operation_or_select_foreground(self):
-        for option in ("op", "async", "task", "model"):
+        for option in ("op", "operation", "async", "task", "model"):
             with self.subTest(option=option):
                 response = self.kernel.cell(f"await agent('inspect', **{{{option!r}: 'override'}})")
                 self.assertFalse(response["ok"])
@@ -221,6 +274,303 @@ class StructuredReaderTests(unittest.TestCase):
         self.assertEqual([result["details"]["id"] for result in results], ["job-second", "job-first"])
         self.assertTrue(results[0]["isError"])
         self.assertFalse(results[1]["isError"])
+
+    def launch_worker(self):
+        response = self.kernel.cell(
+            "worker = await agent('inspect the code', agent='scout', keep_alive=True, isolation='none'); worker.id",
+            self.reply_with(envelope(worker_snapshot())),
+        )
+        self.assertEqual(self.value(response), "worker-native")
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "name": "subagent", "args": {"agent": "scout", "isolation": "none",
+                "task": "inspect the code", "operation": "worker_start"},
+        })
+
+    def test_warm_worker_reuses_identity_across_cells_and_turns_keep_their_selection(self):
+        self.launch_worker()
+        response = self.kernel.cell("second = await worker.send('follow up'); (worker.turn_id, second.turn_id)",
+                                    self.reply_with(envelope(worker_snapshot(turn_id=2, status="queued"))))
+        self.assertEqual(self.value(response), (2, 2))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "name": "subagent", "args": {"operation": "worker_send", "workerId": "worker-native", "task": "follow up"},
+        })
+        response = self.kernel.cell("third = await worker.send('another'); worker.turn_id",
+                                    self.reply_with(envelope(worker_snapshot(turn_id=3, status="queued"))))
+        self.assertEqual(self.value(response), 3)
+        for expression, turn_id in (("await second", 2), ("await worker", 3)):
+            response = self.kernel.cell(expression, self.reply_with(envelope(
+                worker_snapshot(turn_id=turn_id, status="completed", result=turn_result(turn_id)))))
+            self.assertEqual(self.value(response)["details"]["turn"], turn_id)
+            self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                "name": "subagent", "args": {"operation": "worker_wait", "workerId": "worker-native",
+                    "turnId": turn_id, "timeoutMs": 30000},
+            })
+
+    def test_mixed_wait_accepts_jobs_workers_and_pinned_turns_with_one_deadline(self):
+        self.launch_agent("job", "job-once")
+        self.launch_worker()
+        response = self.kernel.cell("second = await worker.send('second'); second.turn_id",
+                                    self.reply_with(envelope(worker_snapshot(turn_id=2, status="queued"))))
+        self.assertEqual(self.value(response), 2)
+        response = self.kernel.cell("third = await worker.send('third'); worker.turn_id",
+                                    self.reply_with(envelope(worker_snapshot(turn_id=3, status="queued"))))
+        self.assertEqual(self.value(response), 3)
+        requests = []
+        def bridge(frame):
+            request = frame["bridge"]["input"]
+            requests.append(request)
+            self.assertGreaterEqual(request["args"]["timeoutMs"], 0)
+            self.assertLessEqual(request["args"]["timeoutMs"], 10000)
+            if request["name"] == "jobs":
+                snapshot = {"schema": "pi.host_job.v1", "id": "job-once", "status": "exited",
+                            "result": turn_result(0)}
+            else:
+                turn_id = request["args"]["turnId"]
+                native = {**turn_result(turn_id), "isError": turn_id == 2}
+                snapshot = worker_snapshot(turn_id=turn_id,
+                                           status="failed" if turn_id == 2 else "completed", result=native)
+            self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+        response = self.kernel.cell("await wait([job, second, worker], timeout=10, raise_errors=False)", bridge)
+        results = self.value(response)
+        self.assertEqual([item["details"]["turn"] for item in results], [0, 2, 3])
+        self.assertTrue(results[1]["isError"])
+        self.assertEqual([request["name"] for request in requests], ["jobs", "subagent", "subagent"])
+        self.assertGreaterEqual(requests[0]["args"]["timeoutMs"], requests[-1]["args"]["timeoutMs"])
+
+    def test_wait_freezes_worker_selection_before_a_concurrent_send(self):
+        self.launch_agent("job", "job-once")
+        self.launch_worker()
+        selected_turns = []
+        def bridge(frame):
+            request = frame["bridge"]["input"]
+            if request["name"] == "jobs":
+                snapshot = {"schema": "pi.host_job.v1", "id": "job-once", "status": "exited",
+                            "result": turn_result(0)}
+            elif request["args"]["operation"] == "worker_send":
+                snapshot = worker_snapshot(turn_id=2, status="queued")
+            else:
+                selected_turns.append(request["args"]["turnId"])
+                snapshot = worker_snapshot(status="completed", result=turn_result(1))
+            self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+        response = self.kernel.cell("""
+import asyncio
+waiting = asyncio.create_task(wait([job, worker], timeout=10))
+await asyncio.sleep(0)
+sent = asyncio.create_task(worker.send('new turn'))
+values = await waiting
+await sent
+([item['details']['turn'] for item in values], worker.turn_id)
+""", bridge)
+        self.assertEqual(self.value(response), ([0, 1], 2))
+        self.assertEqual(selected_turns, [1])
+
+    def test_worker_timeout_leaves_work_running_and_turn_cancel_closes_whole_worker(self):
+        self.launch_worker()
+        response = self.kernel.cell("await worker.wait(0)", self.reply_with(envelope(worker_snapshot())))
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_AGENT_TIMEOUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 2)
+        response = self.kernel.cell("turn = await worker.send('queued'); turn.turn_id",
+                                    self.reply_with(envelope(worker_snapshot(turn_id=2, status="queued"))))
+        self.assertEqual(self.value(response), 2)
+        cancelled = {"content": [{"type": "text", "text": "cancelled"}], "details": None, "isError": True}
+        for expression in ("await turn.cancel()", "await worker.close()"):
+            response = self.kernel.cell(expression, self.reply_with(envelope(
+                worker_snapshot(turn_id=2, status="cancelled", result=cancelled))))
+            self.assertEqual(self.value(response)["status"], "closed")
+            self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                "name": "subagent", "args": {"operation": "worker_close", "workerId": "worker-native"},
+            })
+
+    def test_warm_options_and_empty_sends_fail_before_dispatch(self):
+        for options in ({"keep_alive": 1}, {"keep_alive": "true"}, {"keep_alive": None},
+                        {"keep_alive": True, "isolation": "worktree"},
+                        {"keep_alive": True, "iso_apply": False},
+                        {"keep_alive": True, "output_schema": {}},
+                        {"keep_alive": True, "schema_mode": "strict"},
+                        {"keep_alive": True, "op": "worker_close"},
+                        {"keep_alive": True, "worker_id": "foreign"}):
+            with self.subTest(options=options):
+                response = self.kernel.cell(f"await agent('inspect', **{options!r})")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_AGENT_INPUT", response["error"])
+                self.assertEqual(self.kernel.calls, [])
+        self.launch_worker()
+        for value in ("", "  ", 4, None):
+            response = self.kernel.cell(f"await worker.send({value!r})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_AGENT_INPUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 1)
+
+    def test_worker_protocol_rejects_identity_or_turn_substitution_and_missing_results(self):
+        self.launch_worker()
+        invalid = [worker_snapshot("other"), worker_snapshot(turn_id=2),
+                   {**worker_snapshot(), "jobId": "different"},
+                   {**worker_snapshot(), "agent": "different"},
+                   {**worker_snapshot(), "turn": {"id": 1, "status": "unknown", "result": None}},
+                   worker_snapshot(status="completed"),
+                   {**worker_snapshot(), "turnId": True}]
+        for snapshot in invalid:
+            response = self.kernel.cell("await worker.wait(0)", self.reply_with(envelope(snapshot)))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_AGENT_PROTOCOL", response["error"])
+        response = self.kernel.cell("await worker.status()",
+                                    lambda frame: self.kernel.reply(frame, error="PI_WORKER_OWNER_CHANGED"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_WORKER_OWNER_CHANGED", response["error"])
+
+    def create_pool(self, concurrency=2):
+        response = self.kernel.cell(f"pool = await workpool(agent='scout', concurrency={concurrency}); pool.concurrency")
+        self.assertEqual(self.value(response), concurrency)
+
+    def test_pool_lazily_starts_workers_reuses_fifo_turns_and_retains_items_across_cells(self):
+        self.create_pool()
+        self.assertEqual(self.kernel.calls, [])
+        native = PoolHost(self.kernel)
+        response = self.kernel.cell(
+            "items = await pool.push(['a','b','c','d','e']); [(item.worker_id, item.turn_id) for item in items]", native)
+        self.assertEqual(self.value(response), [
+            ("pool-worker-1", 1), ("pool-worker-2", 1), ("pool-worker-1", 2),
+            ("pool-worker-2", 2), ("pool-worker-1", 3),
+        ])
+        self.assertEqual(native.operations, ["worker_start", "worker_start", "worker_send", "worker_send", "worker_send"])
+        idle = native.workers["pool-worker-1"]
+        idle["status"] = "idle"
+        for turn_id, turn in idle["turns"].items():
+            turn.update(status="completed", result=turn_result(turn_id))
+        response = self.kernel.cell("more = await pool.push(['f']); more[0].worker_id", native)
+        self.assertEqual(self.value(response), "pool-worker-1")
+        self.assertEqual(len(native.workers), 2)
+        self.assertEqual(native.operations[-3:], ["worker_status", "worker_status", "worker_send"])
+        snapshot = self.value(self.kernel.cell("await pool.peek()", native))
+        self.assertEqual(len(snapshot["items"]), 6)
+        self.assertEqual(snapshot["items"][0]["result"]["details"]["turn"], 1)
+        self.assertEqual(snapshot["items"][-1]["turnId"], 4)
+        status = self.value(self.kernel.cell("await pool.status()", native))
+        self.assertEqual(status["total"], 6)
+        self.assertEqual(status["counts"]["completed"], 3)
+        self.assertEqual(status["workerCount"], 2)
+
+    def test_pool_validates_whole_batch_and_enforces_total_capacity_before_dispatch(self):
+        self.create_pool()
+        for tasks in (["valid", ""], ["valid", None], ["valid", "x\0y"],
+                      ["valid", "é" * 32769], ["valid", "\ud800"]):
+            response = self.kernel.cell(f"await pool.push({tasks!r})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+            self.assertEqual(self.kernel.calls, [])
+        native = PoolHost(self.kernel)
+        response = self.kernel.cell("items = await pool.push([f'task {n}' for n in range(32)]); len(items)", native)
+        self.assertEqual(self.value(response), 32)
+        self.assertEqual(len(self.kernel.calls), 32)
+        self.assertEqual(len(native.workers), 2)
+        response = self.kernel.cell("await pool.push(['over capacity'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CAPACITY", response["error"])
+        self.assertEqual(len(self.kernel.calls), 32)
+        for options in ({"concurrency": 0}, {"concurrency": 9}, {"concurrency": 1.5}, {"concurrency": True},
+                        {"timeout_seconds": 0}, {"scope": "all"}, {"isolation": "worktree"},
+                        {"keep_alive": False}, {"output_schema": {}}, {"cwd": None}):
+            response = self.kernel.cell(f"await workpool(**{options!r})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 32)
+
+    def test_pool_partial_failure_keeps_acknowledged_handles_and_closes_admission(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        admissions = []
+        def bridge(frame):
+            operation = frame["bridge"]["input"]["args"]["operation"]
+            if operation in ("worker_start", "worker_send"):
+                admissions.append(operation)
+            if len(admissions) == 3:
+                self.kernel.reply(frame, error="PI_WORKER_REJECTED")
+            else:
+                native(frame)
+        response = self.kernel.cell("""
+try:
+    await pool.push(['a','b','c','d'])
+except Exception as error:
+    failure = (str(error), len(error.admitted), error.requested, len(pool.items), pool.closed)
+failure
+""", bridge)
+        message, acknowledged, requested, retained, closed = self.value(response)
+        self.assertIn("acknowledged 2 of 4", message)
+        self.assertEqual((acknowledged, requested, retained, closed), (2, 4, 2, True))
+        response = self.kernel.cell("await pool.push(['retry'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        snapshot = self.value(self.kernel.cell("await pool.peek()", native))
+        self.assertEqual(len(snapshot["items"]), 2)
+        self.assertIn("PI_WORKER_REJECTED", snapshot["lastError"])
+        closed = self.value(self.kernel.cell("await pool.close()", native))
+        self.assertTrue(closed["allClosed"])
+        self.assertEqual(len(closed["workers"]), 2)
+
+    def test_pool_serializes_concurrent_push_close_and_late_admission(self):
+        self.create_pool(concurrency=1)
+        native = PoolHost(self.kernel)
+        response = self.kernel.cell("""
+import asyncio
+pushing = asyncio.create_task(pool.push(['a', 'b']))
+closing = asyncio.create_task(pool.close())
+late = asyncio.create_task(pool.push(['too late']))
+settled = await asyncio.gather(pushing, closing, late, return_exceptions=True)
+(len(settled[0]), settled[1]['allClosed'], str(settled[2]))
+""", native)
+        count, closed, message = self.value(response)
+        self.assertEqual(count, 2)
+        self.assertTrue(closed)
+        self.assertIn("EVAL_POOL_CLOSED", message)
+        self.assertEqual(native.operations, ["worker_start", "worker_send", "worker_close"])
+        self.assertTrue(self.value(self.kernel.cell("await pool.close()"))["allClosed"])
+        self.assertEqual(len(self.kernel.calls), 3)
+        self.create_pool()
+        self.assertTrue(self.value(self.kernel.cell("await pool.close()"))["allClosed"])
+        self.assertEqual(len(self.kernel.calls), 3)
+
+    def test_cancelled_pool_admission_releases_its_lock_and_keeps_known_workers_closable(self):
+        self.create_pool(concurrency=1)
+        native = PoolHost(self.kernel)
+        pending = []
+        def bridge(frame):
+            if frame["bridge"]["input"]["args"]["operation"] == "worker_send":
+                pending.append(frame)
+            else:
+                native(frame)
+        def observe(frame):
+            if "release-pool-reply" in frame["stream"].get("text", ""):
+                self.assertEqual(len(pending), 1)
+                native(pending[0])
+        response = self.kernel.cell("""
+import asyncio
+running = asyncio.create_task(pool.push(['a', 'b']))
+await asyncio.sleep(0.03)
+running.cancel()
+print('release-pool-reply')
+try:
+    await running
+except asyncio.CancelledError:
+    pass
+(len(pool.items), pool.closed)
+""", bridge, observe)
+        self.assertEqual(self.value(response), (1, True))
+        closed = self.value(self.kernel.cell("await pool.close()", native))
+        self.assertTrue(closed["allClosed"])
+        self.assertEqual(native.operations, ["worker_start", "worker_send", "worker_close"])
+
+    def test_pool_lost_start_acknowledgment_never_claims_every_worker_was_closed(self):
+        self.create_pool()
+        response = self.kernel.cell("await pool.push(['first'])",
+                                    lambda frame: self.kernel.reply(frame, error="acknowledgment lost"))
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_ADMISSION", response["error"])
+        closed = self.value(self.kernel.cell("await pool.close()"))
+        self.assertTrue(closed["allKnownClosed"])
+        self.assertTrue(closed["unknownAdmission"])
+        self.assertFalse(closed["allClosed"])
+        self.assertEqual(len(self.kernel.calls), 1)
 
     def test_malformed_arguments_never_dispatch(self):
         for args in ("4, {}", "'', {}", "'read', None", "'read', []", "'é' * 65, {}",

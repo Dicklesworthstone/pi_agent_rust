@@ -639,9 +639,17 @@ impl Tool for EvalTool {
          or await agent(prompt, **options) in Python starts a native background \
          subagent. Retain its handle across cells to check status, read output, \
          wait or cancel; await wait(handles) returns ordered native results. \
-         Each operation uses the current cell's host and policy. JS handles \
-         can be retained on globalThis. These are independent child jobs, not \
-         reusable workers; all waits remain within the current cell's deadline. \
+         Set keepAlive:true in JS or keep_alive=True in Python to retain one \
+         live child conversation; await worker.send(prompt) queues a follow-up \
+         and returns a handle pinned to that turn. await worker.close() cancels \
+         its running and queued turns. await workpool({agent,concurrency}) in JS \
+         or await workpool(agent=...,concurrency=...) in Python creates a lazy \
+         reusable pool; await pool.push([prompts]) returns turn handles. Use \
+         pool.items, await pool.peek(), await pool.status(), and await pool.close(). \
+         Pools admit at most 32 items on 1-8 workers with fixed total lifetimes; \
+         close cancels all their work. Await every pool command. Each operation \
+         uses the current cell's host and policy. JS handles can be retained on \
+         globalThis; all waits remain within the current cell's deadline. \
          Native call receipts are included in result details. For typed judgments, \
          set judge_model={provider,model} for this cell, then call \
          __pi_judge through tool.call with {state,questions} and parse its JSON. \

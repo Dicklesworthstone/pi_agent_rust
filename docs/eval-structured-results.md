@@ -190,12 +190,185 @@ are captured at launch. Its final result is privacy-protected before job
 retention or completion delivery. See [native background delegation](subagent-builtins.md#background-delegation)
 for cancellation, isolation and lifecycle details.
 
-These handles cover independent native tasks. They do not keep a child agent
-alive for `send()` or provide OMP's warm-worker `workpool()`. Waiting does not
-consume the normal session completion notice or pause the eval watchdog.
-Each handle operation still counts toward the active cell's 64 host-call
-limit; possession of an old handle never supplies authority to a standalone
-eval invocation or a replacement session.
+The default `agent()` call creates an independent task. Set `keepAlive: true`
+in JavaScript or `keep_alive=True` in Python for the reusable conversation
+described below. Waiting does not consume the normal session completion notice
+or pause the eval watchdog. Each handle operation still counts toward the
+active cell's 64 host-call limit; possession of an old handle never supplies
+authority to a standalone eval invocation or a replacement session.
+
+## Reusable agents and queued turns
+
+A reusable agent retains one native RPC child and its conversation across
+prompts. This lets an agent inspect a subsystem, then implement a follow-up
+using that context. Enable `subagent` on the owning Agent; launch, send,
+inspection, waiting and cancellation all use its current tool policy.
+
+```javascript
+globalThis.worker = await agent('Inspect the parser and identify the main bug.', {
+    agent: 'task', keepAlive: true, timeoutSeconds: 300,
+});
+```
+
+In a later cell, queue the next turn and retain its own handle:
+
+```javascript
+globalThis.fix = await worker.send('Implement the correction and explain the change.');
+await fix.wait(20);
+```
+
+Python retains the corresponding objects in its ordinary namespace:
+
+```python
+worker = await agent('Inspect the parser and identify the main bug.',
+                     agent='task', keep_alive=True, timeout_seconds=300)
+fix = await worker.send('Implement the correction and explain the change.')
+result = await fix.wait(20)
+```
+
+Sending while the child is busy appends to its native FIFO queue. Each turn
+starts after the preceding turn finishes and the child's streaming and
+compaction have settled. The child keeps the same process, definition, model,
+tools and working directory for its lifetime.
+
+The worker exposes `id` / `workerId`, `jobId`, `agent` and `turnId` in JavaScript;
+Python uses `id` / `worker_id`, `job_id`, `agent` and `turn_id`. A returned turn
+handle has its own immutable worker and turn selection. The worker's selected
+turn advances to its latest acknowledged send; an earlier turn handle keeps
+pointing to its original result.
+
+| Method | Reusable worker or turn behavior |
+| --- | --- |
+| `worker.send(prompt)` | Queue a follow-up and return its fixed turn handle. |
+| `status()` | Native worker snapshot with the selected turn's status and result. |
+| `done()` | Whether the selected turn has completed, failed or been cancelled. |
+| `output()` | Selected turn's native `ToolOutput`, or null/`None` while pending. |
+| `wait(seconds=30)` | Wait for the selected turn; raise on failure or timeout. |
+| `close()` / `cancel()` | Close the entire worker, cancelling its running and queued turns. |
+
+Closing a turn handle also closes its entire worker. There is no individual
+turn cancellation. Successful turns leave the worker idle and available for
+another send until it is closed or reaches its original deadline.
+
+`wait()` accepts a mixture of one-shot jobs, workers and fixed turn handles.
+It captures each worker's current turn before starting the wait, preserves
+input order, and shares one timeout across the collection. Python also accepts
+`await worker` and `await fix`. The returned result preserves native content
+and `details.results[0]`, including the child PID, hub identity and
+`sessionIsolation: "persistent_rpc_worker"`.
+
+Reusable workers are currently supported on Unix and accept `agent`, `cwd`,
+`scope`, `timeoutSeconds` / `timeout_seconds`, and `isolation: "none"`.
+Worktree isolation, output schemas and `isoApply` / `iso_apply` remain on the
+independent-task path. A schema-bearing agent definition cannot be reused as
+a worker. Invalid combinations are rejected before a worker starts.
+
+Each worker admits at most 32 turns, with at most 64 KiB of UTF-8 text per
+prompt and no NUL characters. Its fixed lifetime includes startup, idle time,
+and all queued turns. The native host limit defaults to 900 seconds; a supplied
+timeout can shorten that limit. Idle workers still occupy one of the process's
+eight active job slots. Retained output is bounded to 128 KiB per turn and
+less than 1 MiB per worker; oversized or unsafe output becomes an explicit
+error. Each send captures current privacy policy, and output is screened again
+when read. See [native reusable workers](subagent-builtins.md#reusable-workers)
+for the direct tool protocol and ownership rules.
+
+Call `await worker.close()` after the conversation is finished. Kernel reset
+loses its guest handle, while the native carrier remains discoverable through
+`jobs list`. Cancelling that job or shutting down the owning session retires
+the worker and its queued turns.
+
+## Reusable workpools
+
+`workpool()` distributes a bounded batch of prompts among reusable native
+workers. Tasks assigned to the same worker share its conversation, making a
+pool useful for related inspections or staged implementation work. Every
+worker is a real child process with its own native queue.
+
+```javascript
+globalThis.pool = await workpool({agent: 'task', concurrency: 3});
+globalThis.items = await pool.push([
+    'Inspect the parser for correctness issues.',
+    'Inspect session persistence for data-loss risks.',
+    'Inspect cancellation and child-process cleanup.',
+    'Check the error handling around your assigned subsystem.',
+]);
+```
+
+The acknowledged tasks keep running after the cell returns. In a later cell:
+
+```javascript
+const results = await wait(pool.items, {timeout: 20, raiseErrors: false});
+console.log(await pool.status());
+await pool.close();
+```
+
+Python exposes the same operations:
+
+```python
+pool = await workpool(agent='task', concurrency=3)
+items = await pool.push([
+    'Inspect the parser for correctness issues.',
+    'Inspect cancellation and child-process cleanup.',
+])
+results = await wait(pool.items, timeout=20, raise_errors=False)
+snapshot = await pool.peek()
+cleanup = await pool.close()
+```
+
+Creation is lazy: `workpool()` makes no native calls until the first `push()`.
+Concurrency defaults to four and accepts 1–8 workers, sharing the same global
+eight-job limit as other native jobs. A pool admits at most 32 items over its
+entire lifetime. All prompts in a push are validated before any admission;
+the worker prompt limits above apply. JavaScript requires an array of strings;
+Python accepts a list or tuple. Empty batches are allowed.
+
+Initial tasks start workers up to the configured concurrency. Later pushes
+poll existing workers once, prefer an idle worker with the fewest admitted
+items, and otherwise balance queued turns across live workers. Each push
+returns fixed turn handles in input order. `pool.items` retains all acknowledged
+handles across pushes as a frozen array or Python tuple. Failed or expired
+workers are never silently replaced, and admission is never automatically retried.
+
+| Operation | Result |
+| --- | --- |
+| `push(tasks)` | Acknowledged turn handles for this batch, in input order. |
+| `peek()` | Each retained item's worker/turn identity, status and native result; unavailable reads include an error. |
+| `status()` | Worker and item counts, including queued, running, completed, failed, cancelled and unavailable items. |
+| `close()` | Close admission and cancel all known workers, including their running and queued turns; report cleanup per worker. |
+
+Pool commands are serialized and **must be awaited**. Native queues perform
+the execution between cells; no guest timers or callbacks are retained to
+dispatch subsequent work. Polling `peek()` or `status()` makes one host call
+per retained item, so it counts toward the current cell's 64-call allowance.
+The normal cell watchdog bounds each command and wait.
+
+If admission fails partway through a push, the pool closes further admission
+and preserves every acknowledged handle in `pool.items`. The raised error's
+`admitted` field contains this push's acknowledged handles, and `requested`
+records the batch size. Already admitted tasks continue until they finish or
+are cancelled. Inspect them and close the pool instead of retrying the same
+batch, which could duplicate effects. Cancellation or an interrupted cell can
+also leave partial admission; acknowledged handles remain inspectable while
+the kernel survives.
+
+A lost new-worker acknowledgment can leave an admitted carrier whose identity
+the guest never received. Such a pool reports `unknownAdmission: true`.
+`close()` distinguishes `allKnownClosed` from `allClosed`; the latter stays
+false while an unknown admission is possible. Use native `jobs list` and
+`jobs cancel` to inspect and retire any remaining owned carrier. Repeated
+`close()` retries only workers whose termination has not been acknowledged.
+
+Pool options are `name`, `agent`, `concurrency`, `cwd`, `scope`,
+`isolation: "none"`, and `timeoutSeconds` / `timeout_seconds`. Names are labels
+for the guest object, not session-wide registrations. Worker deadlines include
+idle and queued time and are not renewed per item. Pools stay open after a
+batch drains until explicitly closed or their workers expire.
+
+This bounded native pool provides shared conversation, queued follow-ups and
+explicit result collection. OMP's context-load scheduling, keyed yield batches,
+aggregate pool completion delivery and custom child-defined eval tools remain
+separate work. Pool `close()` cancels running work as well as queued work.
 
 ## Validation
 
@@ -208,7 +381,12 @@ tools. `src/eval/bridge_result.rs` includes native reader, Python and QuickJS
 regressions, plus serialization, malformed-input and whitelist tests. Its
 retained-agent regression launches a real native child from both kernels,
 checks typed output in a later cell, and rejects a retained handle when that
-cell has no Agent host. The
+cell has no Agent host. The guest diagnostics also cover fixed warm turns,
+mixed waits, real protocol field names, pool reuse, partial admission,
+interrupted-cell recovery and ambiguous cleanup reporting. Native worker
+regressions in `src/subagents/execution/worker.rs`, `src/subagents/worker.rs`
+and `src/jobs/host_task.rs` cover same-process conversation reuse, compaction
+barriers, cancellation/reaping, privacy projection and session ownership. The
 `eval_host_*` tests in `src/agent_tests.rs` exercise the actual Agent and kernels,
 including native writes and reads, approvals, live plan changes, extension
 hooks, disabled tools, recursive wrappers, call budgets and session changes.
