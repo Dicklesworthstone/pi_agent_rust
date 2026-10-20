@@ -234,9 +234,9 @@ impl OpenAIProvider {
     /// (gh #166): `"deepseek"` opts any custom OpenAI-compatible provider into
     /// the DeepSeek dialect regardless of provider id or base URL,
     /// `"openrouter"` opts a proxy into the OpenRouter shape, while any other
-    /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
-    /// `"qwen"`) explicitly opts out — those serialize with no reasoning
-    /// controls, exactly like providers with no dialect.
+    /// declared format opts out. A provider that explicitly declares
+    /// `supportsReasoningEffort: true` may use the plain OpenAI effort field,
+    /// either with `"openai"` or without a declared format (pi-freeflow).
     ///
     /// When no `thinkingFormat` is declared, DeepSeek is identified the same
     /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
@@ -271,6 +271,9 @@ impl OpenAIProvider {
             if format.eq_ignore_ascii_case("openrouter") {
                 return Some(ReasoningStyle::OpenRouter);
             }
+            if format.eq_ignore_ascii_case("openai") && self.supports_plain_reasoning_effort() {
+                return Some(ReasoningStyle::OpenAI);
+            }
             return None;
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
@@ -279,9 +282,18 @@ impl OpenAIProvider {
         let base_is_deepseek = self.base_url.to_ascii_lowercase().contains("deepseek.com");
         if provider_is_deepseek || base_is_deepseek {
             Some(ReasoningStyle::DeepSeek)
+        } else if self.supports_plain_reasoning_effort() {
+            Some(ReasoningStyle::OpenAI)
         } else {
             None
         }
+    }
+
+    fn supports_plain_reasoning_effort(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.supports_reasoning_effort)
+            == Some(true)
     }
 
     fn is_sap_ai_core(&self) -> bool {
@@ -342,9 +354,9 @@ impl OpenAIProvider {
             .then_some(OpenAIUsageAccounting { include: true });
 
         // Forward the reasoning level for providers with a request-side reasoning
-        // dialect: DeepSeek's vendor fields, or OpenRouter's normalized
-        // `reasoning` object (gh #220). Every other transport gets all-`None`,
-        // so its serialized body is unchanged. DeepSeek collapses `low`/`medium`
+        // dialect: DeepSeek's vendor fields, OpenRouter's normalized
+        // `reasoning` object, or an explicitly enabled plain OpenAI effort.
+        // Undeclared transports keep their existing body. DeepSeek collapses `low`/`medium`
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
@@ -352,18 +364,23 @@ impl OpenAIProvider {
         // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
         // enabled levels (gh #117/#165), matching the anthropic-messages and
         // openai-responses transports; `off` never emits an effort.
-        let (thinking, reasoning_effort, reasoning) = match self.reasoning_style() {
+        let level = options.thinking_level.unwrap_or_default();
+        let mapped_effort = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()));
+        let style = if mapped_effort.is_some_and(Option::is_none) {
+            None
+        } else {
+            self.reasoning_style()
+        };
+        let (thinking, reasoning_effort, reasoning) = match style {
             Some(ReasoningStyle::DeepSeek) => {
-                let level = options.thinking_level.unwrap_or_default();
                 if level == ThinkingLevel::Off {
                     (Some(OpenAIThinking { kind: "disabled" }), None, None)
                 } else {
-                    let mapped = self
-                        .compat
-                        .as_ref()
-                        .and_then(|c| c.thinking_level_map.as_ref())
-                        .and_then(|map| map.get(level.to_string().as_str()))
-                        .map(String::as_str);
+                    let mapped = mapped_effort.and_then(Option::as_deref);
                     let effort = mapped.or(match level {
                         ThinkingLevel::High => Some("high"),
                         ThinkingLevel::XHigh | ThinkingLevel::Max => Some("max"),
@@ -375,11 +392,19 @@ impl OpenAIProvider {
                     (Some(OpenAIThinking { kind: "enabled" }), effort, None)
                 }
             }
-            Some(ReasoningStyle::OpenRouter) => (
-                None,
-                None,
-                self.openrouter_reasoning(options.thinking_level.unwrap_or_default()),
-            ),
+            Some(ReasoningStyle::OpenRouter) => (None, None, self.openrouter_reasoning(level)),
+            Some(ReasoningStyle::OpenAI) => {
+                let effort = mapped_effort.and_then(Option::as_deref).or(match level {
+                    ThinkingLevel::Off => None,
+                    ThinkingLevel::Minimal => Some("minimal"),
+                    ThinkingLevel::Low => Some("low"),
+                    ThinkingLevel::Medium => Some("medium"),
+                    ThinkingLevel::High => Some("high"),
+                    ThinkingLevel::XHigh => Some("xhigh"),
+                    ThinkingLevel::Max => Some("max"),
+                });
+                (None, effort, None)
+            }
             None => (None, None, None),
         };
 
@@ -422,7 +447,8 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.thinking_level_map.as_ref())
             .and_then(|map| map.get(level.to_string().as_str()))
-            .map(|value| value.trim())
+            .and_then(Option::as_deref)
+            .map(str::trim)
             .filter(|value| !value.is_empty());
         match mapped {
             Some(value) => match value.parse::<u32>() {
@@ -1552,7 +1578,8 @@ pub struct OpenAIRequest<'a> {
     /// OpenAI-compatible providers never set this, so it serializes away.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<OpenAIThinking>,
-    /// DeepSeek-only reasoning effort (`"high"` | `"max"`). DeepSeek maps
+    /// Plain reasoning effort, enabled explicitly or by the DeepSeek dialect.
+    /// DeepSeek maps
     /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
     /// two values it documents — unless a catalog `thinkingLevelMap` remaps the
     /// level, in which case the mapped value (borrowed from the provider's
@@ -1614,6 +1641,8 @@ struct OpenAIThinking {
 /// (zai/qwen) can be added without touching the `build_request` call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasoningStyle {
+    /// Plain `reasoning_effort`, only for an explicit capability declaration.
+    OpenAI,
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
@@ -2640,9 +2669,9 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("xhigh".to_string(), "high".to_string()),
-                    ("medium".to_string(), "medium".to_string()),
-                    ("off".to_string(), "none".to_string()),
+                    ("xhigh".to_string(), Some("high".to_string())),
+                    ("medium".to_string(), Some("medium".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
                 ])),
                 ..Default::default()
             }));
@@ -3081,6 +3110,63 @@ mod tests {
             .expect("serialize request")
     }
 
+    #[test]
+    fn explicit_plain_effort_capability_preserves_maps_and_null_tiers() {
+        let make = |enabled, reasoning| {
+            OpenAIProvider::new("ovh-free/gpt-oss-120b")
+                .with_provider_name("freeflow")
+                .with_base_url("http://127.0.0.1:28180/v1/chat/completions".to_string())
+                .with_reasoning(reasoning)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: enabled,
+                    thinking_level_map: Some(HashMap::from([
+                        ("xhigh".to_string(), Some("high".to_string())),
+                        ("medium".to_string(), None),
+                    ])),
+                    ..CompatConfig::default()
+                }))
+        };
+        let enabled = make(Some(true), true);
+        let mapped = openrouter_body(&enabled, ThinkingLevel::XHigh);
+        assert_eq!(mapped["reasoning_effort"], "high");
+        assert!(mapped.get("reasoning").is_none());
+        assert!(mapped.get("thinking").is_none());
+        assert_eq!(
+            openrouter_body(&enabled, ThinkingLevel::Low)["reasoning_effort"],
+            "low"
+        );
+        for level in [ThinkingLevel::Off, ThinkingLevel::Medium] {
+            let body = openrouter_body(&enabled, level);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+        for provider in [
+            make(None, true),
+            make(Some(false), true),
+            make(Some(true), false),
+        ] {
+            let body = openrouter_body(&provider, ThinkingLevel::XHigh);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_null_effort_does_not_fall_back_to_a_vendor_dialect() {
+        for format in ["deepseek", "openrouter", "openai"] {
+            let provider = OpenAIProvider::new("freeflow-reasoner")
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: Some(true),
+                    thinking_format: Some(format.to_string()),
+                    thinking_level_map: Some(HashMap::from([("max".to_string(), None)])),
+                    ..CompatConfig::default()
+                }));
+            let body = openrouter_body(&provider, ThinkingLevel::Max);
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+    }
+
     /// gh #220: on the OpenRouter transport a reasoning model's thinking
     /// level goes out as the gateway's normalized `reasoning: {effort}`
     /// object — one fixture per level — and never as a vendor field.
@@ -3153,11 +3239,11 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("high".to_string(), "8000".to_string()),
-                    ("max".to_string(), " 32000 ".to_string()),
-                    ("low".to_string(), "minimal".to_string()),
-                    ("off".to_string(), "none".to_string()),
-                    ("medium".to_string(), "0".to_string()),
+                    ("high".to_string(), Some("8000".to_string())),
+                    ("max".to_string(), Some(" 32000 ".to_string())),
+                    ("low".to_string(), Some("minimal".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                    ("medium".to_string(), Some("0".to_string())),
                 ])),
                 ..Default::default()
             }));

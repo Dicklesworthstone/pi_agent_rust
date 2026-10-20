@@ -3,10 +3,14 @@
 
 mod common;
 
+use futures::StreamExt;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};
+use pi::model::StreamEvent;
+use pi::provider::{Context, StreamOptions};
+use pi::providers::create_provider;
 use pi::scheduler::{DeterministicClock, HostcallOutcome};
 use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
@@ -225,6 +229,106 @@ fn virtual_http_provider_transport_is_derived_from_owned_listener() {
             .is_some_and(|id| !id.is_empty())
     );
     assert!(forged.get("virtualHttpServer").is_none());
+}
+
+#[test]
+fn virtual_http_native_provider_survives_same_origin_restart() {
+    let harness = common::TestHarness::new("virtual_http_provider_restart");
+    let manager = load_extension(
+        &harness,
+        r#"
+        import http from 'node:http';
+        export default function(pi) {
+            let generation = 1;
+            let closed = 0;
+            const listen = () => http.createServer((_req, res) => {
+                const current = generation;
+                res.on('close', () => { closed++; });
+                res.writeHead(200, { 'content-type': 'text/event-stream' });
+                res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'generation-' + current }, finish_reason: null }] }) + '\n\n');
+                if (current > 1) {
+                    res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+                    res.end('data: [DONE]\n\n');
+                }
+            }).listen(28180, '127.0.0.1');
+            let server = listen();
+            pi.registerProvider('restart-provider', {
+                api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+                models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 4096, maxTokens: 512 }],
+            });
+            pi.on('agent_start', () => {
+                server.close();
+                generation++;
+                server = listen();
+                return { result: { closed, generation } };
+            });
+        }
+        "#,
+    );
+    common::run_async(async move {
+        let entries = manager.extension_model_entries();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.model.provider == "restart-provider")
+            .expect("registered provider");
+        let provider = create_provider(entry, Some(&manager)).expect("create provider once");
+        let before = manager.extension_providers();
+        let context = Context::default();
+        let options = StreamOptions {
+            api_key: Some("fixture".to_string()),
+            ..Default::default()
+        };
+        let mut first = provider
+            .stream(&context, &options)
+            .await
+            .expect("initial stream");
+        let first_text = loop {
+            match first.next().await.expect("initial event").expect("event") {
+                StreamEvent::TextDelta { delta, .. } => break delta,
+                StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+                    // ubs:ignore -- regression must fail if the old response terminates before restart.
+                    panic!("initial response must remain open until the listener closes");
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(first_text, "generation-1");
+        let restart = manager
+            .dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10_000)
+            .await
+            .expect("restart listener")
+            .and_then(|value| value.get("result").cloned())
+            .expect("restart result");
+        assert_eq!(restart, json!({ "closed": 1, "generation": 2 }));
+        drop(first);
+        assert_eq!(manager.extension_providers(), before);
+
+        let mut second = provider
+            .stream(&context, &options)
+            .await
+            .expect("existing provider reaches replacement listener");
+        let mut text = String::new();
+        let mut done = false;
+        while let Some(event) = second.next().await {
+            match event.expect("replacement event") {
+                StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                StreamEvent::Done { .. } => {
+                    done = true;
+                    break;
+                }
+                // ubs:ignore -- an unexpected error must fail this native provider regression.
+                StreamEvent::Error { .. } => panic!("replacement response failed"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "generation-2");
+        assert!(
+            done,
+            "the replacement must produce a completed native response"
+        );
+        drop(second);
+        assert!(manager.shutdown(std::time::Duration::from_secs(2)).await);
+    });
 }
 
 #[test]

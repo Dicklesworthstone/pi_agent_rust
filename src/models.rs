@@ -110,6 +110,9 @@ impl ModelEntry {
 
     /// Whether this model supports xhigh thinking level.
     pub fn supports_xhigh(&self) -> bool {
+        if let Some(supported) = self.thinking_level_map_supports("xhigh") {
+            return self.model.reasoning && supported;
+        }
         matches!(
             self.model.id.as_str(),
             "gpt-5.1-codex-max"
@@ -126,7 +129,6 @@ impl ModelEntry {
         ) || self.is_deepseek_reasoning_model()
             || self.is_openrouter_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
-            || self.thinking_level_map_declares("xhigh")
     }
 
     /// Whether this model's thinking level is forwarded as OpenRouter's
@@ -164,17 +166,14 @@ impl ModelEntry {
         })
     }
 
-    /// Whether the catalog's per-model `thinkingLevelMap` declares a mapping
-    /// for the given lowercase thinking-level name. A declared entry is the
-    /// catalog author asserting the model accepts that tier (possibly under a
-    /// different provider vocabulary), so the registry must not clamp it away
-    /// for custom models that hard-coded model-id detection cannot know about
-    /// (gh #165).
-    fn thinking_level_map_declares(&self, level: &str) -> bool {
+    /// A string declares a supported tier; explicit null disables it even if
+    /// a provider heuristic would enable it. An absent key keeps the defaults.
+    fn thinking_level_map_supports(&self, level: &str) -> Option<bool> {
         self.compat
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
-            .is_some_and(|map| map.contains_key(level))
+            .and_then(|map| map.get(level))
+            .map(Option::is_some)
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose modern
@@ -226,13 +225,15 @@ impl ModelEntry {
     /// family; older OpenAI models continue to clamp `Max` down to `XHigh`.
     /// A catalog `thinkingLevelMap` override can still re-map levels per model.
     pub fn supports_max(&self) -> bool {
+        if let Some(supported) = self.thinking_level_map_supports("max") {
+            return self.model.reasoning && supported;
+        }
         matches!(
             self.model.id.as_str(),
             "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) || self.is_deepseek_reasoning_model()
             || self.is_openrouter_reasoning_model()
             || self.is_anthropic_max_effort_model()
-            || self.thinking_level_map_declares("max")
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose
@@ -327,6 +328,10 @@ impl ModelEntry {
         if self.supports_max() {
             levels.push(ThinkingLevel::Max);
         }
+        levels.retain(|level| self.thinking_level_map_supports(&level.to_string()) != Some(false));
+        if levels.is_empty() {
+            levels.push(ThinkingLevel::Off);
+        }
         levels
     }
 
@@ -334,27 +339,39 @@ impl ModelEntry {
     ///
     /// Non-reasoning models always return `Off`. Models without max support
     /// downgrade `Max` to `XHigh` (or `High` if xhigh is also unsupported);
-    /// models without xhigh support downgrade `XHigh` to `High`. All other
-    /// levels pass through unchanged.
+    /// models without xhigh support downgrade `XHigh` to `High`. Explicit
+    /// null mappings remove unsupported tiers. Choose the closest supported
+    /// lower tier, or the first supported tier if none is lower.
     pub fn clamp_thinking_level(
         &self,
         thinking: crate::model::ThinkingLevel,
     ) -> crate::model::ThinkingLevel {
+        use crate::model::ThinkingLevel;
+
         if !self.model.reasoning {
             return crate::model::ThinkingLevel::Off;
         }
-        let mut thinking = thinking;
-        if thinking == crate::model::ThinkingLevel::Max && !self.supports_max() {
-            thinking = if self.supports_xhigh() {
-                crate::model::ThinkingLevel::XHigh
-            } else {
-                crate::model::ThinkingLevel::High
-            };
+        let levels = self.available_thinking_levels();
+        let mut lower = None;
+        for candidate in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ] {
+            if levels.contains(&candidate) {
+                lower = Some(candidate);
+            }
+            if candidate == thinking {
+                break;
+            }
         }
-        if thinking == crate::model::ThinkingLevel::XHigh && !self.supports_xhigh() {
-            return crate::model::ThinkingLevel::High;
-        }
-        thinking
+        lower
+            .or_else(|| levels.first().copied())
+            .unwrap_or(ThinkingLevel::Off)
     }
 }
 
@@ -957,7 +974,7 @@ pub struct ModelOverrideConfig {
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<CompatConfig>,
     pub dialect: Option<crate::dialects::Dialect>,
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -980,7 +997,7 @@ pub struct ModelConfig {
     /// folded into the entry's merged [`CompatConfig`] at registry build time.
     /// Declaring a mapping for `xhigh`/`max` also marks the level as supported,
     /// so the registry does not clamp it away for custom models.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1023,8 +1040,9 @@ pub struct CompatConfig {
     /// `ThinkingLevel` name
     /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
     /// Lets the catalog steer a transport's effort serialization without code
-    /// changes (gh #117). When absent, transports apply their built-in mapping.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    /// changes (gh #117). An explicit null disables that tier; an absent key
+    /// leaves the built-in mapping intact (pi-freeflow, gh #270).
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
     /// Force the modern adaptive-thinking API (`thinking: {type: "adaptive"}`
     /// plus `output_config.effort`) instead of the deprecated `budget_tokens`
     /// extended-thinking path. Authoritative over a transport's built-in
@@ -3761,7 +3779,7 @@ fn apply_model_override(
     }
 }
 
-fn merge_compat(
+pub(crate) fn merge_compat(
     provider_compat: Option<&CompatConfig>,
     model_compat: Option<&CompatConfig>,
 ) -> Option<CompatConfig> {
@@ -8966,8 +8984,8 @@ mod tests {
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "high".to_string()),
-                ("max".to_string(), "ultra".to_string()),
+                ("xhigh".to_string(), Some("high".to_string())),
+                ("max".to_string(), Some("ultra".to_string())),
             ])),
             ..CompatConfig::default()
         });
@@ -9003,7 +9021,10 @@ mod tests {
         use crate::model::ThinkingLevel;
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
-            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            thinking_level_map: Some(HashMap::from([(
+                "xhigh".to_string(),
+                Some("max".to_string()),
+            )])),
             ..CompatConfig::default()
         });
         assert!(entry.supports_xhigh());
@@ -9018,6 +9039,77 @@ mod tests {
         assert_eq!(
             bare.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
+        );
+    }
+
+    #[test]
+    fn nullable_thinking_map_filters_and_clamps_freeflow_efforts() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("ovh-free/gpt-oss-120b", true);
+        entry.model.api = "openai-completions".to_string();
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "supportsReasoningEffort": true,
+                "thinkingLevelMap": {
+                    "off": null, "minimal": null, "low": "low", "medium": null,
+                    "high": "high", "xhigh": null, "max": null
+                }
+            }))
+            .expect("nullable map"),
+        );
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![ThinkingLevel::Low, ThinkingLevel::High]
+        );
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Medium,
+        ] {
+            assert_eq!(entry.clamp_thinking_level(level), ThinkingLevel::Low);
+        }
+        for level in [
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ] {
+            assert_eq!(entry.clamp_thinking_level(level), ThinkingLevel::High);
+        }
+
+        // Explicit null wins over the OpenRouter heuristic; a missing key
+        // still inherits it, so existing partial maps retain their meaning.
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinkingFormat": "openrouter",
+                "thinkingLevelMap": { "max": null }
+            }))
+            .expect("partial nullable map"),
+        );
+        assert!(entry.supports_xhigh());
+        assert!(!entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::XHigh
+        );
+    }
+
+    #[test]
+    fn all_disabled_thinking_tiers_have_a_non_panicking_fallback() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("disabled-reasoner", true);
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinkingLevelMap": {
+                    "off": null, "minimal": null, "low": null, "medium": null,
+                    "high": null, "xhigh": null, "max": null
+                }
+            }))
+            .expect("nullable map"),
+        );
+        assert_eq!(entry.available_thinking_levels(), vec![ThinkingLevel::Off]);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Off
         );
     }
 
@@ -9110,13 +9202,13 @@ mod tests {
                         compat: Some(CompatConfig {
                             thinking_level_map: Some(HashMap::from([(
                                 "xhigh".to_string(),
-                                "compat-loses".to_string(),
+                                Some("compat-loses".to_string()),
                             )])),
                             ..CompatConfig::default()
                         }),
                         thinking_level_map: Some(HashMap::from([(
                             "xhigh".to_string(),
-                            "high".to_string(),
+                            Some("high".to_string()),
                         )])),
                         ..ModelConfig::default()
                     }]),
@@ -9136,7 +9228,7 @@ mod tests {
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
             .expect("thinkingLevelMap should be carried on merged compat");
-        assert_eq!(map.get("xhigh").map(String::as_str), Some("high"));
+        assert_eq!(map.get("xhigh").and_then(Option::as_deref), Some("high"));
         assert!(
             entry.supports_xhigh(),
             "declared xhigh mapping must survive clamping"

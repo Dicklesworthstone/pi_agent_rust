@@ -149,7 +149,7 @@ impl OpenAIResponsesProvider {
         // tool_choice and parallel_tool_calls are always sent (not conditional on tools).
         let (tool_choice, parallel_tool_calls, text, include, reasoning) = if self.codex_mode {
             let effort = options.thinking_level.as_ref().map_or_else(
-                || "high".to_string(),
+                || Some("high".to_string()),
                 |level| responses_effort_for_level(*level, self.compat.as_ref()),
             );
             (
@@ -159,14 +159,15 @@ impl OpenAIResponsesProvider {
                     verbosity: "medium",
                 }),
                 Some(vec!["reasoning.encrypted_content"]),
-                Some(OpenAIResponsesReasoning {
+                effort.map(|effort| OpenAIResponsesReasoning {
                     effort,
                     summary: Some("auto"),
                 }),
             )
-        } else if let Some(level) = options
+        } else if let Some(effort) = options
             .thinking_level
             .filter(|level| self.reasoning && *level != crate::model::ThinkingLevel::Off)
+            .and_then(|level| responses_effort_for_level(level, self.compat.as_ref()))
         {
             // Non-codex reasoning models mirror the TS `openai-responses`
             // builder (gh #165): when the catalog marks the model as reasoning
@@ -179,7 +180,7 @@ impl OpenAIResponsesProvider {
                 None,
                 Some(vec!["reasoning.encrypted_content"]),
                 Some(OpenAIResponsesReasoning {
-                    effort: responses_effort_for_level(level, self.compat.as_ref()),
+                    effort,
                     summary: Some("auto"),
                 }),
             )
@@ -228,7 +229,7 @@ impl OpenAIResponsesProvider {
 fn responses_effort_for_level(
     level: crate::model::ThinkingLevel,
     compat: Option<&CompatConfig>,
-) -> String {
+) -> Option<String> {
     let name = level.to_string();
     if let Some(mapped) = compat
         .and_then(|c| c.thinking_level_map.as_ref())
@@ -236,7 +237,7 @@ fn responses_effort_for_level(
     {
         return mapped.clone();
     }
-    name
+    Some(name)
 }
 
 fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
@@ -2868,8 +2869,8 @@ mod tests {
     fn test_build_request_thinking_level_map_overrides_effort() {
         let compat = CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "max".to_string()),
-                ("high".to_string(), "high".to_string()),
+                ("xhigh".to_string(), Some("max".to_string())),
+                ("high".to_string(), Some("high".to_string())),
             ])),
             ..CompatConfig::default()
         };
@@ -2895,6 +2896,28 @@ mod tests {
         );
         let medium = serde_json::to_value(&medium).expect("serialize request");
         assert_eq!(medium["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_build_request_nullable_effort_does_not_use_default() {
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("freeflow-responses")
+                .with_reasoning(true)
+                .with_codex_mode(codex_mode)
+                .with_compat(Some(CompatConfig {
+                    thinking_level_map: Some(HashMap::from([("max".to_string(), None)])),
+                    ..CompatConfig::default()
+                }));
+            let body = provider.build_request(
+                &reasoning_test_context(),
+                &StreamOptions {
+                    thinking_level: Some(crate::model::ThinkingLevel::Max),
+                    ..Default::default()
+                },
+            );
+            let body = serde_json::to_value(body).expect("request JSON");
+            assert!(body.get("reasoning").is_none(), "{body}");
+        }
     }
 
     /// gh #165: no reasoning field when the model is non-reasoning, when the
@@ -2940,7 +2963,10 @@ mod tests {
         let mapped = OpenAIResponsesProvider::new("gpt-5.2-codex")
             .with_codex_mode(true)
             .with_compat(Some(CompatConfig {
-                thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+                thinking_level_map: Some(HashMap::from([(
+                    "xhigh".to_string(),
+                    Some("max".to_string()),
+                )])),
                 ..CompatConfig::default()
             }));
         let request = mapped.build_request(

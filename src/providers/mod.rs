@@ -2111,6 +2111,78 @@ export default function activate(pi) {
     }
 
     #[test]
+    fn extension_model_reasoning_settings_reach_the_virtual_proxy_request() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r#"
+import http from 'node:http';
+export default function activate(pi) {
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      const parsed = JSON.parse(body);
+      const correct = parsed.model === 'plain' ? parsed.reasoning_effort === 'high' && !parsed.reasoning
+        : parsed.model === 'gateway' ? parsed.reasoning?.effort === 'xhigh' && !parsed.reasoning_effort
+        : parsed.model === 'disabled' && !parsed.reasoning_effort && !parsed.reasoning;
+      if (!correct || parsed.thinking) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'model reasoning contract was lost' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: parsed.model }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  }).listen(28180, '127.0.0.1');
+  pi.registerProvider('freeflow-contract', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
+    models: [
+      { id: 'plain', reasoning: true, thinkingLevelMap: { xhigh: 'high', max: null } },
+      { id: 'gateway', reasoning: true, compat: { thinkingFormat: 'openrouter' }, thinkingLevelMap: { xhigh: 'xhigh', max: null } },
+      { id: 'disabled', reasoning: true, compat: { supportsReasoningEffort: false } }
+    ]
+  });
+}
+"#;
+            let (_dir, manager) = load_extension(source, false).await;
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 3);
+            for entry in &entries {
+                let compat = entry.compat.as_ref().expect("registered compatibility");
+                assert_eq!(compat.supports_developer_role, Some(false));
+                assert!(!entry.supports_max());
+                let provider = create_provider(entry, Some(&manager)).expect("provider");
+                let context = basic_context();
+                let options = StreamOptions {
+                    thinking_level: Some(entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)),
+                    ..basic_options()
+                };
+                let mut events = provider.stream(&context, &options).await.expect("stream");
+                let mut text = String::new();
+                let mut done = false;
+                while let Some(event) = events.next().await {
+                    match event.expect("provider event") {
+                        StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        StreamEvent::Done { .. } => {
+                            done = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(text, entry.model.id);
+                assert!(done);
+            }
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
     fn extension_virtual_http_response_drop_cancels_its_handler() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

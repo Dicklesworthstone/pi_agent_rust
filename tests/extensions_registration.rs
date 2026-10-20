@@ -470,6 +470,48 @@ fn provider_produces_model_entries() {
 }
 
 #[test]
+fn provider_model_compatibility_and_nullable_effort_map_reach_native_registry() {
+    use pi::model::ThinkingLevel;
+    let mgr = ExtensionManager::new();
+    mgr.register_provider(json!({
+        "id": "freeflow", "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:28180/v1",
+        "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "customHeaders": { "x-parent": "kept", "x-override": "parent" }
+        },
+        "models": [{
+            "id": "kilo-model", "reasoning": true,
+            "compat": {
+                "thinkingFormat": "openrouter",
+                "supportsReasoningEffort": false,
+                "customHeaders": { "x-override": "model" },
+                "thinkingLevelMap": { "max": "wrong" }
+            },
+            "thinkingLevelMap": { "xhigh": "high", "max": null }
+        }]
+    }));
+    let entries = mgr.extension_model_entries();
+    let entry = entries.first().expect("model entry");
+    let compat = entry.compat.as_ref().expect("merged compatibility");
+    assert_eq!(compat.supports_developer_role, Some(false));
+    assert_eq!(compat.supports_reasoning_effort, Some(false));
+    assert_eq!(compat.thinking_format.as_deref(), Some("openrouter"));
+    let headers = compat.custom_headers.as_ref().expect("merged headers");
+    assert_eq!(headers.get("x-parent").map(String::as_str), Some("kept"));
+    assert_eq!(headers.get("x-override").map(String::as_str), Some("model"));
+    let map = compat.thinking_level_map.as_ref().expect("top-level map");
+    assert_eq!(map.get("xhigh").and_then(Option::as_deref), Some("high"));
+    assert_eq!(map.get("max"), Some(&None));
+    assert!(!entry.supports_max());
+    assert_eq!(
+        entry.clamp_thinking_level(ThinkingLevel::Max),
+        ThinkingLevel::XHigh
+    );
+}
+
+#[test]
 fn provider_model_entries_use_provider_base_url() {
     let mgr = ExtensionManager::new();
     mgr.register_provider(json!({

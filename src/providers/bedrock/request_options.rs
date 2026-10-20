@@ -131,6 +131,11 @@ fn effort(level: ThinkingLevel, id: Option<&str>, compat: Option<&CompatConfig>)
         .and_then(|config| config.thinking_level_map.as_ref())
         .and_then(|map| map.get(&level.to_string()))
     {
+        let Some(mapped) = mapped else {
+            return Err(request_error(
+                "Bedrock thinkingLevelMap disables the requested effort",
+            ));
+        };
         if matches!(mapped.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
             return Ok(mapped.clone());
         }
@@ -479,7 +484,10 @@ mod tests {
         );
         let mut compat = CompatConfig {
             force_adaptive_thinking: Some(true),
-            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            thinking_level_map: Some(HashMap::from([(
+                "xhigh".to_string(),
+                Some("max".to_string()),
+            )])),
             ..CompatConfig::default()
         };
         let body = prepare(
@@ -497,7 +505,7 @@ mod tests {
             .thinking_level_map
             .as_mut()
             .unwrap()
-            .insert("xhigh".to_string(), "typo".to_string());
+            .insert("xhigh".to_string(), Some("typo".to_string()));
         assert!(
             prepare(
                 "opaque-profile",
@@ -542,6 +550,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn nullable_effort_map_rejects_disabled_tier_before_request() {
+        let compat = CompatConfig {
+            force_adaptive_thinking: Some(true),
+            thinking_level_map: Some(std::collections::HashMap::from([("max".to_string(), None)])),
+            ..CompatConfig::default()
+        };
+        let result = prepare(
+            "opaque-profile",
+            Some(&compat),
+            &context(),
+            &options(ThinkingLevel::Max),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -48,7 +48,7 @@ for the API subset that extensions actually use.
 | `node:https` | `request`, `get` | Shared with http | Same as `node:http` |
 | `node:events` | `EventEmitter`, `on`, `emit`, `once`, `removeListener`, `removeAllListeners`, `listenerCount` | 26 tests | Full EventEmitter pattern |
 | `node:os` | `platform`, `hostname`, `tmpdir`, `homedir`, `cpus`, `arch`, `type`, `release`, `userInfo`, `EOL` | Included | Returns host values |
-| `node:url` | `URL`, `URLSearchParams`, `parse`, `format`, `resolve` | 6 tests | WHATWG URL standard |
+| `node:url` | `URL`, `URLSearchParams`, `parse`, `format`, `resolve` | URL shim regressions | URL construction and base resolution use the native URL parser; the mutable JS surface remains bounded |
 | `node:process` | `env`, `argv`, `cwd`, `exit`, `platform`, `arch`, `version`, `pid`, `hrtime` | 24 tests | `exit` is sandboxed |
 | `node:util` | `format`, `inspect`, `inherits`, `deprecate`, `debuglog`, `types`, `TextEncoder`, `TextDecoder`, `stripVTControlCharacters` | Included | Standard utility functions |
 | `node:stream` | `Readable`, `Writable`, `Transform`, `Duplex`, `PassThrough`, `pipeline`, `finished` | Included | Stream constructors + helpers |
@@ -156,12 +156,31 @@ intercept the route. Unsupported listen forms and non-loopback hosts fail.
 Freeflow's detached daemon spawn options remain unsupported, allowing its
 existing in-process fallback to run.
 
+The provider keeps its originally granted extension/origin binding when that
+extension closes and replaces the listener on the same port. Each new request
+resolves the current owned listener; a provider that had no route when it was
+registered cannot acquire one later without registration. URL construction
+resolves root-relative health and control paths against the origin, allowing
+Freeflow's health, client attachment, shutdown, and recovery operations to use
+their intended endpoints.
+
+Provider-level and model-level `compat` settings survive registration and merge
+with model settings taking precedence. A model's top-level `thinkingLevelMap`
+overrides the compatibility map. String values remap effort names; explicit
+`null` values disable those tiers, while omitted keys retain existing defaults.
+The native model picker and request serializers honor that distinction.
+OpenAI-compatible providers may explicitly enable the plain `reasoning_effort`
+field with `supportsReasoningEffort: true`; declared OpenRouter formats retain
+their `reasoning` object. Undeclared providers keep their existing request shape.
+
 Outbound fetch and Node HTTP calls still require the extension's HTTP
 capability and the connector's TLS/host policy. Responses expose headers before
 streaming body bytes; reader cancellation, request destruction, abort signals,
 header deadlines, body idle timeouts, and runtime task deadlines retain owned
 transport cleanup. `AbortSignal.any()` composes caller and timeout signals.
 `Readable.fromWeb()` and `StringDecoder` preserve byte and split UTF-8 behavior.
+JavaScript tasks awaiting deferred HTTP work yield to the native executor so
+socket readiness, other tasks, and timers can progress within the root deadline.
 Limits include 16 virtual servers and 64 active virtual requests per realm,
 1 MiB of queued virtual response data, a 10 MiB virtual request body, and the
 configured connector response limit. Custom TLS/socket overrides and streaming
@@ -172,8 +191,9 @@ Regression coverage is in `tests/node_http_shim.rs`,
 `scripts/freeflow_compat_probe.mjs` reads the actual embedded JavaScript and
 loads a pinned, clean upstream checkout at
 `c4370df7fd4d186d00a33e4fc177ea340abf08d3` with controlled HTTP responses.
-It covers the import, dispatcher fallback, activation, relay behavior, proxy
-streaming, and Windows/POSIX path projections. The script documents setup and
+It covers the import, dispatcher fallback, activation, model metadata, relay
+behavior, proxy streaming and recovery, health/control requests, and
+Windows/POSIX path projections. The script documents setup and
 usage. These V8-based diagnostics do not replace QuickJS/Rust execution or a
 native Windows run; use `dsr quality --tool pi_agent_rust` for the authoritative
 repository gate.

@@ -1667,8 +1667,12 @@ fn extension_wait_sleep(duration: Duration) -> asupersync::time::Sleep {
     sleep(extension_wait_now(), duration)
 }
 
-fn extension_wait_short_blocking_pause(duration: Duration) {
-    std::thread::park_timeout(duration.min(Duration::from_millis(1)));
+async fn extension_wait_cooperate(root_deadline: Instant) {
+    // A deferred hostcall is polled once per pump, but the pump itself can
+    // remain ready. A self-waking yield only runs ready tasks on the native
+    // current-thread executor; a timer wait also lets it poll I/O readiness.
+    let remaining = root_deadline.saturating_duration_since(Instant::now());
+    extension_wait_sleep(Duration::from_millis(1).min(remaining)).await;
 }
 
 /// Canonicalize a path, stripping the `\\?\` verbatim prefix on Windows.
@@ -18990,7 +18994,166 @@ fn http_hostcall_stream(
 mod deferred_http_security_tests {
     use super::*;
     use crate::connectors::http::HttpConnectorConfig;
+    use asupersync::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use asupersync::net::TcpListener;
     use futures::StreamExt as _;
+
+    async fn serve_streamed_response(listener: TcpListener) -> std::io::Result<()> {
+        let (mut socket, _) = listener.accept().await?;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await?;
+            if count == 0 || request.len() + count > 16 * 1024 {
+                return Err(std::io::Error::other("incomplete test HTTP request"));
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Pi-Test: live\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+        extension_wait_sleep(Duration::from_millis(10)).await;
+        socket.write_all(b"first-").await?;
+        extension_wait_sleep(Duration::from_millis(10)).await;
+        socket.write_all(b"second").await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_streamed_fetch_resumes_native_executor(during_activation: bool) {
+        let executor = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread executor");
+        let handle = executor.handle();
+        executor.block_on(async move {
+            let dir = tempfile::tempdir().expect("extension directory");
+            let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("bind loopback HTTP fixture");
+            let url = format!(
+                "http://{}/relay",
+                listener.local_addr().expect("fixture address")
+            );
+            let entry = dir.path().join("native-fetch.mjs");
+            fs::write(
+                &entry,
+                format!(
+                    r#"
+async function request() {{
+    const response = await fetch({url:?});
+    return {{
+        status: response.status,
+        header: response.headers.get("x-pi-test"),
+        body: await response.text(),
+    }};
+}}
+export default async function(pi) {{
+    pi.registerCommand("native-fetch", {{ handler: request }});
+    if ({during_activation}) globalThis.nativeResult = await request();
+}}
+"#
+                ),
+            )
+            .expect("write extension fixture");
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("extension spec");
+            let manager = ExtensionManager::new();
+            {
+                let mut state = manager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.permission_store = None;
+                state.policy_prompt_cache.clear();
+            }
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                default_caps: vec!["http".to_string()],
+                ..Default::default()
+            };
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)).into(),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::new(HttpConnectorConfig {
+                    require_tls: true,
+                    allow_loopback_http: true,
+                    enforce_allowlist: true,
+                    allowlist: vec!["127.0.0.1".to_string()],
+                    default_timeout_ms: 3_000,
+                    ..Default::default()
+                })),
+                policy: policy.clone(),
+                interceptor: None,
+            };
+            let pool = crate::extensions_js::WarmIsolatePool::new(PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                disk_cache_dir: None,
+                ..Default::default()
+            });
+            // The peer and its delayed response chunks run on the same thread
+            // as the JavaScript waiter. A ready-only pump starves this task.
+            let server = handle.spawn(async move {
+                timeout(
+                    extension_wait_now(),
+                    Duration::from_secs(5),
+                    Box::pin(serve_streamed_response(listener)),
+                )
+                .await
+            });
+            let mut shards = build_js_runtime_shards(
+                &pool,
+                &policy,
+                &host,
+                &[spec],
+                None,
+                js_runtime_request_deadline(5_000),
+            )
+            .await
+            .expect("activate extension without starving native I/O");
+            let result = if during_activation {
+                shards.shards[0]
+                    .runtime
+                    .read_global_json("nativeResult")
+                    .await
+                    .expect("activation response")
+            } else {
+                execute_extension_command_sharded(
+                    &mut shards,
+                    &host,
+                    0,
+                    "native-fetch",
+                    "",
+                    &json!({}),
+                    None,
+                    5_000,
+                    js_runtime_request_deadline(5_000),
+                )
+                .await
+                .expect("command response without starving native I/O")
+            };
+            assert_eq!(
+                result,
+                json!({"status": 200, "header": "live", "body": "first-second"})
+            );
+            assert_eq!(shards.shards[0].runtime.pending_hostcall_count(), 0);
+            server
+                .await
+                .expect("HTTP fixture deadline")
+                .expect("HTTP fixture response");
+        });
+    }
+
+    #[test]
+    fn extension_activation_streamed_fetch_yields_to_native_executor() {
+        assert_streamed_fetch_resumes_native_executor(true);
+    }
+
+    #[test]
+    fn extension_command_streamed_fetch_yields_to_native_executor() {
+        assert_streamed_fetch_resumes_native_executor(false);
+    }
 
     fn start_reply_fixture() -> (JsProviderStreamStartGuard, mpsc::Receiver<JsRuntimeCommand>) {
         let (sender, receiver) = mpsc::channel(4);
@@ -20490,9 +20653,7 @@ async fn await_js_task(
                 timeout.as_millis()
             )));
         }
-        if !runtime.has_pending() {
-            extension_wait_short_blocking_pause(Duration::from_millis(1));
-        }
+        extension_wait_cooperate(root_deadline).await;
     }
 }
 
@@ -20537,9 +20698,7 @@ async fn await_js_task_in_shards(
                 ),
             ));
         }
-        if !shards.shards[shard_index].runtime.has_pending() {
-            extension_wait_short_blocking_pause(Duration::from_millis(1));
-        }
+        extension_wait_cooperate(root_deadline).await;
     }
 }
 

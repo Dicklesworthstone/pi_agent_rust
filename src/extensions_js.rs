@@ -19677,6 +19677,49 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
+                // URL parsing is pure: it shares the host's WHATWG parser,
+                // without granting any filesystem or network capability.
+                global.set(
+                    "__pi_url_parse_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, input: String, base: Option<String>| -> Option<String> {
+                            let parsed = match base {
+                                Some(base) => url::Url::parse(&base).ok()?.join(&input).ok()?,
+                                None => url::Url::parse(&input).ok()?,
+                            };
+                            let protocol = format!("{}:", parsed.scheme());
+                            let has_authority = parsed
+                                .as_str()
+                                .strip_prefix(&protocol)
+                                .is_some_and(|rest| rest.starts_with("//"));
+                            let hostname = parsed.host_str().unwrap_or_default();
+                            let port = parsed
+                                .port()
+                                .map_or_else(String::new, |port| port.to_string());
+                            let host = if port.is_empty() {
+                                hostname.to_string()
+                            } else {
+                                format!("{hostname}:{port}")
+                            };
+                            let parts = serde_json::json!({
+                                "href": parsed.as_str(),
+                                "protocol": protocol,
+                                "hasAuthority": has_authority,
+                                "hostname": hostname,
+                                "host": host,
+                                "port": port,
+                                "username": parsed.username(),
+                                "password": parsed.password().unwrap_or_default(),
+                                "pathname": parsed.path(),
+                                "search": parsed.query().map_or_else(String::new, |query| format!("?{query}")),
+                                "hash": parsed.fragment().map_or_else(String::new, |fragment| format!("#{fragment}")),
+                                "origin": parsed.origin().ascii_serialization(),
+                            });
+                            Some(parts.to_string())
+                        },
+                    ),
+                )?;
+
                 // __pi_base64_encode_native(binary_string) -> base64 string
                 global.set(
                     "__pi_base64_encode_native",
@@ -21608,6 +21651,8 @@ function __pi_register_provider(provider_id, spec) {
         if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
         if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
         if (m && m.headers && typeof m.headers === 'object') out.headers = Object.assign({}, m.headers);
+        if (m && m.compat && typeof m.compat === 'object' && !Array.isArray(m.compat)) out.compat = Object.assign({}, m.compat);
+        if (m && m.thinkingLevelMap && typeof m.thinkingLevelMap === 'object' && !Array.isArray(m.thinkingLevelMap)) out.thinkingLevelMap = Object.assign({}, m.thinkingLevelMap);
         return out;
     }) : [];
 
@@ -21655,6 +21700,9 @@ function __pi_register_provider(provider_id, spec) {
     if (spec.headers && typeof spec.headers === 'object') {
         providerSpec.headers = Object.assign({}, spec.headers);
     }
+    if (spec.compat && typeof spec.compat === 'object' && !Array.isArray(spec.compat)) {
+        providerSpec.compat = Object.assign({}, spec.compat);
+    }
     if (spec.oauth && typeof spec.oauth === 'object') {
         const oauth = {};
         if (spec.oauth.authUrl !== undefined && spec.oauth.authUrl !== null) {
@@ -21690,6 +21738,9 @@ function __pi_register_provider(provider_id, spec) {
         extensionId: ext.id,
         spec: providerSpec,
         streamSimple: streamSimple,
+        // Preserve the granted origin across a same-owner listener restart.
+        // Providers registered without a listener gain no future authority.
+        virtualHttpOrigin: virtualServer ? virtualServer.origin : null,
     };
     ext.providers.set(id, record);
     __pi_provider_index.set(id, record);
@@ -21800,23 +21851,27 @@ function __pi_register_mcp_server_for_extension(extension_id, name, spec) {
 // route at registration; all actual egress continues through pi.http policy.
 const __pi_virtual_http_servers = new __pi_original_Map();
 const __pi_virtual_http_requests = new __pi_original_Set();
-const __pi_virtual_http_server_get = Function.prototype.call.bind(__pi_original_Map.prototype.get);
 const __pi_virtual_http_server_set = Function.prototype.call.bind(__pi_original_Map.prototype.set);
 const __pi_virtual_http_server_delete = Function.prototype.call.bind(__pi_original_Map.prototype.delete);
 const __pi_virtual_http_server_values = Function.prototype.call.bind(__pi_original_Map.prototype.values);
 const __pi_virtual_http_request_values = Function.prototype.call.bind(__pi_original_Set.prototype.values);
 const __pi_virtual_http_request_delete = Function.prototype.call.bind(__pi_original_Set.prototype.delete);
 let __pi_virtual_http_server_seq = 0;
+const __pi_virtual_http_parse_url = __pi_url_parse_native;
+const __pi_virtual_http_parse_json = JSON.parse;
 
 function __pi_virtual_http_origin(value) {
     try {
-        const url = new URL(String(value));
+        if (typeof value !== 'string') return null;
+        const parsed = __pi_virtual_http_parse_url(value, null);
+        if (typeof parsed !== 'string') return null;
+        const url = __pi_virtual_http_parse_json(parsed);
         if (url.protocol !== 'http:' || url.username || url.password) return null;
-        const host = String(url.hostname).toLowerCase();
-        if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(host)) return null;
-        const port = Number(url.port || 80);
-        if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-        return 'http://' + (host === '::1' ? '[::1]' : host) + ':' + String(port);
+        const host = url.hostname;
+        if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]') return null;
+        // The native parser canonicalizes hosts and bounds ports to u16.
+        if (url.port === '0') return null;
+        return 'http://' + host + ':' + (url.port || '80');
     } catch (_) { return null; }
 }
 
@@ -21966,9 +22021,9 @@ globalThis.__pi_virtual_http_dispatch = (request) => {
 
 function __pi_virtual_http_start(provider_id, request) {
     const provider = __pi_provider_index.get(String(provider_id));
-    const id = provider && provider.spec && provider.spec.virtualHttpServer;
-    const server = id ? __pi_virtual_http_server_get(__pi_virtual_http_servers, id) : null;
-    if (!server || server.extensionId !== provider.extensionId) {
+    const origin = provider && provider.virtualHttpOrigin;
+    const server = origin ? __pi_virtual_http_find(provider.extensionId, origin) : null;
+    if (!server) {
         throw new Error('Provider has no active owned virtual HTTP server');
     }
     const stream = __pi_virtual_http_open(server, request);
@@ -24164,45 +24219,25 @@ if (typeof globalThis.URLSearchParams === 'undefined') {
 }
 
 if (typeof globalThis.URL === 'undefined') {
+    const parseURL = __pi_url_parse_native;
     class URL {
         constructor(input, base) {
-            const s = base ? new URL(base).href.replace(/\/[^/]*$/, '/') + String(input ?? '') : String(input ?? '');
-            const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
-            if (m) {
-                this.protocol = m[1] + ':';
-                const auth = m[2];
-                const atIdx = auth.lastIndexOf('@');
-                if (atIdx !== -1) {
-                    const userinfo = auth.slice(0, atIdx);
-                    const ci = userinfo.indexOf(':');
-                    this.username = ci === -1 ? userinfo : userinfo.slice(0, ci);
-                    this._pw = ci === -1 ? String() : userinfo.slice(ci + 1);
-                    this.host = auth.slice(atIdx + 1);
-                } else {
-                    this.username = '';
-                    this._pw = String();
-                    this.host = auth;
-                }
-                const hi = this.host.indexOf(':');
-                this.hostname = hi === -1 ? this.host : this.host.slice(0, hi);
-                this.port = hi === -1 ? '' : this.host.slice(hi + 1);
-                this.pathname = m[3] || '/';
-                this.search = m[4] || '';
-                this.hash = m[5] || '';
-            } else {
-                this.protocol = '';
-                this.username = '';
-                this._pw = String();
-                this.host = '';
-                this.hostname = '';
-                this.port = '';
-                this.pathname = s;
-                this.search = '';
-                this.hash = '';
-            }
+            const parsed = parseURL(String(input), base === undefined ? null : String(base));
+            if (typeof parsed !== 'string') throw new TypeError('Invalid URL');
+            const parts = JSON.parse(parsed);
+            this.protocol = parts.protocol;
+            this.username = parts.username;
+            this._pw = parts.password;
+            this.host = parts.host;
+            this.hostname = parts.hostname;
+            this.port = parts.port;
+            this.pathname = parts.pathname;
+            this.search = parts.search;
+            this.hash = parts.hash;
+            this._hasAuthority = parts.hasAuthority;
             this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
-            this.origin = this.protocol ? `${this.protocol}//${this.host}` : '';
-            this.href = this.toString();
+            this.origin = parts.origin;
+            this.href = parts.href;
         }
         get password() {
             return this._pw;
@@ -24211,8 +24246,9 @@ if (typeof globalThis.URL === 'undefined') {
             this._pw = value == null ? String() : String(value);
         }
         toString() {
-            const auth = this.username ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
-            return this.protocol ? `${this.protocol}//${auth}${this.host}${this.pathname}${this.search}${this.hash}` : this.pathname;
+            const auth = this.username || this.password ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
+            const authority = this._hasAuthority ? `//${auth}${this.host}` : '';
+            return `${this.protocol}${authority}${this.pathname}${this.search}${this.hash}`;
         }
         toJSON() { return this.toString(); }
     }
@@ -26603,11 +26639,17 @@ mod tests {
     /// node:stream adds bounded Web-reader backpressure and iterator cleanup
     /// (+3_271 bytes). These are deliberate source edits, covered by the
     /// fetch, deferred HTTP, and virtual_http_server regression cases.
+    /// Follow-up for gh #270: only `<bridge>` moved, 235_175 -> 235_066
+    /// (-109 bytes). URL construction now delegates to the pure host parser,
+    /// provider routes retain their owned origin across listener restarts,
+    /// and provider/model compatibility and thinking metadata are preserved.
+    /// URL resolution, route ownership, and native provider regressions cover
+    /// these changes; every virtual-module receipt remains unchanged.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            235_175,
-            "8a30e70718753ea059ba56694d0ad533e2020058d08ecfcdff41799ee0e87c3e",
+            235_066,
+            "c97b4c4e52986f21a09c1a6aeda6e3f0364430328b0c74bf75e75e284cd1f8f6",
         ),
         (
             "node:fs",
@@ -34917,6 +34959,122 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(done, serde_json::json!(true));
             let error = get_global_json(&runtime, "iteratorReturnError").await;
             assert_eq!(error, serde_json::Value::Null);
+        });
+    }
+
+    #[test]
+    fn pijs_virtual_http_restart_retains_only_registered_owner_and_origin() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.virtualRestartResult = null;
+                    (async () => {
+                        const results = {};
+                        const begin = id => {
+                            __pi_end_extension(__pi_test_secret);
+                            __pi_begin_extension(__pi_test_secret, id, { name: id });
+                        };
+                        const listen = port => __pi_virtual_http_listen('127.0.0.1', port, () => {
+                            let first = true;
+                            return {
+                                poll() {
+                                    if (first) { first = false; return { done: false, value: { status: 201, headers: {} } }; }
+                                    return { done: true };
+                                },
+                                next() { return Promise.resolve(this.poll()); },
+                                cancel() { results.cancelled = true; },
+                                finished: Promise.resolve(),
+                            };
+                        }, () => {});
+                        const rejected = (id, url = 'http://127.0.0.1:28180/v1/test') => {
+                            try { __pi_virtual_http_start(__pi_test_secret, id, { url }); return false; }
+                            catch (_) { return true; }
+                        };
+                        begin('route-owner');
+                        const original = listen(28180);
+                        const spec = { api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1', models: [{ id: 'test' }] };
+                        pi.registerProvider('bound', spec);
+                        pi.registerProvider('unbound', { ...spec, baseUrl: 'http://127.0.0.1:28181/v1', virtualHttpServer: 'virtual-http-server-1', virtualHttpOrigin: 'http://127.0.0.1:28181' });
+                        original.close();
+                        results.missingRejected = rejected('bound');
+
+                        begin('foreign-owner');
+                        const foreign = listen(28180);
+                        begin('route-owner');
+                        results.foreignRejected = rejected('bound');
+                        const differentPort = listen(28181);
+                        results.differentPortRejected = rejected('bound');
+                        results.lateBindingRejected = rejected('unbound', 'http://127.0.0.1:28181/v1/test');
+                        const replacement = listen(28180);
+                        results.invalidOriginsRejected = [
+                            'http://127.0.0.1:28181/v1/test',
+                            'http://user:password@127.0.0.1:28180/v1/test',
+                            'https://127.0.0.1:28180/v1/test',
+                            'http://example.com:28180/v1/test',
+                            'http://127.0.0.1:65536/v1/test',
+                            '/v1/test',
+                        ].every(url => rejected('bound', url));
+
+                        const originalURL = globalThis.URL;
+                        const originalParser = globalThis.__pi_url_parse_native;
+                        const originalJSONParse = JSON.parse;
+                        try {
+                            globalThis.URL = function() { return { protocol: 'http:', hostname: '127.0.0.1', port: '28180' }; };
+                            globalThis.__pi_url_parse_native = () => '{"protocol":"http:","hostname":"127.0.0.1","port":"28180"}';
+                            JSON.parse = () => ({ protocol: 'http:', hostname: '127.0.0.1', port: '28180' });
+                            results.replacedParsersRejected = rejected('bound', 'https://example.com/v1/test');
+                        } finally {
+                            globalThis.URL = originalURL;
+                            globalThis.__pi_url_parse_native = originalParser;
+                            JSON.parse = originalJSONParse;
+                        }
+                        const stream = __pi_virtual_http_start(__pi_test_secret, 'bound', { url: 'http://127.0.0.1:28180/v1/test' });
+                        original.close();
+                        original.cancelRequests();
+                        const first = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        const last = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        results.replacementStatus = first.value.status;
+                        results.completed = last.done;
+                        results.staleHandleCancelledReplacement = results.cancelled === true;
+                        replacement.close();
+                        differentPort.close();
+                        begin('foreign-owner');
+                        foreign.close();
+                        __pi_end_extension(__pi_test_secret);
+                        const counts = __pi_runtime_registry_snapshot(__pi_test_secret);
+                        results.servers = counts.virtualHttpServers;
+                        results.requests = counts.virtualHttpRequests;
+                        results.streams = counts.providerStreams;
+                        globalThis.virtualRestartResult = results;
+                    })();
+                    "#,
+                ))
+                .await
+                .expect("eval route restart isolation");
+            runtime.drain_microtasks().await.expect("drain");
+            assert_eq!(
+                get_global_json(&runtime, "virtualRestartResult").await,
+                json!({
+                    "missingRejected": true,
+                    "foreignRejected": true,
+                    "differentPortRejected": true,
+                    "lateBindingRejected": true,
+                    "invalidOriginsRejected": true,
+                    "replacedParsersRejected": true,
+                    "replacementStatus": 201,
+                    "completed": true,
+                    "staleHandleCancelledReplacement": false,
+                    "servers": 0,
+                    "requests": 0,
+                    "streams": 0,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
         });
     }
 

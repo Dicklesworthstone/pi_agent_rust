@@ -135,6 +135,12 @@ function createRuntime({baselineUndici=false,extensionId=EXTENSION}={}){
   __pi_bridge_secret_matches_native:candidate=>candidate===SECRET,__pi_owner_extension_id_native:()=>extensionId,
   __pi_process_cwd_native:()=>CWD,__pi_process_args_native:()=>['pi'],__pi_process_platform_native:()=>WINDOWS?'win32':'linux',
   __pi_process_execpath_native:()=>CWD+'/pi'+(WINDOWS?'.exe':''),__pi_env_get_native:key=>env[key]??null,__pi_now_ms_native:()=>now,
+  __pi_url_parse_native:(input,base)=>{
+   try{
+    const url=base===null?new URL(input):new URL(input,base),fragment=url.href.indexOf('#'),query=url.href.indexOf('?');
+    return JSON.stringify({href:url.href,protocol:url.protocol,hasAuthority:url.href.startsWith(url.protocol+'//'),hostname:url.hostname,host:url.host,port:url.port,username:url.username,password:url.password,pathname:url.pathname,search:query>=0&&(fragment<0||query<fragment)?url.href.slice(query,fragment<0?undefined:fragment):'',hash:fragment>=0?url.href.slice(fragment):'',origin:url.origin});
+   }catch{return undefined;}
+  },
   __pi_crypto_random_uuid_native:()=>crypto.randomUUID(),
   __pi_crypto_timing_safe_equal_native:(a,b)=>crypto.timingSafeEqual(Buffer.from(a),Buffer.from(b)),
   __pi_crypto_random_bytes_native:length=>Array.from(crypto.randomBytes(length)),
@@ -178,6 +184,12 @@ function createRuntime({baselineUndici=false,extensionId=EXTENSION}={}){
  vm.runInContext(embedded.bridge,context,{filename:'exact-pijs-bootstrap.js',timeout:3000});
  context.__pi_begin_extension(SECRET,extensionId,{name:'pi-freeflow',version:'1.39.0'});
  return{context,calls,canceled,diagnostics,timers,moduleCache,execAttempts,setResponder:fn=>{respond=fn;},
+  failHttpStream(id,code,message){
+   id=String(id);
+   if(!httpStreams.delete(id))throw Error('No active controlled HTTP stream: '+id);
+   deliver(id,{ok:false,code,message});
+  },
+  activeHttpStreamCount:()=>httpStreams.size,
   async module(specifier){const module=getModule(specifier);if(module.status==='unlinked')await module.link(linker);if(module.status==='linked')await module.evaluate({timeout:3000});return module.namespace;},
   async load(relative){const root='file://'+(WINDOWS?'/':'')+PKG+'/'+relative,module=getModule(root);if(module.status==='unlinked')await module.link(linker);if(module.status==='linked')await module.evaluate({timeout:3000});return module.namespace;},
   async advance(ms){now+=ms;for(const[id,timer]of[...timers])if(timer.at<=now){timers.delete(id);context.__pi_fire_timer(SECRET,id);}await flush();},
@@ -199,6 +211,30 @@ async function main(){
  assert.equal(provider.models.length,35);assert.equal(typeof provider.virtualHttpServer,'string');
  assert.equal(extension.slash_commands.some(command=>command.name==='freeflow'),true);
  console.log('PASS exact upstream extension activation, /freeflow command, 35 models and owned virtual provider transport ('+(WINDOWS?'Windows':'POSIX')+' path projection)');
+ assert.equal(provider.compat.supportsDeveloperRole,false);
+ const catJam=provider.models.find(model=>model.id==='cat-jam-free');
+ assert.equal(catJam.compat.supportsReasoningEffort,true);assert.equal(catJam.thinkingLevelMap.max,'max');assert.equal(catJam.thinkingLevelMap.minimal,null);
+ const dots=provider.models.find(model=>model.id==='dots-studio/dots-3-note-preview:free');
+ assert.equal(dots.compat.thinkingFormat,'openrouter');assert.equal(dots.thinkingLevelMap.max,null);
+ const ovh=provider.models.find(model=>model.id==='ovh-free/gpt-oss-120b');
+ assert.equal(ovh.compat.supportsReasoningEffort,true);assert.equal(ovh.thinkingLevelMap.low,'low');assert.equal(ovh.thinkingLevelMap.medium,null);
+ console.log('PASS exact upstream provider compatibility and model-specific reasoning contracts');
+ const origin=new URL(provider.baseUrl).origin;
+ const health=await bounded(r.context.fetch(origin+'/health'));
+ assert.equal(health.status,200,'the active proxy must answer its unauthenticated identity probe');
+ assert.deepEqual(JSON.parse(await health.text()),{ok:true,service:'pi-freeflow',port:28180,version:'1.39.0'});
+ const denied=await bounded(r.context.fetch(origin+'/_health'));
+ assert.equal(denied.status,401);await denied.text();
+ const headers={authorization:'Bearer '+provider.apiKey,'content-type':'application/json'};
+ for(const action of ['attach','heartbeat','detach']){
+  const response=await bounded(r.context.fetch(origin+'/_client/'+action,{method:'POST',headers,body:JSON.stringify({id:'compat-probe-client'})}));
+  assert.equal(response.status,200,'authenticated client '+action+' must reach its control handler');
+  assert.equal((await response.json()).ok,true);
+ }
+ const client=await r.load('src/client.ts');
+ assert.equal(await bounded(client.ensureDaemon()),28180,'a healthy proxy must be reused without walking to another port');
+ assert.equal(r.context.__pi_runtime_registry_snapshot(SECRET).virtualHttpServers,1);
+ console.log('PASS actual proxy identity, authenticated lease controls and healthy same-port reuse');
 }
 export{createRuntime,flush,bounded,PI,UPSTREAM,PKG,CWD,SECRET};
 
@@ -436,6 +472,19 @@ entry.default(runtime.context.pi).then(()=>{ready=true;},e=>{ready=true;failure=
 for(let i=0;i<120&&!ready;i++)await runtime.advance(100);
 if(failure)throw failure;assert.equal(ready,true);
 const provider=runtime.context.__pi_snapshot_extensions(SECRET)[0].providers.find(p=>p.id==='freeflow');
+const origin=new URL(provider.baseUrl).origin;
+const stopped=await bounded(runtime.context.fetch(origin+'/_shutdown',{method:'POST',headers:{authorization:'Bearer '+provider.apiKey}}));
+assert.equal(stopped.status,200);assert.equal((await stopped.json()).ok,true);
+await runtime.advance(50);
+let reattached=false,reattachError;
+runtime.context.__pi_dispatch_extension_event(SECRET,'session_start',{type:'session_start'},{hasUI:false,model:{provider:'freeflow',id:'ovh-free/gpt-oss-20b'}}).then(()=>{reattached=true;},error=>{reattachError=error;reattached=true;});
+for(let i=0;i<120&&!reattached;i++)await runtime.advance(100);
+if(reattachError)throw reattachError;assert.equal(reattached,true,'the actual session lifecycle must finish recovering its proxy');
+const health=await bounded(runtime.context.fetch(origin+'/health'));
+assert.equal(health.status,200);assert.equal((await health.json()).port,28180);
+const recovered=runtime.context.__pi_snapshot_extensions(SECRET)[0].providers.find(p=>p.id==='freeflow');
+assert.equal(recovered.virtualHttpServer,provider.virtualHttpServer,'same-port upstream recovery does not re-register its provider');
+assert.equal(runtime.context.__pi_runtime_registry_snapshot(SECRET).virtualHttpServers,1);
 const streamText='data: '+JSON.stringify({id:'chatcmpl-fixture',object:'chat.completion.chunk',model:'gpt-oss-20b',choices:[{index:0,delta:{content:'Hello π🙂héllo from actual proxy'},finish_reason:null}]})+'\n\n'+'data: '+JSON.stringify({id:'chatcmpl-fixture',object:'chat.completion.chunk',model:'gpt-oss-20b',choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n'+'data: [DONE]\n\n';
 runtime.calls.length=0;
 runtime.setResponder(entry=>{
@@ -461,6 +510,10 @@ const outboundBody=outbound.body??Buffer.from(outbound.body_bytes,'base64').toSt
 assert.equal(JSON.parse(outboundBody).model,'gpt-oss-20b');
 assert.equal(outbound.headers?.authorization,undefined);
 console.log('PASS complete actual extension provider -> virtual local proxy -> capability HTTP mock -> streamed completion');
+const counts=runtime.context.__pi_runtime_registry_snapshot(SECRET);
+assert.equal(counts.virtualHttpRequests,0);assert.equal(counts.providerStreams,0);assert.equal(counts.pendingHostcalls,0);
+(await runtime.load('src/client.ts')).stopHeartbeat();
+console.log('PASS actual shutdown -> session-start recovery on the same port -> existing provider streamed completion');
 
 }
 {
@@ -592,5 +645,52 @@ console.log('PASS actual provider cancellation after streamed body closes upstre
  assert.equal(r.calls.length,0);
  console.log('PASS custom TLS and socket options fail before any HTTP hostcall');
 }
+}
+{
+ const runtime=createRuntime(),entry=await runtime.load('extensions/index.ts');
+ let ready=false,failure;
+ entry.default(runtime.context.pi).then(()=>{ready=true;},error=>{ready=true;failure=error;});
+ for(let i=0;i<120&&!ready;i++)await runtime.advance(100);
+ if(failure)throw failure;assert.equal(ready,true);
+ const provider=runtime.context.__pi_snapshot_extensions(SECRET)[0].providers.find(p=>p.id==='freeflow');
+ const relayState=await runtime.load('src/relay-state.ts');
+ const relayA='https://relay-a.example',relayB='https://relay-b.example';
+ relayState.setActiveRelayState({...relayState.resolveRelayState(),enabled:true,url:relayA,mode:'sticky',relays:[{url:relayA},{url:relayB}]},true);
+ const frame=text=>'data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n';
+ const terminal='data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n';
+ runtime.calls.length=0;
+ runtime.setResponder(entry=>{
+  const url=entry.args[0].url;
+  if(url===relayA)return{status:200,headers:{'content-type':'text/event-stream'},chunks:[frame('first-prefix')],open:true};
+  if(url===relayB)return{status:200,headers:{'content-type':'text/event-stream'},chunks:[frame('resumed-tail'),terminal]};
+  return{error:{code:'HTTP_FORBIDDEN',message:'Unscripted host network denied'}};
+ });
+ const request={url:provider.baseUrl+'/chat/completions',method:'POST',headers:{authorization:'Bearer '+provider.apiKey,'content-type':'application/json'},body:JSON.stringify({model:'cat-jam-free',messages:[{role:'user',content:'hello'}],stream:true})};
+ const id=runtime.context.__pi_virtual_http_start(SECRET,'freeflow',request);
+ let body='',status;
+ for(let i=0;i<100&&!body.includes('first-prefix');i++){
+  await runtime.advance(0);
+  const next=await runtime.context.__pi_provider_stream_simple_next(SECRET,id);
+  if(next.value?.status)status=next.value.status;
+  if(next.value?.body_bytes)body+=Buffer.from(next.value.body_bytes,'base64').toString();
+ }
+ assert.equal(status,200);assert.match(body,/first-prefix/);assert.equal(runtime.calls.length,1);
+ assert.equal(runtime.activeHttpStreamCount(),1);
+ // Model the native transport's terminal error after headers and one body
+ // chunk. Its bookkeeping closes before the real bridge receives the error.
+ runtime.failHttpStream(runtime.calls[0].id,'HTTP_IO','Controlled mid-body disconnect');
+ let done=false;
+ for(let i=0;i<300;i++){
+  await runtime.advance(0);
+  const next=await runtime.context.__pi_provider_stream_simple_next(SECRET,id);
+  if(next.done){done=true;break;}
+  if(next.value?.body_bytes)body+=Buffer.from(next.value.body_bytes,'base64').toString();
+ }
+ assert.equal(done,true);assert.match(body,/resumed-tail/);assert.match(body,/\[DONE\]/);
+ assert.deepEqual(runtime.calls.map(call=>call.args[0].url),[relayA,relayB]);
+ const counts=runtime.context.__pi_runtime_registry_snapshot(SECRET);
+ assert.equal(counts.pendingHostcalls,0);assert.equal(counts.providerStreams,0);assert.equal(counts.virtualHttpRequests,0);
+ assert.equal(runtime.activeHttpStreamCount(),0);
+ console.log('PASS actual Freeflow post-header relay failure refires once, preserves streamed text and releases transports and bridge registries');
 }
 console.log('ALL supplementary exact-source JS probes passed; DSR/Rust/QuickJS remain separately required.');
