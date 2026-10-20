@@ -187,6 +187,7 @@ fn kernel_thread(
         }
         let console = Rc::new(RefCell::new(console::ConsoleCapture::new()));
         context.with(|ctx| install_globals(&ctx, &console, bridge_tx, &deadline, origin));
+        if context.with(|ctx| modules.install_reload(&ctx)).is_err() { return; }
         let Ok(evaluator) = context.with(|ctx| evaluate::Evaluator::new(&ctx)) else { return; };
         let Ok(host) = context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(&stopped))) else { return; };
         let Ok(displays) = context.with(|ctx| display::DisplaySink::install(&ctx, deadline.clone(), origin)) else {

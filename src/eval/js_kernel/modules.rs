@@ -25,6 +25,7 @@ use crate::eval::lifecycle::source;
 
 mod data;
 mod packages;
+mod reload;
 mod typescript;
 
 const MAX_PATH_BYTES: usize = 4096;
@@ -56,6 +57,7 @@ struct Active {
     owner: AgentCx,
     deadline: Instant,
     resolutions: usize,
+    reloaded: bool,
 }
 
 struct State {
@@ -67,6 +69,7 @@ struct State {
     declarations: usize,
     source_bytes: usize,
     packages: packages::Catalog,
+    versions: reload::Versions,
 }
 
 impl State {
@@ -102,6 +105,7 @@ impl ModuleFiles {
             declarations: 0,
             source_bytes: 0,
             packages: packages::Catalog::default(),
+            versions: reload::Versions::default(),
         })))
     }
 
@@ -110,6 +114,7 @@ impl ModuleFiles {
             owner,
             deadline,
             resolutions: 0,
+            reloaded: false,
         });
     }
 
@@ -156,11 +161,10 @@ impl ModuleFiles {
             );
         }
         let root = self.root()?;
-        let base_path = if base == "eval_script" {
-            root.join("__pi_eval_cell__.js")
-        } else {
-            PathBuf::from(base)
-        };
+        // Native module identities can include a reload generation. Recover
+        // importer paths only from our admitted table, never by stripping a
+        // guest-supplied URL/query suffix. Old modules retain their graph.
+        let (base_path, generation) = self.importer(base, &root);
         if !base_path.is_absolute() || !base_path.starts_with(&root) {
             return Err("EVAL_MODULE_BASE: importer is not a workspace script".into());
         }
@@ -198,13 +202,15 @@ impl ModuleFiles {
             .ok_or("EVAL_MODULE_PATH: module path is not bounded UTF-8")?
             .to_owned();
         let mut state = self.0.borrow_mut();
-        if !state.approved.contains(&resolved) && state.approved.len() >= MAX_MODULES {
+        let identity = reload::identity(&resolved, generation);
+        if !state.approved.contains(&identity) && state.approved.len() >= MAX_MODULES {
             return Err(
                 "EVAL_MODULE_LIMIT: module catalog exhausted; reset JavaScript to clear it".into(),
             );
         }
-        state.approved.insert(resolved.clone());
-        Ok(resolved)
+        state.versions.remember(identity.clone(), resolved, generation);
+        state.approved.insert(identity.clone());
+        Ok(identity)
     }
 
     fn read_module(&self, name: &str) -> Admission<source::Source> {
@@ -224,28 +230,29 @@ impl ModuleFiles {
             // failure; repeating it must not create an unbounded host loop.
             state.declarations += 1;
         }
+        let path = self.module_path(name)?;
         let root = self.root()?;
-        let loaded = if module_language(Path::new(name)) == Some(ModuleLanguage::Text) {
-            source::load_verbatim_sync(&root, Path::new(name))
+        let loaded = if module_language(Path::new(&path)) == Some(ModuleLanguage::Text) {
+            source::load_verbatim_sync(&root, Path::new(&path))
         } else {
-            source::load_sync(&root, Path::new(name))
+            source::load_sync(&root, Path::new(&path))
         };
         let mut source = loaded.map_err(|error| format!("EVAL_MODULE_READ: {error}"))?;
         {
             let state = self.0.borrow();
             state.check()?;
         }
-        if source.path != name {
+        if source.path != path {
             return Err("EVAL_MODULE_CHANGED: module target changed after resolution".into());
         }
         let original_bytes = source.code.len();
         if original_bytes > MAX_SOURCE_BYTES.saturating_sub(self.0.borrow().source_bytes) {
             return Err("EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript".into());
         }
-        if module_language(Path::new(name)) == Some(ModuleLanguage::TypeScript) {
+        if module_language(Path::new(&path)) == Some(ModuleLanguage::TypeScript) {
             // Reuse the same compiler as typed scripts, retaining native ESM
             // linking. No registry borrow crosses the compiler boundary.
-            source.code = typescript::transpile(Path::new(name), &source.code)?;
+            source.code = typescript::transpile(Path::new(&path), &source.code)?;
             self.0.borrow().check()?;
         }
         let mut state = self.0.borrow_mut();
@@ -323,7 +330,9 @@ impl Resolver for ModuleFiles {
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         // A package subpath can export data without a suffix in its public
         // name. Validate the actual target, including on cached resolution.
-        validate_attributes(ctx, &resolved, attributes)?;
+        let path = self.module_path(&resolved)
+            .map_err(|error| Exception::throw_message(ctx, &error))?;
+        validate_attributes(ctx, &path, attributes)?;
         Ok(resolved)
     }
 }
@@ -335,20 +344,22 @@ impl Loader for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
-        validate_attributes(ctx, name, attributes)?;
+        let path = self.module_path(name)
+            .map_err(|error| Exception::throw_message(ctx, &error))?;
+        validate_attributes(ctx, &path, attributes)?;
         let source = self
             .read_module(name)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         // Linking can recursively invoke our callbacks. Do not retain a
         // RefCell borrow (or any open file) across the engine boundary.
-        let module = match module_language(Path::new(name)) {
+        let module = match module_language(Path::new(&path)) {
             Some(ModuleLanguage::Json) => data::declare_json(ctx, name, &source.code)?,
             Some(ModuleLanguage::Text) => data::declare_text(ctx, name, &source.code)?,
             _ => Module::declare(ctx.clone(), name, source.code)?,
         };
         self.0.borrow().check()
             .map_err(|error| Exception::throw_message(ctx, &error))?;
-        let url = url::Url::from_file_path(name).map_err(|()| {
+        let url = url::Url::from_file_path(&path).map_err(|()| {
             Exception::throw_message(
                 ctx,
                 "EVAL_MODULE_PATH: cannot represent module file URL",
