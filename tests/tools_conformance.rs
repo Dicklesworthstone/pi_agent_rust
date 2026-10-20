@@ -51,6 +51,106 @@ impl Drop for UnixModeGuard {
 mod read_tool {
     use super::*;
 
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn json_read_filters_pages_and_keeps_source_edit_anchors_separate() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let source = r#"{"items":[{"id":12345678901234567890,"name":"Ada","active":true},{"id":2,"name":"Grace","active":false},{"id":3,"name":"Lin","active":true}]}"#;
+            std::fs::write(directory.path().join("data.json"), source).unwrap();
+            std::fs::write(
+                directory.path().join("events.jsonl"),
+                "{\"name\":\"Ada\"}\n{\"name\":\"Grace\"}\n{\"name\":\"Lin\"}\n",
+            )
+            .unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let result = tool
+                .execute(
+                    "integer",
+                    serde_json::json!({"path":"data.json?q=.items[0].id"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&result.content).contains("12345678901234567890"));
+            let result = tool
+                .execute(
+                    "filter",
+                    serde_json::json!({"path":"data.json?q=.items | map(select(.active)) | map(.name)&compact=true"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("[\"Ada\",\"Lin\"]"));
+            assert!(!text.contains("Grace"));
+            let result = tool
+                .execute(
+                    "page",
+                    serde_json::json!({"path":"events.jsonl?q=.name&raw=true&limit=1&offset=1"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("Grace"));
+            assert!(!text.contains("Ada"));
+            assert!(!text.contains("Lin"));
+            assert_eq!(
+                result.details.as_ref().unwrap()["pagination"]["nextOffset"],
+                2
+            );
+            let error = tool
+                .execute(
+                    "anchors",
+                    serde_json::json!({"path":"data.json?q=.","hashline":true}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("JSON_QUERY_HASHLINE"));
+            let raw = tool
+                .execute(
+                    "source",
+                    serde_json::json!({"path":"data.json","hashline":true}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&raw.content).contains("1#"));
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("data.json")).unwrap(),
+                source
+            );
+        });
+    }
+
+    #[test]
+    fn json_query_sources_still_enforce_workspace_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(
+                outside.path().join("private.json"),
+                "{\"secret\":true}",
+            )
+            .unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let path = format!(
+                "{}?q=.secret",
+                outside.path().join("private.json").display()
+            );
+            let error = tool
+                .execute("outside", serde_json::json!({"path":path}), None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Cannot read outside"),
+                "{error}"
+            );
+        });
+    }
+
     #[test]
     fn test_read_existing_file() {
         asupersync::test_utils::run_test(|| async {

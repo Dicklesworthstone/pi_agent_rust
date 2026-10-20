@@ -34,6 +34,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+mod structured_json;
+
+/// Run an internal, resource-bounded data query before normal Pi startup.
+/// The worker receives admitted bytes and never loads project configuration,
+/// extensions, credentials, or another agent session.
+#[doc(hidden)]
+pub fn run_structured_read_worker_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != "--internal-json-query" {
+        return None;
+    }
+    if args.next().is_some() {
+        return Some(2);
+    }
+    Some(structured_json::run_json_worker())
+}
+
 // ============================================================================
 // Tool Trait
 // ============================================================================
@@ -6499,6 +6516,82 @@ where
 }
 
 impl ReadTool {
+    async fn execute_json_query(
+        &self,
+        input: &ReadInput,
+        request: structured_json::QueryRequest,
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "read",
+                "[JSON_QUERY_HASHLINE] Query results are not source edit anchors; read the source path without q for hashline edits",
+            ));
+        }
+        let source = request.source_path.clone();
+        let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome = crate::url_read::fetch(
+                &source,
+                policy,
+                crate::url_read::UrlReadMode::SourceUtf8,
+            )
+            .await?;
+            if outcome.download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[JSON_QUERY_INCOMPLETE] Cannot query a truncated download",
+                ));
+            }
+            outcome.content.into_bytes()
+        } else if crate::url_router::has_scheme(&source) {
+            crate::url_router::resolve(&source, &self.cwd)?
+                .content
+                .into_bytes()
+        } else {
+            let archive = crate::archive_read::parse_path(&source)?;
+            let source_path = archive.as_ref().map_or(source.as_str(), |archive| {
+                archive.archive_path.as_str()
+            });
+            let path = resolve_read_path(source_path, &self.cwd);
+            let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
+            let mut roots = self.workspace.snapshot_or(&self.cwd).all();
+            roots.push(Config::global_dir());
+            asupersync::runtime::spawn_blocking_io(move || -> Result<Vec<u8>> {
+                let file = open_regular_file_within_roots_with(&path, &roots, || {})
+                    .map_err(|error| Error::tool("read", error.to_string()))?;
+                if let Some(archive) = archive {
+                    let outcome = crate::archive_read::read_open_file(file, &archive.member)?;
+                    if outcome.is_directory {
+                        return Err(Error::tool(
+                            "read",
+                            "[JSON_QUERY_SOURCE] Select a JSON archive member, not a directory",
+                        ));
+                    }
+                    Ok(outcome.content.into_bytes())
+                } else {
+                    read_open_file_capped_at(&file, structured_json::MAX_INPUT_BYTES as u64)
+                        .map_err(|error| {
+                            Error::tool(
+                                "read",
+                                format!("[JSON_QUERY_SOURCE] Cannot read JSON within the 10 MiB input limit: {error}"),
+                            )
+                        })
+                }
+            })
+            .await?
+        };
+        let mut outcome = structured_json::execute(request, bytes).await?;
+        outcome.metadata["source"] = serde_json::json!(source);
+        outcome.metadata["rendered"] = serde_json::json!(true);
+        let mut output = document_read_output(input, &outcome.content, outcome.metadata, true)?;
+        output.is_error = outcome.is_error;
+        Ok(output)
+    }
+
     /// Internal-scheme reads (bd-cv653.6.3): resolve via the URL router,
     /// then apply the same line-window/truncation contract as text files.
     async fn execute_scheme_read(&self, input: &ReadInput) -> Result<ToolOutput> {
@@ -6729,7 +6822,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). DOCX and PPTX render document and slide text; XLSX renders named worksheets with cell coordinates and saved formula results. EPUB renders book metadata and chapters in reading order. Notebooks render saved cells, results, and errors without execution. PDF extraction requires the url-pdf build feature. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member, without extraction. Use raw=true for original source text; rendered documents and archive members do not provide hashline edit anchors. Images are sent as attachments. Output is limited to 2000 lines or 1MB; use offset/limit to continue. Document offsets address rendered text."
+        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6738,7 +6831,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path (relative or absolute), archive.zip:member/path, http(s) document URL, or internal resource URL"
+                    "description": "File path, archive.zip:member/path, http(s) document URL, internal resource URL, or JSON/JSONL source?q=<jq filter>. Query parameters include raw, compact, limit, and offset. Encode literal filter ampersands as %26; + remains arithmetic."
                 },
                 "offset": {
                     "type": "integer",
@@ -6754,7 +6847,7 @@ impl Tool for ReadTool {
                 },
                 "raw": {
                     "type": "boolean",
-                    "description": "Read original source text instead of converting a document. Use with hashline=true when editing notebook JSON. Local HTML and ordinary text files already return source text."
+                    "description": "Read original source text instead of converting a document or querying JSON. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
                 }
             },
             "required": ["path"]
@@ -6785,6 +6878,12 @@ impl Tool for ReadTool {
             return Err(Error::validation(
                 "`offset` must be non-negative".to_string(),
             ));
+        }
+
+        if !input.raw
+            && let Some(request) = structured_json::parse_path(&input.path)?
+        {
+            return self.execute_json_query(&input, request).await;
         }
 
         // URL reads (bd-cv653.2.2): http(s) paths fetch + convert to

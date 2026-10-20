@@ -244,6 +244,12 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
 
+# Native jq-compatible Read filters run in resource-bounded Pi workers.
+jaq-core = "=3.1.1"
+jaq-std = "=3.0.3"
+jaq-json = "=2.0.3"
+jaq-fmts = { version = "=0.1.1", default-features = false, features = ["tabular"] }
+
 # Error handling
 anyhow = "1.0.104"
 thiserror = "2"

@@ -54,6 +54,9 @@ impl UrlContentKind {
 pub enum UrlReadMode {
     Reader,
     Raw,
+    /// Resolve source URLs and require exact UTF-8 without document conversion.
+    /// Querying must never silently replace malformed source bytes.
+    SourceUtf8,
 }
 
 /// A fetched URL read rendered for tool output.

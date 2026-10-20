@@ -151,7 +151,7 @@ impl Route {
 
     fn enter(&mut self) -> Result<()> {
         self.remember()?;
-        if self.mode == UrlReadMode::Reader
+        if self.mode != UrlReadMode::Raw
             && let Some(raw) = github_blob_to_raw(self.current.as_str())
         {
             self.current = http_url(&raw)?;
@@ -171,6 +171,22 @@ impl Route {
     }
 
     fn finish(&self, content_type: &str, bytes: &[u8], truncated: bool) -> Result<UrlReadOutcome> {
+        if self.mode == UrlReadMode::SourceUtf8 {
+            let content = std::str::from_utf8(bytes)
+                .map_err(|_| error("JSON_QUERY_ENCODING", "query source is not valid UTF-8"))?;
+            return Ok(UrlReadOutcome {
+                content: content.to_owned(),
+                kind: UrlContentKind::PlainText,
+                extractor: if self.github_source {
+                    "github-blob-raw"
+                } else {
+                    "raw"
+                },
+                final_url: self.current.as_str().to_owned(),
+                wire_content_type: content_type.to_owned(),
+                download_truncated: truncated,
+            });
+        }
         if self.mode == UrlReadMode::Raw {
             return Ok(super::raw_bytes(self.current.as_str(), content_type, bytes, truncated));
         }

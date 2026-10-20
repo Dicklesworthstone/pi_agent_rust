@@ -1,4 +1,6 @@
-# Read DOCX, PPTX, XLSX, and EPUB documents
+# Read documents and JSON data
+
+The same `read` tool handles document text and structured data. For JSON/JSONL filters, see [JSON and JSONL queries](#json-and-jsonl-queries) below.
 
 The `read` tool extracts saved text from local Word documents, PowerPoint presentations, Excel workbooks, and EPUB books, and from document URLs. Conversion runs natively in the default build; it does not need an installed Office application, a conversion service, or an additional build feature.
 
@@ -116,3 +118,44 @@ This reader extracts document-body text, slide-part text, saved worksheet cell v
 
 The native converter is implemented in [`src/document_read.rs`](../../src/document_read.rs), with Excel handling in [`src/document_read/xlsx.rs`](../../src/document_read/xlsx.rs) and EPUB handling in [`src/document_read/epub.rs`](../../src/document_read/epub.rs). Generated DOCX/PPTX/XLSX/EPUB ZIP fixtures cover text output, ordering, encodings, sparse coordinates, cached values, malformed packages, and resource bounds. ZIP validation is shared with [`src/archive_read.rs`](../../src/archive_read.rs).
 
+
+## JSON and JSONL queries
+
+Append `?q=` or `?query=` to a `.json`, `.jsonl`, or `.ndjson` source to evaluate a jq-compatible filter with the native jaq engine. Filters support selection, projection, arithmetic, grouping, sorting, reductions, definitions, regular expressions, and CSV/TSV formatting. Selected integer and decimal literals retain their original precision when no arithmetic changes them; calculations follow jaq's numeric semantics.
+
+```json
+{"path":"data/users.json?q=.users[] | select(.active) | {id, name}"}
+```
+
+```json
+{"path":"events.jsonl?q=.message&raw=true&limit=20&offset=0"}
+```
+
+```json
+{"path":"archive.zip:data/orders.json?q=group_by(.region) | map({region: .[0].region, total: (map(.amount) | add)})&compact=true"}
+```
+
+Queries accept local files, admitted UTF-8 ZIP members, supported internal resources, and HTTP(S) source URLs. GitHub blob URLs resolve to raw source. Existing URL admission, redirects, and workspace scope checks apply; invalid UTF-8 and truncated downloads are errors. JSONL is processed as a stream of JSON values, and `inputs` shares that stream with the main filter.
+
+`&raw=true` prints returned strings without JSON quotes; `&compact=true` suppresses JSON indentation. Query `offset` is zero-based. Supplying either query `offset` or `limit` enables result pagination, with a default limit of 100 and a maximum of 1,000. A single returned array pages its members; a stream pages its whole returned values. The response supplies a continuation path when more results exist. The tool's separate JSON properties `offset` and `limit` still page rendered **lines**, starting at one.
+
+Encode a literal `&` inside a filter as `%26` and an encoded percent sign as `%25`. A literal `+` remains the arithmetic operator; it is not converted to a space. For example, `numbers.json?q=.value+1` adds one. File imports are disabled, and `env`/`$ENV` expose an empty object. Bounded diagnostics and runtime-error counts accompany partial output; later JSONL inputs can still produce results after a filter error.
+
+To edit source JSON, read the source path without query selectors and request `hashline: true`. Query results have no source edit anchors. The tool property `raw: true` bypasses conversion/query handling entirely; it differs from the query parameter `&raw=true`.
+
+### Query limits and availability
+
+Native queries run in a supervised Pi subprocess with a 30-second deadline, a 1 GiB address-space ceiling, and bounded pipe capture. Up to four workers can run concurrently. A worker starts before normal configuration, authentication, or extension loading, receives the already-admitted source bytes, and exits after one query. SDK applications must install the `pi` executable beside their executable for this worker path.
+
+Hard process memory limits currently require a supported Unix platform; Linux and macOS 13 or newer are supported. Windows, OpenBSD, and older macOS versions return an explicit unsupported-limit error. Ordinary reads remain available there.
+
+| Query resource | Limit |
+| --- | ---: |
+| JSON source input | 10 MiB |
+| Filter text | 16 KiB |
+| Query parameters | 64 KiB |
+| Source nesting | 256 levels |
+| Rendered query output | 5 MiB |
+| Diagnostic tail | 8 KiB |
+
+The normal Read response limit of 2,000 lines or 1,000,000 bytes still applies after query evaluation. Narrow a filter or use result pagination to reduce evaluation work; display-line pagination alone does not change the query.

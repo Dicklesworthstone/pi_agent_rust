@@ -229,6 +229,10 @@ fn main() {
         std::process::exit(exit_code);
     }
 
+    if let Some(exit_code) = pi::tools::run_structured_read_worker_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     // On Windows CMD.exe, ANSI escape sequences render as garbage (e.g. "←[92m")
     // unless we call SetConsoleMode with ENABLE_VIRTUAL_TERMINAL_PROCESSING first.
     // This must happen before any colored output. Silently ignored on non-Windows

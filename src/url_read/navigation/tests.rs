@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn structured_sources_resolve_github_and_require_exact_utf8() {
+    let route = Route::new(
+        "https://github.com/team/repo/blob/main/data.json",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::SourceUtf8,
+    )
+    .unwrap();
+    let source = br#"{"markup":"<script>saved source</script>","id":12345678901234567890}"#;
+    let output = route.finish("text/html", source, false).unwrap();
+    assert_eq!(output.content.as_bytes(), source);
+    assert_eq!(output.extractor, "github-blob-raw");
+    assert_eq!(
+        output.final_url,
+        "https://raw.githubusercontent.com/team/repo/main/data.json"
+    );
+    let error = route
+        .finish("application/json", b"{\"name\":\"\xff\"}", false)
+        .unwrap_err();
+    assert!(error.to_string().contains("JSON_QUERY_ENCODING"));
+}
+
+#[test]
 fn github_read_plans_raw_io_not_a_placeholder() {
     let route = Route::new("https://github.com/team/repo/blob/feat%2Fone/src/a%20b.rs?plain=1#L20",
         SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
