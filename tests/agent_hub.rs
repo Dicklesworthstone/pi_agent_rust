@@ -11,9 +11,102 @@
 use std::process::{Command, Stdio};
 
 use pi::agent_hub::{self, ChildStatus};
+use pi::tools::Tool as _;
 
 /// Serialize registry-mutating tests: the registry is process-global.
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn public_reply_wait_observes_a_message_arriving_during_its_last_slice() {
+    let _guard = LOCK.lock().expect("lock");
+    let dir = tempfile::tempdir().expect("hub directory");
+    let peer = {
+        let mut hub = agent_hub::registry().lock().expect("hub");
+        hub.set_dir_for_tests(dir.path().to_path_buf());
+        let peer = hub.register("wait-final-slice", "answer").unwrap();
+        hub.mark_running(&peer.id, std::process::id());
+        peer
+    };
+    asupersync::test_utils::run_test(|| async {
+        let tool = pi::tools::HubTool::new(dir.path());
+        let wait = tool.execute(
+            "wait-for-reply",
+            serde_json::json!({
+                "op": "agent", "action": "wait", "name": peer.id, "waitMs": 50
+            }),
+            None,
+        );
+        futures::pin_mut!(wait);
+        // Poll once to take the initial empty snapshot and enter its only
+        // sleep. Publication is deterministic, without a wall-clock assertion.
+        assert!(futures::poll!(&mut wait).is_pending());
+        let reply = {
+            let mut hub = agent_hub::registry().lock().expect("hub");
+            let reply = hub
+                .bus_send("parent", &peer.id, "ready in the last slice")
+                .unwrap();
+            hub.settle(&peer.id, ChildStatus::Done);
+            reply
+        };
+        let output = wait.await.expect("wait output");
+        assert!(!output.is_error);
+        let details = output.details.expect("wait details");
+        assert_eq!(details["schema"], "pi.agent-hub.wait/v1");
+        assert_eq!(details["status"], "messages");
+        assert_eq!(details["messages"][0]["seq"], reply.seq);
+        assert_eq!(details["peerStatus"], "done");
+        assert!(
+            agent_hub::registry()
+                .lock()
+                .unwrap()
+                .inbox("parent")
+                .iter()
+                .any(|message| message.seq == reply.seq)
+        );
+    });
+}
+
+#[test]
+fn public_reply_wait_times_out_without_consuming_unrelated_messages() {
+    let _guard = LOCK.lock().expect("lock");
+    let dir = tempfile::tempdir().expect("hub directory");
+    let (peer, unrelated) = {
+        let mut hub = agent_hub::registry().lock().expect("hub");
+        hub.set_dir_for_tests(dir.path().to_path_buf());
+        let peer = hub.register("wait-timeout", "still working").unwrap();
+        hub.mark_running(&peer.id, std::process::id());
+        let unrelated = hub
+            .bus_send("parent", "some-other-worker", "not this reply")
+            .unwrap();
+        (peer, unrelated)
+    };
+    asupersync::test_utils::run_test(|| async {
+        let tool = pi::tools::HubTool::new(dir.path());
+        let output = tool
+            .execute(
+                "wait-timeout",
+                serde_json::json!({
+                    "op": "agent", "action": "wait", "name": peer.id,
+                    "cursor": unrelated.seq - 1, "waitMs": 5
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["status"], "timedOut");
+        assert_eq!(details["nextCursor"], unrelated.seq);
+        assert!(details["messages"].as_array().unwrap().is_empty());
+    });
+    let mut hub = agent_hub::registry().lock().unwrap();
+    assert!(
+        hub.inbox("parent")
+            .iter()
+            .any(|message| message.seq == unrelated.seq)
+    );
+    hub.settle(&peer.id, ChildStatus::Done);
+}
 
 fn test_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("pi-agent-hub-it-{tag}-{}", std::process::id()));

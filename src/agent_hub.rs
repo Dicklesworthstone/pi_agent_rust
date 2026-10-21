@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub mod ipc;
+mod wait;
+
+pub use wait::{InboxWaitResult, InboxWaitStatus, wait_for_peer};
 
 /// Maximum transcript bytes paged back per `transcript` call.
 const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
@@ -158,6 +161,9 @@ pub struct AgentHubRegistry {
     /// Per-recipient delivered/queued bus messages (in-memory view; the
     /// on-disk steer files are the cross-process channel).
     bus: BTreeMap<String, VecDeque<BusMessage>>,
+    /// Last evicted delivery in each inbox. Global sequence numbers are not
+    /// contiguous per recipient, so oldest retained alone cannot prove loss.
+    dropped_bus_through: BTreeMap<String, u64>,
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
@@ -535,8 +541,10 @@ impl AgentHubRegistry {
         append_steer_line(&entry.steer_path, &message)?;
         self.bus_seq = seq;
         let queue = self.bus.entry(id.to_string()).or_default();
-        if queue.len() >= MAX_QUEUE_PER_CHILD {
-            queue.pop_front();
+        if queue.len() >= MAX_QUEUE_PER_CHILD
+            && let Some(dropped) = queue.pop_front()
+        {
+            self.dropped_bus_through.insert(id.to_string(), dropped.seq);
         }
         queue.push_back(message.clone());
         Ok(message)
@@ -571,8 +579,11 @@ impl AgentHubRegistry {
         }
         self.bus_seq = seq;
         let queue = self.bus.entry("parent".to_string()).or_default();
-        if queue.len() >= MAX_QUEUE_PER_CHILD {
-            queue.pop_front();
+        if queue.len() >= MAX_QUEUE_PER_CHILD
+            && let Some(dropped) = queue.pop_front()
+        {
+            self.dropped_bus_through
+                .insert("parent".to_string(), dropped.seq);
         }
         queue.push_back(message.clone());
         Ok(message)

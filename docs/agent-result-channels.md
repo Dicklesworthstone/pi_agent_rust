@@ -22,7 +22,61 @@ background listener, or expose host filesystem paths as result references.
 Invalid, partial, expired or revoked channel configuration fails; it never
 falls back to an unrelated local registry with colliding display IDs.
 
-## Acceptance and privacy
+## Waiting for peer replies
+
+After sending a question to a native worker, the parent can wait for its reply
+through the same `hub` tool. Use the actual run ID and the sequence returned by
+the send:
+
+```json
+{"op":"agent","action":"send","name":"scout-1","text":"Which files own authentication?"}
+{"op":"agent","action":"wait","name":"scout-1","cursor":17,"waitMs":30000}
+```
+
+Here `17` is an example; replace it with the send result's `seq`. A native
+worker can use the same operation to await a sibling or `"name":"parent"`.
+The authenticated caller determines the inbox being read. `name` identifies
+the sender whose replies are wanted, and cannot grant access to another
+worker's inbox. A root caller reads only its parent inbox.
+
+The result has schema `pi.agent-hub.wait/v1` and one of these statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `messages` | New messages from the named peer are available. |
+| `peerStopped` | The peer finished, failed, or was killed without a newer retained reply. |
+| `historyLost` | Retention evicted messages after the requested cursor; an answer may have been lost. |
+| `timedOut` | The requested wait ended with no matching reply observed. The peer may still be working. |
+
+Results include `messages`, `nextCursor`, `hasMore`, `oldestCursor`,
+`droppedThroughCursor`, and the peer's known status. Continue a paged read with
+`nextCursor` and the **same peer**. A nonzero `droppedThroughCursor` reports a
+retention gap even when some newer replies are returned. Omitting `cursor`
+starts at the beginning of retained history. Correlation uses sender and
+sequence, not an inferred relationship between the message bodies.
+
+`waitMs` defaults to 30 seconds and must be between 1 and 60,000 milliseconds.
+The caller's cancellation and tighter inherited deadline still apply. Waiting
+never sends or replays a question, consumes a message, starts a model turn, or
+revives a finished child. Reading the inbox later still returns those messages.
+A terminal peer's retained replies are returned before `peerStopped`.
+
+Native workers use bounded read-only probes on their existing parent channel;
+root callers read the local registry. Ordinary lock contention retries inside
+the original budget. Authentication, revocation, broken channels and earlier
+transport timeouts remain errors. No registry lock is held while waiting, and
+no listener or helper thread is added. This is an explicit reply wait; it does
+not infer dependency cycles between workers. Child replies arriving after the
+last completed probe remain available in the next wait or inbox read.
+
+The regression coverage includes sender filtering, ordered byte-bounded
+pagination, actual eviction versus sequence gaps, authenticated inbox ownership,
+terminal peers, cancellation/deadline handling, ordinary IPC wait expiry, and
+public `HubTool` delivery during the final wait interval. These Rust regressions
+were authored but could not be executed in the implementation environment;
+the required DSR compiler/test lanes need the configured RCH fleet.
+
+## Result acceptance and privacy
 
 The parent resolves the request through the same native result cache and URL
 projection logic as a parent-side read. Successful schema-validated fields

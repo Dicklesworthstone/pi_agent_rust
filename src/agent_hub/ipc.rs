@@ -43,6 +43,8 @@ pub enum Action {
     Roster,
     Send,
     Inbox,
+    /// Read-only probe used by the caller's bounded reply-wait loop.
+    Wait,
 }
 
 /// Public tool inputs, excluding the channel credential.
@@ -78,6 +80,9 @@ pub enum Reply {
         has_more: bool,
         #[serde(rename = "oldestCursor")]
         oldest_cursor: u64,
+    },
+    Wait {
+        result: super::InboxWaitResult,
     },
 }
 
@@ -147,11 +152,36 @@ pub async fn call_from_env(request: Request) -> Result<Option<Reply>> {
     call(&owner, address, token, request).await.map(Some)
 }
 
+/// Reply waits may repeat read-only probes, but each exchange remains inside
+/// the original wait budget. Mutating sends never use this retry-free loop.
+pub(super) async fn call_from_env_bounded(
+    owner: &AgentCx,
+    request: Request,
+    remaining: Duration,
+) -> Result<Option<Reply>> {
+    let Some((address, token)) = inherited_endpoint()? else {
+        return Ok(None);
+    };
+    call_bounded(owner, address, token, request, remaining)
+        .await
+        .map(Some)
+}
+
 async fn call(
     owner: &AgentCx,
     address: SocketAddr,
     token: String,
     request: Request,
+) -> Result<Reply> {
+    call_bounded(owner, address, token, request, EXCHANGE_TIMEOUT).await
+}
+
+async fn call_bounded(
+    owner: &AgentCx,
+    address: SocketAddr,
+    token: String,
+    request: Request,
+    remaining: Duration,
 ) -> Result<Reply> {
     if !owner.capabilities().io || !owner.capabilities().time {
         return Err(ipc_error(
@@ -183,7 +213,7 @@ async fn call(
         .map_or(EXCHANGE_TIMEOUT, |deadline| {
             Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
         });
-    let timeout = EXCHANGE_TIMEOUT.min(inherited);
+    let timeout = EXCHANGE_TIMEOUT.min(inherited).min(remaining);
     if timeout.is_zero() {
         return Err(ipc_error(
             "TIMEOUT",
@@ -635,6 +665,17 @@ fn dispatch(hub: &mut AgentHubRegistry, sender: &str, request: Request) -> Resul
             }
             hub.inbox_page(sender, request.cursor)
         }
+        Action::Wait => {
+            let peer = request
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| ipc_error("INPUT", "wait requires a peer run id or parent"))?;
+            // The credential chooses the inbox. `name` chooses only the
+            // sender being awaited, never another recipient's private inbox.
+            let result = hub.wait_snapshot(sender, peer, request.cursor.unwrap_or(0))?;
+            Ok(Reply::Wait { result })
+        }
     }
 }
 
@@ -1010,5 +1051,46 @@ mod tests {
             }
             _ => panic!("expected inbox"),
         }
+    }
+
+    #[test]
+    fn reply_wait_probes_only_the_authenticated_inbox_and_follow_peer_lifecycle() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut hub = AgentHubRegistry::default();
+        hub.set_dir_for_tests(temp.path().to_path_buf());
+        let sender = hub.register("sender", "ask peer").unwrap();
+        let peer = hub.register("peer", "answer sender").unwrap();
+        hub.mark_running(&sender.id, 10);
+        hub.mark_running(&peer.id, 20);
+        hub.bus_send("parent", &peer.id, "private parent report")
+            .unwrap();
+        let mut wait = request(Action::Wait);
+        wait.name = Some(peer.id.clone());
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected wait result");
+        };
+        assert_eq!(result.id, sender.id);
+        assert_eq!(result.status, super::super::InboxWaitStatus::Pending);
+        assert!(result.messages.is_empty());
+
+        let answer = hub.bus_send(&sender.id, &peer.id, "answer").unwrap();
+        hub.settle(&peer.id, ChildStatus::Done);
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected wait result");
+        };
+        assert_eq!(result.messages[0].seq, answer.seq);
+        assert_eq!(result.status, super::super::InboxWaitStatus::Messages);
+        wait.cursor = Some(result.next_cursor);
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected stopped result");
+        };
+        assert_eq!(result.status, super::super::InboxWaitStatus::PeerStopped);
+        hub.settle(&sender.id, ChildStatus::Done);
+        assert!(
+            dispatch(&mut hub, &sender.id, wait)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_HUB_IPC_REVOKED")
+        );
     }
 }

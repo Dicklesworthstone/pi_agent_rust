@@ -9750,13 +9750,13 @@ struct HubInput {
     ready: Option<HubReadyInput>,
     /// Survive session exit (state file re-discovery).
     detached: Option<bool>,
-    /// `logs` or `agent inbox`: opaque cursor from a previous page.
+    /// `logs`, `agent inbox`, or `agent wait`: cursor from a previous page.
     cursor: Option<u64>,
     /// `logs`: last N lines (snapshot read).
     tail: Option<usize>,
     /// `logs`: substring filter.
     grep: Option<String>,
-    /// `logs`: bounded wait for matching/new lines in milliseconds.
+    /// `logs` or `agent wait`: bounded wait in milliseconds.
     wait_ms: Option<u64>,
     /// `send`: literal text to write to the service's PTY stdin.
     text: Option<String>,
@@ -9767,7 +9767,7 @@ struct HubInput {
     /// `send`: signal name (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGKILL).
     signal: Option<String>,
     /// `jobs`: list | wait | cancel.
-    /// `agent`: roster | transcript | steer | kill | revive | send | inbox.
+    /// `agent`: roster | transcript | steer | kill | revive | send | inbox | wait.
     action: Option<String>,
     /// `jobs`: job id for wait/cancel.
     job_id: Option<String>,
@@ -9826,12 +9826,16 @@ impl Tool for HubTool {
          keys, signals), `stop` (graceful tree termination), `restart` \
          (retained launch spec), `describe` (full descriptor), `jobs` \
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
-         roster/transcript/steer/kill/revive/send/inbox; revive executes a \
+         roster/transcript/steer/kill/revive/send/inbox/wait; revive executes a \
          settled native child's original assignment with its retained launch \
          policy and transcript context, and waits for the replacement result). \
          Native children use agent roster/send/inbox to reach their parent's hub; \
          roster returns selfId, send accepts a live sibling id or parent, and inbox \
-         defaults to the caller. Include hub in a child's declared tools to enable messaging."
+         defaults to the caller. Agent wait reads the caller's own inbox for replies \
+         from name (peer run id or parent), after cursor (a sent seq or prior wait \
+         nextCursor); it returns on messages, peer exit, retention loss, or waitMs \
+         (default 30000, range 1..60000). It does not send or consume messages. \
+         Include hub in a child's declared tools to enable messaging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -9843,7 +9847,7 @@ impl Tool for HubTool {
                     "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
                     "description": "Operation"
                 },
-                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox; a child inbox defaults to itself" },
+                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox/wait; wait names the peer whose replies are wanted; a child inbox defaults to itself" },
                 "application": { "type": "string", "description": "Program to spawn (start)" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
                 "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
@@ -9858,15 +9862,15 @@ impl Tool for HubTool {
                     "description": "Readiness gates; all supplied gates must pass"
                 },
                 "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
-                "cursor": { "type": "integer", "description": "logs or agent inbox: nextCursor from the preceding page" },
+                "cursor": { "type": "integer", "minimum": 0, "description": "logs/agent inbox: nextCursor; agent wait: sent message seq or prior wait nextCursor for the same peer" },
                 "tail": { "type": "integer", "description": "logs: last N lines" },
                 "grep": { "type": "string", "description": "logs: substring filter" },
-                "waitMs": { "type": "integer", "description": "logs: bounded wait in ms (max 60000)" },
+                "waitMs": { "type": "integer", "description": "logs or agent wait: bounded wait in ms (max 60000); agent wait defaults to 30000 and requires at least 1" },
                 "text": { "type": "string", "description": "send: text for PTY stdin" },
                 "enter": { "type": "boolean", "description": "send: append ENTER after text (default true)" },
                 "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
                 "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
-                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox" },
+                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox/wait" },
                 "from": { "type": "string", "description": "agent steer/send: parent sender label; native children may only identify themselves" },
                 "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
                 "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
@@ -9893,7 +9897,14 @@ impl Tool for HubTool {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
+        let dispatched = if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
+        {
+            Self::dispatch_agent_wait(&input).await
+        } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
             Self::dispatch_inherited_agent(&input).await
         } else if op == "agent"
             && input
@@ -9932,6 +9943,26 @@ impl Tool for HubTool {
 }
 
 impl HubTool {
+    async fn dispatch_agent_wait(input: &HubInput) -> Result<ToolOutput> {
+        let peer = input.name.as_deref().ok_or_else(|| {
+            Error::validation("hub agent wait requires name (peer run id or parent)")
+        })?;
+        let result = crate::agent_hub::wait_for_peer(
+            peer,
+            input.cursor,
+            input.wait_ms.unwrap_or(30_000),
+            input.from.as_deref(),
+        )
+        .await?;
+        let (text, details) =
+            Self::format_agent_reply(crate::agent_hub::ipc::Reply::Wait { result });
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
     async fn dispatch_inherited_agent(input: &HubInput) -> Result<ToolOutput> {
         use crate::agent_hub::ipc::{Action, Request, call_from_env};
 
@@ -10036,7 +10067,49 @@ impl HubTool {
                 });
                 (text, details)
             }
+            Reply::Wait { result } => Self::format_wait_reply(&result),
         }
+    }
+
+    fn format_wait_reply(result: &crate::agent_hub::InboxWaitResult) -> (String, serde_json::Value) {
+        use crate::agent_hub::InboxWaitStatus;
+
+        let mut text = match result.status {
+            InboxWaitStatus::Messages => result
+                .messages
+                .iter()
+                .map(|message| format!("#{} from {}: {}", message.seq, message.from, message.body))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            InboxWaitStatus::PeerStopped => format!(
+                "{} finished without a newer reply. Read its result or continue without the answer.",
+                result.peer
+            ),
+            InboxWaitStatus::HistoryLost => format!(
+                "{}: inbox history after the requested cursor was evicted; a reply may have been lost.",
+                result.id
+            ),
+            InboxWaitStatus::TimedOut => format!(
+                "Reply wait timed out; {} may still be working. Messages remain in the inbox.",
+                result.peer
+            ),
+            InboxWaitStatus::Pending => "No newer reply yet.".to_string(),
+        };
+        if result.dropped_through_cursor != 0 && result.status != InboxWaitStatus::HistoryLost {
+            let _ = write!(
+                text,
+                "\n[Inbox history was evicted through sequence {}; earlier replies may be missing.]",
+                result.dropped_through_cursor
+            );
+        }
+        if result.has_more {
+            text.push_str(
+                "\n[More replies are available; continue with nextCursor and the same peer.]",
+            );
+        }
+        let mut details = serde_json::json!(result);
+        details["schema"] = serde_json::json!("pi.agent-hub.wait/v1");
+        (text, details)
     }
 
     fn append_log_capture_notice(text: &mut String, capture: &crate::hub::LogCapture) {
