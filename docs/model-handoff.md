@@ -6,17 +6,19 @@ selected model:
 ```text
 /handoff --model
 /handoff --model -- focus on remaining verification and the unanswered deployment question
+/handoff --model --export "/tmp/pagination-handoff.json" -- remaining verification
 ```
 
 This is an explicit, one-shot auxiliary model request. Bare `/handoff` and the
 existing human/agent/Bead delivery forms retain their provider-free behavior.
-The model form only displays a preview. It does not write files, send mail or
-Bead comments, create/switch sessions, change a goal, or resume execution.
-Recipient and output-path arguments are intentionally not accepted by this form.
+The model form displays a preview and writes a local bundle only when an explicit
+`--export` destination is supplied. It never sends mail or Bead comments,
+creates/switches sessions, changes a goal, or resumes execution. Recipient
+arguments are not accepted by the model form.
 
 ## What the successor receives
 
-The preview contains the goal, current state, decisions, failed approaches,
+The brief contains the goal, current state, decisions, failed approaches,
 open questions/blockers, and recommended next steps. Every generated item must
 reference one or more supplied evidence IDs. IDs are positions on the selected
 session branch; the source map labels user requests, assistant claims, tool
@@ -25,20 +27,62 @@ results, Bash results, and compaction summaries separately.
 Source-ID validation proves only that the referenced records were supplied.
 It is **not** a semantic proof that the model's claim follows from those records.
 Assistant claims and summaries are not independent test or filesystem evidence.
-Review the preview and actual tool results before a successor acts.
+Review the brief and actual tool results before a successor acts.
 
 Only the selected branch is read. Other branches and abandoned attempts are not
 merged into the successor's task. The first user request and newest compaction
 summary are considered as anchors, followed by recent complete records. Up to
 256 recent candidates are examined, at most 64 records are sent, each record
 must fit 16 KiB encoded, and total evidence fits 48 KiB. Oversized records are
-omitted whole, not sliced into misleading prefixes. The preview reports its
+omitted whole, not sliced into misleading prefixes. The brief reports its
 coverage and omission count, including non-conversational entries.
 
 Image/audio/video bytes, thinking blocks and provider thought signatures are
-not sent as text. The preview cannot claim visual understanding of an omitted
+not sent as text. The brief cannot claim visual understanding of an omitted
 attachment. Session traversal itself uses the existing branch implementation;
 these payload limits are not a new preemptible sandbox for a corrupt session.
+
+## Portable evidence bundle
+
+`--export` creates one JSON file with schema `pi.handoff.bundle.v1`. The file
+contains the structured `brief`, its rendered `markdown`, the selected redacted
+`source.evidence` records, the screened focus, coverage/omission counts, model
+identity, auxiliary reported usage and generation timestamp. A successor can
+resolve the brief's numeric source references against those actual records
+without access to the original session tree. The original conversation remains
+unchanged; this is not a session backup or a replayable session file.
+
+`sourceSnapshotDigest` is a SHA-256 digest of the reviewed source identity and
+selection. It binds the generation to that snapshot without exporting raw
+session identifiers. It is not a signature, authentication, or proof of the
+model's interpretation. `executionAuthorized` is always false. No provider
+credentials, cache keys, tool permissions or automatic continuation are bundled.
+The file can still contain private project information: review it before sharing.
+
+Supply an **absolute path** whose parent directory already exists. Paths with
+spaces or quotes use JSON string quoting, not shell expansion; on Windows,
+backslashes inside quoted paths must be escaped as JSON, or use forward slashes.
+No parent directories are created. An existing file, directory or symlink,
+including a dangling symlink, is refused before the paid model request.
+Unquoted paths without whitespace are also accepted. The optional focus follows
+`--`; extra options, recipients and a second output path are errors.
+
+Publication uses a size-bounded temporary file in that same parent directory.
+On Unix it explicitly sets mode 0600. The complete file, capped at 256 KiB, is
+written and synced before publication. The source session is locked, its branch
+snapshot is rechecked, and the final no-replace publication occurs without an
+intervening await. A conflicting destination created during generation is never
+overwritten. Invalid model output, stale source or refusal before publication
+drops the staged file instead of creating an incomplete final bundle.
+
+The underlying `tempfile::NamedTempFile::persist_noclobber` operation guarantees
+no replacement, not universal filesystem crash atomicity. On some filesystems or
+an interrupted cleanup it can leave the temporary hard link behind. Directory
+metadata is not synced here, so survival across power loss is not guaranteed.
+Temporary cleanup is best effort. Parent-path rechecks are not a sandbox against
+a hostile process replacing directory entries; select a directory you control.
+A successful publication is not later reported as absent merely because the
+owner becomes cancelled after it. Export does not deliver the file anywhere.
 
 ## Model, privacy and failure behavior
 
@@ -52,17 +96,19 @@ separately; it is not silently charged to the main conversation's token counters
 
 The owning agent's auxiliary privacy projection screens the bounded input before
 provider admission, including configured secret patterns and remembered secrets.
-The response and selected source are screened together before display so echoed
-source secrets do not become a raw preview. Block-mode refusal remains refusal.
-The omitted parts of a large transcript are not rescanned by this command.
+The response and selected source are screened together before display or export,
+so echoed source secrets do not become a raw preview or a raw evidence appendix.
+Source IDs, source kinds and coverage are revalidated after screening. Block-mode
+refusal remains refusal. The omitted parts of a large transcript are not rescanned
+by this command. Export requires the initiating owner's I/O capability and checks
+cancellation before file staging and final publication.
 
 A local JSON Schema requires the complete output shape, bounded sections and
 valid source IDs. Duplicate keys, markdown wrappers, extra fields, unknown source
 IDs, missing terminal events and failed provider responses are rejected. There
-is no repair request, heuristic fallback or partial successful brief. After the
-response, the selected branch is read again; changed identity, leaf or selected
-evidence produces `HANDOFF_STALE` instead of presenting an old preview as current.
-This read is a consistency check, not an exclusive lock preventing later edits.
+is no repair request, heuristic fallback or partial successful brief. Changed
+identity, leaf or selected evidence produces `HANDOFF_STALE`. The final source
+lock prevents mutation during publication, not edits after a completed export.
 
 The ordinary terminal UI's keyboard-cancellation integration for auxiliary
 workspace commands is unchanged by this feature. Owner cancellation and the
@@ -71,13 +117,16 @@ keyboard-control claim is introduced.
 
 ## Validation
 
-The implementation includes controlled-provider tests through the real terminal
-dispatcher and native Agent/Session types. They cover provider-free legacy behavior,
-model/credential selection, isolated request state, source references, unchanged
-history, branch-only bounded evidence, nontext omission, secret screening, invalid
-arguments, schema/provider failures and stale-source refusal.
+The original eight controlled-provider/native-dispatcher tests remain in place.
+Eight additional Rust tests cover quoted-path parsing, actual dispatcher export,
+branch-local evidence and unchanged history, private file permissions, credential
+screening, occupied/missing-parent refusal before provider admission, failed and
+stale generation cleanup, destination races, payload/identity bounds, and Unix
+symlink refusal. The publication-race test uses real filesystem operations; the
+model responses are controlled-provider fixtures, not live-model evidence.
 
-These Rust tests are authored, not executed on the implementation host. The
-required acceptance entry point is `dsr quality --tool pi_agent_rust`; the host
-has no `dsr` executable. No compilation, Clippy, formatting, live-provider, PTY
-or cross-platform acceptance is claimed.
+These tests are authored, not executed on the implementation host. The required
+`dsr quality --tool pi_agent_rust` command was attempted and failed to start with
+`dsr: command not found` (exit 127). No compilation, Rust test, Clippy, formatting,
+live-provider, PTY, Windows or cross-platform acceptance is claimed. The default
+terminal's goal keyboard-control integration remains unfinished.

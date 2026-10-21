@@ -231,3 +231,191 @@ fn source_change_during_generation_refuses_a_stale_preview() {
     assert_eq!(provider.calls.lock().unwrap().len(), 1);
     assert!(history(&handle).contains("concurrent source change"));
 }
+
+fn export_command(path: &Path) -> String {
+    format!("--model --export {}", serde_json::to_string(path.to_str().unwrap()).unwrap())
+}
+
+#[test]
+fn export_grammar_preserves_quoted_paths_and_rejects_ambiguous_options() {
+    event("bundle_grammar");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("handoff 雪 with spaces.json");
+    let args = format!("{} -- review tests before deployment", export_command(&path));
+    let selected = bundle::Options::parse(&args).unwrap();
+    assert_eq!(selected.export.as_ref(), Some(&path));
+    assert_eq!(selected.focus, "review tests before deployment");
+    assert!(bundle::Options::parse("--model").unwrap().export.is_none());
+    for args in ["--model --export", "--model --export relative.json",
+        "--model --export null", "--model --export \"unterminated",
+        "--model --export \"bad\u{0000}path\"", "--model --extra"]
+    {
+        assert!(bundle::Options::parse(args).is_err());
+    }
+    for tail in ["extra", "--", "--export elsewhere", "x"] {
+        let args = format!("{} {tail}", export_command(&path));
+        assert!(bundle::Options::parse(&args).is_err());
+    }
+    let adjacent = format!("{}x", export_command(&path));
+    assert!(bundle::Options::parse(&adjacent).is_err());
+}
+
+#[test]
+fn dispatcher_exports_a_complete_branch_local_bundle_without_mutating_history() {
+    event("bundle_dispatcher");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("continuation 雪.json");
+    let (mut handle, provider) = fixture("Implement pagination without deploying", vec![Ok(answer("Review the pagination tests", 1))]);
+    let source_id = {
+        let store = handle.session_store();
+        let mut session = store.try_lock().unwrap();
+        let root = session.leaf_id().unwrap().to_owned();
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("sibling-private-canary".into()), timestamp: None,
+        });
+        assert!(session.navigate_to(&root));
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("selected branch still needs tests".into()), timestamp: None,
+        });
+        session.header.id.clone()
+    };
+    let before = history(&handle);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    runtime().block_on(super::super::run(super::super::WorkspaceCommand::Handoff,
+        &export_command(&path), &mut handle, directory.path(), None, None, &sender));
+    let crate::interactive::PiMsg::System(output) = receiver.try_recv().unwrap() else { panic!("saved handoff"); };
+    assert!(output.contains("Saved handoff bundle:"));
+    assert!(!output.contains("Preview only"));
+    assert_eq!(history(&handle), before);
+    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() <= bundle::MAX_BUNDLE_BYTES);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema"], "pi.handoff.bundle.v1");
+    assert_eq!(value["executionAuthorized"], false);
+    assert_eq!(value["brief"]["goal"]["sources"], json!([1]));
+    assert_eq!(value["source"]["evidence"].as_array().unwrap().len(), 2);
+    assert_eq!(value["coverage"]["includedEntries"], 2);
+    assert_eq!(value["auxiliaryUsage"]["totalTokens"], 50);
+    assert_eq!(value["sourceSnapshotDigest"].as_str().unwrap().len(), 71);
+    assert!(value["markdown"].as_str().unwrap().contains("[E1]"));
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("selected branch still needs tests"));
+    assert!(!text.contains("sibling-private-canary"));
+    assert!(!text.contains(&source_id));
+    assert!(!text.contains("fixture-auth-only"));
+    assert!(!text.contains("parent-cache"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn exported_evidence_and_generated_text_share_the_privacy_projection() {
+    event("bundle_privacy");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("private.json");
+    let canary = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    let (handle, provider) = fixture(&format!("github_token = {canary}\nRotate it"), vec![Ok(answer(canary, 1))]);
+    let output = runtime().block_on(run(&handle, &export_command(&path))).unwrap();
+    let published = std::fs::read_to_string(path).unwrap();
+    assert!(!published.contains(canary));
+    assert!(!output.contains(canary));
+    assert!(!provider.calls.lock().unwrap()[0].0.contains(canary));
+    let bundle: Value = serde_json::from_str(&published).unwrap();
+    assert!(bundle["source"]["evidence"][0]["text"][0].as_str().unwrap().contains("Rotate it"));
+}
+
+#[test]
+fn occupied_or_missing_parent_destination_is_refused_before_model_work() {
+    event("bundle_preflight");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("occupied.json");
+    std::fs::write(&path, "keep existing user data").unwrap();
+    let (handle, provider) = fixture("source", vec![]);
+    runtime().block_on(async {
+        let error = run(&handle, &export_command(&path)).await.unwrap_err();
+        assert!(error.to_string().contains("HANDOFF_EXPORT_EXISTS"));
+        assert!(run(&handle, &export_command(&directory.path().join("missing").join("out.json"))).await.is_err());
+        assert!(run(&handle, &export_command(directory.path())).await.is_err());
+    });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep existing user data");
+    assert!(provider.calls.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn failed_or_stale_generation_publishes_no_bundle_or_temporary_file() {
+    event("bundle_failure_cleanup");
+    for (reply, stale) in [
+        (Ok(answer("unknown source", 999)), false),
+        (Err(Error::api("provider unavailable")), false),
+        (Ok(answer("stale summary", 1)), true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("never-published.json");
+        let (handle, provider) = fixture("source", vec![reply]);
+        if stale { *provider.mutate.lock().unwrap() = Some(handle.session_store()); }
+        assert!(runtime().block_on(run(&handle, &export_command(&path))).is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn publication_never_replaces_a_destination_created_after_preflight() {
+    event("bundle_publication_race");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("raced.json");
+    runtime().block_on(async {
+        let staged = bundle::Destination::prepare(path.clone()).unwrap()
+            .stage(br#"{"complete":true}"#).unwrap();
+        std::fs::write(&path, "concurrent user output").unwrap();
+        assert!(staged.publish().is_err());
+    });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent user output");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn export_size_limit_and_changed_privacy_identity_fail_before_publication() {
+    event("bundle_limits");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("oversized.json");
+    runtime().block_on(async {
+        let destination = bundle::Destination::prepare(path.clone()).unwrap();
+        assert!(destination.stage(&vec![b'x'; bundle::MAX_BUNDLE_BYTES + 1]).is_err());
+    });
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let mut stored = Session::in_memory();
+    stored.append_message(SessionMessage::User { content: UserContent::Text("source".into()), timestamp: None });
+    let input = snapshot(&stored, "").unwrap();
+    let mut changed: Value = serde_json::from_str(&input.prompt).unwrap();
+    changed["evidence"][0]["id"] = json!(999);
+    assert!(screened_source(&changed.to_string(), &input).is_err());
+    let mut changed: Value = serde_json::from_str(&input.prompt).unwrap();
+    changed["omittedEntries"] = json!(99);
+    assert!(screened_source(&changed.to_string(), &input).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_existing_and_dangling_destination_symlinks() {
+    event("bundle_symlink");
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("real.json");
+    std::fs::write(&real, "preserve target").unwrap();
+    for (name, target) in [("existing", real.clone()), ("dangling", directory.path().join("missing"))] {
+        let link = directory.path().join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let (handle, provider) = fixture("source", vec![]);
+        assert!(runtime().block_on(run(&handle, &export_command(&link))).is_err());
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "preserve target");
+}
