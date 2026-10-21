@@ -6,10 +6,10 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../src/eval/js_kernel/async_host.js'), 'utf8');
-function host() {
+function host(globals = {}) {
     let next = 1;
     const requests = [];
-    const context = vm.createContext({tool:{},
+    const context = vm.createContext({...globals,tool:{},
         __pi_set_timer: () => next++, __pi_clear_timer: () => {},
         __pi_async_call: (name, payload) => {
             const id = next++; requests.push({id, name, args:JSON.parse(payload)}); return id;
@@ -137,6 +137,183 @@ test('wait preserves requested handle order and retains native failed results wh
     assert.equal(results[0].details.failure,'fixture');
     assert.equal(results[0].isError,true);
     assert.equal(results[1].details.results[0].data.count,7);
+});
+
+const modelAck = (operation, jobId, timeoutSeconds = operation === 'judgment_batch' ? 300 : 60) =>
+    ({schema:'pi.eval.model-job.v1',operation,jobId,timeoutSeconds});
+const judgmentValue = value => ({schema:'pi.judgment.v1',answers:{safe:{type:'bool',bool:value}}});
+const modelResult = (operation, result, failed = false, error = null) => ({
+    content:[{type:'text',text:failed ? 'model request failed' : 'model request completed'}],
+    details:{schema:'pi.eval.model-job.result.v1',operation,result,error,
+        judgments:{schema:'pi.eval.judgments.v1',attempts:[{attempt:1,status:failed ? 'failed' : 'completed'}]}},
+    ...(failed ? {isError:true} : {}),
+});
+const modelSnapshot = (id, operation, result, status = 'exited') =>
+    ({...jobSnapshot(id,status,result),command:operation === 'completion' ? 'eval model completion' : `eval ${operation}`});
+async function launchModel(h, expression, operation, id = 'model-native', variable = 'model') {
+    const pending = vm.runInContext(`${expression}.then(value=>globalThis.${variable}=value)`,h.context);
+    const request = h.requests.at(-1);
+    assert.equal(request.name,{completion:'__pi_model_complete_start',judgment:'__pi_judge_start',
+        judgment_batch:'__pi_judge_batch_start'}[operation]);
+    h.dispatch.dispatch(request.id,false,true,JSON.stringify(modelAck(operation,id,
+        request.args.timeout_secs ?? (operation === 'judgment_batch' ? 300 : 60))));
+    await pending;
+    return request;
+}
+test('model factories return native handles and preserve explicit options and image evidence', async () => {
+    const h = host();
+    const request = await launchModel(h,
+        "completion('summarize',{system:'be concise',schema:{type:'object'},images:['chart.png'],maxTokens:256,timeoutSeconds:17})",
+        'completion');
+    assert.deepEqual(request.args,{prompt:'summarize',system:'be concise',schema:{type:'object'},images:['chart.png'],max_tokens:256,timeout_secs:17});
+    assert.equal(vm.runInContext('model.operation',h.context),'completion');
+    assert.equal(vm.runInContext('model.id === model.jobId && Object.isFrozen(model)',h.context),true);
+    h.dispatch.clear();
+    const waiting = vm.runInContext('model.wait(5)',h.context);
+    const payload = {schema:'pi.completion.v1',text:'{"answer":42}',data:{answer:42},schemaValid:true};
+    const lookup = h.requests.at(-1);
+    assert.deepEqual(lookup.args,{name:'jobs',args:{action:'wait',jobId:'model-native',timeoutMs:5000}});
+    answer(h,lookup,modelSnapshot('model-native','completion',modelResult('completion',payload)));
+    assert.deepEqual(JSON.parse(JSON.stringify(await waiting)),{answer:42});
+    const single = await launchModel(h,"judge({view:'screen'},{safe:{type:'bool',instructions:'safe?'}},{images:['shot.png'],timeoutSeconds:8})",'judgment','judge-native','review');
+    assert.deepEqual(single.args.images,['shot.png']);
+    assert.equal(single.args.timeout_secs,8);
+    const batch = await launchModel(h,"judgeBatch([{id:1},{id:2}],{safe:{type:'bool',instructions:'safe?'}},{images:{'1':['b.png']},concurrency:2})",'judgment_batch','batch-native','batch');
+    assert.deepEqual(batch.args.images,{'1':['b.png']});
+    assert.equal(batch.args.concurrency,2);
+    assert.equal(h.requests.length,4);
+});
+test('model waits preserve false, zero and null structured answers and full native receipts', async () => {
+    for (const data of [null,false,0]) {
+        const h = host();
+        await launchModel(h,"completion('extract',{schema:true})",'completion');
+        const payload = {schema:'pi.completion.v1',text:JSON.stringify(data),data,schemaValid:true};
+        const native = modelResult('completion',payload);
+        let pending = vm.runInContext('model.wait()',h.context);
+        answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',native));
+        assert.equal(await pending,data);
+        pending = vm.runInContext('model.output()',h.context);
+        answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',native));
+        assert.deepEqual(JSON.parse(JSON.stringify(await pending)),native);
+    }
+    const h = host();
+    await launchModel(h,"judge('evidence',{safe:{type:'bool',instructions:'safe?'}})",'judgment');
+    const pending = vm.runInContext('model.wait()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment',modelResult('judgment',judgmentValue(0))));
+    assert.equal((await pending).safe.bool,0);
+});
+test('mixed judgment batch failures retain ordered successful verdicts and error receipts', async () => {
+    const h = host();
+    await launchModel(h,"judgeBatch(['good','bad'],{safe:{type:'bool',instructions:'safe?'}})",'judgment_batch');
+    const payload = {schema:'pi.eval.judgment-batch.v1',batch:1,total:2,succeeded:1,failed:1,allOk:false,
+        items:[{key:0,ok:true,verdict:judgmentValue(1)},{key:1,ok:false,error:'PI_JUDGE_PROVIDER'}]};
+    const native = modelResult('judgment_batch',payload,true);
+    let pending = vm.runInContext('model.wait(0,false)',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),payload);
+    pending = vm.runInContext('model.wait(0)',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
+    await assert.rejects(pending,error => error.result.details.result.items[0].verdict.answers.safe.bool === 1
+        && error.jobId === 'model-native');
+    pending = vm.runInContext('model.output()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),native);
+});
+test('malformed and lost model acknowledgments reject without retrying admitted work', async () => {
+    for (const response of ['not JSON','null',JSON.stringify(modelAck('judgment','model-native')),
+        JSON.stringify({...modelAck('completion','model-native'),schema:'wrong'}),
+        JSON.stringify(modelAck('completion','')),
+        JSON.stringify(modelAck('completion','model-native',300))]) {
+        const h = host(); const pending = vm.runInContext("completion('work')",h.context);
+        h.dispatch.dispatch(1,false,true,response);
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+        assert.equal(h.requests.length,1);
+    }
+    const h = host(); const pending = vm.runInContext("completion('work')",h.context);
+    h.dispatch.dispatch(1,false,false,'ACK_LOST');
+    await assert.rejects(pending,/ACK_LOST/);
+    assert.equal(h.requests.length,1);
+});
+test('model helpers reject unsupported role, retry, threshold and authority options before dispatch', async () => {
+    for (const expression of ["completion('work',{model:'slow'})","completion('work',{api_key:'secret'})",
+        "completion('work',{maxTokens:0})","completion('work',{timeoutSeconds:601})",
+        "judge('state',{q:{}},{retries:1})","judge('state',{q:{}},{operation:'other'})",
+        "judgeBatch(['state'],{q:{}},{minOk:1})","judgeBatch(['state'],{q:{}},{intent:'custom'})",
+        "judgeBatch(['state'],{q:{}},{concurrency:9})","judgeBatch([],{q:{}})",
+        "completion.attach('invalid id')","completion('work',JSON.parse('{\"__proto__\":{}}'))"]) {
+        const h = host(); await assert.rejects(vm.runInContext(expression,h.context),/EVAL_MODEL_INPUT/);
+        assert.equal(h.requests.length,0);
+    }
+});
+test('model attachment after reset verifies native identity and uses current host authority', async () => {
+    const h = host();
+    const attach = vm.runInContext("completion.attach('recovered').then(value=>globalThis.model=value)",h.context);
+    assert.deepEqual(h.requests[0].args,{name:'jobs',args:{action:'wait',jobId:'recovered',timeoutMs:0}});
+    answer(h,h.requests[0],modelSnapshot('recovered','completion',undefined,'running'));
+    await attach;
+    h.dispatch.clear();
+    let pending = vm.runInContext('model.output()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('recovered','completion',undefined,'running'));
+    assert.equal(await pending,null);
+    pending = vm.runInContext('model.done()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('recovered','completion',
+        modelResult('completion',{schema:'pi.completion.v1',text:'done'})));
+    assert.equal(await pending,true);
+    pending = vm.runInContext('model.status()',h.context);
+    h.dispatch.dispatch(h.requests.at(-1).id,false,false,'PI_JOBS_UNKNOWN_ID');
+    await assert.rejects(pending,/PI_JOBS_UNKNOWN_ID/);
+    assert.equal(h.requests.length,4);
+    for (const changed of [{command:'eval judgment'}, {command:'eval completion'}, {command:'reusable subagent pool pool-id'},
+        {id:'different'}, {status:'unknown'}]) {
+        const rejected = vm.runInContext("completion.attach('recovered')",h.context);
+        answer(h,h.requests.at(-1),{...modelSnapshot('recovered','completion',undefined,'running'),...changed});
+        await assert.rejects(rejected,/PROTOCOL/);
+    }
+});
+test('model timeouts and cancellation never fabricate an answer or replay generation', async () => {
+    const h = host();
+    await launchModel(h,"completion('work')",'completion');
+    let pending = vm.runInContext('model.wait(0)',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',undefined,'running'));
+    await assert.rejects(pending,error=>error.name === 'TimeoutError');
+    const cancelled = {content:[{type:'text',text:'cancelled'}],details:null,isError:true};
+    pending = vm.runInContext('model.cancel()',h.context);
+    assert.equal(h.requests.at(-1).args.args.action,'cancel');
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',cancelled,'killed'));
+    assert.equal((await pending).status,'killed');
+    pending = vm.runInContext('model.wait(0,false)',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',cancelled,'killed'));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),cancelled);
+    assert.equal(h.requests.filter(request=>request.name === '__pi_model_complete_start').length,1);
+});
+test('model terminal metadata and answer schemas must agree with the retained handle', async () => {
+    for (const native of [modelResult('judgment',judgmentValue(1)),
+        modelResult('completion',{schema:'pi.completion.v1',text:'null',data:null}),
+        modelResult('completion',{schema:'wrong',text:'answer'}),
+        modelResult('completion',null),
+        {...modelResult('completion',{schema:'pi.completion.v1',text:'answer'}),details:null}]) {
+        const h = host(); await launchModel(h,"completion('work')",'completion');
+        const pending = vm.runInContext('model.wait()',h.context);
+        answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',native));
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+    }
+});
+test('mixed model and agent waits preserve input order and consume one shared deadline', async () => {
+    let clock = 1000;
+    const h = host({Date:class extends Date { static now() { return clock; } }});
+    await launchAgent(h,'agentJob','agent-native');
+    await launchModel(h,"completion('work')",'completion');
+    const pending = vm.runInContext('wait([model,agentJob],{timeout:10,raiseErrors:false})',h.context);
+    assert.equal(h.requests.at(-1).args.args.timeoutMs,10000);
+    clock = 7500;
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','completion',
+        modelResult('completion',null,true,'PI_COMPLETION_PROVIDER'),'failed'));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(h.requests.at(-1).args,{name:'jobs',args:{action:'wait',jobId:'agent-native',timeoutMs:3500}});
+    answer(h,h.requests.at(-1),jobSnapshot('agent-native'));
+    const values = await pending;
+    assert.equal(values[0].details.error,'PI_COMPLETION_PROVIDER');
+    assert.equal(values[1].details.results[0].data.count,7);
 });
 
 const workerSnapshot = (workerId, turnId = 1, status = 'running', result = null) => ({

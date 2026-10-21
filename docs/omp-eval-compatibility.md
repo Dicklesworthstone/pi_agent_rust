@@ -32,12 +32,27 @@ launch and manage native background subagent jobs across cells. Set
 with queued `send()` follow-ups in the same live child conversation.
 [Reusable `workpool()` helpers](eval-structured-results.md#reusable-workpools)
 distribute up to 32 items across 1–8 native workers, retain per-turn handles,
-and support inspection and explicit cleanup across cells.
+and support inspection and explicit cleanup across cells. `finish()` seals
+admission, drains accepted work, reaps the children and completes one aggregate
+session job.
+
+[Retained model helpers](eval-structured-results.md#retained-background-model-requests)
+provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
+later-cell waits, cancellation and attachment by job ID after a reset. They use
+the launching cell's explicit native `judge_model` binding. Completions and
+judgments accept image evidence through the current host's read policy, and
+completion images can be combined with a validated output schema. OMP model tiers,
+retries, incremental batch drains and automatic backgrounding of arbitrary eval
+code remain separate work; unknown helper options fail explicitly.
+The typed `completion()` helper uses the uniform model-job bridge
+`__pi_model_complete_start`. The existing raw `__pi_complete_start` contract
+remains available through `tool.call`, with its own acknowledgment and direct
+completion result details; see [raw completion jobs](eval-background-completions.md).
+Both use ordinary native session jobs rather than separate schedulers.
 
 Pi's default `agent()` remains one-shot; warm reuse is explicit. The bounded
 pool uses idle/admitted-item scheduling and explicit result collection.
-OMP's context-load scheduling, keyed yield batches, aggregate pool completion
-delivery and automatic close after draining remain separate work. Pi's
+OMP's context-load scheduling and keyed yield batches remain separate work. Pi's
 `pool.close()` cancels running and queued work; worker lifetimes remain fixed
 from their launch. See the linked contracts for supported isolation, schemas,
 partial admission and cleanup behavior.

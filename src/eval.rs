@@ -679,7 +679,7 @@ impl Tool for EvalTool {
          (default 4). Parse the JSON and check allOk or each items entry's ok \
          before using its verdict; ordinary item failures retain successful peers. \
          Single judgments and batch items share 16 reserved attempts per cell; \
-         batches keep the original cell deadline and do not run in the background. \
+         ordinary batches keep the original cell deadline. \
          No model fallback or tools within a judgment request. \
          General text-only one-shot completion uses __pi_complete through tool.call \
          with {prompt,system?,max_tokens?,schema?}, returning JSON with text and \
@@ -691,16 +691,37 @@ impl Tool for EvalTool {
          It uses the same judge_model/host binding, privacy and original cell \
          deadline; max_tokens may only lower the host ceiling (at most 4096). \
          Completions and judgments share the 16-attempt allowance. No history \
-         or tools are passed to these completions. Native attempt/usage receipts \
-         are included in result details. With an owning Agent, explicit \
-         __pi_complete_start through tool.call accepts the same completion \
-         arguments and returns a session-owned jobId before generation finishes. \
-         It freezes the selected model and privacy policy, reserves one shared \
-         attempt and runs for at most 60 seconds from admission. Use the enabled \
-         jobs tool through tool.result to wait, inspect or cancel in this or a \
-         later cell. The settled job result contains the ordinary completion \
-         envelope. Kernel reset does not cancel admitted jobs; session shutdown \
-         does. No borrowed Agent or interpreter is retained by the job."
+         or tools are passed to these completions. For retained model work use \
+         await completion(prompt, options), await judge(state, questions, options), \
+         or await judgeBatch(states, questions, options) in JS; Python uses \
+         keyword options and judge_batch. Retain the returned handle, then use \
+         wait(timeoutSeconds), output(), status(), done() or cancel() in a later \
+         cell. Completion wait returns text or schema data; judge wait returns \
+         answers; batch wait returns the aggregate. Mixed global wait accepts \
+         these handles too. Use output() or wait(timeout,false) in JS / \
+         wait(timeout,raise_errors=False) in Python to inspect failures. \
+         completion.attach(id), judge.attach(id) and judgeBatch.attach(id) / \
+         judge_batch.attach(id) recover known native jobs after reset. JS options \
+         use maxTokens/timeoutSeconds; Python uses max_tokens/timeout_seconds. \
+         No helper model tiers, retries, minOk or incremental drains. The native \
+         bridge for explicitly retained work is available through tool.call: \
+         call __pi_model_complete_start, __pi_judge_start or __pi_judge_batch_start with \
+         the same fields and optional timeout_secs (1-600; default 60 for single \
+         calls and 300 for batches). These require the current Agent host and \
+         enabled jobs controls. All attachments, schemas and text privacy are \
+         prepared in the launching cell before any model request. The JSON \
+         acknowledgment contains jobId, operation and timeoutSeconds. Use jobs \
+         wait/cancel with jobId; completed results and attempt receipts are in \
+         the job's result.details. A mixed failed batch keeps ordered peer \
+         results with allOk=false. Accepted jobs retain their selected model, \
+         prepared inputs and fixed deadline across cell completion or kernel \
+         reset; they never retain a tool host or replay failed work. Native \
+         attempt/usage receipts are included in result details. The separate \
+         __pi_complete_start operation accepts ordinary completion fields and \
+         returns a pi.completion.background.v1 acknowledgment with a jobId and \
+         fixed 60-second budget. Its settled job contains the plain completion \
+         envelope; use jobs directly for those handles. All admitted jobs \
+         survive kernel reset and stop during session shutdown."
     }
 
     fn parameters(&self) -> Value {
@@ -739,7 +760,7 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's judgments, completion and __pi_complete_start calls; host registry credentials only, no fallback. Omit when the host binds a Judge. All share 16 reserved attempts. Awaited calls retain the cell deadline; explicit background completion jobs freeze this binding with a separate 60-second admission budget. Later cells do not inherit the binding for new requests.",
+                    "description": "Explicit model for this cell's judgment/completion calls, including __pi_judge_start, __pi_judge_batch_start, __pi_model_complete_start and __pi_complete_start; host registry credentials only, no fallback. Omit when the host already binds a Judge. Foreground and background requests share 16 reserved attempts in this launching cell. Foreground calls keep the cell deadline; explicitly started jobs freeze this binding under their own bounded timeout. Later cells must select a model again for new requests.",
                     "properties": {
                         "provider": {"type":"string", "minLength":1, "maxLength":256},
                         "model": {"type":"string", "minLength":1, "maxLength":256}

@@ -96,7 +96,128 @@ Direct standalone `EvalTool::execute` embeddings still expose only local
 `read`, `grep`, `find` and `ls`. They do not retain authority from an earlier
 Agent call. Typed model judgments use the separate explicit `__pi_judge` and
 `__pi_judge_batch` operations with their own selection and privacy policies.
-Single judgments and batch items share a 16-reserved-attempt limit.
+Completions, single judgments and batch items share a 16-reserved-attempt limit,
+including the background model requests below.
+
+## Retained background model requests
+
+Agent-owned cells can start a stateless model request and collect its answer in
+a later cell. Supply the launching eval call's explicit
+`judge_model: {provider, model}` or use an SDK host-bound Judge. The helpers
+return after native admission; they do not await the model's final answer.
+
+JavaScript:
+
+```javascript
+globalThis.extraction = await completion(
+  'Extract the paths from: src/api.rs and src/ui.rs need review.',
+  {schema: {type: 'array', items: {type: 'string'}}, timeoutSeconds: 60}
+);
+globalThis.review = await judgeBatch(
+  {api: {change: 'adds input validation'}, ui: {change: 'adds regression tests'}},
+  {safe: {type: 'bool', instructions: 'Does the change improve robustness?'}},
+  {concurrency: 2}
+);
+display({extraction: extraction.id, review: review.id});
+```
+
+A later cell can mix retained model and agent handles in the existing `wait`:
+
+```javascript
+const [paths, judgments] = await wait([extraction, review], {timeout: 20});
+display({paths, items: judgments.items});
+```
+
+Python:
+
+```python
+extraction = await completion(
+    'Extract the paths from: src/api.rs and src/ui.rs need review.',
+    schema={'type': 'array', 'items': {'type': 'string'}},
+    timeout_seconds=60,
+)
+review = await judge_batch(
+    {'api': {'change': 'adds input validation'}, 'ui': {'change': 'adds tests'}},
+    {'safe': {'type': 'bool', 'instructions': 'Does this improve robustness?'}},
+    concurrency=2,
+)
+# In a later cell:
+paths, judgments = await wait([extraction, review], timeout=20)
+display({'paths': paths, 'items': judgments['items']})
+```
+
+| Helper | Options | Successful `wait()` value |
+|---|---|---|
+| `completion(prompt, options)` / `completion(prompt, **options)` | `system`, `schema`, `images`, `maxTokens` / `max_tokens`, `timeoutSeconds` / `timeout_seconds` | Text, or validated `data` when a schema was requested |
+| `judge(state, questions, options)` / `judge(state, questions, **options)` | `images`, task timeout | The typed `answers` object |
+| `judgeBatch(states, questions, options)` / `judge_batch(states, questions, **options)` | `images`, `concurrency`, task timeout | The complete ordered `pi.eval.judgment-batch.v1` aggregate |
+
+The factories are asynchronous: **await the factory to get a handle**. Options
+use an object in JavaScript and keyword arguments in Python. Unknown options,
+including OMP model tiers, retries, `minOk`/`min_ok` and `intent`, are rejected.
+The model is selected by the launching cell's native binding, with no retry or
+fallback. Completion and judgment images use the existing path or embedded-image
+format; batch images map literal state keys or canonical array indices to
+attachment lists. Image reads finish through the current Agent's enabled `read`
+tool before background provider admission. The selected model must declare
+image support, including when a completion also supplies a JSON Schema. Text
+privacy screening does not redact pixels or perform OCR.
+
+| Handle operation | Behavior |
+|---|---|
+| `id`, `jobId` / `job_id`, `operation` | Native job identity and immutable operation kind in JavaScript; read-only public properties in Python |
+| `status()` | Current native job snapshot, including `status` and any final result |
+| `done()` | Whether native status has settled |
+| `output()` | Final native `ToolOutput`, with model provenance, usage and attempt receipts, or null/None while running |
+| `wait(timeout)` | Wait up to the given seconds, then return the typed value above; default 30 seconds |
+| `wait(timeout, false)` / `wait(timeout, raise_errors=False)` | Preserve a completed mixed batch, or return the native failure output when no typed payload exists |
+| `cancel()` | Cancel through the current cell's `jobs` authority and return the native snapshot |
+
+Ordinary `wait()` raises on a failed, cancelled or timed-out native job. The
+error retains its native output as `error.result`; JavaScript also exposes
+`error.jobId` and Python `error.job_id`. For a mixed-success batch, use
+`output()` or the non-raising wait to inspect both successful and failed items.
+A wait that expires while the job is still running raises `TimeoutError` and
+leaves the job running. Repeated waits observe the same job and do not repeat
+provider work. Global `wait()` preserves input order, accepts these handles
+alongside existing agent/turn/pool-item handles, and uses one shared timeout.
+
+After a kernel reset, recover a job ID from `jobs {action: 'list'}` and attach:
+
+```javascript
+globalThis.extraction = await completion.attach('known-job-id');
+```
+
+Python uses `await completion.attach('known-job-id')`; the same form exists on
+`judge` and `judgeBatch` / `judge_batch`. Attachment checks current-session
+access and the native operation label. It starts no model work and requires
+no new `judge_model` selection. Every status, output, wait and cancel operation
+uses the current cell's host, so a retained guest handle is never a retained
+permission grant. An unavailable, foreign-session or wrong-kind job fails.
+
+All inputs, image reads, privacy checks and schema checks complete before the
+provider task is admitted. The owned task retains no interpreter or borrowed
+Agent tool host. Kernel reset and `per_call` retirement do not stop an accepted
+job. Session shutdown and original Agent cancellation do; a process restart
+does not resume jobs. An invalid or lost start acknowledgment is never
+automatically retried: inspect `jobs list` before explicitly starting again.
+
+The helpers use [native retained model jobs](judgment.md#retained-background-model-jobs),
+including the shared 16-attempt cell budget, 1–16-item batches, concurrency up
+to eight, bounded task timeouts, final-result limits and ordinary job retention.
+They expose final aggregates rather than incremental drains. If output privacy
+would change a typed answer or schema-validated data, the native job fails
+without retaining a misleading structured success.
+
+The completion helper uses `__pi_model_complete_start`, with the uniform
+`pi.eval.model-job.v1` acknowledgment and `pi.eval.model-job.result.v1` final
+envelope shared by these handles. Its native job label is `eval model completion`.
+The existing [raw `__pi_complete_start` operation](eval-background-completions.md)
+continues to return `pi.completion.background.v1` and direct `pi.completion.v1`
+result details under the label `eval completion`. Inspect those raw jobs through
+`tool.result('jobs', ...)`; `completion.attach()` deliberately rejects their
+different result contract. Both entry points use the same session-owned jobs
+runtime and capacity limits.
 
 ## Retained background agent jobs
 

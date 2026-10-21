@@ -39,6 +39,31 @@ def turn_result(turn_id):
     return {"content": [{"type": "text", "text": f"turn {turn_id}"}], "details": {"turn": turn_id}}
 
 
+def model_ack(operation, job_id="model-native", timeout_seconds=None):
+    return {"schema": "pi.eval.model-job.v1", "operation": operation, "jobId": job_id,
+            "timeoutSeconds": timeout_seconds if timeout_seconds is not None
+            else 300 if operation == "judgment_batch" else 60}
+
+
+def judgment_value(value):
+    return {"schema": "pi.judgment.v1", "answers": {"safe": {"type": "bool", "bool": value}}}
+
+
+def model_result(operation, result, *, failed=False, error=None):
+    return {"content": [{"type": "text", "text": "model request failed" if failed else "model request completed"}],
+            "details": {"schema": "pi.eval.model-job.result.v1", "operation": operation,
+                        "result": result, "error": error,
+                        "judgments": {"schema": "pi.eval.judgments.v1", "attempts": [
+                            {"attempt": 1, "status": "failed" if failed else "completed"}]}},
+            **({"isError": True} if failed else {})}
+
+
+def model_snapshot(operation, result=None, *, job_id="model-native", status="exited"):
+    return {"schema": "pi.host_job.v1", "id": job_id,
+            "command": "eval model completion" if operation == "completion" else f"eval {operation}", "status": status,
+            **({"result": result} if status != "running" else {})}
+
+
 class PoolHost:
     def __init__(self, kernel):
         self.kernel = kernel
@@ -272,6 +297,185 @@ class StructuredReaderTests(unittest.TestCase):
             f"{variable} = await agent('inspect the code', agent='scout'); {variable}.id", bridge,
         )
         self.assertEqual(self.value(response), job_id)
+
+    def launch_model(self, expression="completion('work')", operation="completion",
+                     job_id="model-native", variable="model"):
+        def bridge(frame):
+            self.assertEqual(frame["bridge"]["tool"], {
+                "completion": "__pi_model_complete_start", "judgment": "__pi_judge_start",
+                "judgment_batch": "__pi_judge_batch_start",
+            }[operation])
+            self.kernel.reply(frame, json.dumps(model_ack(operation, job_id,
+                frame["bridge"]["input"].get("timeout_secs"))))
+        response = self.kernel.cell(f"{variable} = await {expression}; {variable}.id", bridge)
+        self.assertEqual(self.value(response), job_id)
+        return self.kernel.calls[-1]["bridge"]["input"]
+
+    def test_model_factories_preserve_options_and_image_evidence_in_native_requests(self):
+        request = self.launch_model("completion('summarize', system='be concise', schema={'type':'object'}, "
+                                    "images=['chart.png'], max_tokens=256, timeout_seconds=17)")
+        self.assertEqual(request, {"prompt": "summarize", "system": "be concise", "schema": {"type": "object"},
+                                   "images": ["chart.png"], "max_tokens": 256, "timeout_secs": 17})
+        native = model_result("completion", {"schema": "pi.completion.v1", "text": '{"answer":42}',
+                                              "data": {"answer": 42}, "schemaValid": True})
+        response = self.kernel.cell("await model.wait(5)", self.reply_with(envelope(model_snapshot("completion", native))))
+        self.assertEqual(self.value(response), {"answer": 42})
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "name": "jobs", "args": {"action": "wait", "jobId": "model-native", "timeoutMs": 5000},
+        })
+        request = self.launch_model("judge({'view':'screen'}, {'safe':{'type':'bool','instructions':'safe?'}}, "
+                                    "images=['shot.png'], timeout_seconds=8)", "judgment", "judge-native", "review")
+        self.assertEqual(request["images"], ["shot.png"])
+        self.assertEqual(request["timeout_secs"], 8)
+        request = self.launch_model("judge_batch([{'id':1},{'id':2}], {'safe':{'type':'bool','instructions':'safe?'}}, "
+                                    "images={'1':['b.png']}, concurrency=2)", "judgment_batch", "batch-native", "batch")
+        self.assertEqual(request["images"], {"1": ["b.png"]})
+        self.assertEqual(request["concurrency"], 2)
+        self.assertEqual(len(self.kernel.calls), 4)
+
+    def test_model_results_preserve_false_zero_null_and_full_native_receipts(self):
+        for data in (None, False, 0):
+            with self.subTest(data=data):
+                self.launch_model("completion('extract', schema=True)")
+                native = model_result("completion", {"schema": "pi.completion.v1", "text": json.dumps(data),
+                                                      "data": data, "schemaValid": True})
+                response = self.kernel.cell("await model", self.reply_with(envelope(model_snapshot("completion", native))))
+                if data is None:
+                    self.assertTrue(response["ok"], response.get("error"))
+                    self.assertIsNone(response["result"])
+                else:
+                    self.assertEqual(self.value(response), data)
+                response = self.kernel.cell("await model.output()", self.reply_with(envelope(model_snapshot("completion", native))))
+                self.assertEqual(self.value(response), native)
+        self.launch_model("judge('evidence', {'safe':{'type':'bool','instructions':'safe?'}})", "judgment")
+        response = self.kernel.cell("await model.wait()", self.reply_with(envelope(
+            model_snapshot("judgment", model_result("judgment", judgment_value(0))))))
+        self.assertEqual(self.value(response)["safe"]["bool"], 0)
+
+    def test_model_mixed_batch_failures_preserve_ordered_answers_and_receipts(self):
+        self.launch_model("judge_batch(['good','bad'], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        payload = {"schema": "pi.eval.judgment-batch.v1", "batch": 1, "total": 2, "succeeded": 1, "failed": 1,
+                   "allOk": False, "items": [{"key": 0, "ok": True, "verdict": judgment_value(1)},
+                                             {"key": 1, "ok": False, "error": "PI_JUDGE_PROVIDER"}]}
+        native = model_result("judgment_batch", payload, failed=True)
+        snapshot = model_snapshot("judgment_batch", native, status="failed")
+        response = self.kernel.cell("await model.wait(0, raise_errors=False)", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), payload)
+        response = self.kernel.cell("""
+try:
+    await model.wait(0)
+except Exception as error:
+    captured = (error.job_id, error.result)
+captured
+""", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), ("model-native", native))
+        response = self.kernel.cell("await model.output()", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), native)
+
+    def test_model_bad_or_lost_acknowledgments_are_never_replayed(self):
+        for encoded in ("not JSON", "null", json.dumps(model_ack("judgment")),
+                        json.dumps({**model_ack("completion"), "schema": "wrong"}),
+                        json.dumps(model_ack("completion", "")),
+                        json.dumps(model_ack("completion", timeout_seconds=300)),
+                        json.dumps(model_ack("completion", timeout_seconds=True))):
+            with self.subTest(encoded=encoded):
+                previous = len(self.kernel.calls)
+                response = self.kernel.cell("await completion('work')", lambda frame: self.kernel.reply(frame, encoded))
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
+                self.assertEqual(len(self.kernel.calls), previous + 1)
+        previous = len(self.kernel.calls)
+        response = self.kernel.cell("await completion('work')", lambda frame: self.kernel.reply(frame, error="ACK_LOST"))
+        self.assertFalse(response["ok"])
+        self.assertIn("ACK_LOST", response["error"])
+        self.assertEqual(len(self.kernel.calls), previous + 1)
+
+    def test_model_helpers_reject_unknown_or_authority_options_without_dispatch(self):
+        for expression in ("completion('work', model='slow')", "completion('work', api_key='secret')",
+                           "completion('work', max_tokens=0)", "completion('work', timeout_seconds=601)",
+                           "completion('work', timeout_seconds=True)", "judge('state', {'q':{}}, retries=1)",
+                           "judge('state', {'q':{}}, operation='other')", "judge_batch(['state'], {'q':{}}, min_ok=1)",
+                           "judge_batch(['state'], {'q':{}}, intent='custom')",
+                           "judge_batch(['state'], {'q':{}}, concurrency=9)", "judge_batch([], {'q':{}})",
+                           "completion.attach('invalid id')"):
+            with self.subTest(expression=expression):
+                response = self.kernel.cell(f"await {expression}")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_MODEL_INPUT", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_model_attach_reconstructs_handles_and_checks_current_owner_and_operation(self):
+        snapshot = model_snapshot("completion", job_id="recovered", status="running")
+        response = self.kernel.cell("model = await completion.attach('recovered'); (model.id, model.job_id, model.operation)",
+                                    self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), ("recovered", "recovered", "completion"))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "name": "jobs", "args": {"action": "wait", "jobId": "recovered", "timeoutMs": 0},
+        })
+        response = self.kernel.cell("await model.output()", self.reply_with(envelope(snapshot)))
+        self.assertTrue(response["ok"], response.get("error"))
+        self.assertIsNone(response["result"])
+        response = self.kernel.cell("await model.done()", self.reply_with(envelope(
+            model_snapshot("completion", model_result("completion", {"schema": "pi.completion.v1", "text": "done"}),
+                           job_id="recovered"))))
+        self.assertTrue(self.value(response))
+        response = self.kernel.cell("await model.status()", lambda frame: self.kernel.reply(frame, error="PI_JOBS_UNKNOWN_ID"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_JOBS_UNKNOWN_ID", response["error"])
+        for changed in ({"command": "eval judgment"}, {"command": "eval completion"}, {"command": "reusable subagent pool pool-id"},
+                        {"id": "different"}, {"status": "unknown"}):
+            response = self.kernel.cell("await completion.attach('recovered')", self.reply_with(envelope({**snapshot, **changed})))
+            self.assertFalse(response["ok"])
+            self.assertIn("PROTOCOL", response["error"])
+
+    def test_model_timeout_and_cancellation_do_not_fabricate_answers_or_repeat_generation(self):
+        self.launch_model()
+        response = self.kernel.cell("await model.wait(0)", self.reply_with(envelope(
+            model_snapshot("completion", status="running"))))
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_MODEL_TIMEOUT", response["error"])
+        cancelled = {"content": [{"type": "text", "text": "cancelled"}], "details": None, "isError": True}
+        snapshot = model_snapshot("completion", cancelled, status="killed")
+        response = self.kernel.cell("await model.cancel()", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response)["status"], "killed")
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["action"], "cancel")
+        response = self.kernel.cell("await model.wait(0, raise_errors=False)", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), cancelled)
+        self.assertEqual(sum(frame["bridge"]["tool"] == "__pi_model_complete_start" for frame in self.kernel.calls), 1)
+
+    def test_model_terminal_schema_and_operation_must_match_the_retained_handle(self):
+        for native in (model_result("judgment", judgment_value(1)),
+                       model_result("completion", {"schema": "pi.completion.v1", "text": "null", "data": None}),
+                       model_result("completion", {"schema": "wrong", "text": "answer"}),
+                       model_result("completion", None),
+                       {"content": [], "details": None}):
+            with self.subTest(native=native):
+                self.launch_model()
+                response = self.kernel.cell("await model.wait()", self.reply_with(envelope(model_snapshot("completion", native))))
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
+
+    def test_mixed_model_and_agent_waits_use_one_deadline_and_preserve_failed_native_results(self):
+        self.launch_agent("agent_job", "agent-native")
+        self.launch_model()
+        requests = []
+        def bridge(frame):
+            request = frame["bridge"]["input"]["args"]
+            requests.append(request)
+            if request["jobId"] == "model-native":
+                time.sleep(0.05)
+                snapshot = model_snapshot("completion", model_result("completion", None, failed=True,
+                                          error="PI_COMPLETION_PROVIDER"), status="failed")
+            else:
+                snapshot = {"schema": "pi.host_job.v1", "id": "agent-native", "status": "exited",
+                            "result": {"content": [], "details": {"answer": 7}}}
+            self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+        response = self.kernel.cell("await wait([model, agent_job], timeout=10, raise_errors=False)", bridge)
+        values = self.value(response)
+        self.assertEqual(values[0]["details"]["error"], "PI_COMPLETION_PROVIDER")
+        self.assertEqual(values[1]["details"]["answer"], 7)
+        self.assertEqual([request["jobId"] for request in requests], ["model-native", "agent-native"])
+        self.assertLessEqual(requests[1]["timeoutMs"], requests[0]["timeoutMs"] - 40)
 
     def test_agent_handle_survives_cells_and_uses_native_result_without_stored_authority(self):
         self.launch_agent()

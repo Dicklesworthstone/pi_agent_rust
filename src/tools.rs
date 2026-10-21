@@ -9270,7 +9270,8 @@ impl Tool for JobsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage this session's background bash jobs and async subagent tasks. \
+        "Manage this session's background bash jobs, async subagent tasks and \
+         retained eval model requests. \
          Actions: `list` (jobs with status/pid/artifact), `wait` (wait until a job \
          settles, bounded; timeoutMs:0 polls), `cancel` (stop owned work and its \
          child process tree). Native task snapshots include their complete \
@@ -9363,9 +9364,14 @@ impl Tool for JobsTool {
                             jobs.iter()
                                 .map(|job| {
                                     format!(
-                                        "{}: {} (pid {}, exit {}, artifact {})",
+                                        "{}: {}{} (pid {}, exit {}, artifact {})",
                                         job["id"].as_str().unwrap_or("?"),
                                         job["status"].as_str().unwrap_or("?"),
+                                        if job.get("schema").and_then(serde_json::Value::as_str) == Some("pi.host_job.v1") {
+                                            format!(" [{}]", job.get("command").and_then(serde_json::Value::as_str).unwrap_or("native task"))
+                                        } else {
+                                            String::new()
+                                        },
                                         job["pid"].as_i64().map_or_else(
                                             || "n/a".to_string(),
                                             |pid| pid.to_string()

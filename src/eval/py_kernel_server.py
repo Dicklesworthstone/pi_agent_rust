@@ -937,6 +937,8 @@ async def _agent_wait_one(job, timeout_ms, raise_errors):
         return await _agent_wait_turn(job, timeout_ms, raise_errors)
     if type(job) is _AgentPoolItem:
         return await _pool_wait_item(job, timeout_ms, raise_errors)
+    if type(job) is _ModelJob:
+        return await _model_wait_job(job, timeout_ms, raise_errors)
     snapshot = await _agent_read_job(job.id, "wait", timeout_ms)
     if snapshot["status"] == "running":
         raise TimeoutError("EVAL_AGENT_TIMEOUT: job is still running; it remains available through jobs")
@@ -979,6 +981,228 @@ class _AgentJob:
 
     def __await__(self):
         return self.wait().__await__()
+
+
+def _model_job_id(value):
+    return (type(value) is str and 0 < len(value) <= 128
+            and not any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                        for character in value))
+
+
+def _model_protocol():
+    return ToolBridgeError("EVAL_MODEL_PROTOCOL: invalid native model job response")
+
+
+def _model_payload(operation, payload):
+    if type(payload) is not dict:
+        raise _model_protocol()
+    if operation == "completion":
+        if (payload.get("schema") != "pi.completion.v1" or type(payload.get("text")) is not str
+                or ("data" in payload and payload.get("schemaValid") is not True)
+                or ("schemaValid" in payload and ("data" not in payload or payload["schemaValid"] is not True))):
+            raise _model_protocol()
+    elif operation == "judgment":
+        if (payload.get("schema") != "pi.judgment.v1" or type(payload.get("answers")) is not dict
+                or not payload["answers"]):
+            raise _model_protocol()
+    else:
+        if (payload.get("schema") != "pi.eval.judgment-batch.v1" or type(payload.get("items")) is not list
+                or type(payload.get("total")) is not int or payload["total"] != len(payload["items"])
+                or payload["total"] < 1
+                or type(payload.get("succeeded")) is not int or payload["succeeded"] < 0
+                or type(payload.get("failed")) is not int or payload["failed"] < 0
+                or payload["succeeded"] + payload["failed"] != payload["total"]
+                or payload.get("allOk") is not (payload["failed"] == 0)):
+            raise _model_protocol()
+        succeeded = 0
+        for item in payload["items"]:
+            if (type(item) is not dict or type(item.get("ok")) is not bool
+                    or not (type(item.get("key")) is str and bool(item["key"])
+                            or type(item.get("key")) is int and item["key"] >= 0)):
+                raise _model_protocol()
+            if item["ok"]:
+                _model_payload("judgment", item.get("verdict"))
+                succeeded += 1
+            elif type(item.get("error")) is not str or not item["error"]:
+                raise _model_protocol()
+        if succeeded != payload["succeeded"]:
+            raise _model_protocol()
+    return payload
+
+
+def _model_check_job(job, snapshot):
+    expected_label = "eval model completion" if job.operation == "completion" else f"eval {job.operation}"
+    if (snapshot.get("command") != expected_label
+            or snapshot["status"] not in ("running", "exited", "failed", "killed", "timedOut")):
+        raise _model_protocol()
+    if snapshot["status"] == "running":
+        if snapshot.get("result") is not None:
+            raise _model_protocol()
+        return snapshot
+    result = snapshot.get("result")
+    if (type(result) is not dict or type(result.get("content")) is not list or "details" not in result
+            or type(result.get("isError", False)) is not bool):
+        raise _model_protocol()
+    details = result["details"]
+    if details is None:
+        # Cancellation/timeout may retire native work before any typed answer.
+        # Keep the real failure, never turn absent evidence into a verdict.
+        if snapshot["status"] == "exited" or not result.get("isError", False):
+            raise _model_protocol()
+    else:
+        if (type(details) is not dict or details.get("schema") != "pi.eval.model-job.result.v1"
+                or details.get("operation") != job.operation or "result" not in details
+                or type(details.get("judgments")) is not dict
+                or details["judgments"].get("schema") != "pi.eval.judgments.v1"
+                or type(details["judgments"].get("attempts")) is not list):
+            raise _model_protocol()
+        if details["result"] is None:
+            if not result.get("isError", False) or type(details.get("error")) is not str or not details["error"]:
+                raise _model_protocol()
+        else:
+            payload = _model_payload(job.operation, details["result"])
+            if job.operation == "judgment_batch" and result.get("isError", False) is not (not payload["allOk"]):
+                raise _model_protocol()
+            if job.operation != "judgment_batch" and result.get("isError", False):
+                raise _model_protocol()
+        if snapshot["status"] != "exited" and not result.get("isError", False):
+            raise _model_protocol()
+    return snapshot
+
+
+async def _model_read_job(job, action, timeout_ms=None):
+    return _model_check_job(job, await _agent_read_job(job.id, action, timeout_ms))
+
+
+async def _model_wait_job(job, timeout_ms, raise_errors):
+    snapshot = await _model_read_job(job, "wait", timeout_ms)
+    if snapshot["status"] == "running":
+        raise TimeoutError("EVAL_MODEL_TIMEOUT: model job is still running; retain its id and wait again")
+    result = snapshot["result"]
+    if raise_errors and (snapshot["status"] != "exited" or result.get("isError", False)):
+        error = ToolBridgeError(_agent_result_text(result) or f"Model job {snapshot['status']}")
+        error.result = result
+        error.job_id = job.id
+        raise error
+    payload = result["details"].get("result") if result["details"] is not None else None
+    if payload is None:
+        return result
+    if job.operation == "completion":
+        return payload["data"] if "data" in payload else payload["text"]
+    return payload["answers"] if job.operation == "judgment" else payload
+
+
+class _ModelJob:
+    """Native model identity; every read and cancellation uses the current host."""
+
+    __slots__ = ("_id", "_operation")
+
+    def __init__(self, job_id, operation):
+        self._id = job_id
+        self._operation = operation
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def job_id(self):
+        return self._id
+
+    @property
+    def operation(self):
+        return self._operation
+
+    async def status(self):
+        return await _model_read_job(self, "wait", 0)
+
+    async def done(self):
+        return (await self.status())["status"] != "running"
+
+    async def output(self):
+        return (await self.status()).get("result")
+
+    async def cancel(self):
+        return await _model_read_job(self, "cancel")
+
+    async def wait(self, timeout=30, raise_errors=True):
+        if type(raise_errors) is not bool:
+            raise TypeError("EVAL_MODEL_INPUT: raise_errors must be boolean")
+        return await _model_wait_job(self, _agent_wait_ms(timeout), raise_errors)
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
+def _model_options(options, allowed):
+    arguments = {}
+    for name, value in options.items():
+        if name not in allowed:
+            raise TypeError(f"EVAL_MODEL_INPUT: unknown option {name}")
+        if name == "timeout_seconds" and (type(value) is not int or not 1 <= value <= 600):
+            raise ValueError("EVAL_MODEL_INPUT: timeout_seconds must be an integer from 1 to 600")
+        if name == "max_tokens" and (type(value) is not int or not 1 <= value <= 4096):
+            raise ValueError("EVAL_MODEL_INPUT: max_tokens must be an integer from 1 to 4096")
+        if name == "concurrency" and (type(value) is not int or not 1 <= value <= 8):
+            raise ValueError("EVAL_MODEL_INPUT: concurrency must be an integer from 1 to 8")
+        arguments[allowed[name]] = value
+    return arguments
+
+
+async def _model_launch(operation, arguments):
+    bridge = {"completion": "__pi_model_complete_start", "judgment": "__pi_judge_start",
+              "judgment_batch": "__pi_judge_batch_start"}[operation]
+    encoded = await _bridge_call_async(bridge, arguments)
+    try:
+        started = json.loads(encoded)
+    except (ValueError, RecursionError):
+        raise _model_protocol() from None
+    expected_timeout = arguments.get("timeout_secs", 300 if operation == "judgment_batch" else 60)
+    if (type(started) is not dict or started.get("schema") != "pi.eval.model-job.v1"
+            or started.get("operation") != operation or not _model_job_id(started.get("jobId"))
+            or type(started.get("timeoutSeconds")) is not int or started["timeoutSeconds"] != expected_timeout):
+        raise _model_protocol()
+    # A lost or malformed acknowledgment can follow native admission. Never
+    # replay automatically; recover the job id through jobs and attach to it.
+    return _ModelJob(started["jobId"], operation)
+
+
+async def _completion(prompt, **options):
+    if type(prompt) is not str or not prompt.strip():
+        raise TypeError("EVAL_MODEL_INPUT: completion requires a nonempty prompt")
+    arguments = _model_options(options, {"system": "system", "schema": "schema",
+                               "images": "images", "max_tokens": "max_tokens", "timeout_seconds": "timeout_secs"})
+    return await _model_launch("completion", {"prompt": prompt, **arguments})
+
+
+async def _judge(state, questions, **options):
+    if type(questions) is not dict or not questions:
+        raise TypeError("EVAL_MODEL_INPUT: questions must be a nonempty object")
+    return await _model_launch("judgment", {"state": state, "questions": questions,
+                              **_model_options(options, {"images": "images", "timeout_seconds": "timeout_secs"})})
+
+
+async def _judge_batch(states, questions, **options):
+    if type(states) not in (list, dict) or not states or type(questions) is not dict or not questions:
+        raise TypeError("EVAL_MODEL_INPUT: judge_batch requires nonempty states and questions")
+    return await _model_launch("judgment_batch", {"states": states, "questions": questions,
+                              **_model_options(options, {"images": "images", "concurrency": "concurrency",
+                                                        "timeout_seconds": "timeout_secs"})})
+
+
+def _model_attachment(operation):
+    async def attach(job_id):
+        if not _model_job_id(job_id):
+            raise TypeError("EVAL_MODEL_INPUT: attach requires a bounded native job id")
+        job = _ModelJob(job_id, operation)
+        await job.status()
+        return job
+    return attach
+
+
+_completion.attach = _model_attachment("completion")
+_judge.attach = _model_attachment("judgment")
+_judge_batch.attach = _model_attachment("judgment_batch")
 
 
 def _agent_worker_snapshot(snapshot, worker_id=None, turn_id=None):
@@ -1198,9 +1422,9 @@ _AGENT_CLOCK = time.monotonic
 
 async def _agent_wait(handles, timeout=30, raise_errors=True):
     if (type(handles) not in (list, tuple) or len(handles) > 32
-            or any(type(handle) not in (_AgentJob, _AgentWorker, _AgentTurn, _AgentPoolItem) for handle in handles)
+            or any(type(handle) not in (_AgentJob, _AgentWorker, _AgentTurn, _AgentPoolItem, _ModelJob) for handle in handles)
             or type(raise_errors) is not bool):
-        raise TypeError("EVAL_AGENT_INPUT: wait requires up to 32 agent handles and boolean raise_errors")
+        raise TypeError("EVAL_AGENT_INPUT: wait requires up to 32 agent/model handles and boolean raise_errors")
     deadline = _AGENT_CLOCK() + _agent_wait_ms(timeout) / 1000
     # Freeze each worker's current turn before the first await so concurrent
     # sends cannot retarget a mixed wait already in progress.
@@ -1619,6 +1843,9 @@ async def _workpool(**options):
 NAMESPACE["agent"] = _agent
 NAMESPACE["wait"] = _agent_wait
 NAMESPACE["workpool"] = _workpool
+NAMESPACE["completion"] = _completion
+NAMESPACE["judge"] = _judge
+NAMESPACE["judge_batch"] = _judge_batch
 
 
 def _script_stamp(metadata):

@@ -28,6 +28,16 @@ pub struct CompletionRequest {
     images: Vec<ImageContent>,
 }
 
+/// Screened provider input and its original compiled output contract. This
+/// contains only owned data; the launching invocation's callback is not kept.
+pub(crate) struct PreparedCompletion {
+    prompt: String,
+    system: String,
+    max_tokens: Option<u32>,
+    schema: Option<schema::OutputSchema>,
+    images: Vec<ImageContent>,
+}
+
 impl CompletionRequest {
     pub fn parse(input: Value) -> Result<Self> {
         let fields = input.as_object().ok_or_else(invalid)?;
@@ -87,6 +97,17 @@ impl Judge {
         request: CompletionRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
+        let prepared = self.prepare_completion(request, protect)?;
+        self.run_prepared_completion(prepared).await
+    }
+
+    /// Reject privacy or schema changes before admitting any background work.
+    /// The same preparation is used for ordinary foreground completions.
+    pub(crate) fn prepare_completion(
+        &self,
+        request: CompletionRequest,
+        protect: Option<&Protect<'_>>,
+    ) -> Result<PreparedCompletion> {
         self.check_image_support(!request.images.is_empty())?;
         let (system, prompt) = match &request.schema {
             Some(schema) => {
@@ -105,16 +126,29 @@ impl Judge {
                 (system, prompt)
             }
         };
-        let image_count = request.images.len();
+        Ok(PreparedCompletion {
+            prompt, system, max_tokens: request.max_tokens, schema: request.schema,
+            images: request.images,
+        })
+    }
+
+    /// Run a fully prepared completion without any borrowed Agent capability.
+    /// Terminal validation and the original schema remain authoritative.
+    pub(crate) async fn run_prepared_completion(
+        &self,
+        prepared: PreparedCompletion,
+    ) -> Result<Value> {
+        let PreparedCompletion { prompt, system, max_tokens, schema, images } = prepared;
+        let image_count = images.len();
         let (text, usage) = if image_count == 0 {
-            self.request_text(system, prompt, request.max_tokens).await?
+            self.request_text(system, prompt, max_tokens).await?
         } else {
             let mut blocks = Vec::with_capacity(image_count + 1);
             blocks.push(ContentBlock::Text(TextContent::new(prompt)));
-            blocks.extend(request.images.into_iter().map(ContentBlock::Image));
-            self.request_content(system, UserContent::Blocks(blocks), request.max_tokens).await?
+            blocks.extend(images.into_iter().map(ContentBlock::Image));
+            self.request_content(system, UserContent::Blocks(blocks), max_tokens).await?
         };
-        let data = request.schema.as_ref().map(|schema| schema.answer(&text)).transpose()?;
+        let data = schema.as_ref().map(|schema| schema.answer(&text)).transpose()?;
         let mut reply = self.reply("pi.completion.v1", "text", Value::String(text), usage);
         if image_count > 0 { reply["imageCount"] = Value::from(image_count); }
         if let Some(data) = data {

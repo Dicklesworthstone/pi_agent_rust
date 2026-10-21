@@ -5,6 +5,16 @@ model binding and completion validator as `__pi_complete`. It returns a native
 `jobId` after admission, without waiting for generation. The job can be inspected,
 waited for or cancelled through the ordinary `jobs` tool in a later cell.
 
+For a typed guest handle, use the newer
+[`completion()` helper](eval-structured-results.md#retained-background-model-requests).
+It uses `__pi_model_complete_start` and a uniform model-job envelope shared with
+retained judgments and batches. This page documents the existing raw
+`__pi_complete_start` acknowledgment and result contract, which remains available.
+Both entry points use the same session-owned jobs runtime.
+The typed helper also accepts image attachments and configurable bounded task
+timeouts; the raw operation documented here keeps its text-only, fixed-budget
+request contract.
+
 This requires an owning Agent invocation with an owned privacy-snapshot factory.
 Standalone Eval and the borrowed-only `execute_with_host` entry point refuse the
 operation rather than retain a callback or silently weaken privacy. Ordinary
@@ -111,6 +121,10 @@ expected result schema and `budgetSeconds`. Successful settled results retain
 the ordinary `pi.completion.v1` details, including exact text, optional validated
 data, model identity and reported usage. Failed/cancelled/timed-out jobs retain
 an unsuccessful native result, never a fabricated answer or an automatic retry.
+Raw completion jobs have the label `eval completion`. The typed helper uses
+`eval model completion` and a different final envelope; `completion.attach()`
+accepts typed helper jobs only. Continue using the raw `jobs` operations above
+for an ID created by `__pi_complete_start`.
 
 The launching cell's `details.judgments.attempts` records
 `operation: "completion_background"`. `launching` means admission did not finish;
@@ -128,16 +142,19 @@ an acknowledgment could not reach guest code. Session switching cannot grant a
 new session access to old job IDs. There is no credential or ownership embedded
 in the ID itself.
 
-This is the native start/result lifecycle, not full OMP API compatibility. The
-high-level OMP `completion()` handle class, completion-tier selection and OMP's
-wait-watchdog suspension are not supplied by this increment.
+The [typed completion, judgment and batch helpers](eval-structured-results.md#retained-background-model-requests)
+provide later-cell waits, cancellation, full native output and attachment after
+a kernel reset. They use the launching cell's explicit model binding. OMP's
+completion-tier selection and wait-watchdog suspension remain unsupported.
 
 ## Validation
 
 `src/eval/judgment/background/tests.rs` contains controlled-provider tests for
-native acknowledgment/settlement, both Python and QuickJS cross-cell paths,
-reset, typed results, current host policy, session changes, cancellation,
-shutdown isolation, deadlines, attempt bounds and frozen privacy. These Rust
-regressions are authored, not executed in the implementation environment.
-`dsr quality --tool pi_agent_rust` is authoritative; it could not start because
-DSR was absent. Documentation/syntax/source checks are not native acceptance.
+native acknowledgment/settlement, typed results, current host policy, session
+changes, cancellation, shutdown isolation, deadlines, attempt bounds and frozen
+privacy. The guest helper diagnostics live in
+`tests/eval_structured_reader.test.cjs` and
+`tests/eval_structured_reader_test.py`; they execute the embedded guest code
+against controlled host replies. `dsr quality --tool pi_agent_rust` remains the
+authoritative native quality entry point. Guest, syntax and source checks do
+not establish native compilation or test acceptance.

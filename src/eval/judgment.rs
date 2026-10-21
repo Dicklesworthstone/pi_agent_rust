@@ -2,8 +2,8 @@
 //!
 //! A model must be selected explicitly by the host or by this cell's
 //! judge_model field. Neither interpreter holds credentials, a privacy vault,
-//! a provider handle or borrowed authority that can outlive the cell. Explicit
-//! completion jobs retain only owned inputs, a model and a privacy snapshot.
+//! a provider handle. Explicit background starts transfer only prepared,
+//! tool-free requests into the native session-owned jobs registry.
 
 use std::path::{Path, PathBuf};
 
@@ -19,17 +19,17 @@ use crate::models::ModelRegistry;
 use crate::provider::StreamOptions;
 use crate::tools::{ToolInvocationHost, ToolOutput};
 
+mod background;
 mod batch;
 mod completion;
 mod images;
-mod background;
-
-pub(super) type PrivacySnapshot<'a> =
-    dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync + 'a;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
 const MAX_TOOL_CALLS: usize = 64;
+
+pub(super) type SnapshotPrivacy<'a> = dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot
+    + Send + Sync + 'a;
 
 #[derive(Clone, Debug, Serialize)]
 struct Selection {
@@ -128,7 +128,7 @@ pub(super) struct Invocation<'p> {
     host: Option<&'p dyn ToolInvocationHost>,
     host_session: Option<String>,
     tool_receipts: Vec<Value>,
-    snapshot_privacy: Option<&'p PrivacySnapshot<'p>>,
+    snapshot_privacy: Option<&'p SnapshotPrivacy<'p>>,
 }
 
 impl<'p> Invocation<'p> {
@@ -152,7 +152,7 @@ impl<'p> Invocation<'p> {
         self
     }
 
-    pub(super) fn with_privacy_snapshot(mut self, snapshot: Option<&'p PrivacySnapshot<'p>>) -> Self {
+    pub(super) fn with_snapshot_privacy(mut self, snapshot: Option<&'p SnapshotPrivacy<'p>>) -> Self {
         self.snapshot_privacy = snapshot;
         self
     }
@@ -167,14 +167,14 @@ impl<'p> Invocation<'p> {
         name: &str,
         input: Value,
     ) -> std::result::Result<String, String> {
-        if name == BRIDGE_NAME {
+        if let Some(operation) = background::Operation::for_bridge(name) {
+            self.start_background(tool, operation, input).await
+        } else if name == BRIDGE_NAME {
             self.evaluate(&tool.cwd, input).await
         } else if name == batch::BRIDGE_NAME {
             self.evaluate_batch(&tool.cwd, input).await
         } else if name == completion::BRIDGE_NAME {
             self.complete(&tool.cwd, input).await
-        } else if name == background::BRIDGE_NAME {
-            self.start_completion(tool, input).await
         } else if let Some(host) = self.host {
             self.call_host(host, name, input).await
         } else {

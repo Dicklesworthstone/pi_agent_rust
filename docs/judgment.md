@@ -49,7 +49,8 @@ request cancellation/deadline authority. Responses are limited to 32 KiB and
 
 Usage is returned on successful calls; this API does not yet journal failed
 attempts or update aggregate Agent session cost. It does not implement TypeSafe,
-a role fallback chain, background batches, caching, or a retained workpool.
+a role fallback chain, or caching. Eval can also launch the same native
+requests as [retained background model jobs](#retained-background-model-jobs).
 
 ## Judgments inside eval
 
@@ -254,7 +255,7 @@ reviews = json.loads(await tool.call('__pi_judge_batch', {
 display({'allOk': reviews['allOk'], 'items': reviews['items']})
 ```
 
-The response has schema `pi.eval.judgment-batch.v1`, `total`, `succeeded`,
+The foreground response has schema `pi.eval.judgment-batch.v1`, `total`, `succeeded`,
 `failed`, `allOk`, and `items`. Every item has its original `key` and `ok`.
 Array keys are zero-based numeric indices; array results retain input order
 regardless of completion order. Object keys are preserved literally, not parsed
@@ -459,3 +460,148 @@ preflight, privacy integrity, native file-read composition and retained state
 in both kernels, failed receipts and dropped streams. These added Rust tests
 were authored, not compiled or executed in the implementation environment:
 `dsr quality --tool pi_agent_rust` could not start because `dsr` was missing.
+
+## Retained background model jobs
+
+Agent-owned eval cells can explicitly start a completion, judgment, or judgment
+batch and return before its provider work finishes. The native session owns
+the task, its cancellation, retained result and completion notice. A later
+cell can collect the result even if the original kernel was reset or used
+`kernel_mode: "per_call"`.
+
+The foreground operations above keep their existing behavior. These separate
+start operations accept their ordinary request fields plus `timeout_secs`:
+
+| Start operation | Request | Default task timeout |
+|---|---|---|
+| `__pi_model_complete_start` | `prompt`, optional `system`, `schema`, `max_tokens`, `images` | 60 seconds |
+| `__pi_judge_start` | `state`, `questions`, optional `images` | 60 seconds |
+| `__pi_judge_batch_start` | `states`, `questions`, optional `images`, `concurrency` | 300 seconds |
+
+`timeout_secs` must be an integer from 1 through 600. Its budget starts at native
+admission preparation and is not renewed when the task launches; each provider
+request still has its existing 60-second ceiling. The launching cell's deadline
+also covers preparation and admission. An accepted task can continue independently
+of the kernel, while remaining subject to its original Agent cancellation
+context and the session's job shutdown.
+
+For example, pass this cell with an explicit `judge_model` or a host-bound Judge:
+
+```javascript
+globalThis.request = JSON.parse(await tool.call('__pi_model_complete_start', {
+  prompt: 'Extract the paths from: src/api.rs and src/ui.rs need review.',
+  schema: {type: 'array', items: {type: 'string'}},
+  timeout_secs: 60
+}));
+display(request.jobId);
+```
+
+The acknowledgment has this shape:
+
+```json
+{
+  "schema": "pi.eval.model-job.v1",
+  "operation": "completion",
+  "jobId": "job-id-returned-by-the-host",
+  "timeoutSeconds": 60
+}
+```
+
+Use the current cell's normal `jobs` tool access to collect it:
+
+```javascript
+const observation = await tool.result('jobs', {
+  action: 'wait', jobId: request.jobId, timeoutMs: 1000
+});
+const job = observation.details;
+if (job.status === 'exited') {
+  display(job.result.details.result.data);
+}
+```
+
+This observation wait does not extend or reset the task deadline. Use
+`timeoutMs: 0` to poll and `action: 'cancel'` to cancel. A running snapshot has
+no final result. If the guest variable has been lost, `jobs {action: 'list'}`
+shows the session's accepted jobs. Model jobs use the fixed labels
+`eval model completion`, `eval judgment` and `eval judgment_batch`, and their IDs can
+be used from either kernel. Repeating a start call creates another request;
+there is no automatic replay after a lost acknowledgment.
+
+The earlier raw `__pi_complete_start` operation keeps its
+`pi.completion.background.v1` acknowledgment, ordinary `pi.completion.v1`
+result details, fixed 60-second budget and `eval completion` label. Its jobs
+remain accessible through ordinary `jobs` calls. The `completion()` helper
+uses `__pi_model_complete_start` and attaches only to that operation's label;
+see [the raw completion contract](eval-background-completions.md).
+
+### Admission and privacy
+
+Background starts require the current Agent invocation's tool host and owned
+privacy-snapshot factory. A plain standalone `EvalTool::execute` or the older
+borrowed `execute_with_host` interface cannot manufacture this authority.
+Admission checks access to the current session's `jobs` tool. This check and
+image reads consume the ordinary 64-call host-tool allowance.
+
+All request shapes, schemas, image descriptors, image reads and aggregate
+image budgets are checked in the launching cell. The snapshot is captured
+after attachment reads. Complete text input is scanned together before
+preparing individual requests, so a secret assignment in a later batch item
+also protects earlier echoes and the eventual retained output. Changed rubric
+identities, batch keys or schema contracts refuse the whole admission before
+any provider request starts. Binary image evidence remains outside text
+privacy screening, as described above.
+
+Only the explicitly bound Judge, screened owned requests, fixed privacy
+snapshot and cancellation context enter the task. No borrowed Agent, live
+privacy callback, interpreter state, image reader or tool dispatcher is
+retained. The model selection is frozen for the accepted task; later cells do
+not inherit it for new requests. There is no role selection, retry, model
+fallback, history, or tool execution within the provider requests.
+
+Foreground attempts and background item reservations share the **16-attempt
+allowance per launching cell**. A whole batch reserves all its items before
+awaiting admission. Existing batch limits still apply: 1–16 states, concurrency
+1–8, 256 KiB expanded text and 16 MiB encoded images. Each background operation
+uses one ordinary native job slot. The process-wide limit of eight live jobs
+is shared with shell jobs, subagents and workpools; a capacity or shutdown
+rejection starts no provider work.
+
+### Results, errors and retention
+
+The ordinary `pi.host_job.v1` snapshot contains the final native `ToolOutput`
+in `result`. A completed model task's `ToolOutput.details` has schema
+`pi.eval.model-job.result.v1`, its `operation`, its model `result`, and native
+attempt receipts under `judgments`. The nested result uses the same
+`pi.completion.v1`, `pi.judgment.v1`, or `pi.eval.judgment-batch.v1` schema as the
+foreground operation. Content text gives a short summary; complete structured
+results and usage are in details.
+
+A completion or single judgment failure has `result: null`, a sanitized error,
+and `isError: true`. A fully finished batch retains every item in input order,
+including per-item failures. If any item failed, the native job is failed and
+its output has `isError: true`, while the complete batch remains available for
+inspection. A cancelled or timed-out task instead uses the ordinary jobs error
+result; it does not fabricate a complete batch or replay its unfinished items.
+This initial background API exposes the final aggregate, without incremental
+drains or partial results while the job is running.
+
+Launch receipts include the accepted job ID. Final successful-attempt receipts
+contain reported usage; failed attempts retain unknown usage. They do not
+update the main Agent's cost counters or provide a durable billing ledger.
+One completion notice is delivered through the existing session job mechanism.
+Polling a result does not consume that notice.
+
+Retention follows native jobs: process-local state, at most 128 settled jobs
+per session and 512 process-wide, with a shared 32 MiB retained native-result
+budget and 1 MiB final-result ceiling. Older settled entries may be pruned as
+these limits are reached. Kernel reset preserves accepted jobs; restarting
+the Pi process does not resume them. The jobs artifact policy remains in
+effect, and the same captured privacy projection screens retained results,
+artifacts and completion notices.
+
+Native regression fixtures in `src/eval/judgment/background/tests.rs` exercise
+controlled provider streams and real job ownership. The prepared request and
+privacy tests also cover callback lifetime, schema integrity and cross-item
+secret discovery. These fixtures require the authoritative
+`dsr quality --tool pi_agent_rust` run; source review is not native execution
+evidence.

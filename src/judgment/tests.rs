@@ -180,6 +180,88 @@ fn complete_terminal_answer_is_authoritative_and_has_provenance() {
 }
 
 #[test]
+fn prepared_judgment_owns_screened_evidence_without_dispatch_or_callback() -> Result<()> {
+    let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
+    let judge = Judge::new(provider.clone(), StreamOptions::default());
+    let prepared = {
+        let replacement = String::from("screened replacement");
+        let protect = |parts: &[&str]| -> Result<Vec<String>> {
+            Ok(parts.iter().map(|part| part.replace("adds a regression test", &replacement)).collect())
+        };
+        judge.prepare_judgment(request(), Some(&protect))?
+    };
+    // The captured string and privacy callback no longer exist at dispatch.
+    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- This fixture must prove preparation performs no provider I/O.
+    let result = runtime().block_on(judge.run_prepared_judgment(prepared))?;
+    assert_eq!(result["answers"]["safe"]["bool"], 0.9); // ubs:ignore -- The prepared path must retain typed answer validation.
+    let prompts = provider.prompts.lock().expect("provider recorder"); // ubs:ignore -- A poisoned fixture recorder cannot supply reliable request evidence.
+    let prompt = prompts.first().expect("one provider request"); // ubs:ignore -- The fixture is expected to record exactly one provider request.
+    assert!(prompt.contains("screened replacement")); // ubs:ignore -- Verify the owned screened evidence is the evidence actually sent.
+    assert!(!prompt.contains("adds a regression test")); // ubs:ignore -- Unscreened source must not reach the provider.
+    Ok(())
+}
+
+#[test]
+fn prepared_completion_keeps_schema_and_releases_borrowed_privacy() -> Result<()> {
+    let provider = FixtureProvider::new(vec![done("null", StopReason::Stop)]);
+    let judge = Judge::new(provider.clone(), StreamOptions::default());
+    let prepared = {
+        let replacement = String::from("screened prompt");
+        let protect = |parts: &[&str]| -> Result<Vec<String>> {
+            Ok(parts.iter().map(|part| part.replace("original prompt", &replacement)).collect())
+        };
+        judge.prepare_completion(CompletionRequest::parse(json!({
+            "prompt":"original prompt", "schema":{"type":"null"}, "max_tokens":7,
+        }))?, Some(&protect))?
+    };
+    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- Schema and privacy preparation must finish before provider I/O.
+    let result = runtime().block_on(judge.run_prepared_completion(prepared))?;
+    assert_eq!(result.get("data"), Some(&Value::Null)); // ubs:ignore -- Explicit schema-valid null must survive the owned completion path.
+    assert_eq!(result["schemaValid"], true); // ubs:ignore -- The original schema must still validate the terminal answer.
+    assert_eq!(*provider.tokens.lock().expect("token recorder"), vec![Some(7)]); // ubs:ignore -- The requested output ceiling must survive preparation.
+    let prompts = provider.prompts.lock().expect("provider recorder"); // ubs:ignore -- A poisoned fixture recorder must fail this test.
+    let prompt = prompts.first().expect("one provider request"); // ubs:ignore -- A successful completion must record its one request.
+    assert!(prompt.contains("screened prompt") && !prompt.contains("original prompt")); // ubs:ignore -- Only screened text may be dispatched after the callback has gone away.
+    Ok(())
+}
+
+#[test]
+fn preparation_rejects_changed_contracts_before_any_provider_dispatch() -> Result<()> {
+    let provider = FixtureProvider::new(vec![]);
+    let judge = Judge::new(provider.clone(), StreamOptions::default());
+    let change_rubric = |parts: &[&str]| -> Result<Vec<String>> {
+        Ok(parts.iter().map(|part| part.replace("\"safe\"", "\"changed\"")).collect())
+    };
+    assert!(judge.prepare_judgment(request(), Some(&change_rubric)).is_err()); // ubs:ignore -- Changed question identity must refuse admission.
+    let change_schema = |parts: &[&str]| -> Result<Vec<String>> {
+        Ok(parts.iter().map(|part| part.replace("\"null\"", "\"string\"")).collect())
+    };
+    let request = CompletionRequest::parse(json!({"prompt":"classify", "schema":{"type":"null"}}))?;
+    assert!(judge.prepare_completion(request, Some(&change_schema)).is_err()); // ubs:ignore -- A changed output contract must never be sent to a provider.
+    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- Rejected preparation must not perform a provider call.
+    Ok(())
+}
+
+#[test]
+fn prepared_completion_still_rejects_terminal_schema_violation() -> Result<()> {
+    let provider = FixtureProvider::new(vec![done("\"wrong type\"", StopReason::Stop)]);
+    let judge = Judge::new(provider.clone(), StreamOptions::default());
+    let request = CompletionRequest::parse(json!({"prompt":"classify", "schema":{"type":"null"}}))?;
+    let prepared = judge.prepare_completion(request, None)?;
+    let error = runtime().block_on(judge.run_prepared_completion(prepared)).expect_err("schema violation"); // ubs:ignore -- A complete but schema-invalid answer must fail.
+    assert!(error.to_string().contains("PI_COMPLETION_RESPONSE")); // ubs:ignore -- Owned execution must preserve the existing response error contract.
+    assert_eq!(provider.prompts.lock().expect("provider recorder").len(), 1); // ubs:ignore -- Invalid output must not cause a retry or repair request.
+    Ok(())
+}
+
+#[test]
+fn prepared_requests_can_cross_the_owned_task_boundary() {
+    fn require_owned<T: Send + 'static>() {}
+    require_owned::<PreparedJudgment>();
+    require_owned::<PreparedCompletion>();
+}
+
+#[test]
 fn failed_empty_and_unterminated_streams_have_no_verdict() {
     for events in [
         vec![done(ANSWER, StopReason::Error)],

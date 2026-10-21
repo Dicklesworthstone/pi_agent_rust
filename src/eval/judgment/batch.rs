@@ -41,25 +41,25 @@ impl Write for Counter {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-fn encoded_size(value: &impl Serialize, limit: usize) -> BatchResult<usize> {
+pub(super) fn encoded_size(value: &impl Serialize, limit: usize) -> BatchResult<usize> {
     let mut counter = Counter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|_| LIMIT.to_string())?;
     Ok(counter.bytes)
 }
 
-struct Item {
-    key: Value,
-    request: JudgmentRequest,
-    images: images::Sources,
+pub(super) struct Item {
+    pub(super) key: Value,
+    pub(super) request: JudgmentRequest,
+    pub(super) images: images::Sources,
 }
 
-struct Plan {
-    items: Vec<Item>,
-    concurrency: usize,
+pub(super) struct Plan {
+    pub(super) items: Vec<Item>,
+    pub(super) concurrency: usize,
 }
 
 impl Plan {
-    fn parse(input: &Value) -> BatchResult<Self> {
+    pub(super) fn parse(input: &Value) -> BatchResult<Self> {
         let fields = input.as_object().filter(|fields| {
             fields.contains_key("states") && fields.contains_key("questions")
                 && fields.keys().all(|key| matches!(key.as_str(), "states" | "questions" | "concurrency" | "images"))

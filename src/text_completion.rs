@@ -38,7 +38,8 @@ pub struct AuxiliaryPrivacy {
     extra_patterns: Vec<regex::Regex>,
 }
 
-/// An owned, read-only projection of the privacy policy at task admission.
+/// An owned projection of the privacy policy at task admission. Foreground
+/// admission may add discoveries from the complete task input, then freeze it.
 /// Background work may retain this snapshot, never a borrowed Agent or its
 /// mutable vault. Results cannot export restorable secret placeholders.
 #[derive(Clone)]
@@ -59,6 +60,21 @@ impl AuxiliaryPrivacySnapshot {
         known_secrets: &crate::secrets::SecretVault,
     ) -> Self {
         Self { privacy, known_secrets: known_secrets.clone() }
+    }
+
+    /// Remember discoveries across the complete, bounded task input before
+    /// preparing individual requests. This private snapshot never mutates the
+    /// live Agent vault. The caller owns the input shape and byte limits and
+    /// excludes binary image evidence from this text-only projection.
+    pub(crate) fn capture_json(&mut self, value: &serde_json::Value) -> Result<()> {
+        redact_json_with_vault(value, &self.privacy, &mut self.known_secrets)?;
+        Ok(())
+    }
+
+    /// Screen provider-bound fields using the frozen policy and discoveries.
+    /// The returned text cannot export restorable secret placeholders.
+    pub(crate) fn project_inputs(&self, parts: &[&str]) -> Result<Vec<String>> {
+        redact_inputs_with_vault(parts, &self.privacy, &self.known_secrets)
     }
 
     /// Project a bounded complete native result before any durable output or
@@ -354,6 +370,40 @@ mod tests {
             other_vault.restore(&protected.join("\n")),
             protected.join("\n")
         );
+    }
+
+    #[test]
+    fn task_snapshot_captures_late_input_secrets_before_projecting_earlier_items() -> Result<()> {
+        let secret = "r4nd0mCredentialValue123456";
+        let mut snapshot = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::default());
+        snapshot.capture_json(&serde_json::json!([
+            {"earlier_echo":secret}, {"api_key":secret},
+        ]))?;
+        let protected = snapshot.project_inputs(&[secret, "ordinary context"])?;
+        assert_eq!(protected, ["<pi-secret:redacted>", "ordinary context"]); // ubs:ignore -- Admission must discover across the whole batch before individual request screening.
+        let retained = snapshot.project_json(&serde_json::json!({"text":secret}))?;
+        assert_eq!(retained, serde_json::json!({"text":"<pi-secret:redacted>"})); // ubs:ignore -- Provider echoes must remain protected at retained-result publication.
+        Ok(())
+    }
+
+    #[test]
+    fn task_input_discoveries_remain_private_and_block_before_admission() -> Result<()> {
+        let secret = "r4nd0mCredentialValue123456";
+        let source = crate::secrets::SecretVault::default();
+        let original = AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::default(), &source);
+        let mut admitted = original.clone();
+        admitted.capture_json(&serde_json::json!({"api_key":secret}))?;
+        assert_eq!(source.mask(secret), secret); // ubs:ignore -- Task discoveries must never mutate the live Agent vault.
+        assert_eq!(original.project_inputs(&[secret])?, vec![secret]); // ubs:ignore -- Separately captured task snapshots must not share mutable discoveries.
+        assert_eq!(admitted.project_inputs(&[secret])?, vec!["<pi-secret:redacted>"]); // ubs:ignore -- The admitted task must retain its own discoveries.
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()), ..Default::default()
+        }));
+        let mut blocked = AuxiliaryPrivacySnapshot::from_privacy(privacy);
+        let error = blocked.capture_json(&serde_json::json!({"api_key":secret})).expect_err("blocked input"); // ubs:ignore -- Blocking policy must refuse complete input before any background request can be admitted.
+        assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore -- Preserve the named block error without echoing the source.
+        assert!(!error.to_string().contains(secret)); // ubs:ignore -- Error paths cannot disclose the blocked value.
+        Ok(())
     }
 
     #[test]

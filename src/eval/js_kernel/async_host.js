@@ -115,6 +115,178 @@
         async cancel() { return readJob(this.id, 'cancel'); }
         async wait(timeout = 30) { return waitJob(this, waitMilliseconds(timeout), true); }
     }
+    // Model jobs retain only native identity. Input privacy/model resolution is
+    // completed by the host before acknowledgment; later observations re-enter
+    // the current host instead of caching results or launch-time authority.
+    const modelOperations = freeze({
+        completion:'__pi_model_complete_start', judgment:'__pi_judge_start',
+        judgment_batch:'__pi_judge_batch_start',
+    });
+    const modelJobId = id => typeof id === 'string' && id.length > 0 && id.length <= 128
+        && !/[\s\x00-\x1f\x7f]/.test(id);
+    const modelRecord = value => value !== null && typeof value === 'object' && !isArray(value);
+    const modelProtocol = () => new ErrorType('EVAL_MODEL_PROTOCOL: invalid native model job response');
+    const modelPayload = (operation, payload) => {
+        if (!modelRecord(payload)) throw modelProtocol();
+        if (operation === 'completion') {
+            if (payload.schema !== 'pi.completion.v1' || typeof payload.text !== 'string'
+                || (hasOwn(payload,'data') && payload.schemaValid !== true)
+                || (hasOwn(payload,'schemaValid') && (!hasOwn(payload,'data') || payload.schemaValid !== true))) {
+                throw modelProtocol();
+            }
+        } else if (operation === 'judgment') {
+            if (payload.schema !== 'pi.judgment.v1' || !modelRecord(payload.answers)
+                || keys(payload.answers).length === 0) throw modelProtocol();
+        } else {
+            if (payload.schema !== 'pi.eval.judgment-batch.v1' || !isArray(payload.items)
+                || !integer(payload.total) || payload.total !== payload.items.length || payload.total < 1
+                || !integer(payload.succeeded) || payload.succeeded < 0
+                || !integer(payload.failed) || payload.failed < 0
+                || payload.succeeded + payload.failed !== payload.total
+                || payload.allOk !== (payload.failed === 0)) throw modelProtocol();
+            let succeeded = 0;
+            for (const item of payload.items) {
+                if (!modelRecord(item) || typeof item.ok !== 'boolean'
+                    || !(typeof item.key === 'string' && item.key.length > 0
+                        || integer(item.key) && item.key >= 0)) throw modelProtocol();
+                if (item.ok) { modelPayload('judgment',item.verdict); succeeded++; }
+                else if (typeof item.error !== 'string' || !item.error) throw modelProtocol();
+            }
+            if (succeeded !== payload.succeeded) throw modelProtocol();
+        }
+        return payload;
+    };
+    const checkModelJob = (job, snapshot) => {
+        const expectedLabel = job.operation === 'completion' ? 'eval model completion' : `eval ${job.operation}`;
+        if (snapshot.command !== expectedLabel
+            || !['running','exited','failed','killed','timedOut'].includes(snapshot.status)) throw modelProtocol();
+        if (snapshot.status === 'running') {
+            if (snapshot.result !== undefined && snapshot.result !== null) throw modelProtocol();
+            return snapshot;
+        }
+        const result = snapshot.result;
+        if (!modelRecord(result) || !isArray(result.content) || !hasOwn(result,'details')
+            || (hasOwn(result,'isError') && typeof result.isError !== 'boolean')) throw modelProtocol();
+        const details = result.details;
+        if (details === null) {
+            // Native cancellation/timeout can retire work before a typed
+            // result exists. Preserve that failure; never invent a verdict.
+            if (snapshot.status === 'exited' || !result.isError) throw modelProtocol();
+        } else {
+            if (!modelRecord(details) || details.schema !== 'pi.eval.model-job.result.v1'
+                || details.operation !== job.operation || !hasOwn(details,'result')
+                || !modelRecord(details.judgments) || details.judgments.schema !== 'pi.eval.judgments.v1'
+                || !isArray(details.judgments.attempts)) throw modelProtocol();
+            if (details.result === null) {
+                if (!result.isError || typeof details.error !== 'string' || !details.error) throw modelProtocol();
+            } else {
+                const payload = modelPayload(job.operation,details.result);
+                if (job.operation === 'judgment_batch' && (result.isError === true) !== !payload.allOk) throw modelProtocol();
+                if (job.operation !== 'judgment_batch' && result.isError) throw modelProtocol();
+            }
+            if (snapshot.status !== 'exited' && !result.isError) throw modelProtocol();
+        }
+        return snapshot;
+    };
+    const readModelJob = async (job, action, timeoutMs) =>
+        checkModelJob(job,await readJob(job.id,action,timeoutMs));
+    const waitModelJob = async (job, timeoutMs, raiseErrors) => {
+        const snapshot = await readModelJob(job,'wait',timeoutMs);
+        if (snapshot.status === 'running') {
+            const error = new ErrorType('EVAL_MODEL_TIMEOUT: model job is still running; retain its id and wait again');
+            error.name = 'TimeoutError';
+            throw error;
+        }
+        const result = snapshot.result;
+        if (raiseErrors && (snapshot.status !== 'exited' || result.isError)) {
+            const error = new ErrorType(resultText(result) || `Model job ${snapshot.status}`);
+            error.result = result;
+            error.jobId = job.id;
+            throw error;
+        }
+        const payload = result.details?.result;
+        if (payload === null || payload === undefined) return result;
+        if (job.operation === 'completion') return hasOwn(payload,'data') ? payload.data : payload.text;
+        return job.operation === 'judgment' ? payload.answers : payload;
+    };
+    class ModelJob {
+        constructor(id, operation) {
+            this.id = id;
+            this.jobId = id;
+            this.operation = operation;
+            freeze(this);
+        }
+        async status() { return readModelJob(this,'wait',0); }
+        async done() { return (await this.status()).status !== 'running'; }
+        async output() { return (await this.status()).result ?? null; }
+        async cancel() { return readModelJob(this,'cancel'); }
+        async wait(timeout = 30, raiseErrors = true) {
+            if (typeof raiseErrors !== 'boolean') throw new TypeErrorType('EVAL_MODEL_INPUT: raiseErrors must be boolean');
+            return waitModelJob(this,waitMilliseconds(timeout),raiseErrors);
+        }
+    }
+    const modelOptions = (options, allowed) => {
+        if (!modelRecord(options)) throw new TypeErrorType('EVAL_MODEL_INPUT: options must be an object');
+        const args = {};
+        for (const key of keys(options)) {
+            if (!hasOwn(allowed,key)) throw new TypeErrorType(`EVAL_MODEL_INPUT: unknown option ${key}`);
+            const value = options[key];
+            if (key === 'timeoutSeconds' && (!integer(value) || value < 1 || value > 600)) {
+                throw new RangeErrorType('EVAL_MODEL_INPUT: timeoutSeconds must be an integer from 1 to 600');
+            }
+            if (key === 'maxTokens' && (!integer(value) || value < 1 || value > 4096)) {
+                throw new RangeErrorType('EVAL_MODEL_INPUT: maxTokens must be an integer from 1 to 4096');
+            }
+            if (key === 'concurrency' && (!integer(value) || value < 1 || value > 8)) {
+                throw new RangeErrorType('EVAL_MODEL_INPUT: concurrency must be an integer from 1 to 8');
+            }
+            args[allowed[key]] = value;
+        }
+        return args;
+    };
+    const launchModel = async (operation, args) => {
+        const encoded = await callTool(modelOperations[operation],args,false);
+        let started;
+        try { started = parse(encoded); } catch (_) { throw modelProtocol(); }
+        const timeoutSeconds = hasOwn(args,'timeout_secs') ? args.timeout_secs
+            : operation === 'judgment_batch' ? 300 : 60;
+        if (!modelRecord(started) || started.schema !== 'pi.eval.model-job.v1'
+            || started.operation !== operation || !modelJobId(started.jobId)
+            || started.timeoutSeconds !== timeoutSeconds) throw modelProtocol();
+        // Invalid or lost acknowledgment is never retried. The native job may
+        // have started; recover its id from jobs before explicitly attaching.
+        return new ModelJob(started.jobId,operation);
+    };
+    const attachModel = async (operation, id) => {
+        if (!modelJobId(id)) throw new TypeErrorType('EVAL_MODEL_INPUT: attach requires a bounded native job id');
+        const job = new ModelJob(id,operation);
+        await job.status();
+        return job;
+    };
+    const completion = async (prompt, options = {}) => {
+        if (typeof prompt !== 'string' || !prompt.trim()) throw new TypeErrorType('EVAL_MODEL_INPUT: completion requires a nonempty prompt');
+        const args = modelOptions(options,{system:'system',schema:'schema',images:'images',maxTokens:'max_tokens',timeoutSeconds:'timeout_secs'});
+        return launchModel('completion',{prompt,...args});
+    };
+    const judge = async (state, questions, options = {}) => {
+        if (!modelRecord(questions) || keys(questions).length === 0) throw new TypeErrorType('EVAL_MODEL_INPUT: questions must be a nonempty object');
+        return launchModel('judgment',{state,questions,
+            ...modelOptions(options,{images:'images',timeoutSeconds:'timeout_secs'})});
+    };
+    const judgeBatch = async (states, questions, options = {}) => {
+        if ((!isArray(states) && !modelRecord(states)) || keys(states).length === 0
+            || !modelRecord(questions) || keys(questions).length === 0) {
+            throw new TypeErrorType('EVAL_MODEL_INPUT: judgeBatch requires nonempty states and questions');
+        }
+        return launchModel('judgment_batch',{states,questions,
+            ...modelOptions(options,{images:'images',concurrency:'concurrency',timeoutSeconds:'timeout_secs'})});
+    };
+    completion.attach = id => attachModel('completion',id);
+    judge.attach = id => attachModel('judgment',id);
+    judgeBatch.attach = id => attachModel('judgment_batch',id);
+    globalThis.completion = freeze(completion);
+    globalThis.judge = freeze(judge);
+    globalThis.judgeBatch = freeze(judgeBatch);
     const workerStates = new WeakMap();
     const workerGet = workerStates.get.bind(workerStates);
     const workerSet = workerStates.set.bind(workerStates);
@@ -266,10 +438,10 @@
     globalThis.wait = async (handles, options = {}) => {
         if (!isArray(handles) || handles.length > 32 || handles.some(handle =>
             !(handle instanceof AgentJob) && !(handle instanceof AgentTurn)
-            && !(handle instanceof AgentPoolItem) && !workerGet(handle))
+            && !(handle instanceof AgentPoolItem) && !(handle instanceof ModelJob) && !workerGet(handle))
             || !options || typeof options !== 'object' || isArray(options)
             || keys(options).some(name => name !== 'timeout' && name !== 'raiseErrors')) {
-            throw new TypeErrorType('EVAL_AGENT_INPUT: wait requires up to 32 agent handles and timeout/raiseErrors options');
+            throw new TypeErrorType('EVAL_AGENT_INPUT: wait requires up to 32 agent/model handles and timeout/raiseErrors options');
         }
         const timeoutMs = waitMilliseconds(options.timeout === undefined ? 30 : options.timeout);
         const raiseErrors = options.raiseErrors === undefined ? true : options.raiseErrors;
@@ -283,6 +455,7 @@
             const remaining = Math.max(0, deadline - now());
             results.push(await (handle instanceof AgentTurn ? waitTurn(handle, remaining, raiseErrors)
                 : handle instanceof AgentPoolItem ? waitPoolItem(handle, remaining, raiseErrors)
+                : handle instanceof ModelJob ? waitModelJob(handle, remaining, raiseErrors)
                 : waitJob(handle, remaining, raiseErrors)));
         }
         return results;

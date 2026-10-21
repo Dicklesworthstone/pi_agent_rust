@@ -21,6 +21,7 @@ mod tests;
 
 pub use contract::JudgmentRequest;
 pub use completion::CompletionRequest;
+pub(crate) use completion::PreparedCompletion;
 pub(crate) use images::{
     MAX_JUDGMENT_IMAGES, MAX_JUDGMENT_IMAGE_BYTES, MAX_JUDGMENT_IMAGE_ENCODED_BYTES, validate_image,
 };
@@ -39,6 +40,15 @@ pub struct Judge {
     options: StreamOptions,
     privacy: AuxiliaryPrivacy,
     supports_images: bool,
+}
+
+/// Fully screened, owned evidence and rubric. Preparation performs no provider
+/// I/O and retains neither the caller's privacy callback nor any tool authority.
+/// The private fields keep background callers on the ordinary validation path.
+pub(crate) struct PreparedJudgment {
+    system: String,
+    content: UserContent,
+    rubric: JudgmentRequest,
 }
 
 impl Judge {
@@ -84,6 +94,17 @@ impl Judge {
         request: JudgmentRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
+        let prepared = self.prepare_judgment(request, protect)?;
+        self.run_prepared_judgment(prepared).await
+    }
+
+    /// Complete text privacy and answer-identity validation before a retained
+    /// task is admitted. Image loading and its host checks belong to the caller.
+    pub(crate) fn prepare_judgment(
+        &self,
+        request: JudgmentRequest,
+        protect: Option<&Protect<'_>>,
+    ) -> Result<PreparedJudgment> {
         self.check_image_support(request.has_images())?;
         let encoded = request.encoded()?;
         // Screen all state, labels and rubrics in one projection, before any
@@ -104,8 +125,18 @@ impl Judge {
             blocks.extend(images.into_iter().map(ContentBlock::Image));
             UserContent::Blocks(blocks)
         };
+        Ok(PreparedJudgment { system, content, rubric: screened })
+    }
+
+    /// Execute already admitted evidence with the same tool-free collector,
+    /// cancellation checks and response validation as foreground judgments.
+    pub(crate) async fn run_prepared_judgment(
+        &self,
+        prepared: PreparedJudgment,
+    ) -> Result<Value> {
+        let PreparedJudgment { system, content, rubric } = prepared;
         let (answer, usage) = self.request_content(system, content, None).await?;
-        let answers = screened.answers(&answer)?;
+        let answers = rubric.answers(&answer)?;
         Ok(self.reply("pi.judgment.v1", "answers", answers, usage))
     }
 
