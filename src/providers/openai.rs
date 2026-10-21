@@ -311,7 +311,6 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.system_role_name.as_deref())
             .unwrap_or("system");
-        let messages = Self::build_messages_with_role(context, system_role);
 
         let tools_supported = self
             .compat
@@ -324,6 +323,13 @@ impl OpenAIProvider {
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
         };
+        // DeepSeek requires prior reasoning_content to be replayed on requests
+        // that admit tools. Keep this independent of the current thinking-level
+        // override: disabling thinking now must not erase reasoning from history.
+        let replay_reasoning =
+            tools.is_some() && self.reasoning_style() == Some(ReasoningStyle::DeepSeek);
+        let messages =
+            self.build_messages_with_role(context, system_role, replay_reasoning);
 
         // Determine which max-tokens field to populate based on compat config.
         let use_alt_field = self
@@ -522,8 +528,10 @@ impl OpenAIProvider {
 
     /// Build the messages array with system prompt prepended using the given role name.
     fn build_messages_with_role<'a>(
+        &self,
         context: &'a Context<'_>,
         system_role: &'a str,
+        replay_reasoning: bool,
     ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
@@ -534,6 +542,7 @@ impl OpenAIProvider {
                 content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
@@ -545,7 +554,15 @@ impl OpenAIProvider {
             if !matches!(message, Message::ToolResult(_)) {
                 append_tool_result_images(&mut messages, &mut tool_images);
             }
-            messages.push(convert_message_to_openai(message, &mut tool_images));
+            let mut converted = convert_message_to_openai(message, &mut tool_images);
+            if replay_reasoning && let Message::Assistant(assistant) = message {
+                converted.reasoning_content = Some(deepseek_replay_reasoning(
+                    assistant,
+                    &self.provider,
+                    &self.model,
+                ));
+            }
+            messages.push(converted);
         }
         append_tool_result_images(&mut messages, &mut tool_images);
 
@@ -1715,6 +1732,9 @@ struct OpenAIMessage<'a> {
     tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// Native DeepSeek reasoning replay; omitted for other dialects and roles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1880,6 +1900,40 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
+/// Reconstruct the exact native DeepSeek reasoning text from already-screened
+/// same-provider history. Signed or foreign reasoning is never downgraded into
+/// DeepSeek's unsigned replay field.
+fn deepseek_replay_reasoning<'a>(
+    assistant: &'a AssistantMessage,
+    provider: &str,
+    model: &str,
+) -> Cow<'a, str> {
+    if assistant.api != "openai-completions"
+        || !crate::provider_metadata::provider_ids_match(&assistant.provider, provider)
+        || assistant.model != model
+    {
+        return Cow::Borrowed("");
+    }
+    let mut parts = assistant.content.iter().filter_map(|block| match block {
+        ContentBlock::Thinking(thinking) if thinking.thinking_signature.is_none() => {
+            Some(thinking.thinking.as_str())
+        }
+        _ => None,
+    });
+    let Some(first) = parts.next() else {
+        return Cow::Borrowed("");
+    };
+    let Some(second) = parts.next() else {
+        return Cow::Borrowed(first);
+    };
+    let mut reasoning = String::from(first);
+    reasoning.push_str(second);
+    for part in parts {
+        reasoning.push_str(part);
+    }
+    Cow::Owned(reasoning)
+}
+
 #[allow(clippy::too_many_lines)]
 fn convert_message_to_openai<'a>(
     message: &'a Message,
@@ -1891,12 +1945,14 @@ fn convert_message_to_openai<'a>(
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message::Custom(custom) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message::Assistant(assistant) => {
             // Collect text content
@@ -1949,6 +2005,7 @@ fn convert_message_to_openai<'a>(
                 content,
                 tool_calls,
                 tool_call_id: None,
+                reasoning_content: None,
             }
         }
         Message::ToolResult(result) => {
@@ -1998,6 +2055,7 @@ fn convert_message_to_openai<'a>(
                 content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
+                reasoning_content: None,
             }
         }
     }
@@ -2020,6 +2078,7 @@ fn append_tool_result_images<'a>(
         content: Some(OpenAIContent::Parts(parts)),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
 }
 
@@ -2586,6 +2645,160 @@ mod tests {
                 "required": ["q"]
             })
         );
+    }
+
+    #[test]
+    fn deepseek_tool_requests_replay_same_origin_reasoning_exactly() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let assistant = AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: " first\n".to_string(),
+                    thinking_signature: None,
+                }),
+                ContentBlock::Text(TextContent::new("visible")),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "日本語🙂 last ".to_string(),
+                    thinking_signature: None,
+                }),
+            ],
+            ..AssistantMessage::default()
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(assistant)].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &context,
+            &StreamOptions {
+                thinking_level: Some(ThinkingLevel::High),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        assert_eq!(body["messages"][0]["reasoning_content"], " first\n日本語🙂 last ");
+        assert_eq!(body["messages"][0]["content"], "visible");
+    }
+
+    #[test]
+    fn deepseek_replay_survives_current_thinking_off_but_requires_tools() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let message = Message::assistant(AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "prior".to_string(),
+                thinking_signature: None,
+            })],
+            ..AssistantMessage::default()
+        });
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let with_tools = Context {
+            system_prompt: None,
+            messages: vec![message.clone()].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&with_tools, &options)).unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["messages"][0]["reasoning_content"], "prior");
+
+        let without_tools = Context {
+            system_prompt: None,
+            messages: vec![message].into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&without_tools, &options)).unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_replay_never_exports_foreign_or_signed_reasoning() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        for (source_provider, signature) in [
+            ("other-provider", None),
+            ("deepseek", Some("opaque")),
+        ] {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::assistant(AssistantMessage {
+                    api: "openai-completions".to_string(),
+                    provider: source_provider.to_string(),
+                    model: "deepseek-reasoner".to_string(),
+                    content: vec![ContentBlock::Thinking(ThinkingContent {
+                        thinking: "private-reasoning".to_string(),
+                        thinking_signature: signature.map(str::to_string),
+                    })],
+                    ..AssistantMessage::default()
+                })]
+                .into(),
+                tools: vec![ToolDef {
+                    name: "read".to_string(),
+                    description: "Read".to_string(),
+                    parameters: json!({"type":"object"}),
+                }]
+                .into(),
+            };
+            let body = serde_json::to_value(
+                provider.build_request(&context, &StreamOptions::default()),
+            )
+            .unwrap();
+            assert_eq!(body["messages"][0]["reasoning_content"], "");
+            assert!(!body.to_string().contains("private-reasoning"));
+            assert!(!body.to_string().contains("opaque"));
+        }
+    }
+
+    #[test]
+    fn non_deepseek_transport_never_adds_reasoning_content() {
+        let provider = OpenAIProvider::new("gpt-test").with_reasoning(true);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(AssistantMessage {
+                api: "openai-completions".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "local display thought".to_string(),
+                    thinking_signature: None,
+                })],
+                ..AssistantMessage::default()
+            })]
+            .into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
     }
 
     #[test]
