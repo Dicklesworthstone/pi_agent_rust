@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod pool;
+
 const SCHEMA: &str = "pi.subagent.worker.v1";
 const MAX_WORKERS: usize = 32;
 const MAX_TURNS: u64 = 32;
@@ -47,6 +49,7 @@ pub(super) struct WorkerState {
     job_id: String,
     agent: String,
     deadline: Deadline,
+    emit_notices: bool,
     acknowledged: bool,
     started: bool,
     closing: bool,
@@ -86,6 +89,8 @@ pub(super) fn requested(input: &Value) -> Result<bool> {
             if matches!(
                 operation.as_str(),
                 "worker_start" | "worker_send" | "worker_status" | "worker_wait" | "worker_close"
+                    | "pool_start" | "pool_push" | "pool_finish" | "pool_status"
+                    | "pool_result" | "pool_wait" | "pool_close"
             ) =>
         {
             Ok(true)
@@ -287,6 +292,7 @@ async fn start(
         job_id: String::new(),
         agent: name,
         deadline,
+        emit_notices: true,
         acknowledged: false,
         started: false,
         closing: false,
@@ -386,6 +392,9 @@ pub(super) async fn execute(
         .get("operation")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("operation is required"))?;
+    if operation.starts_with("pool_") {
+        return pool::execute(tool, input, privacy).await;
+    }
     if operation == "worker_start" {
         return start(tool, input, privacy).await;
     }
@@ -729,12 +738,12 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
         turn.status = status;
         turn.result = Some(output);
         state.result_bytes = state.result_bytes.saturating_add(bytes);
-        let notice = format!(
+        let notice = state.emit_notices.then(|| format!(
             "[reusable worker {} turn {id} {status}]\n{}",
             state.id,
             if over_budget { WITHHELD } else { &summary }
-        );
-        Ok(((), Some(notice)))
+        ));
+        Ok(((), notice))
     });
     if accepted.is_err() {
         // Lost publication authority must stop the actor before another queued

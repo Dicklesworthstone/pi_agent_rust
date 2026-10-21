@@ -249,3 +249,171 @@ first prompt in its second response while keeping one PID, queued turn ordering,
 the post-turn streaming/compaction barrier, idle cancellation and session ownership.
 Rust acceptance remains the DSR quality lane; guest-language diagnostics alone
 do not establish native execution correctness.
+
+## Reusable workpools
+
+A native pool owns one background carrier job and 1–8 reusable RPC children.
+It accepts further batches while earlier items execute, retains each child's
+conversation, and provides one aggregate completion after admission is sealed
+and all accepted work drains. The queue and controller live in Rust; an eval
+interpreter is not needed to keep them running.
+
+```json
+{
+  "operation": "pool_start",
+  "agent": "reviewer",
+  "tasks": [
+    "Review parser error handling for concrete correctness defects",
+    "Review cancellation and child-process cleanup for concrete races"
+  ],
+  "concurrency": 2,
+  "timeoutSeconds": 300
+}
+```
+
+The acknowledgment has `details.schema: "pi.subagent.pool.v1"`, a stable
+`poolId`, a carrier `jobId`, and `admittedItemIds` in input order. Item IDs are
+1-based, never reused and independent of internal worker/turn assignments.
+The `items` manifest retains admission order. Internal member worker handles
+are not published and cannot be used to cancel a shared carrier accidentally.
+
+Later batches use the existing pool identity:
+
+```json
+{"operation":"pool_push","poolId":"pool-…","tasks":["Review session persistence for data-loss risks"]}
+```
+
+Each batch is admitted atomically under the carrier's cancellation boundary.
+Every assignment and placement is checked before any task is queued: rejection
+does not admit a prefix. Accepted tasks are balanced by pending work and prior
+admissions across live members, then run in FIFO order within each child. A
+later item has no guaranteed affinity to a particular earlier item's child.
+Failed members are not silently replaced.
+
+### Native operations and result shapes
+
+All controls use the `subagent` tool with an explicit `operation` field:
+
+| Operation | Fields and behavior |
+| --- | --- |
+| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, and `isolation: "none"`. Returns the new identity and admitted item IDs. |
+| `pool_push` | Requires `poolId` and a nonempty `tasks` array. Returns all newly admitted item IDs; cannot change launch settings. |
+| `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
+| `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
+| `pool_wait` | Requires `poolId`; accepts `itemId` and `timeoutMs`. Waits for that item, or for terminal pool state when `itemId` is omitted. Does not seal admission. |
+| `pool_finish` | Requires `poolId`. Seals admission and acknowledges immediately; accepted items continue draining. Repeated finish is safe. |
+| `pool_close` | Requires `poolId`. Cancels running and queued work and waits for owned child cleanup. Repeated close is safe. |
+
+Pool status is `open`, `draining`, `completed`, `failed` or `cancelled`.
+`sealed` reports whether further native admission is closed. The manifest
+includes `concurrency`, `admittedItems`, `queuedItems`, `runningItems`,
+`completedItems`, `failedItems` and `remainingMs`. Failed counts include
+cancelled items. Each manifest entry has this shape:
+
+```json
+{"id":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
+```
+
+The summary is an excerpt, not a replacement for the task's native output.
+Fetch one exact result with:
+
+```json
+{"operation":"pool_result","poolId":"pool-…","itemId":1}
+```
+
+This adds `details.itemId` and `details.item: {id, status, result}`. Pending
+items have status `queued` or `running` and `result: null`; terminal items have
+status `completed`, `failed` or `cancelled` and a non-null native `ToolOutput`.
+That output preserves content, native details, error status, child PID and hub
+metadata. Accepted observation/control calls remain successful tool calls even
+when the selected result failed; inspect `details.item.result.isError` and the
+item status. The aggregate carrier result separately reports failed completion.
+
+`pool_wait` accepts a timeout from 0 through 600,000 ms and defaults to 30,000.
+Zero polls. Reaching this observation timeout returns a pending snapshot and
+does not cancel or restart work. Waiting for the pool without sealing it may
+time out even when all currently admitted items have finished: an open pool
+still accepts more work.
+
+### Finish, cancellation and aggregate delivery
+
+Seal the pool when no more tasks will be added, then wait for its carrier:
+
+```json
+{"operation":"pool_finish","poolId":"pool-…"}
+```
+
+```json
+{"action":"wait","jobId":"job-…","timeoutMs":30000}
+```
+
+The second request uses the ordinary `jobs` tool. Successful drain retires all
+member processes before the carrier settles. Its final
+`result.details.schema: "pi.subagent.pool.v1"` contains the ordered bounded
+manifest and result references. Per-item completion notices are suppressed;
+the carrier produces one aggregate session completion notice. Explicit result
+reads and waits do not consume that notice. Full item results remain available
+through `pool_result` while the pool remains retained.
+
+Use `pool_close` or `jobs cancel` to stop work instead of draining it. Either
+retires the shared carrier and all its running and queued items. Session
+shutdown also cancels owned work. Previously performed filesystem effects are
+not rolled back. Normal finish, explicit cancellation and deadline exhaustion
+have different outcomes; a cancelled or timed-out carrier may have the jobs
+runtime's error result rather than a successful aggregate manifest.
+
+### Bounds, policy and recovery
+
+- Each pool consumes **one of the process's eight active native-job slots**.
+  It can own up to eight RPC child processes, including idle members. The
+  carrier count is not a child-process count; select concurrency accordingly.
+- A pool admits at most 32 items across all pushes. Each assignment is nonempty
+  UTF-8 text of at most 64 KiB without NUL. Native `pool_start` accepts an empty
+  initial batch; native `pool_push` does not.
+- Eval's JavaScript and Python `workpool()` helpers additionally cap the entire
+  encoded batch request at 256 KiB and validate it before dispatch. Split larger
+  submissions across pushes. Each accepted guest batch uses one host call, as
+  does each complete manifest observation.
+- One original deadline covers discovery, startup, queueing, execution and idle
+  time. The host limit defaults to 900 seconds; `timeoutSeconds` may shorten it.
+  Push, finish and observation waits never renew the deadline.
+- Children use the definition, model selection, tools and working directory
+  captured at startup. Pools currently require Unix and `isolation: "none"`.
+  Worktree isolation, output schemas, schema-bearing definitions and historical
+  `seance` consultation remain on the ordinary delegation path.
+- Every native operation checks the current owning session and cancellation
+  state. An eval request also passes its active Agent's current tool, approval,
+  plan and extension policy. Captured IDs grant no permission in another
+  session or standalone eval. Each accepted batch captures current privacy
+  policy; results are screened before storage, aggregate delivery and later
+  reads under the caller's current policy.
+- Full item output uses the worker limits: at most 128 KiB per item and less
+  than 1 MiB per member's retained results, with explicit errors for withheld
+  output. Manifests use bounded summaries and result references. The registry
+  retains at most 16 pools, evicting an older reaped pool when needed; active
+  pools are not evicted. Jobs apply their own aggregate-result retention limits.
+
+Atomic admission does not guarantee that its acknowledgment reaches the caller.
+A transport failure, cancellation or interrupted cell can leave an entire batch
+accepted even when its reply was lost. Never automatically replay such a batch.
+When `poolId` is known, inspect `pool_status` to recover the actual admitted
+items. The guest helper closes its own admission after an ambiguous mutation,
+preserves known handles, and can reconcile them with `peek()`; finishing or
+cancelling remains explicit.
+
+Kernel reset loses guest variables without cancelling native jobs. Preserve
+both IDs outside the interpreter, or recover them from the owning session's
+`jobs list`: the carrier label is `reusable subagent pool <poolId>`, and the
+snapshot supplies its job ID. Use native `pool_status`, `pool_result`,
+`pool_finish` or `pool_close` after recovery. A guest that never received its
+first acknowledgment reports `unknownAdmission: true` and cannot claim complete
+cleanup for an unidentified carrier. Recovery uses the direct native operations;
+the original unacknowledged guest object does not automatically bind to the
+recovered identity. This retention is
+bounded and process-local; it does not provide disk durability, process-restart
+resume or reconstruction of child conversations from job artifacts.
+
+See [eval workpool examples](eval-structured-results.md#reusable-workpools) for
+JavaScript and Python handles, aggregate jobs and mixed waits. Native regression
+coverage lives in `src/subagents/worker/pool.rs`; the authoritative acceptance
+entry point remains `dsr quality --tool pi_agent_rust`.

@@ -42,41 +42,86 @@ def turn_result(turn_id):
 class PoolHost:
     def __init__(self, kernel):
         self.kernel = kernel
-        self.workers = {}
+        self.pools = {}
         self.operations = []
 
-    def __call__(self, frame):
+    def snapshot(self, pool):
+        counts = {status: 0 for status in ("queued", "running", "completed", "failed", "cancelled")}
+        for item in pool["items"]:
+            counts[item["status"]] += 1
+        return {"schema": "pi.subagent.pool.v1", "poolId": pool["id"], "jobId": pool["jobId"],
+                "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
+                "concurrency": pool["concurrency"], "admittedItems": len(pool["items"]),
+                "queuedItems": counts["queued"], "runningItems": counts["running"],
+                "completedItems": counts["completed"], "failedItems": counts["failed"] + counts["cancelled"],
+                "remainingMs": 900000, "items": [
+                    {"id": item["id"], "status": item["status"],
+                     "summary": f"item {item['id']}" if item["result"] is not None else "",
+                     "resultRef": {"poolId": pool["id"], "itemId": item["id"]}}
+                    for item in pool["items"]]}
+
+    @staticmethod
+    def complete(pool, item_id, result=None):
+        result = turn_result(item_id) if result is None else result
+        pool["items"][item_id - 1].update(status="failed" if result.get("isError") else "completed", result=result)
+
+    def apply(self, frame):
         request = frame["bridge"]["input"]
+        args = request["args"]
+        if request["name"] == "jobs":
+            self.operations.append(f"jobs:{args['action']}")
+            pool = next(pool for pool in self.pools.values() if pool["jobId"] == args["jobId"])
+            snapshot = {"schema": "pi.host_job.v1", "id": pool["jobId"], "status": "running"}
+            if pool["sealed"]:
+                for item in pool["items"]:
+                    if item["result"] is None:
+                        self.complete(pool, item["id"])
+                pool["status"] = "failed" if any(item["status"] == "failed" for item in pool["items"]) else "completed"
+                snapshot.update(status="exited", result={
+                    "content": [{"type": "text", "text": "aggregate completed"}],
+                    "details": self.snapshot(pool), "isError": pool["status"] == "failed",
+                })
+            return snapshot
         if request["name"] != "subagent":
             raise AssertionError("pool must use native subagent operations")
-        args = request["args"]
         operation = args["operation"]
         self.operations.append(operation)
-        if operation == "worker_start":
-            worker_id = f"pool-worker-{len(self.workers) + 1}"
-            worker = {"id": worker_id, "agent": args["agent"], "status": "running", "latest": 1,
-                      "turns": {1: {"task": args["task"], "status": "running", "result": None}}}
-            self.workers[worker_id] = worker
+        if operation == "pool_start":
+            pool_id = f"pool-native-{len(self.pools) + 1}"
+            pool = {"id": pool_id, "jobId": f"carrier-{pool_id}", "agent": args["agent"],
+                    "concurrency": args["concurrency"], "status": "open", "sealed": False, "items": []}
+            self.pools[pool_id] = pool
         else:
-            worker = self.workers[args["workerId"]]
-            if operation == "worker_send":
-                worker["latest"] += 1
-                worker["status"] = "running"
-                worker["turns"][worker["latest"]] = {"task": args["task"], "status": "queued", "result": None}
-            elif operation == "worker_close":
-                worker["status"] = "closed"
-                for turn in worker["turns"].values():
-                    if turn["result"] is None:
-                        turn["status"] = "cancelled"
-                        turn["result"] = {"content": [], "details": {"cancelled": True}, "isError": True}
-            elif operation not in ("worker_status", "worker_wait"):
-                raise AssertionError(f"unexpected operation {operation}")
-        turn_id = args.get("turnId", worker["latest"])
-        turn = worker["turns"][turn_id]
-        snapshot = {"schema": "pi.subagent.worker.v1", "workerId": worker["id"],
-                    "jobId": f"carrier-{worker['id']}", "agent": worker["agent"], "status": worker["status"],
-                    "turnId": turn_id, "turn": {"id": turn_id, "status": turn["status"], "result": turn["result"]}}
-        self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+            pool = self.pools[args["poolId"]]
+        admitted = []
+        if operation in ("pool_start", "pool_push"):
+            if pool["sealed"]:
+                raise AssertionError("guest must not admit work after sealing")
+            for task in args["tasks"]:
+                item_id = len(pool["items"]) + 1
+                pool["items"].append({"id": item_id, "task": task, "result": None,
+                                      "status": "running" if item_id <= pool["concurrency"] else "queued"})
+                admitted.append(item_id)
+        elif operation == "pool_finish":
+            pool["sealed"] = True
+            pool["status"] = "draining" if any(item["result"] is None for item in pool["items"]) else "completed"
+        elif operation == "pool_close":
+            pool.update(sealed=True, status="cancelled")
+            for item in pool["items"]:
+                if item["result"] is None:
+                    item.update(status="cancelled", result={"content": [], "details": {"cancelled": True}, "isError": True})
+        elif operation not in ("pool_status", "pool_result", "pool_wait"):
+            raise AssertionError(f"unexpected operation {operation}")
+        snapshot = self.snapshot(pool)
+        if operation in ("pool_start", "pool_push"):
+            snapshot["admittedItemIds"] = admitted
+        if "itemId" in args:
+            item = pool["items"][args["itemId"] - 1]
+            snapshot.update(itemId=item["id"], item={"id": item["id"], "status": item["status"], "result": item["result"]})
+        return snapshot
+
+    def __call__(self, frame):
+        self.kernel.reply(frame, json.dumps(envelope(self.apply(frame))))
 
 
 class Kernel:
@@ -423,33 +468,41 @@ await sent
         response = self.kernel.cell(f"pool = await workpool(agent='scout', concurrency={concurrency}); pool.concurrency")
         self.assertEqual(self.value(response), concurrency)
 
-    def test_pool_lazily_starts_workers_reuses_fifo_turns_and_retains_items_across_cells(self):
+    def test_pool_admits_batches_through_one_native_carrier_and_retains_fixed_items(self):
         self.create_pool()
         self.assertEqual(self.kernel.calls, [])
         native = PoolHost(self.kernel)
         response = self.kernel.cell(
-            "items = await pool.push(['a','b','c','d','e']); [(item.worker_id, item.turn_id) for item in items]", native)
-        self.assertEqual(self.value(response), [
-            ("pool-worker-1", 1), ("pool-worker-2", 1), ("pool-worker-1", 2),
-            ("pool-worker-2", 2), ("pool-worker-1", 3),
-        ])
-        self.assertEqual(native.operations, ["worker_start", "worker_start", "worker_send", "worker_send", "worker_send"])
-        idle = native.workers["pool-worker-1"]
-        idle["status"] = "idle"
-        for turn_id, turn in idle["turns"].items():
-            turn.update(status="completed", result=turn_result(turn_id))
-        response = self.kernel.cell("more = await pool.push(['f']); more[0].worker_id", native)
-        self.assertEqual(self.value(response), "pool-worker-1")
-        self.assertEqual(len(native.workers), 2)
-        self.assertEqual(native.operations[-3:], ["worker_status", "worker_status", "worker_send"])
+            "items = await pool.push(['a','b','c','d','e']); [(item.pool_id, item.job_id, item.item_id) for item in items]", native)
+        self.assertEqual(self.value(response), [("pool-native-1", "carrier-pool-native-1", item_id) for item_id in range(1, 6)])
+        self.assertEqual(native.operations, ["pool_start"])
+        self.assertEqual(self.kernel.calls[0]["bridge"]["input"]["args"], {
+            "agent": "scout", "operation": "pool_start", "concurrency": 2, "tasks": ["a", "b", "c", "d", "e"],
+        })
+        self.assertEqual(self.value(self.kernel.cell("(hasattr(items[0], 'worker_id'), hasattr(items[0], 'cancel'))")), (False, False))
+        response = self.kernel.cell("items[0].item_id = 7")
+        self.assertFalse(response["ok"])
+        native_pool = native.pools["pool-native-1"]
+        native.complete(native_pool, 1)
+        response = self.kernel.cell("more = await pool.push(['f']); more[0].item_id", native)
+        self.assertEqual(self.value(response), 6)
+        self.assertEqual(len(native.pools), 1)
+        self.assertEqual(native.operations, ["pool_start", "pool_push"])
+        before = len(self.kernel.calls)
         snapshot = self.value(self.kernel.cell("await pool.peek()", native))
+        self.assertEqual(len(self.kernel.calls), before + 1)
         self.assertEqual(len(snapshot["items"]), 6)
-        self.assertEqual(snapshot["items"][0]["result"]["details"]["turn"], 1)
-        self.assertEqual(snapshot["items"][-1]["turnId"], 4)
+        self.assertEqual(snapshot["items"][0]["summary"], "item 1")
+        self.assertNotIn("result", snapshot["items"][0])
+        self.assertEqual(self.value(self.kernel.cell("await items[0].output()", native))["details"]["turn"], 1)
         status = self.value(self.kernel.cell("await pool.status()", native))
-        self.assertEqual(status["total"], 6)
-        self.assertEqual(status["counts"]["completed"], 3)
-        self.assertEqual(status["workerCount"], 2)
+        self.assertEqual(status["admittedItems"], 6)
+        self.assertEqual(status["completedItems"], 1)
+        fresh = Kernel()
+        self.addCleanup(fresh.close)
+        response = fresh.cell("await tool.result('subagent', {'operation':'pool_status', 'poolId':'pool-native-1'})",
+                              lambda frame: fresh.reply(frame, json.dumps(envelope(native.apply(frame)))))
+        self.assertEqual(self.value(response)["details"]["admittedItems"], 6)
 
     def test_pool_validates_whole_batch_and_enforces_total_capacity_before_dispatch(self):
         self.create_pool()
@@ -459,54 +512,143 @@ await sent
             self.assertFalse(response["ok"])
             self.assertIn("EVAL_POOL_INPUT", response["error"])
             self.assertEqual(self.kernel.calls, [])
+        response = self.kernel.cell("await pool.push(['x' * 65536] * 4)")
+        self.assertFalse(response["ok"])
+        self.assertIn("encoded batch exceeds 256 KiB", response["error"])
+        self.assertFalse(self.value(self.kernel.cell("pool.closed or pool.unknown_admission")))
+        self.assertEqual(self.kernel.calls, [])
         native = PoolHost(self.kernel)
         response = self.kernel.cell("items = await pool.push([f'task {n}' for n in range(32)]); len(items)", native)
         self.assertEqual(self.value(response), 32)
-        self.assertEqual(len(self.kernel.calls), 32)
-        self.assertEqual(len(native.workers), 2)
+        self.assertEqual(len(self.kernel.calls), 1)
+        self.assertEqual(len(native.pools), 1)
         response = self.kernel.cell("await pool.push(['over capacity'])")
         self.assertFalse(response["ok"])
         self.assertIn("EVAL_POOL_CAPACITY", response["error"])
-        self.assertEqual(len(self.kernel.calls), 32)
+        self.assertEqual(len(self.kernel.calls), 1)
         for options in ({"concurrency": 0}, {"concurrency": 9}, {"concurrency": 1.5}, {"concurrency": True},
                         {"timeout_seconds": 0}, {"scope": "all"}, {"isolation": "worktree"},
                         {"keep_alive": False}, {"output_schema": {}}, {"cwd": None}):
             response = self.kernel.cell(f"await workpool(**{options!r})")
             self.assertFalse(response["ok"])
             self.assertIn("EVAL_POOL_INPUT", response["error"])
-        self.assertEqual(len(self.kernel.calls), 32)
+        self.assertEqual(len(self.kernel.calls), 1)
 
-    def test_pool_partial_failure_keeps_acknowledged_handles_and_closes_admission(self):
+    def test_pool_launch_options_use_native_fields_and_keep_name_local(self):
+        response = self.kernel.cell("pool = await workpool(agent='scout', concurrency=3, name='review', cwd='.', "
+                                    "scope='project', isolation='none', timeout_seconds=120); pool.name")
+        self.assertEqual(self.value(response), "review")
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['inspect']); pool.id", native))
+        self.assertEqual(self.kernel.calls[0]["bridge"]["input"]["args"], {
+            "agent": "scout", "cwd": ".", "scope": "project", "isolation": "none", "timeoutSeconds": 120,
+            "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"],
+        })
+
+    def test_pool_lost_batch_acknowledgment_recovers_native_admission_without_replay(self):
         self.create_pool()
         native = PoolHost(self.kernel)
-        admissions = []
+        self.value(self.kernel.cell("await pool.push(['a','b']); len(pool.items)", native))
         def bridge(frame):
-            operation = frame["bridge"]["input"]["args"]["operation"]
-            if operation in ("worker_start", "worker_send"):
-                admissions.append(operation)
-            if len(admissions) == 3:
-                self.kernel.reply(frame, error="PI_WORKER_REJECTED")
-            else:
-                native(frame)
+            native.apply(frame)
+            self.kernel.reply(frame, error="acknowledgment lost")
         response = self.kernel.cell("""
 try:
-    await pool.push(['a','b','c','d'])
+    await pool.push(['c','d'])
 except Exception as error:
-    failure = (str(error), len(error.admitted), error.requested, len(pool.items), pool.closed)
+    failure = (str(error), len(error.admitted), error.requested, len(pool.items), pool.closed, pool.unknown_admission)
 failure
 """, bridge)
-        message, acknowledged, requested, retained, closed = self.value(response)
-        self.assertIn("acknowledged 2 of 4", message)
-        self.assertEqual((acknowledged, requested, retained, closed), (2, 4, 2, True))
+        message, acknowledged, requested, retained, closed, unknown = self.value(response)
+        self.assertIn("EVAL_POOL_ADMISSION", message)
+        self.assertEqual((acknowledged, requested, retained, closed, unknown), (2, 2, 2, True, True))
         response = self.kernel.cell("await pool.push(['retry'])")
         self.assertFalse(response["ok"])
         self.assertIn("EVAL_POOL_CLOSED", response["error"])
         snapshot = self.value(self.kernel.cell("await pool.peek()", native))
-        self.assertEqual(len(snapshot["items"]), 2)
-        self.assertIn("PI_WORKER_REJECTED", snapshot["lastError"])
+        self.assertEqual(len(snapshot["items"]), 4)
+        self.assertTrue(snapshot["closed"])
+        self.assertFalse(snapshot["unknownAdmission"])
+        self.assertEqual(self.value(self.kernel.cell("pool.items[-1].item_id")), 4)
+        self.assertEqual(native.operations, ["pool_start", "pool_push", "pool_status"])
         closed = self.value(self.kernel.cell("await pool.close()", native))
         self.assertTrue(closed["allClosed"])
-        self.assertEqual(len(closed["workers"]), 2)
+
+    def test_pool_finish_seals_once_and_returns_a_retained_aggregate_job(self):
+        self.create_pool(concurrency=1)
+        native = PoolHost(self.kernel)
+        response = self.kernel.cell("""
+import asyncio
+settled = await asyncio.gather(pool.push(['a','b']), pool.finish(), pool.push(['late']), return_exceptions=True)
+(len(settled[0]), settled[1].id, str(settled[2]))
+""", native)
+        count, job_id, rejected = self.value(response)
+        self.assertEqual((count, job_id), (2, "carrier-pool-native-1"))
+        self.assertIn("EVAL_POOL_CLOSED", rejected)
+        self.assertEqual(native.operations, ["pool_start", "pool_finish"])
+        self.assertEqual(self.value(self.kernel.cell("(await pool.finish()).id")), job_id)
+        result = self.value(self.kernel.cell("await pool.wait(10)", native))
+        self.assertEqual(result["details"]["status"], "completed")
+        self.assertEqual([item["id"] for item in result["details"]["items"]], [1, 2])
+        self.assertEqual(native.operations, ["pool_start", "pool_finish", "jobs:wait"])
+        self.assertEqual(self.value(self.kernel.cell("await pool.output()", native))["details"]["completedItems"], 2)
+        response = self.kernel.cell("await pool.wait(-1)")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_AGENT_INPUT", response["error"])
+        self.create_pool()
+        self.assertEqual(self.value(self.kernel.cell("(await pool.finish()).id", native)), "carrier-pool-native-2")
+        self.assertEqual(native.operations[-2:], ["pool_start", "pool_finish"])
+        self.assertEqual(self.kernel.calls[-2]["bridge"]["input"]["args"]["tasks"], [])
+
+    def test_pool_items_participate_in_ordered_mixed_waits_with_one_deadline(self):
+        self.launch_agent("job", "job-once")
+        self.launch_worker()
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); items[0].item_id", native))
+        native.complete(native.pools["pool-native-1"], 1, {**turn_result(1), "isError": True})
+        requests = []
+        def bridge(frame):
+            request = frame["bridge"]["input"]
+            requests.append(request)
+            self.assertGreaterEqual(request["args"]["timeoutMs"], 0)
+            self.assertLessEqual(request["args"]["timeoutMs"], 10000)
+            if request["args"].get("operation") == "pool_wait":
+                native(frame)
+            elif request["name"] == "jobs":
+                self.kernel.reply(frame, json.dumps(envelope({"schema": "pi.host_job.v1", "id": "job-once",
+                    "status": "exited", "result": turn_result(0)})))
+            else:
+                self.kernel.reply(frame, json.dumps(envelope(worker_snapshot(status="completed", result=turn_result(2)))))
+        results = self.value(self.kernel.cell("await wait([items[0], job, worker], timeout=10, raise_errors=False)", bridge))
+        self.assertEqual([result["details"]["turn"] for result in results], [1, 0, 2])
+        self.assertTrue(results[0]["isError"])
+        self.assertEqual([request["args"].get("operation", request["args"].get("action"))
+                          for request in requests], ["pool_wait", "wait", "worker_wait"])
+
+    def test_pool_item_timeout_and_protocol_validation_preserve_native_identity(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); items[0].id", native))
+        response = self.kernel.cell("await items[0].wait(0)", native)
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_AGENT_TIMEOUT", response["error"])
+        self.assertEqual(native.operations, ["pool_start", "pool_wait"])
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 1)
+        good = {**native.snapshot(pool), "itemId": 1, "item": {"id": 1, "status": "completed", "result": turn_result(1)}}
+        invalid = [{**good, "poolId": "other"}, {**good, "jobId": "other"}, {**good, "agent": "other"},
+                   {**good, "itemId": 2}, {**good, "itemId": True}, {**good, "completedItems": 0},
+                   {**good, "item": {"id": 1, "status": "completed", "result": None}},
+                   {**good, "items": [{**good["items"][0], "resultRef": {"poolId": pool["id"], "itemId": 2}}]}]
+        for snapshot in invalid:
+            response = self.kernel.cell("await items[0].status()", self.reply_with(envelope(snapshot)))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_PROTOCOL", response["error"])
+        response = self.kernel.cell("await items[0].output()",
+                                    lambda frame: self.kernel.reply(frame, error="PI_POOL_OWNER_CHANGED"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_POOL_OWNER_CHANGED", response["error"])
 
     def test_pool_serializes_concurrent_push_close_and_late_admission(self):
         self.create_pool(concurrency=1)
@@ -523,19 +665,20 @@ settled = await asyncio.gather(pushing, closing, late, return_exceptions=True)
         self.assertEqual(count, 2)
         self.assertTrue(closed)
         self.assertIn("EVAL_POOL_CLOSED", message)
-        self.assertEqual(native.operations, ["worker_start", "worker_send", "worker_close"])
+        self.assertEqual(native.operations, ["pool_start", "pool_close"])
         self.assertTrue(self.value(self.kernel.cell("await pool.close()"))["allClosed"])
-        self.assertEqual(len(self.kernel.calls), 3)
+        self.assertEqual(len(self.kernel.calls), 2)
         self.create_pool()
         self.assertTrue(self.value(self.kernel.cell("await pool.close()"))["allClosed"])
-        self.assertEqual(len(self.kernel.calls), 3)
+        self.assertEqual(len(self.kernel.calls), 2)
 
-    def test_cancelled_pool_admission_releases_its_lock_and_keeps_known_workers_closable(self):
+    def test_cancelled_pool_admission_releases_lock_and_keeps_known_carrier_closable(self):
         self.create_pool(concurrency=1)
         native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['a']); len(pool.items)", native))
         pending = []
         def bridge(frame):
-            if frame["bridge"]["input"]["args"]["operation"] == "worker_send":
+            if frame["bridge"]["input"]["args"]["operation"] == "pool_push":
                 pending.append(frame)
             else:
                 native(frame)
@@ -545,7 +688,7 @@ settled = await asyncio.gather(pushing, closing, late, return_exceptions=True)
                 native(pending[0])
         response = self.kernel.cell("""
 import asyncio
-running = asyncio.create_task(pool.push(['a', 'b']))
+running = asyncio.create_task(pool.push(['b', 'c']))
 await asyncio.sleep(0.03)
 running.cancel()
 print('release-pool-reply')
@@ -558,9 +701,10 @@ except asyncio.CancelledError:
         self.assertEqual(self.value(response), (1, True))
         closed = self.value(self.kernel.cell("await pool.close()", native))
         self.assertTrue(closed["allClosed"])
-        self.assertEqual(native.operations, ["worker_start", "worker_send", "worker_close"])
+        self.assertEqual(len(closed["items"]), 3)
+        self.assertEqual(native.operations, ["pool_start", "pool_push", "pool_close"])
 
-    def test_pool_lost_start_acknowledgment_never_claims_every_worker_was_closed(self):
+    def test_pool_lost_start_acknowledgment_never_claims_the_unknown_carrier_was_closed(self):
         self.create_pool()
         response = self.kernel.cell("await pool.push(['first'])",
                                     lambda frame: self.kernel.reply(frame, error="acknowledgment lost"))
@@ -570,6 +714,9 @@ except asyncio.CancelledError:
         self.assertTrue(closed["allKnownClosed"])
         self.assertTrue(closed["unknownAdmission"])
         self.assertFalse(closed["allClosed"])
+        response = self.kernel.cell("await pool.finish()")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
         self.assertEqual(len(self.kernel.calls), 1)
 
     def test_malformed_arguments_never_dispatch(self):

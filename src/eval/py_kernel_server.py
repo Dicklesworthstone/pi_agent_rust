@@ -935,6 +935,8 @@ async def _agent_read_job(job_id, action, timeout_ms=None):
 async def _agent_wait_one(job, timeout_ms, raise_errors):
     if type(job) is _AgentTurn:
         return await _agent_wait_turn(job, timeout_ms, raise_errors)
+    if type(job) is _AgentPoolItem:
+        return await _pool_wait_item(job, timeout_ms, raise_errors)
     snapshot = await _agent_read_job(job.id, "wait", timeout_ms)
     if snapshot["status"] == "running":
         raise TimeoutError("EVAL_AGENT_TIMEOUT: job is still running; it remains available through jobs")
@@ -1196,7 +1198,7 @@ _AGENT_CLOCK = time.monotonic
 
 async def _agent_wait(handles, timeout=30, raise_errors=True):
     if (type(handles) not in (list, tuple) or len(handles) > 32
-            or any(type(handle) not in (_AgentJob, _AgentWorker, _AgentTurn) for handle in handles)
+            or any(type(handle) not in (_AgentJob, _AgentWorker, _AgentTurn, _AgentPoolItem) for handle in handles)
             or type(raise_errors) is not bool):
         raise TypeError("EVAL_AGENT_INPUT: wait requires up to 32 agent handles and boolean raise_errors")
     deadline = _AGENT_CLOCK() + _agent_wait_ms(timeout) / 1000
@@ -1220,23 +1222,159 @@ def _pool_bounded_text(value, maximum):
         return False
 
 
-class _AgentPool:
-    """Bounded native FIFO turns on reusable workers; close cancels all work."""
+def _pool_terminal(status):
+    return status not in ("open", "draining")
 
-    __slots__ = ("_options", "_name", "_concurrency", "_workers", "_items", "_closed", "_last_error",
-                 "_unknown_admission", "_start_pending", "_lock")
+
+def _pool_snapshot(snapshot, pool_id=None, item_id=None):
+    if (type(snapshot) is not dict or snapshot.get("schema") != "pi.subagent.pool.v1"
+            or type(snapshot.get("poolId")) is not str or not snapshot["poolId"]
+            or (pool_id is not None and snapshot["poolId"] != pool_id)
+            or type(snapshot.get("jobId")) is not str or not snapshot["jobId"]
+            or type(snapshot.get("agent")) is not str or not snapshot["agent"]
+            or snapshot.get("status") not in ("open", "draining", "completed", "failed", "cancelled")
+            or type(snapshot.get("sealed")) is not bool
+            or type(snapshot.get("concurrency")) is not int or not 1 <= snapshot["concurrency"] <= 8
+            or type(snapshot.get("items")) is not list or len(snapshot["items"]) > 32
+            or type(snapshot.get("admittedItems")) is not int
+            or snapshot["admittedItems"] != len(snapshot["items"])
+            or type(snapshot.get("remainingMs")) is not int or snapshot["remainingMs"] < 0
+            or any(type(snapshot.get(key)) is not int or not 0 <= snapshot[key] <= snapshot["admittedItems"]
+                   for key in ("queuedItems", "runningItems", "completedItems", "failedItems"))):
+        raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native pool snapshot")
+    counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
+    for index, item in enumerate(snapshot["items"], 1):
+        if (type(item) is not dict or type(item.get("id")) is not int or item["id"] != index
+                or type(item.get("status")) is not str or item["status"] not in counts
+                or type(item.get("summary")) is not str
+                or type(item.get("resultRef")) is not dict
+                or item["resultRef"].get("poolId") != snapshot["poolId"]
+                or type(item["resultRef"].get("itemId")) is not int
+                or item["resultRef"]["itemId"] != item["id"]):
+            raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native pool item manifest")
+        counts[item["status"]] += 1
+    if (snapshot["queuedItems"] != counts["queued"] or snapshot["runningItems"] != counts["running"]
+            or snapshot["completedItems"] != counts["completed"]
+            or snapshot["failedItems"] != counts["failed"] + counts["cancelled"]
+            or (snapshot["status"] == "open") == snapshot["sealed"]):
+        raise ToolBridgeError("EVAL_POOL_PROTOCOL: inconsistent native pool state")
+    if item_id is not None or "itemId" in snapshot or "item" in snapshot:
+        item = snapshot.get("item")
+        selected = snapshot.get("itemId")
+        if (type(selected) is not int or not 1 <= selected <= len(snapshot["items"])
+                or (item_id is not None and selected != item_id)
+                or type(item) is not dict or type(item.get("id")) is not int or item["id"] != selected
+                or item.get("status") != snapshot["items"][selected - 1]["status"] or "result" not in item):
+            raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid selected pool item")
+        result = item["result"]
+        if ((result is None and _agent_turn_done(item)) or (result is not None
+                and (type(result) is not dict or type(result.get("content")) is not list
+                     or "details" not in result or type(result.get("isError", False)) is not bool))):
+            raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native pool item result")
+    return snapshot
+
+
+async def _pool_read_item(handle, operation, timeout_ms=None):
+    arguments = {"operation": operation, "poolId": handle.pool_id, "itemId": handle.item_id}
+    if timeout_ms is not None:
+        arguments["timeoutMs"] = timeout_ms
+    snapshot = _pool_snapshot(await _agent_native_result("subagent", arguments), handle.pool_id, handle.item_id)
+    if snapshot["jobId"] != handle.job_id or snapshot["agent"] != handle.agent:
+        raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity changed")
+    return snapshot
+
+
+async def _pool_wait_item(handle, timeout_ms, raise_errors):
+    snapshot = await _pool_read_item(handle, "pool_wait", timeout_ms)
+    if not _agent_turn_done(snapshot["item"]):
+        raise TimeoutError("EVAL_AGENT_TIMEOUT: pool item is still pending; the native pool remains available")
+    result = snapshot["item"]["result"]
+    if raise_errors and (snapshot["item"]["status"] != "completed" or result.get("isError", False)):
+        raise ToolBridgeError(_agent_result_text(result) or f"Pool item {snapshot['item']['status']}")
+    return result
+
+
+class _AgentPoolItem:
+    """One immutable native pool item. Only the pool can cancel its carrier."""
+
+    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent")
+
+    def __init__(self, pool, item_id):
+        self._pool_id = pool["poolId"]
+        self._item_id = item_id
+        self._job_id = pool["jobId"]
+        self._agent = pool["agent"]
+
+    @property
+    def id(self):
+        return self._item_id
+
+    @property
+    def item_id(self):
+        return self._item_id
+
+    @property
+    def pool_id(self):
+        return self._pool_id
+
+    @property
+    def job_id(self):
+        return self._job_id
+
+    @property
+    def agent(self):
+        return self._agent
+
+    async def status(self):
+        return await _pool_read_item(self, "pool_result")
+
+    async def done(self):
+        return _agent_turn_done((await self.status())["item"])
+
+    async def output(self):
+        return (await self.status())["item"]["result"]
+
+    async def wait(self, timeout=30):
+        return await _pool_wait_item(self, _agent_wait_ms(timeout), True)
+
+    def __await__(self):
+        return self.wait().__await__()
+
+
+class _AgentPool:
+    """One native pool carrier; finish drains, close cancels running and queued work."""
+
+    __slots__ = ("_options", "_name", "_concurrency", "_pool_id", "_job_id", "_snapshot", "_items",
+                 "_closed", "_last_error", "_unknown_admission", "_admission_pending",
+                 "_finish_acknowledged", "_close_acknowledged", "_lock")
 
     def __init__(self, options, name, concurrency):
         self._options = options
         self._name = name
         self._concurrency = concurrency
-        self._workers = []
+        self._pool_id = None
+        self._job_id = None
+        self._snapshot = None
         self._items = []
         self._closed = False
         self._unknown_admission = False
-        self._start_pending = False
+        self._admission_pending = False
+        self._finish_acknowledged = False
+        self._close_acknowledged = False
         self._last_error = None
         self._lock = asyncio.Lock()
+
+    @property
+    def id(self):
+        return self._pool_id
+
+    @property
+    def pool_id(self):
+        return self._pool_id
+
+    @property
+    def job_id(self):
+        return self._job_id
 
     @property
     def name(self):
@@ -1251,8 +1389,58 @@ class _AgentPool:
         return self._closed
 
     @property
+    def unknown_admission(self):
+        return self._unknown_admission
+
+    @property
     def items(self):
         return tuple(self._items)
+
+    def _adopt(self, snapshot):
+        _pool_snapshot(snapshot, self._pool_id)
+        if (snapshot["agent"] != self._options["agent"] or snapshot["concurrency"] != self._concurrency
+                or (self._job_id is not None and snapshot["jobId"] != self._job_id)
+                or len(snapshot["items"]) < len(self._items)):
+            raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity or retained items changed")
+        self._pool_id = snapshot["poolId"]
+        self._job_id = snapshot["jobId"]
+        self._items.extend(_AgentPoolItem(snapshot, index + 1)
+                           for index in range(len(self._items), len(snapshot["items"])))
+        self._snapshot = snapshot
+        self._closed |= snapshot["sealed"] or _pool_terminal(snapshot["status"])
+        self._unknown_admission = False
+        return snapshot
+
+    def _view(self):
+        if self._snapshot is None:
+            snapshot = {"schema": "pi.eval.workpool.pending.v1", "poolId": None, "jobId": None,
+                        "agent": self._options["agent"], "status": "unavailable" if self._unknown_admission
+                        else "cancelled" if self._closed else "unstarted", "sealed": self._closed,
+                        "concurrency": self._concurrency, "admittedItems": 0, "items": []}
+        else:
+            snapshot = {**self._snapshot, "items": [{**item, "resultRef": dict(item["resultRef"])}
+                                                   for item in self._snapshot["items"]]}
+        return {**snapshot, "name": self._name, "closed": self._closed,
+                "unknownAdmission": self._unknown_admission, "lastError": self._last_error}
+
+    async def _command(self, operation, **extra):
+        return self._adopt(await _agent_native_result("subagent", {
+            "operation": operation, "poolId": self._pool_id, **extra,
+        }))
+
+    def _batch_arguments(self, tasks):
+        arguments = ({**self._options, "operation": "pool_start", "concurrency": self._concurrency, "tasks": tasks}
+                     if self._pool_id is None else {"operation": "pool_push", "poolId": self._pool_id, "tasks": tasks})
+        # Match the JS bridge's 256 KiB payload cap before any native mutation;
+        # Python's larger outer protocol frame limit is not a pool API promise.
+        try:
+            encoded = json.dumps({"name": "subagent", "args": arguments}, ensure_ascii=False,
+                                 allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (UnicodeError, ValueError):
+            raise TypeError("EVAL_POOL_INPUT: pool arguments must be valid UTF-8 JSON") from None
+        if len(encoded) > 256 * 1024:
+            raise ValueError("EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller push() calls")
+        return arguments
 
     async def push(self, tasks):
         if type(tasks) not in (list, tuple) or len(tasks) > 32:
@@ -1270,67 +1458,41 @@ class _AgentPool:
                 raise ValueError("EVAL_POOL_CAPACITY: at most 32 items may be admitted per pool")
             if not batch:
                 return []
-            admitted = []
+            arguments = self._batch_arguments(list(batch))
             try:
-                # At most eight status requests per push, followed by one
-                # acknowledgment per item. No background guest tasks survive.
-                for entry in self._workers:
-                    entry["status"] = (await entry["worker"].status())["status"]
-                for task in batch:
-                    idle = [entry for entry in self._workers if entry["status"] == "idle"]
-                    chosen = min(idle, key=lambda entry: entry["admitted"]) if idle else None
-                    if chosen is None and len(self._workers) < self._concurrency:
-                        self._start_pending = True
-                        worker = await _agent(task, **self._options)
-                        chosen = {"worker": worker, "admitted": 0, "status": "running", "closeAcknowledged": False}
-                        self._workers.append(chosen)
-                        self._start_pending = False
-                        handle = _AgentTurn(worker, worker.turn_id)
-                    else:
-                        if chosen is None:
-                            live = [entry for entry in self._workers if entry["status"] in ("running", "starting")]
-                            chosen = min(live, key=lambda entry: entry["admitted"]) if live else None
-                        if chosen is None:
-                            raise ToolBridgeError("EVAL_POOL_UNAVAILABLE: no live worker remains; create a new pool")
-                        handle = await chosen["worker"].send(task)
-                    chosen["admitted"] += 1
-                    chosen["status"] = "running"
-                    self._items.append(handle)
-                    admitted.append(handle)
+                self._admission_pending = True
+                previous = len(self._items)
+                snapshot = self._adopt(await _agent_native_result("subagent", arguments))
+                ids = snapshot.get("admittedItemIds")
+                if (type(ids) is not list or len(ids) != len(batch)
+                        or any(type(item_id) is not int or not previous < item_id <= len(self._items)
+                               or (index > 0 and item_id != ids[index - 1] + 1)
+                               for index, item_id in enumerate(ids))):
+                    raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid atomic batch acknowledgment")
                 self._last_error = None
-                return admitted
+                return [self._items[item_id - 1] for item_id in ids]
             except BaseException as cause:
-                # Cancellation or a lost acknowledgment may follow a native
-                # admission. Keep acknowledged handles and never retry it.
+                # A batch is atomic natively, but a lost acknowledgment may
+                # hide its admission. Never replay; peek reconciles known ids.
                 self._closed = True
-                self._unknown_admission |= self._start_pending
-                self._start_pending = False
+                self._unknown_admission = True
                 self._last_error = str(cause) or type(cause).__name__
                 if not isinstance(cause, Exception):
                     raise
                 error = ToolBridgeError(
-                    f"EVAL_POOL_ADMISSION: acknowledged {len(admitted)} of {len(batch)} items; admission closed. "
-                    f"Handles remain in pool.items and peek(). {self._last_error}"
+                    "EVAL_POOL_ADMISSION: batch acknowledgment failed; admission closed without retry. "
+                    f"Retained handles remain in pool.items; peek() can reconcile a known pool. {self._last_error}"
                 )
-                error.admitted = tuple(admitted)
+                error.admitted = tuple(self._items)
                 error.requested = len(batch)
                 raise error from cause
+            finally:
+                self._admission_pending = False
 
     async def _peek_locked(self):
-        items = []
-        for index, handle in enumerate(self._items):
-            identity = {"index": index, "workerId": handle.worker_id,
-                        "jobId": handle.job_id, "turnId": handle.turn_id}
-            try:
-                snapshot = await handle.status()
-                items.append({**identity, "status": snapshot["turn"]["status"],
-                              "result": snapshot["turn"]["result"], "workerStatus": snapshot["status"]})
-            except Exception as error:
-                items.append({**identity, "status": "unavailable", "result": None, "error": str(error)})
-        return {"schema": "pi.eval.workpool.v1", "name": self._name, "closed": self._closed,
-                "unknownAdmission": self._unknown_admission,
-                "concurrency": self._concurrency, "workerCount": len(self._workers),
-                "items": items, "lastError": self._last_error}
+        if self._pool_id is not None:
+            await self._command("pool_status")
+        return self._view()
 
     async def peek(self):
         owner = _bridge_owner()
@@ -1344,14 +1506,48 @@ class _AgentPool:
         async with self._lock:
             if _bridge_owner() is not owner:
                 raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
-            snapshot = await self._peek_locked()
-            counts = {status: 0 for status in ("queued", "running", "completed", "failed", "cancelled", "unavailable")}
-            for item in snapshot["items"]:
-                counts[item["status"]] += 1
-            return {"schema": snapshot["schema"], "name": self._name, "closed": self._closed,
-                    "unknownAdmission": self._unknown_admission,
-                    "concurrency": self._concurrency, "workerCount": len(self._workers),
-                    "total": len(snapshot["items"]), "counts": counts, "lastError": self._last_error}
+            return await self._peek_locked()
+
+    async def finish(self):
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            if self._close_acknowledged or (self._pool_id is None and self._closed):
+                raise ToolBridgeError("EVAL_POOL_CLOSED: a cancelled or unacknowledged pool cannot be finished")
+            self._closed = True
+            if not self._finish_acknowledged:
+                try:
+                    if self._pool_id is None:
+                        arguments = self._batch_arguments([])
+                        self._admission_pending = True
+                        self._adopt(await _agent_native_result("subagent", arguments))
+                        self._admission_pending = False
+                    snapshot = await self._command("pool_finish")
+                    if not snapshot["sealed"]:
+                        raise ToolBridgeError("EVAL_POOL_PROTOCOL: pool finish did not seal admission")
+                    self._finish_acknowledged = True
+                except BaseException as error:
+                    self._unknown_admission |= self._admission_pending
+                    self._last_error = str(error) or type(error).__name__
+                    raise
+                finally:
+                    self._admission_pending = False
+            return _AgentJob(self._job_id, self._options["agent"])
+
+    async def wait(self, timeout=30):
+        deadline = _AGENT_CLOCK() + _agent_wait_ms(timeout) / 1000
+        job = await self.finish()
+        return await _agent_wait_one(job, max(0, int((deadline - _AGENT_CLOCK()) * 1000)), True)
+
+    async def output(self):
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            if self._job_id is None:
+                return None
+            return (await _agent_read_job(self._job_id, "wait", 0)).get("result")
 
     async def close(self):
         owner = _bridge_owner()
@@ -1359,28 +1555,29 @@ class _AgentPool:
             if _bridge_owner() is not owner:
                 raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
             self._closed = True
-            workers = []
-            for entry in self._workers:
-                if not entry["closeAcknowledged"]:
-                    try:
-                        snapshot = await entry["worker"].close()
-                        entry["status"] = snapshot["status"]
-                        entry["closeAcknowledged"] = snapshot["status"] in ("closed", "failed")
-                        entry["closeError"] = (None if entry["closeAcknowledged"]
-                                               else "EVAL_POOL_CLOSE: worker did not acknowledge termination")
-                    except Exception as error:
-                        entry["closeError"] = str(error)
-                workers.append({"workerId": entry["worker"].id, "jobId": entry["worker"].job_id,
-                                "closed": entry["closeAcknowledged"], "error": entry.get("closeError")})
-            all_known_closed = all(worker["closed"] for worker in workers)
-            return {"schema": "pi.eval.workpool.close.v1", "name": self._name, "closed": True,
+            if self._pool_id is not None and not self._close_acknowledged:
+                try:
+                    snapshot = await self._command("pool_close")
+                    if not _pool_terminal(snapshot["status"]):
+                        raise ToolBridgeError("EVAL_POOL_PROTOCOL: pool close did not acknowledge termination")
+                    self._close_acknowledged = True
+                except BaseException as error:
+                    self._last_error = str(error) or type(error).__name__
+                    raise
+            all_known_closed = self._pool_id is None or self._close_acknowledged
+            return {**self._view(), "closed": True,
                     "allClosed": all_known_closed and not self._unknown_admission,
-                    "allKnownClosed": all_known_closed, "unknownAdmission": self._unknown_admission,
-                    "workers": workers}
+                    "allKnownClosed": all_known_closed, "unknownAdmission": self._unknown_admission}
+
+    async def cancel(self):
+        return await self.close()
+
+    def __await__(self):
+        return self.wait().__await__()
 
 
 async def _workpool(**options):
-    native = {"agent": "task", "keep_alive": True}
+    native = {"agent": "task"}
     name = "workpool"
     concurrency = 4
     for key, value in options.items():
@@ -1411,10 +1608,12 @@ async def _workpool(**options):
         elif key == "timeout_seconds":
             if type(value) is not int or not 1 <= value <= 86400:
                 raise ValueError("EVAL_POOL_INPUT: timeout_seconds must be an integer from 1 to 86400")
-            native[key] = value
+            native["timeoutSeconds"] = value
         else:
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
-    return _AgentPool(native, name, concurrency)
+    pool = _AgentPool(native, name, concurrency)
+    pool._batch_arguments([])
+    return pool
 
 
 NAMESPACE["agent"] = _agent

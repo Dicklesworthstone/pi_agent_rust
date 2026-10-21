@@ -265,7 +265,8 @@
     globalThis.agent = launchAgent;
     globalThis.wait = async (handles, options = {}) => {
         if (!isArray(handles) || handles.length > 32 || handles.some(handle =>
-            !(handle instanceof AgentJob) && !(handle instanceof AgentTurn) && !workerGet(handle))
+            !(handle instanceof AgentJob) && !(handle instanceof AgentTurn)
+            && !(handle instanceof AgentPoolItem) && !workerGet(handle))
             || !options || typeof options !== 'object' || isArray(options)
             || keys(options).some(name => name !== 'timeout' && name !== 'raiseErrors')) {
             throw new TypeErrorType('EVAL_AGENT_INPUT: wait requires up to 32 agent handles and timeout/raiseErrors options');
@@ -280,8 +281,9 @@
         const results = [];
         for (const handle of selected) {
             const remaining = Math.max(0, deadline - now());
-            results.push(await (handle instanceof AgentTurn
-                ? waitTurn(handle, remaining, raiseErrors) : waitJob(handle, remaining, raiseErrors)));
+            results.push(await (handle instanceof AgentTurn ? waitTurn(handle, remaining, raiseErrors)
+                : handle instanceof AgentPoolItem ? waitPoolItem(handle, remaining, raiseErrors)
+                : waitJob(handle, remaining, raiseErrors)));
         }
         return results;
     };
@@ -304,6 +306,93 @@
         return true;
     };
     const poolErrorText = error => error && typeof error.message === 'string' ? error.message : 'Pool operation failed';
+    const poolStatuses = new Set(['open', 'draining', 'completed', 'failed', 'cancelled']);
+    const validPoolStatus = poolStatuses.has.bind(poolStatuses);
+    const poolTerminal = status => status !== 'open' && status !== 'draining';
+    const checkPool = (snapshot, poolId, itemId) => {
+        if (!snapshot || snapshot.schema !== 'pi.subagent.pool.v1'
+            || typeof snapshot.poolId !== 'string' || !snapshot.poolId
+            || (poolId !== undefined && snapshot.poolId !== poolId)
+            || typeof snapshot.jobId !== 'string' || !snapshot.jobId
+            || typeof snapshot.agent !== 'string' || !snapshot.agent
+            || !validPoolStatus(snapshot.status) || typeof snapshot.sealed !== 'boolean'
+            || !integer(snapshot.concurrency) || snapshot.concurrency < 1 || snapshot.concurrency > 8
+            || !isArray(snapshot.items) || snapshot.items.length > 32
+            || snapshot.admittedItems !== snapshot.items.length
+            || !integer(snapshot.remainingMs) || snapshot.remainingMs < 0
+            || ['queuedItems','runningItems','completedItems','failedItems'].some(key =>
+                !integer(snapshot[key]) || snapshot[key] < 0 || snapshot[key] > snapshot.admittedItems)) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: invalid native pool snapshot');
+        }
+        const counts = {queued:0,running:0,completed:0,failed:0,cancelled:0};
+        for (let index = 0; index < snapshot.items.length; index++) {
+            const item = snapshot.items[index];
+            if (!item || item.id !== index + 1 || !validTurnStatus(item.status)
+                || typeof item.summary !== 'string' || !item.resultRef
+                || item.resultRef.poolId !== snapshot.poolId || item.resultRef.itemId !== item.id) {
+                throw new ErrorType('EVAL_POOL_PROTOCOL: invalid native pool item manifest');
+            }
+            counts[item.status]++;
+        }
+        if (snapshot.queuedItems !== counts.queued || snapshot.runningItems !== counts.running
+            || snapshot.completedItems !== counts.completed || snapshot.failedItems !== counts.failed + counts.cancelled
+            || (snapshot.status === 'open') === snapshot.sealed) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: inconsistent native pool state');
+        }
+        if (itemId !== undefined || hasOwn(snapshot, 'itemId') || hasOwn(snapshot, 'item')) {
+            const item = snapshot.item;
+            if (!validTurnId(snapshot.itemId) || (itemId !== undefined && snapshot.itemId !== itemId)
+                || !item || item.id !== snapshot.itemId || !validTurnStatus(item.status)
+                || snapshot.items[item.id - 1]?.status !== item.status || !hasOwn(item, 'result')) {
+                throw new ErrorType('EVAL_POOL_PROTOCOL: invalid selected pool item');
+            }
+            const result = item.result;
+            if ((result === null && turnDone(item)) || (result !== null
+                && (!result || !isArray(result.content) || !hasOwn(result, 'details')
+                    || (hasOwn(result, 'isError') && typeof result.isError !== 'boolean')))) {
+                throw new ErrorType('EVAL_POOL_PROTOCOL: invalid native pool item result');
+            }
+        }
+        return snapshot;
+    };
+    const readPoolItem = async (handle, operation, timeoutMs) => {
+        const args = {operation,poolId:handle.poolId,itemId:handle.itemId};
+        if (timeoutMs !== undefined) args.timeoutMs = timeoutMs;
+        const snapshot = checkPool(await nativeResult('subagent',args),handle.poolId,handle.itemId);
+        if (snapshot.jobId !== handle.jobId || snapshot.agent !== handle.agent) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity changed');
+        }
+        return snapshot;
+    };
+    const waitPoolItem = async (handle, timeoutMs, raiseErrors) => {
+        const snapshot = await readPoolItem(handle,'pool_wait',timeoutMs);
+        if (!turnDone(snapshot.item)) {
+            const error = new ErrorType('EVAL_AGENT_TIMEOUT: pool item is still pending; the native pool remains available');
+            error.name = 'TimeoutError';
+            throw error;
+        }
+        const result = snapshot.item.result;
+        if (raiseErrors && (snapshot.item.status !== 'completed' || result.isError)) {
+            throw new ErrorType(resultText(result) || `Pool item ${snapshot.item.status}`);
+        }
+        return result;
+    };
+    class AgentPoolItem {
+        constructor(pool, itemId) {
+            this.id = itemId;
+            this.itemId = itemId;
+            this.poolId = pool.poolId;
+            this.jobId = pool.jobId;
+            this.agent = pool.agent;
+            freeze(this);
+        }
+        async status() { return readPoolItem(this,'pool_result'); }
+        async done() { return turnDone((await this.status()).item); }
+        async output() { return (await this.status()).item.result; }
+        async wait(timeout = 30) { return waitPoolItem(this,waitMilliseconds(timeout),true); }
+        // Item handles cannot close a shared carrier. Use pool.close() to
+        // explicitly cancel every running and queued item in the pool.
+    }
     const serialPool = (state, action) => {
         if (state.busy && state.generation !== cellGeneration) {
             // A caller abandoned this operation at a preceding cell boundary.
@@ -311,7 +400,8 @@
             // or replay its possibly admitted work. Known handles remain usable.
             state.closed = true;
             state.interrupted = true;
-            state.unknownAdmission ||= state.startPending;
+            state.unknownAdmission ||= state.admissionPending;
+            state.admissionPending = false;
             state.lastError = 'EVAL_POOL_INTERRUPTED: previous cell did not finish a pool command; admission closed';
             state.tail = resolvedPromise();
             state.busy = false;
@@ -327,33 +417,65 @@
         state.tail = promiseThen(pending, () => undefined, () => undefined);
         return pending;
     };
-    const peekPool = async state => {
-        const items = [];
-        for (let index = 0; index < state.items.length; index++) {
-            const handle = state.items[index];
-            const identity = {index,workerId:handle.workerId,jobId:handle.jobId,turnId:handle.turnId};
-            try {
-                const snapshot = await handle.status();
-                items.push({...identity,status:snapshot.turn.status,result:snapshot.turn.result,workerStatus:snapshot.status});
-            } catch (error) {
-                items.push({...identity,status:'unavailable',result:null,error:poolErrorText(error)});
-            }
+    const adoptPool = (state, snapshot) => {
+        checkPool(snapshot,state.poolId ?? undefined);
+        if (snapshot.agent !== state.options.agent || snapshot.concurrency !== state.concurrency
+            || (state.jobId !== null && snapshot.jobId !== state.jobId)
+            || snapshot.items.length < state.items.length) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity or retained items changed');
         }
-        return {schema:'pi.eval.workpool.v1',name:state.name,closed:state.closed,
-            interrupted:state.interrupted,unknownAdmission:state.unknownAdmission,
-            concurrency:state.concurrency,workerCount:state.workers.length,
-            items,lastError:state.lastError};
+        state.poolId = snapshot.poolId;
+        state.jobId = snapshot.jobId;
+        for (let index = state.items.length; index < snapshot.items.length; index++) {
+            state.items.push(new AgentPoolItem(snapshot,index + 1));
+        }
+        state.snapshot = snapshot;
+        state.closed ||= snapshot.sealed || poolTerminal(snapshot.status);
+        state.unknownAdmission = false;
+        return snapshot;
+    };
+    const poolView = state => ({
+        ...(state.snapshot ? {...state.snapshot,items:state.snapshot.items.map(item =>
+            ({...item,resultRef:{...item.resultRef}}))} : {
+            schema:'pi.eval.workpool.pending.v1',poolId:null,jobId:null,agent:state.options.agent,
+            status:state.unknownAdmission ? 'unavailable' : state.closed ? 'cancelled' : 'unstarted',
+            sealed:state.closed,concurrency:state.concurrency,admittedItems:0,items:[],
+        }),
+        name:state.name,closed:state.closed,interrupted:state.interrupted,
+        unknownAdmission:state.unknownAdmission,lastError:state.lastError,
+    });
+    const poolCommand = async (state, operation, extra = {}) => adoptPool(state,
+        await nativeResult('subagent',{operation,poolId:state.poolId,...extra}));
+    const poolBatchArgs = (state, tasks) => {
+        const args = state.poolId === null
+            ? {...state.options,operation:'pool_start',concurrency:state.concurrency,tasks}
+            : {operation:'pool_push',poolId:state.poolId,tasks};
+        // The JS bridge admits at most 256 KiB per encoded request. Keep the
+        // same guest contract in Python and reject before a native admission.
+        if (!boundedText(stringify({name:'subagent',args}),256 * 1024)) {
+            throw new RangeErrorType('EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller push() calls');
+        }
+        return args;
+    };
+    const peekPool = async state => {
+        if (state.poolId !== null) await poolCommand(state,'pool_status');
+        return poolView(state);
     };
     class AgentPool {
         constructor(options, name, concurrency) {
-            poolSet(this,{options,name,concurrency,workers:[],items:[],closed:false,interrupted:false,
-                unknownAdmission:false,startPending:false,lastError:null,
+            poolSet(this,{options,name,concurrency,poolId:null,jobId:null,snapshot:null,items:[],
+                closed:false,interrupted:false,finishAcknowledged:false,closeAcknowledged:false,
+                unknownAdmission:false,admissionPending:false,lastError:null,
                 tail:resolvedPromise(),busy:false,generation:cellGeneration});
             freeze(this);
         }
+        get id() { return poolGet(this).poolId; }
+        get poolId() { return poolGet(this).poolId; }
+        get jobId() { return poolGet(this).jobId; }
         get name() { return poolGet(this).name; }
         get concurrency() { return poolGet(this).concurrency; }
         get closed() { return poolGet(this).closed; }
+        get unknownAdmission() { return poolGet(this).unknownAdmission; }
         get items() { return freeze([...poolGet(this).items]); }
         async push(tasks) {
             if (!isArray(tasks) || tasks.length > 32) {
@@ -368,48 +490,33 @@
                 if (state.closed) throw new ErrorType('EVAL_POOL_CLOSED: pool admission is closed; inspect items or close existing workers');
                 if (state.items.length + batch.length > 32) throw new RangeErrorType('EVAL_POOL_CAPACITY: at most 32 items may be admitted per pool');
                 if (batch.length === 0) return [];
-                const admitted = [];
+                const args = poolBatchArgs(state,batch);
                 try {
-                    // Refresh each existing worker once, not once per item.
-                    // Newly admitted native turns run after this cell returns.
-                    for (const entry of state.workers) entry.status = (await entry.worker.status()).status;
-                    for (const task of batch) {
-                        let chosen = state.workers.filter(entry => entry.status === 'idle')
-                            .sort((a,b) => a.admitted - b.admitted)[0];
-                        let handle;
-                        if (!chosen && state.workers.length < state.concurrency) {
-                            state.startPending = true;
-                            const worker = await launchAgent(task,state.options);
-                            chosen = {worker,admitted:0,status:'running',closeAcknowledged:false};
-                            state.workers.push(chosen);
-                            state.startPending = false;
-                            handle = currentTurn(worker);
-                        } else {
-                            if (!chosen) chosen = state.workers
-                                .filter(entry => entry.status === 'running' || entry.status === 'starting')
-                                .sort((a,b) => a.admitted - b.admitted)[0];
-                            if (!chosen) throw new ErrorType('EVAL_POOL_UNAVAILABLE: no live worker remains; create a new pool');
-                            handle = await chosen.worker.send(task);
-                        }
-                        chosen.admitted++;
-                        chosen.status = 'running';
-                        state.items.push(handle);
-                        admitted.push(handle);
+                    state.admissionPending = true;
+                    const previous = state.items.length;
+                    const snapshot = adoptPool(state,await nativeResult('subagent',args));
+                    const ids = snapshot.admittedItemIds;
+                    if (!isArray(ids) || ids.length !== batch.length || ids.some((id,index) =>
+                        !validTurnId(id) || id <= previous || id > state.items.length
+                        || (index > 0 && id !== ids[index - 1] + 1))) {
+                        throw new ErrorType('EVAL_POOL_PROTOCOL: invalid atomic batch acknowledgment');
                     }
                     state.lastError = null;
-                    return admitted;
+                    return ids.map(id => state.items[id - 1]);
                 } catch (cause) {
-                    // A failed acknowledgment may follow a native side effect.
-                    // Close admission instead of silently retrying the batch.
+                    // Admission is native and atomic. A lost acknowledgment
+                    // must never cause replay; a known pool can be reconciled
+                    // by peek(), including all items admitted by that request.
                     state.closed = true;
-                    state.unknownAdmission ||= state.startPending;
-                    state.startPending = false;
+                    state.unknownAdmission = true;
                     state.lastError = poolErrorText(cause);
-                    const error = new ErrorType(`EVAL_POOL_ADMISSION: acknowledged ${admitted.length} of ${batch.length} items; admission closed. Handles remain in pool.items and peek(). ${state.lastError}`);
-                    error.admitted = freeze([...admitted]);
+                    const error = new ErrorType(`EVAL_POOL_ADMISSION: batch acknowledgment failed; admission closed without retry. Retained handles remain in pool.items; peek() can reconcile a known pool. ${state.lastError}`);
+                    error.admitted = freeze([...state.items]);
                     error.requested = batch.length;
                     error.cause = cause;
                     throw error;
+                } finally {
+                    state.admissionPending = false;
                 }
             });
         }
@@ -419,43 +526,70 @@
         }
         async status() {
             const state = poolGet(this);
+            return serialPool(state, () => peekPool(state));
+        }
+        async finish() {
+            const state = poolGet(this);
             return serialPool(state, async () => {
-                const snapshot = await peekPool(state);
-                const counts = {queued:0,running:0,completed:0,failed:0,cancelled:0,unavailable:0};
-                for (const item of snapshot.items) counts[item.status]++;
-                return {schema:snapshot.schema,name:snapshot.name,closed:snapshot.closed,
-                    interrupted:snapshot.interrupted,unknownAdmission:snapshot.unknownAdmission,
-                    concurrency:snapshot.concurrency,
-                    workerCount:snapshot.workerCount,total:snapshot.items.length,counts,lastError:snapshot.lastError};
+                if (state.closeAcknowledged || (state.poolId === null && state.closed)) {
+                    throw new ErrorType('EVAL_POOL_CLOSED: a cancelled or unacknowledged pool cannot be finished');
+                }
+                state.closed = true;
+                if (!state.finishAcknowledged) {
+                    try {
+                        if (state.poolId === null) {
+                            const args = poolBatchArgs(state,[]);
+                            state.admissionPending = true;
+                            adoptPool(state,await nativeResult('subagent',args));
+                            state.admissionPending = false;
+                        }
+                        const snapshot = await poolCommand(state,'pool_finish');
+                        if (!snapshot.sealed) throw new ErrorType('EVAL_POOL_PROTOCOL: pool finish did not seal admission');
+                        state.finishAcknowledged = true;
+                    } catch (error) {
+                        state.unknownAdmission ||= state.admissionPending;
+                        state.lastError = poolErrorText(error);
+                        throw error;
+                    } finally { state.admissionPending = false; }
+                }
+                return new AgentJob(state.jobId,state.options.agent);
             });
+        }
+        async wait(timeout = 30) {
+            const deadline = now() + waitMilliseconds(timeout);
+            const job = await this.finish();
+            return waitJob(job,Math.max(0,deadline - now()),true);
+        }
+        async output() {
+            const state = poolGet(this);
+            return serialPool(state, async () => state.jobId === null ? null
+                : (await readJob(state.jobId,'wait',0)).result ?? null);
         }
         async close() {
             const state = poolGet(this);
             return serialPool(state, async () => {
                 state.closed = true;
-                const workers = [];
-                for (const entry of state.workers) {
-                    if (!entry.closeAcknowledged) {
-                        try {
-                            const snapshot = await entry.worker.close();
-                            entry.status = snapshot.status;
-                            entry.closeAcknowledged = snapshot.status === 'closed' || snapshot.status === 'failed';
-                            entry.closeError = entry.closeAcknowledged ? null : 'EVAL_POOL_CLOSE: worker did not acknowledge termination';
-                        } catch (error) { entry.closeError = poolErrorText(error); }
+                if (state.poolId !== null && !state.closeAcknowledged) {
+                    try {
+                        const snapshot = await poolCommand(state,'pool_close');
+                        if (!poolTerminal(snapshot.status)) throw new ErrorType('EVAL_POOL_PROTOCOL: pool close did not acknowledge termination');
+                        state.closeAcknowledged = true;
+                    } catch (error) {
+                        state.lastError = poolErrorText(error);
+                        throw error;
                     }
-                    workers.push({workerId:entry.worker.id,jobId:entry.worker.jobId,
-                        closed:entry.closeAcknowledged,error:entry.closeError ?? null});
                 }
-                const allKnownClosed = workers.every(worker => worker.closed);
-                return {schema:'pi.eval.workpool.close.v1',name:state.name,closed:true,
+                const allKnownClosed = state.poolId === null || state.closeAcknowledged;
+                return {...poolView(state),closed:true,
                     allClosed:allKnownClosed && !state.unknownAdmission,allKnownClosed,
-                    unknownAdmission:state.unknownAdmission,workers};
+                    unknownAdmission:state.unknownAdmission};
             });
         }
+        async cancel() { return this.close(); }
     }
     globalThis.workpool = async (options = {}) => {
         if (!options || typeof options !== 'object' || isArray(options)) throw new TypeErrorType('EVAL_POOL_INPUT: workpool requires an options object');
-        const native = {agent:'task',keepAlive:true};
+        const native = {agent:'task'};
         let name = 'workpool';
         let concurrency = 4;
         for (const key of keys(options)) {
@@ -483,6 +617,7 @@
                 native.timeoutSeconds = value;
             } else throw new TypeErrorType(`EVAL_POOL_INPUT: unknown option ${key}`);
         }
+        poolBatchArgs({options:native,poolId:null,concurrency},[]);
         return new AgentPool(freeze(native),name,concurrency);
     };
     return {

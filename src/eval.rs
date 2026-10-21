@@ -646,10 +646,16 @@ impl Tool for EvalTool {
          and returns a handle pinned to that turn. await worker.close() cancels \
          its running and queued turns. await workpool({agent,concurrency}) in JS \
          or await workpool(agent=...,concurrency=...) in Python creates a lazy \
-         reusable pool; await pool.push([prompts]) returns turn handles. Use \
-         pool.items, await pool.peek(), await pool.status(), and await pool.close(). \
-         Pools admit at most 32 items on 1-8 workers with fixed total lifetimes; \
-         close cancels all their work. Await every pool command. Each operation \
+         native pool; await pool.push([prompts]) atomically admits a batch and \
+         returns fixed item handles. One session job owns 1-8 reusable workers. \
+         pool.items retains handles; await pool.peek() or pool.status() returns \
+         one bounded summary manifest. Use item.output() or item.wait() for full \
+         results. await pool.finish() seals admission and returns the aggregate \
+         job; await pool.wait() seals and waits for all accepted work to drain. \
+         await pool.close() cancels running and queued work. Pools admit at most \
+         32 items with fixed total lifetimes; split pushes above 256 KiB encoded. \
+         Native results survive kernel reset; jobs list exposes recovery IDs. \
+         Await every pool command. Each operation \
          uses the current cell's host and policy. JS handles can be retained on \
          globalThis; all waits remain within the current cell's deadline. \
          Native call receipts are included in result details. For typed judgments, \

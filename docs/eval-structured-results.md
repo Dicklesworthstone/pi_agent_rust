@@ -280,95 +280,168 @@ the worker and its queued turns.
 
 ## Reusable workpools
 
-`workpool()` distributes a bounded batch of prompts among reusable native
-workers. Tasks assigned to the same worker share its conversation, making a
-pool useful for related inspections or staged implementation work. Every
-worker is a real child process with its own native queue.
+`workpool()` creates a native pool with **one carrier job**, a bounded queue
+and reusable RPC child agents. Native actors keep executing after the eval
+cell returns; no guest timer, callback or retained tool permission drives the
+queue. Items assigned to the same child share its conversation, and each child
+executes its turns in FIFO order. Assignment balances pending work across the
+children; a later prompt is not guaranteed to reach a particular earlier child.
 
 ```javascript
-globalThis.pool = await workpool({agent: 'task', concurrency: 3});
+globalThis.pool = await workpool({
+    agent: 'reviewer', concurrency: 2, name: 'parser-review', timeoutSeconds: 300,
+});
 globalThis.items = await pool.push([
-    'Inspect the parser for correctness issues.',
-    'Inspect session persistence for data-loss risks.',
-    'Inspect cancellation and child-process cleanup.',
-    'Check the error handling around your assigned subsystem.',
+    'Review parser error handling and identify concrete correctness defects.',
+    'Review cancellation and child-process cleanup for concrete races.',
 ]);
+console.log({poolId: pool.poolId, jobId: pool.jobId});
 ```
 
-The acknowledged tasks keep running after the cell returns. In a later cell:
+In a later cell, add work, inspect the bounded manifest, and seal admission:
 
 ```javascript
-const results = await wait(pool.items, {timeout: 20, raiseErrors: false});
-console.log(await pool.status());
-await pool.close();
+await pool.push(['Review session persistence for data-loss risks.']);
+console.log((await pool.peek()).items);
+globalThis.reviewJob = await pool.finish();
 ```
 
-Python exposes the same operations:
+`finish()` lets all accepted items drain and retires the child processes. Its
+returned job receives one ordered aggregate result after that cleanup. Collect
+the manifest and an individual full result in another cell:
+
+```javascript
+const [aggregate] = await wait([reviewJob], {timeout: 20, raiseErrors: false});
+console.log(aggregate.details);
+const first = await items[0].output();
+console.log(first.content);
+```
+
+Python exposes the same lifecycle and retains ordinary namespace assignments:
 
 ```python
-pool = await workpool(agent='task', concurrency=3)
+pool = await workpool(agent='reviewer', concurrency=2,
+                      name='parser-review', timeout_seconds=300)
 items = await pool.push([
-    'Inspect the parser for correctness issues.',
-    'Inspect cancellation and child-process cleanup.',
+    'Review parser error handling and identify concrete correctness defects.',
+    'Review cancellation and child-process cleanup for concrete races.',
 ])
-results = await wait(pool.items, timeout=20, raise_errors=False)
-snapshot = await pool.peek()
-cleanup = await pool.close()
+print(pool.pool_id, pool.job_id)
 ```
 
-Creation is lazy: `workpool()` makes no native calls until the first `push()`.
-Concurrency defaults to four and accepts 1–8 workers, sharing the same global
-eight-job limit as other native jobs. A pool admits at most 32 items over its
-entire lifetime. All prompts in a push are validated before any admission;
-the worker prompt limits above apply. JavaScript requires an array of strings;
-Python accepts a list or tuple. Empty batches are allowed.
+```python
+await pool.push(['Review session persistence for data-loss risks.'])
+snapshot = await pool.peek()
+review_job = await pool.finish()
+```
 
-Initial tasks start workers up to the configured concurrency. Later pushes
-poll existing workers once, prefer an idle worker with the fewest admitted
-items, and otherwise balance queued turns across live workers. Each push
-returns fixed turn handles in input order. `pool.items` retains all acknowledged
-handles across pushes as a frozen array or Python tuple. Failed or expired
-workers are never silently replaced, and admission is never automatically retried.
+```python
+aggregate, = await wait([review_job], timeout=20, raise_errors=False)
+print(aggregate['details'])
+first = await items[0].output()
+print(first['content'])
+```
+
+The pool exposes `id` / `poolId` and `jobId` in JavaScript, or `id` / `pool_id`
+and `job_id` in Python. IDs are null/`None` until the first native admission.
+`pool.items` retains fixed item handles in admission order as a frozen array or
+Python tuple. Each item has `itemId` / `item_id`, `poolId` / `pool_id`, `jobId` /
+`job_id`, and `agent`; `id` is the item ID. Items expose `status()`, `done()`,
+`output()` and `wait(seconds=30)`. They expose no worker ID or cancellation
+method: cancellation belongs to the entire pool.
 
 | Operation | Result |
 | --- | --- |
-| `push(tasks)` | Acknowledged turn handles for this batch, in input order. |
-| `peek()` | Each retained item's worker/turn identity, status and native result; unavailable reads include an error. |
-| `status()` | Worker and item counts, including queued, running, completed, failed, cancelled and unavailable items. |
-| `close()` | Close admission and cancel all known workers, including their running and queued turns; report cleanup per worker. |
+| `push(tasks)` | Atomically admit a batch and return its fixed item handles in input order. |
+| `peek()` / `status()` | One native manifest: pool state, counts, ordered item summaries and result references. |
+| `finish()` | Seal admission and return the aggregate `AgentJob`; accepted work continues draining. |
+| `wait(seconds=30)` | Seal admission, then await the aggregate native `ToolOutput`; raise on failure or timeout. |
+| `output()` | Poll the aggregate job result without sealing; null/`None` while pending. |
+| `close()` / `cancel()` | Seal admission, cancel running and queued work, reap children, and report cleanup. |
 
-Pool commands are serialized and **must be awaited**. Native queues perform
-the execution between cells; no guest timers or callbacks are retained to
-dispatch subsequent work. Polling `peek()` or `status()` makes one host call
-per retained item, so it counts toward the current cell's 64-call allowance.
-The normal cell watchdog bounds each command and wait.
+Pool states are `open`, `draining`, `completed`, `failed` and `cancelled`.
+Item states are `queued`, `running`, `completed`, `failed` and `cancelled`.
+The manifest's `failedItems` count includes cancelled items. Summaries are
+bounded excerpts with `resultRef: {poolId, itemId}`; they are not full task
+results. `item.output()` retrieves the selected native `ToolOutput`, or
+null/`None` while pending. `item.wait()` waits for that item without sealing
+the pool. Global `wait()` accepts a mixture of pool items, one-shot jobs,
+reusable workers and fixed worker turns, preserving input order and one shared
+timeout. Python also supports `await item` and `await pool`.
 
-If admission fails partway through a push, the pool closes further admission
-and preserves every acknowledged handle in `pool.items`. The raised error's
-`admitted` field contains this push's acknowledged handles, and `requested`
-records the batch size. Already admitted tasks continue until they finish or
-are cancelled. Inspect them and close the pool instead of retrying the same
-batch, which could duplicate effects. Cancellation or an interrupted cell can
-also leave partial admission; acknowledged handles remain inspectable while
-the kernel survives.
+Creation is lazy: `workpool()` makes no native call until a nonempty `push()`
+or `finish()`. Closing an unused pool starts nothing; finishing an unused pool
+creates and seals a real empty carrier job. An open pool remains available
+after its current batch drains. Call `finish()` when no further work will be
+added, or `close()` to stop it. Repeated acknowledged finish/close calls do not
+replay their native mutation. Cancelling does not roll back filesystem effects.
 
-A lost new-worker acknowledgment can leave an admitted carrier whose identity
-the guest never received. Such a pool reports `unknownAdmission: true`.
-`close()` distinguishes `allKnownClosed` from `allClosed`; the latter stays
-false while an unknown admission is possible. Use native `jobs list` and
-`jobs cancel` to inspect and retire any remaining owned carrier. Repeated
-`close()` retries only workers whose termination has not been acknowledged.
+### Bounds, admission and ownership
+
+Concurrency defaults to four and accepts 1–8 children. Each pool occupies
+**one of the process's eight active native-job slots**, while up to eight RPC
+child processes belong to that carrier. Idle children still use resources;
+one job slot does not mean one child process. All children share the original
+pool deadline, covering discovery, startup, execution, queueing and idle time.
+The host limit defaults to 900 seconds; an explicit timeout can shorten it.
+Neither a later push nor a wait renews that deadline.
+
+A pool admits at most 32 items over its lifetime. Each prompt must be nonempty
+UTF-8 text of at most 64 KiB without NUL. JavaScript accepts an array; Python
+accepts a list or tuple. Empty pushes on an open pool are local no-ops. The
+entire encoded guest batch request is limited to **256 KiB** in both languages;
+split larger submissions into smaller pushes. All text, capacity and encoded
+size checks happen before dispatch. A nonempty push, `peek()`, or `status()`
+uses one host call, not one call per item. The normal 64-call cell allowance
+and eval watchdog still apply, and pool commands **must be awaited**.
+
+Native batch admission is atomic: a rejected batch does not enqueue a prefix.
+That does not make receipt of the acknowledgment atomic with admission. A
+lost reply or interrupted cell can leave a whole batch admitted but unknown
+to the guest. The helper closes further guest admission, keeps previously
+acknowledged handles, and never automatically retries. The exception's
+`admitted` field contains retained acknowledged handles and `requested` records
+the attempted batch size. When the pool ID is known, `peek()` reconciles the
+actual native items and updates `pool.items`; it does not reopen guest admission.
+Use `finish()` to drain them or `close()` to cancel them.
+
+If the first acknowledgment is lost, the guest may never receive the pool ID.
+It reports `unknownAdmission: true`; `close()` distinguishes `allKnownClosed`
+from `allClosed` and cannot claim complete cleanup while an unknown carrier
+may remain. Inspect the owning session's `jobs list`: a carrier's label includes
+`reusable subagent pool <poolId>`, alongside its job ID. Use those identities
+with native `pool_status`, `pool_finish` or `pool_close`, or cancel the carrier
+through `jobs`. Recovery uses those direct native operations; an unacknowledged
+guest object does not automatically bind to a recovered identity. No batch is
+replayed during recovery.
 
 Pool options are `name`, `agent`, `concurrency`, `cwd`, `scope`,
 `isolation: "none"`, and `timeoutSeconds` / `timeout_seconds`. Names are labels
-for the guest object, not session-wide registrations. Worker deadlines include
-idle and queued time and are not renewed per item. Pools stay open after a
-batch drains until explicitly closed or their workers expire.
+for the guest object. Agent definition, model, child tools and working directory
+are captured at native startup and cannot be changed by later pushes. Pools
+currently require Unix, refuse worktree isolation and output schemas, and do
+not support schema-bearing definitions or historical `seance` consultation.
 
-This bounded native pool provides shared conversation, queued follow-ups and
-explicit result collection. OMP's context-load scheduling, keyed yield batches,
-aggregate pool completion delivery and custom child-defined eval tools remain
-separate work. Pool `close()` cancels running work as well as queued work.
+Every native launch, control request and result read re-enters the active
+Agent's current policy. Pool operations need `subagent`; aggregate job methods
+need `jobs`. A descriptor never carries approval or authority into standalone
+eval or another session. Admission checks the owner and cancellation state;
+accepted output is privacy-screened before retention, and reads apply the
+caller's current privacy policy. Session shutdown cancels the owned carrier
+and its children. These are child-agent jobs, not detached general eval cells.
+
+Kernel reset loses guest objects but leaves native jobs running. Retain both
+IDs outside the kernel or recover them through `jobs list`, then use the direct
+[native pool operations](subagent-builtins.md#reusable-workpools). The native
+pool registry retains at most 16 pools and may evict an older reaped pool when
+another is admitted. Full item results use the bounded reusable-worker result
+storage; the aggregate job retains the ordered summary manifest. This is
+process-local bounded retention, not a disk-backed queue, process-restart
+recovery or durable conversation storage.
+
+Native aggregate completion is delivered through the existing session job
+notice, after drain and child cleanup. OMP's context-load scheduling, keyed
+yield batches and custom child-defined eval tools remain separate work.
 
 ## Validation
 
@@ -382,11 +455,14 @@ regressions, plus serialization, malformed-input and whitelist tests. Its
 retained-agent regression launches a real native child from both kernels,
 checks typed output in a later cell, and rejects a retained handle when that
 cell has no Agent host. The guest diagnostics also cover fixed warm turns,
-mixed waits, real protocol field names, pool reuse, partial admission,
-interrupted-cell recovery and ambiguous cleanup reporting. Native worker
+mixed waits, real protocol field names, atomic pool batches, aggregate finish,
+lost-acknowledgment reconciliation, interrupted-cell recovery and ambiguous
+cleanup reporting. Native worker
 regressions in `src/subagents/execution/worker.rs`, `src/subagents/worker.rs`
 and `src/jobs/host_task.rs` cover same-process conversation reuse, compaction
 barriers, cancellation/reaping, privacy projection and session ownership. The
+native pool regressions in `src/subagents/worker/pool.rs` exercise atomic
+admission, retained item results, aggregate drain and carrier cancellation. The
 `eval_host_*` tests in `src/agent_tests.rs` exercise the actual Agent and kernels,
 including native writes and reads, approvals, live plan changes, extension
 hooks, disabled tools, recursive wrappers, call budgets and session changes.

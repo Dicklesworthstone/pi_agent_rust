@@ -263,38 +263,74 @@ test('worker reply validation rejects changed identity, turn substitution and mi
 });
 
 function poolHost(h) {
-    const workers = new Map();
+    const pools = new Map();
     const operations = [];
-    const reply = request => {
-        assert.equal(request.args.name,'subagent');
-        const args = request.args.args;
-        operations.push(args.operation);
-        let worker;
-        if (args.operation === 'worker_start') {
-            const id = `pool-worker-${workers.size + 1}`;
-            worker = {id,agent:args.agent,status:'running',latest:1,turns:new Map([[1,{task:args.task,status:'running',result:null}]])};
-            workers.set(id,worker);
-        } else {
-            worker = workers.get(args.workerId);
-            assert.ok(worker,'operation must reference an acknowledged worker');
-            if (args.operation === 'worker_send') {
-                worker.latest++;
-                worker.status = 'running';
-                worker.turns.set(worker.latest,{task:args.task,status:'queued',result:null});
-            } else if (args.operation === 'worker_close') {
-                worker.status = 'closed';
-                for (const turn of worker.turns.values()) if (turn.result === null) {
-                    turn.status = 'cancelled';
-                    turn.result = {content:[],details:{cancelled:true},isError:true};
-                }
-            } else assert.ok(['worker_status','worker_wait'].includes(args.operation));
-        }
-        const turnId = args.turnId ?? worker.latest;
-        const turn = worker.turns.get(turnId);
-        answer(h,request,{schema:'pi.subagent.worker.v1',workerId:worker.id,jobId:`carrier-${worker.id}`,
-            agent:worker.agent,status:worker.status,turnId,turn:{id:turnId,status:turn.status,result:turn.result}});
+    const snapshot = pool => {
+        const counts = {queued:0,running:0,completed:0,failed:0,cancelled:0};
+        for (const item of pool.items) counts[item.status]++;
+        return {schema:'pi.subagent.pool.v1',poolId:pool.id,jobId:pool.jobId,agent:pool.agent,
+            status:pool.status,sealed:pool.sealed,concurrency:pool.concurrency,
+            admittedItems:pool.items.length,queuedItems:counts.queued,runningItems:counts.running,
+            completedItems:counts.completed,failedItems:counts.failed+counts.cancelled,remainingMs:900000,
+            items:pool.items.map(item=>({id:item.id,status:item.status,summary:item.result ? `item ${item.id}` : '',
+                resultRef:{poolId:pool.id,itemId:item.id}}))};
     };
-    return {workers,operations,reply};
+    const complete = (pool,id,result=turnResult(id)) => Object.assign(pool.items[id-1],{
+        status:result.isError ? 'failed' : 'completed',result,
+    });
+    const apply = request => {
+        const args = request.args.args;
+        if (request.args.name === 'jobs') {
+            operations.push(`jobs:${args.action}`);
+            const pool = Array.from(pools.values()).find(pool=>pool.jobId===args.jobId);
+            assert.ok(pool,'aggregate lookup must use the single carrier');
+            if (!pool.sealed) return jobSnapshot(pool.jobId,'running');
+            for (const item of pool.items) if (item.result === null) complete(pool,item.id);
+            pool.status = pool.items.some(item=>item.status==='failed') ? 'failed' : 'completed';
+            return jobSnapshot(pool.jobId,'exited',{content:[{type:'text',text:'aggregate completed'}],
+                details:snapshot(pool),isError:pool.status==='failed'});
+        }
+        assert.equal(request.args.name,'subagent');
+        operations.push(args.operation);
+        let pool;
+        if (args.operation === 'pool_start') {
+            const id = `pool-native-${pools.size + 1}`;
+            pool = {id,jobId:`carrier-${id}`,agent:args.agent,concurrency:args.concurrency,
+                status:'open',sealed:false,items:[]};
+            pools.set(id,pool);
+        } else {
+            pool = pools.get(args.poolId);
+            assert.ok(pool,'operation must reference an acknowledged native pool');
+        }
+        const admittedItemIds = [];
+        if (args.operation === 'pool_start' || args.operation === 'pool_push') {
+            assert.ok(!pool.sealed);
+            for (const task of args.tasks) {
+                const id = pool.items.length+1;
+                pool.items.push({id,task,status:id<=pool.concurrency ? 'running' : 'queued',result:null});
+                admittedItemIds.push(id);
+            }
+        } else if (args.operation === 'pool_finish') {
+            pool.sealed = true;
+            pool.status = pool.items.some(item=>item.result===null) ? 'draining' : 'completed';
+        } else if (args.operation === 'pool_close') {
+            pool.sealed = true;
+            pool.status = 'cancelled';
+            for (const item of pool.items) if (item.result === null) {
+                item.status = 'cancelled';
+                item.result = {content:[],details:{cancelled:true},isError:true};
+            }
+        } else assert.ok(['pool_status','pool_result','pool_wait'].includes(args.operation));
+        const result = snapshot(pool);
+        if (args.operation === 'pool_start' || args.operation === 'pool_push') result.admittedItemIds = admittedItemIds;
+        if (args.itemId !== undefined) {
+            const item = pool.items[args.itemId-1];
+            result.itemId = item.id;
+            result.item = {id:item.id,status:item.status,result:item.result};
+        }
+        return result;
+    };
+    return {pools,operations,apply,complete,snapshot,reply:request=>answer(h,request,apply(request))};
 }
 async function drive(h, pending, reply, start = h.requests.length) {
     let settled = false;
@@ -307,117 +343,206 @@ async function drive(h, pending, reply, start = h.requests.length) {
     assert.ok(settled,'controlled host must settle the pool operation');
     return pending;
 }
+function runPool(h, code, reply) {
+    const start = h.requests.length;
+    return drive(h,vm.runInContext(code,h.context),reply,start);
+}
 async function createPool(h, options = {agent:'scout',concurrency:2}) {
     await vm.runInContext(`workpool(${JSON.stringify(options)}).then(value=>globalThis.pool=value)`,h.context);
 }
-test('workpool lazily creates bounded workers, reuses their FIFO turns and survives cells', async () => {
+test('workpool admits whole batches through one native carrier and retains fixed items across cells', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h);
     assert.equal(h.requests.length,0);
-    const handles = await drive(h,vm.runInContext("pool.push(['a','b','c','d','e'])",h.context),native.reply);
-    assert.deepEqual(native.operations,['worker_start','worker_start','worker_send','worker_send','worker_send']);
-    assert.deepEqual(Array.from(handles,turn=>[turn.workerId,turn.turnId]),[
-        ['pool-worker-1',1],['pool-worker-2',1],['pool-worker-1',2],['pool-worker-2',2],['pool-worker-1',3],
-    ]);
+    const handles = await runPool(h,"pool.push(['a','b','c','d','e']).then(items=>globalThis.items=items)",native.reply);
+    assert.deepEqual(native.operations,['pool_start']);
+    assert.deepEqual(h.requests[0].args.args,{agent:'scout',operation:'pool_start',concurrency:2,tasks:['a','b','c','d','e']});
+    assert.deepEqual(Array.from(handles,item=>[item.poolId,item.jobId,item.itemId]),[1,2,3,4,5].map(id=>[
+        'pool-native-1','carrier-pool-native-1',id,
+    ]));
+    assert.equal(handles[0].workerId,undefined);
+    assert.equal(handles[0].cancel,undefined,'an item must not expose shared-carrier cancellation');
+    assert.ok(Object.isFrozen(handles[0]));
     h.dispatch.clear();
-    const idle = native.workers.get('pool-worker-1');
-    idle.status = 'idle';
-    for (const [id,turn] of idle.turns) { turn.status = 'completed'; turn.result = turnResult(id); }
-    const followup = await drive(h,vm.runInContext("pool.push(['f'])",h.context),native.reply);
-    assert.equal(followup[0].workerId,'pool-worker-1','idle worker is preferred before balancing total admissions');
-    assert.equal(native.workers.size,2);
-    assert.deepEqual(native.operations.slice(-3),['worker_status','worker_status','worker_send']);
-    const peek = await drive(h,vm.runInContext('pool.peek()',h.context),native.reply);
+    const nativePool = native.pools.get('pool-native-1');
+    native.complete(nativePool,1);
+    const followup = await runPool(h,"pool.push(['f'])",native.reply);
+    assert.equal(followup[0].itemId,6);
+    assert.equal(native.pools.size,1);
+    assert.deepEqual(native.operations,['pool_start','pool_push']);
+    const before = h.requests.length;
+    const peek = await runPool(h,'pool.peek()',native.reply);
+    assert.equal(h.requests.length,before+1,'the whole manifest uses one hostcall');
     assert.equal(peek.items.length,6);
-    assert.equal(peek.items[0].result.details.turn,1);
-    assert.equal(peek.items[5].turnId,4);
-    const status = await drive(h,vm.runInContext('pool.status()',h.context),native.reply);
-    assert.equal(status.total,6);
-    assert.equal(status.counts.completed,3);
-    assert.equal(status.workerCount,2);
+    assert.equal(peek.items[0].summary,'item 1');
+    assert.equal(peek.items[0].result,undefined,'manifests carry bounded summaries and result references');
+    assert.equal((await runPool(h,'items[0].output()',native.reply)).details.turn,1);
+    assert.equal((await runPool(h,'pool.status()',native.reply)).completedItems,1);
+    const fresh = host();
+    const restored = vm.runInContext("tool.result('subagent',{operation:'pool_status',poolId:'pool-native-1'})",fresh.context);
+    answer(fresh,fresh.requests[0],native.apply(fresh.requests[0]));
+    assert.equal((await restored).details.admittedItems,6,'native state is addressable from a fresh guest realm');
 });
-test('workpool validates every task before launch and enforces a lifetime 32-item bound', async () => {
+test('workpool validates every task and option before dispatch and admits 32 items in one hostcall', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h);
     for (const tasks of [['valid',''],['valid',null],['valid','x\0y'],['valid','é'.repeat(32769)],['valid','\ud800']]) {
         await assert.rejects(vm.runInContext(`pool.push(${JSON.stringify(tasks)})`,h.context),/EVAL_POOL_INPUT/);
         assert.equal(h.requests.length,0);
     }
-    const handles = await drive(h,vm.runInContext('pool.push(Array.from({length:32},(_,n)=>`task ${n}`))',h.context),native.reply);
+    await assert.rejects(vm.runInContext("pool.push(Array(4).fill('x'.repeat(65536)))",h.context),/encoded batch exceeds 256 KiB/);
+    assert.equal(vm.runInContext('pool.closed || pool.unknownAdmission',h.context),false);
+    assert.equal(h.requests.length,0);
+    const handles = await runPool(h,'pool.push(Array.from({length:32},(_,n)=>`task ${n}`))',native.reply);
     assert.equal(handles.length,32);
-    assert.equal(h.requests.length,32,'one native admission per item, not polling before every send');
-    assert.equal(native.workers.size,2);
+    assert.equal(h.requests.length,1);
     await assert.rejects(vm.runInContext("pool.push(['over capacity'])",h.context),/EVAL_POOL_CAPACITY/);
-    assert.equal(h.requests.length,32);
     for (const options of [{concurrency:0},{concurrency:9},{concurrency:1.5},{concurrency:true},
         {isolation:'worktree'},{timeoutSeconds:0},{scope:'all'},{keepAlive:false},{outputSchema:{}},{cwd:null}]) {
         await assert.rejects(vm.runInContext(`workpool(${JSON.stringify(options)})`,h.context),/EVAL_POOL_INPUT/);
     }
-    assert.equal(h.requests.length,32);
+    assert.equal(h.requests.length,1);
 });
-test('workpool partial admission failure retains handles, closes admission and allows cleanup', async () => {
+test('workpool forwards native launch options while keeping its display name local', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h,{agent:'scout',concurrency:3,name:'review',cwd:'.',scope:'project',isolation:'none',timeoutSeconds:120});
+    await runPool(h,"pool.push(['inspect'])",native.reply);
+    assert.deepEqual(h.requests[0].args.args,{agent:'scout',cwd:'.',scope:'project',isolation:'none',timeoutSeconds:120,
+        operation:'pool_start',concurrency:3,tasks:['inspect']});
+    assert.equal(vm.runInContext('pool.name',h.context),'review');
+});
+test('a lost batch acknowledgment preserves handles and reconciles native admission without replay', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h);
-    let admissions = 0;
-    const reply = request => {
-        if (['worker_start','worker_send'].includes(request.args.args.operation) && ++admissions === 3) {
-            h.dispatch.dispatch(request.id,false,false,'PI_WORKER_REJECTED');
-        } else native.reply(request);
+    await runPool(h,"pool.push(['a','b'])",native.reply);
+    const lost = request => {
+        native.apply(request);
+        h.dispatch.dispatch(request.id,false,false,'acknowledgment lost');
     };
-    await assert.rejects(drive(h,vm.runInContext("pool.push(['a','b','c','d'])",h.context),reply),error=>{
-        assert.match(error.message,/acknowledged 2 of 4/);
+    await assert.rejects(runPool(h,"pool.push(['c','d'])",lost),error=>{
+        assert.match(error.message,/EVAL_POOL_ADMISSION/);
         assert.equal(error.admitted.length,2);
-        assert.equal(error.requested,4);
+        assert.equal(error.requested,2);
         return true;
     });
     assert.equal(vm.runInContext('pool.items.length',h.context),2);
+    assert.equal(vm.runInContext('pool.unknownAdmission',h.context),true);
     await assert.rejects(vm.runInContext("pool.push(['retry'])",h.context),/EVAL_POOL_CLOSED/);
-    const peek = await drive(h,vm.runInContext('pool.peek()',h.context),native.reply);
-    assert.equal(peek.items.length,2);
+    const peek = await runPool(h,'pool.peek()',native.reply);
+    assert.equal(peek.items.length,4);
     assert.equal(peek.closed,true);
-    assert.match(peek.lastError,/PI_WORKER_REJECTED/);
-    const closed = await drive(h,vm.runInContext('pool.close()',h.context),native.reply);
-    assert.equal(closed.allClosed,true);
-    assert.equal(closed.workers.length,2);
+    assert.equal(peek.unknownAdmission,false);
+    assert.equal(vm.runInContext('pool.items[3].itemId',h.context),4);
+    assert.deepEqual(native.operations,['pool_start','pool_push','pool_status']);
+    assert.equal((await runPool(h,'pool.close()',native.reply)).allClosed,true);
 });
-test('workpool serializes push then close and refuses later admission without native dispatch', async () => {
+test('finish seals admission once and returns a retained aggregate job that drains every item', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h,{agent:'scout',concurrency:1});
-    const pending = vm.runInContext("Promise.allSettled([pool.push(['a','b']),pool.close(),pool.push(['too late'])])",h.context);
-    const settled = await drive(h,pending,native.reply);
+    const settled = await runPool(h,"Promise.allSettled([pool.push(['a','b']),pool.finish(),pool.push(['too late'])])",native.reply);
+    assert.equal(settled[0].value.length,2);
+    assert.equal(settled[1].value.id,'carrier-pool-native-1');
+    assert.match(settled[2].reason.message,/EVAL_POOL_CLOSED/);
+    assert.deepEqual(native.operations,['pool_start','pool_finish']);
+    assert.equal((await vm.runInContext('pool.finish()',h.context)).id,'carrier-pool-native-1');
+    const result = await runPool(h,'pool.wait(10)',native.reply);
+    assert.equal(result.details.status,'completed');
+    assert.deepEqual(Array.from(result.details.items,item=>item.id),[1,2]);
+    assert.deepEqual(native.operations,['pool_start','pool_finish','jobs:wait']);
+    assert.equal((await runPool(h,'pool.output()',native.reply)).details.completedItems,2);
+    await assert.rejects(vm.runInContext('pool.wait(-1)',h.context),/EVAL_AGENT_INPUT/);
+    const empty = host(); const emptyNative = poolHost(empty); await createPool(empty);
+    assert.equal((await runPool(empty,'pool.finish()',emptyNative.reply)).id,'carrier-pool-native-1');
+    assert.deepEqual(emptyNative.operations,['pool_start','pool_finish']);
+    assert.deepEqual(empty.requests[0].args.args.tasks,[]);
+});
+test('mixed waits preserve order, one timeout, pinned worker turns and failed native pool results', async () => {
+    const h = host(); const native = poolHost(h);
+    await launchAgent(h,'job','job-once');
+    await launchWorker(h);
+    await createPool(h);
+    await runPool(h,"pool.push(['a']).then(items=>globalThis.item=items[0])",native.reply);
+    const failed = {content:[{type:'text',text:'item failed'}],details:{item:1},isError:true};
+    native.complete(native.pools.get('pool-native-1'),1,failed);
+    const waiting = vm.runInContext('wait([job,item,worker],{timeout:10,raiseErrors:false})',h.context);
+    const jobRequest = h.requests.at(-1);
+    const sending = vm.runInContext("worker.send('next')",h.context);
+    answer(h,h.requests.at(-1),workerSnapshot('worker-native',2,'queued'));
+    await sending;
+    const start = h.requests.length;
+    answer(h,jobRequest,jobSnapshot('job-once'));
+    const results = await drive(h,waiting,request=>{
+        assert.ok(request.args.args.timeoutMs<=10000);
+        if (request.args.args.operation==='pool_wait') native.reply(request);
+        else {
+            assert.equal(request.args.args.turnId,1);
+            answer(h,request,workerSnapshot('worker-native',1,'completed',turnResult(1)));
+        }
+    },start);
+    assert.equal(results[0].details.results[0].data.count,7);
+    assert.equal(results[1].isError,true);
+    assert.equal(results[2].details.turn,1);
+    assert.equal(vm.runInContext('worker.turnId',h.context),2);
+});
+test('pool item waits retain pending state and validate current native identity and terminal output', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await runPool(h,"pool.push(['a']).then(items=>globalThis.item=items[0])",native.reply);
+    await assert.rejects(runPool(h,'item.wait(0)',native.reply),/EVAL_AGENT_TIMEOUT/);
+    assert.deepEqual(native.operations,['pool_start','pool_wait']);
+    const pool = native.pools.get('pool-native-1');
+    native.complete(pool,1);
+    const good = {...native.snapshot(pool),itemId:1,item:{id:1,status:'completed',result:turnResult(1)}};
+    for (const bad of [{...good,poolId:'other'},{...good,jobId:'other'},{...good,agent:'other'},
+        {...good,itemId:2},{...good,item:{id:1,status:'completed',result:null}},
+        {...good,items:[{...good.items[0],resultRef:{poolId:pool.id,itemId:2}}]},
+        {...good,completedItems:0}]) {
+        await assert.rejects(runPool(h,'item.status()',request=>answer(h,request,bad)),/EVAL_POOL_PROTOCOL/);
+    }
+    await assert.rejects(runPool(h,'item.output()',request=>{
+        h.dispatch.dispatch(request.id,false,false,'PI_POOL_OWNER_CHANGED');
+    }),/PI_POOL_OWNER_CHANGED/);
+});
+test('workpool serializes cancellation and refuses later admission without native dispatch', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    const settled = await runPool(h,"Promise.allSettled([pool.push(['a','b']),pool.close(),pool.push(['too late'])])",native.reply);
     assert.equal(settled[0].status,'fulfilled');
     assert.equal(settled[1].value.allClosed,true);
+    assert.equal(settled[1].value.status,'cancelled');
     assert.match(settled[2].reason.message,/EVAL_POOL_CLOSED/);
-    assert.deepEqual(native.operations,['worker_start','worker_send','worker_close']);
+    assert.deepEqual(native.operations,['pool_start','pool_close']);
     assert.equal((await vm.runInContext('pool.close()',h.context)).allClosed,true);
-    assert.equal(h.requests.length,3,'acknowledged closes are not replayed');
+    assert.equal(h.requests.length,2,'acknowledged closes are not replayed');
     const empty = host(); await createPool(empty);
     assert.equal((await vm.runInContext('pool.close()',empty.context)).allClosed,true);
     assert.equal(empty.requests.length,0);
 });
-test('an interrupted pool command can close known workers without retaining a stuck guest queue', async () => {
+test('an interrupted pool command can cancel its known carrier without a stuck guest queue', async () => {
     const h = host(); const native = poolHost(h);
-    await createPool(h,{agent:'scout',concurrency:1});
-    vm.runInContext("pool.push(['a','b'])",h.context);
+    await createPool(h);
+    await runPool(h,"pool.push(['a'])",native.reply);
+    vm.runInContext("pool.push(['b'])",h.context);
     await new Promise(resolve=>setImmediate(resolve));
-    native.reply(h.requests[0]);
-    await new Promise(resolve=>setImmediate(resolve));
-    assert.equal(h.requests[1].args.args.operation,'worker_send');
+    assert.equal(h.requests[1].args.args.operation,'pool_push');
+    native.apply(h.requests[1]);
     h.dispatch.clear();
-    const closed = await drive(h,vm.runInContext('pool.close()',h.context),native.reply);
+    const closed = await runPool(h,'pool.close()',native.reply);
     assert.equal(closed.allClosed,true);
-    assert.equal(closed.workers.length,1);
-    assert.equal(vm.runInContext('pool.items.length',h.context),1);
-    assert.equal(h.requests.length,3,'interrupted send is not replayed');
+    assert.equal(closed.items.length,2);
+    assert.equal(closed.interrupted,true);
+    assert.equal(vm.runInContext('pool.items.length',h.context),2);
+    assert.deepEqual(native.operations,['pool_start','pool_push','pool_close']);
 });
-test('workpool reports uncertainty after a lost start acknowledgment instead of claiming full cleanup', async () => {
+test('workpool reports uncertainty after a lost start acknowledgment without retry or false cleanup', async () => {
     const h = host(); await createPool(h);
-    await assert.rejects(drive(h,vm.runInContext("pool.push(['first'])",h.context),request=>{
+    await assert.rejects(runPool(h,"pool.push(['first'])",request=>{
         h.dispatch.dispatch(request.id,false,false,'acknowledgment lost');
     }),/EVAL_POOL_ADMISSION/);
     const closed = await vm.runInContext('pool.close()',h.context);
     assert.equal(closed.allKnownClosed,true);
     assert.equal(closed.unknownAdmission,true);
     assert.equal(closed.allClosed,false);
+    await assert.rejects(vm.runInContext('pool.finish()',h.context),/EVAL_POOL_CLOSED/);
     assert.equal(h.requests.length,1);
 });
