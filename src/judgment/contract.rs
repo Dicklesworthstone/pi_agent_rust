@@ -19,6 +19,7 @@ const MAX_TEXT: usize = 4096;
 pub struct JudgmentRequest {
     state: Value,
     questions: BTreeMap<String, Question>,
+    images: Vec<crate::model::ImageContent>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,8 +102,31 @@ impl JudgmentRequest {
             };
             questions.insert(id.clone(), Question { kind, raw: value.clone() });
         }
-        Ok(Self { state: state.clone(), questions })
+        Ok(Self { state: state.clone(), questions, images: Vec::new() })
     }
+
+    /// Attach up to four explicitly supplied, bounded native images. Image
+    /// data is kept separate from the text rubric and is never serialized into
+    /// `state`, text privacy scanning or provider prompt text. This validates
+    /// envelopes and canvas dimensions, not pixel content or complete rasters.
+    /// A later call replaces the prior image collection after full validation.
+    pub fn with_images(mut self, images: Vec<crate::model::ImageContent>) -> Result<Self> {
+        super::images::validate_images(&images)?;
+        self.images = images;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn has_images(&self) -> bool { !self.images.is_empty() }
+
+    /// Encoded image bytes only. Text keeps its independent validation and
+    /// privacy allowances; this count is suitable for aggregate batch limits.
+    #[must_use]
+    pub fn image_bytes(&self) -> usize {
+        self.images.iter().map(|image| image.data.len()).sum()
+    }
+
+    pub(super) fn into_images(self) -> Vec<crate::model::ImageContent> { self.images }
 
     pub(crate) fn parse_encoded(text: &str) -> Result<Self> {
         if text.len() > MAX_BYTES { return Err(invalid()); }

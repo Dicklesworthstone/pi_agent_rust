@@ -30,6 +30,8 @@ mod python_runtime;
 mod session;
 mod transport;
 
+pub(crate) use display::image_dimensions;
+
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 
@@ -652,16 +654,25 @@ impl Tool for EvalTool {
          globalThis; all waits remain within the current cell's deadline. \
          Native call receipts are included in result details. For typed judgments, \
          set judge_model={provider,model} for this cell, then call \
-         __pi_judge through tool.call with {state,questions} and parse its JSON. \
-         Questions use bool/choice/score rubrics. For independent states call \
-         __pi_judge_batch through tool.call with {states,questions,concurrency?}. \
+         __pi_judge through tool.call with {state,questions,images?} and parse its JSON. \
+         Questions use bool/choice/score rubrics. images is an array of local paths \
+         or {type:'image',data:base64,mimeType}; detail may only be omitted or auto. \
+         PNG/JPEG/GIF/WebP require host/catalog-declared image support, at most \
+         4 images, 4.5 MiB decoded per image and 8 MiB encoded per request. Paths \
+         use the current Agent's enabled read tool, policy and host-call budget; \
+         standalone bindings must embed images. Text privacy excludes image \
+         pixels and metadata. For independent states call __pi_judge_batch through \
+         tool.call with {states,questions,concurrency?,images?}. Batch images is \
+         a map of exact state keys or zero-based array index strings to image \
+         arrays, with a 16 MiB encoded total. All attachments are prepared before \
+         any model request. \
          states is an array or keyed object of 1-16 states; concurrency is 1-8 \
          (default 4). Parse the JSON and check allOk or each items entry's ok \
          before using its verdict; ordinary item failures retain successful peers. \
          Single judgments and batch items share 16 reserved attempts per cell; \
          batches keep the original cell deadline and do not run in the background. \
          No model fallback or tools within a judgment request. \
-         General one-shot completion uses __pi_complete through tool.call \
+         General text-only one-shot completion uses __pi_complete through tool.call \
          with {prompt,system?,max_tokens?,schema?}, returning JSON with text and \
          usage. Optional schema is a bounded object/boolean JSON Schema; valid \
          terminal JSON also returns data and schemaValid=true. Use data for \

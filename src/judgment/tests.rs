@@ -120,11 +120,13 @@ fn redaction_may_change_state_but_not_answer_identity() {
 struct FixtureProvider {
     events: Mutex<Option<Vec<StreamEvent>>>,
     prompts: Mutex<Vec<String>>,
+    contents: Mutex<Vec<UserContent>>,
     tokens: Mutex<Vec<Option<u32>>>,
 }
 impl FixtureProvider {
     fn new(events: Vec<StreamEvent>) -> Arc<Self> {
-        Arc::new(Self { events: Mutex::new(Some(events)), prompts: Mutex::new(Vec::new()), tokens: Mutex::new(Vec::new()) })
+        Arc::new(Self { events: Mutex::new(Some(events)), prompts: Mutex::new(Vec::new()),
+            contents: Mutex::new(Vec::new()), tokens: Mutex::new(Vec::new()) })
     }
 }
 #[async_trait::async_trait]
@@ -137,8 +139,15 @@ impl Provider for FixtureProvider {
         assert!(context.tools.is_empty());
         assert_eq!(context.messages.len(), 1);
         let Message::User(message) = &context.messages[0] else { panic!("expected user state"); };
-        let UserContent::Text(text) = &message.content else { panic!("expected text"); };
+        let text = match &message.content {
+            UserContent::Text(text) => text,
+            UserContent::Blocks(blocks) => match blocks.first() {
+                Some(ContentBlock::Text(text)) => &text.text,
+                _ => panic!("expected screened text before image evidence"), // ubs:ignore[rust.ownership.panic-macro] -- This controlled provider fixture must observe the documented multimodal wire shape.
+            },
+        };
         self.prompts.lock().unwrap().push(text.clone());
+        self.contents.lock().unwrap().push(message.content.clone()); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- The test fixture must fail on a poisoned recording lock rather than lose the provider-bound evidence.
         self.tokens.lock().unwrap().push(options.max_tokens);
         let events = self.events.lock().unwrap().take().expect("provider was retried");
         Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
@@ -218,4 +227,136 @@ fn direct_calls_redact_credentials_before_the_provider() {
     let prompts = provider.prompts.lock().unwrap();
     assert!(!prompts[0].contains(secret));
     assert!(prompts[0].contains("redacted"));
+}
+
+mod image_evidence {
+    use super::*;
+    use crate::model::ImageContent;
+    use base64::Engine as _;
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    fn image() -> ImageContent {
+        ImageContent { data: PNG.to_string(), mime_type: "image/png".to_string() }
+    }
+
+    // An envelope fixture, deliberately not a claim that every payload is a
+    // decodable raster. It exercises byte/canvas admission without decoding.
+    fn gif(bytes: usize, width: u16, height: u16) -> ImageContent {
+        let mut data = vec![0; bytes.max(14)];
+        data[..6].copy_from_slice(b"GIF89a");
+        data[6..8].copy_from_slice(&width.to_le_bytes());
+        data[8..10].copy_from_slice(&height.to_le_bytes());
+        let end = data.len() - 1;
+        data[end] = 0x3b;
+        ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(data),
+            mime_type: "image/gif".to_string(),
+        }
+    }
+
+    #[test]
+    fn images_remain_separate_from_text_contract_and_native_blocks_preserve_order() {
+        // This image alone exceeds the complete text privacy allowance, but
+        // stays admissible as separately bounded opaque image evidence.
+        let second = gif(crate::text_completion::MAX_INPUT_BYTES, 2, 3);
+        let expected = [image(), second];
+        let original = request();
+        let text = original.encoded().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- A validated fixture request must encode before attachment.
+        let request = original.with_images(expected.to_vec()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Controlled PNG/GIF envelopes must be admitted.
+        assert!(request.has_images()); // ubs:ignore[rust.panic.assert-macros] -- The host must detect the image capability requirement.
+        assert_eq!(request.image_bytes(), expected.iter().map(|image| image.data.len()).sum::<usize>()); // ubs:ignore[rust.panic.assert-macros] -- Batch charging uses the exact encoded attachment sizes.
+        assert_eq!(request.encoded().unwrap(), text); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Attaching images must not enlarge or contaminate the text privacy envelope.
+        let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
+        let judge = Judge::new(provider.clone(), StreamOptions::default()).with_image_support(true);
+        let verdict = runtime().block_on(judge.evaluate(request)).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- A terminal fixture verdict is required to inspect transmitted evidence.
+        assert_eq!(verdict["answers"]["safe"]["bool"], 0.9); // ubs:ignore[rust.panic.assert-macros] -- Images preserve the existing typed verdict contract.
+        let contents = provider.contents.lock().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- This isolated fixture cannot continue without its captured provider request.
+        let UserContent::Blocks(blocks) = &contents[0] else {
+            panic!("images were not sent as native content blocks"); // ubs:ignore[rust.ownership.panic-macro] -- Serialized base64 in a text message would not provide vision evidence.
+        };
+        assert_eq!(blocks.len(), 3); // ubs:ignore[rust.panic.assert-macros] -- Exactly one screened text block precedes the two evidence images.
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if !text.text.contains(PNG))); // ubs:ignore[rust.panic.assert-macros] -- Image payloads must never be rendered into prompt text.
+        for (block, original) in blocks[1..].iter().zip(expected) {
+            assert!(matches!(block, ContentBlock::Image(image) if image.data == original.data && image.mime_type == original.mime_type)); // ubs:ignore[rust.panic.assert-macros] -- Admission must preserve exact bytes, MIME and ordering without transcoding.
+        }
+    }
+
+    #[test]
+    fn image_support_is_explicit_and_revocation_refuses_before_provider_admission() {
+        let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
+        let judge = Judge::new(provider.clone(), StreamOptions::default());
+        assert!(judge.check_image_support(false).is_ok()); // ubs:ignore[rust.panic.assert-macros] -- A text request never requires image capability.
+        for binding in [judge.clone(), judge.with_image_support(true).with_image_support(false)] {
+            let request = request().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Valid image evidence isolates the capability rejection.
+            let error = runtime().block_on(binding.evaluate(request)).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- An unsupported binding must fail without silently dropping evidence.
+            assert!(error.to_string().contains("PI_JUDGE_IMAGE_UNSUPPORTED")); // ubs:ignore[rust.panic.assert-macros] -- Callers need a named capability refusal rather than a text-only verdict.
+        }
+        assert!(provider.contents.lock().unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Unsupported requests must consume no provider call; poisoned evidence must fail the test.
+    }
+
+    #[test]
+    fn empty_images_preserve_text_only_binding_and_wire_shape() {
+        let request = request().with_images(vec![image()]).unwrap().with_images(Vec::new()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Replacing attachments with an empty validated collection must remove image authority requirements.
+        assert!(!request.has_images()); // ubs:ignore[rust.panic.assert-macros] -- Empty collections remain ordinary text judgments.
+        assert_eq!(request.image_bytes(), 0); // ubs:ignore[rust.panic.assert-macros] -- Removed evidence must not keep charging the batch image budget.
+        let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
+        runtime().block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request)).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- The default text binding must remain usable after empty-image admission.
+        assert!(matches!(&provider.contents.lock().unwrap()[0], UserContent::Text(_))); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- No-image calls retain the existing wire representation; losing the capture must fail this assertion.
+    }
+
+    #[test]
+    fn text_privacy_still_blocks_or_redacts_without_receiving_image_bytes() {
+        let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
+        let judge = Judge::new(provider.clone(), StreamOptions::default()).with_image_support(true);
+        let protect = |parts: &[&str]| -> Result<Vec<String>> {
+            assert!(parts.iter().all(|part| !part.contains(PNG))); // ubs:ignore[rust.panic.assert-macros] -- Pixel evidence is opaque and excluded from the text privacy scan.
+            Err(failure("PI_SECRET_BLOCK"))
+        };
+        let blocked = request().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Valid evidence ensures the privacy callback is the only refusal.
+        let error = runtime().block_on(judge.evaluate_protected(blocked, Some(&protect))).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Block mode must refuse before sending either text or images.
+        assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- The existing text privacy refusal remains authoritative.
+        assert!(provider.contents.lock().unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- A blocked request cannot leak an image; poisoned capture state cannot be accepted as evidence of no call.
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut value: Value = serde_json::from_str(&request().encoded().unwrap()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Controlled typed input is extended with a known credential-shaped fixture.
+        value["state"] = json!({"API_KEY":secret,"echo":secret});
+        let redacted = JudgmentRequest::parse(value).unwrap().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Known-secret text and valid image evidence must reach the ordinary privacy projection.
+        runtime().block_on(judge.evaluate(redacted)).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Redaction, unlike block mode, should preserve usable evidence.
+        let prompts = provider.prompts.lock().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Inspect exactly what the provider received; poison must invalidate the test.
+        assert!(!prompts[0].contains(secret)); // ubs:ignore[rust.panic.assert-macros] -- Adding image support cannot weaken existing credential redaction.
+        assert!(prompts[0].contains("redacted")); // ubs:ignore[rust.panic.assert-macros] -- The admitted text must carry irreversible redaction.
+    }
+
+    #[test]
+    fn image_admission_rejects_malformed_metadata_base64_and_unbounded_canvas() {
+        let mut cases = vec![
+            ImageContent { data: "CANARY-private-image-data".to_string(), mime_type: "image/png".to_string() },
+            ImageContent { data: String::new(), mime_type: "image/png".to_string() },
+            ImageContent { data: PNG.trim_end_matches('=').to_string(), mime_type: "image/png".to_string() },
+            ImageContent { data: format!("{PNG}\n"), mime_type: "image/png".to_string() },
+            ImageContent { data: PNG.replace("ggg==", "ggh=="), mime_type: "image/png".to_string() },
+            gif(14, 0, 1), gif(14, 16_385, 1), gif(14, 4097, 4096),
+        ];
+        for mime in ["image/jpeg", "image/svg+xml", "IMAGE/PNG", "image/png; charset=utf-8", "image/png\u{1b}"] {
+            cases.push(ImageContent { data: PNG.to_string(), mime_type: mime.to_string() });
+        }
+        for image in cases {
+            let error = validate_image(&image).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Every case violates a different input envelope invariant.
+            assert!(error.to_string().contains("PI_JUDGE_IMAGE_INPUT")); // ubs:ignore[rust.panic.assert-macros] -- Image errors remain named and independent of provider details.
+            assert!(!error.to_string().contains("CANARY")); // ubs:ignore[rust.panic.assert-macros] -- Rejections cannot echo raw image input.
+        }
+    }
+
+    #[test]
+    fn image_count_decoded_and_aggregate_encoded_allowances_are_independent() {
+        let boundary_image = gif(MAX_JUDGMENT_IMAGE_BYTES, 1, 1);
+        assert_eq!(validate_image(&boundary_image).unwrap(), MAX_JUDGMENT_IMAGE_BYTES / 3 * 4); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Exact decoded allowance is admitted without changing bytes.
+        let oversized = gif(MAX_JUDGMENT_IMAGE_BYTES + 1, 1, 1);
+        assert!(validate_image(&oversized).unwrap_err().to_string().contains("PI_JUDGE_IMAGE_LIMIT")); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- A single additional decoded byte must exceed the per-image allowance.
+        assert!(request().with_images(vec![boundary_image.clone(), boundary_image]).unwrap_err().to_string().contains("PI_JUDGE_IMAGE_LIMIT")); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Two individually admissible images cannot exceed the aggregate request allowance.
+        assert!(request().with_images(vec![image(); MAX_JUDGMENT_IMAGES + 1]).is_err()); // ubs:ignore[rust.panic.assert-macros] -- Count admission is independent of byte size.
+        let half = gif(3 * 1024 * 1024, 1, 1);
+        let request = request().with_images(vec![half.clone(), half]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Two 4 MiB encoded envelopes exactly fill the aggregate allowance.
+        assert_eq!(request.image_bytes(), MAX_JUDGMENT_IMAGE_ENCODED_BYTES); // ubs:ignore[rust.panic.assert-macros] -- Aggregate charging is based on encoded bytes, not decoded bytes or image count.
+    }
 }

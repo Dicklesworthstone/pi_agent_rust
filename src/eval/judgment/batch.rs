@@ -11,14 +11,14 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{AgentCx, Invocation, JudgmentRequest, MAX_CALLS, public_error};
+use super::{AgentCx, Invocation, JudgmentRequest, MAX_CALLS, images, public_error};
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge_batch";
 const MAX_CONCURRENCY: usize = 8;
 const DEFAULT_CONCURRENCY: usize = 4;
 const MAX_INPUT_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-const INVALID: &str = "PI_JUDGE_BATCH_INPUT: requires 1-16 states, shared questions and optional concurrency from 1 to 8; states may be an array or a keyed object";
+const INVALID: &str = "PI_JUDGE_BATCH_INPUT: requires 1-16 states, shared questions, optional concurrency from 1 to 8 and an optional images map keyed by exact state keys or array indices";
 const LIMIT: &str = "PI_JUDGE_BATCH_LIMIT: batch input or expanded requests exceed 256 KiB";
 const CALL_LIMIT: &str = "PI_JUDGE_LIMIT: single and batch judgments share 16 reserved attempts per eval cell";
 
@@ -50,6 +50,7 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> BatchResult<usize> {
 struct Item {
     key: Value,
     request: JudgmentRequest,
+    images: images::Sources,
 }
 
 struct Plan {
@@ -59,11 +60,16 @@ struct Plan {
 
 impl Plan {
     fn parse(input: &Value) -> BatchResult<Self> {
-        encoded_size(input, MAX_INPUT_BYTES)?;
         let fields = input.as_object().filter(|fields| {
             fields.contains_key("states") && fields.contains_key("questions")
-                && fields.keys().all(|key| matches!(key.as_str(), "states" | "questions" | "concurrency"))
+                && fields.keys().all(|key| matches!(key.as_str(), "states" | "questions" | "concurrency" | "images"))
         }).ok_or_else(|| INVALID.to_string())?;
+        // Images have their own bounded budget. Count the original text wire
+        // shape without copying or serializing base64 into the rubric budget.
+        let text_fields: std::collections::BTreeMap<_, _> = fields.iter()
+            .filter(|(key, _)| key.as_str() != "images")
+            .collect();
+        encoded_size(&text_fields, MAX_INPUT_BYTES)?;
         let concurrency = match fields.get("concurrency") {
             None => DEFAULT_CONCURRENCY,
             Some(value) => value.as_u64()
@@ -85,6 +91,17 @@ impl Plan {
             }
             _ => return Err(INVALID.to_string()),
         };
+        let image_map = fields.get("images").map(|value| {
+            value.as_object().ok_or_else(|| INVALID.to_string())
+        }).transpose()?;
+        let image_key = |key: &Value| {
+            key.as_str().map_or_else(|| key.to_string(), str::to_owned)
+        };
+        if image_map.is_some_and(|map| map.keys().any(|key| {
+            !selected.iter().any(|(selected_key, _)| image_key(selected_key) == *key)
+        })) {
+            return Err(INVALID.to_string());
+        }
         #[derive(Serialize)]
         struct BorrowedRequest<'a> {
             state: &'a Value,
@@ -92,15 +109,21 @@ impl Plan {
         }
         let questions = &fields["questions"];
         let mut remaining = MAX_INPUT_BYTES;
+        let mut image_bytes = 0_usize;
         let mut items = Vec::with_capacity(selected.len());
         for (key, state) in selected {
             let borrowed = BorrowedRequest { state, questions };
             remaining -= encoded_size(&borrowed, remaining)?;
-            // Reuse the actual single-request validator, including its 128 KiB
-            // bound and refusal of images, empty text, bad rubrics or coercion.
+            // Reuse the single text validator, including its 128 KiB bound.
+            // Images remain separate from text and its privacy projection.
             let request = JudgmentRequest::parse(json!({"state":state,"questions":questions}))
                 .map_err(public_error)?;
-            items.push(Item { key, request });
+            let images = images::Sources::parse(image_map.and_then(|map| map.get(&image_key(&key))))
+                .map_err(public_error)?;
+            image_bytes = image_bytes.checked_add(images.inline_bytes())
+                .filter(|bytes| *bytes <= images::MAX_BATCH_IMAGE_BYTES)
+                .ok_or_else(|| public_error(images::limit()))?;
+            items.push(Item { key, request, images });
         }
         Ok(Self { items, concurrency })
     }
@@ -147,16 +170,47 @@ impl Invocation<'_> {
                 return Err(error);
             }
         };
-        check_owner(&owner)?;
-        let keys: Vec<_> = plan.items.iter().map(|item| item.key.clone()).collect();
-        let mut waiting = plan.items.into_iter().enumerate();
+        let concurrency = plan.concurrency;
+        // Prepare every image before the first provider request. An invalid
+        // later path or an aggregate byte overflow cannot send earlier states.
+        // Reads still use the original cell's host, policy, owner and watchdog.
+        let prepared = async {
+            check_owner(&owner)?;
+            judge.check_image_support(plan.items.iter().any(|item| !item.images.is_empty()))
+                .map_err(public_error)?;
+            self.check_image_reads(plan.items.iter().map(|item| item.images.path_count()).sum())
+                .map_err(public_error)?;
+            let mut bytes = 0_usize;
+            let mut prepared = Vec::with_capacity(count);
+            for item in plan.items {
+                check_owner(&owner)?;
+                let request = self.attach_images(item.request, item.images).await.map_err(public_error)?;
+                bytes = bytes.checked_add(request.image_bytes())
+                    .filter(|bytes| *bytes <= images::MAX_BATCH_IMAGE_BYTES)
+                    .ok_or_else(|| public_error(images::limit()))?;
+                prepared.push((item.key, request));
+            }
+            check_owner(&owner)?;
+            Ok::<_, String>(prepared)
+        }.await;
+        let items = match prepared {
+            Ok(items) => items,
+            Err(error) => {
+                for receipt in &mut self.receipts[base..] {
+                    receipt["admissionError"] = json!(error);
+                }
+                return Err(error);
+            }
+        };
+        let keys: Vec<_> = items.iter().map(|(key, _)| key.clone()).collect();
+        let mut waiting = items.into_iter().enumerate();
         let mut active = FuturesUnordered::new();
         let mut results = vec![Value::Null; count];
         let mut succeeded = 0_usize;
         loop {
-            while active.len() < plan.concurrency {
+            while active.len() < concurrency {
                 check_owner(&owner)?;
-                let Some((index, item)) = waiting.next() else { break; };
+                let Some((index, (_, request))) = waiting.next() else { break; };
                 self.receipts[base + index]["status"] = json!("incomplete");
                 let judge = judge.clone();
                 let item_owner = owner.clone();
@@ -167,7 +221,7 @@ impl Invocation<'_> {
                 // NOT paused or refreshed while this future is pending.
                 active.push(async move {
                     let outcome = item_owner.with_current(
-                        judge.evaluate_protected(item.request, protect),
+                        judge.evaluate_protected(request, protect),
                     ).await;
                     (index, outcome)
                 });

@@ -74,6 +74,17 @@ fn png_dimensions(encoded: &str) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+/// Inspect an already byte-bounded image envelope without raster decoding.
+/// Callers own the encoded-byte allowance; these shared checks authenticate
+/// the declared format and bound its canvas, not complete raster validity.
+pub(crate) fn image_dimensions(encoded: &str, mime: &str) -> Result<(u32, u32)> {
+    if mime == "image/png" {
+        png_dimensions(encoded)
+    } else {
+        images::dimensions(encoded, mime)
+    }
+}
+
 #[derive(Default)]
 struct Displays {
     content: Vec<ContentBlock>,
@@ -113,11 +124,7 @@ fn collect(response: &Value) -> Result<Displays> {
             }
             "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
                 let encoded = data.as_str().ok_or_else(|| invalid("image display data must be base64 text"))?;
-                let (width, height) = if mime == "image/png" {
-                    png_dimensions(encoded)?
-                } else {
-                    images::dimensions(encoded, mime)?
-                };
+                let (width, height) = image_dimensions(encoded, mime)?;
                 descriptor["width"] = json!(width);
                 descriptor["height"] = json!(height);
                 ContentBlock::Image(ImageContent { data: encoded.to_string(), mime_type: mime.to_string() })

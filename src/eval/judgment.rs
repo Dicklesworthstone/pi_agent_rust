@@ -20,6 +20,7 @@ use crate::tools::{ToolInvocationHost, ToolOutput};
 
 mod batch;
 mod completion;
+mod images;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
@@ -107,7 +108,9 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
     };
     let provider = crate::providers::create_provider_with_auth(&entry, None, Some(&auth))
         .map_err(|_| binding_error())?;
-    Ok(Judge::new(provider, options).with_secrets_settings(config.secrets.as_ref()))
+    Ok(Judge::new(provider, options)
+        .with_image_support(entry.model.input.contains(&crate::provider::InputType::Image))
+        .with_secrets_settings(config.secrets.as_ref()))
 }
 
 /// Deliberately borrowed through the native runner. Never retain the Agent's
@@ -175,8 +178,25 @@ impl<'p> Invocation<'p> {
         input: Value,
     ) -> std::result::Result<String, String> {
         let request = super::bridge_result::Request::parse(name, input)?;
-        if request.name.is_empty() || request.name.len() > 128
-            || request.name.chars().any(char::is_control) || !request.args.is_object()
+        let output = self.call_host_output(host, request.name, request.args).await?;
+        if request.structured {
+            super::bridge_result::structured(&output)
+        } else {
+            super::bridge_result::text(&output)
+        }
+    }
+
+    /// The same dispatch and receipt path serves guest calls and image reads.
+    /// Image preparation consumes native content directly, so encoded image
+    /// bytes need not make a redundant round trip through guest JSON framing.
+    async fn call_host_output(
+        &mut self,
+        host: &dyn ToolInvocationHost,
+        name: String,
+        args: Value,
+    ) -> std::result::Result<ToolOutput, String> {
+        if name.is_empty() || name.len() > 128
+            || name.chars().any(char::is_control) || !args.is_object()
         {
             return Err("EVAL_BRIDGE_INPUT: expected a bounded tool name and object arguments".into());
         }
@@ -185,8 +205,8 @@ impl<'p> Invocation<'p> {
         }
         let call = crate::model::ToolCall {
             id: format!("eval-{}", uuid::Uuid::new_v4().simple()),
-            name: request.name,
-            arguments: request.args,
+            name,
+            arguments: args,
             thought_signature: None,
         };
         let index = self.tool_receipts.len();
@@ -208,11 +228,7 @@ impl<'p> Invocation<'p> {
             Ok(output) => {
                 receipt.insert("status".into(), json!(if output.is_error { "failed" } else { "completed" }));
                 receipt.insert("isError".into(), json!(output.is_error));
-                if request.structured {
-                    super::bridge_result::structured(&output)
-                } else {
-                    super::bridge_result::text(&output)
-                }
+                Ok(output)
             }
             Err(error) => {
                 receipt.insert("status".into(), json!("failed"));
@@ -223,7 +239,7 @@ impl<'p> Invocation<'p> {
     }
 
     pub(super) async fn evaluate(&mut self, cwd: &Path, input: Value) -> std::result::Result<String, String> {
-        let request = JudgmentRequest::parse(input).map_err(public_error)?;
+        let (request, images) = images::parse_request(input).map_err(public_error)?;
         if self.judge.is_none() && self.selection.is_none() {
             return Err("PI_JUDGE_UNBOUND: supply this cell's judge_model or bind a Judge in the host".into());
         }
@@ -241,7 +257,7 @@ impl<'p> Invocation<'p> {
             "usage": null,
             "usageKnown": false,
         }));
-        let outcome = self.evaluate_one(cwd, request).await;
+        let outcome = self.evaluate_one(cwd, request, images).await;
         match outcome {
             Ok(verdict) => {
                 self.receipts[index] = json!({
@@ -265,9 +281,17 @@ impl<'p> Invocation<'p> {
         }
     }
 
-    async fn evaluate_one(&mut self, cwd: &Path, request: JudgmentRequest) -> Result<Value> {
-        self.bound_judge(cwd).await?
-            .evaluate_protected(request, self.protect).await
+    async fn evaluate_one(
+        &mut self,
+        cwd: &Path,
+        request: JudgmentRequest,
+        images: images::Sources,
+    ) -> Result<Value> {
+        let judge = self.bound_judge(cwd).await?;
+        judge.check_image_support(!images.is_empty())?;
+        self.check_image_reads(images.path_count())?;
+        let request = self.attach_images(request, images).await?;
+        judge.evaluate_protected(request, self.protect).await
     }
 
     // Resolve once per invocation, not once per batch item. Cloning a Judge
@@ -344,6 +368,8 @@ fn public_error(error: Error) -> String {
         "PI_SECRET_BLOCK", "PI_AUXILIARY_INPUT_LIMIT", "PI_AUXILIARY_KEY_COLLISION",
         "PI_JUDGE_INPUT", "PI_JUDGE_BINDING", "PI_JUDGE_PRIVACY", "PI_JUDGE_PERMISSION",
         "PI_JUDGE_CANCELLED", "PI_JUDGE_TIMEOUT", "PI_JUDGE_RESPONSE", "PI_JUDGE_PROVIDER",
+        "PI_JUDGE_IMAGE_UNSUPPORTED", "PI_JUDGE_IMAGE_INPUT", "PI_JUDGE_IMAGE_LIMIT",
+        "PI_JUDGE_IMAGE_READ", "PI_JUDGE_IMAGE_HOST", "PI_JUDGE_IMAGE_CALL_LIMIT",
     ] {
         if text.contains(code) {
             return format!("{code}: judgment failed; no verdict");

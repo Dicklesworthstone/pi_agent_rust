@@ -5,7 +5,7 @@
 //! as a verdict. Probabilities are model estimates, not calibrated confidence.
 
 use crate::error::{Error, Result};
-use crate::model::{Message, StreamEvent, Usage, UserContent, UserMessage};
+use crate::model::{ContentBlock, Message, StreamEvent, TextContent, Usage, UserContent, UserMessage};
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::text_completion::{AuxiliaryPrivacy, RequestStop, collect_text, redact_inputs, with_timeout};
 use futures::StreamExt;
@@ -15,11 +15,15 @@ use std::time::Duration;
 
 mod completion;
 mod contract;
+mod images;
 #[cfg(test)]
 mod tests;
 
 pub use contract::JudgmentRequest;
 pub use completion::CompletionRequest;
+pub(crate) use images::{
+    MAX_JUDGMENT_IMAGES, MAX_JUDGMENT_IMAGE_BYTES, MAX_JUDGMENT_IMAGE_ENCODED_BYTES, validate_image,
+};
 
 pub(crate) type Protect<'p> = dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync + 'p;
 
@@ -34,18 +38,37 @@ pub struct Judge {
     provider: Arc<dyn Provider>,
     options: StreamOptions,
     privacy: AuxiliaryPrivacy,
+    supports_images: bool,
 }
 
 impl Judge {
     /// Bind a provider. No ambient credential is added to the supplied options.
     pub fn new(provider: Arc<dyn Provider>, options: StreamOptions) -> Self {
-        Self { provider, options, privacy: AuxiliaryPrivacy::default() }
+        Self { provider, options, privacy: AuxiliaryPrivacy::default(), supports_images: false }
     }
 
     #[must_use]
     pub fn with_secrets_settings(mut self, settings: Option<&crate::secrets::SecretsSettings>) -> Self {
         self.privacy = AuxiliaryPrivacy::from_settings(settings);
         self
+    }
+
+    /// Declare image support from trusted host/catalog knowledge. A binding
+    /// without this explicit capability refuses image evidence before provider
+    /// admission; neither the guest request nor a fallback can enable it.
+    #[must_use]
+    pub const fn with_image_support(mut self, supported: bool) -> Self {
+        self.supports_images = supported;
+        self
+    }
+
+    /// Let invocation-owned loaders refuse unsupported image requests before
+    /// reading paths. Empty image collections preserve ordinary text behavior.
+    pub(crate) fn check_image_support(&self, has_images: bool) -> Result<()> {
+        if has_images && !self.supports_images {
+            return Err(failure("PI_JUDGE_IMAGE_UNSUPPORTED: the bound model does not declare image input support; no fallback"));
+        }
+        Ok(())
     }
 
     /// Answer one validated request. Returned usage belongs to this auxiliary
@@ -61,6 +84,7 @@ impl Judge {
         request: JudgmentRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
+        self.check_image_support(request.has_images())?;
         let encoded = request.encoded()?;
         // Screen all state, labels and rubrics in one projection, before any
         // clipping or provider admission. The fallback applies the auxiliary
@@ -70,12 +94,22 @@ impl Judge {
         if !request.same_answer_keys(&screened) {
             return Err(failure("PI_JUDGE_PRIVACY: redaction changed question IDs or choice labels"));
         }
-        let (answer, usage) = self.request_text(system, screened.encoded()?, None).await?;
+        let prompt = screened.encoded()?;
+        let images = request.into_images();
+        let content = if images.is_empty() {
+            UserContent::Text(prompt)
+        } else {
+            let mut blocks = Vec::with_capacity(images.len() + 1);
+            blocks.push(ContentBlock::Text(TextContent::new(prompt)));
+            blocks.extend(images.into_iter().map(ContentBlock::Image));
+            UserContent::Blocks(blocks)
+        };
+        let (answer, usage) = self.request_content(system, content, None).await?;
         let answers = screened.answers(&answer)?;
         Ok(self.reply("pi.judgment.v1", "answers", answers, usage))
     }
 
-    /// One privacy projection covers every field before either operation can
+    /// One privacy projection covers every text field before either operation can
     /// admit a provider. The borrowed callback is never retained by this binding.
     fn screen(&self, system: &str, prompt: &str, protect: Option<&Protect<'_>>) -> Result<[String; 2]> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
@@ -107,6 +141,17 @@ impl Judge {
         prompt: String,
         requested_tokens: Option<u32>,
     ) -> Result<(String, Option<Usage>)> {
+        self.request_content(system, UserContent::Text(prompt), requested_tokens).await
+    }
+
+    /// A validated image request shares the same tool-free terminal collector,
+    /// cancellation checks, token ceiling and deadline as a text completion.
+    async fn request_content(
+        &self,
+        system: String,
+        content: UserContent,
+        requested_tokens: Option<u32>,
+    ) -> Result<(String, Option<Usage>)> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
@@ -115,7 +160,7 @@ impl Judge {
         let context = Context::owned(
             Some(system),
             vec![Message::User(UserMessage {
-                content: UserContent::Text(prompt),
+                content,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             })],
             Vec::new(),

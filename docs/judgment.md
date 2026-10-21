@@ -5,7 +5,8 @@ Bind a `Provider` and `StreamOptions`, validate a `JudgmentRequest`, then await
 `Judge::evaluate`. It makes one stateless, tool-free provider request. It does
 not select a model, add ambient credentials, retry or fail over.
 
-Requests contain exactly `state` and `questions`. State is nonempty text, an
+The text contract parsed by `JudgmentRequest::parse` contains exactly `state`
+and `questions`. State is nonempty text, an
 object or an array. Questions are keyed by ID and have `type`, nonempty
 `instructions`, and the following criteria:
 
@@ -14,8 +15,10 @@ object or an array. Questions are keyed by ID and have `type`, nonempty
 - `score`: 2-16 ordered rubric strings, lowest first.
 
 The limits are 16 questions, 128 KiB encoded input, 32 JSON levels, 65,536
-values, 64-byte IDs/choice labels, and 4,096-byte rubric strings. Images,
-unknown request fields and model-selection directives are not supported.
+values, 64-byte IDs/choice labels, and 4,096-byte rubric strings. Unknown text
+request fields and model-selection directives are not supported. Validated
+native image evidence can be attached separately with `with_images`, as
+described below; its encoded bytes do not consume this text allowance.
 
 The model returns probabilities. Native validation requires all questions,
 all choice labels and all score levels, with no duplicate or unknown keys.
@@ -34,7 +37,7 @@ answers contain the weighted zero-based level index, probabilities keyed by
 level index, and confidence. Confidence is one minus normalized entropy. These
 are model estimates and distribution concentration, not calibrated accuracy.
 
-The entire payload and system instruction pass the auxiliary privacy floor
+The entire text payload and system instruction pass the auxiliary privacy floor
 before provider admission. Configured patterns extend it; block mode refuses.
 An invocation may supply its live Agent projection internally. Redaction must
 not change question IDs, answer types or choice labels. The original state and
@@ -92,6 +95,119 @@ kernel, not just the original eval source. The projection is never stored in a
 shared tool or retained interpreter. Standalone calls use the bound Judge's
 auxiliary privacy policy.
 
+## Image evidence for single and batch judgments
+
+Judgments accept bounded PNG, JPEG, GIF and WebP evidence as native image
+content blocks. The provider receives the screened state and questions in one
+text block, followed by the images in supplied order. Typed answers and verdict
+validation are unchanged. A request without images retains the existing text
+wire shape. Image support does not add image input to `__pi_complete`; general
+completions remain text-only.
+
+For the library API, parse the text request first and attach native
+`Vec<pi::model::ImageContent>` values with
+`JudgmentRequest::with_images(images)?`. A later `with_images` call replaces
+the prior collection after validating the replacement. `has_images()` reports
+whether image capability is required; `image_bytes()` reports the sum of the
+encoded image payload lengths, excluding the text request. For example, with
+provider/options and native images supplied by the host:
+
+```rust
+let judge = Judge::new(provider, options)
+    .with_image_support(model_supports_images);
+let request = JudgmentRequest::parse(text_request)?.with_images(images)?;
+let verdict = judge.evaluate(request).await?;
+```
+
+Image support must be declared by trusted host configuration. A `Judge` defaults
+to refusing image requests until the host binds it with
+`with_image_support(true)`. Eval's `judge_model` binding derives this capability
+from the selected catalog entry's image input support. Guest request fields
+cannot enable it. An unsupported binding fails with
+`PI_JUDGE_IMAGE_UNSUPPORTED` before image path reads or provider admission;
+there is no fallback or silent removal of images. An empty image list is an
+ordinary text request.
+
+The eval `__pi_judge` request adds an optional `images` array alongside `state`
+and `questions`. Each entry is either a local path string or an embedded object:
+
+```javascript
+const verdict = JSON.parse(await tool.call('__pi_judge', {
+  state: {screen: 'checkout confirmation'},
+  questions: {
+    clear: {type: 'bool', instructions: 'Does the screen clearly confirm success?'}
+  },
+  images: ['artifacts/confirmation.png']
+}));
+display(verdict.answers.clear.bool);
+```
+
+The same `images` key is accepted by Python's dictionary request. Embedded
+images use exactly `{type: 'image', data: base64Text, mimeType: 'image/png'}`
+with the appropriate supported MIME type. Optional `detail` may only be
+`'auto'`; other detail settings are rejected rather than ignored. Only the
+exact MIME strings `image/png`, `image/jpeg`, `image/gif` and `image/webp` are
+accepted. URLs, data URLs, SVG, unknown image object fields, noncanonical
+base64 and a MIME that disagrees with the image envelope are refused.
+
+Each request accepts at most **4 images**, at most **4,718,592 decoded bytes per
+image** (6 MiB of canonical base64), and at most **8 MiB of encoded image bytes
+in total**. Both canvas dimensions must be nonzero and at most 16,384 pixels;
+the canvas may contain at most 16,777,216 pixels. These are envelope and canvas
+checks, not a full raster decode, animation frame limit or guarantee that a
+downstream decoder will accept the payload. Native admission preserves the
+accepted image bytes; it does not resize, transcode or strip image metadata.
+
+Local paths require the current cell's Agent tool host. Each path is passed to
+that host's enabled `read` tool under its current policy and captured session
+owner. A successful read must return exactly one native image; descriptive text
+from the read is not added to the judgment. The normal read tool may apply its
+own supported image handling before this admission step. Paths are limited to
+4,096 UTF-8 bytes and cannot be blank or contain control characters. Every path
+read consumes the cell's existing 64-call host-tool allowance and produces a
+native tool receipt. The complete required read count is checked before reads
+begin. A standalone Judge or eval binding without that Agent host must supply
+embedded images; there is no direct filesystem fallback for this operation.
+
+Text privacy checks still cover the full state, question IDs, labels, rubrics
+and system instruction before provider admission. Encoded image bytes are kept
+outside the text privacy projection and its budget. Image pixels and embedded
+metadata are **not inspected or redacted for secrets**. A text privacy refusal
+prevents the whole judgment, including its images, from being sent. Image
+validation and read failures return named, payload-free diagnostics; neither
+image bytes nor image paths are copied into judgment or tool receipts.
+
+`__pi_judge_batch` adds an optional `images` object whose keys select individual
+states. For object-shaped states, use the exact literal state keys. For an
+array of states, use canonical zero-based index strings such as `'0'` and
+`'1'`. Unknown keys, noncanonical array indices and non-object image maps are
+rejected. Omitted keys supply no images for that state. For example:
+
+```python
+reviews = json.loads(await tool.call('__pi_judge_batch', {
+    'states': {'before': {'version': 'before'}, 'after': {'version': 'after'}},
+    'questions': {'clear': {'type': 'bool', 'instructions': 'Is confirmation clear?'}},
+    'images': {
+        'before': ['artifacts/before.png'],
+        'after': ['artifacts/after.png'],
+    },
+    'concurrency': 2,
+}))
+```
+
+The batch has a separate **16 MiB aggregate encoded image allowance** as well
+as every per-request image limit. All image descriptors are validated and all
+required paths are read before the first provider request. An image preparation
+failure refuses the whole batch without sending an earlier state. Once batch
+slots are reserved, an image preparation failure leaves them reserved with a
+sanitized admission error. Text privacy screening remains per item immediately
+before its native evaluation. Neither attachment preparation nor generation
+extends the original cell deadline or detaches work from its owner.
+
+Core image regressions are in `src/judgment/tests.rs`; bridge, path-policy and
+batch image fixtures are in `src/eval/judgment/images/tests.rs`. They use
+controlled hosts and providers and do not establish live-model compatibility.
+
 Native `details.judgments` metadata has schema `pi.eval.judgments.v1` and records
 admitted attempts even when guest code discards the answer or catches its error.
 Completed attempts include provider/model identity and reported usage. Failed
@@ -112,7 +228,8 @@ command remains `dsr quality --tool pi_agent_rust`.
 `__pi_judge_batch` evaluates several independent states against one shared
 rubric, using the same native Judge as `__pi_judge`. It is an invocation-bound
 batch, not OMP's background batch handle or a retained workpool. Requests contain
-`states`, `questions`, and optionally `concurrency` (1-8; default 4). Use either
+`states`, `questions`, and optionally `concurrency` (1-8; default 4) and the
+per-state `images` map described above. Use either
 an array of 1-16 states or an object with 1-16 literal keys. Object keys must be
 nonempty, at most 128 UTF-8 bytes, and contain no control characters. Each state
 and the shared questions follow the ordinary single-judgment contract.
@@ -150,8 +267,8 @@ successful subset, so a handled partial batch does not itself mark the whole
 eval tool result unsuccessful. Failed attempts remain visible in host receipts.
 
 The complete batch shape and every state/rubric are validated before credential
-resolution or provider admission. Both encoded input and the sum of expanded
-state/rubric requests are capped at 256 KiB; the single-request limit still
+resolution or provider admission. Both encoded text input and the sum of
+expanded state/rubric requests are capped at 256 KiB; the single-request limit still
 applies. The completed result is capped at 1 MiB. There is no truncation,
 implicit splitting, provider fallback or automatic retry. Syntax admission is
 all-or-nothing; privacy screening still occurs per item immediately before its
