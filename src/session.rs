@@ -1846,6 +1846,15 @@ fn reject_windows_session_lock_reparse_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows Prefix by itself is not a filesystem path. In
+        // particular, canonicalize() returns verbatim paths such as
+        // \\?\D:\\..., whose first accumulated component is \\?\D:.
+        // Probing that prefix returns ERROR_INVALID_FUNCTION. Defer metadata
+        // inspection until RootDir has been appended; the rooted volume/share
+        // and every descendant are still checked for reparse points.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink()
@@ -16592,6 +16601,42 @@ mod tests {
             std::fs::read(&external_target).expect("read external lock target"),
             sentinel,
             "rejected lock symlink must not touch its target"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_accepts_canonical_verbatim_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("resumed-verbatim.jsonl");
+        let mut session = Session::create();
+        session.path = Some(path.clone());
+        session.append_message(make_test_message("before resume"));
+        run_async(async { session.save().await }).expect("seed session");
+
+        let canonical = std::fs::canonicalize(&path).expect("canonical session path");
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonicalize should produce a verbatim path: {}",
+            canonical.display()
+        );
+
+        // SDK resume paths are canonicalized before the next save. The lock
+        // walker must not probe the incomplete \\?\D: prefix, but must still
+        // validate the rooted volume and all real descendants.
+        session.path = Some(canonical.clone());
+        session.append_message(make_test_message("after resume"));
+        run_async(async { session.save().await })
+            .expect("saving through a canonical verbatim path must succeed");
+
+        let reopened = run_async(async { Session::open(&canonical.to_string_lossy()).await })
+            .expect("reopen canonical session");
+        assert!(
+            reopened
+                .to_messages_for_current_path()
+                .iter()
+                .any(|message| format!("{message:?}").contains("after resume")),
+            "resumed save must persist the appended message"
         );
     }
 
