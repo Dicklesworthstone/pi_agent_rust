@@ -1844,15 +1844,18 @@ fn reject_windows_session_lock_reparse_components(path: &Path) -> Result<()> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
     let mut current = PathBuf::new();
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         current.push(component.as_os_str());
-        // A Windows Prefix by itself is not a filesystem path. In
-        // particular, canonicalize() returns verbatim paths such as
-        // \\?\D:\\..., whose first accumulated component is \\?\D:.
-        // Probing that prefix returns ERROR_INVALID_FUNCTION. Defer metadata
-        // inspection until RootDir has been appended; the rooted volume/share
-        // and every descendant are still checked for reparse points.
-        if matches!(component, std::path::Component::Prefix(_)) {
+        // A rooted Windows path is not ready to probe until RootDir has been
+        // appended: canonicalize() returns \\?\D:\..., and inspecting the bare
+        // \\?\D: volume fails with ERROR_INVALID_FUNCTION. Only defer prefixes
+        // followed by a root. In a drive-relative path such as D:session.jsonl,
+        // D: denotes that drive's current directory and must still be checked.
+        // The completed root and every descendant retain the reparse checks.
+        if matches!(component, std::path::Component::Prefix(_))
+            && matches!(components.peek(), Some(std::path::Component::RootDir))
+        {
             continue;
         }
         match std::fs::symlink_metadata(&current) {
@@ -16563,18 +16566,31 @@ mod tests {
         mode_guard.restore();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn save_rejects_symlink_persistence_lock_without_touching_target() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("guarded-lock.jsonl");
-        let external_target = temp_dir.path().join("external-lock-target");
+        let root = std::fs::canonicalize(temp_dir.path()).expect("canonical temp dir");
+        let path = root.join("guarded-lock.jsonl");
+        let external_target = root.join("external-lock-target");
         let sentinel = b"external lock target must stay unchanged".as_slice();
         std::fs::write(&external_target, sentinel).expect("write external lock target");
         let lock_path = session_persistence_lock_path(&path);
-        symlink(&external_target, &lock_path).expect("create lock symlink");
+        if let Err(error) = symlink(&external_target, &lock_path) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping lock symlink test: Windows requires Developer Mode or symlink privilege"
+                );
+                return;
+            }
+            test_fail!("create lock symlink: {}", error);
+        }
 
         let mut session = Session::create();
         session.path = Some(path.clone());
@@ -16605,11 +16621,168 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_session_lock_test_roots(path: &Path) -> [PathBuf; 2] {
+        use std::path::{Component, Prefix};
+
+        let canonical = std::fs::canonicalize(path).expect("canonical test root");
+        let mut components = canonical.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            test_fail!("canonical Windows path must have a prefix");
+        };
+        // Only the test fixture needs an ordinary spelling. Production keeps
+        // the original path, including verbatim syntax and long-path support.
+        let mut ordinary = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = std::ffi::OsString::from(r"\\");
+                unc.push(server);
+                unc.push(r"\");
+                unc.push(share);
+                PathBuf::from(unc)
+            }
+            other => test_fail!("expected canonical disk or UNC prefix, got {:?}", other),
+        };
+        for component in components {
+            ordinary.push(component.as_os_str());
+        }
+        [ordinary, canonical]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_accepts_ordinary_and_verbatim_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let nested = temp_dir.path().join("nested directory");
+        std::fs::create_dir(&nested).expect("create nested directory");
+        let roots = windows_session_lock_test_roots(&nested);
+        for (index, root) in roots.iter().enumerate() {
+            let path = root.join(format!("session-会話-{index}.jsonl"));
+            let lock_path = session_persistence_lock_path(&path);
+            assert!(!lock_path.exists());
+            drop(lock_session_persistence(&path).expect("create persistence lock"));
+            assert!(lock_path.is_file());
+
+            let sentinel = b"existing lock contents";
+            std::fs::write(&lock_path, sentinel).expect("write lock sentinel");
+            // Reuse the same lock through the other path spelling too.
+            let other_path = roots[1 - index].join(path.file_name().expect("session filename"));
+            drop(lock_session_persistence(&other_path).expect("reuse persistence lock"));
+            assert_eq!(std::fs::read(&lock_path).expect("read lock"), sentinel);
+            assert!(!path.exists(), "locking alone must not create a session");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_preserves_metadata_errors() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let canonical = std::fs::canonicalize(temp_dir.path()).expect("canonical test root");
+        let mut invalid = canonical
+            .join("invalid-session.jsonl.lock")
+            .into_os_string();
+        invalid.push("\0");
+        let invalid = PathBuf::from(invalid);
+        let expected = std::fs::symlink_metadata(&invalid).expect_err("invalid path must fail");
+        let error = reject_windows_session_lock_reparse_components(&invalid)
+            .expect_err("metadata errors on real entries must propagate");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == expected.kind()
+                    && io_error.raw_os_error() == expected.raw_os_error()),
+            "expected original metadata error {expected}, got {error}"
+        );
+
+        // Without a following RootDir, a prefix must still be inspected.
+        // In particular, the raw verbatim volume's error must not be ignored.
+        if let Some(std::path::Component::Prefix(prefix)) = canonical.components().next()
+            && matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        {
+            let bare_volume = Path::new(prefix.as_os_str());
+            let expected = std::fs::symlink_metadata(bare_volume)
+                .expect_err("a bare verbatim volume is not a directory path");
+            let error = reject_windows_session_lock_reparse_components(bare_volume)
+                .expect_err("a prefix without a root must not bypass metadata inspection");
+            assert!(matches!(&error, Error::Io(io_error)
+                if io_error.raw_os_error() == expected.raw_os_error()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_rejects_junctions_in_ordinary_and_verbatim_paths() {
+        use std::os::windows::fs::MetadataExt as _;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let roots = windows_session_lock_test_roots(temp_dir.path());
+        let target = roots[0].join("target");
+        std::fs::create_dir(&target).expect("create junction target");
+        let sentinel_path = target.join("sentinel");
+        let sentinel = b"junction target must stay unchanged";
+        std::fs::write(&sentinel_path, sentinel).expect("write target sentinel");
+
+        // Junctions exercise FILE_ATTRIBUTE_REPARSE_POINT without requiring
+        // Developer Mode or the privilege needed to create symbolic links.
+        // Constant relative arguments keep temporary paths out of shell syntax.
+        for name in ["junction", "terminal.jsonl.lock"] {
+            let output = std::process::Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J", name, "target"])
+                .current_dir(&roots[0])
+                .output()
+                .expect("run mklink /J");
+            assert!(
+                output.status.success(),
+                "create junction {name}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_ne!(
+                std::fs::symlink_metadata(roots[0].join(name))
+                    .expect("junction metadata")
+                    .file_attributes()
+                    & 0x400,
+                0,
+                "fixture must be a reparse point"
+            );
+        }
+
+        // Canonicalize only the safe root. Canonicalizing the whole path would
+        // resolve away the very junction that the validator must reject.
+        for root in &roots {
+            for path in [
+                root.join(r"junction\session.jsonl"),
+                root.join("terminal.jsonl"),
+            ] {
+                let mut session = Session::create_with_dir(Some(root.clone()));
+                session.path = Some(path.clone());
+                session.append_message(make_test_message("must not persist"));
+                let error = run_async(async { session.save().await })
+                    .expect_err("session persistence must reject junction traversal");
+                assert!(
+                    matches!(&error, Error::Io(io_error)
+                        if io_error.kind() == std::io::ErrorKind::InvalidData),
+                    "expected typed InvalidData error, got {error}"
+                );
+                assert!(error.to_string().contains("Windows reparse point"));
+                assert!(!path.exists(), "rejected save must not create a session");
+                assert_eq!(
+                    std::fs::read(&sentinel_path).expect("read sentinel"),
+                    sentinel
+                );
+                assert_eq!(
+                    std::fs::read_dir(&target).expect("read target").count(),
+                    1,
+                    "rejected save must not create a lock or session in the target"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn save_accepts_canonical_verbatim_session_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("resumed-verbatim.jsonl");
-        let mut session = Session::create();
+        let mut session = Session::create_with_dir(Some(temp_dir.path().to_path_buf()));
         session.path = Some(path.clone());
         session.append_message(make_test_message("before resume"));
         run_async(async { session.save().await }).expect("seed session");
@@ -16621,22 +16794,33 @@ mod tests {
             canonical.display()
         );
 
-        // SDK resume paths are canonicalized before the next save. The lock
-        // walker must not probe the incomplete \\?\D: prefix, but must still
-        // validate the rooted volume and all real descendants.
-        session.path = Some(canonical.clone());
+        let session_id = session.header.id.clone();
+        drop(session);
+        let mut session = run_async(async { Session::open(&canonical.to_string_lossy()).await })
+            .expect("resume through the canonical session path");
+        assert_eq!(session.path.as_deref(), Some(canonical.as_path()));
+        assert_eq!(session.header.id, session_id);
         session.append_message(make_test_message("after resume"));
         run_async(async { session.save().await })
             .expect("saving through a canonical verbatim path must succeed");
+        assert_eq!(session.appends_since_checkpoint, 1);
+
+        session.set_model_header(Some("resumed-provider".to_string()), None, None);
+        run_async(async { session.save().await }).expect("rewrite through a verbatim path");
+        assert_eq!(session.appends_since_checkpoint, 0);
 
         let reopened = run_async(async { Session::open(&canonical.to_string_lossy()).await })
             .expect("reopen canonical session");
-        assert!(
-            reopened
-                .to_messages_for_current_path()
-                .iter()
-                .any(|message| format!("{message:?}").contains("after resume")),
-            "resumed save must persist the appended message"
+        assert_eq!(reopened.header.id, session_id);
+        assert_eq!(
+            reopened.header.provider.as_deref(),
+            Some("resumed-provider")
+        );
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path())
+                .expect("reopened messages"),
+            serde_json::to_value(session.to_messages_for_current_path()).expect("saved messages"),
         );
     }
 
