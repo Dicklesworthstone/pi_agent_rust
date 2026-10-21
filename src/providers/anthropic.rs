@@ -1099,15 +1099,24 @@ where
             }
             Some(ContentBlock::ToolCall(tc)) => {
                 if let Some(accum) = self.tool_accums.remove(&index) {
-                    let arguments: serde_json::Value = match serde_json::from_str(&accum.json) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %accum.json,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
+                    // Final tool arguments are execution authority. Validate
+                    // the original JSON before Value can erase duplicate keys.
+                    // Empty input remains a sentinel so the transport can
+                    // distinguish "no deltas" from an observed empty fragment.
+                    let arguments = if accum.json.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        match super::openai::parse_final_tool_arguments(&accum.json) {
+                            Ok(arguments) => arguments,
+                            Err(reason) => {
+                                // Arguments may contain credentials, commands,
+                                // or file contents; never echo them in logs.
+                                tracing::warn!(
+                                    reason,
+                                    "Rejected invalid or ambiguous tool arguments"
+                                );
+                                serde_json::Value::Null
+                            }
                         }
                     };
                     let tool_call = ToolCall {

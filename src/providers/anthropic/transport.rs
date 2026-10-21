@@ -275,10 +275,12 @@ impl StreamLifecycle {
                         "tool call has an empty or duplicate identity",
                     ));
                 }
-                // Only tool starts need the original input object. Token deltas
-                // are decoded once, by the existing parser, with no extra parse.
-                let wire: Value = serde_json::from_str(raw)
-                    .map_err(|_| protocol_error("invalid tool start JSON"))?;
+                // Only tool starts need the original input object. Validate
+                // the original frame before a Value can erase duplicate keys,
+                // including duplicate or escaped-equivalent input fields.
+                // Token deltas keep their existing single-decode hot path.
+                let wire = super::super::openai::parse_final_tool_arguments(raw)
+                    .map_err(|_| protocol_error("invalid or ambiguous tool start JSON"))?;
                 let input = wire
                     .get("content_block")
                     .and_then(|block| block.get("input"))
@@ -708,6 +710,119 @@ mod tests {
                 .any(|event| matches!(event, Ok(StreamEvent::Done { .. }))),
             "{events:?}"
         );
+    }
+
+    fn collect_raw_wire(
+        events: impl IntoIterator<Item = String>,
+        api: &str,
+        provider: &str,
+    ) -> Vec<Result<StreamEvent>> {
+        let chunks: Vec<_> = events
+            .into_iter()
+            .map(|event| Ok::<_, std::io::Error>(format!("data: {event}\n\n").into_bytes()))
+            .collect();
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(
+                wire_stream(
+                    stream::iter(chunks),
+                    "claude-test".to_string(),
+                    api.to_string(),
+                    provider.to_string(),
+                )
+                .collect(),
+            )
+    }
+
+    #[test]
+    fn duplicate_streamed_tool_inputs_are_terminal_on_native_and_vertex() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            for raw in [
+                r#"{"path":"first","path":"second"}"#,
+                r#"{"path":"first","pa\u0074h":"second"}"#,
+                r#"{"nested":{"x":1,"x":2}}"#,
+            ] {
+                let events = collect_wire_for_api(
+                    [
+                        start(),
+                        tool_start(0, "call-a", &json!({})),
+                        tool_delta(0, raw),
+                        stop(0),
+                    ]
+                    .into_iter()
+                    .chain(finish()),
+                    api,
+                    provider,
+                );
+                assert_terminal_error(&events);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_initial_tool_input_is_rejected_before_tool_start_publication() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            for input in [
+                r#"{"path":"first","path":"second"}"#,
+                r#"{"path":"first","pa\u0074h":"second"}"#,
+            ] {
+                let raw = format!(
+                    r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"call-a","name":"read","input":{input}}}}}"#
+                );
+                let mut frames = vec![start().to_string(), raw, stop(0).to_string()];
+                frames.extend(finish().map(|event| event.to_string()));
+                let events = collect_raw_wire(frames, api, provider);
+                assert_terminal_error(&events);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Ok(StreamEvent::ToolCallStart { .. })))
+                );
+                let diagnostic = events.last().unwrap().as_ref().unwrap_err().to_string();
+                assert!(diagnostic.contains("ambiguous tool start JSON"));
+                assert!(!diagnostic.contains("first"));
+                assert!(!diagnostic.contains("second"));
+            }
+        }
+    }
+
+    #[test]
+    fn observed_empty_argument_delta_does_not_fall_back_to_initial_input() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            let events = collect_wire_for_api(
+                [
+                    start(),
+                    tool_start(0, "call-a", &json!({"path":"initial.txt"})),
+                    tool_delta(0, "   "),
+                    stop(0),
+                ]
+                .into_iter()
+                .chain(finish()),
+                api,
+                provider,
+            );
+            assert_terminal_error(&events);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+            );
+        }
     }
 
     #[test]
