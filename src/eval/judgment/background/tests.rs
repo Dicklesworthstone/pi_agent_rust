@@ -77,6 +77,7 @@ impl Drop for Reply {
 
 struct Fixture {
     gate: Arc<Gate>,
+    gates: Mutex<VecDeque<Arc<Gate>>>,
     replies: Mutex<VecDeque<String>>,
     calls: AtomicUsize,
     contents: Mutex<Vec<UserContent>>,
@@ -88,10 +89,27 @@ impl Fixture {
         gate.open.store(open, Ordering::Release);
         Arc::new(Self {
             gate,
+            gates: Mutex::new(VecDeque::new()),
             replies: Mutex::new(replies.iter().map(|text| (*text).to_owned()).collect()),
             calls: AtomicUsize::new(0),
             contents: Mutex::new(Vec::new()),
         })
+    }
+
+    fn queue_gates(&self, states: &[bool]) -> Vec<Arc<Gate>> {
+        let gates: Vec<_> = states
+            .iter()
+            .map(|open| {
+                let gate = Arc::new(Gate::default());
+                gate.open.store(*open, Ordering::Release);
+                gate
+            })
+            .collect();
+        self.gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(gates.iter().cloned());
+        gates
     }
 }
 
@@ -134,8 +152,14 @@ impl Provider for Fixture {
         };
         message.usage.input = 11;
         message.usage.output = 3;
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| Arc::clone(&self.gate));
         Ok(Box::pin(Reply {
-            gate: Arc::clone(&self.gate),
+            gate,
             message: Some(message),
         }))
     }
@@ -664,6 +688,7 @@ mod legacy {
                 0,
                 privacy(),
                 Instant::now(),
+                None,
             ))
             .unwrap_err();
         assert!(error.to_string().contains("PI_COMPLETION_TIMEOUT"));
@@ -939,6 +964,50 @@ fn acknowledgment(text: String) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
+fn partial_details(job: &crate::jobs::JobSnapshot) -> Result<Value> {
+    job.result
+        .as_ref()
+        .and_then(|result| result.details.as_ref())
+        .and_then(|details| details.pointer("/partialResult/details"))
+        .cloned()
+        .ok_or_else(|| Error::tool("fixture", "missing native batch progress"))
+}
+
+async fn batch_observation(
+    harness: &Harness,
+    ack: &Value,
+    completed: u64,
+    running: u64,
+) -> Result<crate::jobs::JobSnapshot> {
+    let id = ack
+        .get("jobId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::tool("fixture", "missing job id"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let job = crate::jobs::wait_async(&harness.host.owner, id, Duration::ZERO).await?;
+        if job.status != "running" {
+            return Err(Error::tool(
+                "fixture",
+                "batch settled before expected progress",
+            ));
+        }
+        if let Ok(partial) = partial_details(&job)
+            && partial.get("completed").and_then(Value::as_u64) == Some(completed)
+            && partial.get("running").and_then(Value::as_u64) == Some(running)
+        {
+            return Ok(job);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::tool(
+                "fixture",
+                "expected batch progress was never published",
+            ));
+        }
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+}
+
 #[test]
 fn all_three_native_starts_keep_typed_results_and_session_ownership() -> Result<()> {
     let _serial = crate::jobs::process_test_guard();
@@ -1209,6 +1278,127 @@ fn cancellation_drops_active_streams_and_never_dispatches_queued_items() -> Resu
         assert_eq!(harness.provider.gate.dropped.load(Ordering::Acquire), 2); // ubs:ignore -- Both retained provider streams must be dropped before settled cancellation.
         Ok(())
     })
+}
+
+#[test]
+fn cancellation_retains_finished_items_errors_and_pending_identity() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(
+        &[r#"{"q":0.9}"#, "invalid model result", r#"{"q":0.1}"#],
+        false,
+    )?;
+    let gates = harness.provider.queue_gates(&[true, true, false]);
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch, json!({
+            "states":["first","second","third","fourth"], "questions":questions(), "concurrency":1,
+        })).await.map_err(bridge_error)?)?;
+        let running = batch_observation(&harness, &ack, 2, 1).await?;
+        started(&harness, 3).await?;
+        let partial = partial_details(&running)?;
+        assert_eq!(running.result.as_ref().and_then(|result| result.details.as_ref()).and_then(|details| details.get("schema")), Some(&json!("pi.host_job.progress.v1"))); // ubs:ignore -- Running observations use the explicit nonterminal native wrapper.
+        assert_eq!(partial["schema"], PROGRESS_SCHEMA); // ubs:ignore -- Typed progress has an independent schema, never the final result schema.
+        assert_eq!(partial["complete"], false); // ubs:ignore -- An observation with pending work cannot claim a completed batch.
+        assert_eq!((partial["total"].as_u64(), partial["succeeded"].as_u64(), partial["failed"].as_u64(), partial["queued"].as_u64()), (Some(4), Some(1), Some(1), Some(1))); // ubs:ignore -- Failed items count as finished without converting pending items into results.
+        assert_eq!(partial.pointer("/items/0/verdict/answers/q/bool"), Some(&json!(0.9))); // ubs:ignore -- A completed peer's typed verdict must be available before the batch settles.
+        assert_eq!(partial.pointer("/items/1/status"), Some(&json!("failed"))); // ubs:ignore -- Per-item failures remain inspectable alongside successful peers.
+        assert!(partial.pointer("/items/1/error").and_then(Value::as_str).is_some_and(|error| error.contains("PI_JUDGE_RESPONSE"))); // ubs:ignore -- Failed progress exposes only the native sanitized error.
+        for (index, status) in [(2, "running"), (3, "queued")] {
+            let item = &partial["items"][index];
+            assert_eq!(item["key"], index); // ubs:ignore -- Pending items retain their original typed array identity.
+            assert_eq!(item["status"], status); // ubs:ignore -- Running and undispatched work remain distinguishable.
+            assert!(item.get("verdict").is_none() && item.get("error").is_none()); // ubs:ignore -- Pending rows cannot fabricate completed or failed evidence.
+        }
+        assert_eq!(partial.pointer("/judgments/attempts").and_then(Value::as_array).map(Vec::len), Some(4)); // ubs:ignore -- Every reserved attempt has a native receipt, including pending items.
+        assert_eq!(partial.pointer("/judgments/attempts/0/usageKnown"), Some(&json!(true))); // ubs:ignore -- Finished usage survives interruption.
+        assert_eq!(partial.pointer("/judgments/attempts/2/usageKnown"), Some(&json!(false))); // ubs:ignore -- A running provider's unknown usage must not be fabricated.
+        let id = ack["jobId"].as_str().ok_or_else(stopped)?;
+        let cancelled = crate::jobs::cancel_async(&harness.host.owner, id).await?;
+        assert_eq!(cancelled.status, "killed"); // ubs:ignore -- Cancellation remains authoritative despite retained peer results.
+        assert!(cancelled.result.as_ref().is_some_and(|result| result.is_error)); // ubs:ignore -- An interrupted partial is a terminal error, never a successful aggregate.
+        assert_eq!(cancelled.result.as_ref().and_then(|result| result.details.as_ref()).and_then(|details| details.get("schema")), Some(&json!("pi.host_job.interrupted.v1"))); // ubs:ignore -- Interrupted work has an explicit wrapper distinct from both running and final results.
+        assert_eq!(partial_details(&cancelled)?, partial); // ubs:ignore -- Cancellation keeps exactly the last accepted observation without inventing results.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 3); // ubs:ignore -- The queued fourth request must never reach the provider after cancellation.
+        assert_eq!(gates[2].dropped.load(Ordering::Acquire), 1); // ubs:ignore -- The active provider stream must be retired before cancelled completion is visible.
+        assert!(!serde_json::to_string(&cancelled)?.contains("invalid model result")); // ubs:ignore -- Raw rejected provider text must not enter retained progress.
+        Ok(())
+    })
+}
+
+#[test]
+fn original_timeout_retains_the_last_batch_observation_without_starting_queued_work() -> Result<()>
+{
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&[r#"{"q":0.25}"#, r#"{"q":0.75}"#], false)?;
+    let gates = harness.provider.queue_gates(&[true, false]);
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch, json!({
+            "states":["first","second","third"], "questions":questions(), "concurrency":1, "timeout_secs":2,
+        })).await.map_err(bridge_error)?)?;
+        let running = batch_observation(&harness, &ack, 1, 1).await?;
+        started(&harness, 2).await?;
+        let partial = partial_details(&running)?;
+        let timed_out = harness.settle(&ack).await?;
+        assert_eq!(timed_out.status, "timedOut"); // ubs:ignore -- The original absolute deadline must settle as native timeout even when the inner guard wins its poll.
+        assert_eq!(partial_details(&timed_out)?, partial); // ubs:ignore -- Timeout retains the last screened evidence without treating pending work as failed judgments.
+        assert_eq!(partial["complete"], false); // ubs:ignore -- Retained evidence from a timeout remains explicitly incomplete.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Observation and deadline expiry cannot dispatch the queued third item.
+        assert_eq!(gates[1].dropped.load(Ordering::Acquire), 1); // ubs:ignore -- Timeout drops the active stream before publishing the interrupted result.
+        Ok(())
+    })
+}
+
+#[test]
+fn progress_and_final_privacy_failures_withdraw_earlier_batch_snapshots() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    for (pattern, second) in [
+        (r"^0[.]875$", r#"{"q":0.875}"#),
+        (r"^pi[.]eval[.]model-job[.]result[.]v1$", r#"{"q":0.75}"#),
+    ] {
+        let harness = Harness::new(&[r#"{"q":0.25}"#, second], false)?;
+        let gates = harness.provider.queue_gates(&[true, false]);
+        let snapshot = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(
+            Some(&crate::secrets::SecretsSettings {
+                mode: Some("obfuscate".into()),
+                extra_patterns: Some(vec![pattern.into()]),
+                ..Default::default()
+            }),
+        ));
+        runtime().block_on(async {
+            let factory = || snapshot.clone();
+            let mut invocation = harness.invocation(&factory)?;
+            let ack = acknowledgment(
+                invocation
+                    .start_background(
+                        &harness.tool,
+                        Operation::Batch,
+                        json!({
+                            "states":["first","second"], "questions":questions(), "concurrency":1,
+                        }),
+                    )
+                    .await
+                    .map_err(bridge_error)?,
+            )?;
+            let running = batch_observation(&harness, &ack, 1, 1).await?;
+            assert_eq!(
+                partial_details(&running)?.pointer("/items/0/verdict/answers/q/bool"),
+                Some(&json!(0.25))
+            ); // ubs:ignore -- The fixture must first publish real completed evidence before testing its withdrawal.
+            gates[1].release();
+            let failed = harness.settle(&ack).await?;
+            assert_eq!(failed.status, "failed"); // ubs:ignore -- Changing typed evidence or final native identity is a task failure.
+            let encoded = serde_json::to_string(&failed)?;
+            assert!(encoded.contains("PI_MODEL_JOB_RESULT_PRIVACY")); // ubs:ignore -- Privacy refusal must remain explicit after withdrawing prior progress.
+            assert!(!encoded.contains("partialResult")); // ubs:ignore -- Neither progress-projection nor final-projection failure may retain an older partial.
+            assert!(!encoded.contains("0.875")); // ubs:ignore -- A rejected secret-bearing probability cannot enter retained output.
+            assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Privacy refusal must not retry or fabricate additional model work.
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]

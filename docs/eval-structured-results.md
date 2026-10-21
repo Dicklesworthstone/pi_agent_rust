@@ -166,9 +166,10 @@ privacy screening does not redact pixels or perform OCR.
 | Handle operation | Behavior |
 |---|---|
 | `id`, `jobId` / `job_id`, `operation` | Native job identity and immutable operation kind in JavaScript; read-only public properties in Python |
-| `status()` | Current native job snapshot, including `status` and any final result |
+| `status()` | Current native job snapshot, including `status` and any published result or batch progress |
 | `done()` | Whether native status has settled |
-| `output()` | Final native `ToolOutput`, with model provenance, usage and attempt receipts, or null/None while running |
+| `output()` | Latest native `ToolOutput`, including batch progress or preserved interruption evidence, or null/None before any output exists |
+| `progress()` | Batch handles only: ordered item states, counts, attempt receipts and `jobStatus`, or null/None when no valid progress was retained |
 | `wait(timeout)` | Wait up to the given seconds, then return the typed value above; default 30 seconds |
 | `wait(timeout, false)` / `wait(timeout, raise_errors=False)` | Preserve a completed mixed batch, or return the native failure output when no typed payload exists |
 | `cancel()` | Cancel through the current cell's `jobs` authority and return the native snapshot |
@@ -181,6 +182,30 @@ A wait that expires while the job is still running raises `TimeoutError` and
 leaves the job running. Repeated waits observe the same job and do not repeat
 provider work. Global `wait()` preserves input order, accepts these handles
 alongside existing agent/turn/pool-item handles, and uses one shared timeout.
+
+For a retained batch, `await review.progress()` observes all original items in
+input order. Each item has its original `key` and a `status` of `queued`,
+`running`, `completed` or `failed`. Only completed items carry a typed `verdict`;
+failed items carry a sanitized `error`. The view includes `total`, `completed`,
+`succeeded`, `failed`, `queued`, `running` and native `judgments` receipts.
+Observations do not consume items and can be repeated after attaching by job ID.
+
+The view's `jobStatus` comes from the same native snapshot as its evidence.
+`complete: true` means a final aggregate exists, including a mixed-success
+aggregate; inspect `failed` before treating the whole batch as successful.
+Cancellation and task timeout preserve the most recent screened progress with
+`complete: false` and `jobStatus: 'killed'` or `'timedOut'`. Pending counts in
+that retained view describe the last update; the outer job has stopped.
+A missing first update or failure without preserved progress returns null/None.
+A running batch still raises `TimeoutError` when its wait expires, even if some
+items already have verdicts. Non-raising waits on an interrupted batch return
+the full native failure output with its retained evidence.
+
+Native running output wraps the partial `ToolOutput` in
+`pi.host_job.progress.v1`; cancellation and timeout use
+`pi.host_job.interrupted.v1`. Both carry `partialResult`, whose details have
+schema `pi.eval.model-job.progress.v1`. `progress()` projects that inner view
+and adds `jobStatus`; `status()` and `output()` keep the complete native wrappers.
 
 After a kernel reset, recover a job ID from `jobs {action: 'list'}` and attach:
 
@@ -205,9 +230,10 @@ automatically retried: inspect `jobs list` before explicitly starting again.
 The helpers use [native retained model jobs](judgment.md#retained-background-model-jobs),
 including the shared 16-attempt cell budget, 1–16-item batches, concurrency up
 to eight, bounded task timeouts, final-result limits and ordinary job retention.
-They expose final aggregates rather than incremental drains. If output privacy
-would change a typed answer or schema-validated data, the native job fails
-without retaining a misleading structured success.
+Batch progress is a bounded snapshot of all items; cursor-based drains remain
+separate work. If output privacy would change a typed answer or schema-validated
+data, the native job fails without retaining a misleading structured success.
+Progress and final outputs pass through the current host's read policy.
 
 The completion helper uses `__pi_model_complete_start`, with the uniform
 `pi.eval.model-job.v1` acknowledgment and `pi.eval.model-job.result.v1` final

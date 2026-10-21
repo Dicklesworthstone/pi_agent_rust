@@ -38,7 +38,10 @@ use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
 
 mod host_task;
-pub(crate) use host_task::{admit_owned_task, spawn_owned_task, with_owned_task_progress};
+pub(crate) use host_task::{
+    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress,
+    spawn_owned_task, with_owned_task_progress,
+};
 
 /// Future returned by the live session-identity resolver shared by the jobs
 /// tools and their completion-notice fetcher.
@@ -2704,7 +2707,9 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
         .filter_map(|job| job.settled_sequence.map(|sequence| (sequence, job.id.clone(), job.result_bytes)))
         .collect();
     task_results.sort();
-    let mut retained_bytes = task_results.iter().fold(0usize, |total, (_, _, bytes)| total.saturating_add(*bytes));
+    // Live progress shares this budget. Only older settled entries are evicted;
+    // a live task's latest observation must remain available to its owner.
+    let mut retained_bytes = reg.jobs.values().fold(0usize, |total, job| total.saturating_add(job.result_bytes));
     for (_, id, bytes) in task_results {
         if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES { break; }
         reg.jobs.remove(&id);
@@ -3704,7 +3709,7 @@ mod tests {
         dir
     }
 
-    fn synthetic_entry(
+    pub(super) fn synthetic_entry(
         id: &str,
         artifact_path: PathBuf,
         sequence: u64,

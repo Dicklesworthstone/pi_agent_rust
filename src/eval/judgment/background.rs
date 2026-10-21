@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 const ACK_SCHEMA: &str = "pi.eval.model-job.v1";
 const RESULT_SCHEMA: &str = "pi.eval.model-job.result.v1";
+const PROGRESS_SCHEMA: &str = "pi.eval.model-job.progress.v1";
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 // Leave room for receipts and the native ToolOutput envelope under jobs' 1 MiB.
 const MAX_RESULT_BYTES: usize = 768 * 1024;
@@ -304,9 +305,9 @@ impl Invocation<'_> {
         let owner = AgentCx::for_current_or_request();
         let deadline = Instant::now() + timeout;
         checkpoint(&owner, deadline).map_err(|error| error.to_string())?;
-        let admission = crate::jobs::admit_owned_task(&owner_id).map_err(|_| {
-            "PI_MODEL_JOB_STOPPED: session cannot admit background work".to_string()
-        })?;
+        let admission = crate::jobs::admit_owned_task(&owner_id)
+            .map_err(|_| "PI_MODEL_JOB_STOPPED: session cannot admit background work".to_string())?
+            .with_deadline(deadline);
         let base = self.receipts.len();
         for index in 0..count {
             self.receipts.push(json!({
@@ -366,7 +367,7 @@ impl Invocation<'_> {
                 "PI_MODEL_JOB_SESSION_CHANGED: owner changed before launch".to_string()
             })?;
             checkpoint(&owner, deadline).map_err(|error| error.to_string())?;
-            let (start_tx, start_rx) = oneshot::channel::<()>();
+            let (start_tx, start_rx) = oneshot::channel::<JobProgress>();
             let result_privacy = privacy.clone();
             let job = crate::jobs::spawn_owned_task(
                 admission,
@@ -378,9 +379,16 @@ impl Invocation<'_> {
                 async move {
                     // Dropping the launching cell before a screened ACK closes
                     // the gate. No provider request can escape that admission.
-                    start_rx.await.map_err(|_| stopped())?;
+                    let progress = start_rx.await.map_err(|_| stopped())?;
                     prepared
-                        .run(judge, operation, base, result_privacy, deadline)
+                        .run(
+                            judge,
+                            operation,
+                            base,
+                            result_privacy,
+                            deadline,
+                            Some(progress),
+                        )
                         .await
                 },
             )
@@ -423,7 +431,12 @@ impl Invocation<'_> {
             })?;
             checkpoint(&owner, deadline).map_err(|error| error.to_string())?;
             crate::jobs::with_owned_task_progress(&owner_id, &job.id, || {
-                start_tx.send(()).map_err(|_| stopped())?;
+                start_tx
+                    .send(JobProgress {
+                        owner: owner_id.clone(),
+                        id: job.id.clone(),
+                    })
+                    .map_err(|_| stopped())?;
                 Ok(((), None))
             })
             .map_err(|_| {
@@ -576,6 +589,14 @@ fn output(
         details: Some(details),
         is_error: failed,
     };
+    screen_output(operation, output, privacy)
+}
+
+fn screen_output(
+    operation: Operation,
+    output: ToolOutput,
+    privacy: &AuxiliaryPrivacySnapshot,
+) -> Result<ToolOutput> {
     // Project the complete aggregate, not independent items: a late provider
     // assignment must protect an earlier bare echo. Privacy cannot silently
     // mutate typed data, answer probabilities, keys, receipts or identity and
@@ -611,6 +632,180 @@ fn output(
     serde_json::from_value(projected).map_err(|_| privacy_error())
 }
 
+/// An owned identity, not a host capability. All mutations still enter the
+/// jobs registry's current owner/cancellation fence.
+struct JobProgress {
+    owner: String,
+    id: String,
+}
+
+impl JobProgress {
+    /// A later aggregate can invalidate an earlier screened observation. Clear
+    /// synchronously before returning the failure, even if cancellation has
+    /// raced it; terminal conversion must not preserve stale typed evidence.
+    fn screened<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            let _ = crate::jobs::clear_owned_task_progress(&self.owner, &self.id);
+        }
+        result
+    }
+
+    fn publish(&self, batch: &BatchProgress, privacy: &AuxiliaryPrivacySnapshot) -> Result<()> {
+        let partial = self.screened(batch.output(privacy))?;
+        // A cancellation refusal keeps the last accepted observation. The
+        // publisher separately withdraws progress if its own screening fails.
+        crate::jobs::publish_owned_task_progress(&self.owner, &self.id, partial, privacy)
+    }
+}
+
+enum BatchItem {
+    Queued(Value),
+    Running(Value),
+    Completed { key: Value, verdict: Value },
+    Failed { key: Value, error: String },
+}
+
+struct BatchProgress {
+    items: Vec<BatchItem>,
+    receipts: Vec<Value>,
+    base: usize,
+}
+
+impl BatchProgress {
+    fn new(items: &[(Value, PreparedJudgment)], base: usize) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(|(key, _)| BatchItem::Queued(key.clone()))
+                .collect(),
+            receipts: (0..items.len())
+                .map(|index| {
+                    json!({
+                        "attempt":base + index + 1, "operation":"judgment", "status":"queued",
+                        "usage":null, "usageKnown":false,
+                    })
+                })
+                .collect(),
+            base,
+        }
+    }
+
+    fn running(&mut self, index: usize) -> Result<()> {
+        let receipt = self
+            .receipts
+            .get_mut(index)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(stopped)?;
+        let item = self.items.get_mut(index).ok_or_else(stopped)?;
+        let BatchItem::Queued(key) = item else {
+            return Err(stopped());
+        };
+        *item = BatchItem::Running(key.clone());
+        receipt.insert("status".into(), json!("running"));
+        Ok(())
+    }
+
+    fn completed(&mut self, index: usize, key: Value, outcome: Result<Value>) -> Result<()> {
+        let item = self.items.get_mut(index).ok_or_else(stopped)?;
+        if !matches!(item, BatchItem::Running(expected) if *expected == key) {
+            return Err(stopped());
+        }
+        *self.receipts.get_mut(index).ok_or_else(stopped)? =
+            attempt(self.base + index, Operation::Judgment, &outcome);
+        *item = match outcome {
+            Ok(verdict) => BatchItem::Completed { key, verdict },
+            Err(error) => BatchItem::Failed {
+                key,
+                error: public_error(error),
+            },
+        };
+        Ok(())
+    }
+
+    fn output(&self, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
+        let mut succeeded = 0_usize;
+        let mut failed = 0_usize;
+        let mut queued = 0_usize;
+        let mut running = 0_usize;
+        let items: Vec<Value> = self
+            .items
+            .iter()
+            .map(|item| match item {
+                BatchItem::Queued(key) => {
+                    queued += 1;
+                    json!({"key":key,"status":"queued"})
+                }
+                BatchItem::Running(key) => {
+                    running += 1;
+                    json!({"key":key,"status":"running"})
+                }
+                BatchItem::Completed { key, verdict } => {
+                    succeeded += 1;
+                    json!({"key":key,"status":"completed","verdict":verdict})
+                }
+                BatchItem::Failed { key, error } => {
+                    failed += 1;
+                    json!({"key":key,"status":"failed","error":error})
+                }
+            })
+            .collect();
+        let details = json!({
+            "schema":PROGRESS_SCHEMA, "operation":"judgment_batch", "complete":false,
+            "total":items.len(), "completed":succeeded + failed,
+            "succeeded":succeeded, "failed":failed, "queued":queued, "running":running,
+            "items":items,
+            "judgments":{"schema":"pi.eval.judgments.v1","attempts":self.receipts},
+        });
+        batch::encoded_size(&details, MAX_RESULT_BYTES).map_err(|_| {
+            Error::tool(
+                "eval",
+                "PI_MODEL_JOB_OUTPUT_LIMIT: batch progress exceeds 768 KiB",
+            )
+        })?;
+        screen_output(
+            Operation::Batch,
+            ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Background judgment batch progress: {} of {} items finished.",
+                    succeeded + failed,
+                    self.items.len(),
+                )))],
+                details: Some(details),
+                is_error: false,
+            },
+            privacy,
+        )
+    }
+
+    fn finish(self, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
+        let count = self.items.len();
+        let mut succeeded = 0_usize;
+        let mut results = Vec::with_capacity(count);
+        for item in self.items {
+            results.push(match item {
+                BatchItem::Completed { key, verdict } => {
+                    succeeded += 1;
+                    json!({"key":key,"ok":true,"verdict":verdict})
+                }
+                BatchItem::Failed { key, error } => json!({"key":key,"ok":false,"error":error}),
+                BatchItem::Queued(_) | BatchItem::Running(_) => return Err(stopped()),
+            });
+        }
+        output(
+            Operation::Batch,
+            json!({
+                "schema":"pi.eval.judgment-batch.v1", "batch":self.base + 1,
+                "total":count, "succeeded":succeeded, "failed":count - succeeded,
+                "allOk":succeeded == count, "items":results,
+            }),
+            self.receipts,
+            None,
+            succeeded != count,
+            privacy,
+        )
+    }
+}
+
 impl Prepared {
     async fn run(
         self,
@@ -619,6 +814,7 @@ impl Prepared {
         base: usize,
         privacy: AuxiliaryPrivacySnapshot,
         deadline: Instant,
+        progress: Option<JobProgress>,
     ) -> Result<ToolOutput> {
         let owner = AgentCx::for_current_or_request();
         let check = || {
@@ -628,7 +824,7 @@ impl Prepared {
         check()?;
         let result = crate::text_completion::with_timeout(
             deadline.saturating_duration_since(Instant::now()),
-            self.run_prepared(judge, operation, base, privacy),
+            self.run_prepared(judge, operation, base, privacy, progress),
         )
         .await
         .map_err(|stop| {
@@ -649,6 +845,7 @@ impl Prepared {
         operation: Operation,
         base: usize,
         privacy: AuxiliaryPrivacySnapshot,
+        progress: Option<JobProgress>,
     ) -> Result<ToolOutput> {
         match self {
             Self::Completion(prepared) => {
@@ -682,19 +879,21 @@ impl Prepared {
                 }
             }
             Self::Batch(items, concurrency) => {
-                let count = items.len();
+                let progress = progress.ok_or_else(stopped)?;
+                let mut batch = BatchProgress::new(&items, base);
+                progress.publish(&batch, &privacy)?;
                 let owner = AgentCx::for_current_or_request();
                 let mut waiting = items.into_iter().enumerate();
                 let mut active = FuturesUnordered::new();
-                let mut results = vec![Value::Null; count];
-                let mut receipts = vec![Value::Null; count];
-                let mut succeeded = 0_usize;
                 loop {
                     owner.checkpoint().map_err(|_| stopped())?;
+                    let mut admitted = false;
                     while active.len() < concurrency {
                         let Some((index, (key, request))) = waiting.next() else {
                             break;
                         };
+                        progress.screened(batch.running(index))?;
+                        admitted = true;
                         let judge = judge.clone();
                         let item_owner = owner.clone();
                         active.push(async move {
@@ -704,32 +903,20 @@ impl Prepared {
                             (index, key, result)
                         });
                     }
+                    if admitted {
+                        // Futures have been queued but not polled. Publish the
+                        // bounded wave before its first provider dispatch.
+                        progress.publish(&batch, &privacy)?;
+                    }
                     let Some((index, key, outcome)) = active.next().await else {
                         break;
                     };
-                    let receipt = attempt(base + index, Operation::Judgment, &outcome);
-                    let result = match outcome {
-                        Ok(value) => {
-                            succeeded += 1;
-                            json!({"key":key,"ok":true,"verdict":value})
-                        }
-                        Err(error) => json!({"key":key,"ok":false,"error":public_error(error)}),
-                    };
-                    *results.get_mut(index).ok_or_else(stopped)? = result;
-                    *receipts.get_mut(index).ok_or_else(stopped)? = receipt;
+                    progress.screened(batch.completed(index, key, outcome))?;
+                    // Commit each complete aggregate before replenishing the
+                    // queue; cancellation retains only accepted observations.
+                    progress.publish(&batch, &privacy)?;
                 }
-                output(
-                    operation,
-                    json!({
-                        "schema":"pi.eval.judgment-batch.v1", "batch":base + 1,
-                        "total":count, "succeeded":succeeded, "failed":count - succeeded,
-                        "allOk":succeeded == count, "items":results,
-                    }),
-                    receipts,
-                    None,
-                    succeeded != count,
-                    &privacy,
-                )
+                progress.screened(batch.finish(&privacy))
             }
         }
     }

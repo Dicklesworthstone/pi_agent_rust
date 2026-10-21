@@ -700,10 +700,14 @@ impl Tool for EvalTool {
          answers; batch wait returns the aggregate. Mixed global wait accepts \
          these handles too. Use output() or wait(timeout,false) in JS / \
          wait(timeout,raise_errors=False) in Python to inspect failures. \
+         Batch handles also provide progress(): ordered completed verdicts, \
+         per-item errors, queued/running states and counts. Cancellation or \
+         task timeout retains the last screened progress with complete=false; \
+         it never turns unfinished items into verdicts or retries them. \
          completion.attach(id), judge.attach(id) and judgeBatch.attach(id) / \
          judge_batch.attach(id) recover known native jobs after reset. JS options \
          use maxTokens/timeoutSeconds; Python uses max_tokens/timeout_seconds. \
-         No helper model tiers, retries, minOk or incremental drains. The native \
+         No helper model tiers, retries, minOk or consuming result drains. The native \
          bridge for explicitly retained work is available through tool.call: \
          call __pi_model_complete_start, __pi_judge_start or __pi_judge_batch_start with \
          the same fields and optional timeout_secs (1-600; default 60 for single \
@@ -713,7 +717,10 @@ impl Tool for EvalTool {
          acknowledgment contains jobId, operation and timeoutSeconds. Use jobs \
          wait/cancel with jobId; completed results and attempt receipts are in \
          the job's result.details. A mixed failed batch keeps ordered peer \
-         results with allOk=false. Accepted jobs retain their selected model, \
+         results with allOk=false. Running batches expose explicit progress \
+         wrappers; interrupted batches retain accepted partial evidence under \
+         an error wrapper, separate from the final model-result schema. \
+         Accepted jobs retain their selected model, \
          prepared inputs and fixed deadline across cell completion or kernel \
          reset; they never retain a tool host or replay failed work. Native \
          attempt/usage receipts are included in result details. The separate \

@@ -41,9 +41,11 @@ provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
 later-cell waits, cancellation and attachment by job ID after a reset. They use
 the launching cell's explicit native `judge_model` binding. Completions and
 judgments accept image evidence through the current host's read policy, and
-completion images can be combined with a validated output schema. OMP model tiers,
-retries, incremental batch drains and automatic backgrounding of arbitrary eval
-code remain separate work; unknown helper options fail explicitly.
+completion images can be combined with a validated output schema. Batch
+`progress()` retains ordered per-item states and finished verdicts across cells,
+including the last valid progress after cancellation or task timeout. OMP model
+tiers, retries, cursor-based batch drains and automatic backgrounding of arbitrary
+eval code remain separate work; unknown helper options fail explicitly.
 The typed `completion()` helper uses the uniform model-job bridge
 `__pi_model_complete_start`. The existing raw `__pi_complete_start` contract
 remains available through `tool.call`, with its own acknowledgment and direct

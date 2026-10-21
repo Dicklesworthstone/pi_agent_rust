@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TASK_SCHEMA: &str = "pi.host_job.v1";
+const PROGRESS_SCHEMA: &str = "pi.host_job.progress.v1";
+const INTERRUPTED_SCHEMA: &str = "pi.host_job.interrupted.v1";
 const MAX_TASK_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_TASK_LABEL_BYTES: usize = 256;
 const TASK_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -30,13 +32,23 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Retain the owner's shutdown generation across asynchronous preflight. A
 /// caller must resolve its live session again after taking this token; if it
 /// changed, dropping the token abandons admission without starting any work.
-pub(crate) struct TaskAdmission(super::SessionSpawnAttempt);
+pub(crate) struct TaskAdmission(super::SessionSpawnAttempt, Option<Instant>);
+
+impl TaskAdmission {
+    /// Freeze the original admission deadline before asynchronous preparation.
+    /// Reapplying this bound can only shorten it; later launch or result polling
+    /// never renews the task's budget.
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.1 = Some(self.1.map_or(deadline, |current| current.min(deadline)));
+        self
+    }
+}
 
 pub(crate) fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> {
     if owner_session_id.trim().is_empty() {
         return Err(Error::tool("jobs", "PI_JOBS_SESSION_UNAVAILABLE: missing task owner"));
     }
-    let admission = TaskAdmission(capture_session_spawn_generation(owner_session_id)?);
+    let admission = TaskAdmission(capture_session_spawn_generation(owner_session_id)?, None);
     #[cfg(test)]
     super::invoke_after_initial_owner_check_hook(owner_session_id);
     Ok(admission)
@@ -80,6 +92,80 @@ pub(crate) fn with_owned_task_progress<T>(
     Ok(value)
 }
 
+/// Replace an opted-in task's latest screened progress without writing another
+/// artifact or completion notice. The caller must screen its complete typed
+/// aggregate first; a second projection may not change any field. Preparation
+/// stays outside the global jobs lock, then ownership and cancellation are
+/// checked atomically with publication.
+#[allow(clippy::significant_drop_tightening)]
+pub(crate) fn publish_owned_task_progress(
+    owner_session_id: &str,
+    id: &str,
+    partial_result: ToolOutput,
+    privacy: &AuxiliaryPrivacySnapshot,
+) -> Result<()> {
+    let prepared = (|| -> Result<(ToolOutput, usize)> {
+        if partial_result.is_error {
+            return Err(Error::tool("jobs", "PI_JOBS_TASK_PROGRESS: progress cannot be a terminal error"));
+        }
+        // Bound before converting a caller's structured result to a JSON value.
+        let mut partial = BoundedJson(Vec::new());
+        serde_json::to_writer(&mut partial, &partial_result)
+            .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB"))?;
+        let partial: serde_json::Value = serde_json::from_slice(&partial.0)?;
+        let output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("Background task progress; work is still running."))],
+            details: Some(serde_json::json!({"schema": PROGRESS_SCHEMA, "partialResult": partial})),
+            is_error: false,
+        };
+        let output = protect_exact_result(&output, privacy)?;
+        let mut encoded = BoundedJson(Vec::new());
+        serde_json::to_writer(&mut encoded, &output)
+            .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB"))?;
+        Ok((output, encoded.0.len()))
+    })();
+    let (output, result_bytes) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            // Cancellation can win the worker's terminal-state race. Withdraw
+            // invalidated evidence synchronously so that race cannot preserve
+            // a stale observation as an interrupted partial result.
+            let _ = clear_owned_task_progress(owner_session_id, id);
+            return Err(error);
+        }
+    };
+    let stopped = || Error::tool("jobs", "PI_JOBS_TASK_STOPPED: native task is not accepting progress");
+    let mut reg = registry().lock().map_err(|_| stopped())?;
+    if reg.closing_owners.contains_key(owner_session_id) { return Err(stopped()); }
+    let job = reg.jobs.get_mut(id).filter(|job| {
+        job.owner_session_id == owner_session_id && job.schema == TASK_SCHEMA
+            && matches!(job.status, JobStatus::Running) && job.process_live && !job.cancel_requested
+    }).ok_or_else(stopped)?;
+    job.result = Some(output);
+    job.result_bytes = result_bytes;
+    super::prune_settled_jobs(&mut reg);
+    Ok(())
+}
+
+/// Withdraw a previously published observation when later evidence fails the
+/// task's privacy contract. Removal is permitted after cancellation or owner
+/// shutdown starts, but never after the worker has fenced terminal publication.
+pub(crate) fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Result<()> {
+    let stopped = || Error::tool("jobs", "PI_JOBS_TASK_STOPPED: native task cannot withdraw progress");
+    let mut reg = registry().lock().map_err(|_| stopped())?;
+    let job = reg.jobs.get_mut(id).filter(|job| {
+        job.owner_session_id == owner_session_id && job.schema == TASK_SCHEMA
+            && matches!(job.status, JobStatus::Running) && job.process_live
+    }).ok_or_else(stopped)?;
+    if job.result.as_ref().and_then(|result| result.details.as_ref())
+        .is_some_and(|details| details.get("schema").and_then(serde_json::Value::as_str) == Some(PROGRESS_SCHEMA))
+    {
+        job.result = None;
+        job.result_bytes = 0;
+    }
+    Ok(())
+}
+
 /// Launch admitted native work under its original capabilities and budget.
 /// The caller must finish input validation, approval and owner selection
 /// before calling. The future must own its inputs and clean up on drop.
@@ -113,6 +199,12 @@ where
         return Err(Error::tool("jobs", "PI_JOBS_PRIVACY: task label projection changed shape"));
     };
     let started = Instant::now();
+    let timeout = admission.1.map_or(timeout, |deadline| {
+        timeout.min(deadline.saturating_duration_since(started))
+    });
+    if timeout.is_zero() {
+        return Err(Error::tool("jobs", "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch"));
+    }
     let _lifecycle = lifecycle_lock().lock()
         .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned"))?;
     ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
@@ -315,9 +407,32 @@ impl TaskResources {
                     result = error_output("PI_JOBS_TASK_CANCELLED: task cancelled during result publication; prior side effects may remain");
                 }
                 job.process_live = false;
+                // Keep only an explicitly published, already-screened partial
+                // on interruption. Generic failures (including privacy refusal
+                // and panic) discard it. Capture under the same fence that
+                // prevents late progress from changing the terminal result.
+                if matches!(status, JobStatus::Killed | JobStatus::TimedOut)
+                    && let Some(details) = job.result.as_ref().and_then(|output| output.details.as_ref())
+                    && details.get("schema").and_then(serde_json::Value::as_str) == Some(PROGRESS_SCHEMA)
+                    && let Some(partial) = details.get("partialResult")
+                {
+                    result.details = Some(serde_json::json!({
+                        "schema": INTERRUPTED_SCHEMA, "partialResult": partial,
+                    }));
+                    result.content.push(ContentBlock::Text(TextContent::new(
+                        "Confirmed partial results are available in job details; unfinished work has stopped.",
+                    )));
+                }
             }
         }
-        let result = match protect_result(&result, privacy) {
+        let interrupted = result.details.as_ref()
+            .is_some_and(|details| details.get("schema").and_then(serde_json::Value::as_str) == Some(INTERRUPTED_SCHEMA));
+        let protected = if interrupted {
+            protect_exact_result(&result, privacy)
+        } else {
+            protect_result(&result, privacy)
+        };
+        let result = match protected {
             Ok(result) => result,
             Err(_) => {
                 if matches!(status, JobStatus::Exited | JobStatus::Failed) { status = JobStatus::Failed; }
@@ -357,6 +472,18 @@ impl Drop for TaskResources {
         self.artifact.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seal();
         self.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seal();
         if !self.settled {
+            {
+                let mut reg = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(job) = reg.jobs.get_mut(&self.id).filter(|job| !job.status.settled()) {
+                    // finish itself can unwind after the work future has been
+                    // caught. Never freeze a running progress wrapper as a
+                    // failed terminal result in that emergency path.
+                    job.process_live = false;
+                    let result = error_output("PI_JOBS_TASK_PUBLICATION: task ended without complete result publication");
+                    job.result_bytes = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+                    job.result = Some(result);
+                }
+            }
             if self.started {
                 settle_job_and_enqueue_notice(&self.id, JobStatus::Failed, None, false);
             } else {
@@ -401,6 +528,18 @@ fn protect_result(result: &ToolOutput, privacy: &AuxiliaryPrivacySnapshot) -> Re
         .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: projected result exceeds 1 MiB"))?;
     serde_json::from_value(projected).map_err(|error| Error::tool("jobs", format!("PI_JOBS_PRIVACY: invalid result projection: {error}")))
 }
+
+fn protect_exact_result(result: &ToolOutput, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
+    let protected = protect_result(result, privacy)?;
+    // protect_result bounds both serializations before these value copies.
+    if serde_json::to_value(result)? != serde_json::to_value(&protected)? {
+        return Err(Error::tool("jobs", "PI_JOBS_TASK_PROGRESS_PRIVACY: projection changed typed progress; result withheld"));
+    }
+    Ok(protected)
+}
+
+#[cfg(test)]
+mod progress_tests;
 
 #[cfg(test)]
 mod tests {

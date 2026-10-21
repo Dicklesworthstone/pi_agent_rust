@@ -156,12 +156,66 @@
         }
         return payload;
     };
+    const checkModelProgress = (job, result, wrapperSchema) => {
+        if (job.operation !== 'judgment_batch' || !modelRecord(result) || !isArray(result.content)
+            || (hasOwn(result,'isError') && typeof result.isError !== 'boolean')
+            || !modelRecord(result.details) || result.details.schema !== wrapperSchema) throw modelProtocol();
+        const partial = result.details.partialResult;
+        if (!modelRecord(partial) || !isArray(partial.content)
+            || (hasOwn(partial,'isError') && partial.isError !== false)
+            || !modelRecord(partial.details)) throw modelProtocol();
+        const progress = partial.details;
+        if (progress.schema !== 'pi.eval.model-job.progress.v1' || progress.operation !== 'judgment_batch'
+            || progress.complete !== false || !integer(progress.total) || progress.total < 1 || progress.total > 16
+            || !isArray(progress.items) || progress.items.length !== progress.total
+            || ['completed','succeeded','failed','queued','running'].some(name =>
+                !integer(progress[name]) || progress[name] < 0 || progress[name] > progress.total)
+            || progress.completed !== progress.succeeded + progress.failed
+            || progress.total !== progress.completed + progress.queued + progress.running
+            || !modelRecord(progress.judgments) || progress.judgments.schema !== 'pi.eval.judgments.v1'
+            || !isArray(progress.judgments.attempts) || progress.judgments.attempts.length !== progress.total
+            || progress.judgments.attempts.some(receipt => !modelRecord(receipt))) throw modelProtocol();
+        const counts = {queued:0,running:0,completed:0,failed:0};
+        const seen = [];
+        for (const item of progress.items) {
+            if (!modelRecord(item) || typeof item.status !== 'string' || !hasOwn(counts,item.status)
+                || !(typeof item.key === 'string' && item.key.length > 0 || integer(item.key) && item.key >= 0)
+                || seen.some(key => key === item.key)) throw modelProtocol();
+            seen.push(item.key);
+            counts[item.status]++;
+            if (item.status === 'completed') {
+                if (hasOwn(item,'error')) throw modelProtocol();
+                modelPayload('judgment',item.verdict);
+            } else if (item.status === 'failed') {
+                if (hasOwn(item,'verdict') || typeof item.error !== 'string' || !item.error) throw modelProtocol();
+            } else if (hasOwn(item,'verdict') || hasOwn(item,'error')) throw modelProtocol();
+        }
+        if (counts.queued !== progress.queued || counts.running !== progress.running
+            || counts.completed !== progress.succeeded || counts.failed !== progress.failed) throw modelProtocol();
+        return progress;
+    };
+    const modelProgressView = (job, snapshot) => {
+        const details = snapshot.result?.details;
+        if (!details) return null;
+        if (details.schema === 'pi.host_job.progress.v1' || details.schema === 'pi.host_job.interrupted.v1') {
+            return {...details.partialResult.details,jobStatus:snapshot.status};
+        }
+        if (details.result === null) return null;
+        const batch = details.result;
+        return {schema:'pi.eval.model-job.progress.v1',operation:job.operation,complete:true,jobStatus:snapshot.status,
+            total:batch.total,completed:batch.total,succeeded:batch.succeeded,failed:batch.failed,queued:0,running:0,
+            items:batch.items.map(item => item.ok ? {key:item.key,status:'completed',verdict:item.verdict}
+                : {key:item.key,status:'failed',error:item.error}),judgments:details.judgments};
+    };
     const checkModelJob = (job, snapshot) => {
         const expectedLabel = job.operation === 'completion' ? 'eval model completion' : `eval ${job.operation}`;
         if (snapshot.command !== expectedLabel
             || !['running','exited','failed','killed','timedOut'].includes(snapshot.status)) throw modelProtocol();
         if (snapshot.status === 'running') {
-            if (snapshot.result !== undefined && snapshot.result !== null) throw modelProtocol();
+            if (snapshot.result !== undefined && snapshot.result !== null) {
+                checkModelProgress(job,snapshot.result,'pi.host_job.progress.v1');
+                if (snapshot.result.isError) throw modelProtocol();
+            }
             return snapshot;
         }
         const result = snapshot.result;
@@ -172,6 +226,11 @@
             // Native cancellation/timeout can retire work before a typed
             // result exists. Preserve that failure; never invent a verdict.
             if (snapshot.status === 'exited' || !result.isError) throw modelProtocol();
+        } else if (modelRecord(details) && details.schema === 'pi.host_job.interrupted.v1') {
+            if ((snapshot.status !== 'killed' && snapshot.status !== 'timedOut') || !result.isError) {
+                throw modelProtocol();
+            }
+            checkModelProgress(job,result,'pi.host_job.interrupted.v1');
         } else {
             if (!modelRecord(details) || details.schema !== 'pi.eval.model-job.result.v1'
                 || details.operation !== job.operation || !hasOwn(details,'result')
@@ -204,7 +263,8 @@
             error.jobId = job.id;
             throw error;
         }
-        const payload = result.details?.result;
+        const payload = result.details?.schema === 'pi.eval.model-job.result.v1'
+            ? result.details.result : undefined;
         if (payload === null || payload === undefined) return result;
         if (job.operation === 'completion') return hasOwn(payload,'data') ? payload.data : payload.text;
         return job.operation === 'judgment' ? payload.answers : payload;
@@ -219,6 +279,12 @@
         async status() { return readModelJob(this,'wait',0); }
         async done() { return (await this.status()).status !== 'running'; }
         async output() { return (await this.status()).result ?? null; }
+        async progress() {
+            if (this.operation !== 'judgment_batch') {
+                throw new TypeErrorType('EVAL_MODEL_INPUT: progress is available only for judgment batches');
+            }
+            return modelProgressView(this,await this.status());
+        }
         async cancel() { return readModelJob(this,'cancel'); }
         async wait(timeout = 30, raiseErrors = true) {
             if (typeof raiseErrors !== 'boolean') throw new TypeErrorType('EVAL_MODEL_INPUT: raiseErrors must be boolean');

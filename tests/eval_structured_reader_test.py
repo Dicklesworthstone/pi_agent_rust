@@ -64,6 +64,25 @@ def model_snapshot(operation, result=None, *, job_id="model-native", status="exi
             **({"result": result} if status != "running" else {})}
 
 
+def batch_progress_result(interrupted=False):
+    items = [{"key": "ready", "status": "completed", "verdict": judgment_value(1)},
+             {"key": "bad", "status": "failed", "error": "PI_JUDGE_PROVIDER"},
+             {"key": "active", "status": "running"}, {"key": "later", "status": "queued"}]
+    partial = {"content": [{"type": "text", "text": "2 of 4 judgments completed"}], "details": {
+        "schema": "pi.eval.model-job.progress.v1", "operation": "judgment_batch", "complete": False,
+        "total": 4, "completed": 2, "succeeded": 1, "failed": 1, "queued": 1, "running": 1, "items": items,
+        "judgments": {"schema": "pi.eval.judgments.v1", "attempts": [
+            {"attempt": index + 1, "operation": "judgment", "status": item["status"], "usage": None, "usageKnown": False}
+            for index, item in enumerate(items)]}}}
+    return {"content": [{"type": "text", "text": "job interrupted" if interrupted else "job running"}],
+            "details": {"schema": "pi.host_job.interrupted.v1" if interrupted else "pi.host_job.progress.v1",
+                        "partialResult": partial}, **({"isError": True} if interrupted else {})}
+
+
+def batch_progress_snapshot(native, status="running", job_id="model-native"):
+    return {**model_snapshot("judgment_batch", native, status=status, job_id=job_id), "result": native}
+
+
 class PoolHost:
     def __init__(self, kernel):
         self.kernel = kernel
@@ -371,6 +390,157 @@ captured
         self.assertEqual(self.value(response), ("model-native", native))
         response = self.kernel.cell("await model.output()", self.reply_with(envelope(snapshot)))
         self.assertEqual(self.value(response), native)
+
+    def test_batch_progress_exposes_ordered_evidence_and_each_observation_reenters_host(self):
+        self.launch_model("judge_batch({'ready':1,'bad':2,'active':3,'later':4}, "
+                          "{'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        native = batch_progress_result()
+        snapshot = batch_progress_snapshot(native)
+        progress = {**native["details"]["partialResult"]["details"], "jobStatus": "running"}
+        for method, expected in (("progress", progress), ("status", snapshot), ("output", native), ("done", False)):
+            response = self.kernel.cell(f"await model.{method}()", self.reply_with(envelope(snapshot)))
+            self.assertEqual(self.value(response), expected)
+            self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                "name": "jobs", "args": {"action": "wait", "jobId": "model-native", "timeoutMs": 0}})
+        self.assertEqual(len(self.kernel.calls), 5)
+
+    def test_partial_batch_results_never_satisfy_individual_or_global_waits(self):
+        self.launch_model("judge_batch([1,2,3,4], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        for expression in ("model.wait(0)", "model.wait(0, raise_errors=False)",
+                           "wait([model], timeout=0, raise_errors=False)"):
+            response = self.kernel.cell(f"await {expression}", self.reply_with(envelope(
+                batch_progress_snapshot(batch_progress_result()))))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_TIMEOUT", response["error"])
+        self.assertEqual(sum(frame["bridge"]["tool"] == "__pi_judge_batch_start" for frame in self.kernel.calls), 1)
+        self.assertTrue(all(frame["bridge"]["input"]["args"]["action"] == "wait" for frame in self.kernel.calls[1:]))
+
+    def test_interrupted_batches_retain_evidence_without_claiming_remaining_work_continues(self):
+        for status in ("killed", "timedOut"):
+            with self.subTest(status=status):
+                self.launch_model("judge_batch([1,2,3,4], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+                native = batch_progress_result(interrupted=True)
+                native["details"]["result"] = "unrelated wrapper metadata"
+                snapshot = batch_progress_snapshot(native, status)
+                progress = {**native["details"]["partialResult"]["details"], "jobStatus": status}
+                for expression, expected in (("model.progress()", progress), ("model.done()", True),
+                        ("model.output()", native), ("model.wait(0, raise_errors=False)", native),
+                        ("wait([model], timeout=0, raise_errors=False)", [native])):
+                    response = self.kernel.cell(f"await {expression}", self.reply_with(envelope(snapshot)))
+                    self.assertEqual(self.value(response), expected)
+                response = self.kernel.cell("""
+try:
+    await model.wait(0)
+except Exception as error:
+    captured = (error.job_id, error.result)
+captured
+""", self.reply_with(envelope(snapshot)))
+                self.assertEqual(self.value(response), ("model-native", native))
+                if status == "killed":
+                    response = self.kernel.cell("await model.cancel()", self.reply_with(envelope(snapshot)))
+                    self.assertEqual(self.value(response)["status"], "killed")
+                    self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["action"], "cancel")
+
+    def test_settled_batch_progress_derives_complete_counts_from_final_aggregate(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                self.launch_model("judge_batch([1,2], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+                items = [{"key": "first", "ok": True, "verdict": judgment_value(1)},
+                         {"key": "second", "ok": False, "error": "PI_JUDGE_PROVIDER"} if failed
+                         else {"key": "second", "ok": True, "verdict": judgment_value(0)}]
+                payload = {"schema": "pi.eval.judgment-batch.v1", "total": 2, "succeeded": 1 if failed else 2,
+                           "failed": 1 if failed else 0, "allOk": not failed, "items": items}
+                native = model_result("judgment_batch", payload, failed=failed)
+                native["details"]["judgments"]["attempts"] = [
+                    {"attempt": index + 1, "status": "completed" if item["ok"] else "failed"}
+                    for index, item in enumerate(items)]
+                status = "failed" if failed else "exited"
+                response = self.kernel.cell("await model.progress()", self.reply_with(envelope(
+                    model_snapshot("judgment_batch", native, status=status))))
+                self.assertEqual(self.value(response), {
+                    "schema": "pi.eval.model-job.progress.v1", "operation": "judgment_batch", "complete": True,
+                    "jobStatus": status, "total": 2, "completed": 2, "succeeded": payload["succeeded"],
+                    "failed": payload["failed"], "queued": 0, "running": 0,
+                    "items": [{"key": "first", "status": "completed", "verdict": judgment_value(1)},
+                              {"key": "second", "status": "failed", "error": "PI_JUDGE_PROVIDER"} if failed
+                              else {"key": "second", "status": "completed", "verdict": judgment_value(0)}],
+                    "judgments": native["details"]["judgments"]})
+
+    def test_batch_progress_is_none_before_first_update_and_for_unpreserved_failures(self):
+        self.launch_model("judge_batch([1,2], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        failure = {"content": [], "details": None, "isError": True}
+        for snapshot in (model_snapshot("judgment_batch", status="running"), batch_progress_snapshot(None),
+                         batch_progress_snapshot(failure, "failed"), batch_progress_snapshot(failure, "killed"),
+                         batch_progress_snapshot(model_result("judgment_batch", None, failed=True,
+                                                 error="PI_JUDGE_PRIVACY"), "failed")):
+            response = self.kernel.cell("await model.progress()", self.reply_with(envelope(snapshot)))
+            self.assertTrue(response["ok"], response.get("error"))
+            self.assertIsNone(response["result"])
+
+    def test_batch_attachment_recovers_partial_results_without_caching_old_access(self):
+        snapshot = batch_progress_snapshot(batch_progress_result(), job_id="recovered")
+        response = self.kernel.cell("model = await judge_batch.attach('recovered'); model.id",
+                                    self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response), "recovered")
+        response = self.kernel.cell("await model.progress()", self.reply_with(envelope(snapshot)))
+        self.assertEqual(self.value(response)["completed"], 2)
+        response = self.kernel.cell("await model.progress()", lambda frame: self.kernel.reply(frame, error="PI_JOBS_UNKNOWN_ID"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_JOBS_UNKNOWN_ID", response["error"])
+        self.assertEqual(len(self.kernel.calls), 3)
+        self.assertTrue(all(frame["bridge"]["tool"] == "__pi_tool_result" for frame in self.kernel.calls))
+
+    def test_batch_progress_validates_counts_unique_keys_evidence_and_receipts(self):
+        self.launch_model("judge_batch([1,2,3,4], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        prefix = ("details", "partialResult", "details")
+        corruptions = [(("details", "schema"), "wrong"), (("isError",), True),
+            (("details", "partialResult", "isError"), True), (("details", "partialResult", "content"), None),
+            (prefix + ("schema",), "wrong"), (prefix + ("operation",), "completion"),
+            (prefix + ("complete",), True), (prefix + ("total",), 5), (prefix + ("completed",), 3),
+            (prefix + ("succeeded",), True), (prefix + ("running",), -1),
+            (prefix + ("items", 3, "key"), "ready"), (prefix + ("items", 3, "key"), ""),
+            (prefix + ("items", 3, "key"), False), (prefix + ("items", 0, "status"), ["completed"]),
+            (prefix + ("items", 0, "verdict"), None), (prefix + ("items", 0, "error"), "contradiction"),
+            (prefix + ("items", 1, "error"), ""), (prefix + ("items", 1, "verdict"), judgment_value(1)),
+            (prefix + ("items", 2, "verdict"), judgment_value(1)), (prefix + ("items", 3, "error"), None),
+            (prefix + ("items", 3, "status"), "running"), (prefix + ("judgments", "schema"), "wrong"),
+            (prefix + ("judgments", "attempts"), []), (prefix + ("judgments", "attempts", 0), None)]
+        for path, value in corruptions:
+            with self.subTest(path=path, value=value):
+                native = batch_progress_result()
+                target = native
+                for component in path[:-1]:
+                    target = target[component]
+                target[path[-1]] = value
+                response = self.kernel.cell("await model.status()", self.reply_with(envelope(batch_progress_snapshot(native))))
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
+        native = batch_progress_result()
+        items = native["details"]["partialResult"]["details"]["items"]
+        items[0]["key"], items[1]["key"] = 0, "0"
+        response = self.kernel.cell("await model.progress()", self.reply_with(envelope(batch_progress_snapshot(native))))
+        self.assertEqual([item["key"] for item in self.value(response)["items"]], [0, "0", "active", "later"])
+
+    def test_progress_wrappers_only_fit_batches_and_matching_running_or_interrupted_states(self):
+        self.launch_model("judge_batch([1,2,3,4], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+        for native, status in ((batch_progress_result(True), "running"), (batch_progress_result(True), "exited"),
+                               (batch_progress_result(True), "failed"), (batch_progress_result(), "killed"),
+                               (batch_progress_result(), "timedOut")):
+            response = self.kernel.cell("await model.status()", self.reply_with(envelope(batch_progress_snapshot(native, status))))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
+        for operation, expression in (("completion", "completion('work')"),
+                                      ("judgment", "judge('work', {'safe':{'type':'bool','instructions':'safe?'}})")):
+            self.launch_model(expression, operation)
+            count = len(self.kernel.calls)
+            response = self.kernel.cell("await model.progress()")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_INPUT", response["error"])
+            self.assertEqual(len(self.kernel.calls), count)
+            snapshot = {**model_snapshot(operation, status="running"), "result": batch_progress_result()}
+            response = self.kernel.cell("await model.status()", self.reply_with(envelope(snapshot)))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
 
     def test_model_bad_or_lost_acknowledgments_are_never_replayed(self):
         for encoded in ("not JSON", "null", json.dumps(model_ack("judgment")),

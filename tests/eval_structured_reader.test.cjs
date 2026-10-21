@@ -150,6 +150,24 @@ const modelResult = (operation, result, failed = false, error = null) => ({
 });
 const modelSnapshot = (id, operation, result, status = 'exited') =>
     ({...jobSnapshot(id,status,result),command:operation === 'completion' ? 'eval model completion' : `eval ${operation}`});
+const batchProgressResult = (interrupted = false) => {
+    const items = [{key:'ready',status:'completed',verdict:judgmentValue(1)},
+        {key:'bad',status:'failed',error:'PI_JUDGE_PROVIDER'},
+        {key:'active',status:'running'},{key:'later',status:'queued'}];
+    const partialResult = {content:[{type:'text',text:'2 of 4 judgments completed'}],details:{
+        schema:'pi.eval.model-job.progress.v1',operation:'judgment_batch',complete:false,
+        total:4,completed:2,succeeded:1,failed:1,queued:1,running:1,items,
+        judgments:{schema:'pi.eval.judgments.v1',attempts:items.map((item,index) =>
+            ({attempt:index + 1,operation:'judgment',status:item.status,usage:null,usageKnown:false}))},
+    }};
+    return {content:[{type:'text',text:interrupted ? 'job interrupted' : 'job running'}],
+        details:{schema:interrupted ? 'pi.host_job.interrupted.v1' : 'pi.host_job.progress.v1',partialResult},
+        ...(interrupted ? {isError:true} : {})};
+};
+const batchProgressSnapshot = (native, status = 'running', id = 'model-native') =>
+    ({...modelSnapshot(id,'judgment_batch',native,status),result:native});
+const startProgressBatch = h => launchModel(h,
+    "judgeBatch({ready:1,bad:2,active:3,later:4},{safe:{type:'bool',instructions:'safe?'}})",'judgment_batch');
 async function launchModel(h, expression, operation, id = 'model-native', variable = 'model') {
     const pending = vm.runInContext(`${expression}.then(value=>globalThis.${variable}=value)`,h.context);
     const request = h.requests.at(-1);
@@ -218,6 +236,150 @@ test('mixed judgment batch failures retain ordered successful verdicts and error
     pending = vm.runInContext('model.output()',h.context);
     answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
     assert.deepEqual(JSON.parse(JSON.stringify(await pending)),native);
+});
+test('batch progress exposes ordered evidence and each observation reenters the host', async () => {
+    const h = host(); await startProgressBatch(h); h.dispatch.clear();
+    const native = batchProgressResult(); const snapshot = batchProgressSnapshot(native);
+    const progress = native.details.partialResult.details;
+    for (const [method,expected] of [['progress',{...progress,jobStatus:'running'}],
+        ['status',snapshot],['output',native],['done',false]]) {
+        const pending = vm.runInContext(`model.${method}()`,h.context);
+        assert.deepEqual(h.requests.at(-1).args,{name:'jobs',args:{action:'wait',jobId:'model-native',timeoutMs:0}});
+        answer(h,h.requests.at(-1),snapshot);
+        assert.deepEqual(JSON.parse(JSON.stringify(await pending)),expected);
+    }
+    assert.equal(h.requests.length,5);
+});
+test('partial batch results never satisfy either individual or global waits', async () => {
+    const h = host(); await startProgressBatch(h);
+    for (const expression of ['model.wait(0)','model.wait(0,false)',
+        'wait([model],{timeout:0,raiseErrors:false})']) {
+        const pending = vm.runInContext(expression,h.context);
+        answer(h,h.requests.at(-1),batchProgressSnapshot(batchProgressResult()));
+        await assert.rejects(pending,error => error.name === 'TimeoutError');
+    }
+    assert.equal(h.requests.filter(request => request.name === '__pi_judge_batch_start').length,1);
+    assert.ok(h.requests.slice(1).every(request => request.args.args.action === 'wait'));
+});
+test('cancelled and timed-out batches retain completed evidence without claiming remaining work continues', async () => {
+    for (const status of ['killed','timedOut']) {
+        const h = host(); await startProgressBatch(h);
+        const native = batchProgressResult(true); const snapshot = batchProgressSnapshot(native,status);
+        // A generic wrapper field must never be mistaken for a typed final payload.
+        native.details.result = 'unrelated wrapper metadata';
+        const progress = {...native.details.partialResult.details,jobStatus:status};
+        for (const [expression,expected] of [['model.progress()',progress],['model.done()',true],
+            ['model.output()',native],['model.wait(0,false)',native],
+            ['wait([model],{timeout:0,raiseErrors:false})',[native]]]) {
+            const pending = vm.runInContext(expression,h.context);
+            answer(h,h.requests.at(-1),snapshot);
+            assert.deepEqual(JSON.parse(JSON.stringify(await pending)),expected);
+        }
+        const raising = vm.runInContext('model.wait(0)',h.context);
+        answer(h,h.requests.at(-1),snapshot);
+        await assert.rejects(raising,error => error.jobId === 'model-native'
+            && error.result.details.partialResult.details.items[0].verdict.answers.safe.bool === 1);
+        if (status === 'killed') {
+            const cancelled = vm.runInContext('model.cancel()',h.context);
+            assert.equal(h.requests.at(-1).args.args.action,'cancel');
+            answer(h,h.requests.at(-1),snapshot);
+            assert.equal((await cancelled).status,'killed');
+        }
+    }
+});
+test('settled batch progress derives complete counts and ordered items from the final aggregate', async () => {
+    for (const failed of [false,true]) {
+        const h = host(); await startProgressBatch(h);
+        const items = [{key:'first',ok:true,verdict:judgmentValue(1)},failed
+            ? {key:'second',ok:false,error:'PI_JUDGE_PROVIDER'} : {key:'second',ok:true,verdict:judgmentValue(0)}];
+        const payload = {schema:'pi.eval.judgment-batch.v1',total:2,succeeded:failed ? 1 : 2,
+            failed:failed ? 1 : 0,allOk:!failed,items};
+        const native = modelResult('judgment_batch',payload,failed);
+        native.details.judgments.attempts = items.map((item,index) =>
+            ({attempt:index + 1,status:item.ok ? 'completed' : 'failed'}));
+        const status = failed ? 'failed' : 'exited';
+        const pending = vm.runInContext('model.progress()',h.context);
+        answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,status));
+        const progress = JSON.parse(JSON.stringify(await pending));
+        assert.deepEqual(progress,{schema:'pi.eval.model-job.progress.v1',operation:'judgment_batch',
+            complete:true,jobStatus:status,total:2,completed:2,succeeded:payload.succeeded,failed:payload.failed,
+            queued:0,running:0,items:[{key:'first',status:'completed',verdict:judgmentValue(1)},failed
+                ? {key:'second',status:'failed',error:'PI_JUDGE_PROVIDER'}
+                : {key:'second',status:'completed',verdict:judgmentValue(0)}],judgments:native.details.judgments});
+    }
+});
+test('batch progress returns null before the first update and for failures without retained evidence', async () => {
+    const h = host(); await startProgressBatch(h);
+    const failed = {content:[],details:null,isError:true};
+    for (const snapshot of [modelSnapshot('model-native','judgment_batch',undefined,'running'),
+        batchProgressSnapshot(null),batchProgressSnapshot(failed,'failed'),batchProgressSnapshot(failed,'killed'),
+        batchProgressSnapshot(modelResult('judgment_batch',null,true,'PI_JUDGE_PRIVACY'),'failed')]) {
+        const pending = vm.runInContext('model.progress()',h.context);
+        answer(h,h.requests.at(-1),snapshot); assert.equal(await pending,null);
+    }
+});
+test('batch attachment recovers partial results after reset without caching old access', async () => {
+    const h = host(); const snapshot = batchProgressSnapshot(batchProgressResult(),'running','recovered');
+    const attached = vm.runInContext("judgeBatch.attach('recovered').then(value=>globalThis.model=value)",h.context);
+    answer(h,h.requests.at(-1),snapshot); await attached;
+    h.dispatch.clear();
+    let pending = vm.runInContext('model.progress()',h.context);
+    answer(h,h.requests.at(-1),snapshot);
+    assert.equal((await pending).completed,2);
+    pending = vm.runInContext('model.progress()',h.context);
+    h.dispatch.dispatch(h.requests.at(-1).id,false,false,'PI_JOBS_UNKNOWN_ID');
+    await assert.rejects(pending,/PI_JOBS_UNKNOWN_ID/);
+    assert.equal(h.requests.length,3);
+    assert.ok(h.requests.every(request => request.name === '__pi_tool_result'));
+});
+test('batch progress validates counts, unique keys, evidence and receipt shapes', async () => {
+    const h = host(); await startProgressBatch(h);
+    const corruptions = [
+        (n,p) => { n.details.schema = 'wrong'; }, (n,p) => { n.isError = true; },
+        (n,p) => { n.details.partialResult.isError = true; }, (n,p) => { n.details.partialResult.content = null; },
+        (n,p) => { p.schema = 'wrong'; }, (n,p) => { p.operation = 'completion'; },
+        (n,p) => { p.complete = true; }, (n,p) => { p.total = 5; },
+        (n,p) => { p.completed = 3; }, (n,p) => { p.succeeded = true; },
+        (n,p) => { p.running = -1; }, (n,p) => { p.items[3].key = 'ready'; },
+        (n,p) => { p.items[3].key = ''; }, (n,p) => { p.items[3].key = false; },
+        (n,p) => { p.items[0].status = ['completed']; }, (n,p) => { p.items[0].verdict = null; },
+        (n,p) => { p.items[0].error = 'contradiction'; }, (n,p) => { p.items[1].error = ''; },
+        (n,p) => { p.items[1].verdict = judgmentValue(1); }, (n,p) => { p.items[2].verdict = judgmentValue(1); },
+        (n,p) => { p.items[3].error = null; }, (n,p) => { p.items[3].status = 'running'; },
+        (n,p) => { p.judgments.schema = 'wrong'; }, (n,p) => { p.judgments.attempts.pop(); },
+        (n,p) => { p.judgments.attempts[0] = null; },
+    ];
+    for (const corrupt of corruptions) {
+        const native = batchProgressResult(); corrupt(native,native.details.partialResult.details);
+        const pending = vm.runInContext('model.status()',h.context);
+        answer(h,h.requests.at(-1),batchProgressSnapshot(native));
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+    }
+    const native = batchProgressResult();
+    native.details.partialResult.details.items[0].key = 0;
+    native.details.partialResult.details.items[1].key = '0';
+    const pending = vm.runInContext('model.progress()',h.context);
+    answer(h,h.requests.at(-1),batchProgressSnapshot(native));
+    assert.deepEqual(Array.from((await pending).items,item => item.key),[0,'0','active','later']);
+});
+test('progress wrappers are restricted to batches and the matching running or interrupted states', async () => {
+    const h = host(); await startProgressBatch(h);
+    for (const [native,status] of [[batchProgressResult(true),'running'],[batchProgressResult(true),'exited'],
+        [batchProgressResult(true),'failed'],[batchProgressResult(),'killed'],[batchProgressResult(),'timedOut']]) {
+        const pending = vm.runInContext('model.status()',h.context);
+        answer(h,h.requests.at(-1),batchProgressSnapshot(native,status));
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+    }
+    for (const [operation,expression] of [['completion',"completion('work')"],
+        ['judgment',"judge('work',{safe:{type:'bool',instructions:'safe?'}})"]]) {
+        const other = host(); await launchModel(other,expression,operation);
+        await assert.rejects(vm.runInContext('model.progress()',other.context),/EVAL_MODEL_INPUT/);
+        assert.equal(other.requests.length,1);
+        const pending = vm.runInContext('model.status()',other.context);
+        answer(other,other.requests.at(-1),{...modelSnapshot('model-native',operation,undefined,'running'),
+            result:batchProgressResult()});
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+    }
 });
 test('malformed and lost model acknowledgments reject without retrying admitted work', async () => {
     for (const response of ['not JSON','null',JSON.stringify(modelAck('judgment','model-native')),

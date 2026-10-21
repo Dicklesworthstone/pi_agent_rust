@@ -521,7 +521,8 @@ if (job.status === 'exited') {
 
 This observation wait does not extend or reset the task deadline. Use
 `timeoutMs: 0` to poll and `action: 'cancel'` to cancel. A running snapshot has
-no final result. If the guest variable has been lost, `jobs {action: 'list'}`
+no final result; a running batch can contain an explicit progress observation,
+as described below. If the guest variable has been lost, `jobs {action: 'list'}`
 shows the session's accepted jobs. Model jobs use the fixed labels
 `eval model completion`, `eval judgment` and `eval judgment_batch`, and their IDs can
 be used from either kernel. Repeating a start call creates another request;
@@ -580,10 +581,87 @@ A completion or single judgment failure has `result: null`, a sanitized error,
 and `isError: true`. A fully finished batch retains every item in input order,
 including per-item failures. If any item failed, the native job is failed and
 its output has `isError: true`, while the complete batch remains available for
-inspection. A cancelled or timed-out task instead uses the ordinary jobs error
-result; it does not fabricate a complete batch or replay its unfinished items.
-This initial background API exposes the final aggregate, without incremental
-drains or partial results while the job is running.
+inspection. A cancelled or timed-out task remains an error. For batches, the
+native job preserves its last accepted progress observation alongside that
+error; it does not fabricate a complete batch or replay its unfinished items.
+Generic task failures, including privacy refusal and panic, discard progress.
+
+### Batch progress and interrupted results
+
+Batch handles expose `progress()` in JavaScript and Python. It returns the
+latest native observation without consuming results or starting more work:
+
+```javascript
+globalThis.review = await judgeBatch(
+  ['The first claim and its evidence', 'The second claim and its evidence'],
+  {supported: {type: 'bool', instructions: 'Is this claim supported?'}},
+  {concurrency: 2, timeoutSeconds: 120}
+);
+
+// In this or a later cell, including after reconstructing the handle with attach:
+const progress = await review.progress();
+if (progress) {
+  display(progress.items.filter(item => item.status === 'completed'));
+  display({completed: progress.completed, queued: progress.queued, running: progress.running});
+}
+```
+
+`progress()` returns `null` in JavaScript or `None` in Python until an
+observation is available, and when a terminal failure retained no typed evidence.
+
+An unfinished observation has schema `pi.eval.model-job.progress.v1`, operation
+`judgment_batch`, and `complete: false`. It includes every original item in
+input order, the native attempt receipts, and the following counts:
+
+- `total`: all reserved items.
+- `completed`: finished items, equal to `succeeded + failed`.
+- `succeeded` and `failed`: completed verdicts and per-item errors.
+- `queued` and `running`: pending items, so `total = completed + queued + running`.
+
+Each row retains its original typed `key`. Its `status` determines which
+evidence is present:
+
+| Status | Evidence |
+|---|---|
+| `queued` | No verdict or error; the request has not entered a provider wave. |
+| `running` | No verdict or error; the request belongs to the current bounded wave. |
+| `completed` | A native typed `verdict`; no error. |
+| `failed` | A sanitized `error`; no verdict. |
+
+Running counts describe admitted work in the current wave; they do not prove
+that a provider received a request or billed it. Pending receipts report
+unknown usage. Progress is published before the first provider wave, when a
+wave is admitted, and after each result before another queued request can
+start. Each update is a complete screened snapshot. Reading it repeatedly
+does not drain, duplicate, or replay completed items.
+
+Through the raw `jobs` API, a running job's `result.details` has schema
+`pi.host_job.progress.v1` and a `partialResult` containing the native progress
+`ToolOutput`. The progress object is at `result.details.partialResult.details`.
+After cancellation or timeout, the job status remains `killed` or `timedOut`,
+the outer result has `isError: true`, and its details use
+`pi.host_job.interrupted.v1` with the same `partialResult` shape. The inner
+observation keeps `complete: false`; its queued/running counts record the last
+accepted observation, not work continuing after settlement. Only progress
+accepted before the cancellation fence can be retained.
+
+The handle's `progress()` also exposes the observed `jobStatus`. For a fully
+finished batch it derives a `complete: true` view from the ordinary final
+aggregate, without changing that final result's schema. `wait()` keeps its
+normal completion/error behavior; it does not return partial evidence as a
+successful batch. Use `progress()` or `output()` to inspect interrupted work.
+
+Privacy screens the complete aggregate, including every finished result,
+pending key, receipt, count and schema identity, before each publication.
+A change to typed evidence or identity refuses the new observation and
+withdraws previously retained progress before terminal publication. The same
+rule applies when screening the final aggregate. A racing cancellation cannot
+preserve an older snapshot that this failure has invalidated.
+
+Only the latest accepted progress snapshot is retained in memory. Progress
+updates create neither additional artifacts nor completion notices; terminal
+publication writes the final or interrupted result through the ordinary jobs
+artifact policy.
 
 Launch receipts include the accepted job ID. Final successful-attempt receipts
 contain reported usage; failed attempts retain unknown usage. They do not
@@ -593,14 +671,17 @@ Polling a result does not consume that notice.
 
 Retention follows native jobs: process-local state, at most 128 settled jobs
 per session and 512 process-wide, with a shared 32 MiB retained native-result
-budget and 1 MiB final-result ceiling. Older settled entries may be pruned as
+budget covering live progress and settled results, and a 1 MiB result ceiling.
+Older settled entries may be pruned as
 these limits are reached. Kernel reset preserves accepted jobs; restarting
 the Pi process does not resume them. The jobs artifact policy remains in
 effect, and the same captured privacy projection screens retained results,
 artifacts and completion notices.
 
 Native regression fixtures in `src/eval/judgment/background/tests.rs` exercise
-controlled provider streams and real job ownership. The prepared request and
+controlled provider streams and real job ownership, including ordered mixed
+progress, retained cancellation/timeout evidence, and withdrawal after either
+progress or final-result privacy refusal. The prepared request and
 privacy tests also cover callback lifetime, schema integrity and cross-item
 secret discovery. These fixtures require the authoritative
 `dsr quality --tool pi_agent_rust` run; source review is not native execution

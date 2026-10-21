@@ -1030,6 +1030,75 @@ def _model_payload(operation, payload):
     return payload
 
 
+def _model_check_progress(job, result, wrapper_schema):
+    if (job.operation != "judgment_batch" or type(result) is not dict or type(result.get("content")) is not list
+            or type(result.get("isError", False)) is not bool
+            or type(result.get("details")) is not dict or result["details"].get("schema") != wrapper_schema):
+        raise _model_protocol()
+    partial = result["details"].get("partialResult")
+    if (type(partial) is not dict or type(partial.get("content")) is not list
+            or partial.get("isError", False) is not False or type(partial.get("details")) is not dict):
+        raise _model_protocol()
+    progress = partial["details"]
+    if (progress.get("schema") != "pi.eval.model-job.progress.v1" or progress.get("operation") != "judgment_batch"
+            or progress.get("complete") is not False or type(progress.get("total")) is not int
+            or not 1 <= progress["total"] <= 16
+            or type(progress.get("items")) is not list or len(progress["items"]) != progress["total"]
+            or any(type(progress.get(name)) is not int or not 0 <= progress[name] <= progress["total"]
+                   for name in ("completed", "succeeded", "failed", "queued", "running"))
+            or progress["completed"] != progress["succeeded"] + progress["failed"]
+            or progress["total"] != progress["completed"] + progress["queued"] + progress["running"]
+            or type(progress.get("judgments")) is not dict
+            or progress["judgments"].get("schema") != "pi.eval.judgments.v1"
+            or type(progress["judgments"].get("attempts")) is not list
+            or len(progress["judgments"]["attempts"]) != progress["total"]
+            or any(type(receipt) is not dict for receipt in progress["judgments"]["attempts"])):
+        raise _model_protocol()
+    counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
+    seen = set()
+    for item in progress["items"]:
+        if (type(item) is not dict or type(item.get("status")) is not str or item["status"] not in counts
+                or not (type(item.get("key")) is str and bool(item["key"])
+                        or type(item.get("key")) is int and item["key"] >= 0)):
+            raise _model_protocol()
+        identity = (type(item["key"]), item["key"])
+        if identity in seen:
+            raise _model_protocol()
+        seen.add(identity)
+        counts[item["status"]] += 1
+        if item["status"] == "completed":
+            if "error" in item:
+                raise _model_protocol()
+            _model_payload("judgment", item.get("verdict"))
+        elif item["status"] == "failed":
+            if "verdict" in item or type(item.get("error")) is not str or not item["error"]:
+                raise _model_protocol()
+        elif "verdict" in item or "error" in item:
+            raise _model_protocol()
+    if (counts["queued"] != progress["queued"] or counts["running"] != progress["running"]
+            or counts["completed"] != progress["succeeded"] or counts["failed"] != progress["failed"]):
+        raise _model_protocol()
+    return progress
+
+
+def _model_progress_view(job, snapshot):
+    result = snapshot.get("result")
+    details = result.get("details") if result is not None else None
+    if details is None:
+        return None
+    if details["schema"] in ("pi.host_job.progress.v1", "pi.host_job.interrupted.v1"):
+        return {**details["partialResult"]["details"], "jobStatus": snapshot["status"]}
+    batch = details["result"]
+    if batch is None:
+        return None
+    return {"schema": "pi.eval.model-job.progress.v1", "operation": job.operation, "complete": True,
+            "jobStatus": snapshot["status"], "total": batch["total"], "completed": batch["total"],
+            "succeeded": batch["succeeded"], "failed": batch["failed"], "queued": 0, "running": 0,
+            "items": [{"key": item["key"], "status": "completed", "verdict": item["verdict"]} if item["ok"]
+                      else {"key": item["key"], "status": "failed", "error": item["error"]} for item in batch["items"]],
+            "judgments": details["judgments"]}
+
+
 def _model_check_job(job, snapshot):
     expected_label = "eval model completion" if job.operation == "completion" else f"eval {job.operation}"
     if (snapshot.get("command") != expected_label
@@ -1037,7 +1106,9 @@ def _model_check_job(job, snapshot):
         raise _model_protocol()
     if snapshot["status"] == "running":
         if snapshot.get("result") is not None:
-            raise _model_protocol()
+            _model_check_progress(job, snapshot["result"], "pi.host_job.progress.v1")
+            if snapshot["result"].get("isError", False):
+                raise _model_protocol()
         return snapshot
     result = snapshot.get("result")
     if (type(result) is not dict or type(result.get("content")) is not list or "details" not in result
@@ -1049,6 +1120,10 @@ def _model_check_job(job, snapshot):
         # Keep the real failure, never turn absent evidence into a verdict.
         if snapshot["status"] == "exited" or not result.get("isError", False):
             raise _model_protocol()
+    elif type(details) is dict and details.get("schema") == "pi.host_job.interrupted.v1":
+        if snapshot["status"] not in ("killed", "timedOut") or not result.get("isError", False):
+            raise _model_protocol()
+        _model_check_progress(job, result, "pi.host_job.interrupted.v1")
     else:
         if (type(details) is not dict or details.get("schema") != "pi.eval.model-job.result.v1"
                 or details.get("operation") != job.operation or "result" not in details
@@ -1084,7 +1159,9 @@ async def _model_wait_job(job, timeout_ms, raise_errors):
         error.result = result
         error.job_id = job.id
         raise error
-    payload = result["details"].get("result") if result["details"] is not None else None
+    details = result["details"]
+    payload = (details["result"] if details is not None
+               and details.get("schema") == "pi.eval.model-job.result.v1" else None)
     if payload is None:
         return result
     if job.operation == "completion":
@@ -1121,6 +1198,11 @@ class _ModelJob:
 
     async def output(self):
         return (await self.status()).get("result")
+
+    async def progress(self):
+        if self.operation != "judgment_batch":
+            raise TypeError("EVAL_MODEL_INPUT: progress is available only for judgment batches")
+        return _model_progress_view(self, await self.status())
 
     async def cancel(self):
         return await _model_read_job(self, "cancel")
