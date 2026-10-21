@@ -1131,6 +1131,7 @@ fn sdk_conformance_event_ordering() {
             AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
             AgentEvent::FailoverStart { .. } => "FailoverStart",
             AgentEvent::FailoverEnd { .. } => "FailoverEnd",
+            AgentEvent::PrewalkSwitched { .. } => "PrewalkSwitched",
             AgentEvent::ExtensionError { .. } => "ExtensionError",
             AgentEvent::AdvisorNote { .. } => "AdvisorNote",
             AgentEvent::ProviderError { .. } => "ProviderError",

@@ -191,6 +191,7 @@ pub enum SlashCommand {
     Share,
     Mcp,
     Plan,
+    Prewalk,
     Advisor,
     Checkpoint,
     Rewind,
@@ -254,6 +255,7 @@ impl SlashCommand {
             Self::Share => "/share",
             Self::Mcp => "/mcp",
             Self::Plan => "/plan",
+            Self::Prewalk => "/prewalk",
             Self::Advisor => "/advisor",
             Self::Checkpoint => "/checkpoint",
             Self::Rewind => "/rewind",
@@ -312,6 +314,7 @@ impl SlashCommand {
         Self::Share,
         Self::Mcp,
         Self::Plan,
+        Self::Prewalk,
         Self::Advisor,
         Self::Checkpoint,
         Self::Rewind,
@@ -370,6 +373,7 @@ impl SlashCommand {
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
             "/plan" => Self::Plan,
+            "/prewalk" => Self::Prewalk,
             "/advisor" => Self::Advisor,
             "/checkpoint" | "/cp2" => Self::Checkpoint,
             "/rewind" => Self::Rewind,
@@ -424,6 +428,7 @@ impl SlashCommand {
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
   /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /prewalk [status|off] - Hand off to @smol after planning and the first edit
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
   /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
@@ -2675,6 +2680,7 @@ impl PiApp {
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
             SlashCommand::Plan => self.handle_slash_plan(args),
+            SlashCommand::Prewalk => self.handle_slash_prewalk(args),
             SlashCommand::Advisor => self.handle_slash_advisor(args),
             SlashCommand::Checkpoint => self.handle_slash_checkpoint(args),
             SlashCommand::Rewind => self.handle_slash_rewind(args),
@@ -3308,6 +3314,100 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         } else {
             format!("Role {role} set to {provider}/{model_id}")
         });
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_slash_prewalk(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Wait for the current turn before changing prewalk".to_string());
+            return None;
+        }
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        match args.trim() {
+            "off" => {
+                agent.handle.disarm_prewalk();
+                self.status_message = Some("Prewalk disarmed".to_string());
+                return None;
+            }
+            "status" => {
+                self.status_message = Some(agent.handle.prewalk_target().map_or_else(
+                    || "Prewalk is not armed".to_string(),
+                    |target| format!("Prewalk armed → {}", target.label()),
+                ));
+                return None;
+            }
+            "" => {}
+            _ => {
+                self.status_message = Some("Usage: /prewalk [status|off]".to_string());
+                return None;
+            }
+        }
+        let target = if let Some(target) = agent.handle.prewalk_target() {
+            target.clone()
+        } else {
+            let spec = self
+                .role_model_overrides
+                .get(&ModelRole::Smol)
+                .map(|(provider, model)| format!("{provider}/{model}"))
+                .or_else(|| {
+                    self.config
+                        .model_roles
+                        .as_ref()
+                        .and_then(|roles| roles.smol.clone())
+                });
+            let Some(spec) = spec else {
+                self.status_message = Some(
+                    "Prewalk requires a configured @smol model; use /model smol provider/model"
+                        .to_string(),
+                );
+                return None;
+            };
+            let Some(registry) = agent.handle.session().model_registry() else {
+                self.status_message = Some("Prewalk requires a model registry".to_string());
+                return None;
+            };
+            match crate::app::resolve_prewalk_model_spec(&spec, &self.config, registry, &self.cwd) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.status_message = Some(format!("Prewalk: {error}"));
+                    return None;
+                }
+            }
+        };
+        let owner = self.displayed_session_id.clone();
+        drop(agent);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let note = match OwnedMutexGuard::lock(agent, &cx).await {
+                Ok(mut agent) => {
+                    let current = agent
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await;
+                    if current.ok().as_ref() != owner.as_ref() {
+                        return;
+                    }
+                    match agent.handle.arm_prewalk(target).await {
+                        Ok(Some(target)) => format!("Prewalk armed → {}", target.label()),
+                        Ok(None) => {
+                            "Prewalk: nothing to switch; target model and thinking already match"
+                                .to_string()
+                        }
+                        Err(error) => format!("Prewalk: {error}"),
+                    }
+                }
+                Err(error) => format!("Prewalk: {error}"),
+            };
+            let _ = enqueue_pi_event(&event_tx, &cx, PiMsg::SystemNote(note)).await;
+        });
+        self.status_message = Some("Arming prewalk...".to_string());
         None
     }
 

@@ -925,6 +925,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             description: "Enter or manage read-only plan mode",
         },
         BuiltinSlashCommand {
+            name: "prewalk",
+            description: "Hand off to @smol after planning and the first edit",
+        },
+        BuiltinSlashCommand {
             name: "advisor",
             description: "Second-model turn review (advisor)",
         },

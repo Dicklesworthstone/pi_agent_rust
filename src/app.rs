@@ -1344,6 +1344,71 @@ pub fn resolve_role_model(
     None
 }
 
+/// Resolve a prewalk destination without the ordinary role selector's fallback
+/// or ad-hoc model creation: a typo must never choose an unintended paid model.
+pub fn resolve_prewalk_target(
+    spec: &str,
+    cli: &cli::Cli,
+    config: &Config,
+    registry: &ModelRegistry,
+    cwd: &Path,
+) -> Result<crate::prewalk::PrewalkTarget> {
+    let spec = spec.trim();
+    let spec = if let Some(name) = spec.strip_prefix('@') {
+        let role = ModelRole::from_name(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown prewalk role: {spec}"))?;
+        role_spec_from_cli(cli, role)
+            .or_else(|| config.model_roles.as_ref()
+                .and_then(|roles| role_spec_from_settings(roles, role)))
+            .ok_or_else(|| anyhow::anyhow!(
+                "Prewalk requires an explicit {spec} destination; configure modelRoles.{role} or use --prewalk-into provider/model"
+            ))?
+    } else {
+        spec
+    };
+    resolve_prewalk_model_spec(spec, config, registry, cwd)
+}
+
+/// Resolve a concrete prewalk model spec under the workspace provider policy.
+pub fn resolve_prewalk_model_spec(
+    spec: &str,
+    config: &Config,
+    registry: &ModelRegistry,
+    cwd: &Path,
+) -> Result<crate::prewalk::PrewalkTarget> {
+    let (model_spec, thinking) = match spec.rsplit_once(':') {
+        Some((prefix, suffix)) if parse_thinking_level_opt(suffix).is_some() => {
+            (prefix, parse_thinking_level_opt(suffix))
+        }
+        _ => (spec, None),
+    };
+    let entry = if let Some((provider, model)) = split_provider_model_spec(model_spec.trim()) {
+        registry.find(provider, model)
+    } else {
+        registry.find_by_id(model_spec.trim())
+    }
+    .ok_or_else(|| anyhow::anyhow!("Unknown prewalk model: {spec}"))?;
+    let scope = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| crate::failover::best_scope_override(overrides, cwd));
+    if crate::failover::provider_is_disabled(
+        config.disabled_providers.as_deref().unwrap_or_default(),
+        scope,
+        &entry.model.provider,
+    ) {
+        bail!(
+            "Prewalk destination provider is disabled: {}",
+            entry.model.provider
+        );
+    }
+    Ok(crate::prewalk::PrewalkTarget {
+        provider: entry.model.provider,
+        model: entry.model.id,
+        thinking,
+    })
+}
+
 /// The model spec a subagent child should run with when its agent definition
 /// does not pin `model:`.
 ///

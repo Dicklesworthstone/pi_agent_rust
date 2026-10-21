@@ -365,6 +365,10 @@ pub struct SessionOptions {
     pub model_scope: Option<Vec<String>>,
     pub api_key: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
+    /// One-shot handoff after planning and the first successful project edit.
+    /// Explicitly opt in for this session; resumed sessions never re-arm it
+    /// from saved history. The destination must be registered and authenticated.
+    pub prewalk: Option<crate::prewalk::PrewalkTarget>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     /// Built-in selection. `None` keeps CLI defaults; an empty vector disables
@@ -577,6 +581,7 @@ impl Default for SessionOptions {
             model_scope: None,
             api_key: None,
             thinking: None,
+            prewalk: None,
             system_prompt: None,
             append_system_prompt: None,
             enabled_tools: None,
@@ -2624,6 +2629,24 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// Arm a one-shot prewalk. Repeated calls preserve an already armed target.
+    /// `None` means the destination already matches the active model/reasoning.
+    pub async fn arm_prewalk(
+        &mut self,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.session.arm_prewalk(target).await
+    }
+
+    #[must_use]
+    pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
+        self.session.agent.prewalk_target()
+    }
+
+    pub fn disarm_prewalk(&mut self) {
+        self.session.agent.disarm_prewalk();
+    }
+
     /// Return the currently configured thinking level.
     pub const fn thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
         self.session.agent.stream_options().thinking_level
@@ -4040,6 +4063,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+    }
+
+    if let Some(target) = options.prewalk {
+        agent_session.arm_prewalk(target).await?;
     }
 
     let mut listeners = EventListeners::new();

@@ -329,6 +329,17 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AutoCompactionStart { reason } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
         }
+        AgentEvent::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => {
+            batcher.send_immediate(PiMsg::ProviderRecovery {
+                message: format!("Prewalk switched → {provider}/{model}:{thinking}"),
+                model: Some((provider.clone(), model.clone())),
+                discard_incomplete: false,
+            });
+        }
         AgentEvent::AdvisorNote { level, rationale } => {
             batcher.send_immediate(PiMsg::SystemNote(format!(
                 "[ADVISOR:{level}] {rationale}"

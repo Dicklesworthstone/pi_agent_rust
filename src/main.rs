@@ -1969,6 +1969,11 @@ async fn run(
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
     let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
+    if !is_interactive && (cli.prewalk || cli.prewalk_into.is_some()) {
+        bail!(
+            "Prewalk CLI flags require interactive mode; SDK callers can use SessionOptions.prewalk"
+        );
+    }
     // The default FTUI stack runs on an SDK session that boots its own
     // extension runtime (`pi::sdk::create_agent_session`), so the classic
     // startup below must not boot one as well: until 2026-09-02 every FTUI
@@ -2329,6 +2334,28 @@ async fn run(
         has_extensions,
     )?;
 
+    let prewalk_enabled = is_interactive
+        && !cli.no_prewalk
+        && (cli.prewalk
+            || cli.prewalk_into.is_some()
+            || (saved_workdir.is_none()
+                && config
+                    .prewalk
+                    .as_ref()
+                    .and_then(|settings| settings.enabled)
+                    == Some(true)));
+    let prewalk_target = if prewalk_enabled {
+        Some(pi::app::resolve_prewalk_target(
+            cli.prewalk_into.as_deref().unwrap_or("@smol"),
+            &cli,
+            &config,
+            &model_registry,
+            &cwd,
+        )?)
+    } else {
+        None
+    };
+
     let enabled_tools = cli.enabled_tools();
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
     // `clamp_max_tool_iterations` keeps invalid values out of the loop and
@@ -2375,6 +2402,7 @@ async fn run(
             model: cli.model.clone(),
             model_scope: cli.models.as_deref().map(pi::app::parse_models_arg),
             api_key: cli.api_key.clone(),
+            prewalk: prewalk_target.clone(),
             working_directory: Some(cwd.clone()),
             workspace_trusted,
             // Session persistence honors the same flags as the default
@@ -2512,6 +2540,14 @@ async fn run(
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
                 model_names: ftui_model_names,
                 start_in_plan_mode: cli.plan_mode,
+                prewalk_target: pi::app::resolve_prewalk_target(
+                    "@smol",
+                    &cli,
+                    &config,
+                    &model_registry,
+                    &cwd,
+                )
+                .ok(),
                 initial_content: initial,
                 initial_messages: messages,
                 double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
@@ -3073,6 +3109,15 @@ async fn run(
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+    }
+
+    if let Some(target) = prewalk_target {
+        match agent_session.arm_prewalk(target).await? {
+            Some(target) => eprintln!("Prewalk armed → {}", target.label()),
+            None => {
+                eprintln!("Prewalk: nothing to switch; target model and thinking already match")
+            }
+        }
     }
 
     // Clone session handle for shutdown flush (ensures autosave queue is drained).

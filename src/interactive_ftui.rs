@@ -1507,6 +1507,8 @@ pub enum UiCommand {
     /// Control read-only planning and session-bound review (`/plan`).
     /// The driver retains the exact displayed proposal, not the UI command.
     Plan { action: String },
+    /// Arm a one-shot model handoff, inspect it, or cancel it (`/prewalk`).
+    Prewalk { action: String },
     /// Roll back (`/undo`) or re-apply (`/redo`) recorded agent file edits
     /// (bd-cv653.3.13).
     Undo {
@@ -2997,6 +2999,28 @@ impl PiFtuiModel {
                 let text = sanitize(&text).into_owned();
                 self.push_entry(EntryRole::System, text);
             }
+            PiMsg::ProviderRecovery {
+                message,
+                model,
+                discard_incomplete,
+            } => {
+                if discard_incomplete {
+                    self.streaming.clear();
+                    self.thinking.clear();
+                } else {
+                    self.flush_stream();
+                }
+                if let Some((provider, model)) = model
+                    && let Some(snapshot) = &mut self.status_snapshot
+                {
+                    snapshot.model = self
+                        .model_names
+                        .get(&format!("{provider}/{model}"))
+                        .cloned()
+                        .unwrap_or(model);
+                }
+                self.push_entry(EntryRole::System, sanitize(&message).into_owned());
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
@@ -3754,6 +3778,20 @@ impl PiFtuiModel {
                 });
             } else {
                 self.push_entry(EntryRole::Error, plan_commands::USAGE.to_string());
+            }
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/prewalk") {
+            if matches!(rest.trim(), "" | "status" | "off") {
+                self.begin_busy("updating prewalk ...");
+                self.send_command(UiCommand::Prewalk {
+                    action: rest.trim().to_string(),
+                });
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("Usage: /prewalk [status|off]"),
+                );
             }
             return true;
         }
@@ -5993,6 +6031,17 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::AdvisorNote { level, rationale } => {
             vec![PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}"))]
         }
+        E::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => {
+            vec![PiMsg::ProviderRecovery {
+                message: format!("Prewalk switched → {provider}/{model}:{thinking}"),
+                model: Some((provider.clone(), model.clone())),
+                discard_incomplete: false,
+            }]
+        }
         E::AutoCompactionEnd {
             aborted,
             error_message,
@@ -6676,6 +6725,9 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     // before the driver thread's runtime exists, so it cannot carry one.
     // `replacement_options` installs the live one at each construction site.
     template.runtime_handle = None;
+    // Launch flags are one-shot intent, not a standing rule for restored
+    // sessions or branches. `/prewalk` can explicitly arm the new owner.
+    template.prewalk = None;
     template
 }
 
@@ -7284,6 +7336,42 @@ async fn run_set_model_command(
         Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
     };
     let _ = agent_tx.send(msg);
+}
+
+async fn run_prewalk_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    action: &str,
+    default_target: Option<&crate::prewalk::PrewalkTarget>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let message = match action {
+        "off" => {
+            handle.disarm_prewalk();
+            PiMsg::System(String::from("Prewalk disarmed"))
+        }
+        "status" => PiMsg::System(handle.prewalk_target().map_or_else(
+            || String::from("Prewalk is not armed"),
+            |target| format!("Prewalk armed → {}", target.label()),
+        )),
+        _ => {
+            let target = handle.prewalk_target().or(default_target).cloned();
+            match target {
+                Some(target) => match handle.arm_prewalk(target).await {
+                    Ok(Some(target)) => {
+                        PiMsg::System(format!("Prewalk armed → {}", target.label()))
+                    }
+                    Ok(None) => PiMsg::System(String::from(
+                        "Prewalk: nothing to switch; target model and thinking already match",
+                    )),
+                    Err(error) => PiMsg::AgentError(format!("Prewalk: {error}")),
+                },
+                None => PiMsg::AgentError(String::from(
+                    "Prewalk requires a configured @smol model; set --smol provider/model or modelRoles.smol",
+                )),
+            }
+        }
+    };
+    let _ = agent_tx.send(message);
 }
 
 /// Handle `/compact` in the driver: run compaction with events translated to
@@ -8993,6 +9081,8 @@ pub struct FtuiSettings {
     pub model_names: HashMap<String, String>,
     /// `--plan-mode`: start in planning, as the classic stack does.
     pub start_in_plan_mode: bool,
+    /// Resolved @smol destination for `/prewalk`; admission checks credentials.
+    pub prewalk_target: Option<crate::prewalk::PrewalkTarget>,
     /// CLI files and their first authored message, already read and bounded.
     pub initial_content: Option<crate::app::InitialMessage>,
     /// Remaining CLI messages, routed through the ordinary prompt path.
@@ -9066,9 +9156,11 @@ pub fn run(
         double_escape_action,
         model_names,
         start_in_plan_mode,
+        prewalk_target,
         mut initial_content,
         initial_messages,
     } = settings;
+    let prewalk_requested = session_options.prewalk.is_some();
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
         available_models.clone()
@@ -9188,6 +9280,13 @@ pub fn run(
                 let mut info_catalog = driver_catalog;
                 refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
+                if prewalk_requested {
+                    let note = handle.prewalk_target().map_or_else(
+                        || String::from("Prewalk: nothing to switch; target model and thinking already match"),
+                        |target| format!("Prewalk armed → {}", target.label()),
+                    );
+                    let _ = agent_tx.send(PiMsg::SystemNote(note));
+                }
                 Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #200: a session opened named at launch (--session)
                 // titles the terminal tab after itself immediately.
@@ -9249,6 +9348,9 @@ pub fn run(
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Prewalk { action }) => {
+                            run_prewalk_command(&mut handle, &action, prewalk_target.as_ref(), &agent_tx).await;
                         }
                         Ok(UiCommand::Settings) => {
                             let _ = agent_tx.send(PiMsg::Settings {

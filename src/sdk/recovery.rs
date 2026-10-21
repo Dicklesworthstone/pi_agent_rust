@@ -477,6 +477,11 @@ impl AgentSessionHandle {
         // this logical turn so retries and provider swaps reuse it after the
         // individual attempt has restored the session's ordinary prompt.
         let mut turn_system_prompt = self.session.agent.system_prompt().map(str::to_string);
+        let prewalk_origin = self
+            .session
+            .session_action_admission_gate()
+            .capture_origin();
+        self.session.agent.begin_prewalk_run();
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
@@ -517,11 +522,17 @@ impl AgentSessionHandle {
                 turn_system_prompt.as_deref(),
                 &shared,
                 &turn,
+                &prewalk_origin,
             )
             .await;
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
         let result = fence_session_persistence(&admission, result);
+        let interrupted = match &result {
+            Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
+            Err(_) => true,
+        };
+        self.session.agent.finish_prewalk_run(interrupted);
         turn.finish(&result);
         result
     }
@@ -858,6 +869,7 @@ impl AgentSessionHandle {
         turn_system_prompt: Option<&str>,
         shared: &EventCallback,
         turn: &LogicalTurn,
+        prewalk_origin: &crate::extensions::SessionActionOrigin,
     ) -> Result<AssistantMessage> {
         let mut progress = TurnProgress {
             retry_count: 0,
@@ -871,6 +883,43 @@ impl AgentSessionHandle {
         let mut failed_over = false;
         let mut current = first;
         loop {
+            // The native turn has already saved every result in the triggering
+            // tool batch. Continue that transcript exactly once, without the
+            // retry rewind or a second user message.
+            if current.is_ok()
+                && let Some(target) = self.session.agent.take_prewalk_handoff()
+            {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                progress.retry_count = 0;
+                failed_over = false;
+                ensure_not_aborted(abort_signal)?;
+                // An extension's explicit model selection outranks an armed
+                // automatic handoff. Check and commit under the same provider
+                // and session-action authority; native continuation installs
+                // a newer explicit choice without overwriting it.
+                if self
+                    .session
+                    .commit_prewalk_handoff(&target, prewalk_origin)
+                    .await?
+                {
+                    self.failover_state.clear();
+                    shared(AgentEvent::PrewalkSwitched {
+                        provider: target.provider,
+                        model: target.model,
+                        thinking: self
+                            .session
+                            .agent
+                            .stream_options()
+                            .thinking_level
+                            .unwrap_or_default(),
+                    });
+                }
+                ensure_not_aborted(abort_signal)?;
+                current = self
+                    .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                    .await;
+                continue;
+            }
             // Re-resolve after every committed swap. Compaction settings may
             // be overridden by an embedder and are not model-capacity evidence.
             let window = self

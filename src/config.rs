@@ -76,6 +76,8 @@ pub struct Config {
     pub model_roles: Option<ModelRoleSettings>,
     /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
     pub titling: Option<TitlingSettings>,
+    /// Opt in to a one-shot strong-to-small model handoff on fresh sessions.
+    pub prewalk: Option<PrewalkSettings>,
     /// Providers whose models are hidden from selection and cycling
     /// (bd-cv653.3.2). Canonical ids or aliases, case-insensitive.
     #[serde(alias = "disabledProviders")]
@@ -459,6 +461,14 @@ pub struct TitlingSettings {
     /// Master switch for automatic session titling (default: true).
     #[serde(alias = "autoTitle", alias = "auto")]
     pub auto_title: Option<bool>,
+}
+
+/// Prewalk is off unless explicitly enabled. The destination is the `smol`
+/// model role; CLI `--prewalk-into` can choose a destination for one launch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrewalkSettings {
+    pub enabled: Option<bool>,
 }
 
 /// A path-scoped model-set override (bd-cv653.3.2).
@@ -925,6 +935,12 @@ impl Config {
             enabled_models: other.enabled_models.or(base.enabled_models),
             model_roles: merge_model_roles(base.model_roles, other.model_roles),
             titling: merge_titling(base.titling, other.titling),
+            prewalk: match (base.prewalk, other.prewalk) {
+                (Some(base), Some(other)) => Some(PrewalkSettings {
+                    enabled: other.enabled.or(base.enabled),
+                }),
+                (base, other) => other.or(base),
+            },
             disabled_providers: other.disabled_providers.or(base.disabled_providers),
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
             tools: merge_tools(base.tools, other.tools),

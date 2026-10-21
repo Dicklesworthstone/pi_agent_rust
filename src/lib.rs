@@ -272,6 +272,7 @@ pub mod plan;
 pub mod platform;
 #[doc(hidden)]
 pub mod pmu_telemetry;
+pub mod prewalk;
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;

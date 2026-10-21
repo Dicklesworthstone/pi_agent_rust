@@ -1544,6 +1544,12 @@ pub enum AgentEvent {
     },
     /// Advisor verdict recorded for the session, before queued delivery (bd-cv653.3.3).
     AdvisorNote { level: String, rationale: String },
+    /// A planned one-shot handoff committed after a complete tool batch.
+    PrewalkSwitched {
+        provider: String,
+        model: String,
+        thinking: crate::model::ThinkingLevel,
+    },
     /// A provider request failed and ended the turn (#209). Emitted right
     /// before the `TurnEnd`/`AgentEnd` pair so consumers get the provider,
     /// HTTP status, and retryability as structured fields rather than having
@@ -1868,6 +1874,11 @@ pub struct Agent {
     /// Automatic retry/failover must not replenish the injection allowance.
     stream_rule_turn: usize,
 
+    /// A prewalk only yields to the owning SDK; it never installs a provider
+    /// inside the tool loop or lets a tool choose the destination.
+    prewalk: Option<crate::prewalk::PrewalkState>,
+    prewalk_budget: Option<PrewalkRunBudget>,
+
     /// Discoverable tools promoted into the live schema mid-session via
     /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
     /// execution takes `&self`.
@@ -1953,6 +1964,18 @@ struct ScopedRuleState {
     matcher: crate::context_files::ScopedRuleMatcher,
     workspace_root: PathBuf,
     activated: std::collections::HashSet<usize>,
+}
+
+/// A prewalk continuation and any recovery attempts share the original run
+/// clock and tool budget. The SDK resets this only at a public turn boundary.
+#[derive(Clone, Copy)]
+struct PrewalkRunBudget {
+    started: std::time::Instant,
+    max_time: Option<Duration>,
+    iterations: usize,
+    pause_continuations: usize,
+    turn_index: usize,
+    warned: bool,
 }
 
 /// A rule interruption is distinct from a provider failure or user abort.
@@ -2053,6 +2076,8 @@ impl Agent {
                 crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
             ),
             stream_rule_turn: 0,
+            prewalk: None,
+            prewalk_budget: None,
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
@@ -2168,6 +2193,58 @@ impl Agent {
             crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
         );
         self.stream_rule_turn = 0;
+        self.prewalk = None;
+        self.prewalk_budget = None;
+    }
+
+    /// The destination armed for this live session, never restored from disk.
+    #[must_use]
+    pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
+        self.prewalk.as_ref().map(|state| &state.target)
+    }
+
+    pub(crate) fn begin_prewalk_run(&mut self) {
+        // An abandoned SDK future may have yielded before it installed the
+        // target. A later public prompt must not silently resume that decision.
+        if self
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+        {
+            self.prewalk = None;
+        }
+        self.prewalk_budget = self.prewalk.as_ref().map(|_| PrewalkRunBudget {
+            started: std::time::Instant::now(),
+            max_time: self.config.max_time,
+            iterations: 0,
+            pause_continuations: 0,
+            turn_index: 0,
+            warned: false,
+        });
+    }
+
+    pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+        self.prewalk_budget = None;
+        if interrupted {
+            self.prewalk = None;
+        }
+    }
+
+    pub(crate) fn take_prewalk_handoff(&mut self) -> Option<crate::prewalk::PrewalkTarget> {
+        if self
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+        {
+            self.prewalk.take().map(|state| state.target)
+        } else {
+            None
+        }
+    }
+
+    /// Explicitly cancel a pending one-shot model handoff.
+    pub fn disarm_prewalk(&mut self) {
+        self.prewalk = None;
     }
 
     /// The shared tool approval state (bd-cv653.3.19).
@@ -2705,8 +2782,14 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
+        let mut system_prompt = self.config.system_prompt.as_deref().map(Cow::Borrowed);
+        if self.prewalk_budget.is_some() && self.prewalk.is_some() {
+            let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
+            prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
+            system_prompt = Some(Cow::Owned(prompt));
+        }
         Context {
-            system_prompt: self.config.system_prompt.as_deref().map(Cow::Borrowed),
+            system_prompt,
             messages,
             tools,
         }
@@ -3509,10 +3592,11 @@ impl Agent {
             .as_deref()
             .unwrap_or("")
             .into();
-        let mut iterations = 0usize;
-        let mut pause_turn_continuations = 0usize;
-        let mut warned_at_handoff_threshold = false;
-        let mut turn_index: usize = 0;
+        let budget = self.prewalk_budget;
+        let mut iterations = budget.map_or(0, |budget| budget.iterations);
+        let mut pause_turn_continuations = budget.map_or(0, |budget| budget.pause_continuations);
+        let mut warned_at_handoff_threshold = budget.is_some_and(|budget| budget.warned);
+        let mut turn_index = budget.map_or(0, |budget| budget.turn_index);
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
         let mut turn_keyword_words = std::collections::HashSet::new();
@@ -3592,8 +3676,8 @@ impl Agent {
         // Wall-clock run cap (bd-cv653.3.7, --max-time): checked at turn
         // boundaries — never mid-tool-call. On expiry the run stops with a
         // marker instead of starting another turn.
-        let run_started = std::time::Instant::now();
-        let max_time = self.config.max_time;
+        let run_started = budget.map_or_else(std::time::Instant::now, |budget| budget.started);
+        let max_time = budget.map_or(self.config.max_time, |budget| budget.max_time);
 
         'agent: loop {
             let mut has_more_tool_calls = true;
@@ -3882,6 +3966,9 @@ impl Agent {
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
                     pause_turn_continuations = pause_turn_continuations.saturating_add(1);
+                    if let Some(budget) = &mut self.prewalk_budget {
+                        budget.pause_continuations = pause_turn_continuations;
+                    }
                     if pause_turn_continuations <= MAX_PAUSE_TURN_CONTINUATIONS {
                         // The completed assistant message is already in history. The
                         // next stream request therefore resubmits it verbatim with
@@ -3900,6 +3987,9 @@ impl Agent {
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if execute_local_tools {
                     iterations += 1;
+                    if let Some(budget) = &mut self.prewalk_budget {
+                        budget.iterations = iterations;
+                    }
                     // Soft handoff: at >=80% of the cap, push a one-shot
                     // steering message so the agent has room to write an
                     // incomplete-handoff envelope before the hard stop. The
@@ -4072,6 +4162,39 @@ impl Agent {
                 on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
+                if let Some(budget) = &mut self.prewalk_budget {
+                    budget.turn_index = turn_index;
+                    budget.warned = warned_at_handoff_threshold;
+                }
+                let handoff = if self.prewalk_budget.is_some()
+                    && let Some(prewalk) = &mut self.prewalk
+                {
+                    prewalk.observe(&tool_calls, &tool_results);
+                    !tool_results.is_empty()
+                        && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
+                        && prewalk.yield_at_boundary()
+                } else {
+                    false
+                };
+                if handoff {
+                    // The tool executor may already have drained steering
+                    // (including the original iteration-budget warning).
+                    // Persist those deliveries exactly once before the SDK
+                    // continues; unfetched input stays in the live mailbox.
+                    for delivery in steering_after_tools.take().unwrap_or_default() {
+                        self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
+                        let message = self.consume_queued_delivery(delivery);
+                        self.messages.push(message.clone());
+                        on_event(AgentEvent::MessageStart {
+                            message: message.clone(),
+                        });
+                        on_event(AgentEvent::MessageEnd {
+                            message: message.clone(),
+                        });
+                        new_messages.push(message);
+                    }
+                    break 'agent;
+                }
 
                 if let Some(steering) = steering_after_tools.take() {
                     pending_messages = steering;
@@ -6848,8 +6971,14 @@ impl AdvisorTurn {
                 .advisor
                 .as_ref()
                 .map(|_| Arc::new(StdMutex::new(None))),
-            started: Instant::now(),
-            max_time: session.agent.config.max_time,
+            started: session
+                .agent
+                .prewalk_budget
+                .map_or_else(Instant::now, |budget| budget.started),
+            max_time: session
+                .agent
+                .prewalk_budget
+                .map_or(session.agent.config.max_time, |budget| budget.max_time),
         }
     }
 
@@ -13638,6 +13767,7 @@ mod abort_tests {
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::AdvisorNote { .. } => "advisor_note",
+            AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
             AgentEvent::ProviderError { .. } => "provider_error",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
@@ -15885,20 +16015,59 @@ impl AgentSession {
     }
 
     pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
-        self.ensure_provider_reentry_allowed()?;
         let current_thinking = self
             .agent
             .stream_options()
             .thinking_level
             .unwrap_or_default();
-        let prepared = self.prepare_model_selection(provider_id, model_id, current_thinking)?;
-        let target_provider_id = prepared.provider_id.clone();
-        let target_model_id = prepared.model_id.clone();
-        let next_thinking = prepared.thinking_level;
-        let active_provider = self.agent.provider();
-        let runtime_model_changed = active_provider.name() != target_provider_id
-            || active_provider.model_id() != target_model_id;
+        let admission = self.provider_admission.clone();
+        self.set_provider_model_selection(
+            provider_id,
+            model_id,
+            current_thinking,
+            ProviderSwapAdmission::Gate(&admission),
+            false,
+        )
+        .await?;
+        self.agent.disarm_prewalk();
+        Ok(())
+    }
 
+    /// A prewalk keeps provider and session-action authority from provenance
+    /// validation through durable installation. A newer explicit selection
+    /// wins; navigation to a different session generation refuses continuation.
+    pub(crate) async fn commit_prewalk_handoff(
+        &mut self,
+        target: &crate::prewalk::PrewalkTarget,
+        origin: &SessionActionOrigin,
+    ) -> Result<bool> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire_origin(origin).await?;
+        self.set_provider_model_selection(
+            &target.provider,
+            &target.model,
+            target.thinking.unwrap_or_default(),
+            ProviderSwapAdmission::Held(&authority),
+            true,
+        )
+        .await
+    }
+
+    /// Install model and reasoning level in one durable transition. Automatic
+    /// selection checks provenance while holding the same lock used to save it.
+    #[allow(clippy::too_many_lines)]
+    async fn set_provider_model_selection(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        thinking: crate::model::ThinkingLevel,
+        admission: ProviderSwapAdmission<'_>,
+        automatic: bool,
+    ) -> Result<bool> {
+        self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_request();
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
@@ -15911,6 +16080,41 @@ impl AgentSession {
             .effective_thinking_level_for_current_path()
             .as_deref()
             .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
+        if automatic {
+            let runtime = self.agent.provider();
+            let catalog = self
+                .model_registry
+                .as_ref()
+                .map_or(&[][..], ModelRegistry::models);
+            let model_matches = previous_model.as_ref().is_none_or(|(provider, model)| {
+                crate::models::model_identities_match(
+                    catalog,
+                    runtime.name(),
+                    runtime.model_id(),
+                    provider,
+                    model,
+                )
+            });
+            let thinking_matches = previous_thinking.is_none_or(|thinking| {
+                self.agent
+                    .stream_options()
+                    .thinking_level
+                    .unwrap_or_default()
+                    == thinking
+            });
+            if !model_matches || !thinking_matches {
+                return Ok(false);
+            }
+        }
+        // Respect a newer explicit selection before refreshing credentials for
+        // an automatic destination that will no longer be used.
+        let prepared = self.prepare_model_selection(provider_id, model_id, thinking)?;
+        let target_provider_id = prepared.provider_id.clone();
+        let target_model_id = prepared.model_id.clone();
+        let next_thinking = prepared.thinking_level;
+        let active_provider = self.agent.provider();
+        let runtime_model_changed = active_provider.name() != target_provider_id
+            || active_provider.model_id() != target_model_id;
         if previous_model
             .as_ref()
             .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
@@ -15932,8 +16136,7 @@ impl AgentSession {
         if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
             candidate.append_thinking_level_change(next_thinking.to_string());
         }
-        let _provider_transition = self
-            .provider_admission
+        let _provider_transition = admission
             .begin_transition(
                 "model selection persistence was interrupted before live installation completed"
                     .to_string(),
@@ -15959,7 +16162,64 @@ impl AgentSession {
         drop(session);
         self.install_prepared_model_selection(prepared);
         self.clear_provider_reentry_quarantine();
-        Ok(())
+        Ok(true)
+    }
+
+    /// Arm a one-shot SDK-driven handoff. No provider request is made here.
+    /// Re-arming preserves an existing target. A target matching the current
+    /// model and reasoning level is a no-op, returned as `None`.
+    pub async fn arm_prewalk(
+        &mut self,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.ensure_provider_reentry_allowed()?;
+        if let Some(current) = self.agent.prewalk_target() {
+            return Ok(Some(current.clone()));
+        }
+        let entry = self
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(&target.provider, &target.model))
+            .ok_or_else(|| Error::validation("PREWALK_TARGET: select a registered model"))?;
+        let thinking = target.thinking.unwrap_or_else(|| {
+            self.agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default()
+        });
+        let prepared =
+            self.prepare_model_selection(&entry.model.provider, &entry.model.id, thinking)?;
+        let target = crate::prewalk::PrewalkTarget {
+            provider: prepared.provider_id,
+            model: prepared.model_id,
+            thinking: Some(prepared.thinking_level),
+        };
+        let active = self.agent.provider();
+        if active.name() == target.provider
+            && active.model_id() == target.model
+            && self
+                .agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default()
+                == prepared.thinking_level
+        {
+            return Ok(None);
+        }
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        let todo_ready = self.agent.shared_tools().snapshot().get("todo").is_none()
+            || !crate::todo::latest_from_entries(session.entries_for_current_path()).is_empty();
+        drop(session);
+        self.agent.prewalk = Some(crate::prewalk::PrewalkState::new(
+            target.clone(),
+            todo_ready,
+        ));
+        Ok(Some(target))
     }
 
     /// Update the thinking/reasoning level for this session at runtime.
@@ -16024,6 +16284,7 @@ impl AgentSession {
         }
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
+        self.agent.disarm_prewalk();
         self.refresh_extension_completion_host_state();
         if changed {
             self.clear_provider_reentry_quarantine();
@@ -16169,6 +16430,9 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
+        if runtime_model_changed || current_thinking != effective {
+            self.agent.disarm_prewalk();
+        }
         self.clear_provider_reentry_quarantine();
         Ok(())
     }
@@ -18529,6 +18793,11 @@ impl AgentSession {
             let mut message = result?;
             for continuation in 0..=MAX_ADVISOR_CONTINUATIONS {
                 if message.stop_reason != StopReason::Stop
+                    || self
+                        .agent
+                        .prewalk
+                        .as_ref()
+                        .is_some_and(crate::prewalk::PrewalkState::yielded)
                     || time_cap_marker(&message).is_some()
                     || abort.is_some_and(AbortSignal::is_aborted)
                     || turn.time_exhausted()

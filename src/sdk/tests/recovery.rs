@@ -1981,6 +1981,307 @@ fn write_tool_response() -> (u16, &'static str, String) {
     )
 }
 
+fn prewalk_tool_batch(calls: &[(&str, &str, Value)]) -> (u16, &'static str, String) {
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, args))| {
+            serde_json::json!({
+                "index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": args.to_string()}
+            })
+        })
+        .collect::<Vec<_>>();
+    let chunk = serde_json::json!({
+        "id": "chatcmpl-prewalk", "object": "chat.completion.chunk", "created": 0,
+        "model": "walk-source",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": calls}, "finish_reason": null}]
+    });
+    let end = serde_json::json!({
+        "id": "chatcmpl-prewalk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    });
+    (
+        200,
+        "text/event-stream",
+        format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+    )
+}
+
+fn prewalk_http_handle(
+    dir: &Path,
+    source_url: &str,
+    target_url: &str,
+    with_todo: bool,
+    max_tool_iterations: usize,
+) -> AgentSessionHandle {
+    let mut source = crate::models::ad_hoc_model_entry("openai", "walk-source").unwrap();
+    source.model.api = "openai-completions".to_string();
+    source.model.base_url = source_url.to_string();
+    source.api_key = Some("source-fixture-key".to_string());
+    let mut target = crate::models::ad_hoc_model_entry("groq", "walk-target").unwrap();
+    target.model.api = "openai-completions".to_string();
+    target.model.base_url = target_url.to_string();
+    target.model.context_window = 65_536;
+    target.model.max_tokens = 8_192;
+    target.model.input = vec![crate::provider::InputType::Text];
+    target.api_key = Some("target-fixture-key".to_string());
+    let provider = crate::providers::create_provider(&source, None).unwrap();
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&["write", "read"], dir, None),
+        AgentConfig {
+            system_prompt: Some("ordinary-system".to_string()),
+            max_tool_iterations,
+            stream_options: StreamOptions {
+                api_key: source.api_key.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut stored = Session::create_with_dir(Some(dir.join("sessions")));
+    stored.header.cwd = dir.display().to_string();
+    stored.header.provider = Some(source.model.provider.clone());
+    stored.header.model_id = Some(source.model.id.clone());
+    let mut session = AgentSession::new(
+        agent,
+        Arc::new(AsyncMutex::new(stored)),
+        true,
+        ResolvedCompactionSettings {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    session.set_model_registry(ModelRegistry::from_entries_for_tests(vec![source, target]));
+    session.set_auth_storage(AuthStorage::empty_at(dir.join("auth.json")));
+    if with_todo {
+        let stored = Arc::clone(&session.session);
+        session
+            .agent
+            .extend_tools(vec![Box::new(crate::todo::TodoTool::new(stored))]);
+    }
+    AgentSessionHandle::from_session_with_listeners(session, EventListeners::new())
+}
+
+fn prewalk_destination() -> crate::prewalk::PrewalkTarget {
+    crate::prewalk::PrewalkTarget {
+        provider: "groq".to_string(),
+        model: "walk-target".to_string(),
+        thinking: Some(crate::model::ThinkingLevel::Off),
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn prewalk_cross_provider_persists_the_whole_batch_and_retains_hook_prompt_across_retry() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![prewalk_tool_batch(&[
+        (
+            "walk-plan",
+            "todo",
+            serde_json::json!({"op":"init", "tasks":["implement both files"]}),
+        ),
+        (
+            "walk-first",
+            "write",
+            serde_json::json!({"path":"first.txt", "content":"first"}),
+        ),
+        (
+            "walk-second",
+            "write",
+            serde_json::json!({"path":"second.txt", "content":"second"}),
+        ),
+    ])]);
+    let mut target = RecoveryHttpFixture::new(vec![capacity_response(), completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, true, 32)
+        .with_retry(Some(fast_retry_policy(1)));
+    install_native_content_hooks(&mut handle, &serde_json::json!({"action":"continue"}));
+    assert!(
+        run_async(handle.arm_prewalk(prewalk_destination()))
+            .unwrap()
+            .is_some()
+    );
+    let (events, callback) = event_log();
+    let store = handle.session_store();
+    let result = run_async(handle.prompt("implement both files", move |event| {
+        if matches!(event, AgentEvent::PrewalkSwitched { .. }) {
+            let saved = store.try_lock().expect("handoff releases session lock");
+            let durable = std::fs::read_to_string(saved.path.as_ref().unwrap()).unwrap();
+            assert!(durable.contains("walk-first") && durable.contains("walk-second"));
+            assert_eq!(saved.header.provider.as_deref(), Some("groq"));
+            assert_eq!(saved.header.model_id.as_deref(), Some("walk-target"));
+        }
+        callback(event);
+    }))
+    .unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert!(
+        handle.prewalk_target().is_none(),
+        "one-shot handoff is consumed"
+    );
+    assert_eq!(handle.compaction_settings().context_window_tokens, 65_536);
+    assert_eq!(
+        handle.session.agent.stream_options().max_tokens,
+        Some(8_192)
+    );
+    assert!(!handle.session.agent.model_accepts_images());
+    assert_eq!(
+        handle.session.agent.system_prompt(),
+        Some("ordinary-system")
+    );
+    assert_prompt_hook_ran_once(&handle);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("first.txt")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("second.txt")).unwrap(),
+        "second"
+    );
+    let source_requests = source.requests.lock().unwrap();
+    assert_eq!(
+        source_requests.len(),
+        1,
+        "strong model stops at the first completed edit batch"
+    );
+    assert!(source_requests[0].to_string().contains("## Prewalk"));
+    let target_requests = target.requests.lock().unwrap();
+    assert_eq!(target_requests.len(), 2, "target retry stays on the target");
+    for request in &*target_requests {
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            3
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user"
+                        && message["content"].to_string().contains("implement both files")
+                })
+                .count(),
+            1
+        );
+        assert!(request.to_string().contains("native-content-hook"));
+        assert!(!request.to_string().contains("## Prewalk"));
+    }
+    let events = events.lock().unwrap();
+    for kind in ["agent_start", "agent_end", "prewalk_switched"] {
+        assert_eq!(
+            events.iter().filter(|event| event["type"] == kind).count(),
+            1,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .count(),
+        3
+    );
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some(handle.model())
+    );
+    assert!(!crate::todo::latest_from_entries(reopened.entries_for_current_path()).is_empty());
+    assert_eq!(
+        reopened
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, Message::ToolResult(_)))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn prewalk_preserves_the_original_tool_budget_across_the_handoff() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![prewalk_tool_batch(&[(
+        "over-budget",
+        "write",
+        serde_json::json!({"path":"second.txt", "content":"must not run"}),
+    )])]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 1);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let result = run_async(handle.prompt("write two files", |_| {})).unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(source.requests.lock().unwrap().len(), 1);
+    assert_eq!(target.requests.lock().unwrap().len(), 1);
+    assert_eq!(result.stop_reason, StopReason::Error);
+    assert!(
+        result
+            .error_message
+            .unwrap()
+            .contains("Maximum tool iterations (1)")
+    );
+    assert!(dir.path().join("result.txt").is_file());
+    assert!(!dir.path().join("second.txt").exists());
+}
+
+#[test]
+fn prewalk_cancellation_at_the_completed_batch_never_calls_the_destination() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let (abort, signal) = AbortHandle::new();
+    let result = run_async(handle.prompt_with_abort("write once", signal, move |event| {
+        if matches!(event, AgentEvent::TurnEnd { ref tool_results, .. } if !tool_results.is_empty()) {
+            abort.abort();
+        }
+    }));
+    source.finish();
+    target.finish();
+    assert!(
+        matches!(&result, Err(Error::Aborted))
+            || matches!(&result, Ok(message) if message.stop_reason == StopReason::Aborted)
+    );
+    assert_eq!(handle.model().0, "openai");
+    assert!(handle.prewalk_target().is_none());
+    assert!(target.requests.lock().unwrap().is_empty());
+    assert!(dir.path().join("result.txt").is_file());
+}
+
+#[test]
+fn prewalk_waits_for_a_real_todo_list_when_the_tool_is_available() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response(), completion_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, true, 32);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let result = run_async(handle.prompt("edit without creating todos", |_| {})).unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(handle.model().0, "openai");
+    assert!(handle.prewalk_target().is_some());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn real_tool_work_survives_retry_once_and_terminal_end_follows_persistence() {

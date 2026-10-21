@@ -81,6 +81,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-extensions"
         | "plan-mode"
         | "plan-yolo"
+        | "prewalk"
+        | "no-prewalk"
         | "yolo"
         | "auto-approve"
         | "explain-extension-policy"
@@ -116,6 +118,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "slow"
         | "plan"
         | "advisor"
+        | "prewalk-into"
         | "approval-mode"
         | "thinking"
         | "system-prompt"
@@ -382,6 +385,18 @@ pub struct Cli {
     /// Model spec for the `advisor` role (turn-review second model).
     #[arg(long, value_name = "PROVIDER/MODEL")]
     pub advisor: Option<String>,
+
+    /// Plan with the initial model, then hand off to @smol after the first edit.
+    #[arg(long, conflicts_with = "no_prewalk")]
+    pub prewalk: bool,
+
+    /// Prewalk destination: provider/model[:thinking] or an explicit @role.
+    #[arg(long, value_name = "MODEL_OR_ROLE", conflicts_with = "no_prewalk")]
+    pub prewalk_into: Option<String>,
+
+    /// Disable prewalk for this launch, overriding prewalk.enabled in settings.
+    #[arg(long, conflicts_with_all = ["prewalk", "prewalk_into"])]
+    pub no_prewalk: bool,
 
     /// Start in plan mode: read-only planning until a plan is approved
     /// (bd-cv653.3.5).
