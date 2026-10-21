@@ -110,12 +110,24 @@ impl Prepared {
         }
     }
 
-    async fn run(self, structured_results: bool) -> Result<ToolOutput> {
+    async fn run(
+        self,
+        structured_results: bool,
+        progress: futures::channel::oneshot::Receiver<workflow::Progress>,
+    ) -> Result<ToolOutput> {
         match self {
             Self::Delegation { request, mode } => {
+                drop(progress);
                 Ok(result_output(request.run(None).await, mode, structured_results))
             }
-            Self::Workflow(plan) => plan.run(None).await,
+            Self::Workflow(plan) => {
+                // Do not start a graph before its progress sink has the actual
+                // native job ID. Abandoned admission cannot leave orphan work.
+                let progress = progress.await.map_err(|_| Error::tool(
+                    "subagent", "PI_WORKFLOW_PROGRESS_ADMISSION: job handoff did not complete",
+                ))?;
+                plan.with_progress(progress).run(None).await
+            }
         }
     }
 }
@@ -186,8 +198,11 @@ pub(super) async fn start(
     }
     let request = Request::parse(input)?;
     let deadline = request.deadline(tool)?;
+    // Sample now BEFORE remaining(): this bound may shorten by the sampling
+    // interval, never extend the delegation's monotonic deadline.
+    let job_deadline = std::time::Instant::now() + deadline.remaining();
     let session_id = resolve_session(&tool.job_session_scope, &owner, deadline).await?;
-    let admission = crate::jobs::admit_owned_task(&session_id)?;
+    let admission = crate::jobs::admit_owned_task(&session_id)?.with_deadline(job_deadline);
     let prepared = request.prepare(tool, deadline)?;
     let mode = prepared.mode();
     if resolve_session(&tool.job_session_scope, &owner, deadline).await? != session_id {
@@ -202,6 +217,8 @@ pub(super) async fn start(
     let timeout = deadline.remaining();
     let structured_results = tool.structured_results;
     let artifacts = tool.global_dir.join("tool-output-artifacts");
+    let progress_privacy = (mode == "workflow").then(|| privacy.clone());
+    let (publish, progress) = futures::channel::oneshot::channel();
     let job = crate::jobs::spawn_owned_task(
         admission,
         &format!("subagent {mode}"),
@@ -209,11 +226,20 @@ pub(super) async fn start(
         timeout,
         Some(&artifacts),
         privacy,
-        prepared.run(structured_results),
+        prepared.run(structured_results, progress),
     )?;
+    if let Some(privacy) = progress_privacy {
+        // No await after job publication. If cancellation already retired the
+        // receiver, the existing job ID still identifies its terminal outcome;
+        // never submit the graph again to obtain another acknowledgment.
+        let _ = publish.send(workflow::Progress::new(session_id, job.id.clone(), privacy));
+    }
+    let progress_notice = if mode == "workflow" {
+        " Settled-wave progress is in job.result.details.partialResult; cancellation or timeout preserves the last screened checkpoint. Pending nodes there have unresolved outcomes, not guaranteed absence of side effects."
+    } else { "" };
     Ok(ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(format!(
-            "Background subagent {mode} started as {}. Use jobs wait/cancel with this jobId. Its settled result contains the ordinary native subagent results; completion is also delivered to the owning session.",
+            "Background subagent {mode} started as {}. Use jobs wait/cancel with this jobId. Its settled result contains the ordinary native subagent results; completion is also delivered to the owning session.{progress_notice}",
             job.id,
         )))],
         details: Some(json!({

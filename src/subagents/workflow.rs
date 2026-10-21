@@ -22,7 +22,10 @@ use crate::tools::ToolOutput;
 
 mod decision;
 mod fanout;
+mod progress;
 mod selected_inputs;
+
+pub(super) use progress::Progress;
 
 const MAX_NODES: usize = 32;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -191,11 +194,17 @@ pub(super) struct PreparedWorkflow {
     runner: ChildRunner,
     agents: BTreeMap<String, AgentDefinition>,
     deadline: Deadline,
+    progress: Option<Progress>,
 }
 
 impl PreparedWorkflow {
+    pub(super) fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
     pub(super) async fn run(self, update: Option<UpdateCallback>) -> Result<ToolOutput> {
-        self.plan.run(self.runner, self.agents, self.deadline, update).await
+        self.plan.run(self.runner, self.agents, self.deadline, update, self.progress).await
     }
 }
 
@@ -322,7 +331,7 @@ impl Plan {
         ).with_parent_model(parent_model);
         check_authority(&owner)?;
         deadline.check().map_err(|message| Error::tool("subagent", message))?;
-        Ok(PreparedWorkflow { plan: self, runner, agents, deadline })
+        Ok(PreparedWorkflow { plan: self, runner, agents, deadline, progress: None })
     }
 
     pub(super) async fn execute(self, tool: &SubagentTool, update: Option<UpdateCallback>) -> Result<ToolOutput> {
@@ -336,6 +345,7 @@ impl Plan {
         agents: BTreeMap<String, AgentDefinition>,
         deadline: Deadline,
         update: Option<UpdateCallback>,
+        mut progress: Option<Progress>,
     ) -> Result<ToolOutput> {
         let owner = AgentCx::for_current_or_request();
         check_authority(&owner)?;
@@ -386,7 +396,12 @@ impl Plan {
                     }
                 }
             }
-            if admitted.is_empty() { continue; }
+            if admitted.is_empty() {
+                if let Some(progress) = &mut progress {
+                    progress.publish(&records, wave, waves_run)?;
+                }
+                continue;
+            }
             // This barrier is intentional. All peers use one captured baseline
             // per root; accepted writes settle in authored order before any
             // downstream node can observe them. No alternate spawn/apply path.
@@ -404,6 +419,12 @@ impl Plan {
                     Some(item) => records[index].settle_fanout(result, item)?,
                     None => records[index].settle(result, wave),
                 }
+            }
+            // Never publish provisional child output. Native worktree/schema
+            // acceptance for the whole wave has settled before this checkpoint
+            // becomes visible or a dependant wave can start.
+            if let Some(progress) = &mut progress {
+                progress.publish(&records, wave, waves_run)?;
             }
         }
         for record in &mut records {
@@ -599,7 +620,7 @@ pub(super) fn schema(mut schema: Value) -> Value {
     task_schema["properties"]["outputSchema"]["type"] = json!(["object", "boolean"]);
     schema["definitions"]["workflowTask"] = task_schema;
     schema["properties"]["async"]["description"] = json!(
-        "Return a managed background job for a single, tasks, chain or workflow request. jobs wait returns the complete native result (workflow nodes for a graph); cancellation and session shutdown retire unfinished children. Definitions, model and one deadline freeze before acknowledgment. seance remains foreground."
+        "Return a managed background job for a single, tasks, chain or workflow request. jobs wait returns the complete native result. Background workflows also publish bounded settled-wave checkpoints in job.result.details.partialResult; cancellation/timeouts preserve the last screened checkpoint, not unfinished child results. Pending means unresolved at that checkpoint, not proof that execution never started. Definitions, model and one deadline freeze before acknowledgment. seance remains foreground."
     );
     schema["properties"]["workflow"] = json!({
         "type":"array", "minItems":1, "maxItems":MAX_NODES,
