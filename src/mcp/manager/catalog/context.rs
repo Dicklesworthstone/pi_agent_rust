@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use super::super::{Arc, McpManager, McpTransport, ServerEntry, tool_err};
-use super::{CatalogByteBudget, DEFAULT_MCP_TIMEOUT, Instant, MAX_CURSOR_BYTES};
+#[cfg(test)]
+use super::DEFAULT_MCP_TIMEOUT;
+use super::{CatalogByteBudget, Instant, MAX_CURSOR_BYTES};
 use crate::error::{Error, Result};
 
 const MAX_CONTEXT_ITEMS: usize = 1024;
@@ -498,14 +500,9 @@ impl McpManager {
     ) -> Result<Value> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         super::check_request_owner(&owner)?;
+        let timeout = self.entry(server)?.timeout();
         owner
-            .with_current(self.request_context_with_timeout(
-                server,
-                method,
-                params,
-                shape,
-                DEFAULT_MCP_TIMEOUT,
-            ))
+            .with_current(self.request_context_with_timeout(server, method, params, shape, timeout))
             .await
     }
 
@@ -818,6 +815,9 @@ mod tests {
             url: Some("https://context.invalid/mcp".to_string()),
             headers: Vec::new(),
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };

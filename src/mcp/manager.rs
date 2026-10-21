@@ -17,6 +17,8 @@ use crate::error::{Error, Result};
 
 mod calls;
 mod catalog;
+#[cfg(test)]
+mod config_tests;
 mod connection;
 #[cfg(test)]
 mod live_catalog_tests;
@@ -255,7 +257,27 @@ impl ServerEntry {
     fn effective_cwd(&self, manager_default: &Path) -> PathBuf {
         self.cwd_override
             .clone()
-            .unwrap_or_else(|| manager_default.to_path_buf())
+            .unwrap_or_else(|| self.config.effective_cwd(manager_default))
+    }
+
+    fn timeout(&self) -> Duration {
+        self.config
+            .timeout_ms
+            .map_or(DEFAULT_MCP_TIMEOUT, Duration::from_millis)
+    }
+
+    fn check_enabled(&self) -> Result<()> {
+        if self.config.enabled {
+            Ok(())
+        } else {
+            Err(tool_err(
+                "MCP_SERVER_DISABLED",
+                format!(
+                    "server {:?} is disabled by configuration; enable it in its source or native user settings and restart the session before trusting or using it",
+                    self.config.name
+                ),
+            ))
+        }
     }
 }
 
@@ -485,7 +507,11 @@ impl McpManager {
                     target,
                     provenance: config.provenance.label().to_string(),
                     trust: trust.to_string(),
-                    health: health.label(),
+                    health: if config.enabled {
+                        health.label()
+                    } else {
+                        "disabled".to_string()
+                    },
                     tools,
                     source_file: config.source_file.clone(),
                 }
@@ -504,6 +530,7 @@ impl McpManager {
     /// the eager connect fails (the trust decision still stands).
     pub async fn trust(&self, name: &str) -> Result<Vec<McpToolMeta>> {
         let entry = self.entry(name)?;
+        entry.check_enabled()?;
         let fingerprint = self.trust_fingerprint_for(&entry);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
@@ -818,6 +845,7 @@ impl McpManager {
     /// failures mark the server `Failed` until `/mcp test` revives it.
     /// Trust gate (fail-closed with a named remedy).
     fn check_trust(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+        entry.check_enabled()?;
         let decision = self
             .trust_store()?
             .decision(&entry.config.name, &self.trust_fingerprint_for(entry));
@@ -845,6 +873,12 @@ impl McpManager {
         cwd: &Path,
         trust_path: &Path,
     ) -> Result<TrustWriteGuard> {
+        if !config.enabled {
+            return Err(tool_err(
+                "MCP_SERVER_DISABLED",
+                "server is disabled by configuration",
+            ));
+        }
         let fingerprint = config.fingerprint(cwd);
         let mut store = TrustStore::load(trust_path)?;
         let (decision, guard) = store.locked_decision(&config.name, &fingerprint)?;
@@ -1039,7 +1073,7 @@ impl McpManager {
                         "version": crate::platform::VERSION,
                     },
                 }),
-                DEFAULT_MCP_TIMEOUT,
+                entry.timeout(),
             )
             .await
         {
@@ -1154,6 +1188,7 @@ impl McpManager {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         connection::check_transport_owner(&owner, &config)?;
         let cwd = entry.effective_cwd(&self.inner.cwd);
+        let workspace = self.inner.cwd.clone();
         let trust_path = self.inner.trust_path.clone();
         #[cfg(test)]
         let factory = Self::lock(&self.inner.transport_factory).clone();
@@ -1210,6 +1245,7 @@ impl McpManager {
                     config.provenance,
                     super::config::validate_http_header_value,
                     &cwd,
+                    &workspace,
                 )?;
                 ensure_active()?;
                 return Ok(
@@ -1228,6 +1264,7 @@ impl McpManager {
                 config.provenance,
                 super::config::validate_env_value,
                 &cwd,
+                &workspace,
             )?;
             ensure_active()?;
             let transport =
@@ -1385,6 +1422,9 @@ impl McpManager {
         servers
             .values()
             .filter_map(|entry| {
+                if !entry.config.enabled {
+                    return None;
+                }
                 if store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
                     != TrustDecision::Acknowledged
                 {
@@ -1472,10 +1512,7 @@ impl McpManager {
             .await;
     }
 
-    fn invalidate_notified_catalog(
-        entry: &ServerEntry,
-        transport: &Arc<dyn McpTransport>,
-    ) -> bool {
+    fn invalidate_notified_catalog(entry: &ServerEntry, transport: &Arc<dyn McpTransport>) -> bool {
         if !transport.take_tools_list_changed() {
             return false;
         }
@@ -1519,8 +1556,9 @@ impl McpManager {
         let mut tracked = Vec::new();
         let mut pending = Vec::new();
         for entry in servers.values().filter(|entry| {
-            store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
-                == TrustDecision::Acknowledged
+            entry.config.enabled
+                && store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
+                    == TrustDecision::Acknowledged
                 && (!stale_only || !Self::catalog_is_fresh(entry))
         }) {
             let entry = Arc::clone(entry);
@@ -1652,6 +1690,9 @@ impl McpManager {
                 url: optional_string(spec, "url")?,
                 headers: optional_string_map(spec, "headers")?,
                 transport_hint,
+                enabled: super::config::configured_enabled(spec)?,
+                cwd: None,
+                timeout_ms: super::config::configured_timeout(spec)?,
                 provenance: Provenance::Extension,
                 source_file: extension_id.map_or_else(
                     || PathBuf::from("<extension>"),
@@ -1769,9 +1810,10 @@ fn resolve_server_secrets(
     provenance: Provenance,
     validate_value: fn(&str) -> std::result::Result<(), String>,
     cwd: &Path,
+    workspace: &Path,
 ) -> Result<Vec<(String, String)>> {
     if provenance != Provenance::Acp {
-        return resolve_secrets(entries, validate_value, cwd);
+        return resolve_secrets(entries, validate_value, cwd, workspace);
     }
     entries
         .iter()
@@ -1803,6 +1845,7 @@ mod acp_literal_tests {
             Provenance::Acp,
             super::super::config::validate_env_value,
             Path::new("."),
+            Path::new("."),
         )
         .expect("literal ACP values");
         assert_eq!(resolved, entries);
@@ -1811,6 +1854,7 @@ mod acp_literal_tests {
                 &[("TOKEN".into(), "bad\r\nvalue".into())],
                 Provenance::Acp,
                 super::super::config::validate_http_header_value,
+                Path::new("."),
                 Path::new("."),
             )
             .is_err()
@@ -1838,13 +1882,23 @@ mod acp_literal_tests {
             super::super::config::validate_env_value as fn(&str) -> std::result::Result<(), String>,
             super::super::config::validate_http_header_value,
         ] {
-            let resolved =
-                resolve_server_secrets(&entries, Provenance::GlobalPi, validate, project.path())
-                    .expect("resolve in selected workspace");
+            let resolved = resolve_server_secrets(
+                &entries,
+                Provenance::GlobalPi,
+                validate,
+                project.path(),
+                project.path(),
+            )
+            .expect("resolve in selected workspace");
             assert_eq!(resolved[0].1, "selected-workspace-token");
-            let resolved =
-                resolve_server_secrets(&entries, Provenance::GlobalPi, validate, other.path())
-                    .expect("resolve in another selected workspace");
+            let resolved = resolve_server_secrets(
+                &entries,
+                Provenance::GlobalPi,
+                validate,
+                other.path(),
+                other.path(),
+            )
+            .expect("resolve in another selected workspace");
             assert_eq!(resolved[0].1, "different-workspace-token");
         }
         assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
@@ -1856,8 +1910,14 @@ fn resolve_secrets(
     entries: &[(String, String)],
     validate_value: fn(&str) -> std::result::Result<(), String>,
     cwd: &Path,
+    workspace: &Path,
 ) -> Result<Vec<(String, String)>> {
     resolve_secrets_with(entries, validate_value, |raw| {
+        // Expand literal templates directly. Never feed expanded data back
+        // through $CMD/$ENV parsing: an environment value is data, not code.
+        if raw.contains("${") && !raw.trim().starts_with("$CMD:") {
+            return super::config::expand_config_value(raw, workspace).map(Some);
+        }
         crate::auth::resolve_secret_reference(raw, cwd)
     })
 }
@@ -2277,6 +2337,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2310,6 +2373,9 @@ mod tests {
                 url: None,
                 headers: Vec::new(),
                 transport_hint: Some("stdio".to_string()),
+                enabled: true,
+                cwd: None,
+                timeout_ms: None,
                 provenance: Provenance::ProjectPi,
                 source_file: cwd.join(".pi/mcp.json"),
             })
@@ -2504,6 +2570,9 @@ mod tests {
             url: Some("https://fixture.invalid/mcp".to_string()),
             headers: Vec::new(),
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2758,6 +2827,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2816,6 +2888,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -3053,6 +3128,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };
@@ -3165,6 +3243,9 @@ mod tests {
             url: Some("http://127.0.0.1:1/mcp".to_string()),
             headers: vec![("Authorization".to_string(), command)],
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -3283,6 +3364,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -3401,6 +3485,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };

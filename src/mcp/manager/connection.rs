@@ -5,8 +5,8 @@
 //! owned until cleanup has settled, including cancellation racing publication.
 
 use super::{
-    Arc, DEFAULT_MCP_TIMEOUT, Duration, Error, Instant, McpManager, McpTransport, Result,
-    ServerEntry, ServerHealth, catalog, tool_err,
+    Arc, Duration, Error, Instant, McpManager, McpTransport, Result, ServerEntry, ServerHealth,
+    catalog, tool_err,
 };
 use crate::agent_cx::AgentCx;
 
@@ -123,14 +123,12 @@ fn setup_timeout() -> Error {
 
 impl McpManager {
     pub(super) async fn ensure_ready(&self, entry: &Arc<ServerEntry>) -> Result<()> {
-        self.ensure_ready_owned(entry, DEFAULT_MCP_TIMEOUT, true)
-            .await
+        self.ensure_ready_owned(entry, entry.timeout(), true).await
     }
 
     /// Startup, trust, test, and recovery already hold this connection's lane.
     pub(super) async fn ensure_ready_in_lane(&self, entry: &Arc<ServerEntry>) -> Result<()> {
-        self.ensure_ready_owned(entry, DEFAULT_MCP_TIMEOUT, false)
-            .await
+        self.ensure_ready_owned(entry, entry.timeout(), false).await
     }
 
     async fn ensure_ready_owned(
@@ -326,6 +324,9 @@ mod tests {
             url: Some("https://setup.invalid/mcp".to_string()),
             headers: Vec::new(),
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };

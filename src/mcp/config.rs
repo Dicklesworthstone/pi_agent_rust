@@ -8,7 +8,8 @@
 //! 4. `~/.pi/agent/mcp.json` (global native)
 //! 5. Foreign files (`.claude/mcp.json`, `.cursor/mcp.json`,
 //!    `.windsurf/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`
-//!    under the project) — marked `provenance=foreign`.
+//!    under the project, including OMP and VS Code) — marked `provenance=foreign`.
+//! 6. Project-root `mcp.json` / `.mcp.json` portable fallbacks.
 //!
 //! Merge semantics: per server name, the highest-precedence source wins the
 //! whole definition; every server records where it came from. Malformed
@@ -30,6 +31,8 @@ use sha2::{Digest, Sha256};
 
 const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
+/// Keep every MCP operation bounded, including imported OMP configurations.
+pub(super) const MAX_MCP_TIMEOUT_MS: u64 = 3_600_000;
 
 /// `HttpTransport` always installs Content-Type + Accept and may add an MCP
 /// session and protocol-version headers after initialize. Leave room for all
@@ -165,6 +168,12 @@ pub struct ConfiguredServer {
     pub headers: Vec<(String, String)>,
     /// Explicit transport hint (`"stdio"` / `"http"` / `"sse"`).
     pub transport_hint: Option<String>,
+    /// Explicit configuration disablement is independent of operator trust.
+    pub enabled: bool,
+    /// Working directory, anchored to the session workspace during discovery.
+    pub cwd: Option<PathBuf>,
+    /// Per-operation timeout in milliseconds; absent means the native default.
+    pub timeout_ms: Option<u64>,
     /// Where the definition came from.
     pub provenance: Provenance,
     /// Source file it was read from.
@@ -172,6 +181,22 @@ pub struct ConfiguredServer {
 }
 
 impl ConfiguredServer {
+    /// Resolve execution paths consistently for trust, identity, and spawn.
+    #[must_use]
+    pub fn effective_cwd(&self, workspace: &Path) -> PathBuf {
+        self.cwd.as_ref().map_or_else(
+            || canonical_cwd(workspace),
+            |cwd| {
+                let path = if cwd.is_absolute() {
+                    cwd.clone()
+                } else {
+                    workspace.join(cwd)
+                };
+                canonical_cwd(&path)
+            },
+        )
+    }
+
     /// Versioned cryptographic fingerprint of the complete execution surface.
     ///
     /// Trust is global on disk, so the digest binds not only the target but
@@ -378,6 +403,12 @@ impl ConfiguredServer {
 pub(super) fn validate_transport_shape(
     config: &ConfiguredServer,
 ) -> std::result::Result<(), String> {
+    validate_timeout(config.timeout_ms)?;
+    if let Some(cwd) = &config.cwd
+        && (cwd.as_os_str().is_empty() || cwd.to_string_lossy().chars().any(is_terminal_control))
+    {
+        return Err("cwd must be a nonempty path without control characters".to_string());
+    }
     let hint = config.transport_hint.as_deref().map(str::trim);
     if hint.is_some_and(str::is_empty) {
         return Err("transport type must not be empty".to_string());
@@ -660,7 +691,7 @@ pub(crate) fn display_safe(text: &str) -> String {
 }
 
 /// One raw server entry (tolerant: unknown fields ignored).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawServer {
     #[serde(default)]
@@ -675,11 +706,174 @@ struct RawServer {
     headers: Option<HashMap<String, String>>,
     #[serde(default, rename = "type")]
     transport: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default, rename = "timeout", alias = "timeoutMs", alias = "timeout_ms")]
+    timeout_ms: Option<u64>,
 }
 
 /// Parse one server entry; `Err` carries the skip reason.
 fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, String> {
-    serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))
+    for key in [
+        "enabled",
+        "disabled",
+        "cwd",
+        "timeout",
+        "timeoutMs",
+        "timeout_ms",
+    ] {
+        if raw.get(key).is_some_and(Value::is_null) {
+            return Err(format!("entry {name:?}: field {key:?} must not be null"));
+        }
+    }
+    let server: RawServer =
+        serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))?;
+    validate_timeout(server.timeout_ms)?;
+    Ok(server)
+}
+
+pub(super) fn validate_timeout(timeout_ms: Option<u64>) -> std::result::Result<(), String> {
+    if timeout_ms.is_some_and(|value| !(1..=MAX_MCP_TIMEOUT_MS).contains(&value)) {
+        return Err(format!(
+            "timeout must be an integer from 1 to {MAX_MCP_TIMEOUT_MS} milliseconds; zero/unbounded timeouts are not supported"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn configured_enabled(value: &Value) -> Result<bool, String> {
+    let flag = |key: &str| -> Result<Option<bool>, String> {
+        value
+            .get(key)
+            .map(|flag| {
+                flag.as_bool()
+                    .ok_or_else(|| format!("field {key:?} must be a boolean"))
+            })
+            .transpose()
+    };
+    Ok(flag("enabled")? != Some(false) && flag("disabled")? != Some(true))
+}
+
+pub(super) fn configured_timeout(value: &Value) -> Result<Option<u64>, String> {
+    let mut timeout = None;
+    for key in ["timeout", "timeoutMs", "timeout_ms"] {
+        if let Some(value) = value.get(key) {
+            if timeout.is_some() {
+                return Err("timeout aliases must not be combined".to_string());
+            }
+            timeout = Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| "timeout must be an integer in milliseconds".to_string())?,
+            );
+        }
+    }
+    validate_timeout(timeout)?;
+    Ok(timeout)
+}
+
+/// Expand OMP `${VAR}` / `${VAR:-default}` and VS Code `${env:VAR}`.
+/// Non-secret fields expand before trust; env/header values use this same
+/// parser only at the already-trusted transport-construction boundary.
+pub(super) fn expand_config_value(raw: &str, cwd: &Path) -> Result<String, String> {
+    expand_config_value_with(raw, cwd, |name| std::env::var(name).ok())
+}
+
+fn expand_config_value_with(
+    raw: &str,
+    cwd: &Path,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut output = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let expression = &rest[start + 2..];
+        let Some(end) = expression.find('}') else {
+            return Err("unterminated MCP configuration variable".to_string());
+        };
+        let expression = &expression[..end];
+        let value = if expression == "workspaceFolder" {
+            cwd.to_string_lossy().into_owned()
+        } else {
+            let expression = expression.strip_prefix("env:").unwrap_or(expression);
+            let (name, fallback) = expression
+                .split_once(":-")
+                .map_or((expression, None), |(name, fallback)| {
+                    (name, Some(fallback))
+                });
+            let mut bytes = name.bytes();
+            if !bytes
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == b'_')
+                || !bytes.all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+            {
+                return Err("unsupported MCP configuration variable; use ${VAR}, ${VAR:-default}, ${env:VAR}, or ${workspaceFolder}".to_string());
+            }
+            lookup(name)
+                .filter(|value| !value.is_empty())
+                .or_else(|| fallback.map(str::to_string))
+                .ok_or_else(|| {
+                    format!("MCP configuration environment variable {name:?} is unset or empty")
+                })?
+        };
+        if output.len().saturating_add(value.len()) > MAX_MCP_ENV_VALUE_BYTES {
+            return Err("expanded MCP configuration value exceeds 65536 bytes".to_string());
+        }
+        output.push_str(&value);
+        rest = &rest[start + 2 + end + 1..];
+    }
+    if output.len().saturating_add(rest.len()) > MAX_MCP_ENV_VALUE_BYTES {
+        return Err("expanded MCP configuration value exceeds 65536 bytes".to_string());
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+#[derive(Default)]
+struct ServerSelection {
+    disabled: std::collections::HashSet<String>,
+    disabled_sources: HashMap<String, (Provenance, PathBuf)>,
+    enabled: std::collections::HashSet<String>,
+    invalid: bool,
+}
+
+impl ServerSelection {
+    fn load(
+        &mut self,
+        root: &serde_json::Map<String, Value>,
+        provenance: Provenance,
+        path: &Path,
+    ) -> Result<(), String> {
+        for (key, destination) in [
+            ("disabledServers", &mut self.disabled),
+            ("enabledServers", &mut self.enabled),
+        ] {
+            let Some(value) = root.get(key) else {
+                continue;
+            };
+            let names = value
+                .as_array()
+                .ok_or_else(|| format!("{key} must be an array of server names"))?;
+            for name in names {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| format!("{key} must contain only server names"))?;
+                validate_server_name(name)?;
+                destination.insert(name.to_string());
+                if key == "disabledServers" {
+                    self.disabled_sources
+                        .entry(name.to_string())
+                        .or_insert_with(|| (provenance, path.to_path_buf()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_bounded_config(path: &Path) -> std::io::Result<String> {
@@ -726,6 +920,74 @@ fn read_bounded_config(path: &Path) -> std::io::Result<String> {
     })
 }
 
+/// Parse the file envelope without interpreting individual server definitions.
+fn parse_server_map(
+    path: &Path,
+    provenance: Provenance,
+    content: &str,
+    selection: &mut ServerSelection,
+) -> Result<HashMap<String, Value>, String> {
+    // Use the TOML parser so booleans, nested env/header tables, quoted names,
+    // multiline arrays and comments keep their meaning during Codex import.
+    let value = if path.extension().is_some_and(|e| e == "toml") {
+        parse_codex_toml(content)?
+    } else {
+        serde_json::from_str(content).map_err(|err| format!("invalid JSON: {err}"))?
+    };
+    // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
+    // Presence of the wrapper is authoritative even when it is empty; never
+    // reinterpret unrelated top-level settings as a fallback server map.
+    let root = value
+        .as_object()
+        .ok_or_else(|| "MCP config root must be an object".to_string())?;
+    // Only operator-selected and native user files may override another
+    // source's enable flag. A lower-priority project's enable list cannot
+    // authorize a disabled global definition. Deny always wins over enable.
+    if matches!(provenance, Provenance::Cli | Provenance::GlobalPi)
+        && let Err(reason) = selection.load(root, provenance, path)
+    {
+        selection.invalid = true;
+        return Err(reason);
+    }
+    let vscode = path.ends_with(Path::new(".vscode/mcp.json"));
+    let wrapped = root.get("mcpServers").or_else(|| {
+        if vscode {
+            root.get("servers")
+                .or_else(|| root.get("mcp").and_then(|mcp| mcp.get("servers")))
+        } else {
+            None
+        }
+    });
+    if let Some(wrapped) = wrapped {
+        let wrapped = wrapped.as_object().ok_or_else(|| {
+            "MCP server map must be an object (mcpServers, or VS Code servers)".to_string()
+        })?;
+        Ok(wrapped.clone().into_iter().collect())
+    } else if provenance.is_native() {
+        // Native and explicit CLI files are MCP-only surfaces. Claim every
+        // bare-map key before parsing so a malformed high-precedence override
+        // cannot fall through to an older, already-trusted definition.
+        Ok(root
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "$schema" | "disabledServers" | "enabledServers"
+                )
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect())
+    } else {
+        // Foreign settings files share their root with unrelated settings, so
+        // only object values carrying an MCP execution field are candidates.
+        Ok(root
+            .iter()
+            .filter(|(_, value)| value.get("command").is_some() || value.get("url").is_some())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect())
+    }
+}
+
 /// Load one config file.
 ///
 /// Returns `true` when a whole-file failure in a native or explicitly selected
@@ -737,6 +999,7 @@ fn load_file(
     out: &mut Vec<(String, RawServer, Provenance, PathBuf)>,
     warnings: &mut Vec<ConfigWarning>,
     claimed_names: &mut std::collections::HashSet<String>,
+    selection: &mut ServerSelection,
 ) -> bool {
     let content = match read_bounded_config(path) {
         Ok(content) => content,
@@ -752,16 +1015,8 @@ fn load_file(
             return provenance.is_native();
         }
     };
-    // TOML is only supported for .codex/config.toml via a minimal parse: the
-    // [mcp_servers.NAME] tables. Everything else is JSON.
-    let parsed: std::result::Result<Value, String> =
-        if path.extension().is_some_and(|e| e == "toml") {
-            Ok(parse_codex_toml(&content))
-        } else {
-            serde_json::from_str(&content).map_err(|err| format!("invalid JSON: {err}"))
-        };
-    let value = match parsed {
-        Ok(value) => value,
+    let servers = match parse_server_map(path, provenance, &content, selection) {
+        Ok(servers) => servers,
         Err(reason) => {
             warnings.push(ConfigWarning {
                 source_file: path.to_path_buf(),
@@ -770,40 +1025,6 @@ fn load_file(
             });
             return provenance.is_native();
         }
-    };
-    // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
-    // Presence of the wrapper is authoritative even when it is empty; never
-    // reinterpret unrelated top-level settings as a fallback server map.
-    let Some(root) = value.as_object() else {
-        warnings.push(ConfigWarning {
-            source_file: path.to_path_buf(),
-            entry: "<file>".to_string(),
-            reason: "MCP config root must be an object".to_string(),
-        });
-        return provenance.is_native();
-    };
-    let servers: HashMap<String, Value> = if let Some(wrapped) = root.get("mcpServers") {
-        let Some(wrapped) = wrapped.as_object() else {
-            warnings.push(ConfigWarning {
-                source_file: path.to_path_buf(),
-                entry: "<file>".to_string(),
-                reason: "mcpServers must be an object".to_string(),
-            });
-            return provenance.is_native();
-        };
-        wrapped.clone().into_iter().collect()
-    } else if provenance.is_native() {
-        // Native and explicit CLI files are MCP-only surfaces. Claim every
-        // bare-map key before parsing so a malformed high-precedence override
-        // cannot fall through to an older, already-trusted definition.
-        root.clone().into_iter().collect()
-    } else {
-        // Foreign settings files share their root with unrelated settings, so
-        // only object values carrying an MCP execution field are candidates.
-        root.iter()
-            .filter(|(_, value)| value.get("command").is_some() || value.get("url").is_some())
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
     };
     for (name, raw) in servers {
         // A higher-precedence definition owns its name even when malformed.
@@ -814,77 +1035,67 @@ fn load_file(
         }
         match parse_server(&name, &raw) {
             Ok(server) => out.push((name, server, provenance, path.to_path_buf())),
-            Err(reason) => warnings.push(ConfigWarning {
-                source_file: path.to_path_buf(),
-                entry: name,
-                reason,
-            }),
+            Err(reason) => {
+                // A disabled entry still owns its name when another field is
+                // malformed. Keep an inert reservation so later extension
+                // registration cannot bypass that explicit disablement.
+                if raw.get("enabled").and_then(Value::as_bool) == Some(false)
+                    || raw.get("disabled").and_then(Value::as_bool) == Some(true)
+                {
+                    out.push((
+                        name.clone(),
+                        RawServer {
+                            disabled: Some(true),
+                            ..RawServer::default()
+                        },
+                        provenance,
+                        path.to_path_buf(),
+                    ));
+                }
+                warnings.push(ConfigWarning {
+                    source_file: path.to_path_buf(),
+                    entry: name,
+                    reason,
+                });
+            }
         }
     }
     false
 }
 
-/// Minimal TOML extraction for `.codex/config.toml` `[mcp_servers.NAME]`
-/// tables (string values and string arrays only — the MCP surface).
-/// Never fails: unrecognized lines are ignored.
-fn parse_codex_toml(content: &str) -> Value {
-    let mut servers = serde_json::Map::new();
-    let mut current: Option<(String, serde_json::Map<String, Value>)> = None;
-    let flush = |current: Option<(String, serde_json::Map<String, Value>)>,
-                 servers: &mut serde_json::Map<String, Value>| {
-        if let Some((name, table)) = current {
-            servers.insert(name, Value::Object(table));
-        }
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(name) = line
-            .strip_prefix("[mcp_servers.")
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            let finished = current.take();
-            flush(finished, &mut servers);
-            current = Some((name.trim_matches('"').to_string(), serde_json::Map::new()));
-            continue;
-        }
-        if line.starts_with('[') {
-            let finished = current.take();
-            flush(finished, &mut servers);
-            continue;
-        }
-        if let (Some((_, table)), Some((key, value))) = (current.as_mut(), line.split_once('=')) {
-            let key = key.trim().to_string();
-            let value = value.trim();
-            let parsed = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .map_or_else(
-                    || {
-                        if value.starts_with('[') {
-                            serde_json::from_str(&value.replace('\'', "\"")).unwrap_or(Value::Null)
-                        } else {
-                            Value::String(value.trim_matches('"').to_string())
-                        }
-                    },
-                    |stripped| Value::String(stripped.to_string()),
-                );
-            table.insert(key, parsed);
+/// Extract only Codex's MCP tables from a fully parsed TOML document.
+fn parse_codex_toml(content: &str) -> Result<Value, String> {
+    let value: toml::Value =
+        toml::from_str(content).map_err(|_| "invalid TOML in MCP configuration".to_string())?;
+    let servers = value
+        .get("mcp_servers")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let mut servers = serde_json::to_value(servers)
+        .map_err(|_| "cannot decode Codex MCP configuration".to_string())?;
+    if let Some(servers) = servers.as_object_mut() {
+        for server in servers.values_mut().filter_map(Value::as_object_mut) {
+            if let Some(headers) = server.remove("http_headers") {
+                server.entry("headers").or_insert(headers);
+            }
         }
     }
-    flush(current, &mut servers);
-    Value::Object(serde_json::Map::from_iter([(
-        "mcpServers".to_string(),
-        Value::Object(servers),
-    )]))
+    Ok(serde_json::json!({"mcpServers": servers}))
 }
 
 /// Foreign discovery candidates under the project root.
 const FOREIGN_PROJECT_FILES: &[&str] = &[
+    ".omp/mcp.json",
     ".claude/mcp.json",
+    ".claude/.mcp.json",
     ".cursor/mcp.json",
     ".windsurf/mcp.json",
+    ".windsurf/mcp_config.json",
     ".gemini/settings.json",
     ".codex/config.toml",
+    ".vscode/mcp.json",
+    "mcp.json",
+    ".mcp.json",
 ];
 
 /// The merged discovery result.
@@ -918,6 +1129,7 @@ pub fn discover(
     let mut layered: Vec<(String, RawServer, Provenance, PathBuf)> = Vec::new();
     let mut warnings = Vec::new();
     let mut claimed_names = std::collections::HashSet::new();
+    let mut selection = ServerSelection::default();
 
     // Precedence high → low. Later layers only fill names not already set. A
     // whole-file failure in a native or explicit source blocks every lower
@@ -934,6 +1146,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -943,6 +1156,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -952,6 +1166,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked {
@@ -961,6 +1176,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -971,17 +1187,44 @@ pub fn discover(
                 &mut layered,
                 &mut warnings,
                 &mut claimed_names,
+                &mut selection,
             );
         }
     }
 
     let mut servers = Vec::new();
+    if selection.invalid {
+        return McpDiscovery { servers, warnings };
+    }
     for (name, raw, provenance, source_file) in layered {
         if let Err(reason) = validate_server_name(&name) {
             warnings.push(ConfigWarning {
                 source_file,
                 entry: name,
                 reason,
+            });
+            continue;
+        }
+        let enabled = !selection.disabled.contains(&name)
+            && raw.disabled != Some(true)
+            && (raw.enabled != Some(false) || selection.enabled.contains(&name));
+        if !enabled {
+            // Keep the name occupied even without an executable, credentials,
+            // or a currently available working directory. Neither a lower
+            // file nor an extension may revive a disabled definition.
+            servers.push(ConfiguredServer {
+                name,
+                command: raw.command,
+                args: raw.args.unwrap_or_default(),
+                env: Vec::new(),
+                url: raw.url,
+                headers: Vec::new(),
+                transport_hint: raw.transport,
+                enabled: false,
+                cwd: None,
+                timeout_ms: raw.timeout_ms,
+                provenance,
+                source_file,
             });
             continue;
         }
@@ -1008,14 +1251,65 @@ pub fn discover(
                 continue;
             }
         };
+        let execution = (|| -> Result<_, String> {
+            let command = raw
+                .command
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let args = raw
+                .args
+                .unwrap_or_default()
+                .iter()
+                .map(|value| expand_config_value(value, cwd))
+                .collect::<Result<Vec<_>, _>>()?;
+            let url = raw
+                .url
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let server_cwd = raw
+                .cwd
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let server_cwd = server_cwd
+                .map(|value| {
+                    if value.is_empty() {
+                        return Err("cwd must not be empty".to_string());
+                    }
+                    let path = PathBuf::from(value);
+                    Ok(canonical_cwd(&if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    }))
+                })
+                .transpose()?;
+            Ok((command, args, url, server_cwd))
+        })();
+        let (command, args, url, server_cwd) = match execution {
+            Ok(values) => values,
+            Err(reason) => {
+                warnings.push(ConfigWarning {
+                    source_file,
+                    entry: name,
+                    reason,
+                });
+                continue;
+            }
+        };
         let config = ConfiguredServer {
             name,
-            command: raw.command,
-            args: raw.args.unwrap_or_default(),
+            command,
+            args,
             env,
-            url: raw.url,
+            url,
             headers,
             transport_hint: raw.transport,
+            enabled,
+            cwd: server_cwd,
+            timeout_ms: raw.timeout_ms,
             provenance,
             source_file,
         };
@@ -1028,6 +1322,26 @@ pub fn discover(
             continue;
         }
         servers.push(config);
+    }
+    // The denylist also applies to extension definitions registered after
+    // discovery, even when no file currently defines that server name.
+    for (name, (provenance, source_file)) in selection.disabled_sources {
+        if !servers.iter().any(|server| server.name == name) {
+            servers.push(ConfiguredServer {
+                name,
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                transport_hint: None,
+                enabled: false,
+                cwd: None,
+                timeout_ms: None,
+                provenance,
+                source_file,
+            });
+        }
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
     McpDiscovery { servers, warnings }
@@ -1671,6 +1985,9 @@ mod tests {
             url: None,
             headers: Vec::new(),
             transport_hint: None,
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::GlobalPi,
             source_file: PathBuf::from("/tmp/whatever.json"),
         }
@@ -1847,6 +2164,9 @@ mod tests {
             url: Some("https://example.invalid/mcp".to_string()),
             headers: Vec::new(),
             transport_hint: None,
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::GlobalPi,
             source_file: PathBuf::from("/tmp/remote.json"),
         };
@@ -1954,6 +2274,309 @@ mod tests {
         assert_eq!(
             config,
             json!({"mcpServers": {"docs": {"url": "https://example.test"}}, "other": 1})
+        );
+    }
+
+    #[test]
+    fn omp_vscode_and_portable_configs_follow_native_precedence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        for (file, contents) in [
+            (
+                ".pi/mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"native"}}}"#,
+            ),
+            (
+                ".omp/mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"omp"},"omp":{"command":"omp"}}}"#,
+            ),
+            (
+                ".vscode/mcp.json",
+                r#"{"servers":{"shared":{"command":"vscode"},"vscode":{"command":"code"}},"inputs":[{}]}"#,
+            ),
+            (
+                "mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"portable"},"portable":{"command":"root"}}}"#,
+            ),
+            (
+                ".mcp.json",
+                r#"{"mcpServers":{"portable":{"command":"hidden"},"hidden":{"command":"hidden"}}}"#,
+            ),
+        ] {
+            write(&cwd.join(file), contents);
+        }
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 5);
+        let server = |name| {
+            discovery
+                .servers
+                .iter()
+                .find(|server| server.name == name)
+                .unwrap()
+        };
+        assert_eq!(server("shared").command.as_deref(), Some("native"));
+        assert_eq!(server("portable").command.as_deref(), Some("root"));
+        for name in ["omp", "vscode", "portable", "hidden"] {
+            assert_eq!(server(name).provenance, Provenance::Foreign);
+        }
+    }
+
+    #[test]
+    fn vscode_nested_servers_are_not_confused_with_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".vscode/mcp.json"),
+            r#"{
+            "mcp":{"servers":{"docs":{"command":"docs-server","enabled":false}}},
+            "inputs":[{"id":"token","type":"promptString"}]
+        }"#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 1);
+        assert!(!discovery.servers[0].enabled);
+    }
+
+    #[test]
+    fn imported_configs_are_not_read_without_workspace_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for file in [".omp/mcp.json", ".vscode/mcp.json", "mcp.json", ".mcp.json"] {
+            write(&temp.path().join(file), "{malformed must never be read");
+        }
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], false);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings.is_empty());
+    }
+
+    #[test]
+    fn disabled_override_keeps_its_name_without_resolving_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{
+            "docs":{"enabled":false,"command":"${PI_MCP_MISSING_DISABLED_COMMAND}"},
+            "absent":{"disabled":true}
+        }}"#,
+        );
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"fallback"},"absent":{"command":"fallback"}}}"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 2);
+        assert!(discovery.servers.iter().all(|server| !server.enabled));
+        assert!(
+            discovery
+                .servers
+                .iter()
+                .all(|server| server.provenance == Provenance::ProjectPi)
+        );
+    }
+
+    #[test]
+    fn native_user_selection_deny_wins_and_can_enable_foreign_definitions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            r#"{"mcpServers":{
+            "allowed":{"command":"server","enabled":false},
+            "blocked":{"command":"server","enabled":false},
+            "explicit":{"command":"server","disabled":true}
+        }}"#,
+        );
+        write(
+            &global.join("mcp.json"),
+            r#"{
+            "enabledServers":["allowed","blocked","explicit"],
+            "disabledServers":["blocked","extension-only"]
+        }"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 4);
+        let enabled: Vec<_> = discovery
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["allowed"]);
+        let placeholder = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "extension-only")
+            .unwrap();
+        assert_eq!(placeholder.source_file, global.join("mcp.json"));
+        assert!(placeholder.command.is_none());
+    }
+
+    #[test]
+    fn malformed_enable_and_timeout_fields_cannot_fall_back_to_trusted_definitions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        for invalid in [
+            serde_json::json!({"enabled":"false"}),
+            serde_json::json!({"enabled":null}),
+            serde_json::json!({"disabled":"true"}),
+            serde_json::json!({"timeout":0}),
+            serde_json::json!({"timeout":-1}),
+            serde_json::json!({"timeout":1.5}),
+            serde_json::json!({"timeout":3_600_001}),
+            serde_json::json!({"timeout":1000,"timeout_ms":1000}),
+            serde_json::json!({"cwd":null}),
+        ] {
+            write(
+                &temp.path().join(".pi/mcp.json"),
+                &serde_json::json!({"mcpServers":{"docs":invalid}}).to_string(),
+            );
+            write(
+                &global.join("mcp.json"),
+                r#"{"mcpServers":{"docs":{"command":"fallback"}}}"#,
+            );
+            let discovery = discover(temp.path(), &global, &[], true);
+            assert!(discovery.servers.is_empty(), "{invalid}");
+            assert_eq!(discovery.warnings.len(), 1, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn malformed_user_denylist_cannot_leave_project_servers_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"server"}}}"#,
+        );
+        write(&global.join("mcp.json"), r#"{"disabledServers":"docs"}"#);
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+    }
+
+    #[test]
+    fn malformed_disabled_entry_still_reserves_the_name_for_later_extensions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            r#"{"mcpServers":{
+            "docs":{"enabled":false,"timeout":0,"command":"server"}
+        }}"#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.servers.len(), 1);
+        assert_eq!(discovery.servers[0].name, "docs");
+        assert!(!discovery.servers[0].enabled);
+        assert!(discovery.servers[0].command.is_none());
+    }
+
+    #[test]
+    fn file_cwd_expansion_and_timeout_survive_discovery_and_bind_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join("server")).unwrap();
+        write(
+            &cwd.join(".omp/mcp.json"),
+            r#"{"mcpServers":{"docs":{
+            "command":"./serve","args":["${workspaceFolder}/input"],
+            "cwd":"server","timeout":120000,
+            "env":{"TOKEN":"${PI_MCP_DEFERRED_TOKEN}"}
+        }}}"#,
+        );
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        let server = &discovery.servers[0];
+        assert_eq!(server.cwd, Some(cwd.join("server").canonicalize().unwrap()));
+        assert_eq!(server.timeout_ms, Some(120_000));
+        assert_eq!(
+            server.args,
+            [cwd.join("input").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            server.env,
+            [("TOKEN".to_string(), "${PI_MCP_DEFERRED_TOKEN}".to_string())]
+        );
+        let mut changed = server.clone();
+        changed.cwd = Some(cwd.clone());
+        assert_ne!(
+            server.fingerprint(&server.effective_cwd(&cwd)),
+            changed.fingerprint(&changed.effective_cwd(&cwd))
+        );
+    }
+
+    #[test]
+    fn config_variables_expand_once_with_no_command_interpretation() {
+        let workspace = Path::new("/workspace/project");
+        let lookup = |name: &str| match name {
+            "TOKEN" => Some("secret-token".to_string()),
+            "DATA" => Some("$CMD:do-not-run".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_config_value_with("Bearer ${TOKEN}", workspace, lookup).unwrap(),
+            "Bearer secret-token"
+        );
+        assert_eq!(
+            expand_config_value_with("${env:TOKEN}", workspace, lookup).unwrap(),
+            "secret-token"
+        );
+        assert_eq!(
+            expand_config_value_with("${MISSING:-fallback}/${EMPTY:-value}", workspace, lookup)
+                .unwrap(),
+            "fallback/value"
+        );
+        assert_eq!(
+            expand_config_value_with("${DATA}", workspace, lookup).unwrap(),
+            "$CMD:do-not-run"
+        );
+        assert_eq!(
+            expand_config_value_with("${workspaceFolder}/src", workspace, lookup).unwrap(),
+            "/workspace/project/src"
+        );
+        for value in ["${MISSING}", "${input:secret}", "${TOKEN", "${}"] {
+            assert!(
+                expand_config_value_with(value, workspace, lookup).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_toml_preserves_disabled_flags_nested_env_and_multiline_arguments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".codex/config.toml"),
+            r#"
+            [mcp_servers."docs.api"]
+            command = 'server'
+            args = [
+                'first', # comments are TOML, not argv
+                'second',
+            ]
+            enabled = true
+            cwd = 'service'
+            [mcp_servers."docs.api".env]
+            TOKEN = '${env:TOKEN}'
+            [mcp_servers.disabled]
+            command = 'never'
+            enabled = false
+        "#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 2);
+        assert!(!discovery.servers[0].enabled);
+        let server = &discovery.servers[1];
+        assert_eq!(server.name, "docs.api");
+        assert_eq!(server.args, ["first", "second"]);
+        assert_eq!(
+            server.env,
+            [("TOKEN".to_string(), "${env:TOKEN}".to_string())]
         );
     }
 }

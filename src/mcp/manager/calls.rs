@@ -5,8 +5,8 @@
 //! cannot clear a replacement's cache or return an old generation's result.
 
 use super::{
-    Arc, DEFAULT_MCP_TIMEOUT, Duration, Error, McpManager, McpTransport, Result, ServerEntry,
-    Value, catalog, is_indeterminate_call_delivery, tool_err,
+    Arc, Duration, Error, McpManager, McpTransport, Result, ServerEntry, Value, catalog,
+    is_indeterminate_call_delivery, tool_err,
 };
 use crate::agent_cx::AgentCx;
 use crate::mcp::progress::{self, ProgressSubscription};
@@ -16,6 +16,9 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+#[cfg(test)]
+use super::DEFAULT_MCP_TIMEOUT;
 
 #[cfg(all(test, unix))]
 mod progress_tests;
@@ -405,7 +408,8 @@ impl McpManager {
     /// transport, or server errors. An abandoned/superseded call may already
     /// have had remote side effects; output-contract errors are not replayed.
     pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
-        self.call_tool_with_updates(server, tool, arguments, None).await
+        self.call_tool_with_updates(server, tool, arguments, None)
+            .await
     }
 
     /// Execute through the normal call lifecycle while reporting bounded,
@@ -430,8 +434,9 @@ impl McpManager {
         owner
             .with_current(async {
                 let entry = self.entry(server)?;
+                let timeout = entry.timeout();
                 let (transport, contract) = self
-                    .prepare_tool_call(&owner, &entry, tool, DEFAULT_MCP_TIMEOUT)
+                    .prepare_tool_call(&owner, &entry, tool, timeout)
                     .await?;
                 // Setup has committed and released its publication guard. An
                 // invalid model input must not tear down a healthy cold-start
@@ -443,7 +448,7 @@ impl McpManager {
                         &transport,
                         tool,
                         &arguments,
-                        DEFAULT_MCP_TIMEOUT,
+                        timeout,
                         contract.output_schema,
                         on_update.as_deref(),
                     )
@@ -452,7 +457,7 @@ impl McpManager {
                     Ok(value) => Ok(value),
                     Err(error) if is_indeterminate_call_delivery(&error) => {
                         let deadline = Instant::now()
-                            .checked_add(DEFAULT_MCP_TIMEOUT)
+                            .checked_add(timeout)
                             .unwrap_or_else(Instant::now);
                         let recovery = run_phase(
                             &owner,
@@ -582,9 +587,8 @@ impl McpManager {
                         && is_current(entry, transport)
                         && transport.is_alive()
                         && self.check_trust(entry).is_ok()
-                        && generation.is_none_or(|expected| {
-                            transport.progress_generation() == expected
-                        })
+                        && generation
+                            .is_none_or(|expected| transport.progress_generation() == expected)
                 },
             ),
             timeout,
@@ -806,6 +810,9 @@ mod tests {
                     url: Some("https://execution.invalid/mcp".to_string()),
                     headers: Vec::new(),
                     transport_hint: Some("http".to_string()),
+                    enabled: true,
+                    cwd: None,
+                    timeout_ms: None,
                     provenance: Provenance::ProjectPi,
                     source_file: temp.path().join("mcp.json"),
                 }],

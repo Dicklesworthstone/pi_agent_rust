@@ -187,6 +187,9 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
         args: if is_http { Vec::new() } else { args },
         env: Vec::new(), url, headers: Vec::new(),
         transport_hint: Some(if is_http { "http" } else { "stdio" }.to_string()),
+        enabled: true,
+        cwd: None,
+        timeout_ms: None,
         provenance: Provenance::ProjectPi,
         source_file: root.join("mcp.json"),
     }, child)

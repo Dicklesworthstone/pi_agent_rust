@@ -181,6 +181,9 @@ pub fn parse_acp_servers(
             headers: normalize_http_headers(pairs(wire.headers))
                 .map_err(|_| format!("Invalid HTTP headers at mcpServers[{index}]"))?,
             transport_hint: Some(kind.to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::Acp,
             // A stable workspace-scoped source identity, not a file we create
             // or read. Provenance prevents aliasing a real CLI/project file.

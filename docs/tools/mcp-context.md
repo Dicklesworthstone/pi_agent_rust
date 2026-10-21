@@ -4,7 +4,7 @@ A trusted MCP server gets a server-bound context tool in addition to its ordinar
 `mcp__...` tool wrappers. The context tool name starts with `mcp_context_`, includes
 a shortened server label and a stable hash, and is available through the same
 startup, runtime trust, and extension-registration paths as other MCP tools.
-Pending or denied servers do not expose context tools. Existing wrappers recheck
+Pending, denied, or configuration-disabled servers do not expose context tools. Existing wrappers recheck
 trust on every call, including after a server has returned its response.
 
 These are the six supported actions. They run against the server attached to the
@@ -62,8 +62,10 @@ Existing transport and media-specific bounds still apply and may be smaller.
 Cursors are limited to 4,096 bytes; resource URIs to 16,384 bytes; prompt and
 argument names to 1,024 bytes. A prompt accepts at most 128 string arguments and
 64 KiB of serialized argument data, including JSON escaping. Each dispatched
-request uses the existing 30-second MCP request timeout. Initial connection and
-trust validation retain the manager's existing behavior.
+request uses the server's configured MCP timeout, defaulting to 30 seconds.
+See [MCP configuration](mcp-configuration.md) for imported settings, bounded
+timeout values, and the earlier startup/caller deadlines that still apply.
+Initial connection and trust validation retain the manager's existing behavior.
 
 Cancellation or a transport failure does not replay a request. Late results from
 a revoked server, a replaced transport, or a shut-down session are rejected.
