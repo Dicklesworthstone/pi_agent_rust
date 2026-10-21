@@ -5,6 +5,7 @@
 
 use super::{Judge, Protect};
 use crate::error::{Error, Result};
+use crate::model::{ContentBlock, ImageContent, TextContent, UserContent};
 use serde_json::Value;
 
 mod schema;
@@ -24,6 +25,7 @@ pub struct CompletionRequest {
     system: String,
     max_tokens: Option<u32>,
     schema: Option<schema::OutputSchema>,
+    images: Vec<ImageContent>,
 }
 
 impl CompletionRequest {
@@ -49,7 +51,18 @@ impl CompletionRequest {
         if let Some(schema) = &schema {
             schema.envelope(prompt)?;
         }
-        Ok(Self { prompt: prompt.to_owned(), system: system.to_owned(), max_tokens, schema })
+        Ok(Self { prompt: prompt.to_owned(), system: system.to_owned(), max_tokens, schema, images: Vec::new() })
+    }
+
+    /// Attach validated native images without putting encoded bytes in the
+    /// textual prompt or JSON Schema. The same count, MIME, envelope and byte
+    /// limits used by typed judgments apply. No paths or URLs are read here.
+    /// The bound Judge must separately declare image support; this request
+    /// cannot grant it. Images can contain secrets that text scans cannot see.
+    pub fn with_images(mut self, images: Vec<ImageContent>) -> Result<Self> {
+        super::images::validate_images(&images)?;
+        self.images = images;
+        Ok(self)
     }
 }
 
@@ -74,6 +87,7 @@ impl Judge {
         request: CompletionRequest,
         protect: Option<&Protect<'_>>,
     ) -> Result<Value> {
+        self.check_image_support(!request.images.is_empty())?;
         let (system, prompt) = match &request.schema {
             Some(schema) => {
                 // Screen prompt and schema together: annotations and example
@@ -91,9 +105,18 @@ impl Judge {
                 (system, prompt)
             }
         };
-        let (text, usage) = self.request_text(system, prompt, request.max_tokens).await?;
+        let image_count = request.images.len();
+        let (text, usage) = if image_count == 0 {
+            self.request_text(system, prompt, request.max_tokens).await?
+        } else {
+            let mut blocks = Vec::with_capacity(image_count + 1);
+            blocks.push(ContentBlock::Text(TextContent::new(prompt)));
+            blocks.extend(request.images.into_iter().map(ContentBlock::Image));
+            self.request_content(system, UserContent::Blocks(blocks), request.max_tokens).await?
+        };
         let data = request.schema.as_ref().map(|schema| schema.answer(&text)).transpose()?;
         let mut reply = self.reply("pi.completion.v1", "text", Value::String(text), usage);
+        if image_count > 0 { reply["imageCount"] = Value::from(image_count); }
         if let Some(data) = data {
             // Explicit JSON null is valid data. Absence means no schema was
             // requested; neither malformed output nor failure yields null.

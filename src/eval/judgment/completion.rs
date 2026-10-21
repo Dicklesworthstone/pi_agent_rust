@@ -10,7 +10,14 @@ pub(super) const BRIDGE_NAME: &str = "__pi_complete";
 
 impl Invocation<'_> {
     pub(super) async fn complete(&mut self, cwd: &Path, input: Value) -> Result<String, String> {
-        let request = CompletionRequest::parse(input).map_err(public_error)?;
+        let Value::Object(mut fields) = input else {
+            return Err("PI_COMPLETION_INPUT: expected completion arguments".into());
+        };
+        let raw_images = fields.remove("images");
+        // Compile the schema and validate every descriptor before any read,
+        // credential resolution, attempt reservation or provider admission.
+        let request = CompletionRequest::parse(Value::Object(fields)).map_err(public_error)?;
+        let images = super::images::Sources::parse(raw_images.as_ref()).map_err(public_error)?;
         if self.judge.is_none() && self.selection.is_none() {
             return Err("PI_COMPLETION_UNBOUND: supply this cell's judge_model or bind a Judge in the host".into());
         }
@@ -25,8 +32,11 @@ impl Invocation<'_> {
         // The pending generation belongs to this bridge await. No task or
         // interpreter handle can carry the borrowed privacy callback elsewhere.
         let outcome = async {
-            self.bound_judge(cwd).await?
-                .complete_protected(request, self.protect).await
+            let judge = self.bound_judge(cwd).await?;
+            judge.check_image_support(!images.is_empty())?;
+            self.check_image_reads(images.path_count())?;
+            let request = request.with_images(self.load_images(images).await?)?;
+            judge.complete_protected(request, self.protect).await
         }.await;
         match outcome {
             Ok(reply) => {
@@ -55,7 +65,8 @@ pub(super) fn public_error(error: Error) -> String {
         "PI_COMPLETION_INPUT", "PI_COMPLETION_SCHEMA", "PI_COMPLETION_PRIVACY", "PI_COMPLETION_RESPONSE"] {
         if text.contains(code) { return format!("{code}: completion failed; no answer"); }
     }
-    for suffix in ["BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER"] {
+    for suffix in ["BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER",
+        "IMAGE_UNSUPPORTED", "IMAGE_INPUT", "IMAGE_LIMIT", "IMAGE_READ", "IMAGE_HOST", "IMAGE_CALL_LIMIT"] {
         if text.contains(&format!("PI_JUDGE_{suffix}")) {
             return format!("PI_COMPLETION_{suffix}: completion failed; no answer");
         }
@@ -65,3 +76,5 @@ pub(super) fn public_error(error: Error) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod image_tests;

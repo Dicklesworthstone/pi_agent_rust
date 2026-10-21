@@ -1,4 +1,4 @@
-//! Invocation-owned image evidence for typed judgments.
+//! Invocation-owned image evidence for judgments and one-shot completions.
 //!
 //! Paths always enter the current Agent's enabled read tool and its policy.
 //! Only validated native image blocks cross into the model request; filenames,
@@ -166,6 +166,13 @@ impl Invocation<'_> {
         request: JudgmentRequest,
         sources: Sources,
     ) -> Result<JudgmentRequest> {
+        request.with_images(self.load_images(sources).await?)
+    }
+
+    /// Shared acquisition path. Callers preflight the model capability and
+    /// complete read count before entering it; every read keeps host policy,
+    /// the original owner/deadline and native tool receipts.
+    pub(super) async fn load_images(&mut self, sources: Sources) -> Result<Vec<ImageContent>> {
         let mut images = Vec::with_capacity(sources.items.len());
         let mut bytes = 0_usize;
         for source in sources.items {
@@ -181,7 +188,7 @@ impl Invocation<'_> {
             images.push(image);
         }
         checkpoint()?;
-        request.with_images(images)
+        Ok(images)
     }
 
     async fn read_judgment_image(&mut self, path: String) -> Result<ImageContent> {
