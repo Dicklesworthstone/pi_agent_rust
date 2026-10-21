@@ -22,6 +22,7 @@ use crate::tools::{ToolInvocationHost, ToolOutput};
 mod background;
 mod batch;
 mod completion;
+mod drain;
 mod images;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
@@ -167,7 +168,9 @@ impl<'p> Invocation<'p> {
         name: &str,
         input: Value,
     ) -> std::result::Result<String, String> {
-        if let Some(operation) = background::Operation::for_bridge(name) {
+        if name == drain::BRIDGE_NAME {
+            self.drain_batch(tool, input).await
+        } else if let Some(operation) = background::Operation::for_bridge(name) {
             self.start_background(tool, operation, input).await
         } else if name == BRIDGE_NAME {
             self.evaluate(&tool.cwd, input).await
