@@ -1529,9 +1529,10 @@ pub(super) fn validate_final_tool_identity<'a>(
 }
 
 /// Parse final tool arguments without the repairs used for streaming previews.
-/// Empty arguments remain compatible with providers that omit an empty object
-/// for a no-argument tool. Every nonempty payload must be a complete JSON object.
-/// Error text deliberately excludes the payload, which may contain secrets.
+/// Empty arguments remain compatible with providers that omit an empty object.
+/// Every nonempty payload must be a complete JSON object with unique decoded
+/// keys in every nested object. Error text deliberately excludes the payload,
+/// which may contain secrets.
 pub(super) fn parse_final_tool_arguments(
     raw: &str,
 ) -> std::result::Result<serde_json::Value, &'static str> {
@@ -1543,7 +1544,60 @@ pub(super) fn parse_final_tool_arguments(
     if !arguments.is_object() {
         return Err("arguments must be a JSON object");
     }
+    serde_json::from_str::<UniqueToolArgumentKeys>(raw)
+        .map_err(|_| "arguments contain duplicate JSON object keys")?;
     Ok(arguments)
+}
+
+/// Validation-only JSON traversal that rejects duplicate decoded object keys
+/// before serde_json::Value can silently keep the last occurrence.
+struct UniqueToolArgumentKeys;
+
+impl<'de> Deserialize<'de> for UniqueToolArgumentKeys {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueToolArgumentKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON with unique object keys")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self, E> { Ok(self) }
 }
 
 #[cfg(test)]

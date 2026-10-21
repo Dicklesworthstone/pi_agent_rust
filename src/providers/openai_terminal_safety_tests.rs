@@ -52,6 +52,76 @@ fn tool_end_count(state: &TestState) -> usize {
 }
 
 #[test]
+fn terminal_parser_rejects_duplicate_decoded_keys_recursively() {
+    for raw in [
+        r#"{"path":"first","path":"second"}"#,
+        r#"{"path":"first","pa\u0074h":"second"}"#,
+        r#"{"nested":{"x":1,"x":2}}"#,
+        r#"{"items":[{"safe":1},{"x":1,"x":2}]}"#,
+    ] {
+        assert_eq!(
+            parse_final_tool_arguments(raw).unwrap_err(),
+            "arguments contain duplicate JSON object keys"
+        );
+    }
+}
+
+#[test]
+fn terminal_parser_allows_same_key_in_distinct_objects() {
+    let raw = r#"{"left":{"path":"a"},"right":{"path":"b"},"items":[{"x":1},{"x":2}]}"#;
+    assert_eq!(
+        parse_final_tool_arguments(raw).unwrap(),
+        json!({"left":{"path":"a"},"right":{"path":"b"},"items":[{"x":1},{"x":2}]})
+    );
+}
+
+#[test]
+fn duplicate_argument_rejects_the_entire_parallel_tool_batch() {
+    let mut state = state();
+    feed(
+        &mut state,
+        tool_delta(0, "good", "read", r#"{"path":"kept"}"#),
+        None,
+    );
+    feed(
+        &mut state,
+        tool_delta(1, "bad", "write", r#"{"path":"one","path":"two"}"#),
+        Some("tool_calls"),
+    );
+    assert_eq!(tool_end_count(&state), 0);
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate JSON object keys"))
+    );
+    for block in message.content {
+        if let ContentBlock::ToolCall(call) = block {
+            assert!(call.arguments.is_null());
+        }
+    }
+}
+
+#[test]
+fn duplicate_argument_diagnostic_does_not_echo_private_payload() {
+    let raw =
+        r#"{"private-key":"private-first","private-key":"private-second"}"#;
+    let mut state = state();
+    feed(
+        &mut state,
+        tool_delta(0, "call", "write", raw),
+        Some("tool_calls"),
+    );
+    let error = done_message(&mut state).error_message.unwrap();
+    assert!(error.contains("duplicate JSON object keys"));
+    for secret in ["private-key", "private-first", "private-second"] {
+        assert!(!error.contains(secret));
+    }
+}
+
+#[test]
 fn terminal_parser_rejects_incomplete_or_non_object_arguments() {
     for raw in [
         "{",
