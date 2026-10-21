@@ -34,6 +34,7 @@ pub(crate) use display::image_dimensions;
 
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
+const PY_BROWSER_BOOTSTRAP: &str = include_str!("eval/python_browser.py");
 
 /// Default per-cell budget.
 const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
@@ -70,6 +71,9 @@ impl PyKernel {
         let script = packages.path().join("kernel.py");
         std::fs::write(&script, PY_KERNEL_SERVER)
             .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
+        let bootstrap = packages.path().join("browser.py");
+        std::fs::write(&bootstrap, PY_BROWSER_BOOTSTRAP)
+            .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
         let mut command = runtime.command();
         command
             // Keep -c's workspace import semantics; only the large bootstrap
@@ -78,6 +82,7 @@ impl PyKernel {
                 "-c",
                 "import sys\nwith open(sys.argv[1], encoding='utf-8') as source:\n code = source.read()\nexec(compile(code, sys.argv[1], 'exec'))",
             ])
+            .arg(&bootstrap)
             .arg(&script)
             .env("_PI_EVAL_PACKAGE_ROOT", packages.path())
             .current_dir(cwd)
@@ -640,6 +645,13 @@ impl Tool for EvalTool {
          calls per cell, all within this cell's deadline; eval and xdev cannot \
          be called recursively. Call discoverable tools by their actual names. \
          Standalone embeddings retain only the local read/grep/find/ls bridge. \
+         Both kernels expose browser handles over the enabled native browser \
+         tool: JS await browser.open({name,url}), Python await browser.open(name=...,url=...). \
+         Use browser.tab(name), explicit frame handles and locator(selector); \
+         Python get_by_label/get_by_role/wait_for/drag_to correspond to JS \
+         getByLabel/getByRole/waitFor/dragTo. Await tab/locator actions and \
+         tab.batch for native sequences. Results keep content and details; \
+         failed actions raise with the native partial result, never replay. \
          When subagent and jobs are enabled, await agent(prompt, options) in JS \
          or await agent(prompt, **options) in Python starts a native background \
          subagent. Retain its handle across cells to check status, read output, \

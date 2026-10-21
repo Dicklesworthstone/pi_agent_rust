@@ -1,6 +1,6 @@
-# Browser scripting inside JavaScript Eval
+# Browser scripting inside Eval
 
-The JavaScript kernel installs a `browser` prelude over the existing native
+Both Python and JavaScript kernels install a `browser` prelude over the existing native
 `browser` tool. It lets a cell inspect a page, compute a decision, and perform
 several actions without another model round trip. Enable the browser tool on
 the owning Agent; this helper does not enable it, launch a second driver, or
@@ -109,8 +109,73 @@ validation, not a security sandbox against arbitrary code in an Eval cell.
 
 `evaluate` requires an explicit page-source string. Functions and closures are
 not serialized, and there is no `browser.run` or Playwright compatibility claim.
-This increment installs the JavaScript interface; Python can continue to use
-`await tool.result('browser', {...})` through the same native policy path.
+The two language interfaces share that native policy path; direct
+`await tool.result('browser', {...})` remains available in either language.
+
+## Python workflows
+
+Python uses keyword options and snake_case method names. `browser.tab`,
+`frame`, `locator`, `ref` and the `get_by_*` selectors construct addresses
+synchronously; browser actions are asynchronous and must be awaited.
+
+```python
+page = await browser.open(name='app', url='https://example.com', timeout_ms=10000)
+await page.get_by_label('Email').fill('person@example.test')
+await page.get_by_role('button', 'Continue').click(
+    wait_after={'selector': '#status', 'text': 'Ready', 'text_match': 'exact'},
+)
+observed = await page.snapshot()
+display(observed['details'])
+```
+
+Python exposes the same tab actions as JavaScript, including `call(action,
+**options)`, explicit-source `evaluate`, screenshots, frame discovery and
+navigation. Its locator methods are `click`, `hover`, `fill`, `type`, `press`,
+`wait_for`, `upload`, `download` and `drag_to`. Semantic constructors are
+`get_by_text`, `get_by_label`, `get_by_test_id` and `get_by_role(role, name,
+exact=True)`. `page.frame(actual_frame_id)` pins each subsequent operation's
+frame argument; it does not change a global browser selection.
+
+Use ordinary Python to choose from returned evidence, then send one native
+batch for a predetermined sequence. No additional model round trip is required:
+
+```python
+seen = await page.snapshot()
+save = next((element for element in seen['details']['snapshot']['elements']
+             if element['text'] == 'Save'), None)
+if save is None:
+    raise RuntimeError('Save control is missing')
+try:
+    await page.ref(save['ref_id']).click()
+except browser.ActionError as error:
+    display(error.result)  # Includes native partial-step/postcondition evidence.
+    raise
+```
+
+`await page.batch(steps, timeout_ms=15000)` sends one native batch with the
+same `call`, `bind` and `expect` dictionaries shown above. Its complete shape
+is checked before dispatch; an invalid later step cannot execute a valid prefix.
+Python handles retain only tab/frame/selector addresses and the ordinary guest
+transport. Reusing them in later cells re-enters current host policy. Explicit
+kernel reset recreates the helper and discards old user variables. It does not
+close an independently retained native browser session.
+
+Python accepts only exact built-in JSON types: dictionaries with string keys,
+lists, strings, booleans, null, finite floats and integers from -2^63 through
+2^64-1. It does not invoke custom iterators/serializers or coerce tuples, objects,
+numeric field values or huge integers. It bounds shape to depth 32 and 16,384
+values and both string/key UTF-8 bytes and encoded arguments to 256 KiB; the
+native wire limit remains authoritative, including transport framing. Invalid
+Unicode is refused. Arguments are copied when the coroutine executes, before
+waiting for the native reply; as with ordinary Python coroutines, creating a
+coroutine without awaiting/scheduling it performs no action or snapshot.
+
+The compiled-in Python helper and kernel are staged in the existing private
+kernel directory. A small bootstrap loads the kernel by its exact staged path,
+installs the helper before its receive loop, and retains `-c` workspace import
+semantics and the prior argument shape. It does not edit the kernel source,
+start a second process, add the private directory to `sys.path`, or create an
+alternative timeout/bridge. The user namespace remains `__name__ == '__main__'`.
 
 ## Verification
 
@@ -119,3 +184,11 @@ The production prelude has a dependency-free controlled-transport suite:
 coverage is in `tests/eval_browser_prelude.rs`. Neither suite implies real-CDP,
 Chromium or live-site acceptance. `dsr quality --tool pi_agent_rust` remains the
 authoritative Rust quality command; it was unavailable during implementation.
+
+Python's production helper and staged bootstrap are exercised by
+`python3 tests/eval_browser_prelude_test.py` with controlled native replies.
+That suite passed 25 cases; the unchanged JavaScript suite passed 20. Six added
+Rust regressions cover the actual Python kernel/host path, retained state,
+workspace imports, reset, current policy and partial errors. They were authored,
+not compiled or executed: DSR was unavailable (exit 127). Controlled-transport
+checks are not a substitute for native Rust or real-browser acceptance.
