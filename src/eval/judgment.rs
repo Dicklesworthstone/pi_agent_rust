@@ -2,7 +2,8 @@
 //!
 //! A model must be selected explicitly by the host or by this cell's
 //! judge_model field. Neither interpreter holds credentials, a privacy vault,
-//! a provider handle or a judgment task that can outlive the cell.
+//! a provider handle or borrowed authority that can outlive the cell. Explicit
+//! completion jobs retain only owned inputs, a model and a privacy snapshot.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,10 @@ use crate::tools::{ToolInvocationHost, ToolOutput};
 mod batch;
 mod completion;
 mod images;
+mod background;
+
+pub(super) type PrivacySnapshot<'a> =
+    dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync + 'a;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
@@ -123,6 +128,7 @@ pub(super) struct Invocation<'p> {
     host: Option<&'p dyn ToolInvocationHost>,
     host_session: Option<String>,
     tool_receipts: Vec<Value>,
+    snapshot_privacy: Option<&'p PrivacySnapshot<'p>>,
 }
 
 impl<'p> Invocation<'p> {
@@ -137,12 +143,17 @@ impl<'p> Invocation<'p> {
         }
         Ok(Self {
             judge, selection, protect, receipts: Vec::new(),
-            host: None, host_session: None, tool_receipts: Vec::new(),
+            host: None, host_session: None, tool_receipts: Vec::new(), snapshot_privacy: None,
         })
     }
 
     pub(super) fn with_host(mut self, host: Option<&'p dyn ToolInvocationHost>) -> Self {
         self.host = host;
+        self
+    }
+
+    pub(super) fn with_privacy_snapshot(mut self, snapshot: Option<&'p PrivacySnapshot<'p>>) -> Self {
+        self.snapshot_privacy = snapshot;
         self
     }
 
@@ -162,6 +173,8 @@ impl<'p> Invocation<'p> {
             self.evaluate_batch(&tool.cwd, input).await
         } else if name == completion::BRIDGE_NAME {
             self.complete(&tool.cwd, input).await
+        } else if name == background::BRIDGE_NAME {
+            self.start_completion(tool, input).await
         } else if let Some(host) = self.host {
             self.call_host(host, name, input).await
         } else {

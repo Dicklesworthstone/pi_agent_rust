@@ -206,6 +206,8 @@ pub struct EvalTool {
     execution: Arc<futures::lock::Mutex<()>>,
     // Fixed host binding only; invocation privacy is always borrowed per cell.
     judge: Option<crate::judgment::Judge>,
+    // Capture host storage policy with the tool, not from a later eval cell.
+    completion_artifacts: PathBuf,
 }
 
 impl EvalTool {
@@ -221,6 +223,7 @@ impl EvalTool {
             retained_sessions: Mutex::new(session::RetainedSessions::default()),
             execution: Arc::new(futures::lock::Mutex::new(())),
             judge: None,
+            completion_artifacts: crate::config::Config::global_dir().join("tool-output-artifacts"),
         }
     }
 
@@ -689,7 +692,15 @@ impl Tool for EvalTool {
          deadline; max_tokens may only lower the host ceiling (at most 4096). \
          Completions and judgments share the 16-attempt allowance. No history \
          or tools are passed to these completions. Native attempt/usage receipts \
-         are included in result details."
+         are included in result details. With an owning Agent, explicit \
+         __pi_complete_start through tool.call accepts the same completion \
+         arguments and returns a session-owned jobId before generation finishes. \
+         It freezes the selected model and privacy policy, reserves one shared \
+         attempt and runs for at most 60 seconds from admission. Use the enabled \
+         jobs tool through tool.result to wait, inspect or cancel in this or a \
+         later cell. The settled job result contains the ordinary completion \
+         envelope. Kernel reset does not cancel admitted jobs; session shutdown \
+         does. No borrowed Agent or interpreter is retained by the job."
     }
 
     fn parameters(&self) -> Value {
@@ -728,7 +739,7 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's __pi_judge, __pi_judge_batch and __pi_complete bridge calls, including schema-validated completion data; host registry credentials only, no fallback. Omit when the host already binds a Judge. All operations share 16 reserved attempts and the original cell deadline. Not retained by later cells.",
+                    "description": "Explicit model for this cell's judgments, completion and __pi_complete_start calls; host registry credentials only, no fallback. Omit when the host binds a Judge. All share 16 reserved attempts. Awaited calls retain the cell deadline; explicit background completion jobs freeze this binding with a separate 60-second admission budget. Later cells do not inherit the binding for new requests.",
                     "properties": {
                         "provider": {"type":"string", "minLength":1, "maxLength":256},
                         "model": {"type":"string", "minLength":1, "maxLength":256}
@@ -751,7 +762,7 @@ impl Tool for EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, None, None).await
+        self.execute_with_mode(input, on_update, None, None, None).await
     }
 
     async fn execute_with_auxiliary_privacy(
@@ -761,7 +772,7 @@ impl Tool for EvalTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, Some(protect), None).await
+        self.execute_with_mode(input, on_update, Some(protect), None, None).await
     }
 
     async fn execute_with_host(
@@ -772,7 +783,20 @@ impl Tool for EvalTool {
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
         host: &dyn crate::tools::ToolInvocationHost,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, Some(protect), Some(host)).await
+        self.execute_with_mode(input, on_update, Some(protect), Some(host), None).await
+    }
+
+    async fn execute_with_invocation(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: crate::tools::ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        self.execute_with_mode(
+            input, on_update, Some(context.protect), context.host,
+            Some(context.snapshot_privacy),
+        ).await
     }
 
     fn effects(&self) -> ToolEffects {
