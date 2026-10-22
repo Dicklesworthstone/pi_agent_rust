@@ -38,9 +38,16 @@ type Connected = Arc<dyn Fn() -> bool + Send + Sync>;
 struct Capacity;
 impl Capacity {
     fn reserve() -> Result<Arc<Self>> {
-        TERMINALS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            (count < MAX_TERMINALS).then_some(count + 1)
-        }).map_err(|_| tool_err("DAP_TERMINAL_CAPACITY", "eight terminal lifetimes are still active"))?;
+        TERMINALS
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < MAX_TERMINALS).then_some(count + 1)
+            })
+            .map_err(|_| {
+                tool_err(
+                    "DAP_TERMINAL_CAPACITY",
+                    "eight terminal lifetimes are still active",
+                )
+            })?;
         Ok(Arc::new(Self))
     }
 }

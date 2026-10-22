@@ -4681,7 +4681,7 @@ mod tests {
     use crate::extensions::ExtensionManager;
     use crate::keybindings::KeyBindings;
     use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
-    use crate::models::{ExtensionProviderBinding, ModelEntry};
+    use crate::models::{ExtensionProviderBinding, ModelEntry, ModelRole};
     use crate::package_manager::PackageManager;
     use crate::provider::{Context, Provider, StreamOptions};
     use crate::provider::{InputType, Model, ModelCost};

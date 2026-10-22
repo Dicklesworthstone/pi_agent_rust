@@ -178,7 +178,7 @@ fn configuration_backpressure_preserves_state_and_retry_closes_before_updating()
     let path = temp.path().join("source.rs");
     std::fs::write(&path, "fn original() {}\n").unwrap();
     let uri = peer.client.ensure_synced(&path, "rust").unwrap();
-    let snapshot = peer.client.document_snapshots()[&uri];
+    let snapshot = snapshot_of(&peer.client, &uri);
     peer.notifications(&[json!({
         "jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
         "params":{"uri":uri,"version":snapshot.version,"diagnostics":[{"message":"keep me"}]}
@@ -198,7 +198,7 @@ fn configuration_backpressure_preserves_state_and_retry_closes_before_updating()
     let (settings, revision) = peer.client.workspace_settings();
     assert_eq!(settings.as_ref(), before.value());
     assert_eq!(revision, 1);
-    let retained = peer.client.document_snapshots()[&uri];
+    let retained = snapshot_of(&peer.client, &uri);
     assert_eq!(retained.version, snapshot.version);
     assert_eq!(retained.hash, snapshot.hash);
     assert_eq!(peer.client.diagnostics_snapshot(), diagnostics);
@@ -214,7 +214,7 @@ fn configuration_backpressure_preserves_state_and_retry_closes_before_updating()
     assert!(!peer.client.quiescent.load(Ordering::SeqCst));
     assert_eq!(peer.client.workspace_settings().0.as_ref(), after.value());
     peer.client.ensure_synced(&path, "rust").unwrap();
-    assert!(peer.client.document_snapshots()[&uri].version > snapshot.version);
+    assert!(snapshot_of(&peer.client, &uri).version > snapshot.version);
     let frames = peer.frames();
     let updates: Vec<_> = frames.iter().enumerate()
         .filter(|(_, frame)| frame["method"] == "workspace/didChangeConfiguration")
@@ -296,6 +296,11 @@ fn pending_settings() -> Settings {
     Settings::parse(&json!({"x":"x".repeat(MAX_SETTINGS_BYTES - 8)})).unwrap()
 }
 
+/// `document_snapshots` is keyed by filesystem path; these tests hold the URI.
+fn snapshot_of(client: &LspClient, uri: &str) -> crate::lsp::client::DocumentSnapshot {
+    client.document_snapshots()[&uri_to_path(uri).expect("synced file URI")]
+}
+
 fn synced_source(peer: &Fixture, root: &std::path::Path) -> String {
     let path = root.join("source.rs");
     std::fs::write(&path, "fn source() {}\n").unwrap();
@@ -305,7 +310,7 @@ fn synced_source(peer: &Fixture, root: &std::path::Path) -> String {
 fn assert_unconfigured(peer: &Fixture, uri: &str, version: u64) {
     assert!(peer.client.is_alive());
     assert_eq!(peer.client.workspace_settings().1, 0);
-    assert_eq!(peer.client.document_snapshots()[uri].version, version);
+    assert_eq!(snapshot_of(&peer.client, uri).version, version);
     let frames = peer.frames();
     assert!(!frames.iter().any(|frame| matches!(frame["method"].as_str(),
         Some("workspace/didChangeConfiguration" | "textDocument/didClose"))));
@@ -318,7 +323,7 @@ fn asynchronous_configuration_waits_for_capacity_and_commits_exactly_once() {
         return;
     };
     let uri = synced_source(&peer, temp.path());
-    let version = peer.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&peer.client, &uri).version;
     let settings = pending_settings();
     let stalled = peer.stall_reads(temp.path());
     saturate_writer(&peer.client);
@@ -328,7 +333,7 @@ fn asynchronous_configuration_waits_for_capacity_and_commits_exactly_once() {
         ));
         assert!(futures::poll!(update.as_mut()).is_pending());
         assert_eq!(peer.client.workspace_settings().1, 0);
-        assert_eq!(peer.client.document_snapshots()[&uri].version, version);
+        assert_eq!(snapshot_of(&peer.client, &uri).version, version);
         drop(stalled);
         assert_eq!(update.await.unwrap(), (true, 1));
     });
@@ -345,7 +350,7 @@ fn asynchronous_configuration_timeout_preserves_the_previous_baseline() {
         return;
     };
     let uri = synced_source(&peer, temp.path());
-    let version = peer.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&peer.client, &uri).version;
     let settings = pending_settings();
     let stalled = peer.stall_reads(temp.path());
     saturate_writer(&peer.client);
@@ -366,7 +371,7 @@ fn cancelling_configuration_capacity_wait_has_no_remote_effects() {
         return;
     };
     let uri = synced_source(&peer, temp.path());
-    let version = peer.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&peer.client, &uri).version;
     let settings = pending_settings();
     let stalled = peer.stall_reads(temp.path());
     saturate_writer(&peer.client);
@@ -391,7 +396,7 @@ fn dropping_configuration_capacity_wait_releases_the_request_lane() {
         return;
     };
     let uri = synced_source(&peer, temp.path());
-    let version = peer.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&peer.client, &uri).version;
     let settings = pending_settings();
     let stalled = peer.stall_reads(temp.path());
     saturate_writer(&peer.client);
@@ -414,7 +419,7 @@ fn configuration_lane_admission_and_zero_budget_cannot_dispatch_late() {
         return;
     };
     let uri = synced_source(&peer, temp.path());
-    let version = peer.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&peer.client, &uri).version;
     let settings = pending_settings();
     peer.runtime.block_on(async {
         let error = peer.client.set_workspace_settings_with_timeout(&settings, Duration::ZERO).await.unwrap_err();
@@ -474,7 +479,7 @@ fn agent_facing_configure_waits_for_transport_capacity_before_reporting_success(
     runtime.block_on(tool.execute("inspect", json!({"action":"configure","file":"source.cfgpressure"}), None)).unwrap();
     let entry = tool.registry.entry_for_root("pressure", &root).unwrap();
     let uri = entry.client.ensure_synced(&path, "plaintext").unwrap();
-    let version = entry.client.document_snapshots()[&uri].version;
+    let version = snapshot_of(&entry.client, &uri).version;
     let stalled = super::super::test_server::StalledReads::start(&entry.client, &runtime, &root);
     saturate_writer(&entry.client);
     let settings = pending_settings();
@@ -484,7 +489,7 @@ fn agent_facing_configure_waits_for_transport_capacity_before_reporting_success(
         }), None));
         assert!(futures::poll!(update.as_mut()).is_pending());
         assert_eq!(entry.client.workspace_settings().1, 0);
-        assert_eq!(entry.client.document_snapshots()[&uri].version, version);
+        assert_eq!(snapshot_of(&entry.client, &uri).version, version);
         drop(stalled);
         update.await.unwrap()
     });

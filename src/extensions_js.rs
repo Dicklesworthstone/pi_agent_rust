@@ -7955,7 +7955,7 @@ fn default_virtual_modules() -> HashMap<String, String> {
     // a socket/dispatcher implementation or loading arbitrary npm packages.
     modules.insert(
         "undici".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(r"
 export class Agent {
   constructor() {
     const error = new Error('Custom Undici dispatchers are not available in PiJS; use global fetch through the host HTTP capability');
@@ -7967,7 +7967,7 @@ export const fetch = globalThis.fetch;
 export const Headers = globalThis.Headers;
 export const Response = globalThis.Response;
 export default { Agent, fetch, Headers, Response };
-"#)
+")
         .trim()
         .to_string(),
     );

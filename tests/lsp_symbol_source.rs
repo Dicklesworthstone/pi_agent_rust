@@ -141,7 +141,10 @@ fn selected_definitions_return_implementation_not_comments_or_name_only() {
         assert_eq!(output["matched"], 2);
         assert_eq!(output["sourceIncluded"], true);
         assert_eq!(output["sourceTruncated"], false);
-        assert_eq!(output["sourceSha256"], format!("{:x}", Sha256::digest(SOURCE.as_bytes())));
+        assert_eq!(
+            output["sourceSha256"],
+            pi::package_manager::hex_encode(&Sha256::digest(SOURCE.as_bytes()))
+        );
         assert_eq!(output["symbols"][0]["source"]["text"], "run() {\r\n    return \"日本😀\";\r\n  }");
         assert_eq!(output["symbols"][0]["ancestors"][0]["name"], "Box");
         assert_exact_source(&output["symbols"][0], SOURCE);

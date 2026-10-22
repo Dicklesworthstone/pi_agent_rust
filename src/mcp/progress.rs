@@ -171,7 +171,7 @@ impl ProgressRegistry {
     ) -> Option<ProgressSubscription> {
         let id = self
             .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .ok()?;
         let token = format!("pi-mcp-{}-{id}", self.prefix);
         let slot = Arc::new(Slot {

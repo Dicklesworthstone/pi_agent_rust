@@ -403,7 +403,7 @@ fn response_callback_failure_cancels_real_streaming_hostcall() {
         runtime.drain_microtasks().await.expect("enqueue request");
         let requests = runtime.drain_hostcall_requests();
         assert_eq!(requests.len(), 1);
-        let request = requests.first().expect("request");
+        let request = requests.front().expect("request");
         assert_eq!(request.payload["stream"], true);
         assert!(runtime.is_hostcall_active(&request.call_id));
         runtime.complete_hostcall(

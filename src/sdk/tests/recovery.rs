@@ -2059,7 +2059,9 @@ fn prewalk_http_handle(
         let stored = Arc::clone(&session.session);
         session
             .agent
-            .extend_tools(vec![Box::new(crate::todo::TodoTool::new(stored))]);
+            .extend_tools(vec![
+                Box::new(crate::todo::TodoTool::new(stored)) as Box<dyn crate::tools::Tool>
+            ]);
     }
     AgentSessionHandle::from_session_with_listeners(session, EventListeners::new())
 }
@@ -2795,7 +2797,7 @@ fn overflow_rejects_extension_cuts_that_discard_current_input_or_name_unknown_en
                     ..Default::default()
                 },
             )));
-            stored.append_model_message(Message::ToolResult(crate::model::ToolResultMessage {
+            stored.append_model_message(Message::tool_result(crate::model::ToolResultMessage {
                 tool_call_id: "already-completed-write".to_string(),
                 tool_name: "write".to_string(),
                 content: vec![ContentBlock::Text(TextContent::new("saved"))],

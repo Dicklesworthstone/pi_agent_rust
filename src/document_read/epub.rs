@@ -432,7 +432,7 @@ fn chapter_text(bytes: &[u8]) -> Result<String> {
                     return None;
                 }
                 if handler_work
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                         used.checked_add(result.content.len())
                             .filter(|total| *total <= MAX_RENDER_WORK_BYTES)
                     })

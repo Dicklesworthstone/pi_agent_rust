@@ -1736,7 +1736,7 @@ pub fn estimate_entries_context_tokens(entries: &[&SessionEntry]) -> u64 {
 /// requests. A session's full entry path also contains history hidden by
 /// compaction, so it cannot measure whether a recovery made the input smaller.
 #[must_use]
-pub(crate) fn estimate_model_context_tokens(messages: &[Message]) -> u64 {
+pub fn estimate_model_context_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
         .cloned()

@@ -602,9 +602,9 @@ mod tests {
             let (notifications, _notification_rx) = std::sync::mpsc::sync_channel(1);
             let handled = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&handled);
-            let handler: super::super::ServerRequestHandler = Arc::new(move |_, _| {
+            let handler: super::super::ServerRequestResponder = Arc::new(move |_, _| {
                 observed.fetch_add(1, Ordering::SeqCst);
-                Some(serde_json::json!({"applied":true}))
+                Some(Ok(serde_json::json!({"applied":true})))
             });
             let reader_thread = std::thread::spawn(super::super::reader_loop(
                 reader,

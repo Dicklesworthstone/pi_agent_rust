@@ -8,7 +8,7 @@
 //! cancellation is not published; a transport failure retains its diagnostic.
 
 use super::AgentCx;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::http::client::{Client, RequestBuilder, Response};
 use futures::{Future, Stream, TryStreamExt};
 use std::future::poll_fn;

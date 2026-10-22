@@ -864,9 +864,10 @@ mod tests {
 
     #[test]
     fn porcelain_paths_keep_the_first_character_of_unstaged_paths() {
-        let status = " M src/a.rs\nM  src/b.rs\n?? new.txt\nR  old.rs -> src/renamed.rs\n";
+        // `git status --porcelain -z`: a rename lists its destination first.
+        let status = b" M src/a.rs\0M  src/b.rs\0?? new.txt\0R  src/renamed.rs\0old.rs\0";
         assert_eq!(
-            porcelain_paths(status),
+            porcelain_paths_zero(status).unwrap(),
             vec!["src/a.rs", "src/b.rs", "new.txt", "src/renamed.rs"]
         );
     }

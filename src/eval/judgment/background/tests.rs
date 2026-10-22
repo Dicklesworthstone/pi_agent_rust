@@ -1188,7 +1188,7 @@ fn javascript_and_python_launches_survive_cell_return_and_kernel_reset() -> Resu
                     .and_then(|details| details.pointer("/result/text").cloned()),
                 Some(json!("retained answer"))
             ); // ubs:ignore -- The job retains the final provider text across kernel reset.
-            Ok(())
+            Ok::<(), Error>(())
         })?;
     }
     Ok(())
@@ -1464,7 +1464,7 @@ fn progress_and_final_privacy_failures_withdraw_earlier_batch_snapshots() -> Res
             assert!(!encoded.contains("partialResult")); // ubs:ignore -- Neither progress-projection nor final-projection failure may retain an older partial.
             assert!(!encoded.contains("0.875")); // ubs:ignore -- A rejected secret-bearing probability cannot enter retained output.
             assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Privacy refusal must not retry or fabricate additional model work.
-            Ok(())
+            Ok::<(), Error>(())
         })?;
     }
     Ok(())

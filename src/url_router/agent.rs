@@ -63,6 +63,8 @@ impl OutputCache {
         });
     }
 
+    // A cached output's `namespace` is its entry's `transcript_path`.
+    #[allow(clippy::suspicious_operation_groupings)]
     fn get(&self, entry: &ChildEntry) -> Option<Arc<str>> {
         self.entries
             .iter()

@@ -534,7 +534,7 @@ impl Tool for SubagentTool {
                 "poolId": {"type": "string", "minLength": 1, "description": "Stable session-owned pool identity returned by pool_start."},
                 "itemId": {"type": "integer", "minimum": 1, "maximum": 32, "description": "pool_result requires an admitted item ID; pool_wait optionally selects one item instead of the whole pool."},
                 "turnId": {"type": "integer", "minimum": 1, "maximum": 32, "description": "worker_status/worker_wait: select a specific admitted turn; defaults to the latest."},
-                "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 600000, "description": "worker_wait/pool_wait: bounded observation time, default 30000. Zero polls; expiration leaves accepted work running."},
+                "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 600_000, "description": "worker_wait/pool_wait: bounded observation time, default 30000. Zero polls; expiration leaves accepted work running."},
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
                 "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},

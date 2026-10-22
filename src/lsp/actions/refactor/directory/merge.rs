@@ -33,10 +33,12 @@ fn conflict(message: &str) -> crate::error::Error {
 }
 
 fn overlap(a: Range, b: Range) -> bool {
+    // An empty range is a point: it overlaps a range that contains it,
+    // including either endpoint.
     if a.start == a.end {
-        b.start <= a.start && a.start <= b.end
+        (b.start..=b.end).contains(&a.start)
     } else if b.start == b.end {
-        a.start <= b.start && b.start <= a.end
+        (a.start..=a.end).contains(&b.start)
     } else {
         a.start < b.end && b.start < a.end
     }

@@ -765,9 +765,21 @@ impl ModelReviewer {
             return Err(Error::validation("PI_REVIEW_PRIVACY: request belongs to a different reviewer"));
         }
         let files = request.units.len();
+        // Create the (lazy) unit requests before the async block and box them
+        // as `Send`. A `map` closure that borrows `self`, a unit and the prompt
+        // inside the stream makes a spawned review, such as the interactive
+        // `/review` command, fail rust-lang/rust#100013 ("lifetime bound not
+        // satisfied"). Nothing runs until `buffer_unordered` polls a request.
+        let requests: Vec<futures::future::BoxFuture<'_, Result<Vec<ReviewFinding>>>> = request
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| {
+                futures::FutureExt::boxed(self.review_unit(index, unit, &request.system_prompt))
+            })
+            .collect();
         let findings = with_timeout_and_abort(REVIEW_TIMEOUT, abort, async {
-            futures::stream::iter(request.units.iter().enumerate())
-                .map(|(index, unit)| self.review_unit(index, unit, &request.system_prompt))
+            futures::stream::iter(requests)
                 .buffer_unordered(REVIEW_CONCURRENCY)
                 .try_collect::<Vec<_>>()
                 .await
@@ -950,6 +962,21 @@ mod model_review_tests {
     use super::*;
     use crate::model::{AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, UserContent};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Compile-time check: the interactive `/review` command spawns a prepared
+    /// review, so its future must be `Send + 'static` (rust-lang/rust#100013).
+    #[test]
+    fn prepared_review_future_can_be_spawned() {
+        fn spawnable<F: std::future::Future + Send + 'static>(_: F) {}
+        fn spawn_review(
+            client: ModelReviewer,
+            request: PreparedReview,
+            abort: crate::agent::AbortSignal,
+        ) {
+            spawnable(async move { client.review_prepared(request, Some(&abort)).await });
+        }
+        let _ = spawn_review;
+    }
 
     #[derive(Default)]
     struct ReviewProvider {

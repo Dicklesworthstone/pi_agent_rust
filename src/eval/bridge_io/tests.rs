@@ -205,9 +205,10 @@ assert 'native payload' in answer
         let line = kernel.next_line(deadline, &mut capture, &session).await.unwrap().unwrap();
         let bridge: Value = serde_json::from_str(&line).unwrap();
         transport::validate_bridge_owner(&bridge, 1, line.len()).unwrap();
+        let mut judgments = super::super::judgment::Invocation::new(None, &json!({}), None).unwrap();
         let pending = async {
             gate.await.unwrap();
-            tool.run_bridge_call(&bridge["bridge"]).await
+            tool.run_bridge_call(&bridge["bridge"], &mut judgments).await
         };
         let reply = wait_python(&kernel.lines, 1, deadline, &mut capture, &session, pending).await.unwrap();
         assert_eq!(reply["ok"], true);

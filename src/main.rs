@@ -13631,9 +13631,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(&context.messages).unwrap());
+            // ToolDef is not Serialize; the names show which tools were offered.
+            let tools: Vec<&str> = context.tools.iter().map(|tool| tool.name.as_str()).collect();
             self.metadata.lock().unwrap().push(json!({
                 "system": context.system_prompt,
-                "tools": context.tools,
+                "tools": tools,
                 "sessionId": options.session_id,
                 "promptCacheKey": options.prompt_cache_key,
                 "maxTokens": options.max_tokens,

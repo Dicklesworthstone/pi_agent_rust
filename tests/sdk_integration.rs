@@ -665,7 +665,7 @@ fn sdk_resumed_session_persists_turn_through_canonical_path() {
         let mut source = Session::create_with_dir(Some(session_dir));
         source.header.cwd = cwd.display().to_string();
         source.path = Some(path.clone());
-        source.append_message(Message::User(UserMessage {
+        source.append_model_message(Message::User(UserMessage {
             content: UserContent::Text("before resume".to_string()),
             timestamp: 1,
         }));
