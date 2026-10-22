@@ -148,6 +148,62 @@ provide later-cell waits, cancellation, full native output and attachment after
 a kernel reset. They use the launching cell's explicit model binding. OMP's
 completion-tier selection and wait-watchdog suspension remain unsupported.
 
+## Collect batch results as they finish
+
+Retained judgment batches expose `await batch.drain(cursor=bookmark, timeout=10)`
+in Python and `await batch.drain({cursor: bookmark, timeout: 10})` in JavaScript.
+Each call uses the native [batch drain](eval-batch-drains.md) to read newly
+settled items without waiting for every judgment. It returns the complete native
+page, including item keys, verdict metadata, explicit errors and job lifecycle
+state. Completion and individual judgment handles reject this method.
+
+Start a batch in an Agent-owned cell with an explicit model binding:
+
+```python
+review = await judge_batch(
+    {'api': {'tests': 'passing'}, 'ui': {'tests': 'pending'}},
+    {'ready': {'type': 'bool', 'instructions': 'Does the evidence show readiness?'}},
+)
+review_cursor = None
+display(review.id)
+```
+
+Collect a page in the same or a later cell:
+
+```python
+page = await review.drain(cursor=review_cursor, timeout=10)
+for item in page['items']:
+    if item['ok']:
+        display({'key': item['key'], 'answers': item['verdict']['answers']})
+    else:
+        display({'key': item['key'], 'error': item['error']})
+review_cursor = page['cursor']  # Acknowledge only after processing succeeds.
+display({'done': page['done'], 'jobFailed': page['jobFailed']})
+```
+
+The cursor is explicit application state. Repeating a call with the previous
+cursor repeats the same retained items, so an interrupted processing step can
+be retried without losing results. Later inputs may finish before earlier
+ones; the cursor remembers individual indices rather than a consuming offset.
+After a kernel reset, use `review = await judge_batch.attach(saved_job_id)` and
+pass the saved cursor. Neither attachment nor reading needs a new model binding;
+both still require current access to the retained native job.
+
+`timeout` is finite seconds from 0 through 600, defaults to 30, and accepts
+fractional seconds converted to whole milliseconds. Zero requests a nonblocking
+observation. A native timeout or refused host lookup raises its original error
+without changing the caller's cursor. The helper never polls in guest code,
+restarts generation or extends job retention. Cancelling the Python await uses
+the existing bridge cleanup and does not cancel the model job; explicit
+`review.cancel()` remains available.
+
+Always inspect the page's lifecycle fields. `done` can describe failure,
+cancellation or timeout. Interrupted work may retain usable items while
+`complete` is false. If evidence is withdrawn or unavailable, `items` is empty,
+`total` and `settled` are null, and the supplied cursor is preserved. See
+`review.output()` for the native failure result. Malformed pages or cursors
+raise an error instead of producing a successful empty page.
+
 ## Validation
 
 `src/eval/judgment/background/tests.rs` contains controlled-provider tests for

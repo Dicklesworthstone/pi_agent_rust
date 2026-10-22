@@ -83,6 +83,27 @@ def batch_progress_snapshot(native, status="running", job_id="model-native"):
     return {**model_snapshot("judgment_batch", native, status=status, job_id=job_id), "result": native}
 
 
+def batch_drain_cursor(seen=(), manifest="a" * 64):
+    return {"schema": "pi.eval.batch-cursor.v1", "jobId": "model-native", "manifest": manifest, "seen": list(seen)}
+
+
+def batch_drain_item(index, key=None, *, error=None):
+    item = {"index": index, "key": index if key is None else key, "ok": error is None}
+    if error is None:
+        item["verdict"] = {"schema": "pi.judgment.v1", "answers": {
+            "safe": {"type": "bool", "bool": False}, "score": {"type": "number", "number": 0}},
+            "provider": "fixture", "modelId": "reviewer", "usage": {"input": 9, "output": 3}, "extra": None}
+    else:
+        item["error"] = error
+    return item
+
+
+def batch_drain_page(**updates):
+    return {"schema": "pi.eval.batch-drain.v1", "jobId": "model-native", "jobStatus": "running",
+            "done": False, "jobFailed": False, "complete": False, "evidenceAvailable": True,
+            "total": 2, "settled": 1, "items": [batch_drain_item(1)], "cursor": batch_drain_cursor([1]), **updates}
+
+
 class PoolHost:
     def __init__(self, kernel):
         self.kernel = kernel
@@ -392,6 +413,242 @@ captured
         self.assertEqual(self.value(response), ("model-native", native))
         response = self.kernel.cell("await model.output()", self.reply_with(envelope(snapshot)))
         self.assertEqual(self.value(response), native)
+
+    def launch_batch(self):
+        self.launch_model("judge_batch([1,2], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
+
+    def test_batch_drain_uses_one_native_waiter_call_and_preserves_full_page(self):
+        self.launch_batch()
+        page = batch_drain_page()
+        response = self.kernel.cell("await model.drain(timeout=0.025)", self.reply_with(page))
+        self.assertEqual(self.value(response), page)
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["tool"], "__pi_judge_batch_drain")
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+            "jobId": "model-native", "cursor": None, "timeoutMs": 25})
+        self.assertEqual(len(self.kernel.calls), 2)
+
+    def test_batch_drain_acknowledgment_is_explicit_and_pages_can_finish_out_of_order(self):
+        self.launch_batch()
+        first = batch_drain_page()
+        response = self.kernel.cell("""
+bookmark = None
+page = await model.drain(cursor=bookmark)
+raise RuntimeError('processing failed')
+""", self.reply_with(first))
+        self.assertFalse(response["ok"])
+        self.assertIn("processing failed", response["error"])
+        response = self.kernel.cell("page = await model.drain(cursor=bookmark); page", self.reply_with(first))
+        self.assertEqual(self.value(response), first)
+        for frame in self.kernel.calls[1:]:
+            self.assertEqual(frame["bridge"]["input"], {"jobId": "model-native", "cursor": None, "timeoutMs": 30000})
+        self.assertEqual(self.value(self.kernel.cell("bookmark = page['cursor']; bookmark")), batch_drain_cursor([1]))
+        second = batch_drain_page(jobStatus="exited", done=True, complete=True, settled=2,
+                                 items=[batch_drain_item(0)], cursor=batch_drain_cursor([0, 1]))
+        response = self.kernel.cell("page = await model.drain(cursor=bookmark, timeout=0); page", self.reply_with(second))
+        self.assertEqual(self.value(response), second)
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["cursor"], batch_drain_cursor([1]))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["timeoutMs"], 0)
+        response = self.kernel.cell("await model.drain(cursor=page['cursor'], timeout=0)", self.reply_with({**second, "items": []}))
+        self.assertEqual(self.value(response)["items"], [])
+
+    def test_batch_drain_preserves_literal_keys_and_explicit_item_failures(self):
+        self.launch_batch()
+        page = batch_drain_page(jobStatus="failed", done=True, jobFailed=True, complete=True, settled=2,
+                               items=[batch_drain_item(0, "雪"), batch_drain_item(1, "__proto__", error="PI_JUDGE_PROVIDER")],
+                               cursor=batch_drain_cursor([0, 1]))
+        response = self.kernel.cell("await model.drain()", self.reply_with(page))
+        self.assertEqual(self.value(response), page)
+
+    def test_batch_drain_interruption_and_withdrawal_preserve_honest_partial_evidence(self):
+        self.launch_batch()
+        for status in ("killed", "timedOut"):
+            page = batch_drain_page(jobStatus=status, done=True, jobFailed=True)
+            response = self.kernel.cell("await model.drain()", self.reply_with(page))
+            self.assertEqual(self.value(response), page)
+            self.assertFalse(self.value(response)["complete"])
+        empty = batch_drain_page(evidenceAvailable=False, total=None, settled=None, items=[],
+                                cursor=batch_drain_cursor([], None))
+        response = self.kernel.cell("await model.drain(timeout=0)", self.reply_with(empty))
+        self.assertEqual(self.value(response), empty)
+        response = self.kernel.cell("bookmark = (await model.drain())['cursor']; bookmark", self.reply_with(batch_drain_page()))
+        self.assertEqual(self.value(response), batch_drain_cursor([1]))
+        withdrawn = {**empty, "jobStatus": "failed", "done": True, "jobFailed": True, "cursor": batch_drain_cursor([1])}
+        response = self.kernel.cell("await model.drain(cursor=bookmark)", self.reply_with(withdrawn))
+        self.assertEqual(self.value(response), withdrawn)
+        self.assertEqual(self.value(self.kernel.cell("bookmark")), batch_drain_cursor([1]))
+
+    def test_batch_drain_cursor_can_be_reused_after_fresh_kernel_attachment(self):
+        self.launch_batch()
+        saved = self.value(self.kernel.cell("(await model.drain())['cursor']", self.reply_with(batch_drain_page())))
+        self.kernel = Kernel()
+        self.addCleanup(self.kernel.close)
+        response = self.kernel.cell("model = await judge_batch.attach('model-native'); model.id",
+                                    self.reply_with(envelope(model_snapshot("judgment_batch", status="running"))))
+        self.assertEqual(self.value(response), "model-native")
+        page = batch_drain_page(jobStatus="exited", done=True, complete=True, settled=2,
+                               items=[batch_drain_item(0)], cursor=batch_drain_cursor([0, 1]))
+        response = self.kernel.cell(f"await model.drain(cursor={saved!r}, timeout=0)", self.reply_with(page))
+        self.assertEqual(self.value(response), page)
+        self.assertEqual([frame["bridge"]["tool"] for frame in self.kernel.calls], ["__pi_tool_result", "__pi_judge_batch_drain"])
+
+    def test_batch_drain_native_failures_do_not_acknowledge_retry_or_poison_the_bridge(self):
+        self.launch_batch()
+        self.assertEqual(self.value(self.kernel.cell(f"bookmark = {batch_drain_cursor([1])!r}; bookmark")), batch_drain_cursor([1]))
+        for message in ("EVAL_BATCH_TIMEOUT", "EVAL_BATCH_HOST: current jobs lookup was refused", "PI_JOBS_UNKNOWN_ID"):
+            before = len(self.kernel.calls)
+            response = self.kernel.cell("await model.drain(cursor=bookmark)",
+                                        lambda frame: self.kernel.reply(frame, error=message))
+            self.assertFalse(response["ok"])
+            self.assertIn(message, response["error"])
+            self.assertNotIn("EVAL_BATCH_PROTOCOL", response["error"])
+            self.assertEqual(len(self.kernel.calls), before + 1)
+            self.assertEqual(self.value(self.kernel.cell("bookmark")), batch_drain_cursor([1]))
+        self.assert_next_cell_works()
+
+    def test_batch_drain_rejects_nonbatch_handles_without_dispatch(self):
+        for operation, expression in (("completion", "completion('work')"),
+                                      ("judgment", "judge('work', {'safe':{'type':'bool','instructions':'safe?'}})")):
+            self.launch_model(expression, operation)
+            before = len(self.kernel.calls)
+            response = self.kernel.cell("await model.drain()")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_INPUT", response["error"])
+            self.assertEqual(len(self.kernel.calls), before)
+
+    def test_batch_drain_validates_timeout_and_cursor_before_dispatch(self):
+        self.launch_batch()
+        for timeout in ("True", "None", "'30'", "-1", "601", "float('inf')", "float('nan')", "10 ** 1000"):
+            response = self.kernel.cell(f"await model.drain(timeout={timeout})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_INPUT", response["error"])
+        invalid = [None, [], "cursor", {}, batch_drain_cursor([1, 1]), batch_drain_cursor([-1]),
+                   batch_drain_cursor([16]), batch_drain_cursor([True]), batch_drain_cursor([1.0]),
+                   batch_drain_cursor([0], None), batch_drain_cursor([], "A" * 64), batch_drain_cursor([], "a" * 63),
+                   {**batch_drain_cursor(), "jobId": "foreign"}, {**batch_drain_cursor(), "schema": "wrong"},
+                   {**batch_drain_cursor(), "extra": 1}, {**batch_drain_cursor(), "seen": (1,)}]
+        for cursor in invalid[1:]:
+            with self.subTest(cursor=cursor):
+                response = self.kernel.cell(f"await model.drain(cursor={cursor!r})")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_BATCH_INPUT", response["error"])
+        for expression in ("model.drain(retries=1)", "model.drain(None, 30)"):
+            response = self.kernel.cell(f"await {expression}")
+            self.assertFalse(response["ok"])
+            self.assertIn("TypeError", response["error"])
+        self.assertEqual(len(self.kernel.calls), 1)
+
+    def test_batch_drain_does_not_execute_cursor_subclass_callbacks(self):
+        self.launch_batch()
+        response = self.kernel.cell(f"""
+class Trap(dict):
+    def __iter__(self):
+        raise AssertionError('cursor callback ran')
+class SeenTrap(list):
+    def __iter__(self):
+        raise AssertionError('seen callback ran')
+errors = []
+for bookmark in (Trap({batch_drain_cursor()!r}), {{**{batch_drain_cursor()!r}, 'seen': SeenTrap([1])}}):
+    try:
+        await model.drain(cursor=bookmark)
+    except TypeError as error:
+        errors.append(str(error))
+errors
+""")
+        self.assertTrue(all("EVAL_BATCH_INPUT" in error for error in self.value(response)))
+        self.assertEqual(len(self.value(response)), 2)
+        self.assertEqual(len(self.kernel.calls), 1)
+
+    def test_batch_drain_snapshots_cursor_before_awaiting_the_host(self):
+        self.launch_batch()
+        response = self.kernel.cell(f"""
+import asyncio
+bookmark = {batch_drain_cursor([1])!r}
+pending = asyncio.create_task(model.drain(cursor=bookmark))
+await asyncio.sleep(0)
+bookmark['seen'].append(0)
+bookmark['manifest'] = 'changed'
+await pending
+""", self.reply_with(batch_drain_page(items=[])))
+        self.assertEqual(self.value(response), batch_drain_page(items=[]))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["cursor"], batch_drain_cursor([1]))
+
+    def test_batch_drain_cancellation_drains_reply_without_acknowledging_or_cancelling_job(self):
+        self.launch_batch()
+        pending = []
+
+        def observe(frame):
+            if "release-drain" in frame["stream"].get("text", ""):
+                self.assertEqual(len(pending), 1)
+                self.kernel.reply(pending[0], json.dumps(batch_drain_page()))
+
+        response = self.kernel.cell("""
+import asyncio
+bookmark = None
+pending = asyncio.create_task(model.drain(cursor=bookmark))
+await asyncio.sleep(0.02)
+pending.cancel()
+print('release-drain')
+try:
+    page = await pending
+    bookmark = page['cursor']
+    outcome = 'unexpected success'
+except asyncio.CancelledError:
+    outcome = 'cancelled'
+(outcome, bookmark)
+""", pending.append, observe)
+        self.assertEqual(self.value(response), ("cancelled", None))
+        response = self.kernel.cell("await model.drain(cursor=bookmark, timeout=0)", self.reply_with(batch_drain_page()))
+        self.assertEqual(self.value(response), batch_drain_page())
+        self.assertEqual([frame["bridge"]["tool"] for frame in self.kernel.calls],
+                         ["__pi_judge_batch_start", "__pi_judge_batch_drain", "__pi_judge_batch_drain"])
+
+    def test_batch_drain_rejects_malformed_pages_and_keeps_errors_distinct(self):
+        self.launch_batch()
+        corruptions = [(("schema",), "wrong"), (("jobId",), "foreign"), (("jobStatus",), "unknown"),
+            (("done",), True), (("done",), 0), (("jobFailed",), True), (("complete",), True),
+            (("complete",), 0), (("evidenceAvailable",), 1), (("total",), 0), (("total",), 17),
+            (("total",), True), (("settled",), 2), (("settled",), True), (("cursor",), None),
+            (("cursor", "seen"), [0, 1]), (("items", 0, "index"), True), (("items", 0, "key"), 0),
+            (("items", 0, "key"), False), (("items", 0, "ok"), 1), (("items", 0, "verdict"), None),
+            (("items", 0, "error"), "also failed"), (("evidenceAvailable",), False)]
+        for path, value in corruptions:
+            with self.subTest(path=path, value=value):
+                page = batch_drain_page()
+                target = page
+                for component in path[:-1]:
+                    target = target[component]
+                target[path[-1]] = value
+                response = self.kernel.cell("await model.drain()", self.reply_with(page))
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_BATCH_PROTOCOL", response["error"])
+        for items in ([batch_drain_item(1), batch_drain_item(0)],
+                      [batch_drain_item(0, "same"), batch_drain_item(1, "same")],
+                      [batch_drain_item(0), batch_drain_item(1, "literal")],
+                      [{"index": 0, "key": 0, "ok": False, "error": ""}, batch_drain_item(1)]):
+            page = batch_drain_page(settled=2, items=items, cursor=batch_drain_cursor([0, 1]))
+            response = self.kernel.cell("await model.drain()", self.reply_with(page))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_PROTOCOL", response["error"])
+        for encoded in ("not JSON", "null", "[]", "{}"):
+            response = self.kernel.cell("await model.drain()", lambda frame: self.kernel.reply(frame, encoded))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_PROTOCOL", response["error"])
+        self.assert_next_cell_works()
+
+    def test_batch_drain_cannot_change_manifest_redeliver_or_forget_acknowledged_items(self):
+        self.launch_batch()
+        for page in (batch_drain_page(), batch_drain_page(items=[], cursor=batch_drain_cursor([1], "b" * 64)),
+                     batch_drain_page(settled=0, items=[], cursor=batch_drain_cursor())):
+            response = self.kernel.cell(f"await model.drain(cursor={batch_drain_cursor([1])!r})", self.reply_with(page))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_PROTOCOL", response["error"])
+        for missing in ("total", "settled"):
+            page = batch_drain_page(evidenceAvailable=False, total=None, settled=None, items=[],
+                                   cursor=batch_drain_cursor([], None))
+            page.pop(missing)
+            response = self.kernel.cell("await model.drain(timeout=0)", self.reply_with(page))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_BATCH_PROTOCOL", response["error"])
 
     def test_batch_progress_exposes_ordered_evidence_and_each_observation_reenters_host(self):
         self.launch_model("judge_batch({'ready':1,'bad':2,'active':3,'later':4}, "

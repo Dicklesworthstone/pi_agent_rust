@@ -1169,6 +1169,112 @@ async def _model_wait_job(job, timeout_ms, raise_errors):
     return payload["answers"] if job.operation == "judgment" else payload
 
 
+def _model_drain_input():
+    return TypeError("EVAL_BATCH_INPUT: drain accepts cursor and timeout seconds from 0 through 600")
+
+
+def _model_drain_protocol():
+    return ToolBridgeError("EVAL_BATCH_PROTOCOL: invalid native drain response")
+
+
+def _model_drain_cursor(value, job_id, fail):
+    if value is None:
+        return None
+    if (type(value) is not dict or any(type(name) is not str for name in value)
+            or set(value) != {"schema", "jobId", "manifest", "seen"}
+            or type(value["schema"]) is not str or value["schema"] != "pi.eval.batch-cursor.v1"
+            or type(value["jobId"]) is not str or value["jobId"] != job_id
+            or type(value["seen"]) is not list or len(value["seen"]) > 16):
+        raise fail()
+    manifest = value["manifest"]
+    if manifest is not None and (type(manifest) is not str or len(manifest) != 64
+                                or any(character not in "0123456789abcdef" for character in manifest)):
+        raise fail()
+    seen = value["seen"]
+    if (any(type(index) is not int or not 0 <= index < 16 for index in seen)
+            or len(set(seen)) != len(seen) or seen and manifest is None):
+        raise fail()
+    # Copy before awaiting. A caller retains its acknowledgment and cannot
+    # mutate either the queued request or the validation baseline in flight.
+    return {"schema": value["schema"], "jobId": job_id, "manifest": manifest, "seen": sorted(seen)}
+
+
+def _model_check_drain(page, job_id, previous):
+    if (type(page) is not dict or page.get("schema") != "pi.eval.batch-drain.v1"
+            or page.get("jobId") != job_id
+            or page.get("jobStatus") not in ("running", "exited", "failed", "killed", "timedOut")
+            or page.get("done") is not (page["jobStatus"] != "running")
+            or page.get("jobFailed") is not (page["jobStatus"] not in ("running", "exited"))
+            or type(page.get("complete")) is not bool or type(page.get("evidenceAvailable")) is not bool
+            or type(page.get("items")) is not list or len(page["items"]) > 16):
+        raise _model_drain_protocol()
+    cursor = _model_drain_cursor(page.get("cursor"), job_id, _model_drain_protocol)
+    if cursor is None:
+        raise _model_drain_protocol()
+    before = set(previous["seen"]) if previous is not None else set()
+    manifest = previous["manifest"] if previous is not None else None
+    if manifest is not None and cursor["manifest"] != manifest:
+        raise _model_drain_protocol()
+    if not page["evidenceAvailable"]:
+        if ("total" not in page or page["total"] is not None
+                or "settled" not in page or page["settled"] is not None
+                or page["complete"] or page["items"] or page["jobStatus"] == "exited"
+                or cursor["manifest"] != manifest or set(cursor["seen"]) != before):
+            raise _model_drain_protocol()
+        return page
+    if (type(page.get("total")) is not int or not 1 <= page["total"] <= 16
+            or type(page.get("settled")) is not int or not 0 <= page["settled"] <= page["total"]
+            or cursor["manifest"] is None
+            or (page["complete"] and (not page["done"] or page["settled"] != page["total"]
+                                      or page["jobStatus"] not in ("exited", "failed")))
+            or (not page["complete"] and page["jobStatus"] not in ("running", "killed", "timedOut"))
+            or any(index >= page["total"] for index in cursor["seen"])):
+        raise _model_drain_protocol()
+    added, keys = set(), set()
+    last_index, key_type = -1, None
+    for item in page["items"]:
+        if (type(item) is not dict or type(item.get("index")) is not int
+                or not last_index < item["index"] < page["total"] or item["index"] in before
+                or type(item.get("ok")) is not bool
+                or not (type(item.get("key")) is str and 0 < len(item["key"]) <= 128
+                        or type(item.get("key")) is int and item["key"] == item["index"])
+                or item["key"] in keys or key_type is not None and type(item["key"]) is not key_type):
+            raise _model_drain_protocol()
+        last_index, key_type = item["index"], type(item["key"])
+        keys.add(item["key"])
+        added.add(item["index"])
+        if item["ok"]:
+            if "error" in item:
+                raise _model_drain_protocol()
+            try:
+                _model_payload("judgment", item.get("verdict"))
+            except ToolBridgeError:
+                raise _model_drain_protocol() from None
+        elif ("verdict" in item or type(item.get("error")) is not str or not item["error"]
+              or page["jobStatus"] == "exited"):
+            raise _model_drain_protocol()
+    if len(before) + len(added) != page["settled"] or set(cursor["seen"]) != before | added:
+        raise _model_drain_protocol()
+    return page
+
+
+async def _model_drain_job(job, cursor, timeout):
+    if (job.operation != "judgment_batch" or not _model_job_id(job.id)
+            or type(timeout) not in (int, float) or not 0 <= timeout <= 600 or not math.isfinite(timeout)):
+        raise _model_drain_input()
+    cursor = _model_drain_cursor(cursor, job.id, _model_drain_input)
+    # The native waiter owns readiness, policy rechecks and deadline accounting.
+    # A drain never acknowledges locally, polls jobs, retries or cancels the job.
+    encoded = await _bridge_call_async("__pi_judge_batch_drain", {
+        "jobId": job.id, "cursor": cursor, "timeoutMs": int(timeout * 1000),
+    })
+    try:
+        page = json.loads(encoded)
+    except (ValueError, RecursionError):
+        raise _model_drain_protocol() from None
+    return _model_check_drain(page, job.id, cursor)
+
+
 class _ModelJob:
     """Native model identity; every read and cancellation uses the current host."""
 
@@ -1203,6 +1309,10 @@ class _ModelJob:
         if self.operation != "judgment_batch":
             raise TypeError("EVAL_MODEL_INPUT: progress is available only for judgment batches")
         return _model_progress_view(self, await self.status())
+
+    async def drain(self, *, cursor=None, timeout=30):
+        """Read new batch items; save the returned cursor only after processing."""
+        return await _model_drain_job(self, cursor, timeout)
 
     async def cancel(self):
         return await _model_read_job(self, "cancel")

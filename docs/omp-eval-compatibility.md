@@ -52,8 +52,11 @@ judgments accept image evidence through the current host's read policy, and
 completion images can be combined with a validated output schema. Batch
 `progress()` retains ordered per-item states and finished verdicts across cells,
 including the last valid progress after cancellation or task timeout. JavaScript
-batch `drain({cursor, timeout})` exposes native cursor-based result pages;
-Python can use the raw `__pi_judge_batch_drain` bridge. Retries and automatic
+batch `drain({cursor, timeout})` and Python `drain(cursor=..., timeout=...)`
+expose [native cursor-based result pages](eval-background-completions.md#collect-batch-results-as-they-finish).
+Callers acknowledge pages explicitly after processing; both helpers preserve
+partial failures and current host access checks without implicit cursor state
+or guest polling. The raw `__pi_judge_batch_drain` bridge remains available. Retries and automatic
 backgrounding of arbitrary eval code remain separate work; unknown helper
 options fail explicitly.
 The typed `completion()` helper uses the uniform model-job bridge
