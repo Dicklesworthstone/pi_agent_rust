@@ -3024,7 +3024,8 @@ impl PiFtuiModel {
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
-            } | PiMsg::ReviewFinished {
+            }
+            | PiMsg::ReviewFinished {
                 owner_session_id,
                 message,
                 ..
@@ -7443,6 +7444,7 @@ async fn complete_replacement_after_shutdown(
 /// after the old handle completes awaited shutdown so singleton servers never
 /// overlap and the previous session flushes before replacement.
 /// Construction failures surface as UI errors and keep the current session.
+/// Returns whether a replacement completed; errors report terminal cleanup.
 async fn new_session_command(
     template: &crate::sdk::SessionOptions,
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -7450,7 +7452,7 @@ async fn new_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let (provider, model_id) = handle.model();
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     // `thinking` is deliberately left as the template carries it: that is the
@@ -7471,7 +7473,7 @@ async fn new_session_command(
                             "Uncommitted new session cleanup issue: {issue}"
                         )));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             // Commit the candidate before teardown begins. Cancellation during
@@ -7518,12 +7520,13 @@ async fn new_session_command(
                 |entry| crate::interactive::model_display_label(&entry),
             );
             let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {label}")));
+            Ok(true)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Handle `/session`: report the live session's file/id/name/model/thinking/
@@ -8597,7 +8600,7 @@ async fn reload_session_command(
             return Ok(());
         }
     };
-    match saved {
+    let replaced = match saved {
         Some(path) => {
             Box::pin(resume_session_command(
                 &path.to_string_lossy(),
@@ -8608,7 +8611,7 @@ async fn reload_session_command(
                 agent_tx,
                 runtime_handle,
             ))
-            .await?;
+            .await?
         }
         None if empty => {
             Box::pin(new_session_command(
@@ -8619,7 +8622,7 @@ async fn reload_session_command(
                 agent_tx,
                 runtime_handle,
             ))
-            .await?;
+            .await?
         }
         None => {
             let _ = agent_tx.send(PiMsg::AgentError(String::from(
@@ -8628,6 +8631,9 @@ async fn reload_session_command(
             )));
             return Ok(());
         }
+    };
+    if !replaced {
+        return Ok(());
     }
     let _ = agent_tx.send(PiMsg::System(String::from(
         "Reloaded extensions, skills, prompt templates, themes and context files.",
@@ -8639,7 +8645,7 @@ async fn reload_session_command(
 /// launch selection preserved, await the previous handle's shutdown before
 /// starting the replacement's MCP servers, rewire the ask bridge, and replay
 /// the conversation into the UI. Construction failures keep the current
-/// session.
+/// session. Returns whether replacement completed; errors report terminal cleanup.
 async fn resume_session_command(
     path: &str,
     template: &crate::sdk::SessionOptions,
@@ -8648,24 +8654,21 @@ async fn resume_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
+    // `/reload` resumes this same file. Flush the outgoing session before
+    // constructing its replacement so the new context includes pending rows.
+    // No runtime resources are stopped until the candidate is installed.
+    let prepared = match handle.preflight_replacement().await {
+        Ok(prepared) => prepared,
+        Err(shutdown) => {
+            report_replacement_shutdown_failure(&shutdown, agent_tx);
+            return Ok(false);
+        }
+    };
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
-            let prepared = match handle.preflight_replacement().await {
-                Ok(prepared) => prepared,
-                Err(shutdown) => {
-                    report_replacement_shutdown_failure(&shutdown, agent_tx);
-                    let cleanup = new_handle.discard_uncommitted_resources().await;
-                    for issue in cleanup.messages() {
-                        let _ = agent_tx.send(PiMsg::System(format!(
-                            "Uncommitted resumed session cleanup issue: {issue}"
-                        )));
-                    }
-                    return Ok(());
-                }
-            };
             let old_handle = std::mem::replace(handle, new_handle);
             ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
@@ -8689,12 +8692,13 @@ async fn resume_session_command(
             if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await {
                 let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
             }
+            Ok(true)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Snapshot the handle's conversation and reset the UI transcript from it.
@@ -15307,8 +15311,10 @@ mod tests {
             assert!(model.route_slash_command("/plan stale-before-reload"));
             let stale = submit_rx.try_recv().expect("queued before reload");
 
-            // A saved conversation to keep across the reload.
-            let session_id = {
+            // A saved conversation with a newer pending row. Reload must
+            // flush it even when ordinary shutdown uses throughput mode, and
+            // open the replacement only after that flush reaches disk.
+            let (session_id, session_path) = {
                 let store = handle.session_store();
                 let cx = crate::agent_cx::AgentCx::for_request();
                 let mut session = store.lock(cx.cx()).await.expect("session lock");
@@ -15317,8 +15323,76 @@ mod tests {
                     timestamp: Some(0),
                 });
                 session.save().await.expect("save session");
-                session.header.id.clone()
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Throughput,
+                );
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("keep pending too")),
+                    timestamp: Some(1),
+                });
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                (
+                    session.header.id.clone(),
+                    session.path.clone().expect("saved session path"),
+                )
             };
+
+            // A failed default-mode save must leave the old runtime live and
+            // must not announce a completed reload. Repairing the destination
+            // lets the same handle retry with every queued row still present.
+            let original_store = handle.session_store();
+            let blocked = sessions.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block reload save");
+            {
+                let mut session = original_store.try_lock().expect("current session");
+                session.path = Some(blocked);
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Balanced,
+                );
+            }
+            reload_session_command(
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("a refused reload keeps the driver running");
+            assert!(Arc::ptr_eq(&original_store, &handle.session_store()));
+            let refused = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(refused.iter().any(|message| matches!(
+                message,
+                PiMsg::AgentError(text) if text.contains("failed to flush session autosave")
+            )));
+            assert!(!refused.iter().any(|message| matches!(
+                message,
+                PiMsg::System(text) if text.starts_with("Reloaded")
+            )));
+            run_extension_command(&handle, cwd.path(), "Plan", "still live", true, &agent_tx).await;
+            assert!(agent_rx.try_iter().any(|message| matches!(
+                message,
+                PiMsg::SystemNote(text) if text.contains(r#""args":"still live""#)
+            )), "refused preflight must not stop the old extension runtime");
+            {
+                let mut session = original_store.try_lock().expect("retryable session");
+                assert_eq!(session.header.id, session_id);
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                session.path = Some(session_path.clone());
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Throughput,
+                );
+            }
+            let old_origin = handle
+                .session()
+                .session_action_admission_gate()
+                .capture_origin();
+            let old_extension_session = handle
+                .extension_manager()
+                .expect("current extension manager")
+                .session_handle()
+                .expect("current extension session adapter");
 
             write_extension("status");
             reload_session_command(
@@ -15332,6 +15406,20 @@ mod tests {
             .await
             .expect("reload");
 
+            let stale_error = old_extension_session
+                .append_custom_entry(
+                    "pre-reload-action".to_string(),
+                    None,
+                    Some(old_origin),
+                )
+                .await
+                .expect_err("an action captured before replacement cannot mutate the old store");
+            assert!(stale_error.to_string().contains("active Session changed"));
+            assert!(original_store.try_lock().unwrap().entries.iter().all(|entry| !matches!(
+                entry,
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "pre-reload-action"
+            )));
             let manager = handle.extension_manager().expect("extensions after reload");
             assert!(
                 manager.has_command("status"),
@@ -15369,22 +15457,33 @@ mod tests {
                     .iter()
                     .any(|entry| entry.name == "Plan")
             );
-            let (id, kept) = handle
+            let (id, kept, kept_pending) = handle
                 .with_session(|session| {
-                    let kept = session
-                        .to_messages_for_current_path()
+                    let messages = session.to_messages_for_current_path();
+                    let contains = |expected: &str| messages
                         .iter()
                         .any(|message| matches!(
                             message,
                             crate::model::Message::User(user)
-                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep me")
+                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == expected)
                         ));
-                    (session.header.id.clone(), kept)
+                    (session.header.id.clone(), contains("keep me"), contains("keep pending too"))
                 })
                 .await
                 .expect("session snapshot");
             assert_eq!(id, session_id, "reload keeps the same session");
             assert!(kept, "reload keeps the conversation");
+            assert!(kept_pending, "reload includes mutations flushed during replacement preflight");
+            let reopened = crate::session::Session::open(
+                session_path.to_str().expect("session path"),
+            )
+            .await
+            .expect("reopen reloaded session");
+            assert!(reopened.to_messages_for_current_path().iter().any(|message| matches!(
+                message,
+                crate::model::Message::User(user)
+                    if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep pending too")
+            )), "reload durably saves throughput-mode pending rows");
             let replies = agent_rx.try_iter().collect::<Vec<_>>();
             assert!(
                 replies

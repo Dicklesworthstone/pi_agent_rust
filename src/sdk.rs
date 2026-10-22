@@ -1562,7 +1562,8 @@ impl RpcTransportClient {
         objective: Option<&str>,
         token_budget: Option<u64>,
     ) -> Result<RpcGoalResult> {
-        self.goal_with_limits(op, objective, token_budget, None).await
+        self.goal_with_limits(op, objective, token_budget, None)
+            .await
     }
 
     /// `goal` with an optional native prompt-count budget.
@@ -2154,11 +2155,16 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
     Error::api(format!("RPC {command} failed: {error}"))
 }
 
-/// Proof that replacement preflight completed without mutating runtime
-/// resources. The caller must install the prepared candidate before consuming
-/// the old handle with `commit_resource_shutdown`.
+/// A durable outgoing snapshot held stable while its replacement is prepared.
+/// Dropping this token cancels preparation and releases mutation admission.
+/// Install the candidate before consuming the old handle and token with
+/// `commit_resource_shutdown`.
 pub(crate) struct PreparedSessionShutdown {
     owner_session_id: String,
+    // Drop the store before mutation admission on an uncommitted token too.
+    session: asupersync::sync::OwnedMutexGuard<Session>,
+    session_actions: crate::agent::SessionActionAdmissionGate,
+    session_action_permit: asupersync::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2269,9 +2275,10 @@ impl AgentSessionHandle {
         self.mcp_manager = None;
     }
 
-    /// Flush durable state and capture session ownership without stopping any
-    /// runtime resource. On success the caller can synchronously install its
-    /// prepared replacement before cleanup reaches an irreversible step.
+    /// Flush durable state and retain exclusive mutation admission while a
+    /// replacement is prepared, without stopping runtime resources. Dropping
+    /// the returned token keeps the current session available; a successful
+    /// replacement consumes it only after installing its candidate.
     // `&mut self` is deliberate: the preflight must hold exclusive access to
     // the handle while ownership is captured, even though no field is mutated.
     #[allow(clippy::needless_pass_by_ref_mut)]
@@ -2279,6 +2286,19 @@ impl AgentSessionHandle {
         &mut self,
     ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
         let cx = crate::agent_cx::AgentCx::for_request();
+        // Extension mutations take action admission before the store. Keep
+        // that order so an in-flight callback can finish before we freeze it.
+        let session_actions = self.session.session_action_admission_gate();
+        let session_action_permit = match session_actions.acquire(cx.cx()).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let warning = format!("failed to reserve session replacement: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.admission_failed", "{warning}");
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
+        };
         let mut session = match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
@@ -2298,8 +2318,13 @@ impl AgentSessionHandle {
             }
         };
         let owner_session_id = session.header.id.clone();
+        // Replacing the only live handle must preserve every pending mutation,
+        // even when final process shutdown is configured as best-effort or
+        // skips its flush. A failed preflight leaves this handle available.
         if self.session.save_enabled()
-            && let Err(err) = session.flush_autosave_on_shutdown().await
+            && let Err(err) = session
+                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                .await
         {
             let warning = format!("failed to flush session autosave: {err}");
             tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
@@ -2307,7 +2332,12 @@ impl AgentSessionHandle {
             report.fail(warning);
             return Err(report);
         }
-        Ok(PreparedSessionShutdown { owner_session_id })
+        Ok(PreparedSessionShutdown {
+            owner_session_id,
+            session,
+            session_actions,
+            session_action_permit,
+        })
     }
 
     async fn shutdown_runtime_resources(
@@ -2364,8 +2394,20 @@ impl AgentSessionHandle {
         self,
         prepared: PreparedSessionShutdown,
     ) -> SessionResourceShutdown {
+        let PreparedSessionShutdown {
+            owner_session_id,
+            session,
+            session_actions,
+            session_action_permit,
+        } = prepared;
+        // Queued extension work must fail its old-origin check after the
+        // commit. Release both guards before awaiting runtime shutdown, whose
+        // callbacks may themselves need Session access.
+        session_actions.advance_generation();
+        drop(session);
+        drop(session_action_permit);
         self.shutdown_runtime_resources(
-            Some(prepared.owner_session_id.as_str()),
+            Some(owner_session_id.as_str()),
             SessionResourceShutdown::default(),
         )
         .await
@@ -2858,13 +2900,7 @@ impl AgentSessionHandle {
             ));
         }
         self.session
-            .install_context_candidate(
-                &mut guard,
-                candidate,
-                true,
-                &admission,
-                "checkpoint rewind",
-            )
+            .install_context_candidate(&mut guard, candidate, true, &admission, "checkpoint rewind")
             .await?;
         Ok(outcome)
     }
@@ -7708,6 +7744,164 @@ mod tests {
         indeterminate.fail(String::from("MCP shutdown timed out"));
         assert!(!indeterminate.permits_replacement_mcp_activation());
         assert!(!indeterminate.completed_cleanly());
+    }
+
+    #[test]
+    fn replacement_preflight_preserves_balanced_session_after_failed_save() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        run_async(async {
+            handle
+                .prompt("persisted before replacement", |_| {})
+                .await
+                .expect("baseline turn");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let blocked = tmp.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block replacement save");
+            let (path, session_id, entry_count) = {
+                let mut session = store.try_lock().expect("session");
+                let path = session.path.clone().expect("saved session path");
+                session
+                    .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Balanced);
+                session.append_session_info(Some("pending replacement name".to_string()));
+                session.path = Some(blocked.clone());
+                (path, session.header.id.clone(), session.entries.len())
+            };
+            let before_disk = std::fs::read(&path).expect("baseline session");
+            let failure = handle
+                .preflight_replacement()
+                .await
+                .err()
+                .expect("replacement must refuse an unsaved balanced session");
+            assert!(!failure.completed_cleanly());
+            assert!(
+                failure
+                    .messages()
+                    .any(|message| message.contains("failed to flush"))
+            );
+            assert!(Arc::ptr_eq(&store, &handle.session_store()));
+            assert_eq!(std::fs::read(&path).unwrap(), before_disk);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            handle
+                .session
+                .ensure_provider_reentry_allowed()
+                .expect("preflight did not retire the current session");
+            {
+                let mut session = store.try_lock().expect("live session after refusal");
+                assert_eq!(session.header.id, session_id);
+                assert_eq!(session.entries.len(), entry_count);
+                assert_eq!(session.path.as_ref(), Some(&blocked));
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("pending replacement name")
+                );
+                session.path = Some(path.clone());
+            }
+
+            let prepared = handle
+                .preflight_replacement()
+                .await
+                .expect("retry preflight after repairing persistence");
+            assert!(store.try_lock().is_err(), "prepared snapshot stays locked");
+            let reopened = Session::open(path.to_str().expect("session path"))
+                .await
+                .expect("reopen flushed session");
+            assert_eq!(reopened.header.id, session_id);
+            assert_eq!(
+                reopened.get_name().as_deref(),
+                Some("pending replacement name")
+            );
+            assert_eq!(reopened.entries.len(), entry_count);
+
+            let next = saving_handle(tmp.path());
+            let next_store = next.session_store();
+            let old_handle = std::mem::replace(&mut handle, next);
+            assert!(
+                old_handle
+                    .commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
+            assert!(Arc::ptr_eq(&next_store, &handle.session_store()));
+            assert_eq!(
+                store
+                    .try_lock()
+                    .unwrap()
+                    .autosave_metrics()
+                    .pending_mutations,
+                0
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+
+    #[test]
+    fn cancelled_replacement_releases_store_and_action_guards_without_retiring_session() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        let actions = handle.session.session_action_admission_gate();
+        let origin = actions.capture_origin();
+        store
+            .try_lock()
+            .unwrap()
+            .append_session_info(Some("retained pending history".to_string()));
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let prepared = handle.preflight_replacement().await.expect("preflight");
+            assert!(store.try_lock().is_err());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(prepared);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preparation releases action admission"),
+            );
+            assert!(actions.origin_source().accepts(&origin));
+            {
+                let session = store
+                    .try_lock()
+                    .expect("cancelled preparation releases store");
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("retained pending history")
+                );
+                assert_eq!(session.autosave_metrics().pending_mutations, 0);
+            }
+
+            // Cancellation while waiting for the store must release the
+            // already-acquired action permit as well.
+            let held_store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                .await
+                .expect("hold store");
+            let mut preflight = Box::pin(handle.preflight_replacement());
+            assert!(futures::poll!(preflight.as_mut()).is_pending());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(preflight);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preflight releases action admission"),
+            );
+            drop(held_store);
+            assert!(actions.origin_source().accepts(&origin));
+            handle
+                .prompt("continue after cancelled replacement", |_| {})
+                .await
+                .expect("the old session remains usable");
+            assert_eq!(
+                store.try_lock().unwrap().get_name().as_deref(),
+                Some("retained pending history")
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
     }
 
     #[test]
