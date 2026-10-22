@@ -1872,7 +1872,10 @@ fn reject_windows_session_lock_reparse_components(path: &Path) -> Result<()> {
                     ))));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            // A missing component does not imply that every later prefix is
+            // missing: Windows can normalize `missing\..` away. Keep walking
+            // so a subsequent junction or other reparse point is still checked.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(crate::Error::Io(Box::new(error))),
         }
     }
@@ -16709,6 +16712,48 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_session_lock_checks_paths_after_missing_components() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let [ordinary, _] = windows_session_lock_test_roots(temp_dir.path());
+        let missing = ordinary.join("missing");
+        assert_eq!(
+            std::fs::symlink_metadata(&missing)
+                .expect_err("fixture component must be missing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        // Ordinary Windows paths normalize `missing\..` before opening. A
+        // missing lexical component must neither reject a safe path nor end
+        // the validation of the remaining components.
+        let path = ordinary.join(r"missing\..\normalized.jsonl");
+        assert!(
+            path.components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        );
+        drop(lock_session_persistence(&path).expect("lock a safe normalized path"));
+        assert!(ordinary.join("normalized.jsonl.lock").is_file());
+        assert!(!ordinary.join("normalized.jsonl").exists());
+        assert!(!missing.exists());
+
+        let mut invalid = ordinary
+            .join(r"missing\..\invalid-session.jsonl.lock")
+            .into_os_string();
+        invalid.push("\0");
+        let invalid = PathBuf::from(invalid);
+        let expected = std::fs::symlink_metadata(&invalid).expect_err("invalid path must fail");
+        let error = reject_windows_session_lock_reparse_components(&invalid)
+            .expect_err("a missing component must not hide later metadata errors");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == expected.kind()
+                    && io_error.raw_os_error() == expected.raw_os_error()),
+            "expected original metadata error {expected}, got {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_session_lock_rejects_junctions_in_ordinary_and_verbatim_paths() {
         use std::os::windows::fs::MetadataExt as _;
 
@@ -16745,12 +16790,39 @@ mod tests {
             );
         }
 
+        // Prove that the OS can reach the junction even though the first
+        // lexical component does not exist. Stopping at that NotFound would
+        // miss the reparse point, and OPEN_REPARSE_POINT only protects the
+        // final lock entry, not the directory junction preceding it.
+        assert_eq!(
+            std::fs::symlink_metadata(roots[0].join("missing"))
+                .expect_err("fixture component must be missing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let normalized_junction = roots[0].join(r"missing\..\junction");
+        assert!(
+            normalized_junction
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        );
+        assert_ne!(
+            std::fs::symlink_metadata(&normalized_junction)
+                .expect("normalized path must still reach the junction")
+                .file_attributes()
+                & 0x400,
+            0,
+            "normalized fixture must identify the junction itself"
+        );
+
         // Canonicalize only the safe root. Canonicalizing the whole path would
         // resolve away the very junction that the validator must reject.
         for root in &roots {
             for path in [
                 root.join(r"junction\session.jsonl"),
                 root.join("terminal.jsonl"),
+                root.join(r"missing\..\junction\session.jsonl"),
+                root.join(r"missing\..\terminal.jsonl"),
             ] {
                 let mut session = Session::create_with_dir(Some(root.clone()));
                 session.path = Some(path.clone());
