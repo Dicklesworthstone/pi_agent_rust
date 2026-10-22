@@ -4,6 +4,7 @@
 //! model-visible goal tool or submit provider turns. Mutations are admitted by
 //! the RPC loop only while idle; get is read-only. Budget revision is an atomic
 //! pause operation, retaining the outer loop's existing input-recovery preflight.
+//! Reviewed completion and save-only resolution use that same guarded route.
 
 use super::{
     GoalBudget, GoalPersistence, GoalStatus, Record, Transition, append, check_owner, failure,
@@ -17,6 +18,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::sync::Arc;
+
+mod resolution;
+#[cfg(test)]
+mod resolution_tests;
 
 fn status_name(status: GoalStatus) -> &'static str {
     match status {
@@ -151,6 +156,7 @@ pub(crate) async fn rpc_goal_command(
         .get("op")
         .and_then(Value::as_str)
         .ok_or_else(|| failure("GOAL_RPC", "goal op is required"))?;
+    let resolution = resolution::parse(request, op)?;
     // Refuse misplaced budget edits rather than silently resuming with an
     // ignored allowance. A plain pause keeps its existing wire contract.
     if request.get("budget").is_some() && op != "pause" {
@@ -177,46 +183,58 @@ pub(crate) async fn rpc_goal_command(
         .try_lock_owned()
         .map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
 
-    let next = match op {
-        "create" => {
-            require_no_plan_mode(&session)?;
-            let objective = request
-                .get("objective")
-                .and_then(Value::as_str)
-                .ok_or_else(|| failure("GOAL_RPC", "objective is required when op=create"))?;
-            if latest(&session)?.is_some_and(|(_, record)| !record.status.terminal()) {
-                return Err(failure(
-                    "GOAL_EXISTS",
-                    "resume or drop the existing goal before creating another",
-                ));
+    let next = if let Some(resolution) = resolution {
+        resolution.apply(&session)?
+    } else {
+        Some(match op {
+            "create" => {
+                require_no_plan_mode(&session)?;
+                let objective = request
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| failure("GOAL_RPC", "objective is required when op=create"))?;
+                if latest(&session)?.is_some_and(|(_, record)| !record.status.terminal()) {
+                    return Err(failure(
+                        "GOAL_EXISTS",
+                        "resume or drop the existing goal before creating another",
+                    ));
+                }
+                Record::new(objective.trim(), requested_budget(request)?)?
             }
-            Record::new(objective.trim(), requested_budget(request)?)?
-        }
-        "resume" => {
-            require_no_plan_mode(&session)?;
-            let (_, record) = latest(&session)?
-                .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
-            transition(record, Transition::Resume)?
-        }
-        "pause" if request.get("budget").is_some() => revised_budget(&session, request)?,
-        "pause" => {
-            let (_, record) = latest(&session)?
-                .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
-            transition(record, Transition::Pause("paused by RPC host"))?
-        }
-        "drop" => {
-            let (_, record) = latest(&session)?
-                .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
-            transition(record, Transition::Drop("dropped by RPC host"))?
-        }
-        _ => unreachable!(),
+            "resume" => {
+                require_no_plan_mode(&session)?;
+                let (_, record) = latest(&session)?
+                    .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+                transition(record, Transition::Resume)?
+            }
+            "pause" if request.get("budget").is_some() => revised_budget(&session, request)?,
+            "pause" => {
+                let (_, record) = latest(&session)?
+                    .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+                transition(record, Transition::Pause("paused by RPC host"))?
+            }
+            "drop" => {
+                let (_, record) = latest(&session)?
+                    .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+                transition(record, Transition::Drop("dropped by RPC host"))?
+            }
+            _ => unreachable!(),
+        })
     };
 
     check_owner(owner, enabled)?;
-    append(&mut session, &next)?;
-    agent_session.invalidate_background_compaction();
+    let journal_changed = next.is_some();
+    if let Some(next) = next {
+        append(&mut session, &next)?;
+        agent_session.invalidate_background_compaction();
+    }
     let persistence = persist(&mut session, owner, enabled).await;
     let mut value = rpc_goal_state(&session)?;
+    if let Some(resolution) = resolution {
+        value["resolution"] = json!({
+            "kind": resolution.name(), "journalChanged": journal_changed,
+        });
+    }
     value["persistence"] = Value::String(
         match &persistence {
             GoalPersistence::MemoryOnly => "memory_only",
