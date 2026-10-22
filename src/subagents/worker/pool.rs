@@ -174,6 +174,8 @@ async fn start(
             "scope",
             "timeoutSeconds",
             "isolation",
+            "outputSchema",
+            "schemaMode",
         ],
     )?;
     if !cfg!(unix) {
@@ -223,14 +225,22 @@ async fn start(
     let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&owner_id)?;
     let parent_model = tool.capture_parent_model();
-    let agent = tool
+    let mut agent = tool
         .discover(scope)?
         .remove(&name)
         .ok_or_else(|| invalid("unknown agent definition"))?;
-    if agent.output_schema.is_some() {
-        return Err(invalid(
-            "schema-bearing agents currently require ordinary subagent tasks",
-        ));
+    let schema = input.get("outputSchema").or(agent.output_schema.as_ref());
+    if input.get("schemaMode").is_some_and(|mode| mode.as_str() != Some("strict"))
+        || (input.get("schemaMode").is_some() && schema.is_none())
+    {
+        return Err(invalid("retained output contracts require a schema and strict mode; no corrective retries"));
+    }
+    // Every member receives this same owned definition. Validate the complete
+    // contract before registering the pool or publishing its carrier; the
+    // existing RPC actor then validates each turn without retrying its work.
+    super::output_contract::OutputContract::preflight(schema, &privacy)?;
+    if let Some(schema) = input.get("outputSchema") {
+        agent.output_schema = Some(schema.clone());
     }
     let selected_cwd = input
         .get("cwd")
@@ -783,6 +793,9 @@ fn drain_snapshot(
                 before.get("id") == after.get("id")
                     && before.get("status") == after.get("status")
                     && before.pointer("/result/isError") == after.pointer("/result/isError")
+                    && before.get("result").zip(after.get("result")).is_some_and(|(before, after)| {
+                        super::output_contract::preserves_typed_result(before, after)
+                    })
                     && after.get("result").is_some_and(|result| {
                         serde_json::from_value::<ToolOutput>(result.clone()).is_ok()
                     })
@@ -1040,6 +1053,11 @@ fn projected_snapshot_with(
         || !items_preserved
         || value.pointer("/item/id") != details.pointer("/item/id")
         || value.pointer("/item/status") != details.pointer("/item/status")
+        || value.pointer("/item/result").is_some_and(|before| {
+            details.pointer("/item/result").is_none_or(|after| {
+                !super::output_contract::preserves_typed_result(before, after)
+            })
+        })
     {
         return Err(Error::tool(
             "subagent",
