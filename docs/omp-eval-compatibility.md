@@ -66,8 +66,16 @@ completion result details; see [raw completion jobs](eval-background-completions
 Both use ordinary native session jobs rather than separate schedulers.
 
 Pi's default `agent()` remains one-shot; warm reuse is explicit. The bounded
-pool uses idle/admitted-item scheduling and explicit result collection.
-OMP's context-load scheduling and keyed yield batches remain separate work. Pi's
+pool assigns new items to idle children by observed context load, using the
+post-compaction idle barrier's token estimate and model capacity. Busy children
+keep balanced FIFO queues. JavaScript `pool.drain({cursor, timeout, maxItems})` and
+Python `pool.drain(cursor=..., timeout=..., max_items=...)` collect up to four
+completed, failed or cancelled full results per native call, across cells and
+without waiting for earlier unfinished items. Explicit replayable cursors
+acknowledge only processed item IDs; reads do not seal or cancel the pool.
+See [incremental pool results](eval-structured-results.md#collect-completed-pool-items-across-cells).
+OMP's keyed yield batches remain separate work: native pools execute one
+prompt per item and use explicit `finish()` for aggregate completion. Pi's
 `pool.close()` cancels running and queued work; worker lifetimes remain fixed
 from their launch. See the linked contracts for supported isolation, schemas,
 partial admission and cleanup behavior.

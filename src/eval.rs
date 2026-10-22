@@ -665,7 +665,12 @@ impl Tool for EvalTool {
          returns fixed item handles. One session job owns 1-8 reusable workers. \
          pool.items retains handles; await pool.peek() or pool.status() returns \
          one bounded summary manifest. Use item.output() or item.wait() for full \
-         results. await pool.finish() seals admission and returns the aggregate \
+         results. pool.drain({cursor,timeout,maxItems}) in JS or \
+         pool.drain(cursor=...,timeout=...,max_items=...) in Python returns up \
+         to four finished full results without waiting for earlier items or \
+         sealing the pool; save nextCursor only after processing the page. \
+         Idle workers prefer lower observed active context pressure. \
+         await pool.finish() seals admission and returns the aggregate \
          job; await pool.wait() seals and waits for all accepted work to drain. \
          await pool.close() cancels running and queued work. Pools admit at most \
          32 items with fixed total lifetimes; split pushes above 256 KiB encoded. \

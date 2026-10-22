@@ -496,8 +496,11 @@ the worker and its queued turns.
 and reusable RPC child agents. Native actors keep executing after the eval
 cell returns; no guest timer, callback or retained tool permission drives the
 queue. Items assigned to the same child share its conversation, and each child
-executes its turns in FIFO order. Assignment balances pending work across the
-children; a later prompt is not guaranteed to reach a particular earlier child.
+executes its turns in FIFO order. Idle children with lower observed context
+usage receive new assignments first. The token estimate and model capacity
+come from the child's post-turn, post-compaction idle barrier; busy children
+keep their existing balanced FIFO queues. A later prompt is not guaranteed to
+reach a particular earlier child.
 
 ```javascript
 globalThis.pool = await workpool({
@@ -566,6 +569,7 @@ method: cancellation belongs to the entire pool.
 | --- | --- |
 | `push(tasks)` | Atomically admit a batch and return its fixed item handles in input order. |
 | `peek()` / `status()` | One native manifest: pool state, counts, ordered item summaries and result references. |
+| `drain({cursor, timeout, maxItems})` / `drain(cursor=None, timeout=0, max_items=4)` | One native page of previously unacknowledged completed, failed or cancelled item results. Does not seal admission. |
 | `finish()` | Seal admission and return the aggregate `AgentJob`; accepted work continues draining. |
 | `wait(seconds=30)` | Seal admission, then await the aggregate native `ToolOutput`; raise on failure or timeout. |
 | `output()` | Poll the aggregate job result without sealing; null/`None` while pending. |
@@ -575,8 +579,11 @@ Pool states are `open`, `draining`, `completed`, `failed` and `cancelled`.
 Item states are `queued`, `running`, `completed`, `failed` and `cancelled`.
 The manifest's `failedItems` count includes cancelled items. Summaries are
 bounded excerpts with `resultRef: {poolId, itemId}`; they are not full task
-results. `item.output()` retrieves the selected native `ToolOutput`, or
-null/`None` while pending. `item.wait()` waits for that item without sealing
+results. Its `workerContexts` rows contain a one-based `workerIndex`, `tokens`
+and `window`; null values mean the child has not supplied that measurement.
+These are the latest observed context estimates, not provider billing usage or
+a live measurement of a running prompt. `item.output()` retrieves the selected
+native `ToolOutput`, or null/`None` while pending. `item.wait()` waits for that item without sealing
 the pool. Global `wait()` accepts a mixture of pool items, one-shot jobs,
 reusable workers and fixed worker turns, preserving input order and one shared
 timeout. Python also supports `await item` and `await pool`.
@@ -587,6 +594,80 @@ creates and seals a real empty carrier job. An open pool remains available
 after its current batch drains. Call `finish()` when no further work will be
 added, or `close()` to stop it. Repeated acknowledged finish/close calls do not
 replay their native mutation. Cancelling does not roll back filesystem effects.
+
+### Collect completed pool items across cells
+
+Use `drain()` to collect full results as items finish, including while other
+items remain queued or running. Each call uses one native operation and returns
+at most four items, ordered by item ID within the page. A slow earlier item
+does not block a later completed item. The cursor records the acknowledged
+IDs explicitly, so that earlier item is still collected when it eventually
+finishes.
+
+After the pool's first nonempty `push()`, initialize a cursor once:
+
+```javascript
+globalThis.poolCursor = null;
+```
+
+In a later cell, process a page and then acknowledge it:
+
+```javascript
+const page = await pool.drain({cursor: poolCursor, timeout: 20, maxItems: 4});
+for (const item of page.items) {
+    console.log({id: item.id, status: item.status, details: item.result.details});
+}
+globalThis.poolCursor = page.nextCursor;
+console.log({pending: page.pendingItems, hasMore: page.hasMore, done: page.done});
+```
+
+Python uses keyword options and the same native cursor/page fields:
+
+```python
+pool_cursor = None  # Initialize once, after the first push.
+```
+
+```python
+page = await pool.drain(cursor=pool_cursor, timeout=20, max_items=4)
+for item in page['items']:
+    print({'id': item['id'], 'status': item['status'], 'details': item['result']['details']})
+pool_cursor = page['nextCursor']
+print({'pending': page['pendingItems'], 'hasMore': page['hasMore'], 'done': page['done']})
+```
+
+The returned `pi.subagent.pool.drain.v1` page contains `poolId`, `jobId`,
+`agent`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
+`items`, `cursor`, `nextCursor`, `hasMore`, `done` and `timedOut`. Each item has
+`id`, terminal `status`, and its full native `result` (`content`, `details`,
+optional `isError`). Item failures and cancellation are returned alongside
+successful results; they do not throw away the page or its partial successes.
+
+`cursor` echoes the acknowledged IDs supplied to this call. `nextCursor` adds
+the returned IDs. Only a later call that supplies `nextCursor` acknowledges
+those items for that reader. Reading does not delete retained results, change
+other readers' cursors, or store an implicit guest cursor. After an interrupted
+read or processing failure, reuse the previous cursor to reread available
+results; newly settled items may also appear. Make any effects of processing a
+result safe to repeat. Cursors use
+`{schema: 'pi.subagent.pool.cursor.v1', poolId, itemIds: [...]}` with sorted,
+unique one-based item IDs, and are bound to the owning native pool.
+
+`hasMore` means additional unacknowledged settled results are ready beyond the
+page limit. `done` becomes true only when the native pool is terminal and the
+returned `nextCursor` covers every admitted item. An open pool with all current
+items acknowledged remains open and reports `done: false`; call `finish()`
+when no more work will be submitted. `drain()` also works after `close()` to
+retrieve successes and terminal cancellation results.
+
+The default timeout is zero: inspect immediately without waiting. A timeout
+from 0 through 600 seconds waits natively for at least one unseen settled
+item, terminal completion, or expiry. An empty unfinished page reports
+`timedOut: true`; expiry does not cancel the pool. `maxItems` / `max_items`
+accepts 1–4. An unused lazy pool has no native identity and rejects `drain()`;
+the method never launches workers. A finished empty pool returns an empty
+final page. Bridge, ownership, privacy and malformed protocol failures remain
+errors, with no automatic retry or acknowledgment. The eval watchdog and
+current host-call budget still apply.
 
 ### Bounds, admission and ownership
 
@@ -603,7 +684,7 @@ UTF-8 text of at most 64 KiB without NUL. JavaScript accepts an array; Python
 accepts a list or tuple. Empty pushes on an open pool are local no-ops. The
 entire encoded guest batch request is limited to **256 KiB** in both languages;
 split larger submissions into smaller pushes. All text, capacity and encoded
-size checks happen before dispatch. A nonempty push, `peek()`, or `status()`
+size checks happen before dispatch. A nonempty push, `peek()`, `status()` or `drain()`
 uses one host call, not one call per item. The normal 64-call cell allowance
 and eval watchdog still apply, and pool commands **must be awaited**.
 
@@ -652,8 +733,9 @@ process-local bounded retention, not a disk-backed queue, process-restart
 recovery or durable conversation storage.
 
 Native aggregate completion is delivered through the existing session job
-notice, after drain and child cleanup. OMP's context-load scheduling, keyed
-yield batches and custom child-defined eval tools remain separate work.
+notice, after drain and child cleanup. OMP's keyed yield batches and custom
+child-defined eval tools remain separate work. Native pools keep one prompt
+per admitted item, explicit sealing, and fixed child lifetimes.
 
 ## Validation
 

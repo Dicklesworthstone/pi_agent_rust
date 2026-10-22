@@ -649,6 +649,7 @@ function poolHost(h) {
             status:pool.status,sealed:pool.sealed,concurrency:pool.concurrency,
             admittedItems:pool.items.length,queuedItems:counts.queued,runningItems:counts.running,
             completedItems:counts.completed,failedItems:counts.failed+counts.cancelled,remainingMs:900000,
+            workerContexts:Array.from({length:pool.concurrency},(_,index)=>({workerIndex:index+1,tokens:null,window:null})),
             items:pool.items.map(item=>({id:item.id,status:item.status,summary:item.result ? `item ${item.id}` : '',
                 resultRef:{poolId:pool.id,itemId:item.id}}))};
     };
@@ -697,7 +698,8 @@ function poolHost(h) {
                 item.status = 'cancelled';
                 item.result = {content:[],details:{cancelled:true},isError:true};
             }
-        } else assert.ok(['pool_status','pool_result','pool_wait'].includes(args.operation));
+        } else if (args.operation === 'pool_drain') return poolDrainPage(pool,args);
+        else assert.ok(['pool_status','pool_result','pool_wait'].includes(args.operation));
         const result = snapshot(pool);
         if (args.operation === 'pool_start' || args.operation === 'pool_push') result.admittedItemIds = admittedItemIds;
         if (args.itemId !== undefined) {
@@ -708,6 +710,18 @@ function poolHost(h) {
         return result;
     };
     return {pools,operations,apply,complete,snapshot,reply:request=>answer(h,request,apply(request))};
+}
+function poolDrainPage(pool, args = {}) {
+    const cursor = args.cursor ?? {schema:'pi.subagent.pool.cursor.v1',poolId:pool.id,itemIds:[]};
+    const settled = pool.items.filter(item=>!['queued','running'].includes(item.status));
+    const items = settled.filter(item=>!cursor.itemIds.includes(item.id)).slice(0,args.maxItems ?? 4)
+        .map(item=>({id:item.id,status:item.status,result:item.result}));
+    const itemIds = [...cursor.itemIds,...items.map(item=>item.id)].sort((left,right)=>left-right);
+    const done = !['open','draining'].includes(pool.status) && itemIds.length === pool.items.length;
+    return {schema:'pi.subagent.pool.drain.v1',poolId:pool.id,jobId:pool.jobId,agent:pool.agent,
+        status:pool.status,sealed:pool.sealed,admittedItems:pool.items.length,
+        settledItems:settled.length,pendingItems:pool.items.length-settled.length,items,cursor,
+        nextCursor:{...cursor,itemIds},hasMore:settled.length>itemIds.length,done,timedOut:!items.length&&!done};
 }
 async function drive(h, pending, reply, start = h.requests.length) {
     let settled = false;
@@ -727,6 +741,163 @@ function runPool(h, code, reply) {
 async function createPool(h, options = {agent:'scout',concurrency:2}) {
     await vm.runInContext(`workpool(${JSON.stringify(options)}).then(value=>globalThis.pool=value)`,h.context);
 }
+test('workpool drain pages out-of-order results across cells and acknowledges only an explicit cursor', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await runPool(h,"pool.push(['a','b','c','d'])",native.reply);
+    const pool = native.pools.get('pool-native-1');
+    native.complete(pool,2); native.complete(pool,4);
+    const first = await runPool(h,'pool.drain({maxItems:1}).then(page=>globalThis.page=page)',native.reply);
+    assert.deepEqual(Array.from(first.items,item=>item.id),[2]);
+    assert.equal(first.hasMore,true);
+    assert.deepEqual(h.requests.at(-1).args.args,{operation:'pool_drain',poolId:pool.id,timeoutMs:0,maxItems:1});
+    assert.equal(first.done,false);
+    assert.equal(vm.runInContext('pool.closed',h.context),false);
+    h.dispatch.clear();
+    native.complete(pool,1);
+    const second = await runPool(h,'pool.drain({cursor:page.nextCursor,timeout:0.125,maxItems:2}).then(page=>globalThis.page=page)',native.reply);
+    assert.deepEqual(Array.from(second.items,item=>item.id),[1,4]);
+    assert.deepEqual(Array.from(second.nextCursor.itemIds),[1,2,4]);
+    assert.equal(h.requests.at(-1).args.args.timeoutMs,125);
+    assert.equal(second.items[0].result.details.turn,1);
+    const replay = await runPool(h,'pool.drain({cursor:page.cursor,maxItems:2})',native.reply);
+    assert.deepEqual(Array.from(replay.items,item=>item.id),[1,4]);
+    assert.deepEqual(native.operations,['pool_start','pool_drain','pool_drain','pool_drain']);
+    await runPool(h,"pool.push(['later'])",native.reply);
+    native.complete(pool,5);
+    const later = await runPool(h,'pool.drain({cursor:page.nextCursor})',native.reply);
+    assert.deepEqual(Array.from(later.items,item=>item.id),[5]);
+    assert.equal(later.pendingItems,1);
+    assert.equal(later.done,false);
+});
+test('workpool drain retains failed, cancelled and rich results through terminal paging', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await runPool(h,"pool.push(['a','b','c','d','e','f'])",native.reply);
+    const pool = native.pools.get('pool-native-1');
+    native.complete(pool,1,{content:[{type:'image',mimeType:'image/png',data:'aW1hZ2U='}],details:{data:{count:0}}});
+    native.complete(pool,2,{content:[{type:'text',text:'review failed'}],details:{cause:'fixture'},isError:true});
+    await runPool(h,'pool.close()',native.reply);
+    const first = await runPool(h,'pool.drain().then(page=>globalThis.page=page)',native.reply);
+    assert.equal(first.status,'cancelled'); assert.equal(first.done,false); assert.equal(first.hasMore,true);
+    assert.deepEqual(Array.from(first.items,item=>item.status),['completed','failed','cancelled','cancelled']);
+    assert.equal(first.items[0].result.content[0].data,'aW1hZ2U=');
+    assert.equal(first.items[0].result.details.data.count,0);
+    assert.equal(first.items[1].result.isError,true);
+    const last = await runPool(h,'pool.drain({cursor:page.nextCursor}).then(page=>globalThis.page=page)',native.reply);
+    assert.equal(last.done,true); assert.equal(last.hasMore,false); assert.equal(last.timedOut,false);
+    const empty = await runPool(h,'pool.drain({cursor:page.nextCursor})',native.reply);
+    assert.equal(empty.done,true); assert.equal(empty.items.length,0); assert.equal(empty.timedOut,false);
+    const reread = await runPool(h,'pool.drain({cursor:page.cursor})',native.reply);
+    assert.deepEqual(Array.from(reread.items,item=>item.id),[5,6]);
+});
+test('workpool drain timeout keeps admission open and all-acknowledged open pools are not done', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await assert.rejects(vm.runInContext('pool.drain()',h.context),/EVAL_POOL_INPUT/);
+    assert.equal(h.requests.length,0);
+    await runPool(h,"pool.push(['a'])",native.reply);
+    const timed = await runPool(h,'pool.drain({timeout:0.2})',native.reply);
+    assert.equal(timed.timedOut,true); assert.equal(timed.done,false); assert.equal(timed.items.length,0);
+    assert.equal(h.requests.at(-1).args.args.timeoutMs,200);
+    native.complete(native.pools.get('pool-native-1'),1);
+    await runPool(h,'pool.drain().then(page=>globalThis.page=page)',native.reply);
+    const acknowledged = await runPool(h,'pool.drain({cursor:page.nextCursor})',native.reply);
+    assert.equal(acknowledged.pendingItems,0); assert.equal(acknowledged.done,false); assert.equal(acknowledged.timedOut,true);
+    await runPool(h,'pool.finish()',native.reply);
+    const done = await runPool(h,'pool.drain({cursor:page.nextCursor})',native.reply);
+    assert.equal(done.done,true); assert.equal(done.timedOut,false);
+    assert.deepEqual(native.operations,['pool_start','pool_drain','pool_drain','pool_drain','pool_finish','pool_drain']);
+});
+test('an explicitly finished empty pool has an empty final drain without launching another carrier', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await runPool(h,'pool.finish()',native.reply);
+    const page = await runPool(h,'pool.drain()',native.reply);
+    assert.equal(page.admittedItems,0); assert.equal(page.done,true); assert.equal(page.timedOut,false);
+    assert.deepEqual(Array.from(page.nextCursor.itemIds),[]);
+    assert.deepEqual(native.operations,['pool_start','pool_finish','pool_drain']);
+});
+test('workpool drain validates controls and cursor shape without dispatch or accessor execution', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['a'])",native.reply);
+    const cursor = "{schema:'pi.subagent.pool.cursor.v1',poolId:pool.poolId,itemIds:[]}";
+    const invalid = ['null','[]','{timeout:true}','{timeout:NaN}','{timeout:Infinity}','{timeout:-0.1}',
+        '{timeout:601}','{maxItems:0}','{maxItems:5}','{maxItems:1.5}','{maxItems:true}','{extra:0}',
+        '{cursor:undefined}','{cursor:{}}',`{cursor:{...${cursor},poolId:'other'}}`,
+        ...['[1,1]','[2,1]','[0]','[33]','[true]','[1.5]','[,1]'].map(ids=>`{cursor:{...${cursor},itemIds:${ids}}}`),
+        `Object.create({timeout:0})`,`{get timeout(){throw Error('getter ran')}}`,
+        `{cursor:{...${cursor},toJSON(){throw Error('serializer ran')}}}`,
+        `{cursor:{...${cursor},itemIds:Object.assign([],{extra:1})}}`];
+    for (const options of invalid) {
+        await assert.rejects(vm.runInContext(`pool.drain(${options})`,h.context),/EVAL_POOL_INPUT/,options);
+    }
+    assert.equal(h.requests.length,1);
+    assert.equal(vm.runInContext('pool.closed',h.context),false);
+});
+test('workpool drain copies caller cursors before awaiting a queued native observation', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['a','b'])",native.reply);
+    const pool = native.pools.get('pool-native-1'); native.complete(pool,1); native.complete(pool,2);
+    await runPool(h,'pool.drain({maxItems:1}).then(page=>globalThis.bookmark=page.nextCursor)',native.reply);
+    const start = h.requests.length;
+    const pending = vm.runInContext('pool.drain({cursor:bookmark})',h.context);
+    vm.runInContext('bookmark.itemIds.push(2); bookmark.poolId="changed"',h.context);
+    const page = await drive(h,pending,request=>{
+        assert.deepEqual(request.args.args.cursor,{schema:'pi.subagent.pool.cursor.v1',poolId:pool.id,itemIds:[1]});
+        native.reply(request);
+    },start);
+    assert.deepEqual(Array.from(page.items,item=>item.id),[2]);
+    assert.equal(page.cursor.poolId,pool.id);
+});
+test('workpool drain rejects malformed native pages without losing a replayable cursor', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['a','b'])",native.reply);
+    const pool = native.pools.get('pool-native-1'); native.complete(pool,2);
+    const good = poolDrainPage(pool);
+    const bad = [null,{}, {...good,schema:'wrong'},{...good,poolId:'other'},
+        {...good,jobId:'other'},{...good,agent:'other'},{...good,status:'running'},
+        {...good,sealed:true},{...good,admittedItems:1},{...good,settledItems:0},{...good,pendingItems:0},
+        {...good,done:true},{...good,hasMore:true},{...good,timedOut:true},
+        {...good,cursor:good.nextCursor},{...good,nextCursor:good.cursor},
+        {...good,items:[...good.items,...good.items]},
+        {...good,items:[{...good.items[0],id:3}]},
+        {...good,items:[{...good.items[0],status:'running'}]},
+        {...good,items:[{...good.items[0],result:null}]},
+        {...good,items:[{...good.items[0],result:{content:[]}}]},
+        {...good,nextCursor:{...good.nextCursor,itemIds:[1,2]}}];
+    for (const page of bad) {
+        await assert.rejects(runPool(h,'pool.drain()',request=>answer(h,request,page)),/EVAL_POOL_PROTOCOL/);
+    }
+    const page = await runPool(h,'pool.drain()',native.reply);
+    assert.deepEqual(Array.from(page.items,item=>item.id),[2]);
+    assert.equal(vm.runInContext('pool.closed || pool.unknownAdmission',h.context),false);
+});
+test('workpool drain preserves native and bridge failures without retry or cancellation', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['a'])",native.reply);
+    const before = h.requests.length;
+    await assert.rejects(runPool(h,'pool.drain()',request=>h.dispatch.dispatch(request.id,false,false,'PI_POOL_OWNER_CHANGED')),/PI_POOL_OWNER_CHANGED/);
+    await assert.rejects(runPool(h,'pool.drain()',request=>h.dispatch.dispatch(request.id,false,true,JSON.stringify({
+        ...envelope(null),isError:true,content:[{type:'text',text:'PI_SUBAGENT_POOL_CURSOR: pending item'}],
+    }))),/PI_SUBAGENT_POOL_CURSOR: pending item/);
+    await assert.rejects(runPool(h,'pool.drain()',request=>h.dispatch.dispatch(request.id,false,true,'not json')),/EVAL_BRIDGE_PROTOCOL/);
+    assert.equal(h.requests.length,before+3);
+    native.complete(native.pools.get('pool-native-1'),1);
+    assert.equal((await runPool(h,'pool.drain()',native.reply)).items.length,1);
+    assert.equal(vm.runInContext('pool.closed',h.context),false);
+});
+test('workpool views copy worker context rows before exposing cached snapshots', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['a'])",native.reply);
+    const view = await runPool(h,'pool.close()',native.reply);
+    view.workerContexts[0].tokens = 999;
+    view.workerContexts.push({workerIndex:3,tokens:1,window:100});
+    const repeated = await vm.runInContext('pool.close()',h.context);
+    assert.equal(repeated.workerContexts.length,2);
+    assert.equal(repeated.workerContexts[0].tokens,null);
+    assert.deepEqual(native.operations,['pool_start','pool_close']);
+});
 test('workpool admits whole batches through one native carrier and retains fixed items across cells', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h);

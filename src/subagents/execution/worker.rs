@@ -399,6 +399,11 @@ impl Actor {
                 self.tick(|line, sent| reply.ingest(line, sent))?;
                 if let Some(idle) = reply.idle {
                     if idle {
+                        crate::subagents::worker::observe_idle_context(
+                            &self.state,
+                            reply.context_tokens,
+                            reply.context_window,
+                        );
                         return Ok(());
                     }
                     break;
@@ -552,12 +557,19 @@ fn idle_event(line: &str) -> Result<()> {
 struct IdleReply {
     id: String,
     idle: Option<bool>,
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
 }
 
 #[cfg(unix)]
 impl IdleReply {
     const fn new(id: String) -> Self {
-        Self { id, idle: None }
+        Self {
+            id,
+            idle: None,
+            context_tokens: None,
+            context_window: None,
+        }
     }
 
     fn ingest(&mut self, line: &str, sent: bool) -> Result<()> {
@@ -581,8 +593,22 @@ impl IdleReply {
             .pointer("/data/isCompacting")
             .and_then(Value::as_bool)
             .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        self.context_tokens = context_metric(&event, "contextTokens", true)?;
+        self.context_window = context_metric(&event, "contextWindow", false)?;
         self.idle = Some(!streaming && !compacting);
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn context_metric(event: &Value, field: &str, allow_zero: bool) -> Result<Option<u64>> {
+    match event.get("data").and_then(|data| data.get(field)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| allow_zero || *value > 0)
+            .map(Some)
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC)),
     }
 }
 
@@ -925,5 +951,31 @@ exec sleep 30
                 .is_err()
         ); // ubs:ignore[rust.panic.assert-macros] -- A prior readiness response cannot authorize the new barrier.
         assert!(idle_event(&ended("unexpected background answer")).is_err()); // ubs:ignore[rust.panic.assert-macros] -- An idle worker cannot accept unsolicited provider activity.
+    }
+
+    #[test]
+    fn idle_context_telemetry_is_exact_optional_and_rejects_malformed_counters() {
+        let response = json!({"type":"response", "id":"ready", "command":"get_state", "success":true,
+            "data":{"isStreaming":false,"isCompacting":false,"contextTokens":0,"contextWindow":128000}});
+        let mut reply = IdleReply::new("ready".to_string());
+        reply.ingest(&response.to_string(), true).expect("valid context telemetry");
+        assert_eq!(reply.context_tokens, Some(0));
+        assert_eq!(reply.context_window, Some(128_000));
+        for field in ["contextTokens", "contextWindow"] {
+            for value in [json!(-1), json!(1.5), json!("100"), json!(true), json!({})] {
+                let mut invalid = response.clone();
+                invalid["data"][field] = value;
+                assert!(IdleReply::new("ready".to_string()).ingest(&invalid.to_string(), true).is_err());
+            }
+        }
+        let mut unknown = response.clone();
+        unknown["data"]["contextTokens"] = Value::Null;
+        unknown["data"]["contextWindow"] = Value::Null;
+        let mut reply = IdleReply::new("ready".to_string());
+        reply.ingest(&unknown.to_string(), true).expect("unknown context telemetry");
+        assert_eq!(reply.context_tokens, None);
+        assert_eq!(reply.context_window, None);
+        unknown["data"]["contextWindow"] = json!(0);
+        assert!(IdleReply::new("ready".to_string()).ingest(&unknown.to_string(), true).is_err());
     }
 }

@@ -104,6 +104,22 @@ def batch_drain_page(**updates):
             "total": 2, "settled": 1, "items": [batch_drain_item(1)], "cursor": batch_drain_cursor([1]), **updates}
 
 
+def pool_drain_page(pool, arguments=None):
+    arguments = {} if arguments is None else arguments
+    cursor = arguments.get("cursor", {"schema": "pi.subagent.pool.cursor.v1", "poolId": pool["id"], "itemIds": []})
+    settled = [item for item in pool["items"] if item["status"] not in ("queued", "running")]
+    selected = [item for item in settled if item["id"] not in cursor["itemIds"]][:arguments.get("maxItems", 4)]
+    items = [{"id": item["id"], "status": item["status"], "result": item["result"]} for item in selected]
+    item_ids = sorted(cursor["itemIds"] + [item["id"] for item in items])
+    done = pool["status"] not in ("open", "draining") and len(item_ids) == len(pool["items"])
+    return {"schema": "pi.subagent.pool.drain.v1", "poolId": pool["id"], "jobId": pool["jobId"],
+            "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
+            "admittedItems": len(pool["items"]), "settledItems": len(settled),
+            "pendingItems": len(pool["items"]) - len(settled), "items": items, "cursor": cursor,
+            "nextCursor": {**cursor, "itemIds": item_ids}, "hasMore": len(settled) > len(item_ids),
+            "done": done, "timedOut": not items and not done}
+
+
 class PoolHost:
     def __init__(self, kernel):
         self.kernel = kernel
@@ -119,6 +135,8 @@ class PoolHost:
                 "concurrency": pool["concurrency"], "admittedItems": len(pool["items"]),
                 "queuedItems": counts["queued"], "runningItems": counts["running"],
                 "completedItems": counts["completed"], "failedItems": counts["failed"] + counts["cancelled"],
+                "workerContexts": [{"workerIndex": index + 1, "tokens": None, "window": None}
+                                   for index in range(pool["concurrency"])],
                 "remainingMs": 900000, "items": [
                     {"id": item["id"], "status": item["status"],
                      "summary": f"item {item['id']}" if item["result"] is not None else "",
@@ -175,6 +193,8 @@ class PoolHost:
             for item in pool["items"]:
                 if item["result"] is None:
                     item.update(status="cancelled", result={"content": [], "details": {"cancelled": True}, "isError": True})
+        elif operation == "pool_drain":
+            return pool_drain_page(pool, args)
         elif operation not in ("pool_status", "pool_result", "pool_wait"):
             raise AssertionError(f"unexpected operation {operation}")
         snapshot = self.snapshot(pool)
@@ -1130,6 +1150,260 @@ await sent
     def create_pool(self, concurrency=2):
         response = self.kernel.cell(f"pool = await workpool(agent='scout', concurrency={concurrency}); pool.concurrency")
         self.assertEqual(self.value(response), concurrency)
+
+    def test_pool_drain_pages_out_of_order_results_and_acknowledges_only_explicit_cursors(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a','b','c','d']); len(items)", native))
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 2)
+        native.complete(pool, 4)
+        first = self.value(self.kernel.cell("page = await pool.drain(max_items=1); page", native))
+        self.assertEqual([item["id"] for item in first["items"]], [2])
+        self.assertTrue(first["hasMore"])
+        self.assertFalse(first["done"])
+        self.assertFalse(self.value(self.kernel.cell("pool.closed")))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"], {
+            "operation": "pool_drain", "poolId": pool["id"], "timeoutMs": 0, "maxItems": 1})
+        native.complete(pool, 1)
+        second = self.value(self.kernel.cell("page = await pool.drain(page['nextCursor'], timeout=0.125, max_items=2); page", native))
+        self.assertEqual([item["id"] for item in second["items"]], [1, 4])
+        self.assertEqual(second["nextCursor"]["itemIds"], [1, 2, 4])
+        self.assertEqual(second["items"][0]["result"]["details"]["turn"], 1)
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["timeoutMs"], 125)
+        replay = self.value(self.kernel.cell("await pool.drain(page['cursor'], max_items=2)", native))
+        self.assertEqual([item["id"] for item in replay["items"]], [1, 4])
+        self.assertEqual(native.operations, ["pool_start", "pool_drain", "pool_drain", "pool_drain"])
+        self.value(self.kernel.cell("later = await pool.push(['later']); later[0].id", native))
+        native.complete(pool, 5)
+        later = self.value(self.kernel.cell("await pool.drain(page['nextCursor'])", native))
+        self.assertEqual([item["id"] for item in later["items"]], [5])
+        self.assertEqual(later["pendingItems"], 1)
+        self.assertFalse(later["done"])
+
+    def test_pool_drain_retains_failed_cancelled_and_rich_results_through_terminal_paging(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a','b','c','d','e','f']); len(items)", native))
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 1, {"content": [{"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="}],
+                                  "details": {"data": {"count": 0}}})
+        native.complete(pool, 2, {"content": [{"type": "text", "text": "review failed"}],
+                                  "details": {"cause": "fixture"}, "isError": True})
+        self.value(self.kernel.cell("await pool.close()", native))
+        first = self.value(self.kernel.cell("page = await pool.drain(); page", native))
+        self.assertEqual(first["status"], "cancelled")
+        self.assertFalse(first["done"])
+        self.assertTrue(first["hasMore"])
+        self.assertEqual([item["status"] for item in first["items"]], ["completed", "failed", "cancelled", "cancelled"])
+        self.assertEqual(first["items"][0]["result"]["content"][0]["data"], "aW1hZ2U=")
+        self.assertEqual(first["items"][0]["result"]["details"]["data"]["count"], 0)
+        self.assertTrue(first["items"][1]["result"]["isError"])
+        last = self.value(self.kernel.cell("page = await pool.drain(page['nextCursor']); page", native))
+        self.assertTrue(last["done"])
+        self.assertFalse(last["hasMore"] or last["timedOut"])
+        empty = self.value(self.kernel.cell("await pool.drain(page['nextCursor'])", native))
+        self.assertTrue(empty["done"])
+        self.assertEqual(empty["items"], [])
+        self.assertFalse(empty["timedOut"])
+        replay = self.value(self.kernel.cell("await pool.drain(page['cursor'])", native))
+        self.assertEqual([item["id"] for item in replay["items"]], [5, 6])
+
+    def test_pool_drain_timeout_keeps_admission_open_until_explicit_finish(self):
+        self.create_pool()
+        response = self.kernel.cell("await pool.drain()")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        timed = self.value(self.kernel.cell("await pool.drain(timeout=0.2)", native))
+        self.assertTrue(timed["timedOut"])
+        self.assertFalse(timed["done"])
+        self.assertEqual(timed["items"], [])
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["timeoutMs"], 200)
+        native.complete(native.pools["pool-native-1"], 1)
+        self.value(self.kernel.cell("page = await pool.drain(); page", native))
+        acknowledged = self.value(self.kernel.cell("await pool.drain(page['nextCursor'])", native))
+        self.assertEqual(acknowledged["pendingItems"], 0)
+        self.assertFalse(acknowledged["done"])
+        self.assertTrue(acknowledged["timedOut"])
+        self.value(self.kernel.cell("finished = await pool.finish(); finished.id", native))
+        done = self.value(self.kernel.cell("await pool.drain(page['nextCursor'])", native))
+        self.assertTrue(done["done"])
+        self.assertFalse(done["timedOut"])
+        self.assertEqual(native.operations, ["pool_start", "pool_drain", "pool_drain", "pool_drain", "pool_finish", "pool_drain"])
+
+    def test_empty_finished_pool_has_an_empty_final_drain_without_another_carrier(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("job = await pool.finish(); job.id", native))
+        page = self.value(self.kernel.cell("await pool.drain()", native))
+        self.assertEqual(page["admittedItems"], 0)
+        self.assertTrue(page["done"])
+        self.assertFalse(page["timedOut"])
+        self.assertEqual(page["nextCursor"]["itemIds"], [])
+        self.assertEqual(native.operations, ["pool_start", "pool_finish", "pool_drain"])
+
+    def test_pool_drain_validates_controls_and_sorted_cursor_ids_before_dispatch(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        for expression in ("True", "float('nan')", "float('inf')", "-0.1", "601", "'2'"):
+            response = self.kernel.cell(f"await pool.drain(timeout={expression})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        for value in (True, 0, 5, 1.5, "1", None):
+            response = self.kernel.cell(f"await pool.drain(max_items={value!r})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        cursor = {"schema": "pi.subagent.pool.cursor.v1", "poolId": "pool-native-1", "itemIds": []}
+        invalid = [{}, [], True, {**cursor, "poolId": "other"}, {**cursor, "schema": "wrong"},
+                   {**cursor, "extra": 1}, *({**cursor, "itemIds": ids} for ids in
+                    ([1, 1], [2, 1], [0], [33], [True], [1.5], (1,), ["1"]))]
+        for bookmark in invalid:
+            response = self.kernel.cell(f"await pool.drain({bookmark!r})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 1)
+        self.assertFalse(self.value(self.kernel.cell("pool.closed")))
+
+    def test_pool_drain_does_not_execute_cursor_subclass_callbacks(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        response = self.kernel.cell("""
+class CursorTrap(dict):
+    def __iter__(self):
+        raise AssertionError('cursor callback ran')
+class IdsTrap(list):
+    def __iter__(self):
+        raise AssertionError('itemIds callback ran')
+bookmark = {'schema':'pi.subagent.pool.cursor.v1', 'poolId':pool.pool_id, 'itemIds':[]}
+errors = []
+for cursor in (CursorTrap(bookmark), {**bookmark, 'itemIds':IdsTrap([1])}):
+    try:
+        await pool.drain(cursor)
+    except TypeError as error:
+        errors.append(str(error))
+errors
+""")
+        self.assertEqual(len(self.value(response)), 2)
+        self.assertTrue(all("EVAL_POOL_INPUT" in error for error in self.value(response)))
+        self.assertEqual(len(self.kernel.calls), 1)
+
+    def test_pool_drain_copies_cursor_before_awaiting_native_observation(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a','b']); len(items)", native))
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 1)
+        native.complete(pool, 2)
+        self.value(self.kernel.cell("page = await pool.drain(max_items=1); bookmark = page['nextCursor']; bookmark", native))
+        response = self.kernel.cell("""
+import asyncio
+pending = asyncio.create_task(pool.drain(bookmark))
+await asyncio.sleep(0)
+bookmark['itemIds'].append(2)
+bookmark['poolId'] = 'changed'
+await pending
+""", native)
+        self.assertEqual([item["id"] for item in self.value(response)["items"]], [2])
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"]["cursor"], {
+            "schema": "pi.subagent.pool.cursor.v1", "poolId": pool["id"], "itemIds": [1]})
+
+    def test_pool_drain_cancellation_does_not_acknowledge_results_or_cancel_native_work(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        native.complete(native.pools["pool-native-1"], 1)
+        held = []
+
+        def observe(frame):
+            if "release-pool-drain" in frame["stream"].get("text", ""):
+                self.assertEqual(len(held), 1)
+                native(held[0])
+
+        response = self.kernel.cell("""
+import asyncio
+bookmark = None
+pending = asyncio.create_task(pool.drain(bookmark))
+await asyncio.sleep(0.02)
+pending.cancel()
+print('release-pool-drain')
+try:
+    page = await pending
+    bookmark = page['nextCursor']
+    outcome = 'unexpected success'
+except asyncio.CancelledError:
+    outcome = 'cancelled'
+(outcome, bookmark, pool.closed)
+""", held.append, observe)
+        self.assertEqual(self.value(response), ("cancelled", None, False))
+        page = self.value(self.kernel.cell("await pool.drain(bookmark)", native))
+        self.assertEqual([item["id"] for item in page["items"]], [1])
+        self.assertEqual(native.operations, ["pool_start", "pool_drain", "pool_drain"])
+
+    def test_pool_drain_rejects_malformed_pages_without_losing_replayable_results(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a','b']); len(items)", native))
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 2)
+        good = pool_drain_page(pool)
+        invalid = [None, {}, {**good, "schema": "wrong"}, {**good, "poolId": "other"},
+                   {**good, "jobId": "other"}, {**good, "agent": "other"}, {**good, "status": "running"},
+                   {**good, "sealed": True}, {**good, "admittedItems": 1}, {**good, "settledItems": 0},
+                   {**good, "pendingItems": 0}, {**good, "pendingItems": True}, {**good, "done": True},
+                   {**good, "done": 0}, {**good, "hasMore": True}, {**good, "timedOut": True},
+                   {**good, "cursor": good["nextCursor"]}, {**good, "nextCursor": good["cursor"]},
+                   {**good, "items": good["items"] * 2},
+                   {**good, "items": [{**good["items"][0], "id": 3}]},
+                   {**good, "items": [{**good["items"][0], "status": "running"}]},
+                   {**good, "items": [{**good["items"][0], "result": None}]},
+                   {**good, "items": [{**good["items"][0], "result": {"content": []}}]},
+                   {**good, "nextCursor": {**good["nextCursor"], "itemIds": [1, 2]}}]
+        for page in invalid:
+            response = self.kernel.cell("await pool.drain()", self.reply_with(envelope(page)))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_PROTOCOL", response["error"])
+        page = self.value(self.kernel.cell("await pool.drain()", native))
+        self.assertEqual([item["id"] for item in page["items"]], [2])
+        self.assertFalse(self.value(self.kernel.cell("pool.closed or pool.unknown_admission")))
+
+    def test_pool_drain_preserves_native_bridge_and_wire_errors_without_retries(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        failures = [
+            (lambda frame: self.kernel.reply(frame, error="PI_POOL_OWNER_CHANGED"), "PI_POOL_OWNER_CHANGED"),
+            (self.reply_with({**envelope(None, failed=True), "content": [{"type": "text", "text": "PI_SUBAGENT_POOL_CURSOR: pending item"}]}),
+             "PI_SUBAGENT_POOL_CURSOR: pending item"),
+            (lambda frame: self.kernel.reply(frame, "not json"), "EVAL_BRIDGE_PROTOCOL"),
+        ]
+        for reply, message in failures:
+            response = self.kernel.cell("await pool.drain()", reply)
+            self.assertFalse(response["ok"])
+            self.assertIn(message, response["error"])
+        self.assertEqual(len(self.kernel.calls), 4)
+        native.complete(native.pools["pool-native-1"], 1)
+        self.assertEqual(len(self.value(self.kernel.cell("await pool.drain()", native))["items"]), 1)
+        self.assertFalse(self.value(self.kernel.cell("pool.closed")))
+
+    def test_pool_views_copy_worker_context_rows_before_exposing_cached_snapshots(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("items = await pool.push(['a']); len(items)", native))
+        self.value(self.kernel.cell("view = await pool.close(); view", native))
+        response = self.kernel.cell("""
+view['workerContexts'][0]['tokens'] = 999
+view['workerContexts'].append({'workerIndex':3, 'tokens':1, 'window':100})
+await pool.close()
+""")
+        repeated = self.value(response)
+        self.assertEqual(len(repeated["workerContexts"]), 2)
+        self.assertIsNone(repeated["workerContexts"][0]["tokens"])
+        self.assertEqual(native.operations, ["pool_start", "pool_close"])
 
     def test_pool_admits_batches_through_one_native_carrier_and_retains_fixed_items(self):
         self.create_pool()

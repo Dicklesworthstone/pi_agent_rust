@@ -14772,15 +14772,15 @@ fn session_state(
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
-    let model = session
+    let model_entry = session
         .header
         .provider
         .as_deref()
         .zip(session.header.model_id.as_deref())
-        .and_then(|(provider, model_id)| {
-            model_entry_for_provider_and_id(provider, model_id, models)
-        })
-        .map(rpc_model_from_entry);
+        .and_then(|(provider, model_id)| model_entry_for_provider_and_id(provider, model_id, models));
+    let model = model_entry.map(rpc_model_from_entry);
+    let context_tokens =
+        crate::compaction::estimate_model_context_tokens(&session.to_messages_for_current_path());
 
     let message_count = session
         .entries_for_current_path()
@@ -14847,6 +14847,13 @@ fn session_state(
     state.insert(
         "messageCount".to_string(),
         Value::Number(message_count.into()),
+    );
+    state.insert("contextTokens".to_string(), Value::from(context_tokens));
+    state.insert(
+        "contextWindow".to_string(),
+        model_entry
+            .filter(|entry| entry.model.context_window > 0)
+            .map_or(Value::Null, |entry| Value::from(entry.model.context_window)),
     );
     state.insert(
         "pendingMessageCount".to_string(),

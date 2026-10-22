@@ -285,10 +285,22 @@ Later batches use the existing pool identity:
 
 Each batch is admitted atomically under the carrier's cancellation boundary.
 Every assignment and placement is checked before any task is queued: rejection
-does not admit a prefix. Accepted tasks are balanced by pending work and prior
-admissions across live members, then run in FIFO order within each child. A
-later item has no guaranteed affinity to a particular earlier item's child.
-Failed members are not silently replaced.
+does not admit a prefix. Idle members take new work before busy members. Among
+idle members, assignment prefers the lowest observed context pressure: the
+active token estimate divided by the current model's context window, or the
+raw estimate when capacity is unknown. The child reports this estimate at its
+correlated idle barrier after persistence and compaction, so discarded history
+and cumulative provider usage do not inflate the next assignment's load.
+`workerContexts` in the manifest exposes each member's `workerIndex`, `tokens`
+and `window`; unobserved values are null. A used worker with unknown token load
+does not masquerade as an empty conversation. Fresh workers start empty.
+
+When all members are busy, assignment balances pending item counts, using
+prior admissions and member order to break ties. Accepted items keep their
+assigned child and run in FIFO order. A later item has no guaranteed affinity
+to a particular earlier item's child. Failed members are not silently replaced.
+This scheduling preserves individual native turns; it does not combine queued
+items into OMP's keyed child-yield batches.
 
 ### Native operations and result shapes
 
@@ -301,6 +313,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 | `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
 | `pool_wait` | Requires `poolId`; accepts `itemId` and `timeoutMs`. Waits for that item, or for terminal pool state when `itemId` is omitted. Does not seal admission. |
+| `pool_drain` | Requires `poolId`; accepts `cursor`, `maxItems` (1–4, default 4) and `timeoutMs` (default 0). Returns newly settled full results and a replayable acknowledgment cursor. Does not seal or consume results. |
 | `pool_finish` | Requires `poolId`. Seals admission and acknowledges immediately; accepted items continue draining. Repeated finish is safe. |
 | `pool_close` | Requires `poolId`. Cancels running and queued work and waits for owned child cleanup. Repeated close is safe. |
 
@@ -334,6 +347,50 @@ Zero polls. Reaching this observation timeout returns a pending snapshot and
 does not cancel or restart work. Waiting for the pool without sealing it may
 time out even when all currently admitted items have finished: an open pool
 still accepts more work.
+
+### Collect completed results while work continues
+
+`pool_drain` returns completed, failed and cancelled items without waiting for
+earlier unfinished items. It uses one native observation, with at most four
+full results per page:
+
+```json
+{"operation":"pool_drain","poolId":"pool-…","maxItems":4,"timeoutMs":10000}
+```
+
+The returned `details.schema` is `pi.subagent.pool.drain.v1`. Its `items` are
+`{id, status, result}` records in ascending item order among currently settled
+results. `result` is the full native `ToolOutput`. The page includes pool/job/
+agent identity, pool `status`, `sealed`, and `admittedItems`, `settledItems` and
+`pendingItems` counts.
+
+Only advance to `nextCursor` after processing the page:
+
+```json
+{
+  "operation":"pool_drain",
+  "poolId":"pool-…",
+  "cursor":{"schema":"pi.subagent.pool.cursor.v1","poolId":"pool-…","itemIds":[2,4]},
+  "timeoutMs":10000
+}
+```
+
+The cursor is an explicit sorted set of acknowledged terminal item IDs. An
+omitted cursor starts from an empty set. `cursor` echoes that acknowledgment;
+`nextCursor` adds the returned items. Reusing an earlier cursor observes those
+results again, along with any newly eligible results that fit the page. Cursors
+for another pool, duplicate/unsorted IDs, unadmitted IDs, and acknowledgments of
+pending items fail without changing the pool or consuming results.
+
+`hasMore` means further settled results remain beyond this page. `done` means
+the pool has terminated, its children have been reaped, and `nextCursor` covers
+every admitted item. An open pool is not done simply because its current batch
+finished. An empty page with `timedOut: true` means the observation deadline
+expired; accepted work continues. Failed/cancelled item evidence remains
+available after shutdown, and each read reapplies captured and current privacy
+policy. Later pushes retain earlier item IDs and remain compatible with a saved
+cursor. The cursor carries no permission and can be used after a kernel reset
+only through the owning session's permitted native tool path.
 
 ### Finish, cancellation and aggregate delivery
 

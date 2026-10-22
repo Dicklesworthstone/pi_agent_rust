@@ -693,6 +693,13 @@
             || (snapshot.status === 'open') === snapshot.sealed) {
             throw new ErrorType('EVAL_POOL_PROTOCOL: inconsistent native pool state');
         }
+        if (hasOwn(snapshot,'workerContexts') && (!isArray(snapshot.workerContexts)
+            || snapshot.workerContexts.length !== snapshot.concurrency
+            || snapshot.workerContexts.some((worker,index) => !modelRecord(worker) || worker.workerIndex !== index + 1
+                || (worker.tokens !== null && (!integer(worker.tokens) || worker.tokens < 0))
+                || (worker.window !== null && (!integer(worker.window) || worker.window <= 0))))) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: invalid native worker context snapshot');
+        }
         if (itemId !== undefined || hasOwn(snapshot, 'itemId') || hasOwn(snapshot, 'item')) {
             const item = snapshot.item;
             if (!validTurnId(snapshot.itemId) || (itemId !== undefined && snapshot.itemId !== itemId)
@@ -708,6 +715,69 @@
             }
         }
         return snapshot;
+    };
+    const poolDrainInput = () => new TypeErrorType('EVAL_POOL_INPUT: drain requires a pool cursor, timeout seconds from 0 through 600 and maxItems from 1 through 4');
+    const poolDrainProtocol = () => new ErrorType('EVAL_POOL_PROTOCOL: invalid native pool drain response');
+    const poolDrainCursor = (value, poolId, fail) => {
+        if (value === null) return null;
+        const cursor = drainRecord(value,['schema','poolId','itemIds'],fail);
+        if (keys(cursor).length !== 3 || cursor.schema !== 'pi.subagent.pool.cursor.v1'
+            || cursor.poolId !== poolId || !isArray(cursor.itemIds) || cursor.itemIds.length > 32) throw fail();
+        const itemIds = [];
+        for (let index = 0; index < cursor.itemIds.length; index++) {
+            const field = drainDescriptor(cursor.itemIds,String(index));
+            if (!field || !hasOwn(field,'value') || !integer(field.value) || field.value < 1 || field.value > 32
+                || (index > 0 && field.value <= itemIds[index - 1])) throw fail();
+            itemIds.push(field.value);
+        }
+        if (drainOwnKeys(cursor.itemIds).length !== itemIds.length + 1) throw fail();
+        // The acknowledgment is copied before queueing or awaiting; inherited
+        // serializers cannot change which native results it acknowledges.
+        drainSetPrototype(itemIds,null);
+        cursor.itemIds = itemIds;
+        return cursor;
+    };
+    const checkPoolDrain = (page, state, previous, maximum) => {
+        if (!modelRecord(page) || page.schema !== 'pi.subagent.pool.drain.v1'
+            || page.poolId !== state.poolId || page.jobId !== state.jobId || page.agent !== state.options.agent
+            || !validPoolStatus(page.status) || typeof page.sealed !== 'boolean'
+            || (page.status === 'open') === page.sealed
+            || !integer(page.admittedItems) || page.admittedItems < state.items.length || page.admittedItems > 32
+            || !integer(page.settledItems) || page.settledItems < 0 || page.settledItems > page.admittedItems
+            || page.pendingItems !== page.admittedItems - page.settledItems
+            || (poolTerminal(page.status) && page.pendingItems !== 0)
+            || !isArray(page.items) || page.items.length > maximum
+            || typeof page.hasMore !== 'boolean' || typeof page.done !== 'boolean' || typeof page.timedOut !== 'boolean') {
+            throw poolDrainProtocol();
+        }
+        const cursor = poolDrainCursor(page.cursor,state.poolId,poolDrainProtocol);
+        const next = poolDrainCursor(page.nextCursor,state.poolId,poolDrainProtocol);
+        if (cursor === null || next === null) throw poolDrainProtocol();
+        const before = previous === null ? [] : previous.itemIds;
+        if (cursor.itemIds.length !== before.length) throw poolDrainProtocol();
+        for (let index = 0; index < before.length; index++) {
+            if (cursor.itemIds[index] !== before[index]) throw poolDrainProtocol();
+        }
+        const added = [];
+        let last = 0;
+        for (const item of page.items) {
+            if (!modelRecord(item) || !integer(item.id) || item.id <= last || item.id > page.admittedItems
+                || drainHas(before,item.id) || !['completed','failed','cancelled'].includes(item.status)
+                || !modelRecord(item.result) || !isArray(item.result.content) || !hasOwn(item.result,'details')
+                || (hasOwn(item.result,'isError') && typeof item.result.isError !== 'boolean')) throw poolDrainProtocol();
+            last = item.id;
+            added.push(item.id);
+        }
+        if (next.itemIds.length !== before.length + added.length || next.itemIds.length > page.settledItems) throw poolDrainProtocol();
+        for (let index = 0; index < next.itemIds.length; index++) {
+            const id = next.itemIds[index];
+            if (id > page.admittedItems || (!drainHas(before,id) && !drainHas(added,id))) throw poolDrainProtocol();
+        }
+        if (page.hasMore !== (page.settledItems > next.itemIds.length)
+            || (page.hasMore && page.items.length !== maximum)
+            || page.done !== (poolTerminal(page.status) && next.itemIds.length === page.admittedItems)
+            || page.timedOut !== (page.items.length === 0 && !page.done)) throw poolDrainProtocol();
+        return page;
     };
     const readPoolItem = async (handle, operation, timeoutMs) => {
         const args = {operation,poolId:handle.poolId,itemId:handle.itemId};
@@ -790,7 +860,9 @@
     };
     const poolView = state => ({
         ...(state.snapshot ? {...state.snapshot,items:state.snapshot.items.map(item =>
-            ({...item,resultRef:{...item.resultRef}}))} : {
+            ({...item,resultRef:{...item.resultRef}})),
+            ...(state.snapshot.workerContexts ? {workerContexts:state.snapshot.workerContexts.map(worker => ({...worker}))} : {}),
+        } : {
             schema:'pi.eval.workpool.pending.v1',poolId:null,jobId:null,agent:state.options.agent,
             status:state.unknownAdmission ? 'unavailable' : state.closed ? 'cancelled' : 'unstarted',
             sealed:state.closed,concurrency:state.concurrency,admittedItems:0,items:[],
@@ -881,6 +953,28 @@
         async status() {
             const state = poolGet(this);
             return serialPool(state, () => peekPool(state));
+        }
+        async drain(options = {}) {
+            const state = poolGet(this);
+            const fields = drainRecord(options,['cursor','timeout','maxItems'],poolDrainInput);
+            const seconds = hasOwn(fields,'timeout') ? fields.timeout : 0;
+            const maximum = hasOwn(fields,'maxItems') ? fields.maxItems : 4;
+            if (typeof seconds !== 'number' || !finite(seconds) || seconds < 0 || seconds > 600
+                || !integer(maximum) || maximum < 1 || maximum > 4 || state.poolId === null) throw poolDrainInput();
+            const cursor = poolDrainCursor(hasOwn(fields,'cursor') ? fields.cursor : null,state.poolId,poolDrainInput);
+            return serialPool(state, async () => {
+                const args = drainCreate(null);
+                args.operation = 'pool_drain';
+                args.poolId = state.poolId;
+                if (cursor !== null) args.cursor = cursor;
+                args.timeoutMs = Math.floor(seconds * 1000);
+                args.maxItems = maximum;
+                const page = checkPoolDrain(await nativeResult('subagent',args),state,cursor,maximum);
+                state.closed ||= page.sealed;
+                // Observation never acknowledges a page implicitly. A failed
+                // read can be retried with the same cursor without replaying work.
+                return page;
+            });
         }
         async finish() {
             const state = poolGet(this);

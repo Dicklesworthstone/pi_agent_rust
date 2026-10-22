@@ -23,6 +23,9 @@ const MAX_CHILDREN: u64 = 8;
 const MAX_ITEMS: usize = 32;
 const SUMMARY_BYTES: usize = 2048;
 const MAX_SNAPSHOT_BYTES: usize = 768 * 1024;
+const DRAIN_SCHEMA: &str = "pi.subagent.pool.drain.v1";
+const CURSOR_SCHEMA: &str = "pi.subagent.pool.cursor.v1";
+const MAX_DRAIN_ITEMS: u64 = 4;
 
 type Pool = Arc<Mutex<PoolState>>;
 type ActorFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -149,6 +152,8 @@ fn worker(owner: &str, agent: &str, deadline: Deadline) -> Shared {
         queue: VecDeque::new(),
         turns: BTreeMap::new(),
         result_bytes: 0,
+        context_tokens: None,
+        context_window: None,
     }))
 }
 
@@ -351,6 +356,34 @@ struct Batch {
     acknowledgment: ToolOutput,
 }
 
+struct WorkerLoad {
+    index: usize,
+    active: usize,
+    latest: u64,
+    available: bool,
+    tokens: u64,
+    window: u64,
+}
+
+impl WorkerLoad {
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        self.active
+            .cmp(&other.active)
+            .then_with(|| {
+                if self.active == 0 {
+                    // Compare exact fractions instead of converting large
+                    // counters to floats. Unknown capacity uses raw tokens.
+                    (u128::from(self.tokens) * u128::from(other.window))
+                        .cmp(&(u128::from(other.tokens) * u128::from(self.window)))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| self.latest.cmp(&other.latest))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
 fn prepare_batch(
     pool: &Pool,
     count: usize,
@@ -371,24 +404,32 @@ fn prepare_batch(
                     .values()
                     .filter(|turn| pending(turn.status))
                     .count();
-                Ok((
+                Ok(WorkerLoad {
                     index,
                     active,
-                    worker.latest,
-                    !worker.closed && !worker.closing,
-                ))
+                    latest: worker.latest,
+                    available: !worker.closed && !worker.closing,
+                    // A fresh child has no conversation. Once used, missing
+                    // telemetry must not masquerade as an empty context.
+                    tokens: worker.context_tokens.unwrap_or(if worker.latest == 0 {
+                        0
+                    } else {
+                        u64::MAX
+                    }),
+                    window: worker.context_window.filter(|window| *window > 0).unwrap_or(1),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let mut placements = Vec::with_capacity(count);
         for _ in 0..count {
             let candidate = loads
                 .iter_mut()
-                .filter(|load| load.3 && load.2 < MAX_TURNS)
-                .min_by_key(|load| (load.1, load.2, load.0))
+                .filter(|load| load.available && load.latest < MAX_TURNS)
+                .min_by(|left, right| left.compare(right))
                 .ok_or_else(stopped)?;
-            candidate.1 += 1;
-            candidate.2 += 1;
-            placements.push((candidate.0, candidate.2));
+            candidate.active += 1;
+            candidate.latest += 1;
+            placements.push((candidate.index, candidate.latest));
         }
         let mut value = manifest(&state, None, false)?;
         let ids: Vec<_> = (state.items.len() + 1..=state.items.len() + count).collect();
@@ -535,10 +576,16 @@ pub(super) async fn execute(
         "pool_finish" | "pool_status" | "pool_close" => &["operation", "poolId"],
         "pool_result" => &["operation", "poolId", "itemId"],
         "pool_wait" => &["operation", "poolId", "itemId", "timeoutMs"],
+        "pool_drain" => &["operation", "poolId", "cursor", "timeoutMs", "maxItems"],
         _ => return Err(invalid("unknown pool operation")),
     };
     validate_fields(&input, allowed)?;
     let id = required_text(&input, "poolId", 128)?;
+    let drain = if operation == "pool_drain" {
+        Some(DrainRequest::parse(&input, id)?)
+    } else {
+        None
+    };
     let selected = optional_integer(&input, "itemId", 1, MAX_TURNS)?;
     if operation == "pool_result" && selected.is_none() {
         return Err(invalid("pool_result requires itemId"));
@@ -548,7 +595,8 @@ pub(super) async fn execute(
     } else {
         None
     };
-    let timeout_ms = optional_integer(&input, "timeoutMs", 0, 600_000)?.unwrap_or(30_000);
+    let timeout_ms = optional_integer(&input, "timeoutMs", 0, 600_000)?
+        .unwrap_or(if drain.is_some() { 0 } else { 30_000 });
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
     let budget = Deadline::for_request(Some(Duration::from_millis(timeout_ms + 30_000)), None)?;
@@ -577,6 +625,21 @@ pub(super) async fn execute(
     let started = Instant::now();
     loop {
         recheck_owner(tool, &owner, &owner_id, budget).await?;
+        if let Some(request) = &drain {
+            let expired = started.elapsed() >= Duration::from_millis(timeout_ms);
+            let output = drain_snapshot(&pool, request, &privacy, expired)?;
+            let details = output.details.as_ref().ok_or_else(stopped)?;
+            let ready = details.get("items").and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+                || details.get("done").and_then(Value::as_bool) == Some(true);
+            if ready || expired {
+                return Ok(output);
+            }
+            owner.time().sleep(
+                POLL_INTERVAL.min(Duration::from_millis(timeout_ms).saturating_sub(started.elapsed())),
+            ).await;
+            continue;
+        }
         let output = snapshot(&pool, selected, &privacy)?;
         let details = output.details.as_ref().ok_or_else(stopped)?;
         let waiting = if selected.is_some() {
@@ -604,6 +667,140 @@ pub(super) async fn execute(
             )
             .await;
     }
+}
+
+struct DrainRequest {
+    acknowledged: Vec<u64>,
+    max_items: usize,
+}
+
+impl DrainRequest {
+    fn parse(input: &Value, pool_id: &str) -> Result<Self> {
+        let mut acknowledged = Vec::new();
+        if let Some(cursor) = input.get("cursor") {
+            validate_fields(cursor, &["schema", "poolId", "itemIds"])?;
+            if cursor.get("schema").and_then(Value::as_str) != Some(CURSOR_SCHEMA)
+                || cursor.get("poolId").and_then(Value::as_str) != Some(pool_id)
+            {
+                return Err(invalid("cursor must identify this pool with the native cursor schema"));
+            }
+            let ids = cursor.get("itemIds").and_then(Value::as_array)
+                .filter(|ids| ids.len() <= MAX_ITEMS)
+                .ok_or_else(|| invalid("cursor itemIds must be a sorted array of at most 32 IDs"))?;
+            for value in ids {
+                let id = value.as_u64().filter(|id| (1..=MAX_TURNS).contains(id))
+                    .ok_or_else(|| invalid("cursor item IDs must be integers from 1 to 32"))?;
+                if acknowledged.last().is_some_and(|previous| *previous >= id) {
+                    return Err(invalid("cursor item IDs must be strictly increasing without duplicates"));
+                }
+                acknowledged.push(id);
+            }
+        }
+        let max_items = usize::try_from(
+            optional_integer(input, "maxItems", 1, MAX_DRAIN_ITEMS)?.unwrap_or(MAX_DRAIN_ITEMS),
+        ).map_err(|_| invalid("maxItems must be from 1 to 4"))?;
+        Ok(Self { acknowledged, max_items })
+    }
+}
+
+fn drain_cursor(pool_id: &str, ids: &[u64]) -> Value {
+    json!({"schema":CURSOR_SCHEMA,"poolId":pool_id,"itemIds":ids})
+}
+
+/// A cursor is a caller-owned acknowledgment set, never mutable native state.
+/// Later items can be returned while an earlier item is still running. Reads
+/// neither seal admission nor consume results, including after cancellation.
+fn drain_snapshot(
+    pool: &Pool,
+    request: &DrainRequest,
+    privacy: &AuxiliaryPrivacySnapshot,
+    expired: bool,
+) -> Result<ToolOutput> {
+    let (value, policies) = {
+        let state = pool.lock().map_err(|_| stopped())?;
+        let workers = state.workers.iter()
+            .map(|worker| worker.lock().map_err(|_| stopped()))
+            .collect::<Result<Vec<_>>>()?;
+        if request.acknowledged.last().is_some_and(|id| {
+            usize::try_from(*id).map_or(true, |id| id > state.items.len())
+        }) {
+            return Err(invalid("cursor acknowledges an item not admitted by this pool"));
+        }
+        let mut settled = 0usize;
+        let mut unseen = 0usize;
+        let mut items = Vec::with_capacity(request.max_items);
+        let mut next = request.acknowledged.clone();
+        for (index, item) in state.items.iter().enumerate() {
+            let id = u64::try_from(index + 1).map_err(|_| stopped())?;
+            let worker = workers.get(item.worker).ok_or_else(stopped)?;
+            let turn = worker.turns.get(&item.turn).ok_or_else(stopped)?;
+            let acknowledged = request.acknowledged.binary_search(&id).is_ok();
+            if pending(turn.status) {
+                if acknowledged {
+                    return Err(invalid("cursor cannot acknowledge a pending item"));
+                }
+                continue;
+            }
+            if !matches!(turn.status, "completed" | "failed" | "cancelled") {
+                return Err(stopped());
+            }
+            settled += 1;
+            if !acknowledged {
+                unseen += 1;
+                if items.len() < request.max_items {
+                    let result = turn.result.as_ref().ok_or_else(stopped)?;
+                    items.push(json!({"id":id,"status":turn.status,"result":result}));
+                    next.push(id);
+                }
+            }
+        }
+        next.sort_unstable();
+        let done = state.closed && settled == state.items.len() && next.len() == state.items.len();
+        let value = json!({
+            "schema":DRAIN_SCHEMA,"poolId":state.id,"jobId":state.job_id,"agent":state.agent,
+            "status":status(&state,false),"sealed":state.sealed,
+            "admittedItems":state.items.len(),"settledItems":settled,
+            "pendingItems":state.items.len() - settled,
+            "cursor":drain_cursor(&state.id,&request.acknowledged),
+            "nextCursor":drain_cursor(&state.id,&next),
+            "hasMore":unseen > items.len(),"done":done,
+            "timedOut":expired && items.is_empty() && !done,"items":items,
+        });
+        (value, state.privacy.clone())
+    };
+    let mut details = value.clone();
+    for policy in policies.iter().chain(std::iter::once(privacy)) {
+        details = policy.project_json(&details)?;
+    }
+    let identity_preserved = [
+        "schema", "poolId", "jobId", "agent", "status", "sealed", "admittedItems",
+        "settledItems", "pendingItems", "cursor", "nextCursor", "hasMore", "done", "timedOut",
+    ].iter().all(|key| value.get(key) == details.get(key));
+    let results_preserved = value.get("items").and_then(Value::as_array)
+        .zip(details.get("items").and_then(Value::as_array))
+        .is_some_and(|(before, after)| before.len() == after.len()
+            && before.iter().zip(after).all(|(before, after)| {
+                before.get("id") == after.get("id")
+                    && before.get("status") == after.get("status")
+                    && before.pointer("/result/isError") == after.pointer("/result/isError")
+                    && after.get("result").is_some_and(|result| {
+                        serde_json::from_value::<ToolOutput>(result.clone()).is_ok()
+                    })
+            }));
+    if !identity_preserved || !results_preserved {
+        return Err(Error::tool("subagent", "PI_SUBAGENT_POOL_PRIVACY: privacy policy withheld pool drain identity"));
+    }
+    let output = ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(
+            "Pool result page. Process items before using nextCursor; reuse cursor to replay this observation. Drain does not seal or cancel the pool.",
+        ))],
+        details: Some(details),
+        is_error: false,
+    };
+    if serde_json::to_vec(&output).map_err(|_| stopped())?.len() > MAX_SNAPSHOT_BYTES {
+        return Err(Error::tool("subagent", "PI_SUBAGENT_POOL_RESULT_LIMIT: projected pool drain exceeded its bounded result budget"));
+    }
+    Ok(output)
 }
 
 async fn seal(
@@ -773,6 +970,9 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         "admittedItems":state.items.len(), "queuedItems":queued, "runningItems":running,
         "completedItems":completed, "failedItems":failed, "items":items,
         "remainingMs":u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
+        "workerContexts":workers.iter().enumerate().map(|(index, worker)| json!({
+            "workerIndex":index + 1, "tokens":worker.context_tokens, "window":worker.context_window,
+        })).collect::<Vec<_>>(),
     });
     if let Some(id) = selected {
         let item = selected_item.ok_or_else(|| invalid("itemId was not admitted by this pool"))?;
@@ -819,6 +1019,7 @@ fn projected_snapshot_with(
         "failedItems",
         "itemId",
         "admittedItemIds",
+        "workerContexts",
     ]
     .iter()
     .all(|key| value.get(key) == details.get(key));
@@ -1439,6 +1640,10 @@ done
                 .details
                 .expect("empty manifest"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The aggregate is structurally identical for zero admitted items.
             assert_eq!(manifest.get("items"), Some(&json!([]))); // ubs:ignore[rust.panic.assert-macros] -- An empty pool must not manufacture member results.
+            let page = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            assert_eq!(page["items"], json!([]));
+            assert_eq!(page["done"], true);
+            assert_eq!(page["timedOut"], false);
             if fixture.root.path().join("launches").exists() {
                 fixture.assert_reaped();
             }
@@ -1458,5 +1663,178 @@ done
             assert!(tasks(&json!({"tasks":value}), false).is_err()); // ubs:ignore[rust.panic.assert-macros] -- Malformed batched assignments cannot be coerced or partially accepted.
         }
         assert!(tasks(&json!({}), true).expect("empty start").is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- Empty start explicitly establishes a recoverable native pool identity.
+    }
+
+    #[test]
+    fn pool_drain_collects_later_items_without_sealing_and_replays_explicit_cursors() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        runtime().block_on(async {
+            let started = fixture.call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"tasks":["hold","immediate answer"]})).await;
+            let pool = field(&started, "poolId");
+            fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":2,"timeoutMs":5000})).await;
+            let page = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            assert_eq!(page["schema"], DRAIN_SCHEMA);
+            assert_eq!(page["items"].as_array().expect("page items").len(), 1);
+            assert_eq!(page["items"][0]["id"], 2);
+            assert_eq!(page["items"][0]["result"]["details"]["results"][0]["output"], "empty");
+            assert_eq!(page["pendingItems"], 1);
+            assert_eq!(page["sealed"], false);
+            assert_eq!(page["done"], false);
+            assert_eq!(page["timedOut"], false);
+            let repeated = fixture.call(json!({"operation":"pool_drain","poolId":pool,"cursor":page["cursor"]})).await;
+            assert_eq!(repeated, page);
+
+            let acknowledged = page["nextCursor"].clone();
+            let empty = fixture.call(json!({"operation":"pool_drain","poolId":pool,"cursor":acknowledged,"timeoutMs":0})).await;
+            assert_eq!(empty["items"], json!([]));
+            assert_eq!(empty["timedOut"], true);
+            assert_eq!(empty["done"], false);
+            assert_eq!(empty["nextCursor"], acknowledged);
+            let pending_cursor = drain_cursor(&pool, &[1]);
+            assert!(fixture.tool.execute("pending-ack",json!({"operation":"pool_drain","poolId":pool,"cursor":pending_cursor}),None).await.is_err());
+
+            fixture.call(json!({"operation":"pool_push","poolId":pool,"tasks":["later batch"]})).await;
+            let later = fixture.call(json!({"operation":"pool_drain","poolId":pool,"cursor":acknowledged,"timeoutMs":5000})).await;
+            assert_eq!(later["items"][0]["id"], 3);
+            assert_eq!(later["nextCursor"]["itemIds"], json!([2,3]));
+            assert_eq!(later["sealed"], false);
+
+            let protected = execute(&fixture.tool,json!({"operation":"pool_drain","poolId":pool}),private_projection("empty"))
+                .await.expect("current privacy applies to retained results");
+            assert!(!serde_json::to_string(&protected).expect("encoded protected page").contains("empty"));
+
+            fixture.call(json!({"operation":"pool_finish","poolId":pool})).await;
+            fixture.release();
+            fixture.call(json!({"operation":"pool_wait","poolId":pool,"timeoutMs":5000})).await;
+            let last = fixture.call(json!({"operation":"pool_drain","poolId":pool,"cursor":later["nextCursor"]})).await;
+            assert_eq!(last["items"][0]["id"], 1);
+            assert_eq!(last["done"], true);
+            assert_eq!(last["nextCursor"]["itemIds"], json!([1,2,3]));
+
+            let limited = fixture.call(json!({"operation":"pool_drain","poolId":pool,"maxItems":2})).await;
+            assert_eq!(limited["items"].as_array().expect("bounded page").len(), 2);
+            assert_eq!(limited["hasMore"], true);
+            assert_eq!(limited["done"], false);
+            let tail = fixture.call(json!({"operation":"pool_drain","poolId":pool,"cursor":limited["nextCursor"],"maxItems":2})).await;
+            assert_eq!(tail["items"][0]["id"], 3);
+            assert_eq!(tail["done"], true);
+            fixture.assert_reaped();
+        });
+    }
+
+    #[test]
+    fn cancelled_pool_drain_retains_completed_results_and_settles_unfinished_items() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        runtime().block_on(async {
+            let started = fixture.call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"tasks":["immediate answer","hold"]})).await;
+            let pool = field(&started, "poolId");
+            fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":1,"timeoutMs":5000})).await;
+            fixture.call(json!({"operation":"pool_close","poolId":pool})).await;
+            let page = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            assert_eq!(page["status"], "cancelled");
+            assert_eq!(page["done"], true);
+            assert_eq!(page["pendingItems"], 0);
+            assert_eq!(page["items"][0]["status"], "completed");
+            assert_eq!(page["items"][1]["status"], "cancelled");
+            assert_eq!(page["items"][1]["result"]["isError"], true);
+            assert_eq!(page["items"][0]["result"]["details"]["results"][0]["output"], "empty");
+            fixture.assert_reaped();
+        });
+    }
+
+    #[test]
+    fn drain_cursors_reject_foreign_identity_duplicate_unsorted_and_unbounded_ids() {
+        for cursor in [
+            Value::Null,
+            json!({}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"other","itemIds":[]}),
+            json!({"schema":"wrong","poolId":"pool","itemIds":[]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[1,1]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[2,1]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[0]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[33]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[1.0]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[true]}),
+            json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[],"extra":true}),
+        ] {
+            assert!(DrainRequest::parse(&json!({"cursor":cursor}),"pool").is_err());
+        }
+        for max_items in [json!(0),json!(5),json!(1.5),json!("2"),Value::Null] {
+            assert!(DrainRequest::parse(&json!({"maxItems":max_items}),"pool").is_err());
+        }
+        let request = DrainRequest::parse(&json!({}),"pool").expect("empty acknowledgment");
+        assert!(request.acknowledged.is_empty());
+        assert_eq!(request.max_items, 4);
+    }
+
+    #[test]
+    fn idle_pool_assignment_uses_current_context_pressure_after_compaction() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(r#"
+printf '%s\n' "$$" >> launches
+memory=empty
+tokens=0
+window=100
+while IFS= read -r line; do
+    id=${line#*\"id\":\"}
+    id=${id%%\"*}
+    case "$line" in
+        *'"type":"get_state"'*)
+            printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"contextTokens":%s,"contextWindow":%s}}\n' "$id" "$tokens" "$window"
+            ;;
+        *'"type":"prompt"'*)
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            case "$line" in
+                *'Task: wide context'*) memory=wide; tokens=90; window=1000 ;;
+                *'Task: narrow context'*) memory=narrow; tokens=20; window=100 ;;
+                *'Task: grow context'*) tokens=900 ;;
+                *'Task: compact context'*) tokens=1 ;;
+            esac
+            printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"%s"}]}]}\n' "$memory"
+            ;;
+    esac
+done
+"#);
+        runtime().block_on(async {
+            let started = fixture.call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"tasks":["wide context","narrow context"]})).await;
+            let pool = field(&started, "poolId");
+            let wide = fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":1,"timeoutMs":5000})).await;
+            let narrow = fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":2,"timeoutMs":5000})).await;
+            assert_eq!(narrow["workerContexts"][0]["tokens"], 90);
+            assert_eq!(narrow["workerContexts"][1]["tokens"], 20);
+
+            fixture.call(json!({"operation":"pool_push","poolId":pool,"tasks":["grow context"]})).await;
+            let grown = fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":3,"timeoutMs":5000})).await;
+            // 90/1000 is less pressure than 20/100 despite having more tokens.
+            assert_eq!(native_result(&grown)["pid"], native_result(&wide)["pid"]);
+            assert_eq!(grown["workerContexts"][0]["tokens"], 900);
+
+            fixture.call(json!({"operation":"pool_push","poolId":pool,"tasks":["compact context"]})).await;
+            let compacted = fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":4,"timeoutMs":5000})).await;
+            assert_eq!(native_result(&compacted)["pid"], native_result(&narrow)["pid"]);
+            assert_eq!(compacted["workerContexts"][1]["tokens"], 1);
+
+            fixture.call(json!({"operation":"pool_push","poolId":pool,"tasks":["recall"]})).await;
+            let next = fixture.call(json!({"operation":"pool_wait","poolId":pool,"itemId":5,"timeoutMs":5000})).await;
+            assert_eq!(native_result(&next)["output"], "narrow");
+            fixture.call(json!({"operation":"pool_finish","poolId":pool})).await;
+            fixture.call(json!({"operation":"pool_wait","poolId":pool,"timeoutMs":5000})).await;
+            fixture.assert_reaped();
+        });
+    }
+
+    #[test]
+    fn busy_workers_balance_queue_depth_without_context_reassignment() {
+        let idle = WorkerLoad { index: 0, active: 0, latest: 20, available: true, tokens: 99, window: 100 };
+        let busy = WorkerLoad { index: 1, active: 1, latest: 1, available: true, tokens: 1, window: 100 };
+        assert!(idle.compare(&busy).is_lt());
+        let queued = WorkerLoad { active: 2, ..idle };
+        assert!(busy.compare(&queued).is_lt());
+        let unknown = WorkerLoad { index: 0, active: 0, latest: 1, available: true, tokens: u64::MAX, window: 1 };
+        let known = WorkerLoad { active: 0, tokens: u64::MAX, window: u64::MAX, ..busy };
+        assert!(known.compare(&unknown).is_lt());
     }
 }

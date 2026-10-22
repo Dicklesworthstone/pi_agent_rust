@@ -59,6 +59,11 @@ pub(super) struct WorkerState {
     queue: VecDeque<PendingTurn>,
     turns: BTreeMap<u64, Turn>,
     result_bytes: usize,
+    // Latest active context observed at the correlated post-compaction idle
+    // barrier. Provider usage can describe discarded history, so it is never
+    // used for scheduling retained workers.
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
 }
 
 fn registry() -> &'static Mutex<VecDeque<Shared>> {
@@ -90,7 +95,7 @@ pub(super) fn requested(input: &Value) -> Result<bool> {
                 operation.as_str(),
                 "worker_start" | "worker_send" | "worker_status" | "worker_wait" | "worker_close"
                     | "pool_start" | "pool_push" | "pool_finish" | "pool_status"
-                    | "pool_result" | "pool_wait" | "pool_close"
+                    | "pool_result" | "pool_wait" | "pool_drain" | "pool_close"
             ) =>
         {
             Ok(true)
@@ -309,6 +314,8 @@ async fn start(
             },
         )]),
         result_bytes: 0,
+        context_tokens: None,
+        context_window: None,
     }));
     register(Arc::clone(&state))?;
     let runner = ChildRunner::new(
@@ -582,6 +589,7 @@ fn snapshot(
             "status": status, "turnId": turn_id,
             "turn": {"id": turn_id, "status": turn.status, "result": turn.result},
             "admittedTurns": state.latest, "queuedTurns": state.queue.len(),
+            "contextTokens": state.context_tokens, "contextWindow": state.context_window,
             "remainingMs": u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
         })
     };
@@ -601,6 +609,8 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
         "/turnId",
         "/turn/id",
         "/turn/status",
+        "/contextTokens",
+        "/contextWindow",
     ] {
         if value.pointer(path) != details.pointer(path) {
             return Err(Error::tool(
@@ -663,6 +673,19 @@ pub(super) fn should_close(shared: &Shared) -> bool {
     shared.lock().map_or(true, |state| {
         state.closed || state.closing || state.deadline.check().is_err()
     })
+}
+
+pub(super) fn observe_idle_context(
+    shared: &Shared,
+    tokens: Option<u64>,
+    window: Option<u64>,
+) {
+    if let Ok(mut state) = shared.lock() {
+        if !state.closed && !state.closing && state.deadline.check().is_ok() {
+            state.context_tokens = tokens;
+            state.context_window = window;
+        }
+    }
 }
 
 fn protected_result(result: Result<ToolOutput>, privacy: &AuxiliaryPrivacySnapshot) -> ToolOutput {

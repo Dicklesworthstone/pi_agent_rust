@@ -1676,6 +1676,18 @@ def _pool_snapshot(snapshot, pool_id=None, item_id=None):
             or snapshot["failedItems"] != counts["failed"] + counts["cancelled"]
             or (snapshot["status"] == "open") == snapshot["sealed"]):
         raise ToolBridgeError("EVAL_POOL_PROTOCOL: inconsistent native pool state")
+    if "workerContexts" in snapshot:
+        workers = snapshot["workerContexts"]
+        if (type(workers) is not list or len(workers) != snapshot["concurrency"]
+                or any(type(worker) is not dict or type(worker.get("workerIndex")) is not int
+                       or worker["workerIndex"] != index
+                       or (worker.get("tokens") is not None
+                           and (type(worker["tokens"]) is not int or worker["tokens"] < 0))
+                       or (worker.get("window") is not None
+                           and (type(worker["window"]) is not int or worker["window"] <= 0))
+                       or "tokens" not in worker or "window" not in worker
+                       for index, worker in enumerate(workers, 1))):
+            raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native worker context snapshot")
     if item_id is not None or "itemId" in snapshot or "item" in snapshot:
         item = snapshot.get("item")
         selected = snapshot.get("itemId")
@@ -1690,6 +1702,75 @@ def _pool_snapshot(snapshot, pool_id=None, item_id=None):
                      or "details" not in result or type(result.get("isError", False)) is not bool))):
             raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native pool item result")
     return snapshot
+
+
+def _pool_drain_input():
+    return TypeError("EVAL_POOL_INPUT: drain requires a pool cursor, timeout seconds from 0 through 600 and max_items from 1 through 4")
+
+
+def _pool_drain_protocol():
+    return ToolBridgeError("EVAL_POOL_PROTOCOL: invalid native pool drain response")
+
+
+def _pool_drain_cursor(value, pool_id, fail):
+    if value is None:
+        return None
+    if (type(value) is not dict or any(type(key) is not str for key in value)
+            or set(value) != {"schema", "poolId", "itemIds"}
+            or type(value["schema"]) is not str or value["schema"] != "pi.subagent.pool.cursor.v1"
+            or type(value["poolId"]) is not str or value["poolId"] != pool_id
+            or type(value["itemIds"]) is not list or len(value["itemIds"]) > 32):
+        raise fail()
+    item_ids = value["itemIds"]
+    if any(type(item_id) is not int or not 1 <= item_id <= 32
+           or (index > 0 and item_id <= item_ids[index - 1]) for index, item_id in enumerate(item_ids)):
+        raise fail()
+    # Freeze the acknowledgment before queueing or awaiting. Mutating a caller's
+    # cursor later cannot change either the request or its validation baseline.
+    return {"schema": value["schema"], "poolId": pool_id, "itemIds": list(item_ids)}
+
+
+def _pool_check_drain(page, pool, previous, maximum):
+    if (type(page) is not dict or page.get("schema") != "pi.subagent.pool.drain.v1"
+            or page.get("poolId") != pool.pool_id or page.get("jobId") != pool.job_id
+            or page.get("agent") != pool._options["agent"]
+            or page.get("status") not in ("open", "draining", "completed", "failed", "cancelled")
+            or type(page.get("sealed")) is not bool or (page["status"] == "open") == page["sealed"]
+            or type(page.get("admittedItems")) is not int or not len(pool._items) <= page["admittedItems"] <= 32
+            or type(page.get("settledItems")) is not int or not 0 <= page["settledItems"] <= page["admittedItems"]
+            or type(page.get("pendingItems")) is not int
+            or page["pendingItems"] != page["admittedItems"] - page["settledItems"]
+            or (_pool_terminal(page["status"]) and page["pendingItems"] != 0)
+            or type(page.get("items")) is not list or len(page["items"]) > maximum
+            or any(type(page.get(key)) is not bool for key in ("hasMore", "done", "timedOut"))):
+        raise _pool_drain_protocol()
+    cursor = _pool_drain_cursor(page.get("cursor"), pool.pool_id, _pool_drain_protocol)
+    next_cursor = _pool_drain_cursor(page.get("nextCursor"), pool.pool_id, _pool_drain_protocol)
+    if cursor is None or next_cursor is None:
+        raise _pool_drain_protocol()
+    before = [] if previous is None else previous["itemIds"]
+    if cursor["itemIds"] != before:
+        raise _pool_drain_protocol()
+    added = []
+    last = 0
+    for item in page["items"]:
+        if (type(item) is not dict or type(item.get("id")) is not int
+                or not last < item["id"] <= page["admittedItems"] or item["id"] in before
+                or item.get("status") not in ("completed", "failed", "cancelled")
+                or type(item.get("result")) is not dict or type(item["result"].get("content")) is not list
+                or "details" not in item["result"] or type(item["result"].get("isError", False)) is not bool):
+            raise _pool_drain_protocol()
+        last = item["id"]
+        added.append(item["id"])
+    acknowledged = next_cursor["itemIds"]
+    if (acknowledged != sorted(before + added) or len(acknowledged) > page["settledItems"]
+            or any(item_id > page["admittedItems"] for item_id in acknowledged)
+            or page["hasMore"] is not (page["settledItems"] > len(acknowledged))
+            or (page["hasMore"] and len(page["items"]) != maximum)
+            or page["done"] is not (_pool_terminal(page["status"]) and len(acknowledged) == page["admittedItems"])
+            or page["timedOut"] is not (not page["items"] and not page["done"])):
+        raise _pool_drain_protocol()
+    return page
 
 
 async def _pool_read_item(handle, operation, timeout_ms=None):
@@ -1838,6 +1919,8 @@ class _AgentPool:
         else:
             snapshot = {**self._snapshot, "items": [{**item, "resultRef": dict(item["resultRef"])}
                                                    for item in self._snapshot["items"]]}
+            if "workerContexts" in self._snapshot:
+                snapshot["workerContexts"] = [dict(worker) for worker in self._snapshot["workerContexts"]]
         return {**snapshot, "name": self._name, "closed": self._closed,
                 "unknownAdmission": self._unknown_admission, "lastError": self._last_error}
 
@@ -1925,6 +2008,26 @@ class _AgentPool:
             if _bridge_owner() is not owner:
                 raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
             return await self._peek_locked()
+
+    async def drain(self, cursor=None, timeout=0, max_items=4):
+        if (self._pool_id is None or type(timeout) not in (int, float)
+                or not 0 <= timeout <= 600 or not math.isfinite(timeout)
+                or type(max_items) is not int or not 1 <= max_items <= 4):
+            raise _pool_drain_input()
+        previous = _pool_drain_cursor(cursor, self._pool_id, _pool_drain_input)
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            arguments = {"operation": "pool_drain", "poolId": self._pool_id,
+                         "timeoutMs": int(timeout * 1000), "maxItems": max_items}
+            if previous is not None:
+                arguments["cursor"] = previous
+            page = _pool_check_drain(await _agent_native_result("subagent", arguments), self, previous, max_items)
+            self._closed |= page["sealed"]
+            # Only the caller's next explicit cursor acknowledges these results.
+            # Failed observations never replay work or close further admission.
+            return page
 
     async def finish(self):
         owner = _bridge_owner()
