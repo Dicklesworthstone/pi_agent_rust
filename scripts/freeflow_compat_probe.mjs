@@ -175,7 +175,8 @@ function createRuntime({baselineUndici=false,extensionId=EXTENSION}={}){
    if(!id.startsWith('file:'))throw Error('Package module specifiers are not supported in PiJS: '+specifier);
    let virtualPath=decodeURIComponent(new URL(id).pathname);if(/^\/[a-z]:\//i.test(virtualPath))virtualPath=virtualPath.slice(1);
    const mapped=fixturePath(virtualPath);if(!mapped.local)throw Error('Module unavailable in fixture: '+id);
-   text=stripTypeScriptTypes(fs.readFileSync(mapped.local,'utf8'),{mode:'transform'});
+   // Node 26 accepts only mode 'strip'; the pinned fixture uses no syntax that needs 'transform'.
+   text=stripTypeScriptTypes(fs.readFileSync(mapped.local,'utf8'),{mode:'strip'});
   }
   const module=new vm.SourceTextModule(text,{context,identifier:id,initializeImportMeta:meta=>{meta.url=id;},importModuleDynamically:async(name,owner)=>{const imported=getModule(name,owner.identifier);if(imported.status==='unlinked')await imported.link(linker);if(imported.status==='linked')await imported.evaluate();return imported;}});
   moduleCache.set(id,module);return module;
