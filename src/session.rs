@@ -1293,6 +1293,8 @@ pub(crate) fn open_existing_session_file_for_read(path: &Path) -> Result<std::fs
 }
 
 fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
+    #[cfg(windows)]
+    let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(path)?;
     let initial_metadata = std::fs::symlink_metadata(path)?;
     if initial_metadata.file_type().is_symlink() || !initial_metadata.is_file() {
         return Err(Error::Io(Box::new(std::io::Error::new(
@@ -1338,7 +1340,12 @@ fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
         Ok(file)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        open_windows_session_file_for_append(path, initial_identity)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         if !file.metadata()?.is_file() {
@@ -1349,6 +1356,40 @@ fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
         }
         Ok(file)
     }
+}
+
+#[cfg(windows)]
+fn open_windows_session_file_for_append(
+    path: &Path,
+    initial_identity: crate::file_identity::FileIdentity,
+) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    // The outer save path resolves intentional terminal symlinks before taking
+    // its lock. A new link or regular-file replacement here is a race, and must
+    // not receive any append bytes. Omit FILE_SHARE_DELETE to prevent renaming
+    // or deleting the checked file until the append and sync finish.
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::file_identity::FileIdentity::of_open_file(&file)? != initial_identity
+    {
+        return Err(Error::Io(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session append target changed while it was being opened",
+        ))));
+    }
+    Ok(file)
 }
 
 fn jsonl_ends_with_newline(path: &Path) -> Result<bool> {
@@ -1797,18 +1838,21 @@ fn append_jsonl_entries_blocking(
         } else {
             Some(begin_session_index_namespace_change(sessions_root)?)
         };
+        let mut file = open_existing_session_file_for_append(path)?;
         if !serialized_entries.is_empty() {
             attachments.validate()?;
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
-            let mut file = open_existing_session_file_for_append(path)?;
             file.write_all(&serialized_entries)?;
-            persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
-            file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
-            persistence_test_failpoint(
-                "jsonl_append_after_sync",
-                Some("append_sync_completed=true"),
-            )?;
         }
+        // A failed or cancelled append can leave every requested row visible
+        // without a durable acknowledgement. Deduplicating that replay must
+        // still cross the sync boundary before the caller clears pending work.
+        persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
+        file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
+        persistence_test_failpoint(
+            "jsonl_append_after_sync",
+            Some("append_sync_completed=true"),
+        )?;
         enqueue_session_index_snapshot_update(
             sessions_root,
             path,
@@ -16560,6 +16604,116 @@ mod tests {
         assert_eq!(reopened.entries.len(), 2);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_retains_validated_file_through_sync() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("append-会話-{index}.jsonl"));
+            let moved = root.join(format!("moved-{index}.jsonl"));
+            std::fs::write(&path, b"before\n").expect("seed append target");
+
+            let mut file = open_existing_session_file_for_append(&path)
+                .expect("open ordinary or verbatim append target");
+            std::fs::rename(&path, &moved)
+                .expect_err("the checked append handle must prevent replacement while live");
+            file.write_all(b"after\n").expect("append bytes");
+            file.sync_all().expect("sync append");
+            drop(file);
+
+            assert_eq!(
+                std::fs::read(&path).expect("read appended target"),
+                b"before\nafter\n"
+            );
+            std::fs::rename(&path, &moved).expect("closing the handle must release the name");
+            assert_eq!(
+                std::fs::read(&moved).expect("read moved target"),
+                b"before\nafter\n"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_rejects_replacement_and_missing_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("replaced-{index}.jsonl"));
+            let retained = root.join(format!("original-{index}.jsonl"));
+            let original = b"validated session bytes\n";
+            let replacement = b"unrelated replacement bytes\n";
+            std::fs::write(&path, original).expect("seed append target");
+            let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+                .expect("capture preflight identity");
+
+            // Retain the original object so its file index cannot be recycled.
+            std::fs::rename(&path, &retained).expect("move original aside");
+            let missing = open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must not recreate a missing validated target");
+            assert!(
+                matches!(&missing, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "unexpected missing-file error: {missing}"
+            );
+            assert!(!path.exists());
+
+            std::fs::write(&path, replacement).expect("install replacement");
+            let error = open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must reject a different regular file at the same name");
+            assert!(
+                matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData),
+                "unexpected replacement error: {error}"
+            );
+            assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
+            assert_eq!(std::fs::read(&retained).expect("read original"), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_rejects_substituted_symlink_to_same_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("linked-{index}.jsonl"));
+            let retained = root.join(format!("retained-{index}.jsonl"));
+            let sentinel = b"symlink target must remain intact\n";
+            std::fs::write(&path, sentinel).expect("seed append target");
+            let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+                .expect("capture preflight identity");
+            std::fs::rename(&path, &retained).expect("move original aside");
+
+            // Following this link would yield the expected file identity. The
+            // open itself must reject reparse traversal before returning a writer.
+            if let Err(error) = std::os::windows::fs::symlink_file(&retained, &path) {
+                if error.raw_os_error() == Some(1314) {
+                    eprintln!(
+                        "skipping append symlink test: Windows requires Developer Mode or symlink privilege"
+                    );
+                    return;
+                }
+                test_fail!("create append symlink: {}", error);
+            }
+
+            open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must reject a substituted link even to the same file");
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .expect("link metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&retained).expect("read sentinel"), sentinel);
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn v2_source_state_rejects_replacement_without_truncating_it() {
@@ -17308,9 +17462,17 @@ mod tests {
         )
         .expect("simulate writer reaching disk before cancellation");
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
+        assert_eq!(session.autosave_metrics().pending_mutations, 1);
+        let before_replay = std::fs::read(&path).expect("read unacknowledged append");
 
         run_async(async { session.save().await })
             .expect("one identical persisted replay must remain idempotent");
+        assert_eq!(session.autosave_metrics().pending_mutations, 0);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(&path).expect("read acknowledged replay"),
+            before_replay
+        );
         let (reloaded, diagnostics) =
             open_jsonl_blocking(&path).expect("reload idempotently reconciled JSONL");
         assert!(diagnostics.skipped_entries.is_empty());

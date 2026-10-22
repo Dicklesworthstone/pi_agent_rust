@@ -784,7 +784,14 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_PATH", session_path)
         .env("PI_SESSION_PERSISTENCE_TEST_BACKEND", backend)
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT", failpoint)
-        .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION", "hard_exit")
+        .env(
+            "PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION",
+            if save_mode == Some("append-retry") {
+                "error"
+            } else {
+                "hard_exit"
+            },
+        )
         .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
         .env(
@@ -829,7 +836,7 @@ fn persistence_failpoint_worker_process_entrypoint() {
     let backend = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_BACKEND");
     // Read only to fail fast when the parent omitted it; the backend consumes
     // the variable itself at the checkpoint.
-    let _failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
+    let failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
     let message = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_MESSAGE");
 
     run_async_test(async {
@@ -843,13 +850,67 @@ fn persistence_failpoint_worker_process_entrypoint() {
         // A dirty header forces the full-rewrite path; leaving it clean takes
         // the incremental append path. Defaults: JSONL rewrites, SQLite
         // appends; the save-mode variable selects the other path.
-        let rewrite = match std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE").as_deref() {
+        let save_mode = std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE");
+        let rewrite = match save_mode.as_deref() {
             Ok("rewrite") => true,
-            Ok("append") => false,
+            Ok("append" | "append-retry") => false,
             _ => backend == "jsonl",
         };
         if rewrite {
             session.set_model_header(Some(format!("failpoint-{backend}")), None, None);
+        }
+        if save_mode.as_deref() == Ok("append-retry") {
+            let initial_metrics = session.autosave_metrics();
+            assert!(initial_metrics.pending_mutations > 0);
+            let expected_ids = session
+                .entries
+                .iter()
+                .map(|entry| entry.base().id.clone())
+                .collect::<Vec<_>>();
+            let mut written_bytes = None;
+            for attempt in 0..3 {
+                let result = match attempt {
+                    0 => session.save().await,
+                    1 => {
+                        session
+                            .flush_autosave(pi::session::AutosaveFlushTrigger::Periodic)
+                            .await
+                    }
+                    _ => {
+                        session
+                            .flush_autosave(pi::session::AutosaveFlushTrigger::Shutdown)
+                            .await
+                    }
+                };
+                let error =
+                    result.expect_err("the same pending append must cross the sync boundary");
+                assert!(error.to_string().contains(&failpoint));
+                let metrics = session.autosave_metrics();
+                assert_eq!(metrics.pending_mutations, initial_metrics.pending_mutations);
+                assert_eq!(metrics.flush_succeeded, initial_metrics.flush_succeeded);
+                assert_eq!(
+                    metrics.flush_failed,
+                    initial_metrics.flush_failed + attempt + 1
+                );
+
+                let bytes = std::fs::read(&session_path).expect("read failed append bytes");
+                if let Some(expected) = &written_bytes {
+                    assert_eq!(&bytes, expected, "replay must not append duplicate rows");
+                } else {
+                    written_bytes = Some(bytes);
+                }
+                let reopened = reopen_strict(&session_path, "append retry").await;
+                assert_eq!(
+                    reopened
+                        .entries
+                        .iter()
+                        .map(|entry| entry.base().id.clone())
+                        .collect::<Vec<_>>(),
+                    expected_ids,
+                    "the original pending row IDs must remain intact on disk"
+                );
+            }
+            return;
         }
         let result = session.save().await;
         panic!("hard-exit persistence failpoint returned unexpectedly: {result:?}");
@@ -3305,6 +3366,52 @@ fn jsonl_append_fault_windows_preserve_integrity() {
             vec!["append-base", "append-written-unsynced", "append-synced"]
         );
         assert_no_duplicate_user_texts(&texts, "jsonl append after fsync");
+    });
+}
+
+/// A failed append can leave complete rows on disk while its original caller
+/// still has pending work. Retrying those same IDs must cross the durability
+/// boundary again, even when deduplication means no new bytes are written.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn jsonl_append_retries_require_durable_acknowledgement() {
+    let harness = TestHarness::new("e2e_jsonl_append_retry_durability");
+    run_async_test(async {
+        for point in [
+            "jsonl_append_after_write_before_sync",
+            "jsonl_append_after_sync",
+        ] {
+            let mut session = Session::create_with_dir_and_store(
+                Some(harness.temp_dir().to_path_buf()),
+                SessionStoreKind::Jsonl,
+            );
+            session.append_message(SessionMessage::User {
+                content: UserContent::Text("retry-base".to_string()),
+                timestamp: Some(0),
+            });
+            session.save().await.expect("save retry baseline");
+            let path = session.path.clone().expect("retry session path");
+            let marker = harness.temp_path(format!("{point}.marker"));
+            let child = run_persistence_failpoint_child(
+                &path,
+                &marker,
+                "jsonl",
+                point,
+                "pending-replay",
+                Some("append-retry"),
+            );
+            assert!(
+                child.status.success(),
+                "{point} retry worker failed: {}\nstdout:\n{}\nstderr:\n{}",
+                child.status,
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let reopened = reopen_strict(&path, point).await;
+            let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+            assert_eq!(texts, vec!["retry-base", "pending-replay"]);
+            assert_no_duplicate_user_texts(&texts, point);
+        }
     });
 }
 
