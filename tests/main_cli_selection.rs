@@ -766,19 +766,19 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
 }
 
 #[test]
-fn apply_piped_stdin_inserts_message_and_sets_print() {
+fn apply_piped_stdin_returns_input_and_sets_print() {
     let mut cli = cli::Cli::parse_from(["pi", "hello", "world"]);
-    apply_piped_stdin(&mut cli, Some("stdin".to_string()));
+    let input = apply_piped_stdin(&mut cli, Some("stdin".to_string()));
 
     assert!(cli.print);
-    let messages = cli.message_args();
-    assert_eq!(messages, vec!["stdin", "hello", "world"]);
+    assert_eq!(input.as_deref(), Some("stdin"));
+    assert_eq!(cli.message_args(), vec!["hello", "world"]);
 }
 
 #[test]
 fn apply_piped_stdin_none_keeps_args() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, None);
+    assert!(apply_piped_stdin(&mut cli, None).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -1325,7 +1325,7 @@ fn cli_message_args_empty_when_only_files() {
 #[test]
 fn apply_piped_stdin_empty_content_no_op() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, Some(String::new()));
+    assert!(apply_piped_stdin(&mut cli, Some(String::new())).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -1333,7 +1333,7 @@ fn apply_piped_stdin_empty_content_no_op() {
 #[test]
 fn apply_piped_stdin_whitespace_only_no_op() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, Some("\n\n\r\n".to_string()));
+    assert!(apply_piped_stdin(&mut cli, Some("\n\n\r\n".to_string())).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -1341,9 +1341,10 @@ fn apply_piped_stdin_whitespace_only_no_op() {
 #[test]
 fn apply_piped_stdin_trims_trailing_newlines() {
     let mut cli = cli::Cli::parse_from(["pi"]);
-    apply_piped_stdin(&mut cli, Some("some input\n\n".to_string()));
+    let input = apply_piped_stdin(&mut cli, Some("some input\n\n".to_string()));
     assert!(cli.print);
-    assert_eq!(cli.message_args(), vec!["some input"]);
+    assert_eq!(input.as_deref(), Some("some input"));
+    assert!(cli.message_args().is_empty());
 }
 
 #[test]

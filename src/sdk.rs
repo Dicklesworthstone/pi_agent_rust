@@ -2787,7 +2787,8 @@ impl AgentSessionHandle {
         candidate.ensure_full_v2_hydration_before_save()?;
         let messages = candidate.to_messages_for_current_path();
         let checkpoint = crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
-        self.install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
+        self.session
+            .install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
             .await?;
         Ok(checkpoint)
     }
@@ -2878,57 +2879,16 @@ impl AgentSessionHandle {
                 "Session changed while the rewind summary was running; the result was not applied",
             ));
         }
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            true,
-            &admission,
-            "checkpoint rewind",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                true,
+                &admission,
+                "checkpoint rewind",
+            )
+            .await?;
         Ok(outcome)
-    }
-
-    /// The caller owns provider and Session-action authority plus the live
-    /// Session lock. Persist a private candidate, then install its context
-    /// without another await. An interrupted or failed save keeps admission
-    /// quarantined even though the original live view remains intact.
-    async fn install_context_candidate(
-        &mut self,
-        live: &mut Session,
-        mut candidate: Session,
-        replace_context: bool,
-        admission: &crate::agent::ProviderAdmissionGate,
-        operation: &str,
-    ) -> Result<()> {
-        admission.ensure_allowed()?;
-        let save_enabled = self.session.save_enabled();
-        if save_enabled {
-            admission.block(format!(
-                "SDK {operation} persistence was interrupted before live installation completed"
-            ));
-            if let Err(first_error) = candidate.save().await
-                && let Err(retry_error) = candidate.save().await
-            {
-                let reason = format!(
-                    "SDK {operation} persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
-                );
-                admission.block(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
-        }
-        // Save reconciles IDs, navigation and the persisted header. Project
-        // from the accepted candidate, not the view prepared before that I/O.
-        let messages = replace_context.then(|| candidate.to_messages_for_current_path());
-        *live = candidate;
-        if let Some(messages) = messages {
-            self.session.invalidate_background_compaction();
-            self.session.agent.replace_messages(messages);
-        }
-        if save_enabled {
-            admission.clear();
-        }
-        Ok(())
     }
 
     /// OMP `/retry`: move the session leaf to the parent of the last
@@ -2938,7 +2898,7 @@ impl AgentSessionHandle {
     /// Structured user input is refused before changing the session; use
     /// [`Self::prepare_retry_content`] to retain its ordered content blocks.
     pub async fn prepare_retry(&mut self) -> Result<String> {
-        match self.prepare_retry_input(true).await? {
+        match self.session.prepare_retry_input(true).await? {
             UserContent::Text(text) => Ok(text),
             UserContent::Blocks(_) => Err(Error::session(
                 "Structured retry input requires prepare_retry_content",
@@ -2955,39 +2915,7 @@ impl AgentSessionHandle {
     /// persisted before the live context changes. A failed save leaves the
     /// live turn intact and fences subsequent provider calls until recovery.
     pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
-        self.prepare_retry_input(false).await
-    }
-
-    async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
-        let admission = self.session.provider_admission_gate();
-        admission.ensure_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
-        // Provider callbacks may need Session actions and the store before
-        // releasing their provider permit. Match recovery's lock order and
-        // reserve authority without quarantining while validation is pending.
-        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
-        let session_actions = self.session.session_action_admission_gate();
-        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
-        let store = Arc::clone(&self.session.session);
-        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        let plan = crate::checkpoint::plan_retry_content(&guard)
-            .ok_or_else(|| Error::session("No user turn to retry"))?;
-        if let UserContent::Blocks(blocks) = &plan.content {
-            if require_text {
-                return Err(Error::session(
-                    "The last user turn contains structured content; use prepare_retry_content to preserve its attachments",
-                ));
-            }
-            AgentSession::validate_user_content_blocks(blocks)?;
-        }
-        let mut candidate = guard.clone();
-        crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
-            .map_err(|error| Error::session(error.to_string()))?;
-        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
-            .await?;
-        Ok(plan.content)
+        self.session.prepare_retry_content().await
     }
 
     /// OMP `/branch` and double-Esc rewind: move the session leaf to just
@@ -3012,7 +2940,8 @@ impl AgentSessionHandle {
         candidate.ensure_full_v2_hydration_before_save()?;
         let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
             .ok_or_else(|| Error::session(format!("No user message {entry_id} on this branch")))?;
-        self.install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
             .await?;
         Ok(prepared)
     }
@@ -3074,14 +3003,15 @@ impl AgentSessionHandle {
             roots.push(canonical.clone());
         }
         candidate.set_additional_roots(&roots);
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            false,
-            &admission,
-            "workspace root grant",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root grant",
+            )
+            .await?;
         if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots) {
             // The candidate reached disk, but another host changed live access.
             // Preserve that authority and require deliberate reconciliation.
@@ -3144,14 +3074,15 @@ impl AgentSessionHandle {
         // restore access, including through a later flush of the live Session.
         guard.set_additional_roots(&roots);
         candidate.set_additional_roots(&roots);
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            false,
-            &admission,
-            "workspace root removal",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root removal",
+            )
+            .await?;
         if !workspace.replace_additional_roots_if_unchanged(&roots, roots.clone()) {
             guard.set_additional_roots(&workspace.additional_roots());
             let reason = "Workspace roots changed while a root removal was being saved; \

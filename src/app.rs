@@ -86,16 +86,20 @@ struct RestoreResult {
     deferred_warning: Option<String>,
 }
 
-pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) {
+/// Select print mode for nonempty stdin while keeping it separate from argv.
+/// Piped text remains input, even when it starts with `/` or `@`.
+#[must_use]
+pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) -> Option<String> {
     if let Some(stdin_content) = stdin_content {
         // Match pi-mono's `.trim()` — strip all leading/trailing whitespace.
         let stdin_content = stdin_content.trim();
         if stdin_content.is_empty() {
-            return;
+            return None;
         }
         cli.print = true;
-        cli.args.insert(0, stdin_content.to_string());
+        return Some(stdin_content.to_string());
     }
+    None
 }
 
 /// Did the caller name a session, in any of the four ways pi accepts?
@@ -2825,21 +2829,30 @@ mod tests {
     }
 
     #[test]
-    fn apply_piped_stdin_trims_newlines_and_prepends_message() {
+    fn apply_piped_stdin_trims_newlines_without_changing_argv() {
         let mut cli = cli::Cli::parse_from(["pi", "existing-message"]);
-        apply_piped_stdin(&mut cli, Some("from-stdin\n".to_string()));
+        let input = apply_piped_stdin(&mut cli, Some("from-stdin\n".to_string()));
 
         assert!(cli.print);
-        assert_eq!(
-            cli.args,
-            vec!["from-stdin".to_string(), "existing-message".to_string()]
-        );
+        assert_eq!(input.as_deref(), Some("from-stdin"));
+        assert_eq!(cli.args, vec!["existing-message".to_string()]);
+    }
+
+    #[test]
+    fn piped_file_and_command_syntax_remains_input() {
+        for text in ["@literal-text", "/retry", "/compact", "/handoff"] {
+            let mut cli = cli::Cli::parse_from(["pi", "/compact", "later input"]);
+            let input = apply_piped_stdin(&mut cli, Some(text.to_string()));
+            assert_eq!(input.as_deref(), Some(text));
+            assert!(cli.file_args().is_empty());
+            assert_eq!(cli.message_args(), vec!["/compact", "later input"]);
+        }
     }
 
     #[test]
     fn apply_piped_stdin_ignores_empty_input() {
         let mut cli = cli::Cli::parse_from(["pi", "existing-message"]);
-        apply_piped_stdin(&mut cli, Some("\n".to_string()));
+        assert!(apply_piped_stdin(&mut cli, Some("\n".to_string())).is_none());
 
         assert!(!cli.print);
         assert_eq!(cli.args, vec!["existing-message".to_string()]);
@@ -5289,7 +5302,7 @@ mod tests {
 
         proptest! {
             #[test]
-            fn apply_piped_stdin_trims_sets_print_and_prepends(
+            fn apply_piped_stdin_trims_sets_print_and_preserves_argv(
                 existing in prop::collection::vec("[A-Za-z0-9._/-]{1,16}", 0..4),
                 leading_ws in "[ \\t\\n\\r]{0,4}",
                 core in "[A-Za-z0-9._/-]{1,24}",
@@ -5300,12 +5313,11 @@ mod tests {
                 cli.print = false;
 
                 let raw = format!("{leading_ws}{core}{trailing_ws}");
-                apply_piped_stdin(&mut cli, Some(raw));
+                let input = apply_piped_stdin(&mut cli, Some(raw));
 
                 prop_assert!(cli.print);
-                prop_assert_eq!(cli.args.len(), existing.len() + 1);
-                prop_assert_eq!(cli.args.first().map(String::as_str), Some(core.as_str()));
-                prop_assert_eq!(&cli.args[1..], existing.as_slice());
+                prop_assert_eq!(input.as_deref(), Some(core.as_str()));
+                prop_assert_eq!(cli.args, existing);
             }
 
             #[test]
@@ -5320,12 +5332,12 @@ mod tests {
                 cli.print = initial_print;
                 cli.no_session = initial_no_session;
 
-                apply_piped_stdin(&mut cli, None);
+                prop_assert!(apply_piped_stdin(&mut cli, None).is_none());
                 prop_assert_eq!(&cli.args, &existing);
                 prop_assert_eq!(cli.print, initial_print);
                 prop_assert_eq!(cli.no_session, initial_no_session);
 
-                apply_piped_stdin(&mut cli, Some(whitespace));
+                prop_assert!(apply_piped_stdin(&mut cli, Some(whitespace)).is_none());
                 prop_assert_eq!(&cli.args, &existing);
                 prop_assert_eq!(cli.print, initial_print);
                 prop_assert_eq!(cli.no_session, initial_no_session);

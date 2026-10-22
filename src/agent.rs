@@ -17314,6 +17314,87 @@ impl AgentSession {
         Ok((matches, current))
     }
 
+    /// Persist a private session candidate before installing its live context.
+    /// The caller must hold provider transition authority, Session-action
+    /// authority, and the live Session lock in that order.
+    pub(crate) async fn install_context_candidate(
+        &mut self,
+        live: &mut Session,
+        mut candidate: Session,
+        replace_context: bool,
+        admission: &ProviderAdmissionGate,
+        operation: &str,
+    ) -> Result<()> {
+        admission.ensure_allowed()?;
+        let save_enabled = self.save_enabled();
+        if save_enabled {
+            admission.block(format!(
+                "Session {operation} persistence was interrupted before live installation completed"
+            ));
+            if let Err(first_error) = candidate.save().await
+                && let Err(retry_error) = candidate.save().await
+            {
+                let reason = format!(
+                    "Session {operation} persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
+                );
+                admission.block(reason.clone());
+                return Err(Error::session_persistence(reason));
+            }
+        }
+        // Save reconciles IDs, navigation and the persisted header. Project
+        // from the accepted candidate, not the view prepared before that I/O.
+        let messages = replace_context.then(|| candidate.to_messages_for_current_path());
+        *live = candidate;
+        if let Some(messages) = messages {
+            self.invalidate_background_compaction();
+            self.agent.replace_messages(messages);
+        }
+        if save_enabled {
+            admission.clear();
+        }
+        Ok(())
+    }
+
+    /// Rewind the selected branch to the parent of its last retryable user
+    /// turn. The returned input preserves native content block order and bytes.
+    /// Re-send it as a new prompt to create a sibling of the abandoned turn.
+    /// A failed save preserves the live view and fences later provider calls.
+    pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
+        self.prepare_retry_input(false).await
+    }
+
+    pub(crate) async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
+        let admission = self.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        // Provider callbacks may need Session actions and the store before
+        // releasing their provider permit. Match recovery's lock order and
+        // reserve authority without quarantining while validation is pending.
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = Arc::clone(&self.session);
+        let mut guard = OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let plan = crate::checkpoint::plan_retry_content(&guard)
+            .ok_or_else(|| Error::session("No user turn to retry"))?;
+        if let UserContent::Blocks(blocks) = &plan.content {
+            if require_text {
+                return Err(Error::session(
+                    "The last user turn contains structured content; use prepare_retry_content to preserve its attachments",
+                ));
+            }
+            Self::validate_user_content_blocks(blocks)?;
+        }
+        let mut candidate = guard.clone();
+        crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
+            .map_err(|error| Error::session(error.to_string()))?;
+        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
+            .await?;
+        Ok(plan.content)
+    }
+
     /// Force-run compaction synchronously (used by `/compact` slash command).
     pub async fn compact_now(
         &mut self,

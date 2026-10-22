@@ -161,6 +161,56 @@ Creates a new session file starting from the current point (or a selected point)
 
 Manually triggers context compaction. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
 
+### Session commands in print mode
+
+Explicit command-line arguments can perform session maintenance without opening
+the terminal UI:
+
+```sh
+pi --continue -p '/compact'
+pi --session ./run.jsonl -p '/compact shake'
+pi --session ./run.jsonl -p '/retry'
+```
+
+`/compact` uses the selected session's native summarizer, privacy policy,
+extension hooks and durable compaction transaction. `/compact shake` uses the
+same transaction with local removal of bulky older tool output and no summary
+model request. Disabled compaction is an error; an eligible session with nothing
+to compact reports that no change was made. Custom compaction instructions are
+not accepted on this surface.
+
+`/retry` immediately repeats the latest retryable user turn from the selected
+branch. It preserves ordered text and image/audio/video content, saves the
+rewound parent before invoking the provider, and retains the abandoned attempt
+as a sibling in the session tree. Missing retryable input or failed persistence
+stops the command. The repeated turn uses the ordinary print-mode provider
+retry, failover and tool-approval behavior. Stored input is not rescanned for
+magic keywords because its original authored/template provenance is unavailable.
+
+Use `--continue`, `--resume`, `--session` or `--session-dir` when the result should
+persist. Print mode without a requested session remains ephemeral. Commands and
+ordinary message arguments can be mixed; they run in argument order.
+
+Only original command-line message arguments have command authority. Piped
+stdin and file bytes remain input, including text beginning with `/retry`,
+`/compact` or `@`. A command produced by prompt-template expansion also remains
+input. A command explicitly paired with `@file` attachments is refused rather
+than dropping the attachments; submit it separately. If stdin and files are
+both supplied, files retain their normal pairing with the first input message,
+and later explicit CLI commands still execute.
+
+Command failures return a nonzero exit status, including an error-valued
+provider response during `/retry` in JSON mode. `--mode json` retains the session
+header and native events, adds `command_start` when a retry begins, and emits a
+successful `command_result` only after the operation finishes. Compaction results
+include `data.changed` and the native compaction result when one was produced.
+Ctrl+C and extension cancellation fail the command without acknowledging success;
+interrupted persistence retains the native session admission fence.
+
+Print-mode `/handoff` is explicitly unsupported. Use `pi handoff` for the
+existing local structured report, or the interactive `/handoff` command for
+model-assisted handoff options.
+
 ## ADR: Session Store V2 + Wire-Format Contract
 
 - ADR ID: `ADR-SESSION-STORE-V2`

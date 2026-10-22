@@ -1100,14 +1100,16 @@ fn main_impl() -> Result<()> {
         }
     }
 
-    if cli.command.is_none()
+    let piped_stdin = if cli.command.is_none()
         && cli.fetch_models.is_none()
         && !cli.acp
         && cli.mode.as_deref().is_none_or(|mode| mode.ne("rpc"))
     {
         let stdin_content = read_piped_stdin()?;
-        pi::app::apply_piped_stdin(&mut cli, stdin_content);
-    }
+        pi::app::apply_piped_stdin(&mut cli, stdin_content)
+    } else {
+        None
+    };
 
     if !cli.print && cli.mode.is_none() && !cli.message_args().is_empty() {
         cli.print = true;
@@ -1126,6 +1128,7 @@ fn main_impl() -> Result<()> {
         && cli.fetch_models.is_none()
         && early_mode.eq("text")
         && cli.export.is_none()
+        && piped_stdin.is_none()
         && cli.file_args().is_empty()
         && cli
             .message_args()
@@ -1155,7 +1158,13 @@ fn main_impl() -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
-    let result = runtime.block_on(run(cli, extension_flags, handle, package_subcommand_trust));
+    let result = runtime.block_on(run(
+        cli,
+        extension_flags,
+        handle,
+        package_subcommand_trust,
+        piped_stdin,
+    ));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
     // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
@@ -1653,6 +1662,7 @@ async fn run(
     extension_flags: Vec<cli::ExtensionCliFlag>,
     runtime_handle: RuntimeHandle,
     package_subcommand_trust: Option<bool>,
+    piped_stdin: Option<String>,
 ) -> Result<()> {
     let invocation_cwd = std::env::current_dir()?;
     let requested_session = pi::app::requested_a_session(&cli);
@@ -2222,6 +2232,10 @@ async fn run(
     pi::app::validate_rpc_args(&cli)?;
 
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
+    let first_message_is_piped = piped_stdin.is_some();
+    if let Some(input) = piped_stdin {
+        messages.insert(0, input);
+    }
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
     let initial = pi::app::prepare_initial_message(
         &cwd,
@@ -3248,6 +3262,7 @@ async fn run(
             &mode,
             initial,
             messages,
+            first_message_is_piped,
             &resources,
             runtime_handle.clone(),
             &config,
@@ -9371,12 +9386,208 @@ struct FailoverResolution<'a> {
     cli_api_key: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintCommand {
+    Compact,
+    Shake,
+    Retry,
+}
+
+impl PrintCommand {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Compact | Self::Shake => "compact",
+            Self::Retry => "retry",
+        }
+    }
+}
+
+/// Inspect original argv bytes only. Resource expansion and piped/file input
+/// never acquire command authority from their contents.
+fn parse_print_command(input: &str, from_argument: bool) -> Result<Option<PrintCommand>> {
+    if !from_argument {
+        return Ok(None);
+    }
+    let input = input.trim();
+    let (name, args) = input
+        .split_once(char::is_whitespace)
+        .map_or((input, ""), |(name, args)| (name, args.trim()));
+    match (name, args) {
+        ("/compact", "") => Ok(Some(PrintCommand::Compact)),
+        ("/compact", "shake") => Ok(Some(PrintCommand::Shake)),
+        ("/retry", "") => Ok(Some(PrintCommand::Retry)),
+        ("/compact", _) => bail!("Print mode supports /compact or /compact shake"),
+        ("/retry", _) => bail!("Print-mode /retry takes no arguments"),
+        ("/handoff", _) => bail!(
+            "Print-mode /handoff is not available. Use pi handoff for a local structured report, or /handoff in the interactive session for model-assisted options"
+        ),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+struct PrintRequest {
+    text: String,
+    command: Option<PrintCommand>,
+}
+
+fn prepare_print_requests(messages: Vec<String>, first_is_piped: bool) -> Result<Vec<PrintRequest>> {
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(_, message)| !message.trim().is_empty())
+        .map(|(index, text)| {
+            let command = parse_print_command(&text, !first_is_piped || index != 0)?;
+            Ok(PrintRequest { text, command })
+        })
+        .collect()
+}
+
+fn validate_print_attachment_command(initial: &InitialMessage, first_is_piped: bool) -> Result<()> {
+    if parse_print_command(&initial.keyword_scan_source, !first_is_piped)?.is_some() {
+        bail!(
+            "Print-mode session commands cannot consume @file attachments. Run the command separately so no attached content is discarded"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_print_command_response(message: &AssistantMessage) -> Result<()> {
+    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+        bail!(
+            "{}",
+            message
+                .error_message
+                .as_deref()
+                .unwrap_or("Retried turn failed")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PrintCommandOutcome {
+    Compacted(Option<serde_json::Value>),
+    Retry(pi::model::UserContent),
+}
+
+fn print_retry_input(content: pi::model::UserContent) -> PromptInput {
+    // Stored input may contain expanded templates or generated attachment
+    // wrappers. Replaying it cannot confer new authored-keyword authority.
+    match content {
+        pi::model::UserContent::Text(text) => PromptInput::Text {
+            text,
+            keyword_scan_source: Some(String::new()),
+        },
+        pi::model::UserContent::Blocks(content) => PromptInput::Content {
+            content,
+            keyword_scan_source: Some(String::new()),
+        },
+    }
+}
+
+#[derive(Default)]
+struct PrintCompactionObservation {
+    started: bool,
+    result: Option<serde_json::Value>,
+    failure: Option<String>,
+}
+
+/// Execute maintenance against the same live session as ordinary prompts.
+/// Dropping a cancelled transaction retains the native persistence fence.
+async fn execute_print_command(
+    session: &mut AgentSession,
+    command: PrintCommand,
+    abort: &pi::agent::AbortSignal,
+    on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> Result<PrintCommandOutcome> {
+    if abort.is_aborted() {
+        return Err(pi::error::Error::Aborted.into());
+    }
+    let observed = Arc::new(StdMutex::new(PrintCompactionObservation::default()));
+    let capture = Arc::clone(&observed);
+    let on_event = Arc::new(on_event);
+    let forward = Arc::clone(&on_event);
+    let event_handler = move |event: AgentEvent| {
+        {
+            let mut state = capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &event {
+                AgentEvent::AutoCompactionStart { .. } => state.started = true,
+                AgentEvent::AutoCompactionEnd {
+                    result,
+                    aborted,
+                    error_message,
+                    ..
+                } => {
+                    state.started = false;
+                    state.result.clone_from(result);
+                    state.failure = error_message
+                        .clone()
+                        .or_else(|| aborted.then(|| "Compaction cancelled".to_string()));
+                }
+                _ => {}
+            }
+        }
+        forward(event);
+    };
+    let operation = async {
+        match command {
+            PrintCommand::Retry => session
+                .prepare_retry_content()
+                .await
+                .map(PrintCommandOutcome::Retry),
+            PrintCommand::Compact | PrintCommand::Shake => {
+                if !session.compaction_settings().enabled {
+                    return Err(pi::error::Error::validation(
+                        "Compaction is disabled in the current session settings",
+                    ));
+                }
+                if command == PrintCommand::Shake {
+                    session.shake_now(event_handler).await?;
+                } else {
+                    session.compact_now(event_handler).await?;
+                }
+                let state = observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(error) = &state.failure {
+                    return Err(pi::error::Error::session(error.clone()));
+                }
+                Ok(PrintCommandOutcome::Compacted(state.result.clone()))
+            }
+        }
+    };
+    let cancelled = abort.wait();
+    futures::pin_mut!(operation, cancelled);
+    match futures::future::select(cancelled, operation).await {
+        futures::future::Either::Right((result, _)) => result.map_err(Into::into),
+        futures::future::Either::Left(_) => {
+            let started = observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .started;
+            if started {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: Some("Compaction cancelled".to_string()),
+                });
+            }
+            Err(pi::error::Error::Aborted.into())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_print_mode(
     session: &mut AgentSession,
     mode: &str,
     initial: Option<InitialMessage>,
     messages: Vec<String>,
+    first_message_is_piped: bool,
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
     config: &Config,
@@ -9386,6 +9597,10 @@ async fn run_print_mode(
     if mode.ne("text") && mode.ne("json") {
         bail!("Unknown mode: {mode}");
     }
+    if let Some(initial) = &initial {
+        validate_print_attachment_command(initial, first_message_is_piped)?;
+    }
+    let messages = prepare_print_requests(messages, first_message_is_piped && initial.is_none())?;
 
     if mode.eq("json") {
         let cx = pi::agent_cx::AgentCx::for_request();
@@ -9456,15 +9671,6 @@ async fn run_print_mode(
         initial.text = generated_prefix + &expanded_source;
     }
 
-    let messages = messages
-        .into_iter()
-        .map(|keyword_scan_source| {
-            let text = resources.expand_input(&keyword_scan_source);
-            (text, keyword_scan_source)
-        })
-        .filter(|(message, _)| !message.trim().is_empty())
-        .collect::<Vec<_>>();
-
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
             flush_stdout()?;
@@ -9528,7 +9734,8 @@ async fn run_print_mode(
         }
     }
 
-    for (message, keyword_scan_source) in messages {
+    for request in messages {
+        let retry_command = request.command == Some(PrintCommand::Retry);
         // Cooldown restoration (bd-gm481.1) is a between-prompt lifecycle: the
         // previous prompt's turn is finished and its `FailoverEnd
         // { restoredPrimary: false }` already closed, so this can open and
@@ -9542,6 +9749,49 @@ async fn run_print_mode(
         // covers the refusals, which is where the return value earns its keep.
         let _restored =
             maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
+        let input = if let Some(command) = request.command {
+            let outcome = execute_print_command(session, command, &abort_signal, make_event_handler())
+                .await?;
+            match outcome {
+                PrintCommandOutcome::Compacted(result) => {
+                    sent_prompts = sent_prompts.saturating_add(1);
+                    if is_json {
+                        write_print_line(&serde_json::to_string(&serde_json::json!({
+                            "type": "command_result",
+                            "command": command.name(),
+                            "success": true,
+                            "data": { "changed": result.is_some(), "result": result }
+                        }))?);
+                    } else {
+                        write_print_line(if result.is_some() {
+                            "Compacted conversation."
+                        } else {
+                            "Nothing to compact in the selected session."
+                        });
+                    }
+                    continue;
+                }
+                PrintCommandOutcome::Retry(content) => {
+                    if is_json {
+                        write_print_line(&serde_json::to_string(&serde_json::json!({
+                            "type": "command_start",
+                            "command": command.name(),
+                            "data": { "rerunning": true }
+                        }))?);
+                    }
+                    print_retry_input(content)
+                }
+            }
+        } else {
+            let text = resources.expand_input(&request.text);
+            if text.trim().is_empty() {
+                continue;
+            }
+            PromptInput::Text {
+                text,
+                keyword_scan_source: Some(request.text),
+            }
+        };
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -9552,10 +9802,7 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Text {
-                text: message,
-                keyword_scan_source: Some(keyword_scan_source),
-            },
+            input,
             failover_ctx,
             &mut failover_state,
         )
@@ -9567,6 +9814,16 @@ async fn run_print_mode(
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
             )?;
+        }
+        if retry_command {
+            // JSON prompts historically report a provider error in-band.
+            // A requested command must also fail the process for scripts.
+            ensure_print_command_response(&response)?;
+            if is_json {
+                write_print_line(&serde_json::to_string(&serde_json::json!({
+                    "type": "command_result", "command": "retry", "success": true
+                }))?);
+            }
         }
     }
 
@@ -13127,6 +13384,440 @@ mod tests {
         assert!(!message_marks_session_persistence(
             "500 internal server error"
         ));
+    }
+
+    #[test]
+    fn headless_commands_require_original_argument_provenance() {
+        for input in ["/compact", "/compact shake", "/retry", "/handoff"] {
+            assert_eq!(parse_print_command(input, false).unwrap(), None);
+        }
+        assert_eq!(
+            parse_print_command(" /retry \n", true).unwrap(),
+            Some(PrintCommand::Retry)
+        );
+        assert_eq!(
+            parse_print_command("/compact shake", true).unwrap(),
+            Some(PrintCommand::Shake)
+        );
+        for input in ["/retrying", "Explain /compact", "/my-template"] {
+            assert_eq!(parse_print_command(input, true).unwrap(), None);
+        }
+        for input in ["/retry extra", "/compact unknown", "/handoff"] {
+            let error = parse_print_command(input, true).unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+        }
+        let requests = prepare_print_requests(
+            vec![
+                "/retry".into(),
+                "/retry".into(),
+                "@literal-data".into(),
+                "/compact".into(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.command)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(PrintCommand::Retry),
+                None,
+                Some(PrintCommand::Compact)
+            ]
+        );
+        assert_eq!(requests[0].text, "/retry");
+        assert_eq!(requests[2].text, "@literal-data");
+    }
+
+    #[test]
+    fn attachment_bytes_cannot_become_commands_and_attached_commands_cannot_drop_files() {
+        let directory = TempDir::new().expect("input directory");
+        fs::write(directory.path().join("input.txt"), "/retry\n").expect("fixture");
+        let workspace = pi::workspace::WorkspaceHandle::single(directory.path());
+        for (mut messages, piped, should_refuse) in [
+            (Vec::<String>::new(), false, false),
+            (vec!["/retry".to_string()], true, false),
+            (vec!["/retry".to_string()], false, true),
+        ] {
+            let initial = pi::app::prepare_initial_message(
+                directory.path(),
+                &["input.txt".to_string()],
+                &mut messages,
+                false,
+                &workspace,
+            )
+            .unwrap()
+            .expect("file input");
+            assert!(initial.text.contains("/retry"));
+            assert_eq!(
+                validate_print_attachment_command(&initial, piped).is_err(),
+                should_refuse
+            );
+        }
+        let mut messages = vec!["/retry".to_string(), "/compact".to_string()];
+        let initial = pi::app::prepare_initial_message(
+            directory.path(),
+            &["input.txt".to_string()],
+            &mut messages,
+            false,
+            &workspace,
+        )
+        .unwrap()
+        .expect("file and piped input");
+        validate_print_attachment_command(&initial, true).expect("piped data is not a command");
+        let requests = prepare_print_requests(messages, false).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].command, Some(PrintCommand::Compact));
+    }
+
+    #[derive(Default)]
+    struct HeadlessCommandProvider {
+        requests: StdMutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl pi::provider::Provider for HeadlessCommandProvider {
+        fn name(&self) -> &str {
+            "headless-command-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &pi::provider::Context<'_>,
+            _options: &pi::provider::StreamOptions,
+        ) -> pi::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+            >,
+        > {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(&context.messages).unwrap());
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                    "Retained summary",
+                ))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: pi::model::Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(pi::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(pi::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn headless_command_session(
+        provider: &Arc<HeadlessCommandProvider>,
+        stored: Session,
+        save_enabled: bool,
+        compaction_enabled: bool,
+    ) -> AgentSession {
+        let mut agent = Agent::new(
+            Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_model_accepts_images(true);
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            save_enabled,
+            ResolvedCompactionSettings {
+                enabled: compaction_enabled,
+                context_window_tokens: 128,
+                reserve_tokens: 16,
+                keep_recent_tokens: 8,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    fn headless_compaction_history() -> Session {
+        let mut stored = Session::in_memory();
+        for text in [
+            "older context ".repeat(300),
+            "prior decisions ".repeat(300),
+            "continue".to_string(),
+        ] {
+            stored.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text(text),
+                timestamp: Some(0),
+            });
+        }
+        stored
+    }
+
+    #[test]
+    fn headless_retry_preserves_native_input_and_the_abandoned_branch_on_disk() {
+        run_cli_workdir_test(async {
+            let directory = TempDir::new().expect("session directory");
+            let path = directory.path().join("headless.jsonl");
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let content = pi::model::UserContent::Blocks(vec![
+                ContentBlock::Text(pi::model::TextContent::new("Read this image")),
+                ContentBlock::Image(pi::model::ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Media(pi::model::MediaContent {
+                    data: "YXVkaW8=".to_string(),
+                    mime_type: "audio/wav".to_string(),
+                    name: Some("voice.wav".to_string()),
+                }),
+                ContentBlock::Text(pi::model::TextContent::new("Keep the ordered context")),
+            ]);
+            let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            stored.path = Some(path.clone());
+            let old_user = stored.append_message(pi::session::SessionMessage::User {
+                content: content.clone(),
+                timestamp: Some(0),
+            });
+            stored.save().await.unwrap();
+            let mut session = headless_command_session(&provider, stored, true, false);
+            let (_abort, signal) = AbortHandle::new();
+            let outcome = execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+                .await
+                .unwrap();
+            let PrintCommandOutcome::Retry(recovered) = outcome else {
+                panic!("native retry input")
+            };
+            assert_eq!(
+                serde_json::to_value(&recovered).unwrap(),
+                serde_json::to_value(&content).unwrap()
+            );
+            assert!(provider.requests.lock().unwrap().is_empty());
+            assert!(session.agent.messages().is_empty());
+            let response = run_print_recovery_fixture(&mut session, print_retry_input(recovered))
+                .await
+                .unwrap();
+            ensure_print_command_response(&response).unwrap();
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(
+                reopened.get_entry(&old_user).is_some(),
+                "abandoned branch is retained"
+            );
+            let users = reopened
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry,
+                        pi::session::SessionEntry::Message(entry)
+                            if matches!(entry.message, pi::session::SessionMessage::User { .. }))
+                })
+                .count();
+            assert_eq!(
+                users, 2,
+                "the repeated turn is a sibling, not a destructive replacement"
+            );
+            let active = reopened.to_messages_for_current_path();
+            let pi::model::Message::User(user) = &active[0] else {
+                panic!("active user")
+            };
+            assert_eq!(
+                serde_json::to_value(&user.content).unwrap(),
+                serde_json::to_value(content).unwrap()
+            );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0].to_string().contains("/retry"));
+        });
+    }
+
+    #[test]
+    fn headless_retry_does_not_promote_expanded_text_into_authored_keywords() {
+        run_cli_workdir_test(async {
+            let text = "ultrathink from an expanded template";
+            for content in [
+                pi::model::UserContent::Text(text.to_string()),
+                pi::model::UserContent::Blocks(vec![ContentBlock::Text(
+                    pi::model::TextContent::new(text),
+                )]),
+            ] {
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let mut stored = Session::in_memory();
+                stored.append_message(pi::session::SessionMessage::User {
+                    content,
+                    timestamp: Some(0),
+                });
+                let mut session = headless_command_session(&provider, stored, false, false);
+                let (_abort, signal) = AbortHandle::new();
+                let outcome =
+                    execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+                        .await
+                        .unwrap();
+                let PrintCommandOutcome::Retry(recovered) = outcome else {
+                    panic!("native retry input")
+                };
+                run_print_recovery_fixture(&mut session, print_retry_input(recovered))
+                    .await
+                    .unwrap();
+                let cx = pi::agent_cx::AgentCx::for_request();
+                {
+                    let stored = session.session.lock(cx.cx()).await.unwrap();
+                    assert!(!stored.entries.iter().any(|entry| {
+                        matches!(entry,
+                            pi::session::SessionEntry::Custom(entry)
+                                if entry.custom_type == "magic_keyword")
+                    }));
+                }
+                // Positive control: a freshly authored occurrence still works.
+                run_print_recovery_fixture(
+                    &mut session,
+                    PromptInput::Text {
+                        text: text.to_string(),
+                        keyword_scan_source: Some(text.to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert!(stored.entries.iter().any(|entry| {
+                    matches!(entry,
+                        pi::session::SessionEntry::Custom(entry)
+                            if entry.custom_type == "magic_keyword")
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn headless_compaction_runs_native_maintenance_instead_of_a_user_prompt() {
+        run_cli_workdir_test(async {
+            for command in [PrintCommand::Compact, PrintCommand::Shake] {
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let mut session = headless_command_session(
+                    &provider,
+                    headless_compaction_history(),
+                    false,
+                    true,
+                );
+                let (_abort, signal) = AbortHandle::new();
+                let outcome = execute_print_command(&mut session, command, &signal, |_| {})
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, PrintCommandOutcome::Compacted(Some(_))));
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert!(stored.entries.iter().any(|entry| {
+                    matches!(entry, pi::session::SessionEntry::Compaction(_))
+                }));
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), usize::from(command == PrintCommand::Compact));
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| !request.to_string().contains("/compact"))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn headless_compaction_extension_cancellation_fails_without_dispatch_or_mutation() {
+        run_cli_workdir_test(async {
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let stored = headless_compaction_history();
+            let old_leaf = stored.leaf_id().map(str::to_string);
+            let mut session = headless_command_session(&provider, stored, false, true);
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("cancel-compact.native.json");
+            let descriptor = json!({
+                "id": "cancel-compact", "name": "cancel-compact", "version": "1.0.0",
+                "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                "eventHooks": ["session_before_compact"],
+                "eventResponses": {"session_before_compact": false}
+            });
+            fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            let manager = pi::extensions::ExtensionManager::new();
+            manager.set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+            manager
+                .load_native_extensions(vec![
+                    pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path).unwrap(),
+                ])
+                .await
+                .unwrap();
+            session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+            let (_abort, signal) = AbortHandle::new();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let error = execute_print_command(
+                &mut session,
+                PrintCommand::Compact,
+                &signal,
+                move |event| captured.lock().unwrap().push(event),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            assert!(provider.requests.lock().unwrap().is_empty());
+            assert!(events.lock().unwrap().iter().any(|event| {
+                matches!(event, AgentEvent::AutoCompactionEnd { aborted: true, .. })
+            }));
+            let cx = pi::agent_cx::AgentCx::for_request();
+            let stored = session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(stored.leaf_id(), old_leaf.as_deref());
+            assert!(!stored.entries.iter().any(|entry| {
+                matches!(entry, pi::session::SessionEntry::Compaction(_))
+            }));
+            drop(stored);
+            session.extensions.as_ref().unwrap().shutdown().await;
+        });
+    }
+
+    #[test]
+    fn headless_command_refusals_and_cancellation_do_not_dispatch() {
+        run_cli_workdir_test(async {
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let mut session = headless_command_session(&provider, Session::in_memory(), false, false);
+            let (abort, signal) = AbortHandle::new();
+            for command in [PrintCommand::Compact, PrintCommand::Retry] {
+                let error = execute_print_command(&mut session, command, &signal, |_| {})
+                    .await
+                    .unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            }
+            abort.abort();
+            assert!(
+                execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+                    .await
+                    .is_err()
+            );
+            assert!(session.agent.messages().is_empty());
+            assert!(provider.requests.lock().unwrap().is_empty());
+            let failed = AssistantMessage {
+                stop_reason: StopReason::Error,
+                error_message: Some("provider refused retry".to_string()),
+                ..AssistantMessage::default()
+            };
+            let error = ensure_print_command_response(&failed).unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+        });
     }
 
     struct PrintRecoveryProvider {
