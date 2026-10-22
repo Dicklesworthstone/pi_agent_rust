@@ -12,6 +12,8 @@
 //! - `session/prompt` — send a prompt; the response (with `stopReason`) is
 //!   delivered only after the turn completes
 //! - `session/cancel` — abort the current prompt turn for a session
+//! - `_session/steering` — inject native input into a running turn or its
+//!   follow-up queue without starting a second prompt
 //! - `session/list`, `session/load`, `session/resume` — session management
 //! - `session/set_model` — switch the live session's provider/model at runtime
 //! - `session/set_config_option` — set a runtime option (e.g. thinking/effort)
@@ -32,6 +34,7 @@ mod history;
 mod mcp;
 #[cfg(test)]
 mod recovery_tests;
+mod steering;
 
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
@@ -156,7 +159,13 @@ fn json_rpc_notification(method: &str, params: Value) -> String {
 // ============================================================================
 
 type AcpSessionsMap = Arc<Mutex<HashMap<String, Arc<Mutex<AcpSessionState>>>>>;
-type PendingPermissionMap = Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>;
+type PendingPermissionMap = Arc<StdMutex<HashMap<String, PendingPermission>>>;
+
+struct PendingPermission {
+    session_id: String,
+    request_id: Value,
+    sender: oneshot::Sender<Value>,
+}
 
 /// Synchronous agent callbacks cannot wait for the editor to drain stdout.
 /// Preserve the bounded FIFO, but turn saturation into a terminal transport
@@ -179,17 +188,23 @@ struct AcpOutputShared {
 struct AcpOutputState {
     failure: Option<&'static str>,
     stopping: bool,
-    prompts: HashMap<String, AbortHandle>,
+    prompts: HashMap<String, AcpPromptState>,
+}
+
+struct AcpPromptState {
+    abort: AbortHandle,
+    input: Arc<steering::Mailbox>,
 }
 
 impl AcpOutputShared {
     fn record_failure(&self, state: &mut AcpOutputState, reason: &'static str) {
         state.failure.get_or_insert(reason);
         state.stopping = true;
-        for handle in state.prompts.values() {
+        for prompt in state.prompts.values() {
             // Use the native abort lane. Cancelling the runtime context can
             // prevent the task from running its persistence/owner cleanup.
-            handle.abort();
+            prompt.abort.abort();
+            drop(prompt.input.close());
         }
         self.pending_permissions
             .lock()
@@ -294,9 +309,18 @@ impl AcpOutput {
         if state.prompts.contains_key(&session_id) {
             return Err(Error::session("ACP session already has an active prompt"));
         }
-        state.prompts.insert(session_id.clone(), abort);
+        let input = Arc::new(steering::Mailbox::new());
+        state.prompts.insert(
+            session_id.clone(),
+            AcpPromptState {
+                abort,
+                input: Arc::clone(&input),
+            },
+        );
         Ok(AcpPromptGuard {
             shared: Arc::clone(&self.shared),
+            output: self.clone(),
+            input,
             session_id,
             started: false,
             settled: false,
@@ -309,9 +333,12 @@ impl AcpOutput {
     fn register_permission(
         &self,
         key: String,
+        session_id: &str,
+        request_id: Value,
         sender: oneshot::Sender<Value>,
+        frame: String,
     ) -> std::result::Result<(), &'static str> {
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
@@ -321,22 +348,125 @@ impl AcpOutput {
                 .failure
                 .unwrap_or("permission request client is shutting down"));
         }
+        if state
+            .prompts
+            .get(session_id)
+            .is_some_and(|prompt| !prompt.input.permits_tool())
+        {
+            return Err("permission request superseded by queued steering");
+        }
         self.shared
             .pending_permissions
             .lock()
             .map_err(|_| "permission request registry unavailable")?
-            .insert(key, sender);
+            .insert(
+                key,
+                PendingPermission {
+                    session_id: session_id.to_string(),
+                    request_id,
+                    sender,
+                },
+            );
+        // Publication shares the admission lock with steering/cancel. A
+        // cancellation frame can never precede this dialog's request frame.
+        if self.sender.try_send(frame).is_err() {
+            self.shared.record_failure(
+                &mut state,
+                "ACP permission request could not be delivered",
+            );
+            return Err("permission request client disconnected");
+        }
         Ok(())
     }
 
     fn abort_prompt(&self, session_id: &str) {
+        let cancelled = {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(prompt) = state.prompts.get(session_id) {
+                prompt.input.seal();
+                prompt.abort.abort();
+            }
+            self.take_permissions(session_id)
+        };
+        self.cancel_permissions(cancelled);
+    }
+
+    /// Detach under the output-state lock so admission cannot race a new
+    /// permission publication or cancellation of a subsequent prompt.
+    fn take_permissions(&self, session_id: &str) -> Vec<PendingPermission> {
+        let mut pending = self
+            .shared
+            .pending_permissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids = pending
+            .iter()
+            .filter(|(_, permission)| permission.session_id == session_id)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|key| pending.remove(&key))
+            .collect()
+    }
+
+    fn cancel_permissions(&self, cancelled: Vec<PendingPermission>) {
+        for permission in cancelled {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({ "requestId": permission.request_id }),
+            ));
+            // Closing just this response channel denies the pending tool.
+            // Late editor replies cannot authorize it or affect another turn.
+            drop(permission.sender);
+        }
+    }
+
+    fn prompt_input(&self, session_id: &str) -> Option<Arc<steering::Mailbox>> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts
+            .get(session_id)
+            .map(|prompt| Arc::clone(&prompt.input))
+    }
+
+    fn finish_steering(&self, session_id: &str) {
+        if let Some(input) = self.prompt_input(session_id) {
+            input.seal();
+        }
+    }
+
+    fn enqueue_steering(&self, session_id: &str, input: steering::Input) {
         let state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handle) = state.prompts.get(session_id) {
-            handle.abort();
+        let Some(prompt) = state.prompts.get(session_id) else {
+            drop(state);
+            input.reply(self, "promptRequired");
+            return;
+        };
+        let steer = input.is_steering();
+        let admitted = prompt.input.enqueue(input);
+        let cancelled = if admitted.is_ok() && steer {
+            self.take_permissions(session_id)
+        } else {
+            Vec::new()
+        };
+        drop(state);
+        self.cancel_permissions(cancelled);
+        match admitted {
+            Ok(()) => {}
+            Err((input, false)) => {
+                input.reply(self, "promptRequired");
+            }
+            Err((input, true)) => input.reply_full(self),
         }
     }
 
@@ -350,8 +480,9 @@ impl AcpOutput {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.stopping = true;
-            for handle in state.prompts.values() {
-                handle.abort();
+            for prompt in state.prompts.values() {
+                prompt.input.seal();
+                prompt.abort.abort();
             }
         }
         self.shared
@@ -384,6 +515,8 @@ impl AcpOutput {
 /// Retirement follows the durable prompt result and owner restoration.
 struct AcpPromptGuard {
     shared: Arc<AcpOutputShared>,
+    output: AcpOutput,
+    input: Arc<steering::Mailbox>,
     session_id: String,
     started: bool,
     settled: bool,
@@ -391,17 +524,24 @@ struct AcpPromptGuard {
 
 impl Drop for AcpPromptGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.prompts.remove(&self.session_id);
-        if self.started && !self.settled {
-            self.shared.record_failure(
-                &mut state,
-                "ACP prompt task ended before session cleanup completed",
-            );
+        let pending = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.prompts.remove(&self.session_id);
+            let pending = self.input.close();
+            if self.started && !self.settled {
+                self.shared.record_failure(
+                    &mut state,
+                    "ACP prompt task ended before session cleanup completed",
+                );
+            }
+            pending
+        };
+        for input in pending {
+            input.reply(&self.output, "promptRequired");
         }
     }
 }
@@ -600,25 +740,19 @@ impl AcpPermissionClient {
         let request_key = json_rpc_id_key(&request_id);
         let (reply_tx, mut reply_rx) = oneshot::channel();
 
-        if let Err(reason) = self
-            .out_tx
-            .register_permission(request_key.clone(), reply_tx)
-        {
+        if let Err(reason) = self.out_tx.register_permission(
+            request_key.clone(),
+            session_id,
+            request_id.clone(),
+            reply_tx,
+            json_rpc_permission_request(&request_id, session_id, &request),
+        ) {
             return ToolApprovalDecision::deny(reason);
         }
         let _pending_guard = PendingPermissionGuard {
             pending: Arc::clone(&self.pending),
             key: request_key,
         };
-
-        let request_line = json_rpc_permission_request(&request_id, session_id, &request);
-        if self.out_tx.send(request_line).is_err() {
-            return ToolApprovalDecision::deny(
-                self.out_tx
-                    .failure_reason()
-                    .unwrap_or("permission request client disconnected"),
-            );
-        }
 
         let response = timeout(
             wall_now(),
@@ -1061,6 +1195,59 @@ async fn run(
                         }
                     }
 
+                    "_session/steering" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_REQUEST,
+                                    "Server not initialized",
+                                ));
+                            }
+                            continue;
+                        }
+                        let Some(session_id) = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                        else {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "sessionId required",
+                                ));
+                            }
+                            continue;
+                        };
+                        let known = sessions
+                            .lock(&cx)
+                            .await
+                            .is_ok_and(|sessions| sessions.contains_key(session_id));
+                        if !known {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Unknown ACP session",
+                                ));
+                            }
+                            continue;
+                        }
+                        match steering::Input::parse(&request.params, request.id.clone()) {
+                            Ok(input) => out_tx.enqueue_steering(session_id, input),
+                            Err(error) => {
+                                if request.id.is_some() {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                }
+                            }
+                        }
+                        // The prompt's mailbox owns the eventual reply. Never
+                        // wait here: this loop also receives editor approvals
+                        // and session/cancel while the native turn is running.
+                    }
+
                     // ACP defines session/cancel as a notification that aborts the
                     // current prompt turn for `sessionId`. We accept the request form
                     // too (some clients still send it as a request) and respond with
@@ -1494,8 +1681,8 @@ fn route_permission_response(
 
     let sender = pending.lock().ok().and_then(|mut guard| guard.remove(&key));
 
-    sender.is_some_and(|sender| {
-        let _ = sender.send(cx.cx(), response);
+    sender.is_some_and(|permission| {
+        let _ = permission.sender.send(cx.cx(), response);
         true
     })
 }
@@ -1671,6 +1858,7 @@ fn handle_initialize() -> Value {
             },
         },
         "authMethods": [],
+        "_meta": { "steering": { "supported": true } },
     })
 }
 
@@ -2519,6 +2707,20 @@ async fn run_prompt(
         Ok(taken) => taken,
         Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
+    // The reservation exists before spawn. These readers therefore also claim
+    // steering received while this task was still waiting to be polled. They
+    // are scoped to this exact prompt, never another prompt on the session.
+    let input_lifetime = Arc::new(());
+    if let Some(input) = out_tx.prompt_input(&session_id) {
+        agent_session
+            .session_mut()
+            .agent
+            .register_scoped_message_fetchers(
+                &input_lifetime,
+                Some(input.fetcher(&out_tx, steering::Queue::Steering)),
+                Some(input.fetcher(&out_tx, steering::Queue::FollowUp)),
+            );
+    }
     let recovery_updates =
         AcpRecoveryUpdates::new(&agent_session, available_models, &out_tx, &session_id);
     let recovery_callback = Arc::clone(&recovery_updates);
@@ -2577,6 +2779,12 @@ async fn run_prompt(
             Err(error) => report_prompt_error(&out_tx, &session_id, &error).await,
         }
     };
+
+    // Seal native delivery before owner cleanup can yield again. The prompt
+    // guard resolves unclaimed input only after the stopReason and reservation
+    // retirement, when the client can safely submit it as a new prompt.
+    out_tx.finish_steering(&session_id);
+    drop(input_lifetime);
 
     // Even a failed/aborted fallback can have committed a different model.
     // Publish the final selections before returning the prompt response.
@@ -3096,7 +3304,14 @@ mod tests {
                 .pending_permissions
                 .lock()
                 .unwrap()
-                .insert("approval".into(), reply_tx);
+                .insert(
+                    "approval".into(),
+                    PendingPermission {
+                        session_id: "first".into(),
+                        request_id: json!("approval"),
+                        sender: reply_tx,
+                    },
+                );
 
             assert!(matches!(
                 output.send("overflow".into()),
@@ -3127,6 +3342,240 @@ mod tests {
     }
 
     #[test]
+    fn steering_dispatch_inputs_reach_the_native_agent_and_persist_once() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            let (tx, rx) = std::sync::mpsc::sync_channel(64);
+            let output = AcpOutput::new(tx);
+            let (abort, signal) = AbortHandle::new();
+            let mut guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            for (id, text, queue) in [
+                (11, "steered instruction", "steering"),
+                (12, "next task", "followUp"),
+            ] {
+                let input = steering::Input::parse(
+                    &json!({
+                        "prompt": [{ "type": "text", "text": text }],
+                        "_meta": { "steering": { "queue": queue } },
+                    }),
+                    Some(json!(id)),
+                )
+                .unwrap();
+                output.enqueue_steering("editor-session", input);
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "dispatch must not claim native delivery before execution"
+            );
+            guard.started = true;
+            let reason = run_prompt(
+                Arc::clone(&state),
+                vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+                None,
+                signal,
+                output.clone(),
+                "editor-session".into(),
+                AgentCx::for_current_or_request(),
+            )
+            .await;
+            guard.settled = true;
+            drop(guard);
+            assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let path = stored.try_lock().unwrap().path.clone().unwrap();
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let users = reopened
+                .to_messages_for_current_path()
+                .iter()
+                .filter_map(|message| match message {
+                    crate::model::Message::User(user) => {
+                        Some(serde_json::to_string(&user.content).unwrap())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 3);
+            for (user, expected) in users
+                .iter()
+                .zip(["editor prompt", "steered instruction", "next task"])
+            {
+                assert!(user.contains(expected));
+            }
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            for (id, queue) in [(11, "steering"), (12, "followUp")] {
+                let replies = frames
+                    .iter()
+                    .filter(|frame| frame["id"] == id)
+                    .collect::<Vec<_>>();
+                assert_eq!(replies.len(), 1);
+                assert_eq!(
+                    replies[0]["result"],
+                    json!({ "outcome": "injected", "queue": queue })
+                );
+            }
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+        });
+    }
+
+    #[test]
+    fn steering_idle_terminal_and_cancelled_dispatch_keep_input_with_client() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, _) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let output = AcpOutput::new(tx);
+            let input = |id| {
+                steering::Input::parse(
+                    &json!({ "prompt": "retained by editor" }),
+                    Some(json!(id)),
+                )
+                .unwrap()
+            };
+            output.enqueue_steering("editor-session", input(1));
+            let idle: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(idle["id"], 1);
+            assert_eq!(idle["result"]["outcome"], "promptRequired");
+            let (abort, signal) = AbortHandle::new();
+            let mut guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            output.enqueue_steering("editor-session", input(2));
+            output.abort_prompt("editor-session");
+            output.enqueue_steering("editor-session", input(3));
+            assert!(
+                rx.try_recv().is_err(),
+                "fallback replies wait until the owning turn retires"
+            );
+            guard.started = true;
+            let reason = run_prompt(
+                state,
+                vec![ContentBlock::Text(TextContent::new("cancelled before start"))],
+                None,
+                signal,
+                output.clone(),
+                "editor-session".into(),
+                AgentCx::for_current_or_request(),
+            )
+            .await;
+            guard.settled = true;
+            output
+                .send(json_rpc_ok(json!(99), json!({ "stopReason": reason })))
+                .unwrap();
+            drop(guard);
+            assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let (abort, _) = AbortHandle::new();
+            let guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            output.enqueue_steering("editor-session", input(4));
+            output.finish_steering("editor-session");
+            drop(guard);
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 4);
+            assert_eq!(frames[0]["id"], 99);
+            assert_eq!(frames[0]["result"]["stopReason"], "cancelled");
+            for (frame, id) in frames[1..].iter().zip(2..=4) {
+                assert_eq!(frame["id"], id);
+                assert_eq!(frame["result"]["outcome"], "promptRequired");
+            }
+        });
+    }
+
+    #[test]
+    fn steering_supersedes_only_its_sessions_permission_and_follow_up_does_not() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let output = AcpOutput::new(tx);
+            let first_guard = output
+                .begin_prompt("first".into(), AbortHandle::new().0)
+                .unwrap();
+            let second_guard = output
+                .begin_prompt("second".into(), AbortHandle::new().0)
+                .unwrap();
+            let cx = AgentCx::for_current_or_request();
+            let client = AcpPermissionClient {
+                out_tx: output.clone(),
+                pending: Arc::clone(&output.shared.pending_permissions),
+                request_counter: Arc::new(AtomicU64::new(0)),
+                timeout: Duration::from_secs(60),
+                cx: cx.clone(),
+            };
+            let request = || ToolApprovalRequest {
+                tool_call_id: "permission-tool".into(),
+                tool_name: "bash".into(),
+                arguments: json!({ "command": "echo approved" }),
+            };
+            let first = client.request_permission("first", request());
+            let second = client.request_permission("second", request());
+            futures::pin_mut!(first, second);
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(first.as_mut(), cx).is_pending());
+                assert!(std::future::Future::poll(second.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let first_frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let second_frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let follow_up = steering::Input::parse(
+                &json!({
+                    "prompt": "after this", "_meta": { "steering": { "queue": "followUp" } },
+                }),
+                Some(json!(10)),
+            )
+            .unwrap();
+            output.enqueue_steering("first", follow_up);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(client.pending.lock().unwrap().len(), 2);
+            output.enqueue_steering(
+                "first",
+                steering::Input::parse(
+                    &json!({ "prompt": "stop that tool and inspect instead" }),
+                    Some(json!(11)),
+                )
+                .unwrap(),
+            );
+            let cancelled: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(cancelled["method"], "$/cancel_request");
+            assert_eq!(cancelled["params"]["requestId"], first_frame["id"]);
+            assert!(matches!(first.await, ToolApprovalDecision::Deny { .. }));
+            // The other admission order must also deny: no fresh dialog may
+            // appear after steering was queued but before its next boundary.
+            assert!(matches!(
+                client.request_permission("first", request()).await,
+                ToolApprovalDecision::Deny { .. }
+            ));
+            assert!(rx.try_recv().is_err());
+            let allow = |id| json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "outcome": { "outcome": "selected", "optionId": ACP_PERMISSION_ALLOW_ONCE } },
+            });
+            assert!(!route_permission_response(
+                &allow(first_frame["id"].clone()),
+                &client.pending,
+                &cx,
+            ));
+            assert!(route_permission_response(
+                &allow(second_frame["id"].clone()),
+                &client.pending,
+                &cx,
+            ));
+            assert_eq!(second.await, ToolApprovalDecision::Allow);
+            drop(first_guard);
+            drop(second_guard);
+            assert!(client.pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
     fn output_drain_waits_for_settlement_and_detects_abandoned_turns() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
@@ -3143,8 +3592,15 @@ mod tests {
             guard.started = true;
             let (reply_tx, mut reply_rx) = oneshot::channel();
             output
-                .register_permission("before-shutdown".into(), reply_tx)
+                .register_permission(
+                    "before-shutdown".into(),
+                    "running",
+                    json!("before-shutdown"),
+                    reply_tx,
+                    "permission-before-shutdown".into(),
+                )
                 .expect("permission admitted before shutdown");
+            assert_eq!(rx.try_recv().unwrap(), "permission-before-shutdown");
             let drain = output.finish_prompts();
             futures::pin_mut!(drain);
             futures::future::poll_fn(|cx| {
@@ -3906,6 +4362,8 @@ mod tests {
 
         // ACP requires protocolVersion as an integer, not a string.
         assert_eq!(result["protocolVersion"], 1);
+        // The OMP extension advertises outside agentCapabilities.
+        assert_eq!(result["_meta"]["steering"]["supported"], true);
         assert_eq!(result["agentInfo"]["name"], "pi-agent");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         // Loading now replays history before returning its response.

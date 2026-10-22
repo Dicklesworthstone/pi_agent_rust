@@ -617,6 +617,26 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**ACP live steering.** The initialize response advertises
+`_meta.steering.supported: true`. Editors can send `_session/steering` with
+`sessionId` and the same `prompt` content blocks as `session/prompt` while a
+turn is running. Text, images, and embedded references retain their native
+form. Set `_meta.steering.queue` to `"followUp"` to request delivery after the
+current model turn; the default `"steering"` lane delivers at the next native
+steering boundary. Steering cancels that session's open permission dialog via
+`$/cancel_request`; a follow-up leaves the dialog open.
+
+The response is `{"outcome":"injected","queue":"steering"}` (or
+`"followUp"`) when the native agent claims the input. This acknowledges
+handoff, not completed execution or durable storage. Idle input, and input
+still unclaimed when its owning turn ends or is cancelled, returns
+`"promptRequired"` so the editor can submit it as a new `session/prompt`.
+Unclaimed responses follow the original prompt's terminal response and cleanup;
+unclaimed input is never carried into a different prompt. The per-turn queue
+holds at most 100 requests and 8 MiB; each request is limited to 128 blocks,
+4 MiB for serialized content and request ID together, and 256 KiB of authored prose.
+An overflowing queue returns `"failed"` without accepting the input.
+
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
