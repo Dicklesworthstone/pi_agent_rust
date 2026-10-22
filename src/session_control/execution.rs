@@ -6,7 +6,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::agent::AgentEvent;
@@ -17,32 +16,6 @@ use crate::model::{AssistantMessage, ContentBlock, ImageContent, TextContent, Us
 use super::{ControllableSession, ControlledTurn, SessionControlHandle, control_error};
 
 impl ControllableSession {
-    /// Start an attachment-bearing turn on this reusable controlled session.
-    ///
-    /// Text, images, audio and video retain their native block order. The SDK's
-    /// existing validation, provider media policy, input hooks, retry/failover
-    /// and persistence path remains authoritative; this does not read files or
-    /// fetch URLs. Obtain `turn.control()` before awaiting to steer or abort.
-    /// The returned turn can also use [`ControlledTurn::with_deadline`].
-    pub fn prompt_with_content(
-        &mut self,
-        content: Vec<ContentBlock>,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
-        self.prompt_with_content_with_control(content, move |_, event| on_event(event))
-    }
-
-    /// Native-content counterpart of [`Self::prompt_with_control`]. Every event
-    /// receives this turn's control handle, including the first callback; no
-    /// shared mutable session or separately published control slot is needed.
-    pub fn prompt_with_content_with_control(
-        &mut self,
-        content: Vec<ContentBlock>,
-        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
-    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
-        self.prompt_native_with_control(UserContent::Blocks(content), on_event)
-    }
-
     /// Send text and images through the same live-control and recovery boundary.
     /// Empty text with images is image-only input; no images uses the ordinary
     /// text path, without manufacturing an empty block or changing input hooks.
@@ -74,41 +47,7 @@ impl ControllableSession {
             blocks.extend(images.into_iter().map(ContentBlock::Image));
             UserContent::Blocks(blocks)
         };
-        self.prompt_native_with_control(content, on_event)
-    }
-
-    fn prompt_native_with_control(
-        &mut self,
-        content: UserContent,
-        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
-    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
-        // Reuse the fetchers installed by into_controllable. Starting a native
-        // prompt must not append another pair of fetchers on every turn.
-        let (guard, signal) = self.begin()?;
-        let control = SessionControlHandle {
-            run: Arc::clone(&guard.run),
-        };
-        let callback_control = control.clone();
-        let session = &mut self.session;
-        let future = async move {
-            // Capture even before first poll, so unused/expired turns close
-            // their handles and retain unclaimed input without entering SDK I/O.
-            let _guard = guard;
-            let callback = move |event| on_event(&callback_control, event);
-            match content {
-                UserContent::Text(text) => session.prompt_with_abort(text, signal, callback).await,
-                UserContent::Blocks(blocks) => {
-                    session
-                        .prompt_with_content_with_abort(blocks, signal, callback)
-                        .await
-                }
-            }
-        };
-        Ok(ControlledTurn {
-            future: Box::pin(OwnedTurn::new(future, control.clone())),
-            control,
-            polled: false,
-        })
+        self.prompt_input_with_control(content, on_event)
     }
 }
 

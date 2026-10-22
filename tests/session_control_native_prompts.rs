@@ -258,7 +258,7 @@ fn native_callback_steers_and_follows_up_without_replaying_the_tool() {
     let observed = Arc::clone(&tool_calls);
     runtime.block_on(async {
         let turn = session
-            .prompt_with_content_and_control(native_input("read note.txt"), move |control, event| {
+            .prompt_with_content_with_control(native_input("read note.txt"), move |control, event| {
                 if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
                     assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
                     control.steer("focus on constraints").unwrap();

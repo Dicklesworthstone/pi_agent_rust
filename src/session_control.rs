@@ -507,14 +507,14 @@ impl ControllableSession {
         content: Vec<crate::model::ContentBlock>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
-        self.prompt_with_content_and_control(content, move |_, event| on_event(event))
+        self.prompt_with_content_with_control(content, move |_, event| on_event(event))
     }
 
     /// Native-content counterpart of [`Self::prompt_with_control`]. Each
     /// callback receives this turn's control handle, allowing a host to steer,
     /// queue a follow-up or abort in response to provider/tool events without
     /// borrowing the session or publishing the handle through a separate slot.
-    pub fn prompt_with_content_and_control(
+    pub fn prompt_with_content_with_control(
         &mut self,
         content: Vec<crate::model::ContentBlock>,
         on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
@@ -527,6 +527,9 @@ impl ControllableSession {
         content: UserContent,
         on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
     ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        // Text, native blocks and image helpers share this one constructor.
+        // Reuse the fetchers installed by into_controllable instead of adding
+        // another pair for each attachment-bearing turn.
         let (guard, signal) = self.begin()?;
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
