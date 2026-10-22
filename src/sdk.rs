@@ -785,6 +785,13 @@ pub struct RpcSessionState {
     pub auto_retry_enabled: bool,
     #[serde(default)]
     pub message_count: usize,
+    /// Estimated tokens in the selected branch's active model context.
+    /// Read at an idle boundary; this excludes archived and sibling history.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// Resolved current model capacity, when the model is registered.
+    #[serde(default)]
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub pending_message_count: usize,
     #[serde(default)]
@@ -918,7 +925,7 @@ pub struct RpcBashResult {
     pub full_output_path: Option<String>,
 }
 
-/// Compaction result returned by RPC `compact`.
+/// Compaction result returned by RPC `compact` or in-place `handoff`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcCompactionResult {
@@ -1450,8 +1457,8 @@ impl RpcTransportClient {
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*` borrows
-    /// this client for its single response consumer.
+    /// Clone a write-only lane that remains usable while `prompt*` or
+    /// `handoff*` borrows this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
@@ -1462,6 +1469,15 @@ impl RpcTransportClient {
     }
 
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
+        self.request_with_events(command, payload, |_| {}).await
+    }
+
+    async fn request_with_events(
+        &mut self,
+        command: &str,
+        payload: Map<String, Value>,
+        on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         if payload.contains_key("type") || payload.contains_key("id") {
             return Err(Error::validation(
                 "RPC request payload cannot override reserved type/id fields",
@@ -1476,7 +1492,9 @@ impl RpcTransportClient {
         let mut operation = RpcOperation::new(&self.owner)?;
         self.write_json_line(&Value::Object(command_payload))
             .await?;
-        let response = self.wait_for_response(&request_id, command).await?;
+        let response = self
+            .wait_for_response(&request_id, command, on_event)
+            .await?;
         let success = response
             .get("success")
             .and_then(Value::as_bool)
@@ -1716,6 +1734,39 @@ impl RpcTransportClient {
             );
         }
         self.request_typed("compact", payload).await
+    }
+
+    /// Durably replace an older safe prefix with a continuation brief in the
+    /// same session. Manual handoff works even when automatic compaction is off.
+    ///
+    /// Use [`Self::control_handle`] to send `abort` while this request is pending,
+    /// and keep polling this future until its terminal response arrives.
+    pub async fn handoff(&mut self, focus: Option<&str>) -> Result<RpcCompactionResult> {
+        self.handoff_with_events(focus, |_| {}).await
+    }
+
+    /// Handoff with the native compaction lifecycle and extension UI events.
+    ///
+    /// The callback receives non-response frames. Success is the terminal
+    /// `handoff` response after durable installation, not `agent_end`.
+    pub async fn handoff_with_events(
+        &mut self,
+        focus: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCompactionResult> {
+        let mut payload = Map::new();
+        if let Some(focus) = focus {
+            if focus.len() > 4096 || focus.contains('\0') {
+                return Err(Error::validation(
+                    "Handoff focus must fit 4096 bytes and contain no NUL",
+                ));
+            }
+            payload.insert("focus".to_string(), Value::String(focus.to_string()));
+        }
+        let data = self
+            .request_with_events("handoff", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "handoff")
     }
 
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<RpcCancelledResult> {
@@ -2028,13 +2079,19 @@ impl RpcTransportClient {
             .ok_or_else(|| Error::api("RPC subprocess reader stopped before sending a response"))?
     }
 
-    async fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
+    async fn wait_for_response(
+        &mut self,
+        request_id: &str,
+        command: &str,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         loop {
             let item = self.read_json_line().await?;
             let Some(item_type) = item.get("type").and_then(Value::as_str) else {
                 continue;
             };
             if item_type != "response" {
+                on_event(item);
                 continue;
             }
             if item.get("id").and_then(Value::as_str) != Some(request_id) {
@@ -3179,6 +3236,37 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.session.shake_now(on_event).await
+    }
+
+    /// Generate and durably install a continuation brief in this session.
+    ///
+    /// Uses the native handoff transaction, including safe recent-turn
+    /// retention, privacy screening, extension hooks and source validation.
+    /// Automatic compaction settings do not disable this explicit operation.
+    /// Cancellation is cooperative; keep polling until it returns so an
+    /// in-progress persistence transaction can finish or retain its fence.
+    /// Session subscribers and the supplied callback receive native compaction
+    /// events. No user prompt or new session is created.
+    pub async fn handoff(
+        &mut self,
+        focus: &str,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session.handoff_now(focus, abort, on_event).await?;
+        // Installation has already committed. Caller cancellation must not
+        // leave idle observers reading the old, uncompacted Agent projection.
+        let cleanup_cx = crate::agent_cx::AgentCx::for_request();
+        let messages = self
+            .session
+            .session
+            .lock(cleanup_cx.cx())
+            .await
+            .map_err(|err| Error::session(err.to_string()))?
+            .to_messages_for_current_path();
+        self.session.agent.replace_messages(messages);
+        Ok(())
     }
 
     /// Access the underlying `AgentSession`.
@@ -7365,6 +7453,108 @@ mod tests {
                 .is_empty(),
             "expected no compaction lifecycle events for empty session"
         );
+    }
+
+    #[test]
+    fn native_handoff_fans_out_events_and_refreshes_live_history_after_installation() {
+        run_async(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            });
+            let mut stored = Session::in_memory();
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("older authored context ".repeat(100)),
+                timestamp: Some(1),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("older answer"))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("keep this current request")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: Some(2),
+            });
+            let session_id = stored.header.id.clone();
+            let before = serde_json::to_value(stored.to_messages_for_current_path()).unwrap();
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(stored.to_messages_for_current_path());
+            let mut handle = AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::new(AsyncMutex::new(stored)),
+                    false,
+                    ResolvedCompactionSettings {
+                        enabled: false,
+                        keep_recent_tokens: 1,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                ),
+                EventListeners::new(),
+            );
+            let subscriber_events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Arc::clone(&subscriber_events);
+            handle.subscribe(move |event| {
+                subscriber
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+
+            let (cancelled, cancelled_signal) = AbortHandle::new();
+            cancelled.abort();
+            assert!(matches!(
+                handle.handoff("", &cancelled_signal, |_| {}).await,
+                Err(Error::Aborted)
+            ));
+            assert!(requests.lock().unwrap().is_empty());
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before,
+            );
+
+            let (_, signal) = AbortHandle::new();
+            let callback_events = Arc::new(Mutex::new(Vec::new()));
+            let callback = Arc::clone(&callback_events);
+            handle
+                .handoff("keep the native attachment", &signal, move |event| {
+                    callback
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                })
+                .await
+                .expect("manual handoff ignores disabled automatic compaction");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let stored = handle.session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(stored.header.id, session_id);
+            let projected = stored.to_messages_for_current_path();
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                serde_json::to_value(&projected).unwrap(),
+            );
+            assert_eq!(serde_json::to_value(projected.last()).unwrap(), before[2]);
+            let observed = subscriber_events.lock().unwrap();
+            assert_eq!(*observed, *callback_events.lock().unwrap());
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0]["type"], "auto_compaction_start");
+            assert_eq!(observed[0]["reason"], "handoff");
+            assert_eq!(observed[1]["result"]["details"]["mode"], "handoff");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        });
     }
 
     #[test]

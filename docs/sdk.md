@@ -88,6 +88,7 @@ be breaking for Rust consumers.
 | `session.setModel(provider, model)` | `AgentSessionHandle::set_model(provider, model)` |
 | `session.setThinkingLevel(level)` | `AgentSessionHandle::set_thinking_level(level)` |
 | `session.compact()` | `AgentSessionHandle::compact(on_event)` |
+| In-place context handoff | `AgentSessionHandle::handoff(focus, abort, on_event)` / `RpcTransportClient::handoff(focus)` |
 | `session.abort()` | `AgentSessionHandle::new_abort_handle()` + `prompt_with_abort(...)` |
 | `session.steer(...)`, `session.followUp(...)` | `RpcTransportClient::steer(...)`, `RpcTransportClient::follow_up(...)` |
 | RPC bridge client | `RpcTransportClient` / `SessionTransport::RpcSubprocess` |
@@ -197,6 +198,48 @@ Media names respect the configured secret-screening policy. A MIME type that
 contains secret material is refused when screening is enabled because replacing
 part of that identifier could change how the provider handles the attachment.
 Encoded payload bytes remain opaque to the text secret detector.
+
+### In-place handoff
+
+`AgentSessionHandle::handoff(focus, &abort_signal, on_event).await` generates a
+continuation brief and replaces an older safe prefix in the current session.
+It uses the native handoff transaction: configured privacy screening, extension
+hooks, exact-source validation, and persistence before installation. Session ID,
+path, and the latest complete authored turn remain intact, including native
+image/media blocks and completed tool work. The configured keep-recent budget
+still applies. Automatic compaction enablement, thresholds, and modes do not
+disable or change this explicit operation.
+
+The focus is literal text with a limit of 4096 UTF-8 bytes and no NUL. Empty
+focus is valid. If there is no older safe prefix, synthesis fails, an extension
+cancels, or the source changes during generation, the method returns an error.
+It never installs an empty or local fallback summary. A failed save preserves
+the live context and retains the native persistence fence.
+
+Session subscribers and `on_event` receive `AutoCompactionStart` with reason
+`handoff`, followed by `AutoCompactionEnd`. This operation has no user prompt
+and emits no `AgentEnd`. On successful return, both the durable Session and the
+handle's live Agent messages contain the installed projection.
+
+Create an `AbortHandle`/`AbortSignal` pair before admitting the operation.
+`abort_handle.signal()` can derive another signal later without losing an
+earlier abort. Signal cancellation through the handle and keep polling the
+handoff future until it returns; dropping a future cannot promise asynchronous
+persistence cleanup.
+
+For a subprocess, `RpcTransportClient::handoff(Some(focus)).await` returns a
+`RpcCompactionResult`. `handoff(None)` uses empty focus, and
+`handoff_with_events(focus, callback)` forwards live native lifecycle and
+extension UI frames. A cloned `control_handle()` can send `abort` or extension
+UI replies while the client is borrowed by the pending handoff. Keep awaiting
+the terminal `handoff` response after cancellation. The server rejects a
+handoff during another turn, maintenance operation, or foreground bash command.
+
+`RpcSessionState::context_tokens` estimates the selected branch's active model
+context, excluding archived and sibling history. `context_window` is the
+resolved model capacity or `None` when unknown. Read these values at an idle
+boundary for scheduling; they are estimates, not cumulative provider usage.
+The fields default to zero/`None` when connecting to an older server.
 
 ### Checkpoints and branch rewinds
 

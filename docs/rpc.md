@@ -53,7 +53,7 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 - **follow_up**: Queue a message to follow current turn.
   - Params: `message`, `images` (optional array), `media` (optional array), or an exclusive `content` array.
 - **retry**: Rerun the last durable user turn, preserving its text, images, and media.
-- **abort**: Stop generation.
+- **abort**: Stop generation or request cancellation of an active handoff.
 
 Audio and video attachments use native content blocks in `media`. For example,
 replace the example payload with the standard base64 encoding of your file:
@@ -230,11 +230,72 @@ in-memory content; session resume still hydrates saved sidecar payloads.
   - Params: `outputPath`.
 - **compact**: Trigger context compaction.
   - Params: `customInstructions` (optional), `reserveTokens` (optional), `keepRecentTokens` (optional).
+- **handoff**: Generate and durably install a continuation brief in this session.
+  - Params: `focus` (optional string, at most 4096 UTF-8 bytes, no NUL).
 - **fork**: Fork from a message.
   - Params: `entryId`.
 
+### In-place handoff
+
+```json
+{"id":"handoff-1","type":"handoff","focus":"Preserve the migration decisions and remaining failures"}
+```
+
+Handoff retains the session ID and file, the configured recent-context budget,
+and the latest complete authored turn with its native attachments and tool
+results. It uses the native privacy policy and extension hooks and persists a
+validated candidate before installing it. Automatic compaction settings do not
+disable this manual operation. If all history belongs to the retained span,
+the command fails without calling the provider.
+
+During generation `get_state` reports `isCompacting: true` and
+`isStreaming: false`. The dispatcher continues accepting `abort`,
+`extension_ui_response`, `get_state`, and history reads. New prompts, another
+handoff, session mutations, `get_session_stats`, `export_html`, and queue-mode
+changes are refused until maintenance finishes. A currently running foreground
+bash command also prevents handoff admission.
+
+The server emits `auto_compaction_start` with `reason: "handoff"`, followed by
+`auto_compaction_end`, and then **one terminal response** to the original
+request. There is no early success acknowledgement and no `agent_end` for this
+operation. Successful response data has the compaction result shape:
+
+```json
+{
+  "id":"handoff-1",
+  "type":"response",
+  "command":"handoff",
+  "success":true,
+  "data":{
+    "summary":"Continuation brief...",
+    "firstKeptEntryId":"entry-kept",
+    "tokensBefore":48000,
+    "tokensAfter":12000,
+    "details":{"mode":"handoff"}
+  }
+}
+```
+
+`details` may contain additional native compaction metadata. Token values are
+heuristic estimates. A malformed focus is rejected before session recovery or
+provider work. Provider failure, empty synthesis, cancellation, an unsafe cut,
+or a changed source returns `success: false` with `error` and `errorHints`.
+There is no fallback summary. Persistence failures keep the native quarantine
+and surface as failures; they never authorize a new provider turn.
+
+An `abort` response only acknowledges the cancellation request. Continue
+waiting for the original handoff's terminal response. Cancellation arriving
+after durable installation may still yield success. Closing input drains an
+already admitted handoff through its terminal response before shutdown.
+
 ### State & Config
-- **get_state**: Get current model, settings, token usage, and `outputMode`.
+
+- **get_state**: Get current model, settings, active context estimates, and `outputMode`.
+  - `contextTokens` is always a non-negative integer estimated from the selected
+    branch's active model messages. It excludes hidden pre-compaction and
+    sibling history and is not cumulative provider usage.
+  - `contextWindow` is the resolved model's positive context capacity, or `null`
+    when unknown. Read these values at an idle boundary for context scheduling.
 - **get_messages**: Get conversation history in the negotiated output mode.
 - **get_fork_messages**: Get `{entryId, text}` previews of branchable user messages.
 - **set_output_mode**: Negotiate `full` (default) or `compact` output while idle.

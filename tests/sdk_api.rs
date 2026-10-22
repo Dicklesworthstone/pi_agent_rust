@@ -80,6 +80,8 @@ fn sdk_rpc_state_round_trips_via_serde() {
         "autoCompactionEnabled": true,
         "autoRetryEnabled": false,
         "messageCount": 2,
+        "contextTokens": 128,
+        "contextWindow": 200_000,
         "pendingMessageCount": 0,
         "durabilityMode": "balanced"
     });
@@ -88,6 +90,13 @@ fn sdk_rpc_state_round_trips_via_serde() {
         serde_json::from_value(value.clone()).expect("deserialize RpcSessionState");
     let reencoded = serde_json::to_value(state).expect("serialize RpcSessionState");
     assert_eq!(reencoded, value);
+
+    let mut legacy = value;
+    legacy.as_object_mut().unwrap().remove("contextTokens");
+    legacy.as_object_mut().unwrap().remove("contextWindow");
+    let legacy: sdk::RpcSessionState = serde_json::from_value(legacy).expect("older RPC state");
+    assert_eq!(legacy.context_tokens, 0);
+    assert_eq!(legacy.context_window, None);
 }
 
 #[test]
@@ -127,6 +136,11 @@ while IFS= read -r line; do
       printf '{"type":"agent_start","sessionId":"sess-1"}\n'
       printf '{"type":"agent_end","sessionId":"sess-1","messages":[]}\n'
       ;;
+    handoff)
+      printf '{"type":"auto_compaction_start","reason":"handoff"}\n'
+      printf '{"type":"auto_compaction_end","result":{"summary":"continuation brief","firstKeptEntryId":"kept-1","tokensBefore":9000,"tokensAfter":500},"aborted":false,"willRetry":false}\n'
+      printf '{"type":"response","id":"%s","command":"handoff","success":true,"data":{"summary":"continuation brief","firstKeptEntryId":"kept-1","tokensBefore":9000,"tokensAfter":500,"details":{"mode":"handoff"}}}\n' "$id"
+      ;;
     extension_ui_response)
       printf '{"type":"response","id":"%s","command":"extension_ui_response","success":true,"data":{"resolved":true}}\n' "$id"
       ;;
@@ -150,6 +164,8 @@ done
         assert_eq!(state.thinking_level, "off");
         assert!(state.auto_retry_enabled);
         assert_eq!(state.durability_mode, "balanced");
+        assert_eq!(state.context_tokens, 0);
+        assert_eq!(state.context_window, None);
 
         let models = client
             .get_available_models()
@@ -185,6 +201,24 @@ done
             .await
             .expect("extension_ui_response");
         assert!(resolved);
+
+        assert!(client.handoff(Some(&"x".repeat(4097))).await.is_err());
+        let mut handoff_events = Vec::new();
+        let handoff = client
+            .handoff_with_events(Some("preserve native media"), |event| {
+                handoff_events.push(event);
+            })
+            .await
+            .expect("handoff_with_events");
+        assert_eq!(handoff.summary, "continuation brief");
+        assert_eq!(handoff.first_kept_entry_id, "kept-1");
+        assert_eq!(handoff.tokens_after, 500);
+        assert_eq!(handoff.details["mode"], "handoff");
+        assert_eq!(handoff_events.len(), 2);
+        assert_eq!(handoff_events[0]["type"], "auto_compaction_start");
+        assert_eq!(handoff_events[1]["type"], "auto_compaction_end");
+        let default_focus = client.handoff(None).await.expect("handoff without focus");
+        assert_eq!(default_focus.tokens_before, 9000);
     });
 }
 

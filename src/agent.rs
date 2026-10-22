@@ -1611,6 +1611,17 @@ impl AbortHandle {
         )
     }
 
+    /// Observe this handle's cancellation, including an already requested abort.
+    ///
+    /// This lets an admitted operation keep the same cancellation state when
+    /// its driver starts later.
+    #[must_use]
+    pub fn signal(&self) -> AbortSignal {
+        AbortSignal {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Trigger an abort.
     pub fn abort(&self) {
         if !self.inner.aborted.swap(true, Ordering::SeqCst) {
@@ -13315,6 +13326,24 @@ mod abort_tests {
         let late_signal = signal.clone();
         let mut created_after_abort = Box::pin(late_signal.wait());
         assert!(std::future::Future::poll(created_after_abort.as_mut(), &mut task).is_ready());
+    }
+
+    #[test]
+    fn abort_handle_derived_signals_share_pending_and_latched_cancellation() {
+        let (handle, original) = AbortHandle::new();
+        let admitted = handle.signal();
+        assert!(!admitted.is_aborted());
+
+        handle.clone().abort();
+        assert!(original.is_aborted());
+        assert!(admitted.is_aborted());
+
+        let started_later = handle.signal();
+        assert!(started_later.is_aborted());
+        let mut waiting = Box::pin(started_later.wait());
+        let waker = futures::task::noop_waker();
+        let mut task = TaskContext::from_waker(&waker);
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut task).is_ready());
     }
 
     #[test]

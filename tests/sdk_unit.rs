@@ -243,6 +243,8 @@ fn transport_session_transport_state_variants() {
         auto_compaction_enabled: true,
         auto_retry_enabled: false,
         message_count: 0,
+        context_tokens: 0,
+        context_window: None,
         pending_message_count: 0,
         durability_mode: "balanced".to_string(),
     }));

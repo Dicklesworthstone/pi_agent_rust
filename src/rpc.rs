@@ -190,6 +190,61 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
         .map_err(|_| Error::Validation(format!("{field} exceeds the maximum supported value")))
 }
 
+fn parse_handoff_focus(parsed: &Value) -> Result<&str> {
+    let focus = match parsed.get("focus") {
+        None => "",
+        Some(Value::String(focus)) => focus,
+        Some(_) => return Err(Error::validation("Handoff focus must be a string")),
+    };
+    if focus.len() > 4096 || focus.contains('\0') {
+        return Err(Error::validation(
+            "Handoff focus must fit 4096 bytes and contain no NUL",
+        ));
+    }
+    Ok(focus)
+}
+
+/// Preserve caller budgets and capabilities without sharing its cancellation
+/// bit. A separate supervisor delivers cooperative abort without dropping work
+/// that may already own a durable Session transition.
+fn rpc_operation_owner(runtime: &RuntimeHandle, client_cx: &AgentCx) -> AgentCx {
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+    let capabilities = client_cx.capabilities();
+    let mut mask = CapMask::all();
+    for (allowed, restriction) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            mask = mask.intersect(restriction);
+        }
+    }
+    let _owner = runtime
+        .request_cx_with_budget(client_cx.budget())
+        .set_current_restricted();
+    let _restriction = asupersync::Cx::push_restriction(mask);
+    AgentCx::for_current_or_request()
+}
+
 /// Keep an accepted turn runnable until its terminal event and persistence
 /// finish. Construct ownership before runtime admission: a rejected or never
 /// polled future must answer the client and release its streaming flag too.
@@ -209,48 +264,9 @@ where
     let terminal_guard =
         TerminalAgentEndOnDrop::for_accepted_turn(out_tx, client_cx.clone(), is_streaming);
     async move {
-        use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
-
         let supervisor =
             AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
-        let owner = {
-            // Preserve the client's budget and capability restrictions without
-            // sharing its cancellation bit. The supervisor retains a separate
-            // lifetime so it can deliver abort even while the work is pending.
-            let capabilities = client_cx.capabilities();
-            let mut mask = CapMask::all();
-            for (allowed, restriction) in [
-                (
-                    capabilities.spawn,
-                    CapSet::<false, true, true, true, true>::MASK,
-                ),
-                (
-                    capabilities.time,
-                    CapSet::<true, false, true, true, true>::MASK,
-                ),
-                (
-                    capabilities.entropy,
-                    CapSet::<true, true, false, true, true>::MASK,
-                ),
-                (
-                    capabilities.io,
-                    CapSet::<true, true, true, false, true>::MASK,
-                ),
-                (
-                    capabilities.remote,
-                    CapSet::<true, true, true, true, false>::MASK,
-                ),
-            ] {
-                if !allowed {
-                    mask = mask.intersect(restriction);
-                }
-            }
-            let _owner = runtime
-                .request_cx_with_budget(client_cx.budget())
-                .set_current_restricted();
-            let _restriction = asupersync::Cx::push_restriction(mask);
-            AgentCx::for_current_or_request()
-        };
+        let owner = rpc_operation_owner(&runtime, &client_cx);
         // Move the same guard through the factory and into the turn body.
         // There is no disarm/rearm interval, including a factory panic.
         let future = owner.with_current(turn(owner.clone(), terminal_guard));
@@ -320,6 +336,7 @@ fn command_can_advance_rpc_session(command_type: &str) -> bool {
             | "set_session_name"
             | "bash"
             | "compact"
+            | "handoff"
             | "checkpoint"
             | "rewind"
             | "fresh"
@@ -386,6 +403,7 @@ fn command_payload_can_advance_rpc_session(
             parse_optional_u32_field(parsed, "reserveTokens").is_ok()
                 && parse_optional_u32_field(parsed, "keepRecentTokens").is_ok()
         }
+        "handoff" => parse_handoff_focus(parsed).is_ok(),
         "switch_session" => parsed.get("sessionPath").and_then(Value::as_str).is_some(),
         "fork" => parsed.get("entryId").and_then(Value::as_str).is_some(),
         _ => true,
@@ -1306,6 +1324,199 @@ impl Drop for TerminalAgentEndOnDrop {
         if let Some(is_streaming) = &self.is_streaming {
             is_streaming.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+#[derive(Default)]
+struct RpcHandoffObservation {
+    started: bool,
+    ended: bool,
+    result: Option<Value>,
+}
+
+/// Own a maintenance request before spawning it. Handoff has one terminal RPC
+/// response, not an agent_end (there is no accepted user prompt).
+struct RpcHandoffCompletion {
+    id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    observation: Arc<std::sync::Mutex<RpcHandoffObservation>>,
+    abort: crate::agent::AbortSignal,
+    answered: bool,
+}
+
+impl RpcHandoffCompletion {
+    fn finish(&mut self, result: Result<Value>) {
+        if self.answered {
+            return;
+        }
+        let missing_end = {
+            let mut observed = self
+                .observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let missing = observed.started && !observed.ended;
+            observed.ended |= missing;
+            missing
+        };
+        if missing_end {
+            let _ = self.out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
+                result: None,
+                aborted: self.abort.is_aborted(),
+                will_retry: false,
+                error_message: result.as_ref().err().map(ToString::to_string),
+            }));
+        }
+        let response = match result {
+            Ok(data) => response_ok(self.id.clone(), "handoff", Some(data)),
+            Err(error) => response_error_with_hints(self.id.clone(), "handoff", &error),
+        };
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcHandoffCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            let error = if self.abort.is_aborted() {
+                Error::Aborted
+            } else {
+                Error::session("Handoff ended without a terminal response")
+            };
+            self.finish(Err(error));
+        }
+        // EOF and subsequent admission may proceed only after the response is
+        // queued, including rejection by the runtime before the first poll.
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_rpc_handoff(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    id: Option<String>,
+    focus: String,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    output: RpcOutput,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let observation = Arc::new(std::sync::Mutex::new(RpcHandoffObservation::default()));
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let mut completion = RpcHandoffCompletion {
+        id,
+        out_tx: out_tx.clone(),
+        is_compacting,
+        observation: Arc::clone(&observation),
+        abort: abort_signal.clone(),
+        answered: false,
+    };
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let future = owner.with_current(async {
+            let result: Result<Value> = async {
+                {
+                    let mut slot =
+                        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                            .await
+                            .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                    // An abort frame can arrive after admission but before
+                    // this task starts. Installation cannot erase that abort.
+                    if retry_abort.load(Ordering::SeqCst) {
+                        abort_handle.abort();
+                    }
+                    *slot = Some(abort_handle.clone());
+                }
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let mut guard = OwnedMutexGuard::lock(session, &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                let events = rpc_agent_event_handler(
+                    out_tx,
+                    runtime.clone(),
+                    guard
+                        .extensions
+                        .as_ref()
+                        .map(|region| region.manager().clone()),
+                    None,
+                    false,
+                    output,
+                );
+                let observed_events = Arc::clone(&observation);
+                guard
+                    .handoff_now(&focus, &abort_signal, move |event| {
+                        {
+                            let mut observed = observed_events
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match &event {
+                                AgentEvent::AutoCompactionStart { .. } => observed.started = true,
+                                AgentEvent::AutoCompactionEnd { result, .. } => {
+                                    observed.ended = true;
+                                    observed.result.clone_from(result);
+                                }
+                                _ => {}
+                            }
+                        }
+                        events(event);
+                    })
+                    .await?;
+                // Installation is durable. Refresh under the independent
+                // cleanup context so a late abort cannot leave recovery and
+                // idle readers comparing the old Agent to the new Session.
+                let messages = guard
+                    .session
+                    .lock(supervisor.cx())
+                    .await
+                    .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?
+                    .to_messages_for_current_path();
+                guard.agent.replace_messages(messages);
+                observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .result
+                    .clone()
+                    .ok_or_else(|| {
+                        Error::session("Handoff completed without an installation result")
+                    })
+            }
+            .await;
+            // Clear the old abort lane before releasing admission. Otherwise
+            // a finishing handoff could erase the following turn's handle.
+            if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+                *slot = None;
+            }
+            completion.finish(result);
+        });
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            abort_handle.abort();
+                            break;
+                        }
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
+                    }
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    // Cancellation requests cooperation; it never drops a
+                    // future that may be writing the handoff transaction.
+                    pending.await;
+                }
+            })
+            .await;
     }
 }
 
@@ -2336,6 +2547,30 @@ pub async fn run(
         } else {
             Vec::new()
         };
+
+        if command_type == "handoff"
+            && let Err(err) = parse_handoff_focus(&parsed)
+        {
+            let _ = out_tx.send(response_error_with_hints(id, "handoff", &err));
+            continue;
+        }
+
+        // These commands acquire the outer AgentSession lock. Waiting for a
+        // maintenance task here would stop the dispatcher from receiving the
+        // abort or extension UI reply that task may need to finish.
+        if is_compacting.load(Ordering::SeqCst)
+            && matches!(
+                command_type,
+                "get_session_stats" | "export_html" | "set_steering_mode" | "set_follow_up_mode"
+            )
+        {
+            let _ = out_tx.send(response_error(
+                id,
+                command_type,
+                format!("Agent is currently compacting; wait before running {command_type}"),
+            ));
+            continue;
+        }
 
         if command_type == "retry"
             && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
@@ -4017,6 +4252,49 @@ pub async fn run(
                     running_bash.request_abort(&cx);
                 }
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
+            }
+
+            "handoff" => {
+                let focus = parse_handoff_focus(&parsed)?.to_string();
+                let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+                    .is_some();
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if !bash_running
+                        && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+                    {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "handoff",
+                        "Wait for the current turn, compaction, or bash command before handing off",
+                    ));
+                    continue;
+                }
+                // Admission owns both terminal response and busy flag before
+                // try_spawn, including rejection or an unpolled task.
+                let task = run_rpc_handoff(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    id,
+                    focus,
+                    out_tx.clone(),
+                    output.for_turn(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
             }
 
             "compact" => {
@@ -16666,6 +16944,365 @@ mod tests {
         session
     }
 
+    fn handoff_agent_session(
+        stored: Session,
+        save_enabled: bool,
+        provider: Arc<dyn Provider>,
+    ) -> AgentSession {
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(stored)),
+            save_enabled,
+            ResolvedCompactionSettings {
+                enabled: false,
+                keep_recent_tokens: 1,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    #[test]
+    fn rpc_handoff_survives_eof_and_installs_one_durable_native_result() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            )));
+            let kept = stored.append_message(SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("continue with this attachment")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: Some(42),
+            });
+            stored.save().await.unwrap();
+            let path = stored.path.clone().unwrap();
+            let id = stored.header.id.clone();
+            let current =
+                serde_json::to_value(stored.to_messages_for_current_path().last().unwrap())
+                    .unwrap();
+            let agent_session =
+                handoff_agent_session(stored, true, Arc::new(CompactionSummaryProvider));
+            let inner = Arc::clone(&agent_session.session);
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id": "handoff-1", "type": "handoff", "focus": "retain native media"})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            // EOF must drain maintenance through its response and then compare
+            // the refreshed Agent with the installed Session successfully.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
+                .await
+                .expect("handoff and terminal recovery complete");
+            let events = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "auto_compaction_start").count(),
+                1,
+            );
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "auto_compaction_end").count(),
+                1,
+            );
+            assert!(events.iter().all(|event| event["type"] != "agent_end"));
+            let responses = events
+                .iter()
+                .filter(|event| event["type"] == "response")
+                .collect::<Vec<_>>();
+            assert_eq!(responses.len(), 1);
+            let response = responses[0];
+            assert_ok(response, "handoff");
+            assert_eq!(response["id"], "handoff-1");
+            assert_eq!(response["data"]["firstKeptEntryId"], kept);
+            assert_eq!(response["data"]["details"]["mode"], "handoff");
+            assert_eq!(events.last().unwrap()["type"], "response");
+            let cx = AgentCx::for_request();
+            let live = inner.lock(cx.cx()).await.unwrap();
+            assert_eq!(live.header.id, id);
+            assert_eq!(live.path.as_ref(), Some(&path));
+            assert_eq!(
+                serde_json::to_value(live.to_messages_for_current_path().last()).unwrap(),
+                current,
+            );
+            let expected = serde_json::to_value(live.to_messages_for_current_path()).unwrap();
+            drop(live);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(reopened.header.id, id);
+            assert_eq!(
+                serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+                expected,
+            );
+            assert_eq!(
+                reopened
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry, SessionEntry::Compaction(_)))
+                    .count(),
+                1,
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_handoff_keeps_control_dispatch_live_and_rejects_busy_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (entered_tx, mut entered_rx) = oneshot::channel();
+            let (_gate_tx, gate_rx) = oneshot::channel();
+            let provider = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(entered_tx)),
+                compaction_gate: Mutex::new(Some(gate_rx)),
+            });
+            let agent_session = handoff_agent_session(
+                seed_auto_compaction_session(Session::in_memory()),
+                false,
+                provider,
+            );
+            let inner = Arc::clone(&agent_session.session);
+            let before = serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(&cx, json!({"id": "h", "type": "handoff"}).to_string())
+                    .await
+                    .unwrap();
+                asupersync::time::timeout(wall_now(), Duration::from_secs(10), entered_rx.recv(&cx))
+                    .await
+                    .expect("handoff provider starts")
+                    .unwrap();
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"state","type":"get_state"}"#,
+                    "state during handoff",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["isCompacting"], true);
+                assert_eq!(state["data"]["isStreaming"], false);
+                assert!(state["data"]["contextTokens"].as_u64().unwrap() > 0);
+                for command in [
+                    json!({"id": "busy-prompt", "type": "prompt", "message": "must not enter"}),
+                    json!({"id": "busy-handoff", "type": "handoff"}),
+                    json!({"id": "busy-stats", "type": "get_session_stats"}),
+                    json!({"id": "busy-mode", "type": "set_steering_mode", "mode": "all"}),
+                ] {
+                    let response =
+                        send_recv(&in_tx, &out_rx, &command.to_string(), "busy command").await;
+                    assert_err(&response, command["type"].as_str().unwrap());
+                }
+                let abort = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"abort","type":"abort"}"#,
+                    "abort handoff",
+                )
+                .await;
+                assert_ok(&abort, "abort");
+                let mut ended = false;
+                let handoff = loop {
+                    let frame = parse_response(
+                        &recv_line(&out_rx, "handoff terminal failure").await.unwrap(),
+                    );
+                    match frame["type"].as_str() {
+                        Some("auto_compaction_end") => {
+                            assert!(!ended, "one lifecycle end per handoff");
+                            assert_eq!(frame["aborted"], true);
+                            ended = true;
+                        }
+                        Some("response") => break frame,
+                        Some("agent_end") => panic!("handoff cannot invent a prompt terminal"),
+                        _ => {}
+                    }
+                };
+                assert!(ended, "compaction end precedes the terminal response");
+                assert_err(&handoff, "handoff");
+                assert_eq!(handoff["id"], "h");
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"idle","type":"get_state"}"#,
+                    "idle after cancellation",
+                )
+                .await;
+                assert_eq!(state["data"]["isCompacting"], false);
+                drop(in_tx);
+            };
+            let (result, ()) = futures::future::join(
+                Box::pin(run(agent_session, options, in_rx, out_tx)),
+                client,
+            )
+            .await;
+            result.expect("cancelled handoff does not poison the session");
+            assert_eq!(
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
+                before,
+            );
+            assert!(out_rx
+                .lock()
+                .unwrap()
+                .try_iter()
+                .all(|line| parse_response(&line)["type"] != "agent_end"));
+        }));
+    }
+
+    #[test]
+    fn rpc_unpolled_handoff_answers_once_and_releases_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+        let compacting = Arc::new(AtomicBool::new(true));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let future = run_rpc_handoff(
+            runtime.handle(),
+            AgentCx::for_testing(),
+            Arc::new(asupersync::sync::Mutex::new(session)),
+            Some("not-polled".to_string()),
+            String::new(),
+            out_tx,
+            RpcOutput::default().for_turn(),
+            Arc::clone(&compacting),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(asupersync::sync::Mutex::new(None)),
+        );
+        drop(future);
+        assert!(!compacting.load(Ordering::SeqCst));
+        let frames = out_rx
+            .try_iter()
+            .map(|line| parse_response(&line))
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert_err(&frames[0], "handoff");
+        assert_eq!(frames[0]["id"], "not-polled");
+    }
+
+    #[test]
+    fn rpc_handoff_provider_and_persistence_failures_never_report_success() {
+        for persistence_failure in [false, true] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+                .build()
+                .expect("runtime");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(Box::pin(async move {
+                let temp = tempfile::tempdir().unwrap();
+                let mut stored = seed_auto_compaction_session(Session::in_memory());
+                if persistence_failure {
+                    let blocked = temp.path().join("session-is-a-directory.jsonl");
+                    std::fs::create_dir(&blocked).unwrap();
+                    stored.path = Some(blocked);
+                }
+                let before = serde_json::to_value(&stored.entries).unwrap();
+                let provider: Arc<dyn Provider> = if persistence_failure {
+                    Arc::new(CompactionSummaryProvider)
+                } else {
+                    // Empty terminal content must fail strict native synthesis.
+                    Arc::new(NoopProvider)
+                };
+                let agent_session = handoff_agent_session(stored, persistence_failure, provider);
+                let inner = Arc::clone(&agent_session.session);
+                let gate = agent_session.provider_admission_gate();
+                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = mpsc::channel(4);
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        r#"{"id":"failed","type":"handoff"}"#.to_string(),
+                    )
+                    .await
+                    .unwrap();
+                drop(in_tx);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+                let result = Box::pin(run(agent_session, options, in_rx, out_tx)).await;
+                if persistence_failure {
+                    assert!(result.is_err(), "EOF must surface the durability fence");
+                    assert!(gate.ensure_allowed().unwrap_err().is_session_persistence());
+                } else {
+                    result.expect("failed synthesis leaves ordinary session use available");
+                    gate.ensure_allowed().unwrap();
+                }
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                let responses = events
+                    .iter()
+                    .filter(|event| event["type"] == "response")
+                    .collect::<Vec<_>>();
+                assert_eq!(responses.len(), 1);
+                assert_err(responses[0], "handoff");
+                assert!(responses[0]["errorHints"].is_object());
+                assert!(events.iter().all(|event| event["type"] != "agent_end"));
+                assert!(events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_end")
+                    .all(|event| event.get("result").is_none_or(Value::is_null)));
+                assert_eq!(
+                    serde_json::to_value(&inner.try_lock().unwrap().entries).unwrap(),
+                    before,
+                );
+            }));
+        }
+    }
+
+    #[test]
+    fn handoff_payload_validation_precedes_session_recovery() {
+        assert_eq!(parse_handoff_focus(&json!({})).unwrap(), "");
+        assert_eq!(
+            parse_handoff_focus(&json!({"focus": "日本語"})).unwrap(),
+            "日本語",
+        );
+        assert!(parse_handoff_focus(&json!({"focus": "é".repeat(2048)})).is_ok());
+        for invalid in [
+            json!({"focus": null}),
+            json!({"focus": 42}),
+            json!({"focus": "no\u{0}nul"}),
+            json!({"focus": "é".repeat(2049)}),
+        ] {
+            assert!(parse_handoff_focus(&invalid).is_err());
+            assert!(!command_payload_can_advance_rpc_session(
+                "handoff", &invalid, None,
+            ));
+        }
+        assert!(command_can_advance_rpc_session("handoff"));
+        assert!(!command_resumes_rpc_agent("handoff", &json!({}), None));
+        assert!(!command_can_queue_while_rpc_agent_streams("handoff"));
+    }
+
     async fn run_auto_compaction_persistence_case(
         session: Session,
         save_enabled: bool,
@@ -26444,6 +27081,77 @@ export default function init(pi) {
         let state = session_state(&session, &options.available_models, &snapshot, false, false);
         assert_eq!(state["model"]["provider"], "openrouter");
         assert_eq!(state["model"]["id"], "gpt-4o-mini");
+        assert_eq!(state["contextTokens"], 0);
+        assert_eq!(state["contextWindow"], 200_000);
+    }
+
+    #[test]
+    fn session_state_context_estimate_excludes_archived_and_sibling_history() {
+        let mut model = dummy_entry("test-model", false);
+        model.model.provider = "test-provider".to_string();
+        let mut session = Session::in_memory();
+        session.header.provider = Some("test-provider".to_string());
+        session.header.model_id = Some("test-model".to_string());
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("archived history ".repeat(2000)),
+            timestamp: Some(1),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("old answer"))],
+                usage: Usage {
+                    total_tokens: 190_000,
+                    ..Usage::default()
+                },
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            },
+        });
+        let kept = session.append_message(SessionMessage::User {
+            content: UserContent::Text("retained current request".to_string()),
+            timestamp: Some(2),
+        });
+        let before = crate::compaction::estimate_model_context_tokens(
+            &session.to_messages_for_current_path(),
+        );
+        let compacted = session.append_compaction(
+            "short continuation brief".to_string(),
+            kept,
+            before,
+            None,
+            None,
+        );
+        assert!(session.navigate_to(&root));
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("unselected sibling ".repeat(3000)),
+            timestamp: Some(3),
+        });
+        assert!(session.navigate_to(&compacted));
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+        let expected = crate::compaction::estimate_model_context_tokens(
+            &session.to_messages_for_current_path(),
+        );
+        assert!(expected < before);
+        let state = session_state(&session, &[model.clone()], &snapshot, false, false);
+        assert_eq!(state["contextTokens"], expected);
+        assert!(state["contextTokens"].as_u64().unwrap() < 1000);
+        assert_eq!(state["contextWindow"], 200_000);
+        assert_eq!(
+            session_state(&session, &[], &snapshot, false, false)["contextWindow"],
+            Value::Null,
+        );
+        model.model.context_window = 0;
+        assert_eq!(
+            session_state(&session, &[model], &snapshot, false, false)["contextWindow"],
+            Value::Null,
+        );
     }
 
     // -----------------------------------------------------------------------
