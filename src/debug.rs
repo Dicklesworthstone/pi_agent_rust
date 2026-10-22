@@ -5,6 +5,7 @@ pub mod adapters;
 mod breakpoints;
 mod configuration;
 pub mod dap;
+mod launch_environment;
 mod ownership;
 mod remote;
 pub mod session;
@@ -214,6 +215,7 @@ impl DebugTool {
             })?);
         }
         selected.apply_defaults(&input.action, &mut arguments);
+        launch_environment::apply(input.env.as_ref(), &mut arguments)?;
         configuration::set_stop_on_entry(&adapter.id, &mut arguments, input.stop_on_entry);
         if let Some(mode) = &input.go_mode {
             arguments["mode"] = json!(mode);
@@ -838,6 +840,8 @@ struct DebugInput {
     remote: remote::AttachOptions,
     program: Option<String>,
     args: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "launch_environment::deserialize")]
+    env: Option<launch_environment::LaunchEnvironment>,
     adapter: Option<String>,
     adapter_config: Option<String>,
     cwd: Option<String>,
@@ -907,6 +911,9 @@ impl DebugInput {
 
     fn validate(&self) -> Result<()> {
         self.remote.validate(self)?;
+        if self.env.is_some() && self.action != "launch" {
+            return Err(tool_err("DAP_USAGE", "env is launch-only; an attached process's environment cannot be changed"));
+        }
         configuration::validate_request(
             self.adapter_config.as_deref(),
             self.adapter.as_deref(),
@@ -1042,7 +1049,7 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority. For a configured local backend, explicitly pass adapterConfig (workspace-relative dap.json) and adapter (ID). This executes that file's selected command through the same process/session policy; no configuration is auto-loaded."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority. For a configured local backend, explicitly pass adapterConfig (workspace-relative dap.json) and adapter (ID). This executes that file's selected command through the same process/session policy; no configuration is auto-loaded. Launch env overrides the debuggee environment through the adapter, not Pi or the adapter process; values are literal strings."
     }
     fn parameters(&self) -> Value {
         remote::schema(json!({
@@ -1056,6 +1063,7 @@ impl Tool for DebugTool {
                     "loaded_sources","custom_request","output","terminal_input","terminate","disconnect","sessions"]},
                 "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
+                "env":{"type":"object","maxProperties":128,"propertyNames":{"type":"string","maxLength":256,"pattern":"^[A-Za-z_][A-Za-z0-9_]*$"},"additionalProperties":{"type":"string","maxLength":65536},"description":"Launch-only debuggee environment overrides. Literal strings, no NUL, null deletion or expansion. At most 64 KiB total names/values plus separators. Explicit entries override object-shaped launchDefaults.env; omitted env leaves adapter defaults unchanged. Does not modify Pi or adapter-process environment."},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
                 "adapterConfig":{"type":"string","maxLength":4096,"description":"Explicit workspace-relative dap.json with an adapters map; requires adapter ID. Local launch/pid-attach only. Executes the selected configured command; never auto-loaded."},
                 "cwd":{"type":"string","maxLength":4096,"description":"Launch/attach working directory. Relative paths resolve from the session workspace; launch program and initial breakpoint paths resolve from this directory."},
