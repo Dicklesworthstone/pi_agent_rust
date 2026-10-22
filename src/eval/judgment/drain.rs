@@ -237,7 +237,9 @@ impl<'a> Observation<'a> {
         }
         // Identical literal keys and order are required across observations,
         // including string "0" versus numeric 0. No model answer enters this digest.
-        let manifest = format!("{:x}", Sha256::digest(serde_json::to_vec(&keys).map_err(|_| PROTOCOL)?));
+        let manifest = crate::package_manager::hex_encode(&Sha256::digest(
+            serde_json::to_vec(&keys).map_err(|_| PROTOCOL)?,
+        ));
         if request.seen & !mask != 0 || request.manifest.as_ref().is_some_and(|previous| previous != &manifest) {
             return Err(CURSOR.into());
         }
