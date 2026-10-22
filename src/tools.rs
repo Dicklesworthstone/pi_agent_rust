@@ -9839,7 +9839,10 @@ impl Tool for HubTool {
          roster returns selfId, send accepts a live sibling id or parent, and inbox \
          defaults to the caller. Agent wait reads the caller's own inbox for replies \
          from name (peer run id or parent), after cursor (a sent seq or prior wait \
-         nextCursor); it returns on messages, peer exit, retention loss, or waitMs \
+         nextCursor). Omit name to await any reply to your outstanding sends; \
+         automatic waits use the previous inbox/wait cursor, or omit it initially. \
+         unrelated running agents do not keep this wait open. It returns on \
+         messages, peer exit, no pending replies, retention loss, or waitMs \
          (default 30000, range 1..60000). It does not send or consume messages. \
          Include hub in a child's declared tools to enable messaging."
     }
@@ -9853,7 +9856,7 @@ impl Tool for HubTool {
                     "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
                     "description": "Operation"
                 },
-                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox/wait; wait names the peer whose replies are wanted; a child inbox defaults to itself" },
+                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox/wait; omit for agent wait to await outstanding replies automatically; a child inbox defaults to itself" },
                 "application": { "type": "string", "description": "Program to spawn (start)" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
                 "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
@@ -9868,7 +9871,7 @@ impl Tool for HubTool {
                     "description": "Readiness gates; all supplied gates must pass"
                 },
                 "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
-                "cursor": { "type": "integer", "minimum": 0, "description": "logs/agent inbox: nextCursor; agent wait: sent message seq or prior wait nextCursor for the same peer" },
+                "cursor": { "type": "integer", "minimum": 0, "description": "logs/agent inbox: nextCursor; named agent wait: sent seq or prior nextCursor for the same peer; automatic wait: prior inbox/automatic wait nextCursor, or omit initially" },
                 "tail": { "type": "integer", "description": "logs: last N lines" },
                 "grep": { "type": "string", "description": "logs: substring filter" },
                 "waitMs": { "type": "integer", "description": "logs or agent wait: bounded wait in ms (max 60000); agent wait defaults to 30000 and requires at least 1" },
@@ -9950,11 +9953,8 @@ impl Tool for HubTool {
 
 impl HubTool {
     async fn dispatch_agent_wait(input: &HubInput) -> Result<ToolOutput> {
-        let peer = input.name.as_deref().ok_or_else(|| {
-            Error::validation("hub agent wait requires name (peer run id or parent)")
-        })?;
-        let result = crate::agent_hub::wait_for_peer(
-            peer,
+        let result = crate::agent_hub::wait_for_replies(
+            input.name.as_deref(),
             input.cursor,
             input.wait_ms.unwrap_or(30_000),
             input.from.as_deref(),
@@ -10077,7 +10077,9 @@ impl HubTool {
         }
     }
 
-    fn format_wait_reply(result: &crate::agent_hub::InboxWaitResult) -> (String, serde_json::Value) {
+    fn format_wait_reply(
+        result: &crate::agent_hub::InboxWaitResult,
+    ) -> (String, serde_json::Value) {
         use crate::agent_hub::InboxWaitStatus;
 
         let mut text = match result.status {
@@ -10089,17 +10091,19 @@ impl HubTool {
                 .join("\n"),
             InboxWaitStatus::PeerStopped => format!(
                 "{} finished without a newer reply. Read its result or continue without the answer.",
-                result.peer
+                result.peer.as_deref().unwrap_or("All messaged agents")
             ),
             InboxWaitStatus::HistoryLost => format!(
-                "{}: inbox history after the requested cursor was evicted; a reply may have been lost.",
+                "{}: inbox or pending-reply history after the requested cursor was evicted; inspect the reported gaps before continuing.",
                 result.id
             ),
             InboxWaitStatus::TimedOut => format!(
                 "Reply wait timed out; {} may still be working. Messages remain in the inbox.",
-                result.peer
+                result.peer.as_deref().unwrap_or("an agent you messaged")
             ),
             InboxWaitStatus::Pending => "No newer reply yet.".to_string(),
+            InboxWaitStatus::NothingPending =>
+                "Nothing to wait for: no unanswered sends remain. Unrelated agents do not owe a reply.".to_string(),
         };
         if result.dropped_through_cursor != 0 && result.status != InboxWaitStatus::HistoryLost {
             let _ = write!(
@@ -10108,9 +10112,29 @@ impl HubTool {
                 result.dropped_through_cursor
             );
         }
+        if result.dropped_tracking_through_cursor != 0 {
+            let _ = write!(
+                text,
+                "\n[Pending-reply tracking was evicted through sequence {}; older unanswered sends may be missing.]",
+                result.dropped_tracking_through_cursor
+            );
+        }
+        for reply in &result.pending_replies {
+            let _ = write!(
+                text,
+                "\n{}: sent at sequence {}, {}.",
+                reply.peer,
+                reply.sent_cursor,
+                if reply.can_reply {
+                    "reply still pending"
+                } else {
+                    "cannot reply in this run"
+                }
+            );
+        }
         if result.has_more {
             text.push_str(
-                "\n[More replies are available; continue with nextCursor and the same peer.]",
+                "\n[More replies are available; continue with nextCursor and the same name selection.]",
             );
         }
         let mut details = serde_json::json!(result);

@@ -11,6 +11,8 @@ use crate::error::{Error, Result};
 
 const MAX_WAIT_MS: u64 = 60_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_TRACKED_PEERS: usize = 256;
+const MAX_TRACKED_PEER_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,15 +22,28 @@ pub enum InboxWaitStatus {
     PeerStopped,
     HistoryLost,
     TimedOut,
+    NothingPending,
 }
 
-/// A cursor belongs to this recipient/peer pair. An inbox read remains
+/// An unanswered successful send. Any later message from the peer answers it;
+/// message bodies are never interpreted to guess whether they are questions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReply {
+    pub peer: String,
+    pub sent_cursor: u64,
+    pub peer_status: Option<ChildStatus>,
+    pub can_reply: bool,
+}
+
+/// A cursor belongs to this recipient/peer selection. An inbox read remains
 /// independent: returning messages here does not consume their steering queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxWaitResult {
     pub id: String,
-    pub peer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
     pub status: InboxWaitStatus,
     pub messages: Vec<BusMessage>,
     pub next_cursor: u64,
@@ -38,6 +53,18 @@ pub struct InboxWaitResult {
     /// have been lost; a timeout must never hide this fact.
     pub dropped_through_cursor: u64,
     pub peer_status: Option<ChildStatus>,
+    /// Present for automatic waits. Settled peers are included so an empty
+    /// reply cannot be mistaken for work that is still running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_replies: Vec<PendingReply>,
+    /// Tracking is bounded separately from inbox retention. A lost pending
+    /// send must not become an invented claim that nobody owes a reply.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_tracking_through_cursor: u64,
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn wait_error(code: &str, message: &str) -> Error {
@@ -65,27 +92,100 @@ fn expired_probe(
 }
 
 impl AgentHubRegistry {
+    pub(super) fn record_reply_delivery(&mut self, message: &BusMessage) {
+        let known = |id: &str| id == "parent" || self.entries.contains_key(id);
+        if message.from == message.to || !known(&message.from) || !known(&message.to) {
+            return;
+        }
+        if let Some(pending) = self.pending_replies.get_mut(&message.to) {
+            pending.remove(&message.from);
+        }
+        let pending = self
+            .pending_replies
+            .entry(message.from.clone())
+            .or_default();
+        pending.insert(message.to.clone(), message.seq);
+        let mut bytes = pending.keys().map(String::len).sum::<usize>();
+        while pending.len() > MAX_TRACKED_PEERS || bytes > MAX_TRACKED_PEER_BYTES {
+            let oldest = pending
+                .iter()
+                .min_by_key(|(_, seq)| **seq)
+                .map(|(peer, _)| peer.clone());
+            if let Some(peer) = oldest {
+                bytes = bytes.saturating_sub(peer.len());
+                pending.remove(&peer);
+                self.dropped_reply_tracking_through
+                    .entry(message.from.clone())
+                    // Loss happens now, not at the old question's sequence.
+                    // A reader may already have acknowledged later inbox
+                    // messages while that earlier question stayed pending.
+                    .and_modify(|dropped| *dropped = (*dropped).max(message.seq))
+                    .or_insert(message.seq);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn pending_reply_snapshot(&self, recipient: &str) -> Vec<PendingReply> {
+        let Some(pending) = self.pending_replies.get(recipient) else {
+            return Vec::new();
+        };
+        let mut replies = pending
+            .iter()
+            .map(|(peer, sent_cursor)| {
+                let peer_status = self.entries.get(peer).map(|entry| entry.status);
+                let can_reply = peer == "parent"
+                    || peer_status == Some(ChildStatus::Starting)
+                    || (peer_status == Some(ChildStatus::Running)
+                        && self.control_pid(peer).is_some());
+                PendingReply {
+                    peer: peer.clone(),
+                    sent_cursor: *sent_cursor,
+                    peer_status,
+                    can_reply,
+                }
+            })
+            .collect::<Vec<_>>();
+        replies.sort_unstable_by_key(|reply| reply.sent_cursor);
+        replies
+    }
+
     pub(super) fn wait_snapshot(
         &self,
         recipient: &str,
-        peer: &str,
+        peer: Option<&str>,
         cursor: u64,
     ) -> Result<InboxWaitResult> {
-        if recipient == peer {
+        if peer == Some(recipient) {
             return Err(wait_error("INPUT", "an agent cannot wait for itself"));
         }
         if recipient != "parent" && !self.entries.contains_key(recipient) {
             return Err(wait_error("RECIPIENT", "the waiting agent is unknown"));
         }
-        let peer_status = if peer == "parent" {
-            None
-        } else {
+        let peer_status = if let Some(peer) = peer.filter(|peer| *peer != "parent") {
             Some(
                 self.entries
                     .get(peer)
                     .ok_or_else(|| wait_error("PEER", "the named peer is unknown"))?
                     .status,
             )
+        } else {
+            None
+        };
+        let pending_replies = if peer.is_none() {
+            self.pending_reply_snapshot(recipient)
+        } else {
+            Vec::new()
+        };
+        let dropped_tracking_through_cursor = if peer.is_none() {
+            self.dropped_reply_tracking_through
+                .get(recipient)
+                .copied()
+                .filter(|dropped| *dropped > cursor)
+                .unwrap_or(0)
+        } else {
+            0
         };
         let queue = self.bus.get(recipient);
         let oldest_cursor = queue.and_then(|queue| queue.front()).map_or(0, |m| m.seq);
@@ -101,7 +201,7 @@ impl AgentHubRegistry {
         let mut has_more = false;
         if let Some(queue) = queue {
             for message in queue.iter().filter(|message| message.seq > cursor) {
-                if message.from == peer {
+                if peer.is_none_or(|peer| message.from == peer) {
                     let size = serde_json::to_vec(message)?.len();
                     if bytes.saturating_add(size) > ipc::MAX_INBOX_PAGE_BYTES {
                         has_more = true;
@@ -114,18 +214,27 @@ impl AgentHubRegistry {
                 next_cursor = message.seq;
             }
         }
+        if !has_more {
+            // Acknowledge reported tracking loss even when the caller has
+            // received no messages. Never skip an unreturned inbox page.
+            next_cursor = next_cursor.max(dropped_tracking_through_cursor);
+        }
         let status = if !messages.is_empty() {
             InboxWaitStatus::Messages
-        } else if dropped_through_cursor != 0 {
+        } else if dropped_through_cursor != 0 || dropped_tracking_through_cursor != 0 {
             InboxWaitStatus::HistoryLost
         } else if peer_status.is_some_and(ChildStatus::settled) {
+            InboxWaitStatus::PeerStopped
+        } else if peer.is_none() && pending_replies.is_empty() {
+            InboxWaitStatus::NothingPending
+        } else if peer.is_none() && !pending_replies.iter().any(|reply| reply.can_reply) {
             InboxWaitStatus::PeerStopped
         } else {
             InboxWaitStatus::Pending
         };
         Ok(InboxWaitResult {
             id: recipient.to_string(),
-            peer: peer.to_string(),
+            peer: peer.map(str::to_string),
             status,
             messages,
             next_cursor,
@@ -133,6 +242,8 @@ impl AgentHubRegistry {
             oldest_cursor,
             dropped_through_cursor,
             peer_status,
+            pending_replies,
+            dropped_tracking_through_cursor,
         })
     }
 }
@@ -188,7 +299,7 @@ impl WaitBudget {
 async fn probe_inbox(
     owner: &AgentCx,
     inherited: bool,
-    peer: &str,
+    peer: Option<&str>,
     cursor: u64,
     claimed_from: Option<&str>,
     remaining: Duration,
@@ -198,7 +309,7 @@ async fn probe_inbox(
             owner,
             ipc::Request {
                 action: ipc::Action::Wait,
-                name: Some(peer.to_string()),
+                name: peer.map(str::to_string),
                 text: None,
                 claimed_from: claimed_from.map(str::to_string),
                 cursor: Some(cursor),
@@ -213,7 +324,7 @@ async fn probe_inbox(
                 "parent returned a different reply type",
             ));
         };
-        if result.peer != peer || result.next_cursor < cursor {
+        if result.peer.as_deref() != peer || result.next_cursor < cursor {
             return Err(wait_error(
                 "PROTOCOL",
                 "parent returned an inconsistent reply cursor",
@@ -234,20 +345,21 @@ async fn probe_inbox(
     }
 }
 
-/// Wait for messages from one named run, its terminal state, retention loss,
-/// cancellation, or the requested time limit. A child can only read its own
+/// Wait for messages from one named run, or automatically await unanswered
+/// sends when no peer is named. Other live agents never sustain an automatic
+/// wait. A child can only read its own
 /// authenticated inbox; a root caller reads the parent inbox. An inherited
 /// channel never falls back to a different local registry.
-pub async fn wait_for_peer(
-    peer: &str,
+pub async fn wait_for_replies(
+    peer: Option<&str>,
     cursor: Option<u64>,
     wait_ms: u64,
     claimed_from: Option<&str>,
 ) -> Result<InboxWaitResult> {
-    if peer.trim().is_empty() {
+    if peer.is_some_and(|peer| peer.trim().is_empty()) {
         return Err(wait_error(
             "INPUT",
-            "wait requires name (a peer run id or parent)",
+            "name must be a peer run id or parent, or omitted for unanswered sends",
         ));
     }
     let owner = AgentCx::for_current_or_request();

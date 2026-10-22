@@ -666,11 +666,10 @@ fn dispatch(hub: &mut AgentHubRegistry, sender: &str, request: Request) -> Resul
             hub.inbox_page(sender, request.cursor)
         }
         Action::Wait => {
-            let peer = request
-                .name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| ipc_error("INPUT", "wait requires a peer run id or parent"))?;
+            let peer = request.name.as_deref();
+            if peer.is_some_and(|name| name.trim().is_empty()) {
+                return Err(ipc_error("INPUT", "wait peer must not be empty"));
+            }
             // The credential chooses the inbox. `name` chooses only the
             // sender being awaited, never another recipient's private inbox.
             let result = hub.wait_snapshot(sender, peer, request.cursor.unwrap_or(0))?;
@@ -1086,6 +1085,68 @@ mod tests {
         };
         assert_eq!(result.status, super::super::InboxWaitStatus::PeerStopped);
         hub.settle(&sender.id, ChildStatus::Done);
+        assert!(
+            dispatch(&mut hub, &sender.id, wait)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_HUB_IPC_REVOKED")
+        );
+    }
+
+    #[test]
+    fn automatic_wait_uses_only_the_authenticated_senders_outstanding_messages() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut hub = AgentHubRegistry::default();
+        hub.set_dir_for_tests(temp.path().to_path_buf());
+        let sender = hub.register("sender", "ask peer").unwrap();
+        let peer = hub.register("peer", "answer sender").unwrap();
+        hub.mark_running(&sender.id, 10);
+        hub.mark_running(&peer.id, 20);
+        hub.bus_send(&peer.id, "parent", "private parent question")
+            .unwrap();
+        hub.bus_send("parent", &peer.id, "private parent reply")
+            .unwrap();
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, request(Action::Wait)).unwrap()
+        else {
+            panic!("expected automatic wait result");
+        };
+        assert_eq!(result.id, sender.id);
+        assert_eq!(result.status, super::super::InboxWaitStatus::NothingPending);
+        assert!(result.pending_replies.is_empty());
+        assert!(result.messages.is_empty());
+
+        let mut send = request(Action::Send);
+        send.name = Some(peer.id.clone());
+        send.text = Some("sender question".to_string());
+        let Reply::Sent { message } = dispatch(&mut hub, &sender.id, send).unwrap() else {
+            panic!("expected accepted send");
+        };
+        let mut wait = request(Action::Wait);
+        wait.cursor = Some(message.seq);
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected pending wait");
+        };
+        assert_eq!(result.pending_replies.len(), 1);
+        assert_eq!(result.pending_replies[0].peer, peer.id);
+        assert_eq!(result.status, super::super::InboxWaitStatus::Pending);
+
+        let mut answer = request(Action::Send);
+        answer.name = Some(sender.id.clone());
+        answer.text = Some("sender answer".to_string());
+        dispatch(&mut hub, &peer.id, answer).unwrap();
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected answer");
+        };
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].body, "sender answer");
+        assert!(result.pending_replies.is_empty());
+        assert_eq!(result.status, super::super::InboxWaitStatus::Messages);
+        wait.cursor = Some(result.next_cursor);
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait.clone()).unwrap() else {
+            panic!("expected drained wait");
+        };
+        assert_eq!(result.status, super::super::InboxWaitStatus::NothingPending);
+        hub.mark_process_reaped(&sender.id);
         assert!(
             dispatch(&mut hub, &sender.id, wait)
                 .unwrap_err()

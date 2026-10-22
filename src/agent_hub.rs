@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 pub mod ipc;
 mod wait;
 
-pub use wait::{InboxWaitResult, InboxWaitStatus, wait_for_peer};
+pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
 
 /// Maximum transcript bytes paged back per `transcript` call.
 const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
@@ -164,6 +164,10 @@ pub struct AgentHubRegistry {
     /// Last evicted delivery in each inbox. Global sequence numbers are not
     /// contiguous per recipient, so oldest retained alone cannot prove loss.
     dropped_bus_through: BTreeMap<String, u64>,
+    /// Successful sends awaiting any later message from the recipient. The
+    /// bounded tracker contains identities and sequence numbers, never bodies.
+    pending_replies: BTreeMap<String, BTreeMap<String, u64>>,
+    dropped_reply_tracking_through: BTreeMap<String, u64>,
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
@@ -547,6 +551,7 @@ impl AgentHubRegistry {
             self.dropped_bus_through.insert(id.to_string(), dropped.seq);
         }
         queue.push_back(message.clone());
+        self.record_reply_delivery(&message);
         Ok(message)
     }
 
@@ -586,6 +591,7 @@ impl AgentHubRegistry {
                 .insert("parent".to_string(), dropped.seq);
         }
         queue.push_back(message.clone());
+        self.record_reply_delivery(&message);
         Ok(message)
     }
 

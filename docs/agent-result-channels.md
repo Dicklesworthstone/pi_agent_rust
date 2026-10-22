@@ -47,6 +47,7 @@ The result has schema `pi.agent-hub.wait/v1` and one of these statuses:
 | `peerStopped` | The peer finished, failed, or was killed without a newer retained reply. |
 | `historyLost` | Retention evicted messages after the requested cursor; an answer may have been lost. |
 | `timedOut` | The requested wait ended with no matching reply observed. The peer may still be working. |
+| `nothingPending` | An automatic wait has no unanswered sends and no newer inbox messages. |
 
 Results include `messages`, `nextCursor`, `hasMore`, `oldestCursor`,
 `droppedThroughCursor`, and the peer's known status. Continue a paged read with
@@ -54,6 +55,45 @@ Results include `messages`, `nextCursor`, `hasMore`, `oldestCursor`,
 retention gap even when some newer replies are returned. Omitting `cursor`
 starts at the beginning of retained history. Correlation uses sender and
 sequence, not an inferred relationship between the message bodies.
+
+Omit `name` to wait for outstanding replies automatically:
+
+```json
+{"op":"agent","action":"send","name":"scout-1","text":"Where is authentication implemented?"}
+{"op":"agent","action":"send","name":"reviewer-2","text":"Which authentication tests already exist?"}
+{"op":"agent","action":"wait","waitMs":30000}
+```
+
+For the first automatic wait, omit `cursor` to include retained replies. For
+later waits, use the previous inbox or automatic wait's `nextCursor`. A reply
+can arrive between two sends, so using the last send's sequence could skip a
+fast answer to the earlier question. Each successful send records its recipient; a later message from
+that recipient answers all earlier sends to it. Sending another message records
+a new outstanding reply. Failed queue writes record nothing and cannot answer a
+previous send. This tracking happens at delivery in the parent, so losing an IPC
+acknowledgment does not lose an accepted question.
+
+An automatic wait returns any newer message in the caller's own inbox. With no
+new messages, it waits only while at least one messaged peer can still reply.
+Unasked workers never sustain it. The result includes `pendingReplies`, ordered
+by `sentCursor`, with each `peer`, `peerStatus`, and `canReply`. A reaped process
+cannot reply even if its result is still awaiting writeback. When all asked peers
+stop, the wait returns `peerStopped`; when every send has been answered, it
+returns `nothingPending`. The `peer` field is absent for automatic waits.
+
+Continue automatic reads with `nextCursor` and omit `name` again. Reads remain
+nonconsuming: repeating a cursor deliberately repeats its messages. Switching
+between a named peer and automatic reads requires choosing a cursor for the new
+selection, because a named read can skip other senders. Tracking is per native
+run ID (and the parent hub lifetime), so a revived worker has a separate identity.
+
+Tracking retains at most 256 outstanding peers and 32 KiB of peer identity text
+per caller. If older tracking is evicted, `droppedTrackingThroughCursor` reports
+the loss and an otherwise empty wait returns `historyLost`. Inbox retention is
+reported independently by `droppedThroughCursor`; neither gap becomes a claim
+that no answer is owed. Both kinds of loss remain visible alongside any returned
+messages. A caller can explicitly acknowledge the gap using `nextCursor`, or
+use a named wait for a known peer whose tracking was evicted.
 
 `waitMs` defaults to 30 seconds and must be between 1 and 60,000 milliseconds.
 The caller's cancellation and tighter inherited deadline still apply. Waiting
@@ -69,7 +109,9 @@ no listener or helper thread is added. This is an explicit reply wait; it does
 not infer dependency cycles between workers. Child replies arriving after the
 last completed probe remain available in the next wait or inbox read.
 
-The regression coverage includes sender filtering, ordered byte-bounded
+The regression coverage includes automatic outstanding-reply discovery, failed
+delivery, reaped peers, authenticated tracking isolation, tracking bounds,
+sender filtering, ordered byte-bounded
 pagination, actual eviction versus sequence gaps, authenticated inbox ownership,
 terminal peers, cancellation/deadline handling, ordinary IPC wait expiry, and
 public `HubTool` delivery during the final wait interval. These Rust regressions

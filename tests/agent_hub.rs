@@ -108,6 +108,64 @@ fn public_reply_wait_times_out_without_consuming_unrelated_messages() {
     hub.settle(&peer.id, ChildStatus::Done);
 }
 
+#[test]
+fn public_automatic_wait_follows_accepted_sends_without_a_named_peer() {
+    let _guard = LOCK.lock().expect("lock");
+    let dir = tempfile::tempdir().expect("hub directory");
+    let peer = {
+        let mut hub = agent_hub::registry().lock().expect("hub");
+        hub.set_dir_for_tests(dir.path().to_path_buf());
+        let peer = hub.register("automatic-wait", "answer").unwrap();
+        hub.mark_running(&peer.id, std::process::id());
+        peer
+    };
+    asupersync::test_utils::run_test(|| async {
+        let tool = pi::tools::HubTool::new(dir.path());
+        let sent = tool
+            .execute(
+                "ask-for-answer",
+                serde_json::json!({
+                    "op": "agent", "action": "send", "name": peer.id, "text": "question"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!sent.is_error);
+        let sequence = sent.details.unwrap()["seq"].as_u64().unwrap();
+        let wait = tool.execute(
+            "await-outstanding-answer",
+            serde_json::json!({
+                "op": "agent", "action": "wait", "cursor": sequence, "waitMs": 50
+            }),
+            None,
+        );
+        futures::pin_mut!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        let answer = {
+            let mut hub = agent_hub::registry().lock().unwrap();
+            let answer = hub.bus_send("parent", &peer.id, "answer").unwrap();
+            hub.settle(&peer.id, ChildStatus::Done);
+            answer
+        };
+        let output = wait.await.unwrap();
+        assert!(!output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["status"], "messages");
+        assert!(details.get("peer").is_none());
+        assert_eq!(details["messages"][0]["seq"], answer.seq);
+        assert_eq!(details["nextCursor"], answer.seq);
+        assert!(
+            agent_hub::registry()
+                .lock()
+                .unwrap()
+                .inbox("parent")
+                .iter()
+                .any(|m| m.seq == answer.seq)
+        );
+    });
+}
+
 fn test_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("pi-agent-hub-it-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create test dir");
