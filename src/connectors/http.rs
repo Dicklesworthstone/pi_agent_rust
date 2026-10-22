@@ -309,6 +309,25 @@ struct PreparedRequest {
     timeout_ms: Option<u64>,
 }
 
+/// Request hints can shorten a hostcall budget, never extend it. Zero remains
+/// "unset" for all existing timeout spellings. Resolve aliases independently:
+/// a zero or longer `timeout` must not mask a shorter `timeoutMs`/`timeout_ms`.
+/// The connector default is a fallback, not a maximum; otherwise Freeflow's
+/// explicit five-minute requests would still be truncated to thirty seconds.
+fn effective_timeout_ms(
+    params: &serde_json::Map<String, Value>,
+    call_timeout_ms: Option<u64>,
+    default_timeout_ms: u64,
+) -> Option<u64> {
+    ["timeout", "timeoutMs", "timeout_ms"]
+        .into_iter()
+        .filter_map(|key| params.get(key).and_then(Value::as_u64))
+        .chain(call_timeout_ms)
+        .filter(|value| *value > 0)
+        .min()
+        .or_else(|| (default_timeout_ms > 0).then_some(default_timeout_ms))
+}
+
 impl HttpConnector {
     #[allow(clippy::too_many_lines)]
     fn prepare_request(
@@ -510,22 +529,8 @@ impl HttpConnector {
             )));
         }
 
-        let timeout_ms_param = params
-            .get("timeout")
-            .and_then(Value::as_u64)
-            .or_else(|| params.get("timeoutMs").and_then(Value::as_u64))
-            .or_else(|| params.get("timeout_ms").and_then(Value::as_u64))
-            .filter(|value| *value > 0);
-
-        let timeout_ms_call = call.timeout_ms.filter(|value| *value > 0);
-
-        let timeout_ms = timeout_ms_param.or(timeout_ms_call).or({
-            if self.config.default_timeout_ms > 0 {
-                Some(self.config.default_timeout_ms)
-            } else {
-                None
-            }
-        });
+        let timeout_ms =
+            effective_timeout_ms(params, call.timeout_ms, self.config.default_timeout_ms);
 
         Ok(PreparedRequest {
             url,
@@ -677,5 +682,121 @@ impl HttpConnector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_budget_tests {
+    use super::*;
+
+    fn prepared_timeout(
+        params: Value,
+        call_timeout_ms: Option<u64>,
+        default_ms: u64,
+    ) -> Option<u64> {
+        let connector = HttpConnector::new(HttpConnectorConfig {
+            default_timeout_ms: default_ms,
+            allowlist: vec!["relay.example".to_string()],
+            ..HttpConnectorConfig::default()
+        });
+        let mut call = HostCallPayload {
+            call_id: "freeflow-timeout".to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params,
+            timeout_ms: call_timeout_ms,
+            cancel_token: None,
+            context: None,
+        };
+        call.params["url"] = json!("https://relay.example/relay");
+        call.params["method"] = json!("POST");
+        // Both dispatch paths use this preparation, before any network I/O.
+        connector
+            .prepare_request(&call)
+            .expect("valid request")
+            .timeout_ms
+    }
+
+    #[test]
+    fn every_timeout_alias_respects_the_hostcall_budget() {
+        for alias in ["timeout", "timeoutMs", "timeout_ms"] {
+            let mut params = json!({});
+            params[alias] = json!(300_000);
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(5_000), 30_000),
+                Some(5_000)
+            );
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(600_000), 30_000),
+                Some(300_000)
+            );
+            assert_eq!(prepared_timeout(params, None, 30_000), Some(300_000));
+        }
+    }
+
+    #[test]
+    fn conflicting_aliases_use_the_shortest_positive_budget() {
+        let aliases = ["timeout", "timeoutMs", "timeout_ms"];
+        for short_alias in aliases {
+            let mut params = json!({
+                "timeout": 300_000, "timeoutMs": 600_000, "timeout_ms": 900_000
+            });
+            params[short_alias] = json!(25);
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(1_000), 30_000),
+                Some(25)
+            );
+            assert_eq!(prepared_timeout(params, Some(10), 30_000), Some(10));
+
+            for unset_alias in aliases {
+                if unset_alias != short_alias {
+                    let mut masked = json!({});
+                    masked[unset_alias] = json!(0);
+                    masked[short_alias] = json!(25);
+                    assert_eq!(prepared_timeout(masked, None, 30_000), Some(25));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_zero_and_invalid_hints_keep_existing_fallback_semantics() {
+        for value in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("25"),
+            json!(false),
+        ] {
+            let params = json!({"timeout": value, "timeoutMs": value, "timeout_ms": value});
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(75), 30_000),
+                Some(75)
+            );
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(0), 30_000),
+                Some(30_000)
+            );
+            assert_eq!(prepared_timeout(params, None, 0), None);
+        }
+        assert_eq!(prepared_timeout(json!({}), None, 30_000), Some(30_000));
+        assert_eq!(prepared_timeout(json!({}), Some(0), 0), None);
+    }
+
+    #[test]
+    fn extreme_request_hint_cannot_remove_or_overflow_a_host_budget() {
+        assert_eq!(
+            prepared_timeout(json!({"timeout": u64::MAX}), Some(1), 0),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_timeout(json!({"timeout": 1}), Some(u64::MAX), 0),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_timeout(json!({"timeout": u64::MAX}), None, 0),
+            Some(u64::MAX)
+        );
     }
 }
