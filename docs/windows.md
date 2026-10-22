@@ -42,6 +42,14 @@ installer's `npm.cmd` as well as an `npm.exe` shim such as pnpm's. Empty and
 relative `PATH` entries are skipped. If no `npm` is found, loading the
 configured packages fails with `Failed to spawn npm: program not found`.
 
+## Desktop Automation (`computer` tool)
+
+The `computer` tool has no Windows backend yet. With `computer.enable_computer`
+set, every action on Windows fails with `native computer backend is not
+implemented for this operating system`, so leave the setting off there. The
+native backends are macOS and Linux on X11; see the Computer section of
+[settings.md](settings.md#computer-desktop-automation).
+
 ## Keybindings
 
 ### Windows Terminal

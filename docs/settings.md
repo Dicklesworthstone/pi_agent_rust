@@ -497,6 +497,12 @@ They remain outside project recall, reflection, and startup memory.
 - `computer.require_approval` (bool): Default `true`. Requires operator approval for mouse/keyboard inputs.
 - `computer.screenshot_dir` (string): Destination directory for captured screen artifacts.
 
+Native backends:
+
+- **macOS**: a bundled Swift helper run with `/usr/bin/swift` (Xcode Command Line Tools). Screen Recording permission is needed for screenshots and for actions that list or select windows; Accessibility permission is needed for mouse, keyboard, scroll, window focus and `ax_tree`. Grant both to the terminal or application that runs pi.
+- **Linux on X11**: `xrandr`, `wmctrl`, `xprop`, `scrot`, `xdotool` and `xclip` on `PATH`, plus `python3` with PyGObject and AT-SPI 2 (`gi.repository.Atspi`) for `ax_tree`. `DISPLAY` must be set. A Wayland session is refused rather than driven through XWayland.
+- **Windows**: not implemented yet; every action fails with an error.
+
 ### Browser (headless Chromium automation)
 
 - `browser.enable_browser` (bool): Default `false`. When `true`, activates `browser` tool.
