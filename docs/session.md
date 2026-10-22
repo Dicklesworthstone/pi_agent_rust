@@ -235,9 +235,21 @@ include `data.changed` and the native compaction result when one was produced.
 Ctrl+C and extension cancellation fail the command without acknowledging success;
 interrupted persistence retains the native session admission fence.
 
-The `pi handoff` subcommand remains the local structured report, and the
-interactive `/handoff` workflow retains its preview/export behavior. Print-mode
-`/handoff` performs the in-place continuation compaction described above.
+Both terminal frontends also run this native transaction with `/handoff [focus]`.
+Escape requests cancellation, and the UI waits for the transaction to finish
+before accepting another foreground request. A queued handoff stays bound to its
+original session and cancellation handle. Unknown leading options are errors;
+use `/handoff -- <focus>` for focus text beginning with a dash.
+
+The `pi handoff` subcommand remains the local structured report. In either
+terminal, `/handoff --report [human|agent|target] [path]` selects that report
+explicitly. The default terminal also retains `/handoff --model` and its
+`--export` options for a separate preview or evidence bundle; those modes do not
+compact the conversation. Its `/handoff --import <absolute-bundle.json>` mode
+inspects an exported bundle and can create a separate native continuation
+session with explicit output and workspace paths. Import leaves the active
+session unchanged and does not start a model turn. See
+[Model-assisted handoff](model-handoff.md) and [Handoff import](handoff-import.md).
 
 ## ADR: Session Store V2 + Wire-Format Contract
 

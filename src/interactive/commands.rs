@@ -430,7 +430,8 @@ impl SlashCommand {
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /prewalk [status|off] - Hand off to @smol after planning and the first edit
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
-  /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
+  /handoff [focus]   - Compact context into a continuation brief in this session
+  /handoff --report [to] [path] - Generate or deliver a local session report
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
   /add-dir <dir>     - Grant access to an additional workspace root
   /remove-dir <dir>  - Revoke an additional workspace root immediately
@@ -3503,14 +3504,84 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
-        let report = {
-            let Ok(session_guard) = self.session.try_lock() else {
-                self.status_message = Some("Session busy; try again".to_string());
+        use super::workspace_reports::HandoffMode;
+        let focus = match super::workspace_reports::handoff_mode(args) {
+            Ok(HandoffMode::InPlace(focus)) => focus.to_string(),
+            Ok(HandoffMode::Report(args)) => {
+                let report = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    super::workspace_reports::handoff(&session_guard, args)
+                };
+                self.show_workspace_report(report);
+                return None;
+            }
+            Ok(HandoffMode::ModelPreview(_)) => {
+                self.status_message = Some(
+                    "Model preview/export is available in the default terminal; use /handoff [focus] here to compact this session".to_string(),
+                );
+                return None;
+            }
+            Ok(HandoffMode::Import(_)) => {
+                self.status_message = Some(
+                    "Handoff bundle import is available in the default terminal with /handoff --import".to_string(),
+                );
+                return None;
+            }
+            Err(error) => {
+                self.status_message = Some(error.to_string());
+                return None;
+            }
+        };
+        if self.agent_state != AgentState::Idle
+            || self.bash_running
+            || self.agent.try_lock().is_err()
+        {
+            self.status_message = Some(
+                "Handoff is available after the current request finishes".to_string(),
+            );
+            return None;
+        }
+        let Some(owner_session_id) = self.session.try_lock().ok()
+            .map(|session| session.header.id.clone()) else {
+                self.status_message = Some("Handoff unavailable: session is busy".to_string());
                 return None;
             };
-            super::workspace_reports::handoff(&session_guard, args)
-        };
-        self.show_workspace_report(report);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.handoff_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.extension_compacting.store(true, Ordering::SeqCst);
+        self.status_message = Some("Preparing in-place handoff (Esc to cancel)...".to_string());
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let event = match OwnedMutexGuard::lock(owner, &cx).await {
+                Ok(mut owner) => {
+                    match owner.handle.with_session(|session| session.header.id.clone()).await {
+                        Ok(current) if current == owner_session_id => {
+                            super::workspace_reports::run_in_place_handoff(
+                                &mut owner.handle, &focus, &abort_signal,
+                            ).await
+                        }
+                        Ok(_) => PiMsg::AgentError("Handoff cancelled: the session changed before it started".to_string()),
+                        Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+                    }
+                }
+                Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+            };
+            // Drop the Agent owner before the UI applies its terminal reset.
+            // Delivery uses a fresh context even after owner cancellation.
+            let _ = enqueue_pi_event(
+                &event_tx, &Cx::for_request(),
+                PiMsg::HandoffFinished { request_id, event: Box::new(event) },
+            ).await;
+        });
+        self.scroll_to_bottom();
         None
     }
 

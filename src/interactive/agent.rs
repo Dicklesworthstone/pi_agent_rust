@@ -817,13 +817,44 @@ impl PiApp {
         self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
     }
 
+    fn finish_handoff_ui(&mut self) {
+        self.handoff_request_id = None;
+        self.abort_handle = None;
+        self.agent_state = AgentState::Idle;
+        self.current_tool = None;
+        self.current_tool_id = None;
+        self.current_tool_summary.clear();
+        self.extension_compacting.store(false, Ordering::SeqCst);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_pi_message_with_session_retry(
         &mut self,
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        let (msg, handoff_completion) = match msg {
+            PiMsg::HandoffFinished { request_id, event } => {
+                if self.handoff_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                (*event, Some(request_id))
+            }
+            msg => (msg, None),
+        };
+        if handoff_completion.is_some() && !matches!(&msg, PiMsg::ConversationReset { .. }) {
+            self.finish_handoff_ui();
+        }
         match msg {
+            PiMsg::HandoffFinished { .. } => return None,
+            PiMsg::System(message) | PiMsg::AgentError(message)
+                if self.handoff_request_id.is_some() =>
+            {
+                // Background notices cannot release the active handoff's
+                // abort handle or admit another foreground operation.
+                self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+            }
             PiMsg::AgentStart => {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
@@ -1060,6 +1091,20 @@ impl PiApp {
                 // Update usage
                 if let Some(ref u) = usage {
                     add_usage(&mut self.total_usage, u);
+                }
+
+                if self.handoff_request_id.is_some() {
+                    // A delayed terminal from an earlier turn may finalize its
+                    // display, but it does not own this handoff's cancellation
+                    // handle, hook dialogs, or foreground admission state.
+                    if let Some(message) = time_cap_message {
+                        self.pending_inputs_paused_by_time_cap = true;
+                        self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                    } else if let Some(message) = error_message {
+                        self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                    }
+                    self.refresh_conversation_viewport(follow_tail);
+                    return None;
                 }
 
                 self.agent_state = AgentState::Idle;
@@ -1403,18 +1448,36 @@ After approving access in the browser, press Enter in Pi to complete login."
             } => {
                 match self.session_event_ownership(&session_id) {
                     SessionEventOwnership::Current => {}
-                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Stale => {
+                        if handoff_completion.is_some() {
+                            self.finish_handoff_ui();
+                            self.status_message = Some("Handoff finished for an earlier session; the current display was kept".to_string());
+                        }
+                        return None;
+                    }
                     SessionEventOwnership::Busy => {
+                        let event = PiMsg::ConversationReset {
+                            session_id, messages, usage, status,
+                        };
+                        if let Some(request_id) = handoff_completion {
+                            if attempts_remaining == 0 {
+                                self.finish_handoff_ui();
+                                self.status_message = Some("Handoff saved; the busy session prevented a conversation display refresh".to_string());
+                                return None;
+                            }
+                            return self.retry_busy_session_event(
+                                PiMsg::HandoffFinished { request_id, event: Box::new(event) },
+                                attempts_remaining,
+                            );
+                        }
                         return self.retry_busy_session_event(
-                            PiMsg::ConversationReset {
-                                session_id,
-                                messages,
-                                usage,
-                                status,
-                            },
+                            event,
                             attempts_remaining,
                         );
                     }
+                }
+                if handoff_completion.is_some() {
+                    self.finish_handoff_ui();
                 }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
@@ -1438,6 +1501,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool_summary.clear();
                 self.abort_handle = None;
                 if is_replacement {
+                    self.handoff_request_id = None;
                     self.title_cancellation = None;
                     self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
@@ -2930,6 +2994,15 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
+        if self.handoff_request_id.is_some()
+            || matches!(SlashCommand::parse(trimmed), Some((SlashCommand::Handoff, _)))
+        {
+            self.status_message = Some(
+                "Handoff must finish before submitting another request; Escape cancels it".to_string(),
+            );
+            return;
+        }
+
         if let Some((command, _args)) = parse_extension_command(trimmed)
             && let Some(manager) = &self.extensions
             && manager.has_command(&command)
@@ -3253,6 +3326,13 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
         if self.handle_ask_ui_input(message) {
+            return None;
+        }
+
+        if self.handoff_request_id.is_some() {
+            self.status_message = Some(
+                "Handoff is still running; Escape cancels it".to_string(),
+            );
             return None;
         }
 
@@ -3973,6 +4053,7 @@ mod stream_delta_batcher_tests {
                     let done = matches!(
                         event,
                         PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. } | PiMsg::AgentError(_)
+                            | PiMsg::HandoffFinished { .. }
                     );
                     let _ = app.handle_pi_message(event.clone());
                     events.push(event);
@@ -5572,6 +5653,127 @@ mod stream_delta_batcher_tests {
         assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Successful completion retires request ownership.
         assert!(matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
         eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"}));
+    }
+
+    #[test]
+    fn classic_handoff_runs_the_native_transaction_and_refreshes_both_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("classic-handoff.jsonl");
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }),
+            Config::default(), None,
+            |session| {
+                let mut stored = session.session.try_lock().unwrap();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("Earlier authored migration decision".into()), timestamp: None,
+                });
+                // Larger than the normal recent budget, so the native safe
+                // boundary retains this entire current turn without cutting it.
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("retained native tail ".repeat(8192)), timestamp: None,
+                });
+                session.agent.replace_messages(stored.to_messages_for_current_path());
+            },
+        );
+        let owner = app.session.try_lock().unwrap().header.id.clone();
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            app.session.lock(&cx).await.unwrap().save().await.unwrap();
+        });
+        let _ = app.submit_message("/handoff preserve migration decisions");
+        assert!(app.handoff_request_id.is_some());
+        assert_eq!(app.agent_state, AgentState::Processing);
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::ConversationReset { .. })));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.status_message.as_deref().unwrap().starts_with("Handoff saved"));
+        let reopened = runtime().block_on(Session::open(path.to_str().unwrap())).unwrap();
+        assert_eq!(reopened.header.id, owner);
+        assert_eq!(reopened.entries.len(), 3);
+        assert!(reopened.entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Compaction(compaction) if compaction.details.as_ref().unwrap()["mode"] == "handoff")));
+        assert_eq!(serde_json::to_value(app.agent.try_lock().unwrap().messages()).unwrap(),
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap());
+        eprintln!("{}", json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"}));
+    }
+
+    #[test]
+    fn classic_handoff_refusal_releases_busy_and_report_stays_explicit() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) = build_test_app_with_provider(
+            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }));
+        let _ = app.submit_message("/handoff --report");
+        assert!(app.handoff_request_id.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let _ = app.submit_message("/handoff --unknown target");
+        assert!(app.status_message.as_deref().unwrap().contains("Usage: /handoff"));
+        assert!(app.handoff_request_id.is_none());
+        let _ = app.submit_message("/handoff human is a focus, not a recipient");
+        assert!(app.handoff_request_id.is_some());
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::AgentError(message) if message.contains("Nothing safe to hand off"))));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn classic_handoff_keeps_request_ownership_through_busy_snapshot_retries() {
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let store = Arc::clone(&app.session);
+        let held = store.try_lock().unwrap();
+        let owner = held.header.id.clone();
+        let (abort, signal) = AbortHandle::new();
+        app.handoff_request_id = Some("current-handoff".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        app.extension_compacting.store(true, Ordering::SeqCst);
+        let terminal = PiMsg::HandoffFinished {
+            request_id: "current-handoff".into(),
+            event: Box::new(PiMsg::ConversationReset {
+                session_id: owner, messages: Vec::new(), usage: Usage::default(),
+                status: Some("Handoff saved".into()),
+            }),
+        };
+        assert!(app.handle_pi_message_with_session_retry(terminal.clone(), 1).is_some());
+        let _ = app.handle_pi_message(PiMsg::AgentError("unrelated background error".into()));
+        let _ = app.handle_pi_message(PiMsg::AgentDone {
+            usage: None, stop_reason: StopReason::Stop, error_message: None,
+        });
+        let _ = app.handle_pi_message(PiMsg::HandoffFinished {
+            request_id: "older-handoff".into(), event: Box::new(PiMsg::System("stale".into())),
+        });
+        assert_eq!(app.handoff_request_id.as_deref(), Some("current-handoff"));
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.abort_handle.is_some());
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        assert!(app.handle_pi_message_with_session_retry(terminal, 0).is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.handoff_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(app.status_message.as_deref().unwrap().contains("Handoff saved"));
+        assert!(app.status_message.as_deref().unwrap().contains("display refresh"));
+        drop(held);
     }
 
     #[test]

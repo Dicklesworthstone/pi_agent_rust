@@ -337,7 +337,75 @@ pub fn prepare_review(
     Ok(PreparedWorkspaceReview::Model(client, request))
 }
 
-/// `/handoff [human|agent|<target>] [path]`: a handoff brief of the session.
+/// Explicit report and preview modes never turn an unrecognized option into
+/// a delivery target. All other authored text is the in-place handoff focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffMode<'a> {
+    InPlace(&'a str),
+    Report(&'a str),
+    ModelPreview(&'a str),
+    Import(&'a str),
+}
+
+pub(crate) fn handoff_mode(args: &str) -> crate::error::Result<HandoffMode<'_>> {
+    let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    match first {
+        "--report" => Ok(HandoffMode::Report(rest.trim())),
+        "--model" => Ok(HandoffMode::ModelPreview(args)),
+        "--import" => Ok(HandoffMode::Import(args)),
+        option if option.starts_with('-') && option != "--" => {
+            Err(crate::error::Error::validation(
+                "Usage: /handoff [focus] | /handoff --report [human|agent|target] [path] | /handoff --model [preview options] | /handoff --import <absolute-bundle.json> [import options]. Use /handoff -- <focus> when the focus starts with '-'.",
+            ))
+        }
+        _ => {
+            let focus = if first == "--" { rest.trim() } else { args };
+            if focus.len() > 4096 || focus.contains('\0') {
+                return Err(crate::error::Error::validation(
+                    "Handoff focus must contain at most 4096 UTF-8 bytes and no NUL characters",
+                ));
+            }
+            Ok(HandoffMode::InPlace(focus))
+        }
+    }
+}
+
+/// Both terminal stacks share the native durable transaction. Keep polling it
+/// after cancellation so persistence retains its normal ownership and fence.
+pub(crate) async fn run_in_place_handoff(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    focus: &str,
+    abort: &crate::agent::AbortSignal,
+) -> super::PiMsg {
+    match handle.handoff(focus, abort, |_| {}).await {
+        Ok(()) => match handle
+            .with_session(|session| {
+                let (messages, usage) = super::conversation_from_session(session);
+                (session.header.id.clone(), messages, usage)
+            })
+            .await
+        {
+            Ok((session_id, messages, usage)) => super::PiMsg::ConversationReset {
+                session_id,
+                messages,
+                usage,
+                status: Some("Handoff saved; continuing in this session with compacted context".to_string()),
+            },
+            // The durable transaction succeeded. A display snapshot failure
+            // must not invite a second paid request by claiming it did not.
+            Err(error) => super::PiMsg::System(format!(
+                "Handoff saved; conversation display could not be refreshed: {error}"
+            )),
+        },
+        Err(crate::error::Error::Aborted) => {
+            super::PiMsg::System("Handoff cancelled".to_string())
+        }
+        Err(error) => super::PiMsg::AgentError(format!("Handoff failed: {error}")),
+    }
+}
+
+/// `/handoff --report [human|agent|<target>] [path]`: a local session report.
 pub fn handoff(session: &crate::session::Session, args: &str) -> Report {
     let args = args.trim();
     let (to_target, out_path) = if args.is_empty() {
@@ -631,6 +699,24 @@ pub fn approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_modes_require_explicit_report_or_preview_options() {
+        assert_eq!(handoff_mode("").unwrap(), HandoffMode::InPlace(""));
+        assert_eq!(handoff_mode(" human migration decisions ").unwrap(), HandoffMode::InPlace("human migration decisions"));
+        assert_eq!(handoff_mode("--report agent destination.md").unwrap(), HandoffMode::Report("agent destination.md"));
+        assert_eq!(handoff_mode("--model -- focus").unwrap(), HandoffMode::ModelPreview("--model -- focus"));
+        assert_eq!(handoff_mode("--import /tmp/brief.json --session-output /tmp/new.jsonl --workspace /tmp/project").unwrap(),
+            HandoffMode::Import("--import /tmp/brief.json --session-output /tmp/new.jsonl --workspace /tmp/project"));
+        assert_eq!(handoff_mode("-- --model is part of the focus").unwrap(), HandoffMode::InPlace("--model is part of the focus"));
+        assert_eq!(handoff_mode("preserve @notes.md and 日本語").unwrap(), HandoffMode::InPlace("preserve @notes.md and 日本語"));
+        for invalid in ["--reporting agent", "--modelx", "--importx /tmp/brief.json", "--export /tmp/handoff.json", "-target", "focus\0text"] {
+            assert!(handoff_mode(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(handoff_mode(&"é".repeat(2048)).is_ok());
+        assert!(handoff_mode(&"é".repeat(2049)).is_err());
+        eprintln!("{}", serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"explicit_modes"}));
+    }
 
     /// `/memory` over a real (per-test) project bank: retained facts are
     /// listed and searchable, and `forget` removes one.

@@ -1,7 +1,44 @@
 # Model-assisted terminal handoff
 
-The default terminal can synthesize a continuation brief with its currently
-selected model:
+Both terminal frontends can compact the current session into a model-generated
+continuation brief:
+
+```text
+/handoff
+/handoff preserve migration decisions and remaining verification
+```
+
+This uses the same native operation as print-mode `/handoff`: it saves a
+compaction entry in the current session, preserves the original branch history
+and recent complete turns, and gives the next prompt the brief plus the retained
+tail. Automatic compaction can remain disabled. There must be an older safe
+prefix outside the configured recent-history budget; a single authored turn or
+a budget retaining all history is refused before any model request.
+
+The operation uses the selected provider, configured privacy screening,
+compaction hooks and durable session transaction. Failed, empty, truncated or
+tool-requesting responses do not produce a fallback brief. Escape requests
+cancellation while the UI keeps the operation busy until the native transaction
+returns. A cancellation after durable installation does not undo the saved
+entry. Each queued request keeps its original session identity and cancellation
+handle, so switching sessions cannot retarget it. Focus accepts at most 4096
+UTF-8 bytes and no NUL; `/handoff -- <focus>` permits a leading dash.
+
+Use `/handoff --report [human|agent|target] [path]` for the existing local
+structured report or delivery workflow. Unrecognized leading options are
+refused. The `pi handoff` subcommand remains a local report command.
+
+The default terminal also supports `/handoff --import <absolute-bundle.json>`
+to inspect an exported evidence bundle without calling a model. Supplying the
+explicit `--session-output` and `--workspace` destinations creates a separate
+native continuation session. Import keeps the active session unchanged and
+requires an explicit resume before further work. See
+[Handoff import](handoff-import.md) for the input validation and command syntax.
+
+## Separate model preview and export
+
+The default terminal can also synthesize a standalone evidence-based preview
+with its currently selected model:
 
 ```text
 /handoff --model
@@ -9,14 +46,13 @@ selected model:
 /handoff --model --export "/tmp/pagination-handoff.json" -- remaining verification
 ```
 
-This is an explicit, one-shot auxiliary model request. Bare `/handoff` and the
-existing human/agent/Bead delivery forms retain their provider-free behavior.
-The model form displays a preview and writes a local bundle only when an explicit
+This is an explicit, one-shot auxiliary model request. The `--model` form
+displays a preview and writes a local bundle only when an explicit
 `--export` destination is supplied. It never sends mail or Bead comments,
 creates/switches sessions, changes a goal, or resumes execution. Recipient
 arguments are not accepted by the model form.
 
-## What the successor receives
+## What the preview contains
 
 The brief contains the goal, current state, decisions, failed approaches,
 open questions/blockers, and recommended next steps. Every generated item must
@@ -110,10 +146,9 @@ is no repair request, heuristic fallback or partial successful brief. Changed
 identity, leaf or selected evidence produces `HANDOFF_STALE`. The final source
 lock prevents mutation during publication, not edits after a completed export.
 
-The ordinary terminal UI's keyboard-cancellation integration for auxiliary
-workspace commands is unchanged by this feature. Owner cancellation and the
-bounded auxiliary deadline remain authoritative; no new background task or
-keyboard-control claim is introduced.
+The `--model` preview/export flow retains its existing owner cancellation and
+bounded auxiliary deadline. The request-specific Escape handling described
+above applies to in-place `/handoff [focus]`.
 
 ## Validation
 
@@ -130,3 +165,10 @@ These tests are authored, not executed on the implementation host. The required
 `dsr: command not found` (exit 127). No compilation, Rust test, Clippy, formatting,
 live-provider, PTY, Windows or cross-platform acceptance is claimed. The default
 terminal's goal keyboard-control integration remains unfinished.
+
+Interactive in-place regressions additionally cover both native terminal routes,
+same-session persistence and context refresh, explicit report/preview routing,
+extension-command precedence, pre-dequeue cancellation, stale request replies,
+background notices, late pickers, busy drafts and classic display-lock retries.
+These regressions are also source-only until the DSR quality lane runs; static
+syntax review is not compiler or test evidence.

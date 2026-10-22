@@ -30,10 +30,6 @@ fn failure(code: &str) -> Error {
     Error::validation(format!("[{code}] no model handoff was published; this command did not modify the session"))
 }
 
-pub(super) fn is_option_command(args: &str) -> bool {
-    args.trim_start().starts_with('-')
-}
-
 /// A bounded writer refuses the complete record instead of cloning or sending
 /// a prefix of a large tool result. Privacy scanning always sees whole records.
 struct Bounded {

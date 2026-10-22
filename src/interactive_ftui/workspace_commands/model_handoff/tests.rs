@@ -123,13 +123,13 @@ fn default_dispatcher_synthesizes_with_current_model_without_changing_history() 
 }
 
 #[test]
-fn old_handoff_path_remains_provider_free() {
+fn explicit_handoff_report_remains_provider_free() {
     event("local_handoff_unchanged");
     let (mut handle, provider) = fixture("Document the unfinished task", vec![]);
     let before = history(&handle);
     let (sender, receiver) = std::sync::mpsc::channel();
     runtime().block_on(super::super::run(super::super::WorkspaceCommand::Handoff,
-        "", &mut handle, Path::new("."), None, None, &sender));
+        "--report", &mut handle, Path::new("."), None, None, &sender));
     assert!(matches!(receiver.try_recv().unwrap(), crate::interactive::PiMsg::System(_)));
     assert!(provider.calls.lock().unwrap().is_empty());
     assert_eq!(history(&handle), before);

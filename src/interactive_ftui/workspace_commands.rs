@@ -89,21 +89,26 @@ pub async fn run(
             || PiMsg::System(String::from("The package manager is not available here.")),
             |manager| render(workspace_reports::plugins(manager)),
         ),
-        WorkspaceCommand::Handoff if model_handoff::is_option_command(args) => {
-            match Box::pin(model_handoff::run(handle, args)).await {
-                Ok(preview) => PiMsg::System(preview),
-                Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+        WorkspaceCommand::Handoff => match workspace_reports::handoff_mode(args) {
+            Ok(workspace_reports::HandoffMode::ModelPreview(options)
+                | workspace_reports::HandoffMode::Import(options)) => {
+                match Box::pin(model_handoff::run(handle, options)).await {
+                    Ok(preview) => PiMsg::System(preview),
+                    Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+                }
             }
-        }
-        WorkspaceCommand::Handoff => {
-            match handle
-                .with_session(|session| workspace_reports::handoff(session, args))
-                .await
-            {
-                Ok(report) => render(report),
-                Err(err) => PiMsg::AgentError(format!("handoff: {err}")),
+            Ok(workspace_reports::HandoffMode::Report(options)) => {
+                match handle.with_session(|session| workspace_reports::handoff(session, options)).await {
+                    Ok(report) => render(report),
+                    Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+                }
             }
-        }
+            Ok(workspace_reports::HandoffMode::InPlace(focus)) => {
+                let (_, signal) = crate::agent::AbortHandle::new();
+                workspace_reports::run_in_place_handoff(handle, focus, &signal).await
+            }
+            Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+        },
         WorkspaceCommand::Approval => run_approval(handle, args).await,
         WorkspaceCommand::Goal => {
             // Bind only this invocation's control before native dispatch.
