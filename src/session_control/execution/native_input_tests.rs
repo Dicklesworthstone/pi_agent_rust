@@ -20,8 +20,8 @@ use asupersync::types::Time;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -253,16 +253,32 @@ fn reusable_native_prompt_preserves_wire_order_history_and_live_follow_up() {
         ])
     );
     assert_eq!(wire_users(&requests[1]).len(), 2);
-    assert!(wire_users(&requests[1])[1]["content"].to_string().contains("explain next"));
+    assert!(
+        wire_users(&requests[1])[1]["content"]
+            .to_string()
+            .contains("explain next")
+    );
 }
 
 #[test]
-fn image_only_and_empty_image_calls_reuse_the_session_without_empty_blocks() {
+fn text_native_and_image_prompts_share_turn_lifecycle_without_empty_blocks() {
     let runtime = RuntimeBuilder::current_thread().build().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let peer = Peer::new(vec![false, false]);
+    let peer = Peer::new(vec![false, false, false, false]);
     let mut session = peer.session(temp.path());
     runtime.block_on(async {
+        let text = session.prompt("initial text".to_string(), |_| {}).unwrap();
+        let text_control = text.control();
+        assert_eq!(text.await.unwrap().stop_reason, StopReason::Stop);
+        assert!(text_control.snapshot().finished);
+
+        let native = session.prompt_with_content(blocks(), |_| {}).unwrap();
+        let native_control = native.control();
+        assert!(text_control.steer("stale input").is_err());
+        assert!(!text_control.abort());
+        assert_eq!(native.await.unwrap().stop_reason, StopReason::Stop);
+        assert!(native_control.snapshot().finished);
+
         let turn = session
             .prompt_with_images_with_control(String::new(), vec![image()], |control, event| {
                 if matches!(event, AgentEvent::MessageStart { .. }) {
@@ -271,6 +287,8 @@ fn image_only_and_empty_image_calls_reuse_the_session_without_empty_blocks() {
             })
             .unwrap();
         let old = turn.control();
+        assert!(native_control.steer("stale input").is_err());
+        assert!(!native_control.abort());
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
         let next = session
             .prompt_with_images("plain text".to_string(), Vec::new(), |_| {})
@@ -279,22 +297,30 @@ fn image_only_and_empty_image_calls_reuse_the_session_without_empty_blocks() {
         assert!(!old.abort());
         assert_eq!(next.await.unwrap().stop_reason, StopReason::Stop);
         let saved = users(&mut session).await;
-        assert_eq!(saved.len(), 2);
+        assert_eq!(saved.len(), 4);
+        assert!(matches!(&saved[0], UserContent::Text(text) if text == "initial text"));
         assert_eq!(
-            serde_json::to_value(&saved[0]).unwrap(),
+            serde_json::to_value(&saved[1]).unwrap(),
+            serde_json::to_value(blocks()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&saved[2]).unwrap(),
             serde_json::to_value(vec![ContentBlock::Image(image())]).unwrap()
         );
-        assert!(matches!(&saved[1], UserContent::Text(text) if text == "plain text"));
+        assert!(matches!(&saved[3], UserContent::Text(text) if text == "plain text"));
     });
     let requests = lock(&peer.requests);
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(wire_users(request).len(), index + 1);
+        assert!(!request.to_string().contains("stale input"));
+    }
     assert_eq!(
-        wire_users(&requests[0])[0]["content"],
+        wire_users(&requests[2])[2]["content"],
         json!([
             {"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}
         ])
     );
-    assert!(!requests[1].to_string().contains("stale input"));
 }
 
 #[test]
