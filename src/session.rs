@@ -1098,6 +1098,15 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
 
     let mut encoded = serde_json::to_vec(document)?;
     encoded.push(b'\n');
+    write_v2_source_state_bytes(v2_root, initial_identity, &encoded)
+}
+
+fn write_v2_source_state_bytes(
+    v2_root: &Path,
+    initial_identity: Option<crate::file_identity::FileIdentity>,
+    encoded: &[u8],
+) -> Result<()> {
+    let path = v2_source_state_path(v2_root);
 
     #[cfg(unix)]
     {
@@ -1144,25 +1153,42 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             "V2 source state write",
         )?;
         file.set_len(0)?;
-        file.write_all(&encoded)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         std::fs::File::from(directory).sync_all()?;
     }
 
     #[cfg(not(unix))]
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
+        // An entry observed absent must be created exclusively. An existing
+        // entry must still exist, and opening it must not truncate anything
+        // before its identity and type have been validated.
+        let mut options = std::fs::OpenOptions::new();
+        options
             .write(true)
-            .truncate(true)
-            .open(&path)?;
+            .create_new(initial_identity.is_none())
+            .truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&path)?;
+        let opened_metadata = file.metadata()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid_v2_source_state(
+                    &path,
+                    "state entry must not be a Windows reparse point",
+                ));
+            }
+        }
         let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
-        // The same re-check the Unix arm performs: without it a same-name
-        // replacement landing between the validation above and this open was
-        // written through unnoticed (bd-vr2b8). A reparse point substituted
-        // here fails it too, because the recorded identity was read without
-        // following one while this open does.
-        if !file.metadata()?.is_file()
+        if !opened_metadata.is_file()
             || initial_identity.is_some_and(|initial| initial != opened_identity)
         {
             return Err(invalid_v2_source_state(
@@ -1170,7 +1196,8 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
                 "state entry changed while it was being opened",
             ));
         }
-        file.write_all(&encoded)?;
+        file.set_len(0)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         sync_parent_dir(&path)?;
     }
@@ -16531,6 +16558,155 @@ mod tests {
         let reopened = run_async(async { Session::open(path.to_string_lossy().as_ref()).await })
             .expect("reopen appended session");
         assert_eq!(reopened.entries.len(), 2);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rejects_replacement_without_truncating_it() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        let original_path = temp_dir.path().join("original-state.json");
+        let original = b"validated source state must remain intact";
+        let replacement = b"replacement source state must remain intact";
+        std::fs::write(&path, original).expect("write original state");
+        let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+            .expect("capture preflight identity");
+
+        // Hold the original inode/file index alive while replacing its name
+        // between preflight and the same write boundary production uses.
+        std::fs::rename(&path, &original_path).expect("move original state aside");
+        #[cfg(windows)]
+        {
+            let error = write_v2_source_state_bytes(
+                temp_dir.path(),
+                Some(initial_identity),
+                b"must not be written\n",
+            )
+            .expect_err("a vanished validated entry must not be recreated");
+            assert!(matches!(&error, Error::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::NotFound));
+            assert!(!path.exists());
+        }
+        std::fs::write(&path, replacement).expect("install replacement state");
+        let error = write_v2_source_state_bytes(
+            temp_dir.path(),
+            Some(initial_identity),
+            b"must not be written\n",
+        )
+        .expect_err("a substituted state file must be rejected");
+        assert!(error.to_string().contains("state entry changed"));
+        assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
+        assert_eq!(
+            std::fs::read(&original_path).expect("read original"),
+            original
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_requires_exclusive_creation_after_absent_preflight() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        assert!(!path.exists());
+
+        // None records an absent entry. A file arriving after that observation
+        // belongs to another writer and must not be opened for replacement.
+        let sentinel = b"state created after preflight must remain intact";
+        std::fs::write(&path, sentinel).expect("install intervening state");
+        let error = write_v2_source_state_bytes(temp_dir.path(), None, b"must not be written\n")
+            .expect_err("an intervening state file must block exclusive creation");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::AlreadyExists),
+            "expected AlreadyExists, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read intervening state"),
+            sentinel
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rewrite_truncates_only_after_validation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        let clean = V2SourceState {
+            schema: V2_SOURCE_STATE_SCHEMA.to_string(),
+            state: V2SourceStateValue::Clean,
+            source_fingerprint: Some(V2SourceFingerprint {
+                byte_length: 123,
+                sha256: "a".repeat(64),
+                file_identity: None,
+            }),
+        };
+        write_v2_source_state(temp_dir.path(), &clean).expect("create clean state");
+        let original_length = std::fs::metadata(&path).expect("state metadata").len();
+
+        let dirty = V2SourceState {
+            schema: V2_SOURCE_STATE_SCHEMA.to_string(),
+            state: V2SourceStateValue::Dirty,
+            source_fingerprint: None,
+        };
+        write_v2_source_state(temp_dir.path(), &dirty).expect("rewrite as shorter dirty state");
+        let mut expected = serde_json::to_vec(&dirty).expect("encode expected state");
+        expected.push(b'\n');
+        let actual = std::fs::read(&path).expect("read rewritten state");
+        assert_eq!(actual, expected);
+        assert!(u64::try_from(actual.len()).expect("state length") < original_length);
+        assert_eq!(
+            read_v2_source_state_document(temp_dir.path()).expect("read complete state"),
+            Some(dirty)
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rejects_substituted_symlink_without_touching_target() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = std::fs::canonicalize(temp_dir.path()).expect("canonical test root");
+        let path = v2_source_state_path(&root);
+        let original_path = root.join("original-state.json");
+        let target = root.join("external-state-target");
+        let original = b"original source state";
+        let sentinel = b"external symlink target must remain intact";
+        std::fs::write(&path, original).expect("write original state");
+        std::fs::write(&target, sentinel).expect("write target sentinel");
+        let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+            .expect("capture preflight identity");
+        std::fs::rename(&path, &original_path).expect("move original state aside");
+        if let Err(error) = symlink(&target, &path) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping state symlink test: Windows requires Developer Mode or symlink privilege"
+                );
+                return;
+            }
+            test_fail!("create state symlink: {}", error);
+        }
+
+        write_v2_source_state_bytes(&root, Some(initial_identity), b"must not be written\n")
+            .expect_err("a substituted state symlink must be rejected");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("state link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target sentinel"),
+            sentinel
+        );
+        assert_eq!(
+            std::fs::read(&original_path).expect("read original"),
+            original
+        );
     }
 
     #[cfg(unix)]
