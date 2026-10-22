@@ -356,6 +356,14 @@ impl Client {
         RequestBuilder::new(self, Method::Delete, url)
     }
 
+    pub fn put(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Put, url)
+    }
+
+    pub fn patch(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Patch, url)
+    }
+
     #[must_use]
     pub fn with_vcr(mut self, recorder: VcrRecorder) -> Self {
         self.vcr = Some(recorder);
@@ -383,7 +391,9 @@ impl Default for Client {
 enum Method {
     Delete,
     Get,
+    Patch,
     Post,
+    Put,
 }
 
 impl Method {
@@ -391,7 +401,9 @@ impl Method {
         match self {
             Self::Delete => "DELETE",
             Self::Get => "GET",
+            Self::Patch => "PATCH",
             Self::Post => "POST",
+            Self::Put => "PUT",
         }
     }
 }
@@ -1790,6 +1802,48 @@ mod tests {
     #[test]
     fn method_as_str_post() {
         assert_eq!(Method::Post.as_str(), "POST");
+    }
+
+    /// All mutation verbs must survive both native wire framing and cassette
+    /// recording. In particular, a deployment PATCH or DELETE is never POST.
+    #[test]
+    fn deployment_methods_preserve_wire_and_recorded_request_identity() {
+        let client = Client::new();
+        let url = "https://relay.example/v1/deployments/fixture?scope=test";
+        let parsed = ParsedUrl::parse(url).expect("fixture URL");
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        for (builder, expected) in [
+            (client.get(url), "GET"),
+            (client.post(url), "POST"),
+            (client.put(url), "PUT"),
+            (client.patch(url), "PATCH"),
+            (client.delete(url), "DELETE"),
+        ] {
+            for body in [b"".as_slice(), b"{\"enabled\":true}".as_slice()] {
+                let wire = String::from_utf8(build_request_bytes(
+                    builder.method,
+                    &parsed,
+                    "fixture-agent",
+                    &headers,
+                    body,
+                    None,
+                ))
+                .expect("request headers");
+                assert!(wire.starts_with(&format!(
+                    "{expected} /v1/deployments/fixture?scope=test HTTP/1.1\r\n"
+                )));
+                assert!(wire.contains(&format!("Content-Length: {}\r\n", body.len())));
+                assert_eq!(wire.matches("Content-Length:").count(), 1);
+                let recorded = build_recorded_request(builder.method, url, &headers, body);
+                assert_eq!(recorded.method, expected);
+                assert_eq!(recorded.url, url);
+                if body.is_empty() {
+                    assert!(recorded.body.is_none());
+                } else {
+                    assert_eq!(recorded.body, Some(json!({"enabled": true})));
+                }
+            }
+        }
     }
 
     // ── is_retryable_not_connected (#106 / #66 / asupersync#35) ─────────

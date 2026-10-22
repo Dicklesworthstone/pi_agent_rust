@@ -874,7 +874,9 @@ fn unsupported_method_rejected() {
         ..Default::default()
     });
 
-    for method in &["DELETE", "PUT", "PATCH", "OPTIONS"] {
+    // Deployment mutation verbs are supported; tunnelling, reflection, and
+    // methods whose response semantics are not implemented remain rejected.
+    for method in &["CONNECT", "TRACE", "HEAD", "OPTIONS", "CUSTOM"] {
         let call = http_call("http://example.com/", method);
         let result = run_async({
             let connector = HttpConnector::new(HttpConnectorConfig {
