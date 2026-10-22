@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod pool;
+pub(super) mod output_contract;
 
 const SCHEMA: &str = "pi.subagent.worker.v1";
 const MAX_WORKERS: usize = 32;
@@ -222,6 +223,8 @@ async fn start(
             "scope",
             "timeoutSeconds",
             "isolation",
+            "outputSchema",
+            "schemaMode",
         ],
     )?;
     if !cfg!(unix) {
@@ -263,13 +266,18 @@ async fn start(
     let admission = crate::jobs::admit_owned_task(&owner_id)?;
     let parent_model = tool.capture_parent_model();
     let mut definitions = tool.discover(scope)?;
-    let agent = definitions
+    let mut agent = definitions
         .remove(&name)
         .ok_or_else(|| invalid("unknown agent definition"))?;
-    if agent.output_schema.is_some() {
-        return Err(invalid(
-            "schema-bearing agents currently require ordinary subagent tasks",
-        ));
+    let schema = input.get("outputSchema").or(agent.output_schema.as_ref());
+    if input.get("schemaMode").is_some_and(|mode| mode.as_str() != Some("strict"))
+        || (input.get("schemaMode").is_some() && schema.is_none())
+    {
+        return Err(invalid("retained output contracts require a schema and strict mode; no corrective retries"));
+    }
+    output_contract::OutputContract::preflight(schema, &privacy)?;
+    if let Some(schema) = input.get("outputSchema") {
+        agent.output_schema = Some(schema.clone());
     }
     let selected_cwd = input
         .get("cwd")
@@ -600,6 +608,13 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
     // Re-screen stored results under the current invocation's policy/vault.
     // A later discovery may be stricter than the snapshot that admitted a turn.
     let details = privacy.project_json(&value)?;
+    if let Some(result) = value.pointer("/turn/result")
+        && !output_contract::preserves_typed_result(
+            result, details.pointer("/turn/result").unwrap_or(&Value::Null),
+        )
+    {
+        return Err(Error::tool("subagent", "PI_SUBAGENT_WORKER_PRIVACY: privacy policy withheld a schema-validated result"));
+    }
     for path in [
         "/schema",
         "/workerId",
@@ -696,11 +711,12 @@ fn protected_result(result: Result<ToolOutput>, privacy: &AuxiliaryPrivacySnapsh
             return None;
         }
         let value = serde_json::from_slice::<Value>(&bytes).ok()?;
-        let value = privacy.project_json(&value).ok()?;
-        if serde_json::to_vec(&value).ok()?.len() > MAX_TURN_RESULT_BYTES {
+        let projected = privacy.project_json(&value).ok()?;
+        if !output_contract::preserves_typed_result(&value, &projected)
+            || serde_json::to_vec(&projected).ok()?.len() > MAX_TURN_RESULT_BYTES {
             return None;
         }
-        serde_json::from_value(value).ok()
+        serde_json::from_value(projected).ok()
     })();
     projected.unwrap_or_else(|| error_output(WITHHELD))
 }

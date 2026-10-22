@@ -99,6 +99,7 @@ struct Actor {
     pending: Option<PendingWrite>,
     request_sequence: u64,
     failure: Option<String>,
+    output_contract: Option<crate::subagents::worker::output_contract::OutputContract>,
 }
 
 #[cfg(unix)]
@@ -127,6 +128,7 @@ impl Actor {
             pending: None,
             request_sequence: 0,
             failure: Some(CANCELLED.to_string()),
+            output_contract: None,
         }
     }
 
@@ -284,6 +286,9 @@ impl Actor {
         let id = format!("warm-{}", self.request_sequence);
         let mut request = json!({"id": id, "type": command});
         if let Some(message) = message {
+            let message = self.output_contract.as_ref().map_or_else(
+                || message.to_owned(), |contract| contract.prompt(message),
+            );
             request["message"] = json!(format!("Task: {message}"));
         }
         let mut bytes =
@@ -448,6 +453,12 @@ impl Actor {
         outcome?;
         result.status = SubagentStatus::Completed;
         result.stderr.clone_from(&self.diagnostic);
+        if let Some(contract) = &self.output_contract {
+            // Only a complete, fresh answer after post-turn persistence and
+            // compaction reaches validation. Failure settles this turn without
+            // repeating its effects or discarding the reusable conversation.
+            contract.validate(&mut result);
+        }
         let mut output = result_output(vec![result], "worker", false);
         if let Some(details) = output.details.as_mut() {
             details["sessionIsolation"] = json!("persistent_rpc_worker");
@@ -458,6 +469,9 @@ impl Actor {
     }
 
     async fn execute(&mut self) -> Result<ToolOutput> {
+        self.output_contract = crate::subagents::worker::output_contract::OutputContract::prepare(
+            self.agent.output_schema.as_ref(),
+        )?;
         self.spawn()?;
         self.idle_barrier().await?;
         loop {
@@ -944,7 +958,7 @@ exec sleep 30
             assert_eq!(reply.idle, Some(!streaming && !compacting)); // ubs:ignore[rust.panic.assert-macros] -- Compaction remains a reuse barrier after agent_end has arrived.
         }
         let wrong = json!({"type":"response", "id":"old", "command":"get_state", "success":true,
-            "data":{"isStreaming":false, "isCompacting":false}});
+            "data":{"isStreaming":false,"isCompacting":false}});
         assert!(
             IdleReply::new("new".to_string())
                 .ingest(&wrong.to_string(), true)
