@@ -121,7 +121,26 @@ function __pi_http_decode_chunk(chunk, encoding) {
 
 // ─── IncomingMessage ─────────────────────────────────────────────────────────
 
-class IncomingMessage extends EventEmitter {
+// The general PiJS EventEmitter isolates listener failures and continues
+// dispatch. HTTP callbacks instead own live bodies: a failed callback must
+// propagate to the request's teardown boundary, not leave its producer alive.
+// Use the public raw-listener API so once wrappers and listener ordering stay
+// intact without changing node:events for other extensions.
+class HttpEventEmitter extends EventEmitter {
+  emit(event, ...args) {
+    const listeners = super.rawListeners(event).slice();
+    if (listeners.length === 0) {
+      if (event === 'error') {
+        throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
+      }
+      return false;
+    }
+    for (const listener of listeners) Reflect.apply(listener, this, args);
+    return true;
+  }
+}
+
+class IncomingMessage extends HttpEventEmitter {
   constructor(statusCode, headers, body) {
     super();
     this.statusCode = statusCode;
@@ -129,8 +148,11 @@ class IncomingMessage extends EventEmitter {
     this.headers = headers || {};
     this._body = body || '';
     this._destroyed = false;
+    this._closed = false;
     this.destroyed = false;
     this._reader = null;
+    this._bodyStream = null;
+    this._bodyCancelled = false;
     this._paused = false;
     this._resumeRead = null;
     this._cancelRequest = null;
@@ -154,8 +176,31 @@ class IncomingMessage extends EventEmitter {
       return;
     }
 
+    this._finish();
+  }
+
+  _close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._bodyStream = null;
+    this._cancelRequest = null;
+    this.emit('close');
+  }
+
+  _finish() {
+    if (this._destroyed || this._closed) return;
     this.complete = true;
-    this.emit('end');
+    // An end listener may destroy the response or throw. Neither may skip
+    // cleanup or cause a second close notification.
+    try { this.emit('end'); } finally { this._close(); }
+  }
+
+  _cancelBody(error) {
+    if (this.complete || this._bodyCancelled) return;
+    const source = this._reader || this._bodyStream;
+    if (!source) return;
+    this._bodyCancelled = true;
+    try { Promise.resolve(source.cancel(error)).catch(() => {}); } catch (_) {}
   }
 
   setEncoding(encoding) {
@@ -170,27 +215,30 @@ class IncomingMessage extends EventEmitter {
   }
   pause() { this._paused = true; return this; }
   destroy(error) {
-    if (this._destroyed) {
+    if (this._destroyed || this._closed) {
       return this;
     }
     this._destroyed = true;
     this.destroyed = true;
-    try { if (this._reader) Promise.resolve(this._reader.cancel(error)).catch(() => {}); } catch (_) {}
-    try { if (this._cancelRequest) this._cancelRequest(error); } catch (_) {}
+    this._cancelBody(error);
+    try { if (!this.complete && this._cancelRequest) this._cancelRequest(error); } catch (_) {}
     this.resume();
-    if (error) this.emit('error', error);
-    this.emit('close');
+    try { if (error) this.emit('error', error); } finally { this._close(); }
     return this;
   }
 
   async _deliverWeb(body, onActivity) {
+    this._bodyStream = body;
     if (!body || this._destroyed) {
-      if (!this._destroyed) { this.complete = true; this.emit('end'); this.emit('close'); }
+      if (!this._destroyed) this._finish();
+      else this._cancelBody();
+      this._bodyStream = null;
       return;
     }
-    const reader = body.getReader();
-    this._reader = reader;
+    let reader;
     try {
+      reader = body.getReader();
+      this._reader = reader;
       while (!this._destroyed) {
         if (this._paused) await new Promise(resolve => { this._resumeRead = resolve; });
         if (this._destroyed) break;
@@ -204,20 +252,25 @@ class IncomingMessage extends EventEmitter {
       if (!this._destroyed) {
         const tail = this._decoder ? this._decoder.end() : '';
         if (tail) this.emit('data', tail);
-        if (!this._destroyed) { this.complete = true; this.emit('end'); this.emit('close'); }
+        if (!this._destroyed) this._finish();
       }
     } catch (error) {
-      if (!this._destroyed) this.destroy(error);
+      if (!this._destroyed) {
+        // A response error listener may handle the notification, but the
+        // request must still fail and release its host transport.
+        try { this.destroy(error); } finally { throw error; }
+      }
     } finally {
       this._reader = null;
-      try { reader.releaseLock(); } catch (_) {}
+      this._bodyStream = null;
+      try { if (reader) reader.releaseLock(); } catch (_) {}
     }
   }
 }
 
 // ─── ClientRequest ───────────────────────────────────────────────────────────
 
-class ClientRequest extends EventEmitter {
+class ClientRequest extends HttpEventEmitter {
   constructor(options, callback) {
     super();
     this._options = options;
@@ -225,9 +278,11 @@ class ClientRequest extends EventEmitter {
     this._ended = false;
     this._sent = false;
     this._aborted = false;
+    this._closed = false;
     this.destroyed = false;
     this._controller = new AbortController();
     this._response = null;
+    this._responseBody = null;
     this._timeoutId = null;
     this._timeoutMs = Number(options.timeout) > 0 ? Number(options.timeout) : 0;
     this._headers = {};
@@ -269,20 +324,39 @@ class ClientRequest extends EventEmitter {
   }
 
   abort() {
-    if (this._aborted) return;
+    if (this._aborted || this._closed) return;
     try { this.emit('abort'); } finally { this.destroy(); }
   }
 
   destroy(error) {
-    if (this._aborted) return this;
+    if (this._aborted || this._closed) return this;
     this._aborted = true;
     this.destroyed = true;
     this._clearTimeout();
-    this._controller.abort(error);
-    if (this._response) this._response.destroy();
-    if (error) this.emit('error', error);
-    this.emit('close');
+    this._body.length = 0;
+    // User callbacks can throw while cancelling or reporting an error. The
+    // transport and both lifecycle notifications must still be finalized.
+    try { this._controller.abort(error); } finally {
+      try {
+        if (this._response) this._response.destroy();
+        else if (this._responseBody) {
+          try { Promise.resolve(this._responseBody.cancel(error)).catch(() => {}); } catch (_) {}
+        }
+      } finally {
+        try { if (error) this.emit('error', error); } finally { this._close(); }
+      }
+    }
     return this;
+  }
+
+  _close() {
+    if (this._closed) return;
+    this._closed = true;
+    this.destroyed = true;
+    this._responseBody = null;
+    this._body.length = 0;
+    this._clearTimeout();
+    this.emit('close');
   }
 
   setTimeout(ms, callback) {
@@ -300,7 +374,7 @@ class ClientRequest extends EventEmitter {
 
   _armTimeout() {
     this._clearTimeout();
-    if (!this._timeoutMs || this._aborted || (this._response && this._response.complete)) return;
+    if (!this._timeoutMs || this._aborted || this._closed || (this._response && this._response.complete)) return;
     this._timeoutId = setTimeout(() => {
       const error = new Error('HTTP request timed out');
       error.code = 'ETIMEDOUT';
@@ -364,27 +438,40 @@ class ClientRequest extends EventEmitter {
         const fetchHttp = globalThis.__pi_fetch_for_node_http || globalThis.fetch;
         Promise.resolve(fetchHttp(url, { method, headers, body, signal, timeout: this._timeoutMs || undefined })).then(async (response) => {
           if (this._aborted) { if (response.body) await response.body.cancel(); return; }
+          // Take ownership before any header iterator or response listener
+          // executes. A throw before getReader() used to orphan the body.
+          this._responseBody = response.body;
           const responseHeaders = {};
           for (const [name, value] of response.headers.entries()) responseHeaders[name] = value;
           const incoming = new IncomingMessage(response.status, responseHeaders, '');
+          incoming._bodyStream = this._responseBody;
           incoming._cancelRequest = (reason) => this._controller.abort(reason);
           this._response = incoming;
+          this._responseBody = null;
           this._armTimeout();
           this.emit('response', incoming);
           await incoming._deliverWeb(response.body, () => this._armTimeout());
+          if (incoming.complete) this._close();
+          else this.destroy();
         }).catch((error) => {
-          if (!this._aborted) this.emit('error', error instanceof Error ? error : new Error(String(error)));
+          if (!this._aborted) this.destroy(error instanceof Error ? error : new Error(String(error)));
         }).finally(() => this._clearTimeout());
+        this._body.length = 0;
       } catch (err) {
         this._clearTimeout();
-        this.emit('error', err);
+        // http.get(...).on('error', ...) must be able to observe preflight
+        // failures too, without allowing the rejected request to reach I/O.
+        queueMicrotask(() => this.destroy(err));
+        return;
       }
     } else {
       // No pi.http available — emit error
-      this.emit('error', new Error('HTTP requests require pi.http() hostcall'));
+      queueMicrotask(() => this.destroy(new Error('HTTP requests require pi.http() hostcall')));
+      return;
     }
 
-    this.emit('finish');
+    try { this.emit('finish'); }
+    catch (error) { queueMicrotask(() => this.destroy(error)); }
   }
 
   _handleResponse(result) {
