@@ -503,7 +503,8 @@ pub(super) async fn execute(
     roots: Vec<PathBuf>,
 ) -> Result<QueryOutcome> {
     request.validate()?;
-    let (image, wal_frames) = asupersync::runtime::spawn_blocking_io(move || snapshot(file, &path, &roots)).await?;
+    let (image, wal_frames) =
+        asupersync::runtime::spawn_blocking(move || snapshot(file, &path, &roots)).await?;
     let wire = WorkerRequest {
         request,
         image: base64::engine::general_purpose::STANDARD.encode(image),

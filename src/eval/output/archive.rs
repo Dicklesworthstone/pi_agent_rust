@@ -141,7 +141,7 @@ impl Archive {
             .map_err(|failure| error("EVAL_ARTIFACT_PUBLISH", failure))?;
         // Hash the bytes actually read into the final staging file, not only
         // what the producer intended to write. Receipt is created after publish.
-        let digest = format!("{:x}", source.digest.finalize());
+        let digest = crate::package_manager::hex_encode(&source.digest.finalize());
         Ok(json!({
             "schema":SCHEMA, "status":"written", "format":"jsonl",
             "path":self.target.path(), "bytes":bytes, "sha256":digest,
@@ -301,7 +301,10 @@ mod tests {
         let receipt = archive.publish_sync(false).unwrap();
         let bytes = std::fs::read(dir.path().join("run.jsonl")).unwrap();
         assert_eq!(receipt["bytes"], bytes.len());
-        assert_eq!(receipt["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(
+            receipt["sha256"],
+            crate::package_manager::hex_encode(&Sha256::digest(&bytes))
+        );
         assert_eq!(receipt["complete"], true);
         let rows = records(&dir.path().join("run.jsonl"));
         assert_eq!(rows.len(), 4);
@@ -399,7 +402,10 @@ mod tests {
         assert_eq!(console(&rows, "stdout"), format!("BEGIN-{}-END\n", "界".repeat(500000)));
         assert_eq!(rows.last().unwrap()["stdoutBytes"], 1_500_011);
         assert_eq!(rows.last().unwrap()["status"], "success");
-        assert_eq!(receipt["sha256"], format!("{:x}", Sha256::digest(std::fs::read(path).unwrap())));
+        assert_eq!(
+            receipt["sha256"],
+            crate::package_manager::hex_encode(&Sha256::digest(std::fs::read(path).unwrap()))
+        );
     }
 
     #[test]

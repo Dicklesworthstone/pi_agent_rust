@@ -166,7 +166,10 @@ pub(super) fn document(
     // Do not export raw session identifiers or the unscreened evidence. The
     // digest binds this source snapshot, but is not authentication or proof.
     let identity = serde_json::to_vec(&(&input.session_id, &input.leaf_id, &input.prompt))?;
-    let digest = format!("sha256:{:x}", Sha256::digest(identity));
+    let digest = format!(
+        "sha256:{}",
+        crate::package_manager::hex_encode(&Sha256::digest(identity))
+    );
     Ok(json!({
         "schema":"pi.handoff.bundle.v1",
         "generatedAt":chrono::Utc::now().to_rfc3339(),

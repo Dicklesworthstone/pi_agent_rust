@@ -180,7 +180,7 @@ pub(in crate::eval) async fn send_python(
     let revoked = Arc::clone(&lease.0);
     // No application code or tool operation is run by this worker. It owns
     // one bounded immutable frame and the sole ChildStdin until completion.
-    let operation = asupersync::runtime::spawn_blocking_io(move || {
+    let operation = asupersync::runtime::spawn_blocking(move || {
         write_once(pipe, &frame, &revoked, &owner, deadline)
     });
     wait_receipt(kernel, id, deadline, capture, session, operation).await

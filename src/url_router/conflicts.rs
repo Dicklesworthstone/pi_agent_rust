@@ -85,7 +85,7 @@ fn token(root: &Path, image: &FileImage, region: &parser::Region) -> String {
     hash.update(region.span.end.to_string().as_bytes());
     hash.update(b"\0");
     hash.update(image.hash);
-    format!("{:x}", hash.finalize())
+    crate::package_manager::hex_encode(&hash.finalize())
 }
 
 impl Snapshot {

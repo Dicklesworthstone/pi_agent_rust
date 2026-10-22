@@ -6636,7 +6636,7 @@ impl ReadTool {
             let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
             let mut roots = self.workspace.snapshot_or(&self.cwd).all();
             roots.push(Config::global_dir());
-            asupersync::runtime::spawn_blocking_io(move || -> Result<Vec<u8>> {
+            asupersync::runtime::spawn_blocking(move || -> Result<Vec<u8>> {
                 let file = open_regular_file_within_roots_with(&path, &roots, || {})
                     .map_err(|error| Error::tool("read", error.to_string()))?;
                 if let Some(archive) = archive {
@@ -7076,7 +7076,7 @@ impl Tool for ReadTool {
                     "[ARCHIVE_HASHLINE] Archive members are read-only views and cannot provide source edit anchors",
                 ));
             }
-            let outcome = asupersync::runtime::spawn_blocking_io(move || {
+            let outcome = asupersync::runtime::spawn_blocking(move || {
                 crate::archive_read::read_open_file(std_file, &archive.member)
             })
             .await?;
@@ -7291,7 +7291,7 @@ impl Tool for ReadTool {
                 ));
             }
             let source = path.to_string_lossy().into_owned();
-            let outcome = asupersync::runtime::spawn_blocking_io(move || {
+            let outcome = asupersync::runtime::spawn_blocking(move || {
                 crate::url_read::convert_bytes(&source, document_mime, &bytes, false)
             })
             .await?;
@@ -12507,7 +12507,7 @@ impl GrepTool {
         }
         let path_owned = path.to_string();
         let cwd = self.cwd.clone();
-        let resolved = asupersync::runtime::spawn_blocking_io(move || {
+        let resolved = asupersync::runtime::spawn_blocking(move || {
             let _guard = owner.cx().clone().set_current_restricted();
             owner
                 .checkpoint()
@@ -12600,7 +12600,7 @@ impl GrepTool {
             let scan_limit = effective_limit.saturating_sub(match_count).saturating_add(1);
             let scan_matcher = Arc::clone(&matcher);
             let scan_owner = owner.clone();
-            let (content, mut match_lines) = asupersync::runtime::spawn_blocking_io(move || {
+            let (content, mut match_lines) = asupersync::runtime::spawn_blocking(move || {
                 grep_resource_match_lines(resource.content, &scan_matcher, scan_limit, &scan_owner)
             })
             .await?;

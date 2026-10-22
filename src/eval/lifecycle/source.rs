@@ -56,7 +56,7 @@ pub(super) fn load_path(code: &str) -> Result<Option<PathBuf>> {
 pub(super) async fn load(cwd: PathBuf, path: PathBuf) -> Result<Source> {
     // This worker reads a bounded regular file and compiles typed scripts.
     // Abandoning the await cannot execute source or reset retained state.
-    asupersync::runtime::spawn_blocking_io(move || {
+    asupersync::runtime::spawn_blocking(move || {
         let mut source = load_sync(&cwd, &path)?;
         source.code = typescript::prepare(Path::new(&source.path), source.code)?;
         Ok(source)

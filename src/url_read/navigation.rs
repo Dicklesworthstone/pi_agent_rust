@@ -289,7 +289,7 @@ async fn retrieve(mut route: Route, owner: &AgentCx) -> Result<UrlReadOutcome> {
         // Native document conversion can parse and decompress multiple parts.
         // Keep that bounded CPU work off the async executor so the enclosing
         // owner deadline and cancellation remain observable while it runs.
-        return asupersync::runtime::spawn_blocking_io(move || {
+        return asupersync::runtime::spawn_blocking(move || {
             route.finish(&content_type, &bytes, truncated)
         })
         .await;
