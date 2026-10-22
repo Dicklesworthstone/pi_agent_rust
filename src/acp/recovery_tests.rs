@@ -32,6 +32,15 @@ impl ProviderFixture {
     }
 
     fn with_tool(statuses: Vec<u16>, tool: Option<&'static str>) -> Self {
+        let tools = statuses
+            .iter()
+            .map(|_| tool.map(|name| (name, json!({}))))
+            .collect();
+        Self::with_replies(statuses, tools)
+    }
+
+    fn with_replies(statuses: Vec<u16>, tools: Vec<Option<(&'static str, Value)>>) -> Self {
+        assert_eq!(statuses.len(), tools.len());
         let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
         listener.set_nonblocking(true).expect("nonblocking accept");
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -40,7 +49,7 @@ impl ProviderFixture {
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
         let worker = std::thread::spawn(move || {
-            for (reply_index, status) in statuses.into_iter().enumerate() {
+            for (reply_index, (status, tool)) in statuses.into_iter().zip(tools).enumerate() {
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut stream = loop {
                     if stop.load(Ordering::SeqCst) {
@@ -66,21 +75,21 @@ impl ProviderFixture {
                 let model = request["model"].as_str().unwrap().to_string();
                 captured.lock().unwrap().push((headers, request));
                 let (content_type, body) = if status == 200 {
-                    let delta = tool.map_or_else(
+                    let delta = tool.as_ref().map_or_else(
                         || {
                             json!({
                                 "role": "assistant",
                                 "content": "Recovered editor answer",
                             })
                         },
-                        |tool| {
+                        |(tool, arguments)| {
                             json!({
                                 "role": "assistant",
                                 "tool_calls": [{
                                     "index": 0,
                                     "id": format!("acp-tool-{reply_index}"),
                                     "type": "function",
-                                    "function": { "name": tool, "arguments": "{}" },
+                                    "function": { "name": tool, "arguments": arguments.to_string() },
                                 }],
                             })
                         },
@@ -374,6 +383,190 @@ async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
     timeout(wall_now(), Duration::from_secs(15), Box::pin(work))
         .await
         .expect("ACP launch controls watchdog expired")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit() {
+    use clap::Parser as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut server = ProviderFixture::with_replies(
+        vec![200, 503, 200],
+        vec![
+            Some(("write", json!({"path":"prewalk.txt", "content":"one edit"}))),
+            None,
+            None,
+        ],
+    );
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &server.url, runtime.handle(), 1);
+        let target = format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}");
+        let cli = crate::cli::Cli::try_parse_from([
+            "pi",
+            "--acp",
+            "--prewalk",
+            "--smol",
+            &target,
+            "--tools",
+            "read,write",
+        ])
+        .unwrap();
+        options.launch = AcpLaunchOptions::from_cli(&cli);
+        let (id, mut created) = handle_session_new(
+            &json!({"cwd": root.path(), "mcpServers": []}),
+            &options,
+            None,
+        )
+        .unwrap();
+        arm_acp_prewalk(&mut created, &options).await.unwrap();
+        let state = Arc::new(Mutex::new(created));
+        let observed = events(&state);
+        let (_, signal) = AbortHandle::new();
+        let (reason, updates) = prompt(&state, &id, text(), signal).await;
+        assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+        let selected = configuration_updates(&updates);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0][0]["currentValue"], target);
+        assert_eq!(selected[0][1]["currentValue"], "off");
+        assert!(updates.iter().any(|update| {
+            update["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Prewalk switched"))
+        }));
+        assert_no_private_diagnostics(&updates);
+        let saved = reopen(&state).await;
+        assert_eq!(saved.header.provider.as_deref(), Some(FALLBACK_PROVIDER));
+        assert_eq!(saved.header.model_id.as_deref(), Some(FALLBACK_MODEL));
+        assert_eq!(
+            saved
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| matches!(message, Message::User(_)))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            saved
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| matches!(message, Message::ToolResult(_)))
+                .count(),
+            1,
+        );
+        let observed = observed.lock().unwrap();
+        for event_kind in ["start", "end", "switch", "tool"] {
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| match event_kind {
+                        "start" => matches!(event, AgentEvent::AgentStart { .. }),
+                        "end" => matches!(event, AgentEvent::AgentEnd { .. }),
+                        "switch" => matches!(event, AgentEvent::PrewalkSwitched { .. }),
+                        "tool" => matches!(event, AgentEvent::ToolExecutionStart { .. }),
+                        _ => unreachable!(),
+                    })
+                    .count(),
+                1,
+                "{event_kind}",
+            );
+        }
+        let guard = state.try_lock().unwrap();
+        let handle = guard.agent_session.as_ref().unwrap();
+        assert!(handle.prewalk_target().is_none());
+        assert_eq!(handle.compaction_settings().context_window_tokens, 32_000);
+        assert_eq!(
+            handle.session().agent.stream_options().max_tokens,
+            Some(512),
+        );
+    }));
+    let requests = server.finish(3);
+    assert_eq!(requests[0].1["model"], PRIMARY_MODEL);
+    for (_, request) in &requests[1..] {
+        assert_eq!(request["model"], FALLBACK_MODEL);
+        assert_eq!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            1,
+        );
+        assert!(!request.to_string().contains("## Prewalk"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("prewalk.txt")).unwrap(),
+        "one edit",
+    );
+}
+
+#[test]
+fn editor_prewalk_requires_explicit_intent_and_validates_workspace_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut options = options(
+            root.path(),
+            "https://acp-prewalk.invalid/v1",
+            runtime.handle(),
+            0,
+        );
+        options.config.prewalk = Some(crate::config::PrewalkSettings {
+            enabled: Some(true),
+        });
+        let params = json!({"cwd": root.path(), "mcpServers": []});
+        let (_, mut state) = handle_session_new(&params, &options, None).unwrap();
+        arm_acp_prewalk(&mut state, &options).await.unwrap();
+        assert!(
+            state
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .prewalk_target()
+                .is_none()
+        );
+        options.launch.prewalk = true;
+        assert!(
+            arm_acp_prewalk(&mut state, &options)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicit @smol"),
+        );
+        options.launch.smol = Some(format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}"));
+        options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+            path: root.path().display().to_string(),
+            enabled_models: None,
+            disabled_providers: Some(vec![FALLBACK_PROVIDER.to_string()]),
+        }]);
+        assert!(
+            arm_acp_prewalk(&mut state, &options)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("disabled"),
+        );
+        assert!(
+            state
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .prewalk_target()
+                .is_none()
+        );
+        options.launch.no_prewalk = true;
+        arm_acp_prewalk(&mut state, &options).await.unwrap();
+        assert!(
+            state
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .prewalk_target()
+                .is_none()
+        );
+    });
 }
 
 #[test]

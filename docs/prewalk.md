@@ -101,7 +101,27 @@ and one `AgentEnd`. The low-level `Agent` loop does not perform a handoff by
 itself; use the owning SDK handle so persistence and model installation stay
 together.
 
-Print, RPC, and ACP startup currently reject explicit prewalk CLI flags. They
-do not silently accept a workflow those drivers have not enabled.
+## Editor sessions over ACP
+
+Configure the editor's agent command with an explicit destination:
+
+```sh
+pi --acp --prewalk --smol openai/gpt-5-mini
+pi --acp --prewalk-into openai/gpt-5-mini:low
+```
+
+Each newly created or reopened editor session resolves the destination under
+its own workspace's provider policy and credentials before admission. A
+successful file edit triggers the same durable SDK handoff; the editor receives
+a status notice and updated model/thinking selectors. Tool permissions, live
+steering, retries, and cancellation keep their normal behavior.
+
+The launch flags explicitly arm each new session owner. Reattaching an already
+live editor session keeps its current prewalk state. The `prewalk.enabled`
+setting does not implicitly arm ACP sessions, and `--no-prewalk` disables launch
+arming. ACP's built-in tool set does not include `todo`, so an approved successful
+project edit can trigger the handoff without a todo prerequisite.
+
+Print and RPC startup currently reject explicit prewalk CLI flags.
 
 Behavior reference: [OMP prewalk documentation](https://omp.sh/docs/prewalk).

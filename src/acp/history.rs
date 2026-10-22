@@ -230,6 +230,9 @@ pub(super) async fn load(
         if loaded_id != id {
             return Err(HistoryError::internal("Restored session identity changed"));
         }
+        super::arm_acp_prewalk(&mut state, options)
+            .await
+            .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
         let mcp_state = super::mcp::prepare(
             &cwd,
             &crate::config::Config::global_dir(),

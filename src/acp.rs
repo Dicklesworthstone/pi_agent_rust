@@ -613,6 +613,14 @@ pub struct AcpLaunchOptions {
     pub hide_cwd_in_prompt: bool,
     pub max_tool_iterations: Option<usize>,
     pub max_time: Option<u64>,
+    /// Explicit launch intent; settings never implicitly arm editor sessions.
+    pub prewalk: bool,
+    pub prewalk_into: Option<String>,
+    pub no_prewalk: bool,
+    pub smol: Option<String>,
+    pub slow: Option<String>,
+    pub plan: Option<String>,
+    pub advisor: Option<String>,
 }
 
 impl AcpLaunchOptions {
@@ -633,6 +641,13 @@ impl AcpLaunchOptions {
             hide_cwd_in_prompt: cli.hide_cwd_in_prompt,
             max_tool_iterations: cli.max_tool_iterations,
             max_time: cli.max_time,
+            prewalk: cli.prewalk,
+            prewalk_into: cli.prewalk_into.clone(),
+            no_prewalk: cli.no_prewalk,
+            smol: cli.smol.clone(),
+            slow: cli.slow.clone(),
+            plan: cli.plan.clone(),
+            advisor: cli.advisor.clone(),
         }
     }
 
@@ -664,6 +679,13 @@ impl AcpLaunchOptions {
         cli.hide_cwd_in_prompt = self.hide_cwd_in_prompt;
         cli.max_tool_iterations = self.max_tool_iterations;
         cli.max_time = self.max_time;
+        cli.prewalk = self.prewalk;
+        cli.prewalk_into.clone_from(&self.prewalk_into);
+        cli.no_prewalk = self.no_prewalk;
+        cli.smol.clone_from(&self.smol);
+        cli.slow.clone_from(&self.slow);
+        cli.plan.clone_from(&self.plan);
+        cli.advisor.clone_from(&self.advisor);
         Ok(cli)
     }
 }
@@ -1002,7 +1024,15 @@ async fn run(
                             &options,
                             Some(&permission_client),
                         ) {
-                            Ok((session_id, state)) => {
+                            Ok((session_id, mut state)) => {
+                                if let Err(error) = arm_acp_prewalk(&mut state, &options).await {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        INVALID_PARAMS,
+                                        format!("Cannot arm prewalk: {error}"),
+                                    ));
+                                    continue;
+                                }
                                 let models: Vec<AcpModel> = state
                                     .available_models
                                     .iter()
@@ -2261,6 +2291,34 @@ fn build_acp_session(
     ))
 }
 
+/// Apply explicit host intent before the new/restored session is admitted to
+/// the editor. Reattaching an already live session does not re-arm a consumed
+/// handoff. Resolve policy and credentials in the editor's requested workspace.
+async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> Result<()> {
+    let cli = options.launch.selection_cli()?;
+    if cli.no_prewalk || (!cli.prewalk && cli.prewalk_into.is_none()) {
+        return Ok(());
+    }
+    let handle = state
+        .agent_session
+        .as_mut()
+        .ok_or_else(|| Error::session("Cannot arm prewalk while the session is busy"))?;
+    let registry = handle
+        .session()
+        .model_registry()
+        .ok_or_else(|| Error::config("Prewalk requires a model registry"))?;
+    let target = crate::app::resolve_prewalk_target(
+        cli.prewalk_into.as_deref().unwrap_or("@smol"),
+        &cli,
+        &options.config,
+        registry,
+        &state.cwd,
+    )
+    .map_err(|error| Error::config(error.to_string()))?;
+    handle.arm_prewalk(target).await?;
+    Ok(())
+}
+
 // ============================================================================
 // Runtime reconfiguration (session/set_model, session/set_config_option)
 // ============================================================================
@@ -2419,6 +2477,16 @@ impl AcpRecoveryUpdates {
                 restored_primary: true,
             } => {
                 self.notice(&format!("Restored primary provider: {provider}/{model}."));
+                self.committed_model(provider, model);
+            }
+            AgentEvent::PrewalkSwitched {
+                provider,
+                model,
+                thinking,
+            } => {
+                self.notice(&format!(
+                    "Prewalk switched → {provider}/{model}:{thinking}."
+                ));
                 self.committed_model(provider, model);
             }
             _ => {}

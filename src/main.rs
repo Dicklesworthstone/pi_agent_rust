@@ -1978,10 +1978,10 @@ async fn run(
     let prewarm_memory_limit_bytes =
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
-    let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
-    if !is_interactive && (cli.prewalk || cli.prewalk_into.is_some()) {
+    let is_interactive = !cli.acp && !cli.print && cli.mode.is_none() && cli.export.is_none();
+    if !is_interactive && !cli.acp && (cli.prewalk || cli.prewalk_into.is_some()) {
         bail!(
-            "Prewalk CLI flags require interactive mode; SDK callers can use SessionOptions.prewalk"
+            "Prewalk CLI flags require interactive or ACP mode; SDK callers can use SessionOptions.prewalk"
         );
     }
     // The default FTUI stack runs on an SDK session that boots its own
