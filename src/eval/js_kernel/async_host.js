@@ -640,8 +640,8 @@
         args.task = prompt;
         if (hasOwn(options, 'keepAlive') && options.keepAlive === true) {
             if ((hasOwn(args, 'isolation') && args.isolation !== 'none')
-                || hasOwn(args, 'isoApply') || hasOwn(args, 'outputSchema') || hasOwn(args, 'schemaMode')) {
-                throw new TypeErrorType('EVAL_AGENT_INPUT: warm workers require isolation none and do not accept schema or isoApply options');
+                || hasOwn(args, 'isoApply')) {
+                throw new TypeErrorType('EVAL_AGENT_INPUT: warm workers require isolation none and do not accept isoApply');
             }
             args.operation = 'worker_start';
             const started = checkWorker(await nativeResult('subagent', args), undefined, 1);
@@ -1123,6 +1123,9 @@
             } else if (key === 'timeoutSeconds') {
                 if (!integer(value) || value < 1 || value > 86400) throw new RangeErrorType('EVAL_POOL_INPUT: timeoutSeconds must be an integer from 1 to 86400');
                 native.timeoutSeconds = value;
+            } else if (key === 'outputSchema' || key === 'schemaMode') {
+                // Native pool_start validates the frozen contract before admission.
+                native[key] = value;
             } else throw new TypeErrorType(`EVAL_POOL_INPUT: unknown option ${key}`);
         }
         poolBatchArgs({options:native,poolId:null,concurrency},[]);

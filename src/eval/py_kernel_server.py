@@ -1596,8 +1596,8 @@ async def _agent(prompt, **options):
     arguments["task"] = prompt
     if options.get("keep_alive", False):
         if (("isolation" in arguments and arguments["isolation"] != "none")
-                or any(field in arguments for field in ("isoApply", "outputSchema", "schemaMode"))):
-            raise TypeError("EVAL_AGENT_INPUT: warm workers require isolation none and do not accept schema or iso_apply options")
+                or "isoApply" in arguments):
+            raise TypeError("EVAL_AGENT_INPUT: warm workers require isolation none and do not accept iso_apply")
         arguments["operation"] = "worker_start"
         started = _agent_worker_snapshot(await _agent_native_result("subagent", arguments), turn_id=1)
         if started["agent"] != arguments["agent"]:
@@ -2130,6 +2130,9 @@ async def _workpool(**options):
             if type(value) is not int or not 1 <= value <= 86400:
                 raise ValueError("EVAL_POOL_INPUT: timeout_seconds must be an integer from 1 to 86400")
             native["timeoutSeconds"] = value
+        elif key in ("output_schema", "schema_mode"):
+            # Native pool_start validates the frozen contract before admission.
+            native["outputSchema" if key == "output_schema" else "schemaMode"] = value
         else:
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
     pool = _AgentPool(native, name, concurrency)
