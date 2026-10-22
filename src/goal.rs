@@ -19,10 +19,12 @@ use std::sync::{Arc, Weak};
 
 mod continuation;
 mod driver;
+mod reconciliation;
 mod rpc;
 #[cfg(feature = "ftui")]
 pub(crate) mod terminal;
 pub use driver::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalRunStop, GoalSession};
+pub use reconciliation::GoalReconciliation;
 pub(crate) use rpc::{rpc_goal_command, rpc_goal_state};
 
 #[cfg(test)]
@@ -176,8 +178,8 @@ impl GoalSnapshot {
         self.record.token_budget.saturating_sub(self.record.tokens_spent)
     }
 
-    /// True when the saved intent has no settled result. Explicit resume or
-    /// drop is required; starting a new driver never replays it automatically.
+    /// True when the saved intent has no settled result. Explicit reconciliation,
+    /// resume or drop is required; a new driver never replays it automatically.
     pub const fn interrupted(&self) -> bool {
         self.record.in_flight
     }
@@ -393,6 +395,7 @@ enum Transition<'a> {
     Complete(&'a str),
     Drop(&'a str),
     Budget { budget: GoalBudget, reason: &'a str },
+    Reconcile { outcome: GoalReconciliation, evidence: &'a str },
 }
 
 fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
@@ -403,6 +406,9 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
         ));
     }
     match action {
+        Transition::Reconcile { outcome, evidence } => {
+            return reconciliation::apply(record, outcome, evidence);
+        }
         Transition::Resume => {
             if record.exhausted() {
                 return Err(failure(
@@ -442,17 +448,17 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
         }
         Transition::Pause(reason) | Transition::Drop(reason) | Transition::Complete(reason) => {
             validate_text(reason, "reason or completion evidence")?;
-            if matches!(action, Transition::Complete(_)) && record.in_flight {
+            if matches!(action, Transition::Pause(_) | Transition::Complete(_)) && record.in_flight {
                 return Err(failure(
                     "GOAL_INTERRUPTED",
-                    "reconcile interrupted work before completing it",
+                    "unfinished work requires explicit reconciliation, resume or drop; pause cannot acknowledge its outcome",
                 ));
             }
             record.status = match action {
                 Transition::Pause(_) => GoalStatus::Paused,
                 Transition::Drop(_) => GoalStatus::Dropped,
                 Transition::Complete(_) => GoalStatus::Complete,
-                Transition::Resume | Transition::Budget { .. } => unreachable!(),
+                Transition::Resume | Transition::Budget { .. } | Transition::Reconcile { .. } => unreachable!(),
             };
             record.note = reason.to_string();
         }
@@ -503,6 +509,8 @@ impl AgentSessionHandle {
         Ok(GoalChange { goal, persistence })
     }
 
+    /// Pause settled work. For an unfinished intent use `reconcile_goal` after
+    /// reviewing side effects, or `GoalControl::pause` for a still-running task.
     pub async fn pause_goal(
         &mut self,
         owner: &AgentCx,
