@@ -780,12 +780,13 @@ fn wrap_stream_with_idle_timeout(
         return stream;
     };
 
-    Box::pin(futures::stream::unfold(
-        (stream, start_time, timeout),
-        |(mut stream, mut last_activity, timeout)| async move {
+    let wrapped = futures::stream::unfold(
+        Some((stream, start_time, timeout)),
+        |state| async move {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
+            let (mut stream, last_activity, timeout) = state?;
             let asupersync_now = asupersync::Cx::current()
                 .and_then(|cx| cx.timer_driver())
                 .map_or_else(wall_now, |timer| timer.now());
@@ -793,37 +794,49 @@ fn wrap_stream_with_idle_timeout(
             let elapsed =
                 std::time::Duration::from_nanos(asupersync_now.duration_since(last_activity));
             if elapsed >= timeout {
+                // Release the transport (and any virtual-provider cancellation
+                // guard) before returning the terminal error to the consumer.
+                drop(stream);
                 return Some((
                     Err(std::io::Error::other(
                         "Request timed out reading body stream",
                     )),
-                    (stream, last_activity, timeout),
+                    None,
                 ));
             }
 
             let remaining = timeout.checked_sub(elapsed).unwrap_or_default();
-            let sleep_fut = sleep(asupersync_now, remaining).fuse();
-            let next_fut = stream.next().fuse();
-            futures::pin_mut!(sleep_fut, next_fut);
+            // End both the losing timer and the borrowing read future before
+            // moving or dropping the body. A caller may keep this wrapper
+            // alive after receiving an error; it must not keep the I/O alive.
+            let item = {
+                let sleep_fut = sleep(asupersync_now, remaining).fuse();
+                let next_fut = stream.next().fuse();
+                futures::pin_mut!(sleep_fut, next_fut);
+                match select(next_fut, sleep_fut).await {
+                    Either::Left((item, _)) => item,
+                    Either::Right(_) => Some(Err(std::io::Error::other(
+                        "Request timed out reading body stream",
+                    ))),
+                }
+            };
 
-            match select(next_fut, sleep_fut).await {
-                Either::Left((Some(res), _)) => {
+            match item {
+                Some(Ok(bytes)) => {
                     let now = asupersync::Cx::current()
                         .and_then(|cx| cx.timer_driver())
                         .map_or_else(wall_now, |timer| timer.now());
-                    last_activity = now;
-                    Some((res, (stream, last_activity, timeout)))
+                    Some((Ok(bytes), Some((stream, now, timeout))))
                 }
-                Either::Left((None, _)) => None,
-                Either::Right(_) => Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
-                )),
+                Some(Err(error)) => {
+                    drop(stream);
+                    Some((Err(error), None))
+                }
+                None => None,
             }
         },
-    ))
+    );
+    Box::pin(wrapped.fuse())
 }
 
 impl Response {
@@ -3178,10 +3191,187 @@ mod tests {
             .map_or_else(asupersync::time::wall_now, |timer| timer.now())
     }
 
+    #[derive(Default)]
+    struct IdleStreamCounters {
+        polls: std::sync::atomic::AtomicUsize,
+        drops: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TrackedIdleBody {
+        inner: ByteStream,
+        counters: Arc<IdleStreamCounters>,
+    }
+
+    impl Stream for TrackedIdleBody {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.counters
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.as_mut().poll_next(cx)
+        }
+    }
+
+    impl Drop for TrackedIdleBody {
+        fn drop(&mut self) {
+            self.counters
+                .drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn tracked_idle_body(inner: ByteStream) -> (ByteStream, Arc<IdleStreamCounters>) {
+        let counters = Arc::new(IdleStreamCounters::default());
+        let body = TrackedIdleBody {
+            inner,
+            counters: Arc::clone(&counters),
+        };
+        (Box::pin(body), counters)
+    }
+
+    fn assert_idle_body_released_and_fused(stream: &mut ByteStream, counters: &IdleStreamCounters) {
+        use futures::FutureExt as _;
+        use std::sync::atomic::Ordering;
+
+        // Assert before another poll: the returned error must not retain a
+        // socket or extension cancellation guard until the caller reads again.
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        let polls = counters.polls.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(matches!(stream.next().now_or_never(), Some(None)));
+        }
+        assert_eq!(counters.polls.load(Ordering::SeqCst), polls);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_expired_before_read_releases_unpolled_body() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream =
+                wrap_stream_with_idle_timeout(body, Some((now(), std::time::Duration::ZERO)));
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("timeout");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "Request timed out reading body stream");
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_timer_winning_pending_read_releases_body_before_error() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_millis(50))),
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("timeout");
+            assert_eq!(error.to_string(), "Request timed out reading body stream");
+            assert!(counters.polls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_transport_error_releases_body_and_never_reads_later_data() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset",
+                )),
+                Ok(b"must not be read after failure".to_vec()),
+            ])));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("reset");
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(error.to_string(), "peer reset");
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_successful_eof_releases_body_and_stays_fused() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
+                Ok(b"last chunk".to_vec()),
+            ])));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            assert_eq!(
+                stream.next().await.expect("chunk").expect("bytes"),
+                b"last chunk"
+            );
+            assert!(stream.next().await.is_none());
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_pending_read_is_cancelled_when_wrapper_is_dropped() {
+        use futures::FutureExt as _;
+        use std::sync::atomic::Ordering;
+
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            assert!(stream.next().now_or_never().is_none());
+            assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
+            drop(stream);
+            assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn disabled_idle_timeout_preserves_underlying_stream_semantics() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
+                Err(std::io::Error::other("fixture error")),
+                Ok(b"underlying continuation".to_vec()),
+            ])));
+            let mut stream = wrap_stream_with_idle_timeout(body, None);
+            assert!(stream.next().await.expect("first item").is_err());
+            assert_eq!(
+                stream.next().await.expect("second item").expect("bytes"),
+                b"underlying continuation"
+            );
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert_eq!(counters.drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
     /// Build the wrapped stream *inside* the runtime (so `now()` and the
     /// wrapper's clock agree) and collect items, stopping after the first
-    /// error: the wrapper keeps reporting the timeout on every poll after
-    /// it fires, and a consumer that kept polling would be the bug.
+    /// error as production collectors do. Separate lifecycle regressions keep
+    /// the wrapper alive and verify that terminal reads cannot retain I/O.
     fn drain(build: impl FnOnce() -> ByteStream + Send + 'static) -> Vec<std::io::Result<Vec<u8>>> {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
