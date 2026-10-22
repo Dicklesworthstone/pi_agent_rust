@@ -67,6 +67,41 @@ paths, executable trust acknowledgments, process spawning, and `$CMD:` credentia
 helpers use this same directory. Changing the effective directory changes the
 trust fingerprint. Pi does not change the host process's working directory.
 
+## Protocol negotiation and workspace roots
+
+Native stdio and Streamable HTTP connections request **MCP 2025-11-25**, the
+revision used by OMP 18.12.6. Servers can select **2025-06-18** or **2025-03-26**
+instead. Unsupported revisions and malformed initialization results stop the
+connection before tool discovery or mounting. HTTP requests use the exact
+negotiated `MCP-Protocol-Version`, including after session renewal and during
+orderly shutdown.
+
+The client advertises `roots: {"listChanged": false}` and answers `roots/list`
+with one canonical `file://` URI for the session workspace. The root stays
+fixed for that connection. A separate server `cwd` still controls process and
+credential-helper execution; it does not change the workspace reported to the
+server. Paths containing spaces, `#`, `%`, or non-ASCII characters are encoded
+as file URIs. A server request cannot select additional roots or cause Pi to
+read local files. Roots describe project scope; they do not sandbox the server
+process or replace its existing trust and tool-approval controls.
+
+The same handshake and root behavior applies to native MCP connections in
+interactive, print, RPC, SDK, and ACP sessions. Server trust now binds both the
+execution directory and the exposed workspace. A prior acknowledgment must be
+renewed through the existing trust flow after this update; an acknowledgment
+from another project cannot authorize a new root even when server `cwd` is fixed.
+
+These connections advertise no sampling, elicitation, or task capabilities.
+OAuth login and `/mcp reauth` are not implemented by this protocol update;
+configured authentication headers and credential references retain their
+existing behavior.
+
+Protocol references: [OMP v18.12.6 client](https://github.com/can1357/oh-my-pi/blob/v18.12.6/packages/coding-agent/src/mcp/client.ts),
+[MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
+and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots).
+
+## Request timeouts
+
 `timeout` is an integer in milliseconds, from **1 to 3,600,000**; `timeoutMs` and
 `timeout_ms` are accepted aliases. Use only one spelling. Missing timeouts retain
 the native **30-second** default. The value applies to initialization, tool

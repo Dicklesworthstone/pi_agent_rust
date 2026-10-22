@@ -1617,7 +1617,11 @@ mod tests {
                     if self.0.stall == "close" {
                         Err(tool_err("MCP_SERVER_ERROR", "initialization refused"))
                     } else {
-                        Ok(json!({}))
+                        Ok(json!({
+                            "protocolVersion": crate::mcp::transport::MCP_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "setup-fixture", "version": "1"}
+                        }))
                     }
                 }
                 "tools/call" => {

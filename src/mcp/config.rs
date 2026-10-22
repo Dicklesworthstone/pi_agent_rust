@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
+const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v3";
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 /// Keep every MCP operation bounded, including imported OMP configurations.
 pub(super) const MAX_MCP_TIMEOUT_MS: u64 = 3_600_000;
@@ -197,16 +197,24 @@ impl ConfiguredServer {
         )
     }
 
-    /// Versioned cryptographic fingerprint of the complete execution surface.
+    /// Versioned fingerprint when the session workspace and execution cwd match.
     ///
     /// Trust is global on disk, so the digest binds not only the target but
     /// also its name, raw secret definitions, provenance/source identity, and
     /// the effective working directory for local process resolution. Secret
     /// references are intentionally hashed before resolution: environment
     /// rotation does not re-prompt, while changing `$ENV:`/`$CMD:` definitions
-    /// does.
+    /// does. Use [`Self::fingerprint_for_workspace`] for a separate server cwd.
     #[must_use]
     pub fn fingerprint(&self, effective_cwd: &Path) -> String {
+        self.fingerprint_for_workspace(effective_cwd, effective_cwd)
+    }
+
+    /// Bind both local process execution and the workspace exposed by roots/list.
+    /// Use this when the server's working directory differs from its session's
+    /// workspace. Secret definitions remain bound before their resolution.
+    #[must_use]
+    pub fn fingerprint_for_workspace(&self, effective_cwd: &Path, workspace: &Path) -> String {
         let mut hasher = Sha256::new();
         hash_part(&mut hasher, "domain", TRUST_FINGERPRINT_DOMAIN);
         hash_part(&mut hasher, "name", self.name.as_bytes());
@@ -241,6 +249,12 @@ impl ConfiguredServer {
             &mut hasher,
             "effective_cwd",
             cwd.as_os_str().as_encoded_bytes(),
+        );
+        let workspace = canonical_cwd(workspace);
+        hash_part(
+            &mut hasher,
+            "workspace_root",
+            workspace.as_os_str().as_encoded_bytes(),
         );
 
         crate::package_manager::hex_encode(&hasher.finalize())
@@ -461,7 +475,7 @@ fn canonical_identity(path: &Path, base: &Path) -> PathBuf {
     })
 }
 
-fn canonical_cwd(path: &Path) -> PathBuf {
+pub(super) fn canonical_cwd(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()

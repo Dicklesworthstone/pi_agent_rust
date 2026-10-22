@@ -10,14 +10,41 @@ use super::*;
 struct ConfigProbeTransport {
     requests: Arc<Mutex<Vec<(String, Duration)>>>,
     closed: AtomicBool,
+    initialize_result: Option<Value>,
+    workspace: Option<Arc<Mutex<Option<PathBuf>>>>,
 }
 
 #[async_trait]
 impl McpTransport for ConfigProbeTransport {
-    async fn request(&self, method: &str, _params: Value, timeout: Duration) -> Result<Value> {
+    fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
+        if let Some(selected) = &self.workspace {
+            *McpManager::lock(selected) = Some(workspace.to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn client_capabilities(&self) -> Value {
+        if self.workspace.is_some() {
+            json!({"roots":{"listChanged":false}})
+        } else {
+            json!({})
+        }
+    }
+
+    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         McpManager::lock(&self.requests).push((method.to_string(), timeout));
         match method {
-            "initialize" => Ok(json!({})),
+            "initialize" => {
+                assert_eq!(params["protocolVersion"], "2025-11-25");
+                assert_eq!(params["capabilities"], self.client_capabilities());
+                Ok(self.initialize_result.clone().unwrap_or_else(|| {
+                    json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "config-fixture", "version": "1"}
+                    })
+                }))
+            }
             "tools/list" => Ok(json!({
                 "tools": [{"name":"echo","inputSchema":{"type":"object"}}]
             })),
@@ -27,7 +54,8 @@ impl McpTransport for ConfigProbeTransport {
         }
     }
 
-    async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+    async fn notify(&self, method: &str, _params: Value) -> Result<()> {
+        McpManager::lock(&self.requests).push((method.to_string(), Duration::ZERO));
         Ok(())
     }
 
@@ -84,10 +112,14 @@ fn imported_cwd_and_timeout_reach_trust_setup_tools_and_context() {
     );
     let requests = Arc::new(Mutex::new(Vec::new()));
     let probe_requests = Arc::clone(&requests);
+    let workspace = Arc::new(Mutex::new(None));
+    let probe_workspace = Arc::clone(&workspace);
     *McpManager::lock(&manager.inner.transport_factory) = Some(Arc::new(move || {
         Box::new(ConfigProbeTransport {
             requests: Arc::clone(&probe_requests),
             closed: AtomicBool::new(false),
+            initialize_result: None,
+            workspace: Some(Arc::clone(&probe_workspace)),
         }) as Box<dyn McpTransport>
     }));
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -114,6 +146,11 @@ fn imported_cwd_and_timeout_reach_trust_setup_tools_and_context() {
             .expect("context call");
         manager.shutdown_all().await;
     });
+    assert_eq!(
+        McpManager::lock(&workspace).as_ref(),
+        Some(&manager.inner.cwd)
+    );
+    assert_ne!(McpManager::lock(&workspace).as_ref(), Some(&server_cwd));
     let recorded = McpManager::lock(&requests);
     for method in ["initialize", "tools/list", "tools/call", "resources/list"] {
         let timeouts: Vec<_> = recorded
@@ -157,6 +194,8 @@ fn disabled_import_cannot_be_trusted_started_mounted_or_replaced_by_an_extension
         Box::new(ConfigProbeTransport {
             requests: Arc::new(Mutex::new(Vec::new())),
             closed: AtomicBool::new(false),
+            initialize_result: None,
+            workspace: None,
         }) as Box<dyn McpTransport>
     }));
     manager.register_extension_server("fixture", &json!({"url":"https://other.invalid/mcp"}));
@@ -213,4 +252,111 @@ fn workspace_templates_are_literal_data_and_do_not_follow_server_cwd() {
     )
     .expect("expanded values never become credential commands");
     assert_eq!(literal[0].1, "$CMD:exit 97");
+}
+
+#[test]
+fn unsupported_or_malformed_handshakes_never_initialize_or_publish_a_connection() {
+    for response in [
+        json!({}),
+        json!({"protocolVersion":"2099-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}),
+        json!({"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{}}),
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = imported_manager(
+            &temp,
+            &json!({"mcpServers":{"fixture":{
+                "url":"https://fixture.invalid/mcp"
+            }}}),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let probe_requests = Arc::clone(&requests);
+        *McpManager::lock(&manager.inner.transport_factory) = Some(Arc::new(move || {
+            Box::new(ConfigProbeTransport {
+                requests: Arc::clone(&probe_requests),
+                closed: AtomicBool::new(false),
+                initialize_result: Some(response.clone()),
+                workspace: None,
+            }) as Box<dyn McpTransport>
+        }));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.trust("fixture"))
+            .expect_err("invalid handshake");
+        assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        let entry = manager.entry("fixture").expect("entry");
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        assert!(manager.mounted_tool_metas().is_empty());
+        assert!(matches!(
+            &*McpManager::lock(&entry.health),
+            ServerHealth::Unhealthy { reason, retries: 1 } if reason.contains("MCP_PROTOCOL")
+        ));
+        let recorded = McpManager::lock(&requests);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "no initialized notification or tool discovery after rejection"
+        );
+        assert_eq!(recorded[0].0, "initialize");
+    }
+}
+
+#[test]
+fn fixed_server_cwd_does_not_transfer_root_trust_to_another_workspace() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_cwd = temp.path().join("server");
+    let second_workspace = temp.path().join("other-project");
+    std::fs::create_dir(&server_cwd).expect("server cwd");
+    std::fs::create_dir(&second_workspace).expect("second workspace");
+    let manager = imported_manager(
+        &temp,
+        &json!({"mcpServers":{"fixture":{
+            "url":"https://fixture.invalid/mcp", "cwd":server_cwd
+        }}}),
+    );
+    let entry = manager.entry("fixture").expect("first entry");
+    let other = McpManager::new(
+        &second_workspace,
+        &temp.path().join("global"),
+        McpDiscovery {
+            servers: vec![entry.config.clone()],
+            warnings: Vec::new(),
+        },
+    );
+    let other_entry = other.entry("fixture").expect("other entry");
+    assert_eq!(
+        entry.effective_cwd(&manager.inner.cwd),
+        other_entry.effective_cwd(&other.inner.cwd)
+    );
+    assert_ne!(
+        manager.trust_fingerprint_for(&entry),
+        other.trust_fingerprint_for(&other_entry)
+    );
+    TrustStore::load(&manager.inner.trust_path)
+        .expect("trust store")
+        .acknowledge(
+            "fixture",
+            &manager.trust_fingerprint_for(&entry),
+            "operator",
+        )
+        .expect("first workspace acknowledgment");
+    manager
+        .check_trust(&entry)
+        .expect("selected workspace trusted");
+    let error = other
+        .check_trust(&other_entry)
+        .expect_err("different root needs its own acknowledgment");
+    assert!(error.to_string().contains("MCP_TRUST_PENDING"), "{error}");
+    assert!(
+        McpManager::lock_trust_for_execution(
+            &other_entry.config,
+            &other_entry.effective_cwd(&other.inner.cwd),
+            &other.inner.cwd,
+            &other.inner.trust_path,
+        )
+        .is_err(),
+        "the final construction gate must bind the same root"
+    );
 }

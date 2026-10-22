@@ -9,21 +9,21 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{FutureExt as _, StreamExt as _};
 use serde_json::Value;
 
+use super::progress::ProgressRegistry;
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{
     CompletionWaitError, MCP_ENV_ALLOWLIST, PublicTailBuffer, RpcErrorObject, await_completion,
 };
 use crate::tools::{ProcessCleanupMode, ProcessGuard};
-use super::progress::ProgressRegistry;
 
 #[cfg(test)]
 mod progress_tests;
@@ -42,16 +42,144 @@ const HTTP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-logical-stream event-id budget. Exhaustion fails closed rather than
 /// forgetting old ids and risking duplicate server-request side effects.
 const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
-/// MCP protocol revision this client speaks.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Preferred MCP protocol revision, matching OMP's current handshake.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+/// Revisions whose shared handshake, tools, resources, and prompts we support.
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &[MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26"];
 
 fn tool_err(code: &str, message: impl Into<String>) -> Error {
     Error::tool("mcp", format!("[{code}] {}", message.into()))
 }
 
+/// Validate the server's negotiated revision before publishing any transport.
+/// HTTP also uses this before accepting a session ID from the response headers.
+pub(super) fn validate_initialize_result(result: &Value) -> Result<&str> {
+    let result = result
+        .as_object()
+        .ok_or_else(|| tool_err("MCP_PROTOCOL", "initialize result must be an object"))?;
+    let version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "initialize result has an invalid protocolVersion",
+            )
+        })?;
+    if !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&version) {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            format!(
+                "server selected unsupported protocolVersion {version:?}; supported versions are {}",
+                SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")
+            ),
+        ));
+    }
+    if !result.get("capabilities").is_some_and(Value::is_object) {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "initialize result requires an object-valued capabilities field",
+        ));
+    }
+    let server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "initialize result requires an object-valued serverInfo field",
+            )
+        })?;
+    if server_info.get("name").and_then(Value::as_str).is_none()
+        || server_info.get("version").and_then(Value::as_str).is_none()
+    {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "initialize result serverInfo requires string name and version fields",
+        ));
+    }
+    Ok(version)
+}
+
+/// One immutable, client-selected workspace. Server requests never select or
+/// expand this scope, and changing a server's process cwd cannot change it.
+#[derive(Default)]
+struct ClientRoots(OnceLock<Value>);
+
+impl ClientRoots {
+    fn configure(&self, workspace: &Path) -> Result<()> {
+        let path = workspace.canonicalize().map_err(|error| {
+            tool_err(
+                "MCP_ROOT_INVALID",
+                format!("cannot resolve workspace root: {error}"),
+            )
+        })?;
+        if !path.is_dir() {
+            return Err(tool_err(
+                "MCP_ROOT_INVALID",
+                "workspace root must be a directory",
+            ));
+        }
+        let uri = url::Url::from_file_path(&path)
+            .map_err(|()| tool_err("MCP_ROOT_INVALID", "workspace has no absolute file URI"))?;
+        let mut root = serde_json::json!({"uri": uri.as_str()});
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && !name.chars().any(char::is_control)
+        {
+            root["name"] = Value::String(name.to_string());
+        }
+        let roots = serde_json::json!({"roots": [root]});
+        match self.0.set(roots) {
+            Ok(()) => Ok(()),
+            Err(roots) if self.0.get() == Some(&roots) => Ok(()),
+            Err(_) => Err(tool_err(
+                "MCP_ROOT_INVALID",
+                "an MCP connection's workspace root cannot change",
+            )),
+        }
+    }
+
+    fn capabilities(&self) -> Value {
+        if self.0.get().is_some() {
+            serde_json::json!({"roots": {"listChanged": false}})
+        } else {
+            serde_json::json!({})
+        }
+    }
+
+    fn response(&self, method: &str, id: &Value) -> Value {
+        let result = match method {
+            "ping" => Some(serde_json::json!({})),
+            "roots/list" => self.0.get().cloned(),
+            _ => None,
+        };
+        match result {
+            Some(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            None => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": "client method is not supported"}
+            }),
+        }
+    }
+}
+
 /// One transport connection to an MCP server.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
+    /// Select the session workspace before initialization. Custom transports
+    /// may leave roots unsupported; the default advertises no capabilities.
+    ///
+    /// # Errors
+    /// Built-in transports reject inaccessible roots and changes of scope.
+    fn configure_workspace_root(&self, _workspace: &Path) -> Result<()> {
+        Ok(())
+    }
+    /// Capabilities actually implemented by this configured transport.
+    fn client_capabilities(&self) -> Value {
+        serde_json::json!({})
+    }
     /// Optional, connection-owned progress router. Existing custom transports
     /// remain valid without an observer and receive no progress token.
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
@@ -426,6 +554,7 @@ fn route_stdio_message(
     message: &Value,
     pending: &StdioPending,
     writer_tx: &StdSyncSender<WriterCommand>,
+    roots: &ClientRoots,
 ) -> std::result::Result<(), McpStdioError> {
     let object = message
         .as_object()
@@ -460,22 +589,7 @@ fn route_stdio_message(
                 "server request id must be a string, number, or null".to_string(),
             ));
         }
-        let response = if method.as_str() == Some("ping") {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {},
-            })
-        } else {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": "client does not support server-initiated requests",
-                },
-            })
-        };
+        let response = roots.response(method.as_str().unwrap_or_default(), id);
         let encoded = encode_stdio_message(&response)?;
         return writer_tx
             .try_send(WriterCommand::Message(encoded))
@@ -715,6 +829,7 @@ fn reader_loop(
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
     progress: std::sync::Arc<ProgressRegistry>,
+    roots: std::sync::Arc<ClientRoots>,
     tools_list_changed: std::sync::Arc<AtomicBool>,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
@@ -733,7 +848,7 @@ fn reader_loop(
                 if !alive.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Err(error) = route_stdio_message(&message, &pending, &writer_tx) {
+                if let Err(error) = route_stdio_message(&message, &pending, &writer_tx, &roots) {
                     stop_reader_connection(
                         &writer_tx,
                         &pending,
@@ -815,6 +930,7 @@ struct McpStdioClient {
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
     progress: std::sync::Arc<ProgressRegistry>,
+    roots: std::sync::Arc<ClientRoots>,
     tools_list_changed: std::sync::Arc<AtomicBool>,
     next_id: AtomicU64,
     alive: std::sync::Arc<AtomicBool>,
@@ -885,6 +1001,7 @@ impl McpStdioClient {
 
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let progress = std::sync::Arc::new(ProgressRegistry::default());
+        let roots = std::sync::Arc::new(ClientRoots::default());
         let tools_list_changed = std::sync::Arc::new(AtomicBool::new(false));
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
@@ -945,6 +1062,7 @@ impl McpStdioClient {
             let writer_tx = writer_tx.clone();
             let pending = std::sync::Arc::clone(&pending);
             let progress = std::sync::Arc::clone(&progress);
+            let roots = std::sync::Arc::clone(&roots);
             let tools_list_changed = std::sync::Arc::clone(&tools_list_changed);
             let alive = std::sync::Arc::clone(&alive);
             let closing = std::sync::Arc::clone(&closing);
@@ -957,6 +1075,7 @@ impl McpStdioClient {
                         writer_tx,
                         pending,
                         progress,
+                        roots,
                         tools_list_changed,
                         alive,
                         closing,
@@ -1016,6 +1135,7 @@ impl McpStdioClient {
             writer_tx,
             pending,
             progress,
+            roots,
             tools_list_changed,
             next_id: AtomicU64::new(1),
             alive,
@@ -1281,6 +1401,14 @@ impl StdioTransport {
 
 #[async_trait]
 impl McpTransport for StdioTransport {
+    fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
+        self.rpc.roots.configure(workspace)
+    }
+
+    fn client_capabilities(&self) -> Value {
+        self.rpc.roots.capabilities()
+    }
+
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
         Some(&self.rpc.progress)
     }
@@ -1336,6 +1464,12 @@ impl McpTransport for StdioTransport {
         match outcome {
             Ok(Ok(value)) => {
                 pending_request.disarm();
+                if method == "initialize"
+                    && let Err(error) = validate_initialize_result(&value)
+                {
+                    self.rpc.abort();
+                    return Err(error);
+                }
                 Ok(value)
             }
             Ok(Err(error)) => {
@@ -1443,6 +1577,7 @@ pub struct HttpTransport {
     headers: Vec<(String, String)>,
     session: Mutex<HttpSessionState>,
     progress: std::sync::Arc<ProgressRegistry>,
+    roots: ClientRoots,
     tools_list_changed_generation: AtomicU64,
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
@@ -1769,6 +1904,7 @@ impl HttpTransport {
             headers,
             session: Mutex::new(HttpSessionState::default()),
             progress: std::sync::Arc::new(ProgressRegistry::default()),
+            roots: ClientRoots::default(),
             tools_list_changed_generation: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
@@ -2235,52 +2371,7 @@ impl HttpTransport {
         candidate_session_id: Option<String>,
         initialize_frame: &Value,
     ) -> Result<()> {
-        let result = result
-            .as_object()
-            .ok_or_else(|| tool_err("MCP_PROTOCOL", "initialize result must be an object"))?;
-        let protocol_version = result
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                tool_err(
-                    "MCP_PROTOCOL",
-                    "initialize result is missing protocolVersion",
-                )
-            })?;
-        super::config::validate_http_header_value(protocol_version)
-            .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid protocolVersion: {err}")))?;
-        if protocol_version != MCP_PROTOCOL_VERSION {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                format!(
-                    "server selected unsupported protocolVersion {protocol_version:?}; supported version is {MCP_PROTOCOL_VERSION}"
-                ),
-            ));
-        }
-        if !result.get("capabilities").is_some_and(Value::is_object) {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                "initialize result requires an object-valued capabilities field",
-            ));
-        }
-        let server_info = result
-            .get("serverInfo")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                tool_err(
-                    "MCP_PROTOCOL",
-                    "initialize result requires an object-valued serverInfo field",
-                )
-            })?;
-        if server_info.get("name").and_then(Value::as_str).is_none()
-            || server_info.get("version").and_then(Value::as_str).is_none()
-        {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                "initialize result serverInfo requires string name and version fields",
-            ));
-        }
+        let protocol_version = validate_initialize_result(result)?;
         if let Some(session_id) = candidate_session_id.as_deref() {
             validate_http_session_id(session_id)?;
         }
@@ -2573,18 +2664,7 @@ impl HttpTransport {
                     "SSE JSON-RPC request id must be a string or number",
                 ));
             }
-            let response = if method == "ping" {
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
-            } else {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("client method {method:?} is not supported")
-                    }
-                })
-            };
+            let response = self.roots.response(method, id);
             self.send_server_response(&response, wire_state).await?;
             return Ok(None);
         }
@@ -3089,6 +3169,14 @@ fn parse_sse_responses(body: &str, expected_id: u64) -> Result<Value> {
 
 #[async_trait]
 impl McpTransport for HttpTransport {
+    fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
+        self.roots.configure(workspace)
+    }
+
+    fn client_capabilities(&self) -> Value {
+        self.roots.capabilities()
+    }
+
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
         Some(&self.progress)
     }
@@ -3514,6 +3602,7 @@ pub(crate) mod tests {
                 writer_tx,
                 pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 progress: std::sync::Arc::new(ProgressRegistry::default()),
+                roots: std::sync::Arc::new(ClientRoots::default()),
                 tools_list_changed: std::sync::Arc::new(AtomicBool::new(false)),
                 next_id: AtomicU64::new(1),
                 alive: std::sync::Arc::new(AtomicBool::new(true)),
@@ -3554,6 +3643,7 @@ pub(crate) mod tests {
                             &serde_json::json!({"jsonrpc":"2.0","id":id,"result":message["method"]}),
                             &pending,
                             &writer_tx,
+                            &ClientRoots::default(),
                         )
                         .expect("fixture response");
                     }
@@ -3867,6 +3957,7 @@ pub(crate) mod tests {
             &serde_json::json!({"jsonrpc":"2.0","id":8,"result":"wrong"}),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("unknown late id is ignored");
         assert!(matches!(
@@ -3878,6 +3969,7 @@ pub(crate) mod tests {
             &serde_json::json!({"jsonrpc":"2.0","id":7,"result":"right"}),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("matching response");
         assert_eq!(
@@ -3894,7 +3986,7 @@ pub(crate) mod tests {
         ] {
             assert!(
                 matches!(
-                    route_stdio_message(&malformed, &pending, &writer_tx),
+                    route_stdio_message(&malformed, &pending, &writer_tx, &ClientRoots::default()),
                     Err(McpStdioError::Protocol(_))
                 ),
                 "malformed response was accepted: {malformed}"
@@ -3914,6 +4006,7 @@ pub(crate) mod tests {
             }),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("ping response");
         let WriterCommand::Message(message) = writer_rx.recv().expect("ping writer command") else {
@@ -3935,6 +4028,7 @@ pub(crate) mod tests {
             }),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("unsupported request response");
         let WriterCommand::Message(message) = writer_rx.recv().expect("writer command") else {
@@ -4701,6 +4795,217 @@ pub(crate) mod tests {
         })
     }
 
+    #[test]
+    fn initialize_validation_accepts_supported_revisions_and_rejects_malformed_results() {
+        assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+            let mut result = initialize_success_body();
+            result["protocolVersion"] = serde_json::json!(version);
+            assert_eq!(
+                validate_initialize_result(&result).expect("supported"),
+                version
+            );
+        }
+        for result in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"old","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2099-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25\r\nInjected: yes","capabilities":{},"serverInfo":{"name":"bad","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25","capabilities":[],"serverInfo":{"name":"bad","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"bad"}}),
+        ] {
+            let error = validate_initialize_result(&result).expect_err("invalid handshake");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn roots_are_immutable_canonical_file_uris_and_ignore_server_selected_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("project #1 % with spaces");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let roots = ClientRoots::default();
+        assert_eq!(roots.capabilities(), serde_json::json!({}));
+        assert_eq!(
+            roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
+            -32601
+        );
+        roots.configure(&workspace).expect("select workspace");
+        roots
+            .configure(&workspace)
+            .expect("same workspace is idempotent");
+        assert!(
+            roots.configure(&other).is_err(),
+            "scope cannot expand in place"
+        );
+        assert_eq!(
+            roots.capabilities(),
+            serde_json::json!({"roots":{"listChanged":false}})
+        );
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+        let pending = Mutex::new(HashMap::new());
+        route_stdio_message(
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":"roots-probe", "method":"roots/list",
+                "params":{"path":"/", "roots":[{"uri":"file:///"}]}
+            }),
+            &pending,
+            &writer_tx,
+            &roots,
+        )
+        .expect("server root request");
+        let WriterCommand::Message(encoded) = writer_rx.recv().expect("root response") else {
+            panic!("expected root response message");
+        };
+        let response: Value = serde_json::from_slice(&encoded).expect("root response JSON");
+        assert_eq!(response["id"], "roots-probe");
+        let listed = response["result"]["roots"].as_array().expect("roots array");
+        assert_eq!(listed.len(), 1);
+        let uri = url::Url::parse(listed[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native path"),
+            workspace.canonicalize().expect("canonical workspace")
+        );
+        assert!(uri.query().is_none() && uri.fragment().is_none());
+    }
+
+    #[test]
+    fn roots_reject_files_and_missing_workspaces_without_advertising_capability() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a directory").expect("fixture file");
+        let roots = ClientRoots::default();
+        for path in [file, temp.path().join("missing")] {
+            let error = roots.configure(&path).expect_err("invalid workspace");
+            assert!(error.to_string().contains("MCP_ROOT_INVALID"), "{error}");
+        }
+        assert_eq!(roots.capabilities(), serde_json::json!({}));
+        assert_eq!(
+            roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
+            -32601
+        );
+    }
+
+    #[cfg(unix)]
+    const STDIO_ROOTS_PEER: &str = r#"
+import json, sys
+handshake = json.loads(sys.argv[1])
+observed_initialize = None
+roots_reply = None
+waiting = None
+def emit(frame):
+    print(json.dumps(frame), flush=True)
+def finish(ident):
+    emit({'jsonrpc':'2.0', 'id':ident, 'result':{
+        'tools':[], 'initialize':observed_initialize, 'rootsReply':roots_reply}})
+for line in sys.stdin:
+    frame = json.loads(line)
+    method = frame.get('method')
+    if method == 'initialize':
+        observed_initialize = frame['params']
+        emit({'jsonrpc':'2.0', 'id':frame['id'], 'result':handshake})
+    elif method == 'notifications/initialized':
+        emit({'jsonrpc':'2.0', 'id':'roots-probe', 'method':'roots/list',
+              'params':{'path':'/', 'roots':[{'uri':'file:///'}]}})
+    elif frame.get('id') == 'roots-probe':
+        roots_reply = frame
+        if waiting is not None:
+            finish(waiting)
+            waiting = None
+    elif method == 'tools/list':
+        if roots_reply is None:
+            waiting = frame['id']
+        else:
+            finish(frame['id'])
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stdio_validates_negotiation_and_answers_workspace_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("project #1");
+        let server_cwd = temp.path().join("server");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&server_cwd).expect("server cwd");
+        let runtime = runtime_for_tests();
+        for version in [
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            "unsupported",
+            "malformed",
+        ] {
+            let result = if version == "malformed" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"protocolVersion":version,"capabilities":{},"serverInfo":{"name":"native-peer","version":"1"}})
+            };
+            let args = vec![
+                "-u".to_string(),
+                "-c".to_string(),
+                STDIO_ROOTS_PEER.to_string(),
+                result.to_string(),
+            ];
+            let transport = StdioTransport::spawn("python3", &args, &[], &server_cwd)
+                .expect("native stdio peer");
+            transport
+                .configure_workspace_root(&workspace)
+                .expect("workspace root");
+            runtime.block_on(async {
+                let result = transport
+                    .request(
+                        "initialize",
+                        serde_json::json!({
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "capabilities": transport.client_capabilities(),
+                            "clientInfo":{"name":"test","version":"1"}
+                        }),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                if matches!(version, "unsupported" | "malformed") {
+                    let error =
+                        result.expect_err("invalid native stdio handshake must be rejected");
+                    assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+                    assert!(!transport.is_alive(), "invalid peer must be retired");
+                    return;
+                }
+                assert_eq!(
+                    result.expect("negotiated revision")["protocolVersion"],
+                    version
+                );
+                transport
+                    .notify("notifications/initialized", serde_json::json!({}))
+                    .await
+                    .expect("initialized");
+                let observed = transport
+                    .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                    .await
+                    .expect("native root request round trip");
+                assert_eq!(observed["initialize"]["protocolVersion"], "2025-11-25");
+                assert_eq!(
+                    observed["initialize"]["capabilities"],
+                    serde_json::json!({"roots":{"listChanged":false}})
+                );
+                let uri = observed["rootsReply"]["result"]["roots"][0]["uri"]
+                    .as_str()
+                    .expect("workspace URI");
+                assert_eq!(
+                    url::Url::parse(uri)
+                        .expect("file URI")
+                        .to_file_path()
+                        .expect("native root"),
+                    workspace.canonicalize().expect("canonical workspace")
+                );
+                transport.close().await;
+            });
+        }
+    }
+
     fn runtime_for_tests() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -4844,6 +5149,145 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn streamable_http_renegotiates_supported_versions_and_keeps_exact_wire_headers() {
+        let mut initial = initialize_success_body();
+        initial["protocolVersion"] = serde_json::json!("2025-06-18");
+        let mut renewed = initialize_success_body();
+        renewed["protocolVersion"] = serde_json::json!("2025-03-26");
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initial, "sid-initial"),
+            http_empty(202, "Accepted"),
+            http_empty(404, "Not Found"),
+            http_ok_with_session("__ECHO_ID__", renewed, "sid-renewed"),
+            http_empty(202, "Accepted"),
+            http_ok_plain("__ECHO_ID__", serde_json::json!({"tools":[]})),
+            http_empty(204, "No Content"),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let workspace = tempfile::tempdir().expect("workspace");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("root configuration");
+        runtime_for_tests().block_on(async {
+            transport
+                .request(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion":MCP_PROTOCOL_VERSION,
+                        "capabilities":transport.client_capabilities(),
+                        "clientInfo":{"name":"test","version":"1"}
+                    }),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("supported fallback");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized");
+            transport
+                .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("renewed session");
+            transport.close().await;
+        });
+        let captured = server.captured();
+        assert_eq!(captured.len(), 7);
+        for (index, version) in [
+            (1, "2025-06-18"),
+            (2, "2025-06-18"),
+            (4, "2025-03-26"),
+            (5, "2025-03-26"),
+            (6, "2025-03-26"),
+        ] {
+            assert!(
+                captured[index].0.iter().any(|(name, value)| name
+                    .eq_ignore_ascii_case("MCP-Protocol-Version")
+                    && value == version),
+                "wrong version on request {index}: {:?}",
+                captured[index]
+            );
+        }
+        for index in [0, 3] {
+            let frame: Value = serde_json::from_str(&captured[index].1).expect("initialize frame");
+            assert_eq!(frame["params"]["protocolVersion"], "2025-11-25");
+            assert_eq!(
+                frame["params"]["capabilities"],
+                serde_json::json!({"roots":{"listChanged":false}})
+            );
+            assert!(
+                !captured[index]
+                    .0
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("Mcp-Session-Id")),
+                "renewal must not reuse expired session"
+            );
+        }
+        assert!(server.request_lines()[6].starts_with("DELETE "));
+    }
+
+    #[test]
+    fn streamable_http_post_sse_answers_roots_with_the_negotiated_session() {
+        let root_request = serde_json::json!({
+            "jsonrpc":"2.0", "id":"root-post", "method":"roots/list",
+            "params":{"path":"/", "roots":[{"uri":"file:///"}]}
+        });
+        let stream = format!(
+            "data: {root_request}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":__ECHO_ID__,\"result\":{{\"tools\":[]}}}}\n\n"
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-roots"),
+            http_empty(202, "Accepted"),
+            http_event_stream(&stream),
+            http_empty(202, "Accepted"),
+            http_empty(204, "No Content"),
+        ]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("workspace root");
+        runtime_for_tests().block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized");
+            transport
+                .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("roots exchange while listing tools");
+            transport.close().await;
+        });
+        let captured = server.captured();
+        assert_eq!(captured.len(), 5);
+        let response: Value =
+            serde_json::from_str(&captured[3].1).expect("server request response");
+        assert_eq!(response["id"], "root-post");
+        let roots = response["result"]["roots"].as_array().expect("roots");
+        assert_eq!(roots.len(), 1);
+        let uri = url::Url::parse(roots[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native root"),
+            workspace.path().canonicalize().expect("canonical root")
+        );
+        for (name, value) in [
+            ("Mcp-Session-Id", "sid-roots"),
+            ("MCP-Protocol-Version", "2025-11-25"),
+        ] {
+            assert!(
+                captured[3]
+                    .0
+                    .iter()
+                    .any(|(key, actual)| key.eq_ignore_ascii_case(name) && actual == value)
+            );
+        }
+    }
+
     /// Session-expiry 404 clears stale state and performs EXACTLY ONE
     /// bounded reinitialize/retry; a second consecutive expiry surfaces to
     /// the caller instead of looping (bd-zz6yo).
@@ -4906,8 +5350,8 @@ pub(crate) mod tests {
     }
 
     /// The optional GET channel is activated after the handshake, answers
-    /// server pings, resumes exactly once with its own cursor, and suppresses
-    /// a replayed event id rather than duplicating the response side effect.
+    /// server pings and roots requests, resumes once with its own cursor, and
+    /// suppresses a replayed event rather than duplicating its response.
     #[test]
     fn streamable_http_get_resumes_once_without_duplicate_delivery() {
         let first_stream = concat!(
@@ -4918,7 +5362,7 @@ pub(crate) mod tests {
             "id: stream-1:1\n",
             "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"ping\"}\n\n",
             "id: stream-1:2\n",
-            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-2\",\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-2\",\"method\":\"roots/list\"}\n\n",
         );
         let server = ScriptedHttpServer::start(vec![
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-get"),
@@ -4930,6 +5374,10 @@ pub(crate) mod tests {
         ]);
         let transport =
             std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let workspace = tempfile::tempdir().expect("workspace");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("workspace root");
         let runtime = runtime_for_tests();
         runtime.block_on(async {
             transport
@@ -4972,6 +5420,15 @@ pub(crate) mod tests {
         assert_eq!(header(2, "Last-Event-ID"), None);
         assert_eq!(header(4, "Last-Event-ID"), Some("stream-1:1"));
         assert_eq!(header(4, "Mcp-Session-Id"), Some("sid-get"));
+        assert_eq!(header(5, "MCP-Protocol-Version"), Some("2025-11-25"));
+        let response: Value = serde_json::from_str(&captured[5].1).expect("GET root response");
+        let roots = response["result"]["roots"].as_array().expect("GET roots");
+        assert_eq!(roots.len(), 1);
+        let uri = url::Url::parse(roots[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native root"),
+            workspace.path().canonicalize().expect("canonical root")
+        );
         assert_eq!(
             captured
                 .iter()

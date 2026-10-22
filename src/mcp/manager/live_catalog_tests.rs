@@ -30,7 +30,11 @@ impl McpTransport for CatalogTransport {
     #[allow(clippy::significant_drop_in_scrutinee)]
     async fn request(&self, method: &str, params: Value, _timeout: Duration) -> Result<Value> {
         match method {
-            "initialize" => Ok(json!({})),
+            "initialize" => Ok(json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "catalog-fixture", "version": "1"}
+            })),
             "tools/list" => {
                 self.state.lists.fetch_add(1, Ordering::SeqCst);
                 if self.state.hold_list.load(Ordering::SeqCst) {

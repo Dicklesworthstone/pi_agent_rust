@@ -393,7 +393,7 @@ impl McpManager {
             .collect();
         Self {
             inner: Arc::new(McpManagerInner {
-                cwd: cwd.to_path_buf(),
+                cwd: super::config::canonical_cwd(cwd),
                 servers: Mutex::new(servers),
                 trust_path: global_dir.join("mcp-trust.json"),
                 trust_lock: Mutex::new(()),
@@ -438,7 +438,7 @@ impl McpManager {
     }
 
     fn trust_fingerprint(&self, config: &ConfiguredServer) -> String {
-        config.fingerprint(&self.inner.cwd)
+        config.fingerprint_for_workspace(&self.inner.cwd, &self.inner.cwd)
     }
 
     /// bd-hyik7: fingerprint honoring a per-entry cwd override (extension
@@ -448,7 +448,7 @@ impl McpManager {
     fn trust_fingerprint_for(&self, entry: &Arc<ServerEntry>) -> String {
         entry
             .config
-            .fingerprint(&entry.effective_cwd(&self.inner.cwd))
+            .fingerprint_for_workspace(&entry.effective_cwd(&self.inner.cwd), &self.inner.cwd)
     }
 
     fn check_running(&self) -> Result<()> {
@@ -871,6 +871,7 @@ impl McpManager {
     fn lock_trust_for_execution(
         config: &ConfiguredServer,
         cwd: &Path,
+        workspace: &Path,
         trust_path: &Path,
     ) -> Result<TrustWriteGuard> {
         if !config.enabled {
@@ -879,7 +880,7 @@ impl McpManager {
                 "server is disabled by configuration",
             ));
         }
-        let fingerprint = config.fingerprint(cwd);
+        let fingerprint = config.fingerprint_for_workspace(cwd, workspace);
         let mut store = TrustStore::load(trust_path)?;
         let (decision, guard) = store.locked_decision(&config.name, &fingerprint)?;
 
@@ -1067,7 +1068,7 @@ impl McpManager {
                 "initialize",
                 serde_json::json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "capabilities": transport.client_capabilities(),
                     "clientInfo": {
                         "name": "pi_agent_rust",
                         "version": crate::platform::VERSION,
@@ -1076,6 +1077,7 @@ impl McpManager {
                 entry.timeout(),
             )
             .await
+            .and_then(|result| super::transport::validate_initialize_result(&result).map(|_| ()))
         {
             transport.close().await;
             Self::record_failure(entry, &err);
@@ -1221,12 +1223,13 @@ impl McpManager {
             // A concurrent deny/reset either linearizes before this guard and
             // blocks execution, or waits and linearizes after it.
             let _trust_execution_guard =
-                Self::lock_trust_for_execution(&config, &cwd, &trust_path)?;
+                Self::lock_trust_for_execution(&config, &cwd, &workspace, &trust_path)?;
             ensure_active()?;
 
             #[cfg(test)]
             if let Some(factory) = factory {
                 let transport = factory();
+                transport.configure_workspace_root(&workspace)?;
                 if let Err(error) = ensure_active() {
                     transport.abort();
                     return Err(error);
@@ -1248,10 +1251,9 @@ impl McpManager {
                     &workspace,
                 )?;
                 ensure_active()?;
-                return Ok(
-                    Box::new(super::transport::HttpTransport::new(&url, headers)?)
-                        as Box<dyn McpTransport>,
-                );
+                let transport = super::transport::HttpTransport::new(&url, headers)?;
+                transport.configure_workspace_root(&workspace)?;
+                return Ok(Box::new(transport) as Box<dyn McpTransport>);
             }
             let command = config.command.clone().ok_or_else(|| {
                 tool_err(
@@ -1269,6 +1271,7 @@ impl McpManager {
             ensure_active()?;
             let transport =
                 super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
+            transport.configure_workspace_root(&workspace)?;
             if let Err(error) = ensure_active() {
                 transport.abort();
                 return Err(error);
@@ -2177,7 +2180,11 @@ mod tests {
     impl McpTransport for FlappingCallTransport {
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
-                "initialize" => Ok(serde_json::json!({})),
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "fixture", "version": "1"}
+                })),
                 "tools/list" => Ok(serde_json::json!({
                     "tools": [{
                         "name": "echo",
@@ -2257,7 +2264,11 @@ mod tests {
     impl McpTransport for SuccessfulTransport {
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
-                "initialize" => Ok(serde_json::json!({})),
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "fixture", "version": "1"}
+                })),
                 "tools/list" => Ok(serde_json::json!({"tools": []})),
                 "tools/call" => Ok(serde_json::json!({"content": []})),
                 other => Err(tool_err(
@@ -2455,7 +2466,11 @@ mod tests {
                 Box::new(HeldRequestTransport {
                     started: Mutex::new(Some(started_tx.clone())),
                     release: Arc::clone(&factory_release),
-                    response: serde_json::json!({}),
+                    response: serde_json::json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": {"name": "held-fixture", "version": "1"}
+                    }),
                     closed: Arc::clone(&factory_closed),
                 })
             }));
