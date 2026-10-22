@@ -13,6 +13,12 @@
     const hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     const keys = Object.keys;
     const freeze = Object.freeze;
+    const drainOwnKeys = Reflect.ownKeys;
+    const drainDescriptor = Object.getOwnPropertyDescriptor;
+    const drainCreate = Object.create;
+    const drainPrototype = Object.getPrototypeOf;
+    const drainPlainPrototype = Object.prototype;
+    const drainSetPrototype = Object.setPrototypeOf;
     const now = Date.now;
     const resolvedPromise = Promise.resolve.bind(Promise);
     const promiseThen = Function.prototype.call.bind(Promise.prototype.then);
@@ -269,6 +275,109 @@
         if (job.operation === 'completion') return hasOwn(payload,'data') ? payload.data : payload.text;
         return job.operation === 'judgment' ? payload.answers : payload;
     };
+    // A drain has no hidden consuming cursor. The caller acknowledges a page
+    // only after processing it, by supplying page.cursor to a later drain.
+    // Use the native waiter: guest polling cannot recheck policy at native
+    // readiness boundaries or preserve its host-call/deadline accounting.
+    const drainInput = () => new TypeErrorType('EVAL_BATCH_INPUT: drain accepts cursor and timeout seconds from 0 through 600');
+    const drainProtocol = () => new ErrorType('EVAL_BATCH_PROTOCOL: invalid native drain response');
+    const drainRecord = (value, allowed, fail) => {
+        if (!modelRecord(value) || (drainPrototype(value) !== drainPlainPrototype && drainPrototype(value) !== null)) throw fail();
+        const copied = drainCreate(null);
+        for (const key of drainOwnKeys(value)) {
+            const field = drainDescriptor(value,key);
+            if (typeof key !== 'string' || !allowed.includes(key) || !field || !hasOwn(field,'value')) throw fail();
+            copied[key] = field.value;
+        }
+        return copied;
+    };
+    const drainCursor = (value, id, fail) => {
+        if (value === null) return null;
+        const cursor = drainRecord(value,['schema','jobId','manifest','seen'],fail);
+        if (keys(cursor).length !== 4 || cursor.schema !== 'pi.eval.batch-cursor.v1' || cursor.jobId !== id
+            || !isArray(cursor.seen) || cursor.seen.length > 16
+            || (cursor.manifest !== null && (typeof cursor.manifest !== 'string' || !/^[0-9a-f]{64}$/.test(cursor.manifest)))) throw fail();
+        const seen = [];
+        for (let index = 0; index < cursor.seen.length; index++) {
+            const field = drainDescriptor(cursor.seen,String(index));
+            if (!field || !hasOwn(field,'value') || !integer(field.value) || field.value < 0 || field.value >= 16
+                || seen.includes(field.value)) throw fail();
+            seen.push(field.value);
+        }
+        if (drainOwnKeys(cursor.seen).length !== seen.length + 1 || (seen.length && cursor.manifest === null)) throw fail();
+        seen.sort((left,right) => left - right);
+        // Prevent an inherited toJSON hook from rewriting a checked cursor.
+        drainSetPrototype(seen,null);
+        cursor.seen = seen;
+        return cursor;
+    };
+    const drainHas = (seen, index) => {
+        for (let offset = 0; offset < seen.length; offset++) if (seen[offset] === index) return true;
+        return false;
+    };
+    const checkDrainPage = (page, id, previous) => {
+        if (!modelRecord(page) || page.schema !== 'pi.eval.batch-drain.v1' || page.jobId !== id
+            || !['running','exited','failed','killed','timedOut'].includes(page.jobStatus)
+            || page.done !== (page.jobStatus !== 'running')
+            || page.jobFailed !== (page.jobStatus !== 'running' && page.jobStatus !== 'exited')
+            || typeof page.complete !== 'boolean' || typeof page.evidenceAvailable !== 'boolean'
+            || !isArray(page.items) || page.items.length > 16) throw drainProtocol();
+        const cursor = drainCursor(page.cursor,id,drainProtocol);
+        if (cursor === null) throw drainProtocol();
+        const before = previous === null ? [] : previous.seen;
+        const manifest = previous === null ? null : previous.manifest;
+        if (manifest !== null && cursor.manifest !== manifest) throw drainProtocol();
+        if (!page.evidenceAvailable) {
+            if (page.total !== null || page.settled !== null || page.complete || page.items.length
+                || page.jobStatus === 'exited' || cursor.manifest !== manifest || cursor.seen.length !== before.length) throw drainProtocol();
+            for (let index = 0; index < before.length; index++) if (!drainHas(cursor.seen,before[index])) throw drainProtocol();
+            return page;
+        }
+        if (!integer(page.total) || page.total < 1 || page.total > 16 || !integer(page.settled)
+            || page.settled < 0 || page.settled > page.total || cursor.manifest === null
+            || (page.complete ? !page.done || page.settled !== page.total || !['exited','failed'].includes(page.jobStatus)
+                : !['running','killed','timedOut'].includes(page.jobStatus))) throw drainProtocol();
+        for (let index = 0; index < cursor.seen.length; index++) if (cursor.seen[index] >= page.total) throw drainProtocol();
+        const added = [];
+        const itemKeys = [];
+        let lastIndex = -1;
+        let keyType = null;
+        for (const item of page.items) {
+            if (!modelRecord(item) || !integer(item.index) || item.index <= lastIndex || item.index >= page.total
+                || drainHas(before,item.index) || typeof item.ok !== 'boolean'
+                || !(typeof item.key === 'string' && item.key.length > 0 && item.key.length <= 128
+                    || integer(item.key) && item.key === item.index)
+                || itemKeys.some(key => key === item.key) || (keyType !== null && keyType !== typeof item.key)) throw drainProtocol();
+            lastIndex = item.index;
+            keyType = typeof item.key;
+            itemKeys.push(item.key);
+            added.push(item.index);
+            if (item.ok) {
+                if (hasOwn(item,'error')) throw drainProtocol();
+                try { modelPayload('judgment',item.verdict); } catch (_) { throw drainProtocol(); }
+            } else if (hasOwn(item,'verdict') || typeof item.error !== 'string' || !item.error
+                || page.jobStatus === 'exited') throw drainProtocol();
+        }
+        if (before.length + added.length !== page.settled || cursor.seen.length !== page.settled) throw drainProtocol();
+        for (let index = 0; index < before.length; index++) if (!drainHas(cursor.seen,before[index])) throw drainProtocol();
+        for (const index of added) if (!drainHas(cursor.seen,index)) throw drainProtocol();
+        return page;
+    };
+    const drainModelJob = async (job, options) => {
+        if (job.operation !== 'judgment_batch' || !modelJobId(job.id)) throw drainInput();
+        const fields = drainRecord(options,['cursor','timeout'],drainInput);
+        const seconds = hasOwn(fields,'timeout') ? fields.timeout : 30;
+        if (typeof seconds !== 'number' || !finite(seconds) || seconds < 0 || seconds > 600) throw drainInput();
+        const cursor = drainCursor(hasOwn(fields,'cursor') ? fields.cursor : null,job.id,drainInput);
+        const args = drainCreate(null);
+        args.jobId = job.id;
+        args.cursor = cursor;
+        args.timeoutMs = Math.floor(seconds * 1000);
+        const encoded = await callTool('__pi_judge_batch_drain',args,false);
+        let page;
+        try { page = parse(encoded); } catch (_) { throw drainProtocol(); }
+        return checkDrainPage(page,job.id,cursor);
+    };
     class ModelJob {
         constructor(id, operation) {
             this.id = id;
@@ -285,6 +394,7 @@
             }
             return modelProgressView(this,await this.status());
         }
+        async drain(options = {}) { return drainModelJob(this,options); }
         async cancel() { return readModelJob(this,'cancel'); }
         async wait(timeout = 30, raiseErrors = true) {
             if (typeof raiseErrors !== 'boolean') throw new TypeErrorType('EVAL_MODEL_INPUT: raiseErrors must be boolean');
