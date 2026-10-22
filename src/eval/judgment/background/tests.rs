@@ -1053,6 +1053,75 @@ fn all_three_native_starts_keep_typed_results_and_session_ownership() -> Result<
 }
 
 #[test]
+fn retained_jobs_capture_each_selected_role_before_the_invocation_disappears() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let mut fast = Harness::new(&[r#"{"source":"fast"}"#], false)?;
+    let slow = Harness::new(&[r#"{"q":0.2}"#, r#"{"q":0.3}"#], true)?;
+    let fast_judge = fast.tool.judge.take().ok_or_else(|| Error::tool("fixture", "missing fast binding"))?;
+    let slow_judge = slow.tool.judge.clone().ok_or_else(|| Error::tool("fixture", "missing slow binding"))?;
+    let smol = super::super::Selection::role(&json!("smol")).ok_or_else(|| Error::tool("fixture", "missing smol role"))?;
+    let deep = super::super::Selection::role(&json!("slow")).ok_or_else(|| Error::tool("fixture", "missing slow role"))?;
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None)?
+            .with_host(Some(&fast.host)).with_snapshot_privacy(Some(&factory));
+        invocation.bind_host_session(&fast.host.owner);
+        invocation.resolved = vec![(smol, fast_judge), (deep, slow_judge.clone())];
+        let first = acknowledgment(invocation.start_background(&fast.tool, Operation::Completion,
+            json!({"prompt":"extract","images":["image.png"],"schema":{"type":"object","properties":{"source":{"type":"string"}},"required":["source"]}}))
+            .await.map_err(bridge_error)?)?;
+        started(&fast, 1).await?;
+        let mut input = request();
+        input["model"] = json!("slow");
+        let second = acknowledgment(invocation.start_background(&fast.tool, Operation::Judgment, input)
+            .await.map_err(bridge_error)?)?;
+        let third = acknowledgment(invocation.start_background(&fast.tool, Operation::Batch,
+            json!({"states":["evidence"],"questions":questions(),"model":"slow"}))
+            .await.map_err(bridge_error)?)?;
+        assert_eq!(invocation.receipts[0]["selectedModel"]["role"], "smol"); // ubs:ignore -- Launch receipts must identify the selected role without credentials.
+        assert_eq!(invocation.receipts[1]["selectedModel"]["role"], "slow"); // ubs:ignore -- Each request owns its selection independently of the cell default.
+        assert_eq!(invocation.receipts[2]["selectedModel"]["role"], "slow"); // ubs:ignore -- All batch items inherit that batch's selected role.
+        // A later binding change cannot retarget an already admitted native job.
+        invocation.resolved[0].1 = slow_judge;
+        drop(invocation);
+        let second = fast.settle(&second).await?;
+        let third = fast.settle(&third).await?;
+        assert_eq!(second.status, "exited"); // ubs:ignore -- The slow role can finish while the fast role is gated.
+        assert_eq!(third.status, "exited"); // ubs:ignore -- Role-selected batches retain the ordinary job lifecycle.
+        assert_eq!(slow.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Both overridden requests must use the distinct native provider binding.
+        fast.provider.gate.release();
+        let first = fast.settle(&first).await?;
+        let details = first.result.and_then(|result| result.details)
+            .ok_or_else(|| Error::tool("fixture", "missing completion details"))?;
+        assert_eq!(details.pointer("/result/data/source"), Some(&json!("fast"))); // ubs:ignore -- The first job must retain its original structured result after the cell is gone.
+        assert_eq!(details.pointer("/result/imageCount"), Some(&json!(1))); // ubs:ignore -- Role routing must preserve native image preparation.
+        assert_eq!(fast.host.reads.load(Ordering::Acquire), 1); // ubs:ignore -- Image evidence still enters through the launching Agent's read policy.
+        assert_eq!(fast.provider.calls.load(Ordering::Acquire), 1); // ubs:ignore -- A later override cannot cause a repeat request or retarget the original job.
+        Ok(())
+    })
+}
+
+#[test]
+fn helper_role_cannot_replace_a_host_binding_or_read_images_before_rejection() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&[], true)?;
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let error = invocation.start_background(&harness.tool, Operation::Completion,
+            json!({"prompt":"work","model":"smol","images":["image.png"]}))
+            .await.expect_err("host-bound Judge cannot be overridden"); // ubs:ignore -- Guest role selection cannot replace native host authority.
+        assert!(error.contains("PI_COMPLETION_BINDING")); // ubs:ignore -- The explicit host binding must reject role replacement before admission.
+        assert!(invocation.receipts.is_empty()); // ubs:ignore -- A rejected override must not reserve a provider attempt.
+        assert!(invocation.tool_receipts.is_empty()); // ubs:ignore -- No jobs policy or read call is necessary for a rejected override.
+        assert_eq!(harness.host.reads.load(Ordering::Acquire), 0); // ubs:ignore -- Failed role admission cannot read image evidence.
+        assert!(crate::jobs::list(&harness.host.owner)?.is_empty()); // ubs:ignore -- Rejection must publish no native job.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 0); // ubs:ignore -- Rejection must not contact any provider.
+        Ok(())
+    })
+}
+
+#[test]
 fn javascript_and_python_launches_survive_cell_return_and_kernel_reset() -> Result<()> {
     let _serial = crate::jobs::process_test_guard();
     for kernel in ["js", "python"] {

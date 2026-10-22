@@ -39,13 +39,23 @@ session job.
 [Retained model helpers](eval-structured-results.md#retained-background-model-requests)
 provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
 later-cell waits, cancellation and attachment by job ID after a reset. They use
-the launching cell's explicit native `judge_model` binding. Completions and
+the launching cell's explicit native `judge_model` binding. Native
+[per-request model roles](eval-structured-results.md#per-request-model-roles)
+allow `judge_model: {role: 'smol'}` and helper `model: 'slow'` / `model='slow'`
+to route requests to different configured models in one cell. Roles resolve
+from trusted `modelRoles` settings and the host catalog, with configured
+thinking levels and disabled-provider filtering. Unlike ordinary conversation
+role resolution, eval requires each requested role to be configured explicitly;
+it does not inherit CLI flags or fall back to another model. Host-bound SDK
+Judges cannot be overridden. Completions and
 judgments accept image evidence through the current host's read policy, and
 completion images can be combined with a validated output schema. Batch
 `progress()` retains ordered per-item states and finished verdicts across cells,
-including the last valid progress after cancellation or task timeout. OMP model
-tiers, retries, cursor-based batch drains and automatic backgrounding of arbitrary
-eval code remain separate work; unknown helper options fail explicitly.
+including the last valid progress after cancellation or task timeout. JavaScript
+batch `drain({cursor, timeout})` exposes native cursor-based result pages;
+Python can use the raw `__pi_judge_batch_drain` bridge. Retries and automatic
+backgrounding of arbitrary eval code remain separate work; unknown helper
+options fail explicitly.
 The typed `completion()` helper uses the uniform model-job bridge
 `__pi_model_complete_start`. The existing raw `__pi_complete_start` contract
 remains available through `tool.call`, with its own acknowledgment and direct

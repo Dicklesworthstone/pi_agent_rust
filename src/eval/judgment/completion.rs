@@ -9,7 +9,8 @@ use std::path::Path;
 pub(super) const BRIDGE_NAME: &str = "__pi_complete";
 
 impl Invocation<'_> {
-    pub(super) async fn complete(&mut self, cwd: &Path, input: Value) -> Result<String, String> {
+    pub(super) async fn complete(&mut self, cwd: &Path, mut input: Value) -> Result<String, String> {
+        let selection = self.request_selection(&mut input).map_err(public_error)?;
         let Value::Object(mut fields) = input else {
             return Err("PI_COMPLETION_INPUT: expected completion arguments".into());
         };
@@ -26,13 +27,13 @@ impl Invocation<'_> {
         }
         let index = self.receipts.len();
         self.receipts.push(json!({
-            "attempt":index+1, "operation":"completion", "selectedModel":self.selection,
+            "attempt":index+1, "operation":"completion", "selectedModel":selection,
             "status":"incomplete", "usage":null, "usageKnown":false,
         }));
         // The pending generation belongs to this bridge await. No task or
         // interpreter handle can carry the borrowed privacy callback elsewhere.
         let outcome = async {
-            let judge = self.bound_judge(cwd).await?;
+            let judge = self.bound_judge(cwd, selection.as_ref()).await?;
             judge.check_image_support(!images.is_empty())?;
             self.check_image_reads(images.path_count())?;
             let request = request.with_images(self.load_images(images).await?)?;
@@ -42,6 +43,7 @@ impl Invocation<'_> {
             Ok(reply) => {
                 self.receipts[index] = json!({
                     "attempt":index+1, "operation":"completion", "status":"completed",
+                    "selectedModel":selection,
                     "provider":reply["provider"], "modelId":reply["modelId"],
                     "api":reply["api"], "usage":reply["usage"],
                     "usageKnown":!reply["usage"].is_null(),
@@ -65,7 +67,7 @@ pub(super) fn public_error(error: Error) -> String {
         "PI_COMPLETION_INPUT", "PI_COMPLETION_SCHEMA", "PI_COMPLETION_PRIVACY", "PI_COMPLETION_RESPONSE"] {
         if text.contains(code) { return format!("{code}: completion failed; no answer"); }
     }
-    for suffix in ["BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER",
+    for suffix in ["INPUT", "BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER",
         "IMAGE_UNSUPPORTED", "IMAGE_INPUT", "IMAGE_LIMIT", "IMAGE_READ", "IMAGE_HOST", "IMAGE_CALL_LIMIT"] {
         if text.contains(&format!("PI_JUDGE_{suffix}")) {
             return format!("PI_COMPLETION_{suffix}: completion failed; no answer");

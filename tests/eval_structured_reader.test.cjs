@@ -181,9 +181,9 @@ async function launchModel(h, expression, operation, id = 'model-native', variab
 test('model factories return native handles and preserve explicit options and image evidence', async () => {
     const h = host();
     const request = await launchModel(h,
-        "completion('summarize',{system:'be concise',schema:{type:'object'},images:['chart.png'],maxTokens:256,timeoutSeconds:17})",
+        "completion('summarize',{model:'smol',system:'be concise',schema:{type:'object'},images:['chart.png'],maxTokens:256,timeoutSeconds:17})",
         'completion');
-    assert.deepEqual(request.args,{prompt:'summarize',system:'be concise',schema:{type:'object'},images:['chart.png'],max_tokens:256,timeout_secs:17});
+    assert.deepEqual(request.args,{prompt:'summarize',model:'smol',system:'be concise',schema:{type:'object'},images:['chart.png'],max_tokens:256,timeout_secs:17});
     assert.equal(vm.runInContext('model.operation',h.context),'completion');
     assert.equal(vm.runInContext('model.id === model.jobId && Object.isFrozen(model)',h.context),true);
     h.dispatch.clear();
@@ -193,10 +193,12 @@ test('model factories return native handles and preserve explicit options and im
     assert.deepEqual(lookup.args,{name:'jobs',args:{action:'wait',jobId:'model-native',timeoutMs:5000}});
     answer(h,lookup,modelSnapshot('model-native','completion',modelResult('completion',payload)));
     assert.deepEqual(JSON.parse(JSON.stringify(await waiting)),{answer:42});
-    const single = await launchModel(h,"judge({view:'screen'},{safe:{type:'bool',instructions:'safe?'}},{images:['shot.png'],timeoutSeconds:8})",'judgment','judge-native','review');
+    const single = await launchModel(h,"judge({view:'screen'},{safe:{type:'bool',instructions:'safe?'}},{model:'slow',images:['shot.png'],timeoutSeconds:8})",'judgment','judge-native','review');
+    assert.equal(single.args.model,'slow');
     assert.deepEqual(single.args.images,['shot.png']);
     assert.equal(single.args.timeout_secs,8);
-    const batch = await launchModel(h,"judgeBatch([{id:1},{id:2}],{safe:{type:'bool',instructions:'safe?'}},{images:{'1':['b.png']},concurrency:2})",'judgment_batch','batch-native','batch');
+    const batch = await launchModel(h,"judgeBatch([{id:1},{id:2}],{safe:{type:'bool',instructions:'safe?'}},{model:'tiny',images:{'1':['b.png']},concurrency:2})",'judgment_batch','batch-native','batch');
+    assert.equal(batch.args.model,'tiny');
     assert.deepEqual(batch.args.images,{'1':['b.png']});
     assert.equal(batch.args.concurrency,2);
     assert.equal(h.requests.length,4);
@@ -396,8 +398,12 @@ test('malformed and lost model acknowledgments reject without retrying admitted 
     await assert.rejects(pending,/ACK_LOST/);
     assert.equal(h.requests.length,1);
 });
-test('model helpers reject unsupported role, retry, threshold and authority options before dispatch', async () => {
-    for (const expression of ["completion('work',{model:'slow'})","completion('work',{api_key:'secret'})",
+test('model helpers reject invalid role, retry, threshold and authority options before dispatch', async () => {
+    for (const expression of ["completion('work',{model:'other'})","completion('work',{model:'Slow'})",
+        "completion('work',{model:' smol'})","completion('work',{model:'provider/model'})",
+        "completion('work',{model:'__proto__'})","completion('work',{model:null})",
+        "judge('state',{q:{}},{model:{role:'slow'}})","judgeBatch(['state'],{q:{}},{model:1})",
+        "completion('work',{api_key:'secret'})",
         "completion('work',{maxTokens:0})","completion('work',{timeoutSeconds:601})",
         "judge('state',{q:{}},{retries:1})","judge('state',{q:{}},{operation:'other'})",
         "judgeBatch(['state'],{q:{}},{minOk:1})","judgeBatch(['state'],{q:{}},{intent:'custom'})",
@@ -406,6 +412,19 @@ test('model helpers reject unsupported role, retry, threshold and authority opti
         const h = host(); await assert.rejects(vm.runInContext(expression,h.context),/EVAL_MODEL_INPUT/);
         assert.equal(h.requests.length,0);
     }
+});
+test('model roles are per launch and never replayed or inherited by later calls', async () => {
+    const h = host();
+    for (const role of ['default','smol','slow','plan','commit','vision','designer','task','advisor','tiny']) {
+        const request = await launchModel(h,`completion('work',{model:${JSON.stringify(role)}})`,'completion');
+        assert.equal(request.args.model,role);
+    }
+    const defaultRequest = await launchModel(h,"completion('cell binding')",'completion');
+    assert.deepEqual(defaultRequest.args,{prompt:'cell binding'});
+    const pending = vm.runInContext("completion('blocked',{model:'slow'})",h.context);
+    h.dispatch.dispatch(h.requests.at(-1).id,false,false,'PI_COMPLETION_BINDING');
+    await assert.rejects(pending,/PI_COMPLETION_BINDING/);
+    assert.equal(h.requests.length,12);
 });
 test('model attachment after reset verifies native identity and uses current host authority', async () => {
     const h = host();

@@ -103,7 +103,8 @@ including the background model requests below.
 
 Agent-owned cells can start a stateless model request and collect its answer in
 a later cell. Supply the launching eval call's explicit
-`judge_model: {provider, model}` or use an SDK host-bound Judge. The helpers
+`judge_model: {provider, model}`, `judge_model: {role: 'smol'}`, or use an SDK
+host-bound Judge. The helpers
 return after native admission; they do not await the model's final answer.
 
 JavaScript:
@@ -148,20 +149,79 @@ display({'paths': paths, 'items': judgments['items']})
 
 | Helper | Options | Successful `wait()` value |
 |---|---|---|
-| `completion(prompt, options)` / `completion(prompt, **options)` | `system`, `schema`, `images`, `maxTokens` / `max_tokens`, `timeoutSeconds` / `timeout_seconds` | Text, or validated `data` when a schema was requested |
-| `judge(state, questions, options)` / `judge(state, questions, **options)` | `images`, task timeout | The typed `answers` object |
-| `judgeBatch(states, questions, options)` / `judge_batch(states, questions, **options)` | `images`, `concurrency`, task timeout | The complete ordered `pi.eval.judgment-batch.v1` aggregate |
+| `completion(prompt, options)` / `completion(prompt, **options)` | `model` role, `system`, `schema`, `images`, `maxTokens` / `max_tokens`, `timeoutSeconds` / `timeout_seconds` | Text, or validated `data` when a schema was requested |
+| `judge(state, questions, options)` / `judge(state, questions, **options)` | `model` role, `images`, task timeout | The typed `answers` object |
+| `judgeBatch(states, questions, options)` / `judge_batch(states, questions, **options)` | `model` role, `images`, `concurrency`, task timeout | The complete ordered `pi.eval.judgment-batch.v1` aggregate |
 
 The factories are asynchronous: **await the factory to get a handle**. Options
 use an object in JavaScript and keyword arguments in Python. Unknown options,
-including OMP model tiers, retries, `minOk`/`min_ok` and `intent`, are rejected.
-The model is selected by the launching cell's native binding, with no retry or
-fallback. Completion and judgment images use the existing path or embedded-image
+including retries, `minOk`/`min_ok` and `intent`, are rejected. Requests use the
+launching cell's native binding unless they explicitly select a configured
+model role as described below, with no retry or fallback. Completion and
+judgment images use the existing path or embedded-image
 format; batch images map literal state keys or canonical array indices to
 attachment lists. Image reads finish through the current Agent's enabled `read`
 tool before background provider admission. The selected model must declare
 image support, including when a completion also supplies a JSON Schema. Text
 privacy screening does not redact pixels or perform OCR.
+
+### Per-request model roles
+
+A cell can route cheap extraction and deeper review to different configured
+models. Admit model work explicitly with `judge_model: {role: 'smol'}` on the
+eval invocation, then choose a role on each request:
+
+```javascript
+globalThis.extraction = await completion('Extract the changed file paths.', {
+  model: 'smol', schema: {type: 'array', items: {type: 'string'}}
+});
+globalThis.review = await judge(
+  {change: 'adds input validation'},
+  {safe: {type: 'bool', instructions: 'Does this prevent invalid input?'}},
+  {model: 'slow'}
+);
+```
+
+Python accepts `await completion(prompt, model='smol', schema=...)`,
+`await judge(state, questions, model='slow')`, and
+`await judge_batch(states, questions, model='slow')`. A batch uses one selected
+role for all its items. Omitting the helper's `model` uses the cell's original
+`judge_model`; a previous request's override never changes that default. A
+cell admitted with `{provider, model}` can also select a configured helper role.
+
+Accepted role names are exactly `default`, `smol`, `slow`, `plan`, `commit`,
+`vision`, `designer`, `task`, `advisor`, and `tiny`. Each must be explicitly
+configured in the trusted native settings' `modelRoles` object, using a
+registered model spec such as `provider/model` or `provider/model:high`.
+The configured thinking suffix is clamped to the selected model's supported
+levels. Provider endpoints, credentials, request headers and image capability
+come from the host catalog and authentication store. Global and matching
+workspace-scoped disabled-provider settings apply to both role and named
+selections.
+
+Eval deliberately requires an explicit role assignment: an unset role does
+not inherit another role, legacy defaults, the current conversation model or
+CLI role flags. An unknown, disabled or uncredentialed destination fails with
+a sanitized binding error; it never selects a substitute model. Helper `model`
+values are role names only, not arbitrary provider/model strings, endpoints,
+credentials or thinking overrides. A host-bound SDK `Judge` remains fixed and
+rejects helper role overrides.
+
+Each distinct selection resolves once on first use in the current cell. The
+native job captures that concrete provider, credentials, thinking level and
+privacy snapshot; later cells and settings changes do not retarget accepted
+work. The launch receipt records `selectedModel`, and successful results retain
+the actual `provider` and `modelId`. All roles share the existing 16-attempt
+cell limit, including every item in a batch. A helper role alone does not
+authorize networking: every cell launching model work still needs its own
+explicit `judge_model` or a host-bound Judge. Reading an existing job does not
+need a new model selection.
+
+The foreground raw operations `__pi_complete`, `__pi_judge` and
+`__pi_judge_batch`, and the legacy `__pi_complete_start`, accept the same
+optional `model` role field under these rules.
+
+### Retained handle operations
 
 | Handle operation | Behavior |
 |---|---|
@@ -170,6 +230,7 @@ privacy screening does not redact pixels or perform OCR.
 | `done()` | Whether native status has settled |
 | `output()` | Latest native `ToolOutput`, including batch progress or preserved interruption evidence, or null/None before any output exists |
 | `progress()` | Batch handles only: ordered item states, counts, attempt receipts and `jobStatus`, or null/None when no valid progress was retained |
+| `drain({cursor, timeout})` | JavaScript batch handles only: native page of settled items not acknowledged by the supplied cursor; default timeout 30 seconds |
 | `wait(timeout)` | Wait up to the given seconds, then return the typed value above; default 30 seconds |
 | `wait(timeout, false)` / `wait(timeout, raise_errors=False)` | Preserve a completed mixed batch, or return the native failure output when no typed payload exists |
 | `cancel()` | Cancel through the current cell's `jobs` authority and return the native snapshot |
@@ -230,8 +291,12 @@ automatically retried: inspect `jobs list` before explicitly starting again.
 The helpers use [native retained model jobs](judgment.md#retained-background-model-jobs),
 including the shared 16-attempt cell budget, 1–16-item batches, concurrency up
 to eight, bounded task timeouts, final-result limits and ordinary job retention.
-Batch progress is a bounded snapshot of all items; cursor-based drains remain
-separate work. If output privacy would change a typed answer or schema-validated
+Batch progress is a bounded snapshot of all items. JavaScript batch `drain()`
+uses the native waiter and an explicit cursor: process a returned page before
+passing its `cursor` to the next call. There is no hidden consuming cursor;
+reusing the same cursor preserves replayable evidence, including interruption
+results. Python can use the raw `__pi_judge_batch_drain` bridge with `jobId`,
+`cursor` and `timeoutMs`. If output privacy would change a typed answer or schema-validated
 data, the native job fails without retaining a misleading structured success.
 Progress and final outputs pass through the current host's read policy.
 

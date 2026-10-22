@@ -129,6 +129,10 @@ fn python_available() -> bool {
 #[test]
 fn model_selection_is_explicit_bounded_and_rejects_guest_credentials() {
     assert!(Selection::parse(&json!({"provider":"fixture","model":"family/model"})).is_ok());
+    for role in ModelRole::ALL {
+        let selection = json!({"role":role.as_str()});
+        assert_eq!(serde_json::to_value(Selection::parse(&selection).unwrap()).unwrap(), selection);
+    }
     for selection in [Value::Null, json!("fixture/model"), json!({}),
         json!({"provider":"fixture","model":""}),
         json!({"provider":"fixture","model":"x","api_key":"CANARY"}),
@@ -136,11 +140,161 @@ fn model_selection_is_explicit_bounded_and_rejects_guest_credentials() {
         json!({"provider":" fixture","model":"x"}),
         json!({"provider":"fixture","model":"x\n"}),
         json!({"provider":"fixture","model":"界".repeat(86)}),
+        json!({"role":"other"}), json!({"role":"Smol"}), json!({"role":" smol"}),
+        json!({"role":null}), json!({"role":"provider/model"}),
+        json!({"role":"smol","provider":"fixture"}),
+        json!({"role":"smol","provider":"fixture","model":"x"}),
+        json!({"role":"smol","api_key":"CANARY"}),
     ] {
         let error = Selection::parse(&selection).unwrap_err().to_string();
         assert!(error.contains("EVAL_INPUT"));
         assert!(!error.contains("CANARY"));
     }
+}
+
+fn catalog_entry(provider: &str, id: &str, reasoning: bool) -> ModelEntry {
+    ModelEntry {
+        model: crate::provider::Model {
+            id: id.into(), name: id.into(), api: "openai-responses".into(),
+            provider: provider.into(), base_url: "https://example.test/v1".into(), reasoning,
+            input: vec![crate::provider::InputType::Text],
+            cost: crate::provider::ModelCost {
+                input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0,
+            },
+            context_window: 128_000, max_tokens: 8_192,
+            headers: Default::default(),
+        },
+        api_key: Some("catalog-owned-key".into()), headers: Default::default(),
+        auth_header: true, compat: None, oauth_config: None,
+    }
+}
+
+#[test]
+fn configured_roles_resolve_registered_models_and_clamp_their_thinking() {
+    let registry = ModelRegistry::from_entries_for_tests(vec![
+        catalog_entry("openai", "fast-model", false),
+        catalog_entry("anthropic", "reasoning-model", true),
+    ]);
+    let config = Config {
+        model_roles: Some(crate::config::ModelRoleSettings {
+            smol: Some("openai/fast-model:high".into()),
+            slow: Some("anthropic/reasoning-model:xhigh".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for (role, provider, model, thinking) in [
+        ("smol", "openai", "fast-model", crate::model::ThinkingLevel::Off),
+        ("slow", "anthropic", "reasoning-model", crate::model::ThinkingLevel::High),
+    ] {
+        let selection = Selection::role(&json!(role)).unwrap();
+        let (entry, level) = resolve_entry(Path::new("/workspace/project"), &selection, &config, &registry).unwrap();
+        assert_eq!(entry.model.provider, provider);
+        assert_eq!(entry.model.id, model);
+        assert_eq!(entry.api_key.as_deref(), Some("catalog-owned-key"));
+        assert_eq!(level, Some(thinking));
+    }
+}
+
+#[test]
+fn role_resolution_never_falls_back_or_escapes_provider_policy() {
+    let cwd = Path::new("/workspace/project");
+    let registry = ModelRegistry::from_entries_for_tests(vec![catalog_entry("openai", "fast-model", false)]);
+    let mut config = Config {
+        default_provider: Some("openai".into()), default_model: Some("fast-model".into()),
+        model_roles: Some(crate::config::ModelRoleSettings {
+            default: Some("openai/fast-model".into()),
+            slow: Some("openai/unknown-model".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for role in ["smol", "slow"] {
+        let error = resolve_entry(cwd, &Selection::role(&json!(role)).unwrap(), &config, &registry).unwrap_err();
+        assert!(error.to_string().contains("PI_JUDGE_BINDING"));
+        assert!(!error.to_string().contains("unknown-model"));
+    }
+    let role = Selection::role(&json!("default")).unwrap();
+    let named = Selection::parse(&json!({"provider":"openai","model":"fast-model"})).unwrap();
+    config.disabled_providers = Some(vec!["openai".into()]);
+    for selection in [&role, &named] {
+        assert!(resolve_entry(cwd, selection, &config, &registry).is_err());
+    }
+    config.disabled_providers = None;
+    config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+        path: "/workspace/project".into(), disabled_providers: Some(vec!["openai".into()]),
+        ..Default::default()
+    }]);
+    for selection in [&role, &named] {
+        assert!(resolve_entry(cwd, selection, &config, &registry).is_err());
+        assert!(resolve_entry(Path::new("/another/project"), selection, &config, &registry).is_ok());
+    }
+}
+
+#[test]
+fn each_request_uses_its_selected_role_and_all_roles_share_the_cell_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let fast = RecordedProvider::new([Reply::Answer("fast answer")]);
+    let slow = RecordedProvider::new([
+        Reply::Answer(r#"{"q":0.2}"#), Reply::Answer(r#"{"q":0.3}"#), Reply::Answer(r#"{"q":0.4}"#),
+    ]);
+    let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None).unwrap();
+    invocation.resolved = vec![
+        (Selection::role(&json!("smol")).unwrap(), fast.judge()),
+        (Selection::role(&json!("slow")).unwrap(), slow.judge()),
+    ];
+    runtime().block_on(async {
+        let reply: Value = serde_json::from_str(&invocation.complete(dir.path(), json!({"prompt":"extract"})).await.unwrap()).unwrap();
+        assert_eq!(reply["text"], "fast answer");
+        let mut input = request();
+        input["model"] = json!("slow");
+        let reply: Value = serde_json::from_str(&invocation.evaluate(dir.path(), input).await.unwrap()).unwrap();
+        assert_eq!(reply["answers"]["q"]["bool"], 0.2);
+        let input = json!({"states":["first","second"],"questions":request()["questions"],"model":"slow","concurrency":1});
+        let reply: Value = serde_json::from_str(&invocation.evaluate_batch(dir.path(), input).await.unwrap()).unwrap();
+        assert_eq!(reply["items"][0]["verdict"]["answers"]["q"]["bool"], 0.3);
+        assert_eq!(reply["items"][1]["verdict"]["answers"]["q"]["bool"], 0.4);
+        let reply: Value = serde_json::from_str(&invocation.evaluate(dir.path(), request()).await.unwrap()).unwrap();
+        assert_eq!(reply["answers"]["q"]["bool"], 0.8, "a previous override must not replace the cell default");
+        for receipt in &invocation.receipts[1..4] {
+            assert_eq!(receipt["selectedModel"]["role"], "slow");
+        }
+        assert_eq!(invocation.receipts[0]["selectedModel"]["role"], "smol");
+        assert_eq!(invocation.receipts[4]["selectedModel"]["role"], "smol");
+        while invocation.receipts.len() < MAX_CALLS {
+            invocation.evaluate(dir.path(), request()).await.unwrap();
+        }
+        let error = invocation.complete(dir.path(), json!({"prompt":"one too many","model":"slow"})).await.unwrap_err();
+        assert!(error.contains("PI_COMPLETION_LIMIT"));
+    });
+    assert_eq!(slow.prompts.lock().unwrap().len(), 3);
+    assert_eq!(fast.prompts.lock().unwrap().len(), MAX_CALLS - 3);
+    assert!(invocation.judge.is_none(), "resolved roles must never become a host-bound authority");
+    assert_eq!(invocation.resolved.len(), 2);
+}
+
+#[test]
+fn helper_roles_cannot_admit_an_unbound_cell_or_replace_host_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordedProvider::new([]);
+    runtime().block_on(async {
+        for binding in [None, Some(provider.judge())] {
+            let expected = if binding.is_some() { "BINDING" } else { "UNBOUND" };
+            let mut invocation = Invocation::new(binding, &json!({}), None).unwrap();
+            let mut input = request();
+            input["model"] = json!("smol");
+            assert!(invocation.evaluate(dir.path(), input).await.unwrap_err().contains(expected));
+            assert!(invocation.complete(dir.path(), json!({"prompt":"work","model":"smol"})).await.unwrap_err().contains(expected));
+            let input = json!({"states":["state"],"questions":request()["questions"],"model":"smol"});
+            assert!(invocation.evaluate_batch(dir.path(), input).await.unwrap_err().contains(expected));
+            assert!(invocation.receipts.is_empty());
+            assert!(invocation.resolved.is_empty());
+        }
+    });
+    assert!(provider.prompts.lock().unwrap().is_empty());
+    let tool = EvalTool::new(dir.path());
+    assert!(tool.effects_for_input(&json!({"code":"42","judge_model":{"role":"smol"}})).networks());
+    assert!(!tool.effects_for_input(&json!({"code":"await completion('work',{model:'smol'})"})).networks());
 }
 
 #[test]

@@ -272,8 +272,10 @@ impl Invocation<'_> {
         &mut self,
         tool: &crate::eval::EvalTool,
         operation: Operation,
-        input: Value,
+        mut input: Value,
     ) -> std::result::Result<String, String> {
+        let selection = self.request_selection(&mut input)
+            .map_err(|error| operation.error(error))?;
         let (request, text, timeout) = Request::parse(operation, input)?;
         let snapshot = self.snapshot_privacy.ok_or_else(|| {
             "PI_MODEL_JOB_HOST: background models require the current Agent invocation".to_string()
@@ -313,7 +315,7 @@ impl Invocation<'_> {
             self.receipts.push(json!({
                 "attempt": base + index + 1,
                 "operation": if operation == Operation::LegacyCompletion { "completion_background" } else { operation.name() },
-                "background": true, "item": index, "selectedModel": self.selection,
+                "background": true, "item": index, "selectedModel": selection,
                 "status": "not_started", "usage": null, "usageKnown": false,
             }));
         }
@@ -332,7 +334,7 @@ impl Invocation<'_> {
                 "PI_MODEL_JOB_SESSION_CHANGED: owner changed during admission".to_string()
             })?;
             let judge = self
-                .bound_judge(&tool.cwd)
+                .bound_judge(&tool.cwd, selection.as_ref())
                 .await
                 .map_err(|error| operation.error(error))?;
             judge

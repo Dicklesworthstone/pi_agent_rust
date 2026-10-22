@@ -331,9 +331,9 @@ class StructuredReaderTests(unittest.TestCase):
         return self.kernel.calls[-1]["bridge"]["input"]
 
     def test_model_factories_preserve_options_and_image_evidence_in_native_requests(self):
-        request = self.launch_model("completion('summarize', system='be concise', schema={'type':'object'}, "
+        request = self.launch_model("completion('summarize', model='smol', system='be concise', schema={'type':'object'}, "
                                     "images=['chart.png'], max_tokens=256, timeout_seconds=17)")
-        self.assertEqual(request, {"prompt": "summarize", "system": "be concise", "schema": {"type": "object"},
+        self.assertEqual(request, {"prompt": "summarize", "model": "smol", "system": "be concise", "schema": {"type": "object"},
                                    "images": ["chart.png"], "max_tokens": 256, "timeout_secs": 17})
         native = model_result("completion", {"schema": "pi.completion.v1", "text": '{"answer":42}',
                                               "data": {"answer": 42}, "schemaValid": True})
@@ -343,11 +343,13 @@ class StructuredReaderTests(unittest.TestCase):
             "name": "jobs", "args": {"action": "wait", "jobId": "model-native", "timeoutMs": 5000},
         })
         request = self.launch_model("judge({'view':'screen'}, {'safe':{'type':'bool','instructions':'safe?'}}, "
-                                    "images=['shot.png'], timeout_seconds=8)", "judgment", "judge-native", "review")
+                                    "model='slow', images=['shot.png'], timeout_seconds=8)", "judgment", "judge-native", "review")
+        self.assertEqual(request["model"], "slow")
         self.assertEqual(request["images"], ["shot.png"])
         self.assertEqual(request["timeout_secs"], 8)
         request = self.launch_model("judge_batch([{'id':1},{'id':2}], {'safe':{'type':'bool','instructions':'safe?'}}, "
-                                    "images={'1':['b.png']}, concurrency=2)", "judgment_batch", "batch-native", "batch")
+                                    "model='tiny', images={'1':['b.png']}, concurrency=2)", "judgment_batch", "batch-native", "batch")
+        self.assertEqual(request["model"], "tiny")
         self.assertEqual(request["images"], {"1": ["b.png"]})
         self.assertEqual(request["concurrency"], 2)
         self.assertEqual(len(self.kernel.calls), 4)
@@ -561,7 +563,11 @@ captured
         self.assertEqual(len(self.kernel.calls), previous + 1)
 
     def test_model_helpers_reject_unknown_or_authority_options_without_dispatch(self):
-        for expression in ("completion('work', model='slow')", "completion('work', api_key='secret')",
+        for expression in ("completion('work', model='other')", "completion('work', model='Slow')",
+                           "completion('work', model=' smol')", "completion('work', model='provider/model')",
+                           "completion('work', model=None)", "completion('work', model=True)",
+                           "judge('state', {'q':{}}, model={'role':'slow'})",
+                           "judge_batch(['state'], {'q':{}}, model=1)", "completion('work', api_key='secret')",
                            "completion('work', max_tokens=0)", "completion('work', timeout_seconds=601)",
                            "completion('work', timeout_seconds=True)", "judge('state', {'q':{}}, retries=1)",
                            "judge('state', {'q':{}}, operation='other')", "judge_batch(['state'], {'q':{}}, min_ok=1)",
@@ -573,6 +579,19 @@ captured
                 self.assertFalse(response["ok"])
                 self.assertIn("EVAL_MODEL_INPUT", response["error"])
         self.assertEqual(self.kernel.calls, [])
+
+    def test_model_roles_are_per_launch_and_never_replayed_or_inherited(self):
+        for role in ("default", "smol", "slow", "plan", "commit", "vision", "designer", "task", "advisor", "tiny"):
+            with self.subTest(role=role):
+                request = self.launch_model(f"completion('work', model={role!r})")
+                self.assertEqual(request["model"], role)
+        request = self.launch_model("completion('cell binding')")
+        self.assertEqual(request, {"prompt": "cell binding"})
+        response = self.kernel.cell("await completion('blocked', model='slow')",
+                                    lambda frame: self.kernel.reply(frame, error="PI_COMPLETION_BINDING"))
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_COMPLETION_BINDING", response["error"])
+        self.assertEqual(len(self.kernel.calls), 12)
 
     def test_model_attach_reconstructs_handles_and_checks_current_owner_and_operation(self):
         snapshot = model_snapshot("completion", job_id="recovered", status="running")

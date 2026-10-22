@@ -401,12 +401,17 @@
             return waitModelJob(this,waitMilliseconds(timeout),raiseErrors);
         }
     }
+    const modelRoles = freeze({default:true,smol:true,slow:true,plan:true,commit:true,
+        vision:true,designer:true,task:true,advisor:true,tiny:true});
     const modelOptions = (options, allowed) => {
         if (!modelRecord(options)) throw new TypeErrorType('EVAL_MODEL_INPUT: options must be an object');
         const args = {};
         for (const key of keys(options)) {
             if (!hasOwn(allowed,key)) throw new TypeErrorType(`EVAL_MODEL_INPUT: unknown option ${key}`);
             const value = options[key];
+            if (key === 'model' && (typeof value !== 'string' || !hasOwn(modelRoles,value))) {
+                throw new TypeErrorType('EVAL_MODEL_INPUT: model must name a canonical native role');
+            }
             if (key === 'timeoutSeconds' && (!integer(value) || value < 1 || value > 600)) {
                 throw new RangeErrorType('EVAL_MODEL_INPUT: timeoutSeconds must be an integer from 1 to 600');
             }
@@ -441,13 +446,13 @@
     };
     const completion = async (prompt, options = {}) => {
         if (typeof prompt !== 'string' || !prompt.trim()) throw new TypeErrorType('EVAL_MODEL_INPUT: completion requires a nonempty prompt');
-        const args = modelOptions(options,{system:'system',schema:'schema',images:'images',maxTokens:'max_tokens',timeoutSeconds:'timeout_secs'});
+        const args = modelOptions(options,{model:'model',system:'system',schema:'schema',images:'images',maxTokens:'max_tokens',timeoutSeconds:'timeout_secs'});
         return launchModel('completion',{prompt,...args});
     };
     const judge = async (state, questions, options = {}) => {
         if (!modelRecord(questions) || keys(questions).length === 0) throw new TypeErrorType('EVAL_MODEL_INPUT: questions must be a nonempty object');
         return launchModel('judgment',{state,questions,
-            ...modelOptions(options,{images:'images',timeoutSeconds:'timeout_secs'})});
+            ...modelOptions(options,{model:'model',images:'images',timeoutSeconds:'timeout_secs'})});
     };
     const judgeBatch = async (states, questions, options = {}) => {
         if ((!isArray(states) && !modelRecord(states)) || keys(states).length === 0
@@ -455,7 +460,7 @@
             throw new TypeErrorType('EVAL_MODEL_INPUT: judgeBatch requires nonempty states and questions');
         }
         return launchModel('judgment_batch',{states,questions,
-            ...modelOptions(options,{images:'images',concurrency:'concurrency',timeoutSeconds:'timeout_secs'})});
+            ...modelOptions(options,{model:'model',images:'images',concurrency:'concurrency',timeoutSeconds:'timeout_secs'})});
     };
     completion.attach = id => attachModel('completion',id);
     judge.attach = id => attachModel('judgment',id);

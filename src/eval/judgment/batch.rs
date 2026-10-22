@@ -138,7 +138,8 @@ fn check_owner(owner: &AgentCx) -> BatchResult<()> {
 }
 
 impl Invocation<'_> {
-    pub(super) async fn evaluate_batch(&mut self, cwd: &Path, input: Value) -> BatchResult<String> {
+    pub(super) async fn evaluate_batch(&mut self, cwd: &Path, mut input: Value) -> BatchResult<String> {
+        let selection = self.request_selection(&mut input).map_err(public_error)?;
         let plan = Plan::parse(&input)?;
         if self.judge.is_none() && self.selection.is_none() {
             return Err("PI_JUDGE_UNBOUND: supply this cell's judge_model or bind a Judge in the host".into());
@@ -156,11 +157,11 @@ impl Invocation<'_> {
         for index in 0..count {
             self.receipts.push(json!({
                 "attempt":base + index + 1, "batch":base + 1, "item":index,
-                "selectedModel":self.selection, "status":"not_started",
+                "selectedModel":selection, "status":"not_started",
                 "usage":null, "usageKnown":false,
             }));
         }
-        let judge = match self.bound_judge(cwd).await {
+        let judge = match self.bound_judge(cwd, selection.as_ref()).await {
             Ok(judge) => judge,
             Err(error) => {
                 let error = public_error(error);

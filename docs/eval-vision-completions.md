@@ -24,7 +24,9 @@ with the captured session identity and existing approval/path policy. Standalone
 EvalTool instances must use embedded images; a local fallback reader is not
 granted. No URL fetching or implicit network image download is added.
 
-Requests still use the explicit per-cell `judge_model`, or the SDK host's bound
+Requests use the explicit per-cell `judge_model`, an explicitly selected
+[helper model role](eval-structured-results.md#per-request-model-roles) in an
+admitted cell, or the SDK host's bound
 Judge. The selected catalog model must declare image input; SDK hosts explicitly
 use `Judge::new(provider, options).with_image_support(true)`. Unsupported bindings
 fail before reading image paths or calling the model, rather than dropping images

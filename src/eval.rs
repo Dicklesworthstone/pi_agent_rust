@@ -674,7 +674,7 @@ impl Tool for EvalTool {
          uses the current cell's host and policy. JS handles can be retained on \
          globalThis; all waits remain within the current cell's deadline. \
          Native call receipts are included in result details. For typed judgments, \
-         set judge_model={provider,model} for this cell, then call \
+         set judge_model={provider,model} or {role:'smol'} for this cell, then call \
          __pi_judge through tool.call with {state,questions,images?} and parse its JSON. \
          Questions use bool/choice/score rubrics. images is an array of local paths \
          or {type:'image',data:base64,mimeType}; detail may only be omitted or auto. \
@@ -719,7 +719,13 @@ impl Tool for EvalTool {
          completion.attach(id), judge.attach(id) and judgeBatch.attach(id) / \
          judge_batch.attach(id) recover known native jobs after reset. JS options \
          use maxTokens/timeoutSeconds; Python uses max_tokens/timeout_seconds. \
-         No helper model tiers, retries, minOk or consuming result drains. The native \
+         In an explicitly admitted judge_model cell, model:'smol' or model:'slow' \
+         (Python model='smol') selects a configured native modelRoles entry for \
+         one completion, judgment or batch. All native role names are accepted. \
+         Each selected role resolves once per cell from trusted settings, with \
+         its configured thinking level; missing/disabled roles fail without \
+         fallback. Omission uses the cell binding. SDK host-bound Judges cannot \
+         be overridden. No helper retries or minOk. The native \
          bridge for explicitly retained work is available through tool.call: \
          call __pi_model_complete_start, __pi_judge_start or __pi_judge_batch_start with \
          the same fields and optional timeout_secs (1-600; default 60 for single \
@@ -779,13 +785,24 @@ impl Tool for EvalTool {
                 },
                 "judge_model": {
                     "type": "object",
-                    "description": "Explicit model for this cell's judgment/completion calls, including __pi_judge_start, __pi_judge_batch_start, __pi_model_complete_start and __pi_complete_start; host registry credentials only, no fallback. Omit when the host already binds a Judge. Foreground and background requests share 16 reserved attempts in this launching cell. Foreground calls keep the cell deadline; explicitly started jobs freeze this binding under their own bounded timeout. Later cells must select a model again for new requests.",
-                    "properties": {
-                        "provider": {"type":"string", "minLength":1, "maxLength":256},
-                        "model": {"type":"string", "minLength":1, "maxLength":256}
-                    },
-                    "required": ["provider", "model"],
-                    "additionalProperties": false
+                    "description": "Explicit model admission and default binding for this cell's judgment and schema-validated completion calls, including __pi_judge, __pi_judge_batch, __pi_complete and their retained start operations. Supply provider/model or a role configured in trusted modelRoles settings; role specs preserve their thinking suffix. Each helper may select another configured role with model. Only native registry credentials are used; missing/disabled roles fail without fallback. Omit when the host binds a Judge, which helpers cannot override. Requests share 16 reserved attempts per launching cell. Retained jobs freeze their selected binding and timeout; later cells must opt in again for new requests.",
+                    "oneOf": [
+                        {
+                            "properties": {
+                                "provider": {"type":"string", "minLength":1, "maxLength":256},
+                                "model": {"type":"string", "minLength":1, "maxLength":256}
+                            },
+                            "required": ["provider", "model"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "properties": {
+                                "role": {"type":"string", "enum":["default","smol","slow","plan","commit","vision","designer","task","advisor","tiny"]}
+                            },
+                            "required": ["role"],
+                            "additionalProperties": false
+                        }
+                    ]
                 },
                 "output_path": {
                     "type": "string",

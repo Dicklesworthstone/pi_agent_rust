@@ -1221,6 +1221,9 @@ def _model_options(options, allowed):
     for name, value in options.items():
         if name not in allowed:
             raise TypeError(f"EVAL_MODEL_INPUT: unknown option {name}")
+        if name == "model" and (type(value) is not str or value not in (
+                "default", "smol", "slow", "plan", "commit", "vision", "designer", "task", "advisor", "tiny")):
+            raise TypeError("EVAL_MODEL_INPUT: model must name a canonical native role")
         if name == "timeout_seconds" and (type(value) is not int or not 1 <= value <= 600):
             raise ValueError("EVAL_MODEL_INPUT: timeout_seconds must be an integer from 1 to 600")
         if name == "max_tokens" and (type(value) is not int or not 1 <= value <= 4096):
@@ -1252,7 +1255,7 @@ async def _model_launch(operation, arguments):
 async def _completion(prompt, **options):
     if type(prompt) is not str or not prompt.strip():
         raise TypeError("EVAL_MODEL_INPUT: completion requires a nonempty prompt")
-    arguments = _model_options(options, {"system": "system", "schema": "schema",
+    arguments = _model_options(options, {"model": "model", "system": "system", "schema": "schema",
                                "images": "images", "max_tokens": "max_tokens", "timeout_seconds": "timeout_secs"})
     return await _model_launch("completion", {"prompt": prompt, **arguments})
 
@@ -1261,14 +1264,14 @@ async def _judge(state, questions, **options):
     if type(questions) is not dict or not questions:
         raise TypeError("EVAL_MODEL_INPUT: questions must be a nonempty object")
     return await _model_launch("judgment", {"state": state, "questions": questions,
-                              **_model_options(options, {"images": "images", "timeout_seconds": "timeout_secs"})})
+                              **_model_options(options, {"model": "model", "images": "images", "timeout_seconds": "timeout_secs"})})
 
 
 async def _judge_batch(states, questions, **options):
     if type(states) not in (list, dict) or not states or type(questions) is not dict or not questions:
         raise TypeError("EVAL_MODEL_INPUT: judge_batch requires nonempty states and questions")
     return await _model_launch("judgment_batch", {"states": states, "questions": questions,
-                              **_model_options(options, {"images": "images", "concurrency": "concurrency",
+                              **_model_options(options, {"model": "model", "images": "images", "concurrency": "concurrency",
                                                         "timeout_seconds": "timeout_secs"})})
 
 

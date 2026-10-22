@@ -24,7 +24,8 @@ still uses the current Agent's enabled tools, approval and session policy.
 
 ## Launch, continue working, then collect
 
-Supply `judge_model: {provider, model}` on the launching Eval invocation, or bind
+Supply `judge_model: {provider, model}` or `judge_model: {role: 'smol'}` on the
+launching Eval invocation, or bind
 a Judge in the SDK host. The model is resolved once and frozen in the job; later
 cells need no model binding just to inspect it. New completion requests do not
 inherit an earlier cell's selection.
