@@ -1979,10 +1979,12 @@ async fn run(
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
     let is_interactive = !cli.acp && !cli.print && cli.mode.is_none() && cli.export.is_none();
-    if !is_interactive && !cli.acp && (cli.prewalk || cli.prewalk_into.is_some()) {
-        bail!(
-            "Prewalk CLI flags require interactive or ACP mode; SDK callers can use SessionOptions.prewalk"
-        );
+    let supports_prewalk = is_interactive
+        || cli.acp
+        || (cli.export.is_none()
+            && (cli.print || matches!(cli.mode.as_deref(), Some("text" | "json" | "rpc"))));
+    if !supports_prewalk && (cli.prewalk || cli.prewalk_into.is_some()) {
+        bail!("Prewalk CLI flags require an agent execution mode, not session export");
     }
     // The default FTUI stack runs on an SDK session that boots its own
     // extension runtime (`pi::sdk::create_agent_session`), so the classic
@@ -2348,11 +2350,11 @@ async fn run(
         has_extensions,
     )?;
 
-    let prewalk_enabled = is_interactive
-        && !cli.no_prewalk
+    let prewalk_enabled = !cli.no_prewalk
         && (cli.prewalk
             || cli.prewalk_into.is_some()
-            || (saved_workdir.is_none()
+            || (is_interactive
+                && saved_workdir.is_none()
                 && config
                     .prewalk
                     .as_ref()
@@ -10384,6 +10386,49 @@ where
     H: Fn() -> EH + Sync,
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
+    let prewalk_turn = session.begin_prewalk_turn();
+    let result = run_print_prompt_attempts(
+        session,
+        config,
+        abort_signal,
+        make_event_handler,
+        retry_enabled,
+        max_retries,
+        is_json,
+        text_stream_state,
+        input,
+        failover_ctx,
+        failover_state,
+        &prewalk_turn,
+    )
+    .await;
+    let interrupted = match &result {
+        Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
+        Err(_) => true,
+    };
+    session.finish_prewalk_turn(interrupted);
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_print_prompt_attempts<H, EH>(
+    session: &mut AgentSession,
+    config: &Config,
+    abort_signal: &pi::agent::AbortSignal,
+    make_event_handler: &H,
+    retry_enabled: bool,
+    max_retries: u32,
+    is_json: bool,
+    text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
+    input: PromptInput,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    failover_state: &mut PrintFailoverState,
+    prewalk_turn: &pi::prewalk::PrewalkTurn,
+) -> Result<AssistantMessage>
+where
+    H: Fn() -> EH + Sync,
+    EH: Fn(AgentEvent) + Send + Sync + 'static,
+{
     // Hooks belong to the logical prompt, not its provider attempts. Capture
     // their effective base once so a retry or provider swap retains the same
     // instructions after each attempt restores the session's ordinary prompt.
@@ -10424,11 +10469,6 @@ where
         }
     };
 
-    // Fast path: no retry needed.
-    if !retry_enabled {
-        return first_result.map_err(anyhow::Error::new);
-    }
-
     let mut retry_count: u32 = 0;
     // Set once a fallback chain entry has been installed for this turn; every
     // exit below then closes the failover lifecycle before returning.
@@ -10439,6 +10479,43 @@ where
     let mut current_result = first_result;
 
     loop {
+        if current_result.is_ok() && session.prewalk_handoff_pending() {
+            if retry_count > 0 && is_json {
+                emit_json_event(&AgentEvent::AutoRetryEnd {
+                    success: true,
+                    attempt: retry_count,
+                    final_error: None,
+                });
+            }
+            emit_print_failover_end(is_json, failed_over, session, true);
+            retry_count = 0;
+            failed_over = false;
+            if let Some(target) = session
+                .complete_prewalk_handoff(prewalk_turn, Some(abort_signal))
+                .await?
+            {
+                failover_state.clear();
+                make_event_handler()(AgentEvent::PrewalkSwitched {
+                    provider: target.provider,
+                    model: target.model,
+                    thinking: target.thinking.unwrap_or_default(),
+                });
+            }
+            // The completed tool batch and drained steering are already saved.
+            // Continuing retains the original budgets and effective hook prompt,
+            // even when retries are disabled or text has already been printed.
+            current_result = session
+                .run_continue_with_abort_and_system_prompt(
+                    Some(abort_signal.clone()),
+                    turn_system_prompt.as_deref(),
+                    make_event_handler(),
+                )
+                .await;
+            continue;
+        }
+        if !retry_enabled {
+            return current_result.map_err(anyhow::Error::new);
+        }
         // One policy, shared with RPC and available to the interactive stacks
         // (bd-u2qv4). It decides; everything below is this surface's I/O for
         // the decision — JSON events, the backoff sleep, tail restoration and

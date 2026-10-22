@@ -1874,8 +1874,8 @@ pub struct Agent {
     /// Automatic retry/failover must not replenish the injection allowance.
     stream_rule_turn: usize,
 
-    /// A prewalk only yields to the owning SDK; it never installs a provider
-    /// inside the tool loop or lets a tool choose the destination.
+    /// A prewalk only yields to the owning session driver; it never installs
+    /// a provider inside the tool loop or lets a tool choose the destination.
     prewalk: Option<crate::prewalk::PrewalkState>,
     prewalk_budget: Option<PrewalkRunBudget>,
 
@@ -16053,6 +16053,60 @@ impl AgentSession {
         .await?;
         self.agent.disarm_prewalk();
         Ok(())
+    }
+
+    /// Start the prewalk clock and capture session ownership for one logical
+    /// request. Native drivers retain this token through provider retries and
+    /// call `finish_prewalk_turn` after the final attempt. The SDK does this
+    /// automatically for its prompt/content/continuation entrypoints.
+    #[must_use]
+    pub fn begin_prewalk_turn(&mut self) -> crate::prewalk::PrewalkTurn {
+        let origin = self.session_action_admission.capture_origin();
+        self.agent.begin_prewalk_run();
+        crate::prewalk::PrewalkTurn { origin }
+    }
+
+    /// Whether a completed native attempt yielded after its first edit batch.
+    /// Only a successful, durably saved attempt may commit this handoff.
+    #[must_use]
+    pub fn prewalk_handoff_pending(&self) -> bool {
+        self.agent
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+    }
+
+    /// Commit a yielded handoff before continuing the existing transcript.
+    /// `None` means a newer explicit selection won, or no handoff was pending.
+    /// A driver that observed `prewalk_handoff_pending` continues in either
+    /// case, without rerunning input hooks, user messages, or completed tools.
+    pub async fn complete_prewalk_handoff(
+        &mut self,
+        turn: &crate::prewalk::PrewalkTurn,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        let Some(mut target) = self.agent.take_prewalk_handoff() else {
+            return Ok(None);
+        };
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
+        if !self.commit_prewalk_handoff(&target, &turn.origin).await? {
+            return Ok(None);
+        }
+        target.thinking = Some(
+            self.agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default(),
+        );
+        Ok(Some(target))
+    }
+
+    /// Release the logical request's shared budgets. Errors and cancellation
+    /// disarm an unfinished prewalk; a read-only completed request keeps it.
+    pub fn finish_prewalk_turn(&mut self, interrupted: bool) {
+        self.agent.finish_prewalk_run(interrupted);
     }
 
     /// A prewalk keeps provider and session-action authority from provenance

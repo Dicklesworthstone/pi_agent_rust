@@ -477,11 +477,7 @@ impl AgentSessionHandle {
         // this logical turn so retries and provider swaps reuse it after the
         // individual attempt has restored the session's ordinary prompt.
         let mut turn_system_prompt = self.session.agent.system_prompt().map(str::to_string);
-        let prewalk_origin = self
-            .session
-            .session_action_admission_gate()
-            .capture_origin();
-        self.session.agent.begin_prewalk_run();
+        let prewalk_turn = self.session.begin_prewalk_turn();
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
@@ -522,7 +518,7 @@ impl AgentSessionHandle {
                 turn_system_prompt.as_deref(),
                 &shared,
                 &turn,
-                &prewalk_origin,
+                &prewalk_turn,
             )
             .await;
         // Also cover failures while preparing a retry/failover. Install the
@@ -532,7 +528,7 @@ impl AgentSessionHandle {
             Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
             Err(_) => true,
         };
-        self.session.agent.finish_prewalk_run(interrupted);
+        self.session.finish_prewalk_turn(interrupted);
         turn.finish(&result);
         result
     }
@@ -869,7 +865,7 @@ impl AgentSessionHandle {
         turn_system_prompt: Option<&str>,
         shared: &EventCallback,
         turn: &LogicalTurn,
-        prewalk_origin: &crate::extensions::SessionActionOrigin,
+        prewalk_turn: &crate::prewalk::PrewalkTurn,
     ) -> Result<AssistantMessage> {
         let mut progress = TurnProgress {
             retry_count: 0,
@@ -886,9 +882,7 @@ impl AgentSessionHandle {
             // The native turn has already saved every result in the triggering
             // tool batch. Continue that transcript exactly once, without the
             // retry rewind or a second user message.
-            if current.is_ok()
-                && let Some(target) = self.session.agent.take_prewalk_handoff()
-            {
+            if current.is_ok() && self.session.prewalk_handoff_pending() {
                 self.finish_recovery(&current, progress.retry_count, failed_over, shared);
                 progress.retry_count = 0;
                 failed_over = false;
@@ -897,9 +891,9 @@ impl AgentSessionHandle {
                 // automatic handoff. Check and commit under the same provider
                 // and session-action authority; native continuation installs
                 // a newer explicit choice without overwriting it.
-                if self
+                if let Some(target) = self
                     .session
-                    .commit_prewalk_handoff(&target, prewalk_origin)
+                    .complete_prewalk_handoff(prewalk_turn, Some(abort_signal))
                     .await?
                 {
                     self.failover_state.clear();

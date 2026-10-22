@@ -8,7 +8,7 @@ mod common;
 
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
-use common::TestHarness;
+use common::{MockHttpResponse, MockHttpServer, TestHarness};
 use pi::config::Config;
 #[cfg(unix)]
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
@@ -4103,6 +4103,270 @@ fn collect_json_mode_text_deltas(lines: &[serde_json::Value]) -> Vec<String> {
                 .map(ToOwned::to_owned)
         })
         .collect()
+}
+
+fn prewalk_stream_response(tool_path: Option<&str>) -> MockHttpResponse {
+    let delta = tool_path.map_or_else(
+        || json!({"role": "assistant", "content": "Prewalk destination finished."}),
+        |path| {
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0, "id": format!("write-{path}"), "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json!({"path": path, "content": "one completed edit"}).to_string()
+                    }
+                }]
+            })
+        },
+    );
+    let start = json!({
+        "id": "prewalk-completion", "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+    });
+    let end = json!({
+        "id": "prewalk-completion",
+        "choices": [{"index": 0, "delta": {},
+            "finish_reason": if tool_path.is_some() { "tool_calls" } else { "stop" }}]
+    });
+    MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n").into_bytes(),
+    }
+}
+
+fn configure_prewalk_cli(
+    harness: &CliTestHarness,
+    destination: Vec<MockHttpResponse>,
+    retries: u32,
+) -> MockHttpServer {
+    let server = harness.harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/source/v1/chat/completions",
+        vec![prewalk_stream_response(Some("first-edit.txt"))],
+    );
+    server.add_route_queue("POST", "/target/v1/chat/completions", destination);
+    let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&agent_dir).expect("create isolated prewalk configuration");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth store");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec(&json!({"providers": {
+            "prewalk-source": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/source/v1", server.base_url()),
+                "apiKey": "source-fixture-key", "authHeader": true,
+                "models": [{"id": "source", "reasoning": false,
+                    "contextWindow": 32_000, "maxTokens": 512}]
+            },
+            "prewalk-target": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/target/v1", server.base_url()),
+                "apiKey": "target-fixture-key", "authHeader": true,
+                "models": [{"id": "target", "reasoning": false,
+                    "contextWindow": 64_000, "maxTokens": 256}]
+            }
+        }}))
+        .unwrap(),
+    )
+    .expect("write prewalk models");
+    fs::write(
+        &harness.env["PI_CONFIG_PATH"],
+        serde_json::to_vec(&json!({
+            "defaultProvider": "prewalk-source", "defaultModel": "source",
+            "compaction": {"enabled": false},
+            "retry": {"enabled": retries > 0, "maxRetries": retries,
+                "baseDelayMs": 0, "maxDelayMs": 0}
+        }))
+        .unwrap(),
+    )
+    .expect("write prewalk settings");
+    server
+}
+
+fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> CliResult {
+    let mut args = vec![
+        "--mode",
+        mode,
+        "--prewalk-into",
+        "prewalk-target/target:off",
+        "--tools",
+        "read,write",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--session",
+        "prewalk-session.jsonl",
+        "--max-tool-iterations",
+        tool_limit,
+    ];
+    if mode == "rpc" {
+        harness.run_with_stdin(
+            &args,
+            Some(b"{\"id\":\"prewalk\",\"type\":\"prompt\",\"message\":\"Complete this prewalk task.\"}\n"),
+        )
+    } else {
+        args.extend(["--print", "Complete this prewalk task."]);
+        harness.run(&args)
+    }
+}
+
+fn assert_prewalk_cli_transcript(harness: &CliTestHarness, server: &MockHttpServer, requests: usize) {
+    let captured = server.requests();
+    assert_eq!(
+        captured.len(),
+        requests,
+        "exact native provider admission count"
+    );
+    assert_eq!(captured[0].path, "/source/v1/chat/completions");
+    for request in &captured[1..] {
+        assert_eq!(request.path, "/target/v1/chat/completions");
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer target-fixture-key"
+        }));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "target");
+        let messages = body["messages"].as_array().expect("destination transcript");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            1,
+            "completed source edit must appear once in every destination attempt"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user"
+                        && message.to_string().contains("Complete this prewalk task.")
+                })
+                .count(),
+            1,
+            "continuation must not replay the authored prompt"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(harness.harness.temp_path("first-edit.txt")).unwrap(),
+        "one completed edit"
+    );
+    let saved = fs::read_to_string(harness.harness.temp_path("prewalk-session.jsonl")).unwrap();
+    let entries = parse_json_mode_stdout_lines(&saved);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["message"]["role"] == "toolResult")
+            .count(),
+        1,
+        "the native edit result must be durably recorded exactly once"
+    );
+    assert!(entries.iter().any(|entry| {
+        entry["type"] == "model_change"
+            && entry["provider"] == "prewalk-target"
+            && entry["modelId"] == "target"
+    }));
+}
+
+#[test]
+fn e2e_cli_print_prewalk_continues_even_with_retries_disabled() {
+    for mode in ["text", "json"] {
+        let harness = CliTestHarness::new(&format!("print_prewalk_{mode}"));
+        let server = configure_prewalk_cli(&harness, vec![prewalk_stream_response(None)], 0);
+        let result = run_prewalk_cli(&harness, mode, "8");
+        assert_exit_code(&harness.harness, &result, 0);
+        assert_contains(
+            &harness.harness,
+            &result.stdout,
+            "Prewalk destination finished.",
+        );
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        if mode == "json" {
+            let events = parse_json_mode_stdout_lines(&result.stdout);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "prewalk_switched")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_rpc_prewalk_retries_the_destination_without_replaying_tools() {
+    let harness = CliTestHarness::new("rpc_prewalk_retry");
+    let server = configure_prewalk_cli(
+        &harness,
+        vec![
+            MockHttpResponse::json(
+                503,
+                &json!({"error": {
+                    "message": "fixture unavailable", "type": "server_error"
+                }}),
+            ),
+            prewalk_stream_response(None),
+        ],
+        1,
+    );
+    let result = run_prewalk_cli(&harness, "rpc", "8");
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_prewalk_cli_transcript(&harness, &server, 3);
+    let events = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "prewalk_switched")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "auto_retry_end" && event["success"] == true)
+    );
+    assert_eq!(events.last().unwrap()["type"], "agent_end");
+    assert!(events.last().unwrap().get("error").is_none());
+}
+
+#[test]
+fn e2e_cli_prewalk_preserves_the_original_tool_iteration_limit() {
+    for mode in ["json", "rpc"] {
+        let harness = CliTestHarness::new(&format!("prewalk_tool_budget_{mode}"));
+        let server = configure_prewalk_cli(
+            &harness,
+            vec![prewalk_stream_response(Some("must-not-execute.txt"))],
+            0,
+        );
+        let result = run_prewalk_cli(&harness, mode, "1");
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        assert!(!harness.harness.temp_path("must-not-execute.txt").exists());
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        assert!(events.iter().any(|event| {
+            event
+                .to_string()
+                .contains("Maximum tool iterations (1) exceeded")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_end")
+                .count(),
+            1
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]

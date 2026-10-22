@@ -75,6 +75,30 @@ model or reasoning selection takes precedence over the armed destination.
 Switching models or thinking manually, or interrupting a turn, disarms prewalk. The selected
 model and thinking level are persisted together before the new provider runs.
 
+## Print and RPC
+
+The same explicit launch flags work for text output, JSON event streams, and
+RPC servers:
+
+```sh
+pi --print --prewalk --smol openai/gpt-5-mini "Implement the requested change"
+pi --mode json --prewalk-into openai/gpt-5-mini:low "Implement the requested change"
+pi --mode rpc --prewalk-into @smol
+```
+
+These modes require an explicit prewalk flag; `prewalk.enabled` only supplies a
+default for fresh interactive launches. Add `--session run.jsonl` to save a
+print run. Session export does not execute a provider turn and cannot use
+prewalk flags.
+
+The handoff runs even when automatic retries are disabled. Destination
+failures use the normal retry and compaction policy, while the original
+authored input, completed tools, time limit, and tool-iteration budget are
+retained. JSON and RPC emit `prewalk_switched` after the saved model transition.
+RPC keeps live steering admission open through the handoff and emits its
+terminal `agent_end` when the entire request finishes. Explicit RPC model or
+thinking selections disarm the pending launch handoff.
+
 ## In-process SDK
 
 Set `SessionOptions.prewalk` when creating an SDK session, or arm an existing
@@ -98,8 +122,13 @@ The SDK's prompt, image/content, and continuation entrypoints share this
 workflow. `prewalk_target()` reports the armed destination and
 `disarm_prewalk()` cancels it. A logical SDK turn still emits one `AgentStart`
 and one `AgentEnd`. The low-level `Agent` loop does not perform a handoff by
-itself; use the owning SDK handle so persistence and model installation stay
-together.
+itself. Native `AgentSession` drivers can share the same durable transition:
+call `begin_prewalk_turn()` once per logical request, retain its token through
+retries, and check `prewalk_handoff_pending()` after a successful saved attempt.
+Call `complete_prewalk_handoff()` before continuing the existing transcript,
+then `finish_prewalk_turn(interrupted)` on every exit. A newer explicit selection
+can win the transition without restarting the authored request. The SDK and
+built-in drivers handle this lifecycle automatically.
 
 ## Editor sessions over ACP
 
@@ -121,7 +150,5 @@ live editor session keeps its current prewalk state. The `prewalk.enabled`
 setting does not implicitly arm ACP sessions, and `--no-prewalk` disables launch
 arming. ACP's built-in tool set does not include `todo`, so an approved successful
 project edit can trigger the handoff without a todo prerequisite.
-
-Print and RPC startup currently reject explicit prewalk CLI flags.
 
 Behavior reference: [OMP prewalk documentation](https://omp.sh/docs/prewalk).

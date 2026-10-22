@@ -6085,6 +6085,8 @@ async fn run_prompt_with_retry_owned(
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
     let mut failovers_this_turn: u32 = 0;
+    let mut failover_open = false;
+    let mut prewalk_turn = None;
     // Distinct from retry_count: a failover resets the retry BUDGET but must
     // never replay the first attempt (which would re-add the user message and
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
@@ -6109,6 +6111,7 @@ async fn run_prompt_with_retry_owned(
         }
 
         let (abort_handle, abort_signal) = AbortHandle::new();
+        let handoff_abort = abort_signal.clone();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             // Cancellation may win while acquiring the slot, before the
             // monitor can find this attempt's handle. Publish and recheck
@@ -6128,7 +6131,7 @@ async fn run_prompt_with_retry_owned(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-        let result = {
+        let (result, prewalk_pending) = {
             let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
@@ -6156,7 +6159,7 @@ async fn run_prompt_with_retry_owned(
                 output.clone(),
             );
 
-            if first_attempt_done {
+            let result = if first_attempt_done {
                 // Retry: resume the turn from the last completed state instead of
                 // replaying it from the user message. The incomplete output of the
                 // failed request was stripped via `revert_incomplete_response`
@@ -6209,6 +6212,7 @@ async fn run_prompt_with_retry_owned(
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
+                prewalk_turn = Some(guard.begin_prewalk_turn());
                 turn_system_prompt = guard.agent.system_prompt().map(str::to_string);
                 guard
                     .agent
@@ -6233,13 +6237,74 @@ async fn run_prompt_with_retry_owned(
                         )
                         .await
                 }
-            }
+            };
+            (result, guard.prewalk_handoff_pending())
         };
         let durability_cx = AgentCx::for_request();
         let result = finish_rpc_turn_durability(
             result,
             acknowledge_durable_rpc_in_flight(&session, &shared_state, &durability_cx).await,
         );
+
+        if result.is_ok() && prewalk_pending {
+            let transition = async {
+                let owner = prewalk_turn
+                    .as_ref()
+                    .ok_or_else(|| Error::session("Prewalk turn ownership is unavailable"))?;
+                let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                    .await
+                    .map_err(|error| {
+                        Error::session(format!("prewalk session lock failed: {error}"))
+                    })?;
+                if retry_count > 0 {
+                    let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
+                        success: true,
+                        attempt: retry_count,
+                        final_error: None,
+                    }));
+                    retry_count = 0;
+                }
+                if failover_open {
+                    let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
+                        success: true,
+                        provider: guard.agent.provider().name().to_string(),
+                        model: guard.agent.provider().model_id().to_string(),
+                        restored_primary: false,
+                    }));
+                    failover_open = false;
+                }
+                if let Some(target) = guard
+                    .complete_prewalk_handoff(owner, Some(&handoff_abort))
+                    .await?
+                {
+                    let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                        .await
+                        .map_err(|error| {
+                            Error::session(format!("prewalk state lock failed: {error}"))
+                        })?;
+                    state.clear_failover_lifecycle();
+                    drop(state);
+                    let _ = out_tx.send(output.event_line(&AgentEvent::PrewalkSwitched {
+                        provider: target.provider,
+                        model: target.model,
+                        thinking: target.thinking.unwrap_or_default(),
+                    }));
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(error) = transition {
+                final_error = Some(error.to_string());
+                final_error_hints = Some(error_hints_value(&error));
+                break;
+            }
+            // Keep accepting live steering: the next native attempt consumes
+            // the same durable transcript and original budgets. No retry tail
+            // rewind, second authored prompt, or finalization phase occurs.
+            final_error = None;
+            final_error_hints = None;
+            continue;
+        }
 
         if matches!(
             &result,
@@ -6426,6 +6491,7 @@ async fn run_prompt_with_retry_owned(
                     }
                     retry_count = 0;
                     failovers_this_turn += 1;
+                    failover_open = true;
                     final_error = None;
                     final_error_hints = None;
                     continue;
@@ -6549,6 +6615,16 @@ async fn run_prompt_with_retry_owned(
         }
     }
 
+    let completion_cx = AgentCx::for_request();
+    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &completion_cx).await {
+        guard.finish_prewalk_turn(!success);
+    }
+    if let Ok(mut guard) =
+        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &completion_cx).await
+    {
+        *guard = None;
+    }
+
     if retry_count > 0 {
         let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
             success,
@@ -6563,7 +6639,7 @@ async fn run_prompt_with_retry_owned(
     // primary after cooldown is a separate lifecycle (`restoredPrimary: true`
     // from `maybe_restore_primary`). The turn context may already be
     // cancelled, so the shared state is read with a fresh request context.
-    if failovers_this_turn > 0 {
+    if failover_open {
         let lifecycle_cx = AgentCx::for_request();
         let (provider, model) = OwnedMutexGuard::lock(Arc::clone(&shared_state), &lifecycle_cx)
             .await
@@ -15997,6 +16073,7 @@ async fn apply_thinking_level_for_session(
     }
     *inner_session = candidate;
     guard.agent.stream_options_mut().thinking_level = Some(level);
+    guard.agent.disarm_prewalk();
     guard.refresh_extension_completion_host_state();
     if changed {
         state.provider_admission.clear();
@@ -16053,6 +16130,7 @@ async fn apply_model_change(
         return Err(Error::session_persistence(reason));
     }
     *inner_session = candidate;
+    guard.agent.disarm_prewalk();
     Ok(provider_transition)
 }
 
