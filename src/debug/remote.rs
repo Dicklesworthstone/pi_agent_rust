@@ -134,13 +134,16 @@ impl DebugTool {
             return Err(tool_err("DAP_PERMISSION", "debugger attachment requires I/O and timer capabilities"));
         }
         // Complete local preflight before opening the user's selected endpoint.
+        // cwd selects local source identity, not the remote process directory.
+        // Configuration mapping roots remain anchored to the tool workspace.
+        let source_root = self.resolve_working_directory(input.cwd.as_deref())?;
         let endpoint = input.remote.endpoint()?;
         let mappings = input.remote.mappings(&self.cwd)?;
-        let initial = breakpoints::initial(&self.cwd, input.initial_breakpoints.as_deref().unwrap_or(&[]))?;
+        let initial = breakpoints::initial(&source_root, input.initial_breakpoints.as_deref().unwrap_or(&[]))?;
         let connect_ms = input.remote.connect_timeout_ms.unwrap_or(5_000);
         let startup_ms = input.startup_timeout_ms.unwrap_or(120_000);
         let transport = DapTransport::connect_loopback(endpoint, Duration::from_millis(connect_ms)).await?;
-        let session = DapSession::begin(transport).await?;
+        let session = DapSession::begin(transport).await?.with_source_root(source_root);
         session.start(
             "attach", input.remote.arguments(endpoint, &mappings), &initial,
             input.exception_filters.as_deref(), Duration::from_millis(startup_ms),

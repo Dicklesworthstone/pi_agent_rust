@@ -4,6 +4,7 @@ mod execution;
 mod inspection;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -90,6 +91,9 @@ pub struct DapSession {
     inspection: Arc<asupersync::sync::Mutex<inspection::Handles>>,
     terminal: Option<Arc<TerminalHost>>,
     launch_artifacts: Option<tempfile::TempDir>,
+    // Local source identity belongs to this debugger, including while parked
+    // under another conversation. It must never follow the process cwd.
+    source_root: Option<PathBuf>,
 }
 
 impl DapSession {
@@ -137,12 +141,25 @@ impl DapSession {
             inspection: Arc::new(asupersync::sync::Mutex::new(inspection::Handles::default())),
             terminal,
             launch_artifacts: None,
+            source_root: None,
         })
     }
 
     pub(super) fn with_launch_artifacts(mut self, directory: Option<tempfile::TempDir>) -> Self {
         self.launch_artifacts = directory;
         self
+    }
+
+    /// The tool resolves this local directory before connecting or spawning.
+    /// Installing it consumes the unpublished session; live requests cannot
+    /// change the base of an already-retained breakpoint collection.
+    pub(super) fn with_source_root(mut self, directory: PathBuf) -> Self {
+        self.source_root = Some(directory);
+        self
+    }
+
+    pub(super) fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -186,6 +203,9 @@ impl DapSession {
             )
         };
         snapshot["inspectionRevision"] = json!(inspection_revision);
+        if let Some(root) = self.source_root() {
+            snapshot["sourceRoot"] = json!(root.to_str());
+        }
         if let Some(fault) = &fault {
             snapshot["fault"] = json!(fault);
         }

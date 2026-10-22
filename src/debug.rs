@@ -277,7 +277,7 @@ impl DebugTool {
             DapSession::begin_with_terminal(transport, &working_directory).await?
         } else {
             DapSession::begin(transport).await?
-        }.with_launch_artifacts(artifacts);
+        }.with_launch_artifacts(artifacts).with_source_root(working_directory);
         let timeout_ms = input.startup_timeout_ms.unwrap_or(120_000);
         session
             .start(
@@ -480,13 +480,14 @@ impl DebugTool {
 
     fn breakpoint_target(
         &self,
+        session: &DapSession,
         input: &DebugInput,
         setting: bool,
     ) -> Result<(Group, Option<Value>, Value)> {
         match input.action.as_str() {
             "set_breakpoint" | "remove_breakpoint" => {
                 let path = breakpoints::source_path(
-                    &self.cwd,
+                    session.source_root().unwrap_or(&self.cwd),
                     input.required("file", input.file.as_deref())?,
                 )?;
                 let line = if setting {
@@ -574,7 +575,7 @@ impl DebugTool {
 
     async fn run_breakpoints(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
         let setting = input.action.starts_with("set_");
-        let (group, key, mut payload) = self.breakpoint_target(input, setting)?;
+        let (group, key, mut payload) = self.breakpoint_target(session, input, setting)?;
         let change = if setting {
             let mut spec = key.expect("setting requires a key");
             if !matches!(&group, Group::Source(_)) {
@@ -1066,11 +1067,11 @@ impl Tool for DebugTool {
                 "env":{"type":"object","maxProperties":128,"propertyNames":{"type":"string","maxLength":256,"pattern":"^[A-Za-z_][A-Za-z0-9_]*$"},"additionalProperties":{"type":"string","maxLength":65536},"description":"Launch-only debuggee environment overrides. Literal strings, no NUL, null deletion or expansion. At most 64 KiB total names/values plus separators. Explicit entries override object-shaped launchDefaults.env; omitted env leaves adapter defaults unchanged. Does not modify Pi or adapter-process environment."},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
                 "adapterConfig":{"type":"string","maxLength":4096,"description":"Explicit workspace-relative dap.json with an adapters map; requires adapter ID. Local launch/pid-attach only. Executes the selected configured command; never auto-loaded."},
-                "cwd":{"type":"string","maxLength":4096,"description":"Launch/attach working directory. Relative paths resolve from the session workspace; launch program and initial breakpoint paths resolve from this directory."},
+                "cwd":{"type":"string","maxLength":4096,"description":"Launch/attach local source directory, relative to the session workspace. Retained for initial and later breakpoint paths. Local adapters also start here; port attach does not change the remote process cwd. adapterConfig and pathMappings.localRoot remain relative to the tool workspace."},
                 "goMode":{"type":"string","enum":["debug","test","exec"]},
                 "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":120_000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
-                "file":{"type":"string","description":"Source path for breakpoint set/remove"},
+                "file":{"type":"string","description":"Source path for breakpoint set/remove; relative to the active debugger's retained sourceRoot"},
                 "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear the file's set"},
                 "column":{"type":"integer","minimum":1},
                 "condition":{"type":"string","maxLength":4096},
@@ -1145,3 +1146,6 @@ impl Tool for DebugTool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod source_root_tests;

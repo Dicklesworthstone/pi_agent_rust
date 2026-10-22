@@ -45,6 +45,51 @@ explicit `adapter` and `adapterConfig`. `attachDefaults` are separate from
 `launchDefaults`. A loopback `port` attachment never starts a local adapter,
 so combining it with `adapterConfig` is rejected.
 
+## Working directory and retained source paths
+
+Pass `cwd` on launch or attach to select the local source directory. Relative
+values resolve from the tool's workspace; an absolute directory is also
+accepted. The directory must exist. Pi canonicalizes it before starting the
+adapter or connecting to a loopback endpoint and retains it with that debugger.
+Omitting `cwd` selects the tool's workspace, not another debugger's last root.
+
+```json
+{
+  "action": "launch",
+  "program": "main.py",
+  "adapter": "debugpy",
+  "cwd": "services/api",
+  "initialBreakpoints": [{ "file": "main.py", "line": 12 }]
+}
+```
+
+A later `set_breakpoint` or `remove_breakpoint` with `file: "main.py"` uses
+that same `services/api` directory. Adding, removing and clearing a file's
+breakpoints therefore operate on the initial set, even when a same-named file
+exists in the workspace root. Absolute source paths still select their own
+files. Missing source files retain the existing deferred-binding behavior:
+their paths are normalized beneath the retained root, never replaced by a
+same-named existing file in another directory.
+
+The source root travels with the owned DAP session when conversations are
+parked and restored. Failed startup does not publish a source root, and a fresh
+launch does not inherit one from a terminated debugger. It appears as
+`sourceRoot` in the startup `threadState`, `sessions[].execution`, and
+`output.execution`. Changing `cwd` on a later breakpoint action is rejected;
+start a new debugger to change its source base.
+
+For local launch and PID attach, the adapter process also starts in the selected
+directory and receives the existing local DAP cwd behavior. On loopback attach,
+`cwd` selects **local source identity only**: it is not sent as a request to
+change the remote process's working directory. `pathMappings.localRoot`,
+`adapterConfig`, and relative adapter executable paths stay anchored to the
+original tool workspace. Their configuration and containment rules do not change.
+
+Canonicalizing the root prevents a retargeted cwd symlink from silently moving
+this debugger to a different source tree. This is not a source-file snapshot or
+a filesystem sandbox: descendants can change and existing source-path alias
+normalization still applies. It adds no process, network or filesystem authority.
+
 ## Add a stdio backend
 
 ```json
@@ -114,3 +159,15 @@ directory opt-in, traversal/symlink rejection, unsupported transports, protected
 fields, size limits and error redaction. These are authored native tests, not a
 claim that they ran on the implementation host. The required authoritative
 validation is `dsr quality --tool pi_agent_rust`.
+
+`src/debug/source_root_tests.rs` adds eight native-tool regressions for retained
+launch/PID/port-attach roots, add/remove/clear wire requests, absolute and missing
+source paths, parked conversation isolation, failed-start isolation, refusal
+before a TCP connection, and Unix cwd-symlink retargeting. The deterministic
+Python peer proves protocol routing only, not real-debugger breakpoint hits.
+Missing Python is an explicit skip unless `PI_DEBUG_REQUIRE_PROTOCOL` is set.
+
+These eight tests are authored, not executed. The required DSR command could not
+start on the implementation host because `dsr` is absent (exit 127). Compilation,
+Rust tests, formatting, Clippy, real-debugger and Windows acceptance remain
+unverified. Existing tests and quality gates are unchanged.
