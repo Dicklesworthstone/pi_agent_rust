@@ -9391,6 +9391,7 @@ enum PrintCommand {
     Compact,
     Shake,
     Retry,
+    Handoff,
 }
 
 impl PrintCommand {
@@ -9398,6 +9399,7 @@ impl PrintCommand {
         match self {
             Self::Compact | Self::Shake => "compact",
             Self::Retry => "retry",
+            Self::Handoff => "handoff",
         }
     }
 }
@@ -9418,9 +9420,10 @@ fn parse_print_command(input: &str, from_argument: bool) -> Result<Option<PrintC
         ("/retry", "") => Ok(Some(PrintCommand::Retry)),
         ("/compact", _) => bail!("Print mode supports /compact or /compact shake"),
         ("/retry", _) => bail!("Print-mode /retry takes no arguments"),
-        ("/handoff", _) => bail!(
-            "Print-mode /handoff is not available. Use pi handoff for a local structured report, or /handoff in the interactive session for model-assisted options"
-        ),
+        ("/handoff", focus) if focus.len() > 4096 || focus.contains('\0') => {
+            bail!("Handoff focus must fit 4096 bytes and contain no NUL")
+        }
+        ("/handoff", _) => Ok(Some(PrintCommand::Handoff)),
         _ => Ok(None),
     }
 }
@@ -9498,6 +9501,7 @@ struct PrintCompactionObservation {
 async fn execute_print_command(
     session: &mut AgentSession,
     command: PrintCommand,
+    focus: &str,
     abort: &pi::agent::AbortSignal,
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<PrintCommandOutcome> {
@@ -9538,13 +9542,15 @@ async fn execute_print_command(
                 .prepare_retry_content()
                 .await
                 .map(PrintCommandOutcome::Retry),
-            PrintCommand::Compact | PrintCommand::Shake => {
-                if !session.compaction_settings().enabled {
+            PrintCommand::Compact | PrintCommand::Shake | PrintCommand::Handoff => {
+                if command != PrintCommand::Handoff && !session.compaction_settings().enabled {
                     return Err(pi::error::Error::validation(
                         "Compaction is disabled in the current session settings",
                     ));
                 }
-                if command == PrintCommand::Shake {
+                if command == PrintCommand::Handoff {
+                    session.handoff_now(focus, abort, event_handler).await?;
+                } else if command == PrintCommand::Shake {
                     session.shake_now(event_handler).await?;
                 } else {
                     session.compact_now(event_handler).await?;
@@ -9750,8 +9756,19 @@ async fn run_print_mode(
         let _restored =
             maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
         let input = if let Some(command) = request.command {
-            let outcome = execute_print_command(session, command, &abort_signal, make_event_handler())
-                .await?;
+            let focus = request
+                .text
+                .trim()
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, args)| args.trim());
+            let outcome = execute_print_command(
+                session,
+                command,
+                focus,
+                &abort_signal,
+                make_event_handler(),
+            )
+            .await?;
             match outcome {
                 PrintCommandOutcome::Compacted(result) => {
                     sent_prompts = sent_prompts.saturating_add(1);
@@ -9763,7 +9780,9 @@ async fn run_print_mode(
                             "data": { "changed": result.is_some(), "result": result }
                         }))?);
                     } else {
-                        write_print_line(if result.is_some() {
+                        write_print_line(if command == PrintCommand::Handoff {
+                            "Context handed off and compacted in place."
+                        } else if result.is_some() {
                             "Compacted conversation."
                         } else {
                             "Nothing to compact in the selected session."
@@ -13388,7 +13407,13 @@ mod tests {
 
     #[test]
     fn headless_commands_require_original_argument_provenance() {
-        for input in ["/compact", "/compact shake", "/retry", "/handoff"] {
+        for input in [
+            "/compact",
+            "/compact shake",
+            "/retry",
+            "/handoff",
+            "/handoff preserve the migration plan",
+        ] {
             assert_eq!(parse_print_command(input, false).unwrap(), None);
         }
         assert_eq!(
@@ -13402,10 +13427,15 @@ mod tests {
         for input in ["/retrying", "Explain /compact", "/my-template"] {
             assert_eq!(parse_print_command(input, true).unwrap(), None);
         }
-        for input in ["/retry extra", "/compact unknown", "/handoff"] {
+        assert_eq!(
+            parse_print_command("/handoff preserve the migration plan", true).unwrap(),
+            Some(PrintCommand::Handoff)
+        );
+        for input in ["/retry extra", "/compact unknown", "/handoff invalid\0focus"] {
             let error = parse_print_command(input, true).unwrap_err();
             assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
         }
+        assert!(parse_print_command(&format!("/handoff {}", "x".repeat(4097)), true).is_err());
         let requests = prepare_print_requests(
             vec![
                 "/retry".into(),
@@ -13441,6 +13471,7 @@ mod tests {
             (Vec::<String>::new(), false, false),
             (vec!["/retry".to_string()], true, false),
             (vec!["/retry".to_string()], false, true),
+            (vec!["/handoff keep the plan".to_string()], false, true),
         ] {
             let initial = pi::app::prepare_initial_message(
                 directory.path(),
@@ -13474,8 +13505,25 @@ mod tests {
     }
 
     #[derive(Default)]
+    enum HeadlessCommandBehavior {
+        #[default]
+        Complete,
+        Text(String),
+        Reject,
+        Empty,
+        MessageTruncated,
+        DoneTruncated,
+        ToolCall,
+        MissingTerminal,
+        Cancel(AbortHandle),
+        EditSession(Arc<Mutex<Session>>),
+    }
+
+    #[derive(Default)]
     struct HeadlessCommandProvider {
         requests: StdMutex<Vec<serde_json::Value>>,
+        metadata: StdMutex<Vec<serde_json::Value>>,
+        behavior: HeadlessCommandBehavior,
     }
 
     #[async_trait::async_trait]
@@ -13496,7 +13544,7 @@ mod tests {
         async fn stream(
             &self,
             context: &pi::provider::Context<'_>,
-            _options: &pi::provider::StreamOptions,
+            options: &pi::provider::StreamOptions,
         ) -> pi::error::Result<
             std::pin::Pin<
                 Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
@@ -13506,7 +13554,34 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(&context.messages).unwrap());
-            let message = AssistantMessage {
+            self.metadata.lock().unwrap().push(json!({
+                "system": context.system_prompt,
+                "tools": context.tools,
+                "sessionId": options.session_id,
+                "promptCacheKey": options.prompt_cache_key,
+                "maxTokens": options.max_tokens,
+                "providerHook": options.before_provider_request.is_some(),
+            }));
+            match &self.behavior {
+                HeadlessCommandBehavior::Reject => {
+                    return Err(pi::error::Error::api("Handoff synthesis rejected"));
+                }
+                HeadlessCommandBehavior::Cancel(handle) => {
+                    handle.abort();
+                    return Ok(Box::pin(futures::stream::pending()));
+                }
+                HeadlessCommandBehavior::EditSession(stored) => {
+                    let cx = pi::agent_cx::AgentCx::for_request();
+                    stored.lock(cx.cx()).await.unwrap().append_message(
+                        pi::session::SessionMessage::User {
+                            content: pi::model::UserContent::Text("A newer authored turn".into()),
+                            timestamp: Some(0),
+                        },
+                    );
+                }
+                _ => {}
+            }
+            let mut message = AssistantMessage {
                 content: vec![ContentBlock::Text(pi::model::TextContent::new(
                     "Retained summary",
                 ))],
@@ -13519,15 +13594,38 @@ mod tests {
                 error_message: None,
                 timestamp: 0,
             };
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(pi::model::StreamEvent::Start {
-                    partial: message.clone(),
-                }),
-                Ok(pi::model::StreamEvent::Done {
-                    reason: StopReason::Stop,
+            match &self.behavior {
+                HeadlessCommandBehavior::Text(text) => {
+                    message.content = vec![ContentBlock::Text(pi::model::TextContent::new(text))];
+                }
+                HeadlessCommandBehavior::Empty => message.content.clear(),
+                HeadlessCommandBehavior::MessageTruncated => {
+                    message.stop_reason = StopReason::Length;
+                }
+                HeadlessCommandBehavior::ToolCall => {
+                    message.content.push(ContentBlock::ToolCall(pi::model::ToolCall {
+                        id: "unexpected-handoff-tool".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "should-not-exist.txt", "content": "bad"}),
+                        thought_signature: None,
+                    }));
+                }
+                _ => {}
+            }
+            let mut events = vec![Ok(pi::model::StreamEvent::Start {
+                partial: message.clone(),
+            })];
+            if !matches!(&self.behavior, HeadlessCommandBehavior::MissingTerminal) {
+                events.push(Ok(pi::model::StreamEvent::Done {
+                    reason: if matches!(&self.behavior, HeadlessCommandBehavior::DoneTruncated) {
+                        StopReason::Length
+                    } else {
+                        StopReason::Stop
+                    },
                     message,
-                }),
-            ])))
+                }));
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
@@ -13537,10 +13635,26 @@ mod tests {
         save_enabled: bool,
         compaction_enabled: bool,
     ) -> AgentSession {
+        headless_command_session_with_config(
+            provider,
+            stored,
+            save_enabled,
+            compaction_enabled,
+            AgentConfig::default(),
+        )
+    }
+
+    fn headless_command_session_with_config(
+        provider: &Arc<HeadlessCommandProvider>,
+        stored: Session,
+        save_enabled: bool,
+        compaction_enabled: bool,
+        config: AgentConfig,
+    ) -> AgentSession {
         let mut agent = Agent::new(
             Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
             ToolRegistry::new(&[], Path::new("."), None),
-            AgentConfig::default(),
+            config,
         );
         agent.set_model_accepts_images(true);
         agent.replace_messages(stored.to_messages_for_current_path());
@@ -13601,7 +13715,7 @@ mod tests {
             stored.save().await.unwrap();
             let mut session = headless_command_session(&provider, stored, true, false);
             let (_abort, signal) = AbortHandle::new();
-            let outcome = execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+            let outcome = execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
                 .await
                 .unwrap();
             let PrintCommandOutcome::Retry(recovered) = outcome else {
@@ -13668,7 +13782,7 @@ mod tests {
                 let mut session = headless_command_session(&provider, stored, false, false);
                 let (_abort, signal) = AbortHandle::new();
                 let outcome =
-                    execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+                    execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
                         .await
                         .unwrap();
                 let PrintCommandOutcome::Retry(recovered) = outcome else {
@@ -13718,7 +13832,7 @@ mod tests {
                     true,
                 );
                 let (_abort, signal) = AbortHandle::new();
-                let outcome = execute_print_command(&mut session, command, &signal, |_| {})
+                let outcome = execute_print_command(&mut session, command, "", &signal, |_| {})
                     .await
                     .unwrap();
                 assert!(matches!(outcome, PrintCommandOutcome::Compacted(Some(_))));
@@ -13734,6 +13848,346 @@ mod tests {
                         .iter()
                         .all(|request| !request.to_string().contains("/compact"))
                 );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn headless_handoff_persists_in_place_and_preserves_the_native_recent_turn() {
+        run_cli_workdir_test(async {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("handoff.jsonl");
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let mut stored = headless_compaction_history();
+            stored.path = Some(path.clone());
+            stored.session_dir = Some(directory.path().to_path_buf());
+            stored.header.parent_session = Some("original-parent.jsonl".into());
+            stored.set_name("Migration work");
+            let content = pi::model::UserContent::Blocks(vec![
+                ContentBlock::Text(pi::model::TextContent::new("Keep these exact inputs")),
+                ContentBlock::Image(pi::model::ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }),
+                ContentBlock::Media(pi::model::MediaContent {
+                    data: "YXVkaW8=".into(),
+                    mime_type: "audio/wav".into(),
+                    name: Some("voice.wav".into()),
+                }),
+            ]);
+            let kept_user = stored.append_message(pi::session::SessionMessage::User {
+                content: content.clone(),
+                timestamp: Some(0),
+            });
+            stored.append_message(pi::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(pi::model::ToolCall {
+                        id: "completed-read".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": "migration.md"}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(pi::session::SessionMessage::ToolResult {
+                tool_call_id: "completed-read".into(),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                    "Completed migration evidence",
+                ))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            });
+            stored.save().await.unwrap();
+            let original_id = stored.header.id.clone();
+            let original_leaf = stored.leaf_id().map(str::to_string);
+            let original_entries = serde_json::to_value(&stored.entries).unwrap();
+            let original_count = stored.entries.len();
+            let mut session = headless_command_session(&provider, stored, true, false);
+            session.set_compaction_context_window(128_000);
+            let options = session.agent.stream_options_mut();
+            options.session_id = Some("primary-transport".into());
+            options.prompt_cache_key = Some("primary-cache".into());
+            options.max_tokens = Some(8192);
+            options.before_provider_request = Some(pi::provider::BeforeProviderRequestHook::new(
+                |_| Box::pin(async { None }),
+            ));
+            let (_abort, signal) = AbortHandle::new();
+            let outcome = execute_print_command(
+                &mut session,
+                PrintCommand::Handoff,
+                "preserve migration decisions and next steps",
+                &signal,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            let PrintCommandOutcome::Compacted(Some(result)) = outcome else {
+                panic!("handoff must report its installed result")
+            };
+            assert_eq!(result["details"]["mode"], "handoff");
+            assert_eq!(result["firstKeptEntryId"], kept_user);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(reopened.header.id, original_id);
+            assert_eq!(reopened.header.parent_session.as_deref(), Some("original-parent.jsonl"));
+            assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
+            assert_eq!(reopened.entries.len(), original_count + 1);
+            assert_eq!(
+                serde_json::to_value(&reopened.entries[..original_count]).unwrap(),
+                original_entries,
+                "all original history and branch metadata remain archived",
+            );
+            let pi::session::SessionEntry::Compaction(entry) = reopened.entries.last().unwrap() else {
+                panic!("durable compaction entry")
+            };
+            assert_eq!(entry.base.parent_id, original_leaf);
+            assert_eq!(entry.details.as_ref().unwrap()["mode"], "handoff");
+            let active = reopened.to_messages_for_current_path();
+            assert!(active.iter().any(|message| matches!(message,
+                pi::model::Message::User(user)
+                    if serde_json::to_value(&user.content).unwrap()
+                        == serde_json::to_value(&content).unwrap()
+            )));
+            let active_json = serde_json::to_string(&active).unwrap();
+            assert!(active_json.contains("Retained summary"));
+            assert!(active_json.contains("Completed migration evidence"));
+            assert!(!active_json.contains("older context "));
+            assert!(!active_json.contains("/handoff"));
+            {
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0].to_string().contains("preserve migration decisions and next steps"));
+                assert!(!requests[0].to_string().contains("YXVkaW8="));
+                let metadata = provider.metadata.lock().unwrap();
+                assert_eq!(metadata[0]["tools"], json!([]));
+                assert_ne!(metadata[0]["sessionId"], "primary-transport");
+                assert!(metadata[0]["sessionId"].as_str().is_some_and(|id| !id.is_empty()));
+                assert!(metadata[0]["promptCacheKey"].is_null());
+                assert_eq!(metadata[0]["maxTokens"], 256);
+                assert_eq!(metadata[0]["providerHook"], false);
+            }
+            assert_eq!(session.agent.stream_options().session_id.as_deref(), Some("primary-transport"));
+            run_print_recovery_fixture(
+                &mut session,
+                PromptInput::Text {
+                    text: "Continue from this checkpoint".into(),
+                    keyword_scan_source: Some("Continue from this checkpoint".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let next_request = requests[1].to_string();
+            assert!(next_request.contains("Retained summary"));
+            assert!(next_request.contains("aGVsbG8="));
+            assert!(next_request.contains("YXVkaW8="));
+            assert!(next_request.contains("Completed migration evidence"));
+            assert!(!next_request.contains("older context "));
+        });
+    }
+
+    #[test]
+    fn headless_handoff_failed_or_incomplete_synthesis_never_falls_back_or_changes_disk() {
+        run_cli_workdir_test(async {
+            for behavior in [
+                HeadlessCommandBehavior::Reject,
+                HeadlessCommandBehavior::Empty,
+                HeadlessCommandBehavior::MessageTruncated,
+                HeadlessCommandBehavior::DoneTruncated,
+                HeadlessCommandBehavior::ToolCall,
+                HeadlessCommandBehavior::MissingTerminal,
+            ] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("failed-handoff.jsonl");
+                let provider = Arc::new(HeadlessCommandProvider { behavior, ..Default::default() });
+                let mut stored = headless_compaction_history();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+                stored.save().await.unwrap();
+                let before = fs::read(&path).unwrap();
+                let old_leaf = stored.leaf_id().map(str::to_string);
+                let old_entries = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session(&provider, stored, true, true);
+                assert!(pi::compaction::requires_forced_local_compaction(
+                    pi::compaction::estimate_model_context_tokens(session.agent.messages()),
+                    session.compaction_settings(),
+                ));
+                let (_abort, signal) = AbortHandle::new();
+                let error = execute_print_command(
+                    &mut session, PrintCommand::Handoff, "", &signal, |_| {},
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert_eq!(provider.requests.lock().unwrap().len(), 1);
+                assert_eq!(fs::read(&path).unwrap(), before);
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert_eq!(stored.leaf_id(), old_leaf.as_deref());
+                assert_eq!(serde_json::to_value(&stored.entries).unwrap(), old_entries);
+            }
+        });
+    }
+
+    #[test]
+    fn headless_handoff_cancellation_and_changed_source_refuse_installation() {
+        run_cli_workdir_test(async {
+            let (abort, signal) = AbortHandle::new();
+            let provider = Arc::new(HeadlessCommandProvider {
+                behavior: HeadlessCommandBehavior::Cancel(abort),
+                ..Default::default()
+            });
+            let stored = headless_compaction_history();
+            let old_entries = serde_json::to_value(&stored.entries).unwrap();
+            let mut session = headless_command_session(&provider, stored, false, false);
+            let error = execute_print_command(
+                &mut session, PrintCommand::Handoff, "", &signal, |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+            let cx = pi::agent_cx::AgentCx::for_request();
+            assert_eq!(
+                serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries).unwrap(),
+                old_entries,
+            );
+
+            let stored = Arc::new(Mutex::new(headless_compaction_history()));
+            let provider = Arc::new(HeadlessCommandProvider {
+                behavior: HeadlessCommandBehavior::EditSession(Arc::clone(&stored)),
+                ..Default::default()
+            });
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn pi::provider::Provider>,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent, Arc::clone(&stored), false,
+                ResolvedCompactionSettings {
+                    enabled: false, keep_recent_tokens: 8, ..Default::default()
+                },
+            );
+            let (_abort, signal) = AbortHandle::new();
+            let error = execute_print_command(
+                &mut session, PrintCommand::Handoff, "", &signal, |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("source changed"));
+            let stored = stored.lock(cx.cx()).await.unwrap();
+            assert!(!stored.entries.iter().any(|entry| matches!(entry,
+                pi::session::SessionEntry::Compaction(_)
+            )));
+            assert!(serde_json::to_string(&stored.entries).unwrap().contains("A newer authored turn"));
+        });
+    }
+
+    #[test]
+    fn headless_handoff_applies_privacy_to_focus_source_and_saved_summary() {
+        run_cli_workdir_test(async {
+            for mode in ["obfuscate", "block"] {
+                let provider = Arc::new(HeadlessCommandProvider {
+                    behavior: HeadlessCommandBehavior::Text("ACME-123456 and ACME-654321".into()),
+                    ..Default::default()
+                });
+                let mut stored = Session::in_memory();
+                for text in [
+                    "ACME-123456 was used during earlier work",
+                    "Continue the current task with all of the preserved context",
+                ] {
+                    stored.append_message(pi::session::SessionMessage::User {
+                        content: pi::model::UserContent::Text(text.into()), timestamp: Some(0),
+                    });
+                }
+                let original = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session_with_config(
+                    &provider, stored, false, false,
+                    AgentConfig {
+                        secrets: Some(pi::secrets::SecretsSettings {
+                            mode: Some(mode.into()),
+                            extra_patterns: Some(vec![r"ACME-[0-9]{6}".into()]),
+                        }),
+                        ..Default::default()
+                    },
+                );
+                let (_abort, signal) = AbortHandle::new();
+                let result = execute_print_command(
+                    &mut session, PrintCommand::Handoff, "Consider ACME-654321", &signal, |_| {},
+                )
+                .await;
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                if mode == "block" {
+                    assert!(result.unwrap_err().to_string().contains("PI_SECRET_BLOCK"));
+                    assert!(provider.requests.lock().unwrap().is_empty());
+                    assert_eq!(serde_json::to_value(&stored.entries).unwrap(), original);
+                } else {
+                    let PrintCommandOutcome::Compacted(Some(result)) = result.unwrap() else {
+                        panic!("privacy-screened handoff")
+                    };
+                    let requests = provider.requests.lock().unwrap();
+                    assert_eq!(requests.len(), 1);
+                    let request = requests[0].to_string();
+                    let summary = result["summary"].as_str().unwrap();
+                    for secret in ["ACME-123456", "ACME-654321"] {
+                        assert!(!request.contains(secret));
+                        assert!(!summary.contains(secret));
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&stored.entries[..2]).unwrap(), original,
+                        "privacy projection must not rewrite original evidence",
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn headless_handoff_honors_hook_cancellation_and_refuses_replacement_summaries() {
+        run_cli_workdir_test(async {
+            for response in [
+                json!(false),
+                json!({"compaction": {
+                    "summary": "Unscreened extension summary", "firstKeptEntryId": "unknown"
+                }}),
+            ] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("handoff-hook.native.json");
+                fs::write(&path, serde_json::to_vec(&json!({
+                    "id": "handoff-hook", "name": "handoff-hook", "version": "1.0.0",
+                    "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                    "eventHooks": ["session_before_compact"],
+                    "eventResponses": {"session_before_compact": response}
+                })).unwrap()).unwrap();
+                let manager = pi::extensions::ExtensionManager::new();
+                manager.set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+                manager.load_native_extensions(vec![
+                    pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path).unwrap(),
+                ]).await.unwrap();
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let stored = headless_compaction_history();
+                let old_entries = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session(&provider, stored, false, false);
+                session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+                let (_abort, signal) = AbortHandle::new();
+                let error = execute_print_command(
+                    &mut session, PrintCommand::Handoff, "Keep decisions", &signal, |_| {},
+                ).await.unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert!(provider.requests.lock().unwrap().is_empty());
+                let cx = pi::agent_cx::AgentCx::for_request();
+                assert_eq!(
+                    serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries).unwrap(),
+                    old_entries,
+                );
+                session.extensions.as_ref().unwrap().shutdown().await;
             }
         });
     }
@@ -13769,6 +14223,7 @@ mod tests {
             let error = execute_print_command(
                 &mut session,
                 PrintCommand::Compact,
+                "",
                 &signal,
                 move |event| captured.lock().unwrap().push(event),
             )
@@ -13796,15 +14251,31 @@ mod tests {
             let provider = Arc::new(HeadlessCommandProvider::default());
             let mut session = headless_command_session(&provider, Session::in_memory(), false, false);
             let (abort, signal) = AbortHandle::new();
-            for command in [PrintCommand::Compact, PrintCommand::Retry] {
-                let error = execute_print_command(&mut session, command, &signal, |_| {})
+            for command in [PrintCommand::Compact, PrintCommand::Retry, PrintCommand::Handoff] {
+                let error = execute_print_command(&mut session, command, "", &signal, |_| {})
                     .await
                     .unwrap_err();
                 assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
             }
+            let mut single_turn = Session::in_memory();
+            single_turn.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text("One large authored turn ".repeat(300)),
+                timestamp: Some(0),
+            });
+            let mut single_session = headless_command_session(&provider, single_turn, false, false);
+            let error = execute_print_command(
+                &mut single_session,
+                PrintCommand::Handoff,
+                "",
+                &signal,
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Nothing safe to hand off"));
             abort.abort();
             assert!(
-                execute_print_command(&mut session, PrintCommand::Retry, &signal, |_| {})
+                execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
                     .await
                     .is_err()
             );

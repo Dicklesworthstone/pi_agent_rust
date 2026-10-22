@@ -169,6 +169,7 @@ the terminal UI:
 ```sh
 pi --continue -p '/compact'
 pi --session ./run.jsonl -p '/compact shake'
+pi --session ./run.jsonl -p '/handoff preserve migration decisions and next steps'
 pi --session ./run.jsonl -p '/retry'
 ```
 
@@ -178,6 +179,33 @@ same transaction with local removal of bulky older tool output and no summary
 model request. Disabled compaction is an error; an eligible session with nothing
 to compact reports that no change was made. Custom compaction instructions are
 not accepted on this surface.
+
+`/handoff [focus]` asks the selected model for a continuation brief and compacts
+the selected session in place. It preserves the session ID, path, name, branch
+history and recent native messages. The brief records goals, decisions,
+constraints, completed work, failed approaches, open questions and next steps;
+the optional focus tells the model what to emphasize. The command appends a
+normal compaction entry with `details.mode: "handoff"`. Original history remains
+in the session tree, and the next prompt uses the brief and retained tail.
+
+Manual handoff runs even when automatic compaction is disabled or below its
+threshold. It uses the configured `keepRecentTokens` budget, rounds retention
+back to complete turns, and always keeps the latest authored user turn with its
+ordered images, audio, video and completed tool work. A single authored turn,
+an already compacted leaf, or a budget retaining all history has no safe older
+prefix: the command returns an error without calling the model. It does not
+split the last turn to force a checkpoint. Automatic aggressive, shake and
+snapcompact policies do not change this manual operation.
+
+Handoff uses the existing compaction privacy policy for history, focus and the
+stored summary. The model request has no tools, uses isolated transport/cache
+identity, and has a 60-second generation deadline and a 64-KiB text limit. Empty,
+truncated, tool-requesting or otherwise incomplete responses fail without a
+local fallback or a new compaction entry. A changed source session also refuses
+installation. Before-compaction hooks can cancel; replacement summaries from
+those hooks are explicitly refused for handoff. The ordinary post-compaction
+hook runs after durable installation. Optional focus is limited to 4096 UTF-8
+bytes and cannot contain NUL.
 
 `/retry` immediately repeats the latest retryable user turn from the selected
 branch. It preserves ordered text and image/audio/video content, saves the
@@ -193,7 +221,7 @@ ordinary message arguments can be mixed; they run in argument order.
 
 Only original command-line message arguments have command authority. Piped
 stdin and file bytes remain input, including text beginning with `/retry`,
-`/compact` or `@`. A command produced by prompt-template expansion also remains
+`/compact`, `/handoff` or `@`. A command produced by prompt-template expansion also remains
 input. A command explicitly paired with `@file` attachments is refused rather
 than dropping the attachments; submit it separately. If stdin and files are
 both supplied, files retain their normal pairing with the first input message,
@@ -207,9 +235,9 @@ include `data.changed` and the native compaction result when one was produced.
 Ctrl+C and extension cancellation fail the command without acknowledging success;
 interrupted persistence retains the native session admission fence.
 
-Print-mode `/handoff` is explicitly unsupported. Use `pi handoff` for the
-existing local structured report, or the interactive `/handoff` command for
-model-assisted handoff options.
+The `pi handoff` subcommand remains the local structured report, and the
+interactive `/handoff` workflow retains its preview/export behavior. Print-mode
+`/handoff` performs the in-place continuation compaction described above.
 
 ## ADR: Session Store V2 + Wire-Format Contract
 

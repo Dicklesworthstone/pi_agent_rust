@@ -6881,6 +6881,28 @@ impl Drop for AtomicBoolGuard {
     }
 }
 
+/// Bind a generated context edit to its exact source and persistence target.
+/// Provider and extension callbacks may inspect or change the store while a
+/// summary runs. These bytes remain local and are checked under the store lock.
+#[derive(PartialEq, Eq)]
+pub(crate) struct SessionEditSnapshot {
+    path: Option<PathBuf>,
+    session_dir: Option<PathBuf>,
+    leaf_id: Option<String>,
+    content: Vec<u8>,
+}
+
+impl SessionEditSnapshot {
+    pub(crate) fn capture(session: &Session) -> Result<Self> {
+        Ok(Self {
+            path: session.path.clone(),
+            session_dir: session.session_dir.clone(),
+            leaf_id: session.leaf_id().map(str::to_string),
+            content: serde_json::to_vec(&(&session.header, &session.entries))?,
+        })
+    }
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
@@ -17401,7 +17423,7 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, None)
+        self.compact_synchronous(Arc::new(on_event), false, None, None)
             .await
             .map(|_| ())
     }
@@ -17413,7 +17435,7 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous(Arc::new(on_event), true, None)
+        self.compact_synchronous(Arc::new(on_event), true, None, None)
             .await
             .map(|_| ())
     }
@@ -17429,8 +17451,41 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, Some(abort))
+        self.compact_synchronous(Arc::new(on_event), false, Some(abort), None)
             .await
+    }
+
+    /// Replace an older safe prefix with a model-generated continuation brief.
+    /// This explicit operation ignores automatic thresholds/enabling, retains
+    /// the latest authored turn verbatim, and never creates another session.
+    pub async fn handoff_now(
+        &mut self,
+        focus: &str,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
+        if focus.len() > 4096 || focus.contains('\0') {
+            return Err(Error::validation(
+                "Handoff focus must fit 4096 bytes and contain no NUL",
+            ));
+        }
+        if self.extensions_turn_active.load(Ordering::SeqCst)
+            || self.extensions_is_compacting.load(Ordering::SeqCst)
+        {
+            return Err(Error::session(
+                "Wait for the current turn or compaction before handing off",
+            ));
+        }
+        let changed = self
+            .compact_synchronous(Arc::new(on_event), false, None, Some((focus, abort)))
+            .await?;
+        if !changed {
+            return Err(Error::session(
+                "Nothing safe to hand off: no older prefix remains outside the retained authored turn and keep-recent budget",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn execute_extension_command(
@@ -17590,6 +17645,7 @@ impl AgentSession {
                         Arc::clone(&on_event),
                         provider_admission,
                         None,
+                        None,
                     )
                     .await?;
                     self.compaction_worker.mark_applied_success();
@@ -17715,6 +17771,7 @@ impl AgentSession {
                         true,
                         provider_admission,
                         false,
+                        None,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -17876,7 +17933,7 @@ impl AgentSession {
             }
         };
 
-        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission, None)
+        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission, None, None)
             .await
     }
 
@@ -17930,12 +17987,38 @@ impl AgentSession {
         from_extension: bool,
         provider_admission: OwnedMutexGuard<()>,
         require_reduction: bool,
+        handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
+        let session_action_permit = if handoff_source.is_some() {
+            Some(self.session_action_admission.acquire(cx.cx()).await?)
+        } else {
+            None
+        };
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         self.provider_admission.ensure_allowed()?;
+        if let Some((source, abort)) = handoff_source {
+            if abort.is_aborted() {
+                return Err(Error::Aborted);
+            }
+            if SessionEditSnapshot::capture(&session)? != *source {
+                return Err(Error::session(
+                    "Handoff source changed during generation; the summary was not applied",
+                ));
+            }
+            if summary.trim().is_empty()
+                || !compaction::overflow_compaction_preserves_current_turn(
+                    &session.entries_for_current_path(),
+                    &first_kept_entry_id,
+                )
+            {
+                return Err(Error::session(
+                    "Handoff must preserve the current authored turn and have a nonempty summary",
+                ));
+            }
+        }
         if require_reduction
             && !compaction::overflow_compaction_preserves_current_turn(
                 &session.entries_for_current_path(),
@@ -17999,6 +18082,7 @@ impl AgentSession {
             self.provider_admission.clear();
         }
         drop(session);
+        drop(session_action_permit);
         // The Session transition is complete. Release provider admission
         // before dispatching the re-entrant post-install extension hook.
         drop(provider_admission);
@@ -18027,6 +18111,7 @@ impl AgentSession {
         on_event: AgentEventHandler,
         provider_admission: OwnedMutexGuard<()>,
         overflow_abort: Option<&AbortSignal>,
+        handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
@@ -18050,6 +18135,7 @@ impl AgentSession {
                 false,
                 provider_admission,
                 overflow,
+                handoff_source,
             )
             .await
         {
@@ -18090,30 +18176,40 @@ impl AgentSession {
         on_event: AgentEventHandler,
         shake: bool,
         overflow_abort: Option<&AbortSignal>,
+        handoff: Option<(&str, &AbortSignal)>,
     ) -> Result<bool> {
-        if !self.compaction_settings.enabled {
+        if !self.compaction_settings.enabled && handoff.is_none() {
             return Ok(false);
         }
-        if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+        let abort = handoff.map(|(_, abort)| abort).or(overflow_abort);
+        if abort.is_some_and(AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
         let overflow = overflow_abort.is_some();
 
-        let (entries, preparation) = {
+        let (entries, preparation, handoff_snapshot) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            if handoff.is_some() {
+                session.ensure_full_v2_hydration_before_save()?;
+            }
             session.ensure_entry_ids();
+            let handoff_snapshot = handoff
+                .map(|_| SessionEditSnapshot::capture(&session))
+                .transpose()?;
             let entries = session
                 .entries_for_current_path()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
             let mut settings = self.compaction_settings.clone();
-            let prep = if overflow {
+            let prep = if handoff.is_some() {
+                compaction::prepare_handoff_compaction(&entries, settings)
+            } else if overflow {
                 // A provider may reject a request smaller than the configured
                 // keep-recent budget. Aim to retain at most half the observed
                 // input while preserving the complete current authored turn,
@@ -18128,24 +18224,33 @@ impl AgentSession {
             } else {
                 compaction::prepare_compaction(&entries, settings)
             };
-            (entries, prep)
+            (entries, prep, handoff_snapshot)
         };
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
-                reason: if overflow { "overflow" } else { "threshold" }.to_string(),
+                reason: if handoff.is_some() {
+                    "handoff"
+                } else if overflow {
+                    "overflow"
+                } else {
+                    "threshold"
+                }
+                .to_string(),
             });
             let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
-            if before_outcome.cancel || overflow_abort.is_some_and(AbortSignal::is_aborted) {
+            let before_outcome = self
+                .dispatch_before_compact(&prep, &entries, handoff.map(|(focus, _)| focus))
+                .await;
+            if before_outcome.cancel || abort.is_some_and(AbortSignal::is_aborted) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: true,
                     will_retry: false,
                     error_message: None,
                 });
-                return Err(if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+                return Err(if abort.is_some_and(AbortSignal::is_aborted) {
                     Error::Aborted
                 } else {
                     Error::extension("Compaction cancelled".to_string())
@@ -18153,6 +18258,18 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
+                if handoff.is_some() {
+                    let error = Error::extension(
+                        "Native handoff does not accept extension replacement summaries; cancel the replacement or use /compact",
+                    );
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
                 let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                     Ok(provider_admission) => provider_admission,
@@ -18175,6 +18292,7 @@ impl AgentSession {
                         true,
                         provider_admission,
                         overflow,
+                        None,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -18233,8 +18351,11 @@ impl AgentSession {
                 return Err(err);
             }
             let privacy = self.agent.compaction_privacy();
-            let compaction_result = if overflow_abort.is_some_and(AbortSignal::is_aborted) {
+            let compaction_result = if abort.is_some_and(AbortSignal::is_aborted) {
                 Err(Error::Aborted)
+            } else if let Some((focus, abort)) = handoff {
+                compaction::compact_handoff(prep, provider, &stream_options, focus, abort, &privacy)
+                    .await
             } else if shake {
                 Ok(compaction::compact_shake(prep, &privacy))
             } else {
@@ -18259,6 +18380,7 @@ impl AgentSession {
                         Arc::clone(&on_event),
                         provider_admission,
                         overflow_abort,
+                        handoff_snapshot.as_ref().zip(abort),
                     )
                     .await?;
                 }

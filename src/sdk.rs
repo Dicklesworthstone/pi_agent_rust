@@ -22,6 +22,7 @@
 mod extension_bootstrap;
 mod recovery;
 
+use crate::agent::SessionEditSnapshot;
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
@@ -699,29 +700,6 @@ pub struct AgentSessionHandle {
     /// embedder supplied a runtime, or no extension is loaded to observe with.
     /// Dropping this handle shuts it down with everything else it owns.
     event_runtime: Option<asupersync::runtime::Runtime>,
-}
-
-/// A provider may read or mutate Session through an extension callback while
-/// a rewind summary is running. Bind the result to the complete source view,
-/// including branch navigation and persistence destination, before installing
-/// a candidate derived from it. These bytes never leave this process.
-#[derive(PartialEq, Eq)]
-struct SessionEditSnapshot {
-    path: Option<PathBuf>,
-    session_dir: Option<PathBuf>,
-    leaf_id: Option<String>,
-    content: Vec<u8>,
-}
-
-impl SessionEditSnapshot {
-    fn capture(session: &Session) -> Result<Self> {
-        Ok(Self {
-            path: session.path.clone(),
-            session_dir: session.session_dir.clone(),
-            leaf_id: session.leaf_id().map(str::to_string),
-            content: serde_json::to_vec(&(&session.header, &session.entries))?,
-        })
-    }
 }
 
 /// Snapshot of the current agent session state.
