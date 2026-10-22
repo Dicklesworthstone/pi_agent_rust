@@ -16,6 +16,7 @@ use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::text_completion::AuxiliaryPrivacy;
 
 mod bundle;
+mod import;
 
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 48 * 1024;
@@ -288,6 +289,9 @@ fn screened_source(text: &str, input: &Snapshot) -> Result<Value> {
 }
 
 pub(super) async fn run(handle: &AgentSessionHandle, args: &str) -> Result<String> {
+    if import::is_command(args) {
+        return import::run(handle, args);
+    }
     let selection = bundle::Options::parse(args)?;
     let focus = selection.focus;
     // Refuse occupied/invalid destinations before spending a model request.

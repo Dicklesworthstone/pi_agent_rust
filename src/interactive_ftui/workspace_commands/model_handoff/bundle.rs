@@ -135,9 +135,18 @@ pub(super) struct Publication {
 }
 
 impl Publication {
-    /// The caller holds the source session lock and has just rechecked its
-    /// snapshot. No await separates that check from this no-replace operation.
+    /// The export caller holds its source session lock after rechecking the
+    /// snapshot. Import callers own a fully validated, immutable source buffer.
     pub fn publish(self) -> Result<String> {
+        self.publish_named("Saved handoff bundle", "No recipient was contacted and no work was resumed.")
+    }
+
+    pub fn publish_session(self) -> Result<String> {
+        self.publish_named("Created handoff session",
+            "No model was called and the active session is unchanged. Resume the NEW file explicitly with pi --session; normal startup policies still apply.")
+    }
+
+    fn publish_named(self, label: &str, note: &str) -> Result<String> {
         authorized(&self.destination.owner)?;
         if std::fs::canonicalize(&self.destination.parent).ok().as_ref()
             != Some(&self.destination.parent)
@@ -147,11 +156,12 @@ impl Publication {
         require_absent(&self.destination.path)?;
         let display = serde_json::to_string(self.destination.path.to_str()
             .ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?)?;
+        let message = format!("{label}: {display}\n{note}");
         self.file.persist_noclobber(&self.destination.path)
             .map_err(|_| failure("HANDOFF_EXPORT_PUBLISH"))?;
         // No fallible operation follows publication. Cancellation afterwards
-        // must not misreport an already-published bundle as absent.
-        Ok(format!("Saved handoff bundle: {display}\nNo recipient was contacted and no work was resumed."))
+        // must not misreport an already-published artifact as absent.
+        Ok(message)
     }
 }
 

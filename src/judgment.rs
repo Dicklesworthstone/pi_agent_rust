@@ -238,6 +238,18 @@ impl Judge {
     }
 }
 
+/// Reuse the strict completion decoder for local artifacts. This performs no
+/// provider I/O: bytes, duplicate keys, nesting and node counts stay bounded.
+pub(crate) fn decode_bounded_json(text: &str, limit: usize) -> Result<Value> {
+    if text.len() > limit {
+        return Err(Error::validation("bounded JSON input exceeds byte limit"));
+    }
+    let value = contract::strict_json(text)
+        .map_err(|_| Error::validation("expected one JSON value without duplicate keys"))?;
+    contract::bounded_json(&value, limit)?;
+    Ok(value)
+}
+
 pub(crate) fn failure(message: &str) -> Error {
     Error::tool("judge", message)
 }
