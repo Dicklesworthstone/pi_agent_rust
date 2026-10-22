@@ -471,6 +471,19 @@
     const workerStates = new WeakMap();
     const workerGet = workerStates.get.bind(workerStates);
     const workerSet = workerStates.set.bind(workerStates);
+    const workerControls = new WeakMap();
+    const workerControlGet = workerControls.get.bind(workerControls);
+    const workerControlSet = workerControls.set.bind(workerControls);
+    const workerControl = worker => {
+        const state = workerControlGet(worker);
+        if (state.pending > 0 && state.generation !== cellGeneration) {
+            // The previous cell may have submitted a turn but lost its reply.
+            // Do not reinterpret that as an unsubmitted prompt or replay it.
+            state.uncertain = true;
+            state.allowSend = false;
+        }
+        return state;
+    };
     const workerStatuses = new Set(['starting', 'running', 'idle', 'closed', 'failed']);
     const turnStatuses = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
     const validWorkerStatus = workerStatuses.has.bind(workerStatuses);
@@ -543,30 +556,58 @@
     }
     const currentTurn = worker => new AgentTurn(worker, workerGet(worker));
     class AgentWorker {
-        constructor(snapshot) {
+        constructor(snapshot, allowSend = true, recovered = false) {
             this.id = snapshot.workerId;
             this.workerId = snapshot.workerId;
             this.jobId = snapshot.jobId;
             this.agent = snapshot.agent;
+            this.recovered = recovered;
             workerSet(this, snapshot.turnId);
+            workerControlSet(this, {allowSend, uncertain:false, pending:0, generation:cellGeneration});
             freeze(this);
         }
         get turnId() { return workerGet(this); }
+        get sendAllowed() { return workerControl(this).allowSend; }
+        get unknownAdmission() { return workerControl(this).uncertain; }
+        async turn(turnId) {
+            if (!validTurnId(turnId)) throw new TypeErrorType('EVAL_AGENT_INPUT: turn requires an integer from 1 to 32');
+            const turn = new AgentTurn(this, turnId);
+            await readWorker(turn, 'worker_status');
+            return turn;
+        }
         async send(prompt) {
             if (typeof prompt !== 'string' || !prompt.trim()) {
                 throw new TypeErrorType('EVAL_AGENT_INPUT: send requires a nonempty prompt');
             }
-            const previous = workerGet(this);
-            const snapshot = checkWorker(await nativeResult('subagent', {
-                operation:'worker_send', workerId:this.id, task:prompt,
-            }), this.id);
-            if (snapshot.jobId !== this.jobId || snapshot.agent !== this.agent || snapshot.turnId <= previous) {
-                throw new ErrorType('EVAL_AGENT_PROTOCOL: invalid worker send acknowledgment');
+            const state = workerControl(this);
+            if (!state.allowSend) {
+                throw new ErrorType('EVAL_AGENT_RECOVERY_REQUIRED: sends are disabled on this handle; inspect native turns before explicitly attaching with allowSend:true');
             }
-            // Concurrent sends may resolve out of order. The newest native
-            // turn remains selected without changing earlier returned handles.
-            workerSet(this, Math.max(workerGet(this), snapshot.turnId));
-            return new AgentTurn(this, snapshot.turnId);
+            const previous = workerGet(this);
+            const generation = cellGeneration;
+            state.pending++;
+            state.generation = generation;
+            try {
+                const snapshot = checkWorker(await nativeResult('subagent', {
+                    operation:'worker_send', workerId:this.id, task:prompt,
+                }), this.id);
+                if (generation !== cellGeneration || snapshot.jobId !== this.jobId
+                    || snapshot.agent !== this.agent || snapshot.turnId <= previous) {
+                    throw new ErrorType('EVAL_AGENT_PROTOCOL: invalid worker send acknowledgment');
+                }
+                // Concurrent sends may resolve out of order. The newest native
+                // turn stays selected; earlier returned handles remain fixed.
+                workerSet(this, Math.max(workerGet(this), snapshot.turnId));
+                return new AgentTurn(this, snapshot.turnId);
+            } catch (error) {
+                state.uncertain = true;
+                state.allowSend = false;
+                // Includes transport/protocol/host errors: the guest cannot
+                // establish whether submission occurred. Preserve the cause.
+                throw error;
+            } finally {
+                state.pending--;
+            }
         }
         async status() { return currentTurn(this).status(); }
         async done() { return currentTurn(this).done(); }
@@ -614,6 +655,24 @@
             throw new ErrorType('EVAL_AGENT_PROTOCOL: invalid background acknowledgment');
         }
         return new AgentJob(started.jobId, args.agent);
+    };
+    const recoveryOptions = (id, options, flag, allowTurn = false) => {
+        if (!modelJobId(id) || !modelRecord(options)
+            || keys(options).some(key => key !== flag && !(allowTurn && key === 'turnId'))
+            || (hasOwn(options,flag) && typeof options[flag] !== 'boolean')
+            || (hasOwn(options,'turnId') && !validTurnId(options.turnId))) {
+            throw new TypeErrorType('EVAL_AGENT_INPUT: recovery requires an exact native id and supported typed options');
+        }
+    };
+    launchAgent.attachWorker = async (id, options = {}) => {
+        recoveryOptions(id, options, 'allowSend', true);
+        const allowSend = hasOwn(options,'allowSend') && options.allowSend === true;
+        const args = {operation:'worker_status',workerId:id};
+        const turnId = hasOwn(options,'turnId') ? options.turnId : undefined;
+        if (turnId !== undefined) args.turnId = turnId;
+        const snapshot = checkWorker(await nativeResult('subagent',args),id,turnId);
+        if (!modelJobId(snapshot.jobId)) throw new ErrorType('EVAL_AGENT_PROTOCOL: invalid native worker identity');
+        return new AgentWorker(snapshot,allowSend,true);
     };
     globalThis.agent = launchAgent;
     globalThis.wait = async (handles, options = {}) => {
@@ -891,7 +950,7 @@
         constructor(options, name, concurrency) {
             poolSet(this,{options,name,concurrency,poolId:null,jobId:null,snapshot:null,items:[],
                 closed:false,interrupted:false,finishAcknowledged:false,closeAcknowledged:false,
-                unknownAdmission:false,admissionPending:false,lastError:null,
+                unknownAdmission:false,admissionPending:false,lastError:null,recovered:false,
                 tail:resolvedPromise(),busy:false,generation:cellGeneration});
             freeze(this);
         }
@@ -902,6 +961,7 @@
         get concurrency() { return poolGet(this).concurrency; }
         get closed() { return poolGet(this).closed; }
         get unknownAdmission() { return poolGet(this).unknownAdmission; }
+        get recovered() { return poolGet(this).recovered; }
         get items() { return freeze([...poolGet(this).items]); }
         async push(tasks) {
             if (!isArray(tasks) || tasks.length > 32) {
@@ -1035,7 +1095,7 @@
         }
         async cancel() { return this.close(); }
     }
-    globalThis.workpool = async (options = {}) => {
+    const workpool = async (options = {}) => {
         if (!options || typeof options !== 'object' || isArray(options)) throw new TypeErrorType('EVAL_POOL_INPUT: workpool requires an options object');
         const native = {agent:'task'};
         let name = 'workpool';
@@ -1068,6 +1128,26 @@
         poolBatchArgs({options:native,poolId:null,concurrency},[]);
         return new AgentPool(freeze(native),name,concurrency);
     };
+    workpool.attach = async (id, options = {}) => {
+        recoveryOptions(id, options, 'allowPush');
+        const allowPush = hasOwn(options,'allowPush') && options.allowPush === true;
+        const snapshot = checkPool(await nativeResult('subagent',{operation:'pool_status',poolId:id}),id);
+        if (!modelJobId(snapshot.jobId) || !boundedText(snapshot.agent,128)) {
+            throw new ErrorType('EVAL_POOL_PROTOCOL: invalid recovered pool identity');
+        }
+        // No pool_start, task replay, launch options or renewed timeout. A
+        // known ID suffices because further pushes use the native frozen policy.
+        const pool = new AgentPool(freeze({agent:snapshot.agent}),'recovered-workpool',snapshot.concurrency);
+        const state = poolGet(pool);
+        adoptPool(state,snapshot);
+        state.recovered = true;
+        state.closed ||= !allowPush;
+        // Already-sealed pools can yield their aggregate without resending
+        // pool_finish. Failed/cancelled aggregates retain ordinary wait errors.
+        state.finishAcknowledged = snapshot.sealed;
+        return pool;
+    };
+    globalThis.workpool = workpool;
     return {
         dispatch(id, timer, flag, content) {
             if (timer) {
