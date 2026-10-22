@@ -22,7 +22,7 @@ route:
 ```
 
 `resolution` describes the requested stop outcome. Its presence is explicit;
-a plain `op:"pause"` keeps its prior behavior. Keeping this on the pause route
+a plain `op:"pause"` pauses settled work without attesting completion. Keeping this on the pause route
 preserves the outer RPC loop's idle-state and returned-input recovery preflight.
 It does not add a new mutation command that bypasses that preflight. Resolve
 returned input through the ordinary recovery workflow before resolving a goal.
@@ -35,8 +35,11 @@ Completion appends one native checkpoint; it does not first append a redundant
 pause. Evidence is a host-authored attestation, not independent proof. It is
 never evaluated as a command or inferred from the assistant's response.
 
-Unfinished native intents cannot be completed. Reconcile interrupted work
-through the existing lifecycle before attempting completion. Already completed
+Ordinary completion refuses unfinished native intents. After inspecting actual
+side effects, use the explicit `kind:"reconcile"` outcome described in
+`goal-reconciliation.md` to settle interrupted work without restarting it or
+increasing an exhausted budget. Plain pause also refuses unfinished intents;
+it cannot clear the interruption marker. Already completed
 or dropped goals reject another completion. An old receipt cannot complete a
 replacement goal, another session, another branch, or changed usage. The receipt
 is a logical revision identifier, not a credential or permission grant.
@@ -67,7 +70,7 @@ The whole existing session is saved through its normal storage backend. This
 operation does not repair a corrupt store, override filesystem permissions,
 clear a native provider-admission quarantine, or promise crash durability beyond
 the existing session save contract. A cancelled owner or contended session lock
-fails without a new goal decision. No provider request is made by either
+fails without a new goal decision. No provider request is made by any
 resolution and no model, tool, approval, or workspace policy is changed.
 
 ## Input contract
@@ -77,13 +80,17 @@ resolution and no model, tool, approval, or workspace policy is changed.
 - `{"kind":"complete","evidence":"..."}` with nonblank evidence of at most
   16 KiB UTF-8, preserved literally.
 - `{"kind":"save"}` with no evidence or additional fields.
+- `{"kind":"reconcile","outcome":"complete","evidence":"..."}` for an
+  unfinished attempt. Outcome must be `pause`, `complete` or `drop`; nonblank
+  evidence uses the same 16 KiB bound. See `goal-reconciliation.md` for recovery
+  after restart and exhausted budgets. Extra fields are refused.
 
 A resolution requires `op:"pause"` and a current, well-formed `revision`.
 Null, unknown kinds, extra nested fields, and combinations with `budget`,
 `objective`, `token_budget`, `max_prompts`, or `reason` are rejected by the
 lifecycle adapter. The outer RPC read-only `get` path remains read-only; use
-`pause`, not extra fields on `get`, to request a resolution. Existing plain
-pause and reviewed pause/budget requests are unchanged. These payloads do not
+`pause`, not extra fields on `get`, to request a resolution. Reviewed pause/budget
+requests preserve interruption; plain pause cannot acknowledge it. These payloads do not
 add top-level `op:"complete"` or `op:"save"` spellings.
 
 ## Validation status
@@ -95,6 +102,8 @@ usage and branches, saved-session reopening, save failure and retry, owner
 cancellation, lock contention, corrupt state, and existing pause/budget behavior.
 They use the actual journal and session persistence, not replacement stores.
 They do not constitute an end-to-end RPC subprocess or live-provider test.
+The additional reconciliation-adapter regressions and their unexecuted status
+are described in `goal-reconciliation.md`; these original tests remain unchanged.
 
 These tests were authored but not run on the implementation host.
 `dsr quality --tool pi_agent_rust` could not start because `dsr` is absent

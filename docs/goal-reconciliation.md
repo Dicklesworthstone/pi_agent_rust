@@ -9,6 +9,64 @@ After inspecting session history, external side effects and returned inputs,
 a host can now resolve that uncertainty explicitly. It does not need to resume
 provider work or increase an exhausted budget merely to record an outcome.
 
+## Default terminal
+
+Run `/goal status` and review the displayed state and history. Use its exact
+`g1-...` receipt and explicitly select one outcome:
+
+```text
+/goal reconcile <review> --pause -- I inspected the partial changes; further work needs review.
+/goal reconcile <review> --complete -- I inspected the deliverables and actual verification results after restart.
+/goal reconcile <review> --drop -- I reviewed the side effects and am abandoning the remaining objective.
+```
+
+These are alternatives, not a sequence. A successful decision changes the
+receipt. The terminal lists them only for an unfinished intent, and never
+silently chooses an outcome. Evidence after `--` follows the existing goal
+text grammar: surrounding whitespace is trimmed, interior whitespace and
+Unicode are retained, NUL is refused, and no file/shell expansion occurs.
+Missing evidence, multiple outcome flags, stale reviews and non-interrupted
+state fail without a decision. The command never publishes a live run control.
+
+Reconciliation is an idle lifecycle operation, not Escape-to-abort or a way
+to change an active runner's journal while it owns the session. Completion is
+still a user/host attestation, not a model-derived proof. If saving is not
+confirmed, keep the new receipt and use `/goal save <new-review>`; even a
+terminal state now displays that recovery command. Do not repeat reconciliation.
+
+## RPC hosts
+
+Use `goal` with `op:"get"` to obtain a fresh `gr1-...` revision, then request an
+explicit reconciliation through the existing guarded `pause` route:
+
+```json
+{"id":"inspect","type":"goal","op":"get"}
+```
+
+```json
+{"id":"reconcile","type":"goal","op":"pause","revision":"<current gr1 revision>","resolution":{"kind":"reconcile","outcome":"complete","evidence":"I inspected the deliverables and actual verification results after restart."}}
+```
+
+`outcome` is exactly `pause`, `complete` or `drop`. The nested resolution must
+contain exactly `kind`, `outcome` and nonblank `evidence`; unknown fields and
+combinations with creation/budget fields are rejected. RPC evidence is retained
+literally. The outer command's existing idle-state and returned-input recovery
+preflight still applies; this does not introduce a new route around it.
+
+The response identifies `resolution.kind:"reconcile"` and
+`resolution.journalChanged:true`; the resulting `goal.status` and
+`goal.interrupted:false` describe the chosen outcome. Always inspect its
+separate `persistence` acknowledgement. An unconfirmed decision can be saved
+without replay using the newly reviewed revision:
+
+```json
+{"id":"save","type":"goal","op":"pause","revision":"<new gr1 revision>","resolution":{"kind":"save"}}
+```
+
+Ordinary `resolution.kind:"complete"` still refuses an unfinished attempt;
+reconciliation must be explicit. The read-only `get` route does not execute a
+resolution placed on it. See `goal-rpc-resolution.md` for save-only semantics.
+
 ## Native SDK
 
 ```rust,no_run
@@ -79,6 +137,14 @@ stale decisions, evidence bounds, changed usage/branches/stores, cancellation,
 contention, corrupt checkpoints, native save/reopen and failed-save recovery.
 They use actual AgentSession and Session APIs with a provider that records and
 refuses calls. They do not execute a live model or prove cross-platform behavior.
+
+Eight additional native-adapter regressions cover terminal/RPC outcomes,
+strict command grammar and payloads, stale and repeated reviews, missing and
+settled goals, failed saves and save-only recovery through native reopening.
+The terminal cases use its real parser, receipt, transition and report path
+and refuse any run-control publication. The four terminal cases are enabled
+with `ftui`. These are not PTY or RPC subprocess tests. All pre-existing tests
+remain unchanged.
 
 These Rust tests are authored, not executed on the implementation host. The
 required `dsr quality --tool pi_agent_rust` could not start because `dsr` is

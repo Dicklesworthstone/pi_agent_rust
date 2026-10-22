@@ -7,7 +7,7 @@
 //! Their host acquires the run control before the first poll, without new rights.
 
 use super::{
-    GoalBudget, GoalControl, GoalPersistence, GoalRunReport, GoalStatus, MAX_TEXT_BYTES,
+    GoalBudget, GoalControl, GoalPersistence, GoalReconciliation, GoalRunReport, GoalStatus, MAX_TEXT_BYTES,
     Record, Transition, append, check_owner, failure, latest, persist, snapshot,
     transition, validate_text,
 };
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | run <review> --steps N | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | save <review>]";
+const USAGE: &str = "usage: /goal [status | create <review> [--tokens N] [--prompts N] -- <objective> | budget <review> --tokens N --prompts N -- <reason> | step <review> | run <review> --steps N | pause <review> | resume <review> | drop <review> -- <reason> | complete <review> -- <evidence> | reconcile <review> <--pause|--complete|--drop> -- <evidence> | save <review>]";
 const RECEIPT_PREFIX: &str = "g1-";
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 
@@ -29,6 +29,7 @@ const MAX_REPORT_BYTES: usize = 64 * 1024;
 enum Action<'a> {
     Create { objective: &'a str, budget: GoalBudget },
     Budget { reason: &'a str, budget: GoalBudget },
+    Reconcile { outcome: GoalReconciliation, evidence: &'a str },
     Step,
     Run { steps: u32 },
     Pause,
@@ -124,6 +125,15 @@ fn parse(args: &str) -> Result<Command<'_>> {
         }
         "drop" => Action::Drop(text_tail(&mut remaining)?),
         "complete" => Action::Complete(text_tail(&mut remaining)?),
+        "reconcile" => {
+            let outcome = match word(&mut remaining) {
+                Some("--pause") => GoalReconciliation::Pause,
+                Some("--complete") => GoalReconciliation::Complete,
+                Some("--drop") => GoalReconciliation::Drop,
+                _ => return Err(usage()),
+            };
+            Action::Reconcile { outcome, evidence: text_tail(&mut remaining)? }
+        }
         "run" => {
             if word(&mut remaining) != Some("--steps") {
                 return Err(usage());
@@ -269,6 +279,11 @@ pub(crate) async fn run_with_control(
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
             Some(transition(record.clone(), Transition::Budget { budget, reason })?)
         }
+        Action::Reconcile { outcome, evidence } => {
+            let (_, record) = current.as_ref()
+                .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+            Some(transition(record.clone(), Transition::Reconcile { outcome, evidence })?)
+        }
         Action::Save => {
             if current.is_none() { return Err(failure("GOAL_MISSING", "this branch has no goal to save")); }
             None
@@ -279,7 +294,7 @@ pub(crate) async fn run_with_control(
             let (_, record) = current.as_ref()
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
             if matches!(action, Action::Pause) && record.in_flight {
-                return Err(failure("GOAL_INTERRUPTED", "an unfinished attempt is already paused; inspect it before explicitly resuming or dropping it"));
+                return Err(failure("GOAL_INTERRUPTED", "an unfinished attempt is already paused; inspect history and side effects, then use /goal reconcile, resume or drop"));
             }
             let change = match action {
                 Action::Pause => Transition::Pause("Paused by terminal user"),
@@ -425,7 +440,7 @@ fn render(record: Option<&Record>, review: &str) -> String {
             text.push_str("End of note/evidence.\n");
         }
         if record.in_flight {
-            text.push_str("Interrupted work: inspect history and side effects before explicitly resuming or dropping it.\n");
+            text.push_str("Interrupted work: inspect history, returned input and side effects before explicitly reconciling, resuming or dropping it.\n");
         }
     } else {
         text.push_str("No goal on the current session branch.\n");
@@ -434,8 +449,16 @@ fn render(record: Option<&Record>, review: &str) -> String {
     if record.is_none_or(|record| record.status.terminal()) {
         let _ = writeln!(text, "Create: /goal create {review} --tokens 100000 --prompts 16 -- <objective>");
     } else {
-        let _ = writeln!(text, "Pause: /goal pause {review}\nResume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nAttest completion: /goal complete {review} -- <evidence>\nRetry saving: /goal save {review}");
+        if record.is_some_and(|record| record.in_flight) {
+            let _ = writeln!(text, "Reconcile and keep paused: /goal reconcile {review} --pause -- <evidence>\nReconcile as complete: /goal reconcile {review} --complete -- <evidence>\nReconcile and abandon: /goal reconcile {review} --drop -- <evidence>\nReconciliation records a host attestation, preserves spent allowances and does not execute work.");
+        } else {
+            let _ = writeln!(text, "Pause: /goal pause {review}\nAttest completion: /goal complete {review} -- <evidence>");
+        }
+        let _ = writeln!(text, "Resume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nRetry saving: /goal save {review}");
         let _ = writeln!(text, "Revise total budgets: /goal budget {review} --tokens N --prompts N -- <reason>\nBudget revision preserves spent counters and interruption; it does not resume work.");
+    }
+    if record.is_some_and(|record| record.status.terminal()) {
+        let _ = writeln!(text, "Retry saving terminal state: /goal save {review}");
     }
     if record.is_some_and(|record| record.effective_status() == GoalStatus::Active) {
         let _ = writeln!(text, "Execute one prompt: /goal step {review}\nExecute up to N prompts: /goal run {review} --steps N (1..32)\nRuns pause early on absent or repeated successful tool activity; review the recorded reason before resuming.");
