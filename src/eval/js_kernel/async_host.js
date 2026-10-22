@@ -335,7 +335,7 @@
         }
         if (!integer(page.total) || page.total < 1 || page.total > 16 || !integer(page.settled)
             || page.settled < 0 || page.settled > page.total || cursor.manifest === null
-            || (page.complete ? !page.done || page.settled !== page.total || !['exited','failed'].includes(page.jobStatus)
+            || (page.complete ? !page.done || page.settled !== page.total
                 : !['running','killed','timedOut'].includes(page.jobStatus))) throw drainProtocol();
         for (let index = 0; index < cursor.seen.length; index++) if (cursor.seen[index] >= page.total) throw drainProtocol();
         const added = [];

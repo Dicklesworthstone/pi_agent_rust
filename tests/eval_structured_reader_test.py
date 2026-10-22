@@ -477,6 +477,19 @@ raise RuntimeError('processing failed')
         self.assertEqual(self.value(response), withdrawn)
         self.assertEqual(self.value(self.kernel.cell("bookmark")), batch_drain_cursor([1]))
 
+    def test_batch_drain_complete_evidence_is_independent_of_interruption_status(self):
+        self.launch_batch()
+        for status in ("killed", "timedOut"):
+            with self.subTest(status=status):
+                # An authorized host can retain a final failed aggregate;
+                # complete describes evidence, independently of job failure.
+                page = batch_drain_page(jobStatus=status, done=True, jobFailed=True, complete=True, settled=2,
+                                       items=[batch_drain_item(0), batch_drain_item(1, error="explicit item failure")],
+                                       cursor=batch_drain_cursor([0, 1]))
+                response = self.kernel.cell("await model.drain(timeout=0)", self.reply_with(page))
+                self.assertEqual(self.value(response), page)
+        self.assertEqual(len(self.kernel.calls), 3)
+
     def test_batch_drain_cursor_can_be_reused_after_fresh_kernel_attachment(self):
         self.launch_batch()
         saved = self.value(self.kernel.cell("(await model.drain())['cursor']", self.reply_with(batch_drain_page())))

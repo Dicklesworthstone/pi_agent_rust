@@ -239,6 +239,25 @@ test('mixed judgment batch failures retain ordered successful verdicts and error
     answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
     assert.deepEqual(JSON.parse(JSON.stringify(await pending)),native);
 });
+test('batch drains preserve complete failed evidence independently of interruption status', async () => {
+    const h = host();
+    await launchModel(h,"judgeBatch(['good','bad'],{safe:{type:'bool',instructions:'safe?'}})",'judgment_batch');
+    for (const jobStatus of ['killed','timedOut']) {
+        // The authorized host may retain a final failed aggregate. Native
+        // drain complete describes its evidence, not a successful lifecycle.
+        const page = {schema:'pi.eval.batch-drain.v1',jobId:'model-native',jobStatus,
+            done:true,jobFailed:true,complete:true,evidenceAvailable:true,total:2,settled:2,
+            items:[{index:0,key:0,ok:true,verdict:judgmentValue(0)},
+                {index:1,key:1,ok:false,error:'explicit item failure'}],
+            cursor:{schema:'pi.eval.batch-cursor.v1',jobId:'model-native',manifest:'a'.repeat(64),seen:[0,1]}};
+        const pending = vm.runInContext('model.drain({timeout:0})',h.context);
+        const request = h.requests.at(-1);
+        assert.equal(request.name,'__pi_judge_batch_drain');
+        h.dispatch.dispatch(request.id,false,true,JSON.stringify(page));
+        assert.deepEqual(JSON.parse(JSON.stringify(await pending)),page);
+    }
+    assert.equal(h.requests.length,3);
+});
 test('batch progress exposes ordered evidence and each observation reenters the host', async () => {
     const h = host(); await startProgressBatch(h); h.dispatch.clear();
     const native = batchProgressResult(); const snapshot = batchProgressSnapshot(native);

@@ -1225,8 +1225,7 @@ def _model_check_drain(page, job_id, previous):
     if (type(page.get("total")) is not int or not 1 <= page["total"] <= 16
             or type(page.get("settled")) is not int or not 0 <= page["settled"] <= page["total"]
             or cursor["manifest"] is None
-            or (page["complete"] and (not page["done"] or page["settled"] != page["total"]
-                                      or page["jobStatus"] not in ("exited", "failed")))
+            or (page["complete"] and (not page["done"] or page["settled"] != page["total"]))
             or (not page["complete"] and page["jobStatus"] not in ("running", "killed", "timedOut"))
             or any(index >= page["total"] for index in cursor["seen"])):
         raise _model_drain_protocol()
