@@ -26,6 +26,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
+mod budget;
 mod input;
 mod verification;
 
@@ -81,6 +82,7 @@ impl fmt::Debug for GoalRunReport {
 
 struct ControlState {
     paused: bool,
+    token_limit_reached: bool,
     finished: bool,
     turn: Option<SessionControlHandle>,
     verification_waker: Option<std::task::Waker>,
@@ -99,6 +101,7 @@ impl GoalControl {
         Self {
             state: Arc::new(Mutex::new(ControlState {
                 paused: false,
+                token_limit_reached: false,
                 finished: false,
                 turn: None,
                 verification_waker: None,
@@ -115,12 +118,17 @@ impl GoalControl {
     /// Seal continuation even between prompts. Await the run to drain native
     /// cancellation. Dropping does not promise completed async cleanup.
     pub fn pause(&self) -> bool {
+        self.request_stop(false)
+    }
+
+    fn request_stop(&self, token_limit_reached: bool) -> bool {
         let (turn, waker) = {
             let mut state = self.lock();
             if state.finished || state.paused {
                 return false;
             }
             state.paused = true;
+            state.token_limit_reached = token_limit_reached;
             (state.turn.clone(), state.verification_waker.take())
         };
         if let Some(turn) = turn {
@@ -142,6 +150,10 @@ impl GoalControl {
     fn paused(&self) -> bool {
         let state = self.lock();
         state.paused || state.finished
+    }
+
+    fn token_limit_reached(&self) -> bool {
+        self.lock().token_limit_reached
     }
 
     fn current_turn(&self) -> Result<SessionControlHandle> {
@@ -415,10 +427,14 @@ impl AgentSessionHandle {
             let prompt = prompt_for(&ticket.record);
             let callback = Arc::clone(&on_event);
             let callback_control = control.clone();
+            let prompt_budget = budget::PromptBudget::new(ticket.remaining_tokens());
             // The borrowed SDK path installs scoped fetchers for this turn;
             // they retire with it instead of accumulating on a retained handle.
             // Native hooks, retry/failover and persistence keep their owner.
             let turn = self.prompt_controlled(prompt, move |event| {
+                // Observe terminal assistant usage before the native loop can
+                // admit another tool round, follow-up, retry or server turn.
+                prompt_budget.observe(&callback_control, &event);
                 callback(&callback_control, event);
             });
             let native_control = turn.control();
@@ -447,6 +463,7 @@ impl AgentSessionHandle {
                     report.stop = match interruption(owner, &deadline, &control).or(stop) {
                         Some(GoalRunStop::Cancelled) => GoalRunStop::Cancelled,
                         Some(GoalRunStop::Deadline) => GoalRunStop::Deadline,
+                        Some(GoalRunStop::BudgetLimited) => GoalRunStop::BudgetLimited,
                         Some(GoalRunStop::NativeFailure) => GoalRunStop::NativeFailure,
                         _ => GoalRunStop::Failed,
                     };
@@ -481,6 +498,8 @@ fn failed(mut report: GoalRunReport, error: Error) -> GoalRunReport {
 fn interruption(owner: &AgentCx, deadline: &TurnDeadline, control: &GoalControl) -> Option<GoalRunStop> {
     if owner.checkpoint().is_err() {
         Some(GoalRunStop::Cancelled)
+    } else if control.token_limit_reached() {
+        Some(GoalRunStop::BudgetLimited)
     } else if control.paused() {
         Some(GoalRunStop::Paused)
     } else if deadline.is_elapsed() {
@@ -608,19 +627,28 @@ async fn settle_attempt(
         let state = control.lock();
         let (id, record) = latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
         check_snapshot(expected, &store, &session, &id, &record)?;
-        let late_stop = if state.paused || state.finished {
+        let late_stop = if state.token_limit_reached {
+            Some(GoalRunStop::BudgetLimited)
+        } else if state.paused || state.finished {
             Some(GoalRunStop::Paused)
         } else if deadline.is_elapsed() {
             Some(GoalRunStop::Deadline)
         } else {
             None
         };
-        let decision = if late_stop.is_some() {
-            pause_decision("run interrupted before the host verdict was committed")
-        } else {
-            decision
+        let decision = match late_stop {
+            Some(GoalRunStop::BudgetLimited) => pause_decision(
+                "observed assistant token budget exhausted; review recorded usage and revise total allowances before resuming",
+            ),
+            Some(_) => pause_decision("run interrupted before the host verdict was committed"),
+            None => decision,
         };
-        let record = settle_record(record, decision)?;
+        let mut record = settle_record(record, decision)?;
+        if late_stop == Some(GoalRunStop::BudgetLimited) {
+            // Retries can discard an assistant from the selected branch. Keep
+            // recorded tokens truthful while retaining the observed stop.
+            record.status = GoalStatus::BudgetLimited;
+        }
         check_owner(owner, enabled)?;
         let id = append(&mut session, &record)?;
         (snapshot(&store, &session, id, record), late_stop)

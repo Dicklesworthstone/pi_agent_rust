@@ -1,11 +1,10 @@
 # Goal-driven SDK sessions
 
-Pi's in-process SDK can now retain an objective across several native prompts,
+Pi's in-process SDK can retain an objective across several native prompts,
 stop for review, and resume with its remaining prompt/token budget. This is an
-OMP-inspired **SDK workflow**. The default FrankenTUI also exposes `/goal`
-lifecycle controls described below. Bounded execution remains an SDK workflow,
-not a terminal execution command or a model-facing `goal` tool. The separate
-RPC lifecycle adapter is not the in-process execution driver.
+OMP-inspired workflow. The default FrankenTUI exposes `/goal` lifecycle controls
+and bounded execution described below. There is no model-facing `goal` tool.
+The separate RPC lifecycle adapter is not the in-process execution driver.
 The types currently live in `pi::goal`, an unstable module under the library's
 public API policy; the lifecycle methods are on `AgentSessionHandle`.
 
@@ -83,11 +82,12 @@ two bounded execution commands:
 /goal run <review> --steps 4
 ```
 
-`step` runs exactly one native goal prompt. `run` authorizes 1–32 prompts in
-one terminal invocation, still bounded by the goal's own remaining prompt and
-token budgets. Between successful prompts the terminal supplies a host-side
-**Continue** verdict; after the requested count it supplies **Pause**. Assistant
-prose can never mark the goal complete or extend the user-selected run.
+`step` runs at most one native goal prompt. `run` authorizes an upper bound of
+1–32 prompts in one terminal invocation, still bounded by the goal's remaining
+prompt and token allowances. The shared progress policy can pause earlier when
+successful tool progress is absent or repeats. Continued progress can receive a
+host-side **Continue** verdict; the selected upper bound ends with **Pause**.
+Assistant prose can never mark the goal complete or extend the selected run.
 
 Both commands use the existing SDK driver, tool permissions, approvals,
 persistence, retries, compaction and native cancellation path. Their absolute
@@ -225,9 +225,9 @@ An ordinary verifier error stops with `GoalRunStop::Failed` and pauses the goal;
 the error is reported separately from the preserved native `completion`. A later
 goal-journal error can take precedence in `error`; inspect persistence and obtain
 a fresh snapshot before acting. Invalid empty/oversized evidence fails closed.
-Native errors, refusal, incomplete answers, unclaimed user inputs and native
-run-time-cap messages do not even construct a verifier future. A native time cap
-pauses instead of starting another prompt with a fresh cap.
+Native errors, refusal, incomplete answers, unclaimed user inputs, observed token
+exhaustion and native run-time-cap messages do not construct a verifier future.
+A native time cap pauses instead of starting another prompt with a fresh cap.
 
 The host must own cancellation-safe cleanup for its verifier's resources.
 Pause, expiry or cancellation drops the pending verifier under its initiating
@@ -242,8 +242,8 @@ even if the native prompt already returned successfully. An unused unpolled run
 constructs neither a verifier nor a provider request. Verification has no live
 native input mailbox: `steer`/`follow_up` reject input there instead of silently
 queueing it for another prompt. Keep pending host input separately until the
-next explicit run. No terminal `/goal` workflow, autonomous verifier selection,
-or model-facing completion tool is introduced by these SDK methods.
+next explicit run. No autonomous verifier selection or model-facing completion
+tool is introduced by these SDK methods.
 
 ## Limits and accounting
 
@@ -255,12 +255,39 @@ cannot be confirmed. Resume does not refund attempts or reset spent tokens.
 
 A “prompt” here includes its native tool-iteration loop, retries and live
 follow-ups. It is not a single provider request. Continue configuring the
-session's own maximum tool iterations. The token budget stops **subsequent goal
-prompts**, not an already-running provider/tool loop. One prompt can overshoot;
-usage that the provider never reports cannot be recovered as a billing fact.
-Accounting is conservative: for every recorded assistant message, use the larger
-of `total_tokens` and the saturating sum of input, output and cache buckets.
-This can overestimate when a provider overlaps those buckets.
+session's own maximum tool iterations. Token enforcement now also observes
+**completed assistant messages inside that native loop**, instead of waiting
+until the entire goal prompt returns. Each prompt starts with only the goal's
+remaining allowance, after usage already recorded on its selected branch.
+For every terminal assistant message, the observer uses the same normalization
+as the journal: the larger of `total_tokens` and the saturating sum of input,
+output and cache buckets. Cumulative streaming previews, user/tool messages and
+repeated message lists in turn/agent lifecycle events are not counted again.
+
+When observed usage reaches the remaining allowance, the goal seals live input
+and requests native abort before returning from that event callback. The native
+executor retains ownership of cancellation, pending tool-call results, cleanup
+and persistence. This stops further native tool/provider continuation, including
+queued follow-ups and server `pause_turn` rounds, through its existing admission
+checks. Work already performed is not undone. The goal report distinguishes
+`BudgetLimited` from an ordinary user pause and keeps the native post-drain
+completion and unclaimed inputs. No automatic verifier or completion verdict is
+requested after this boundary; even a prepared verdict cannot override the
+latched token stop. An earlier explicit user pause retains its own cause.
+
+This is **not a hard billing ceiling**. The response that reports the usage can
+already have overshot, unknown provider usage cannot be invented, cache buckets
+can overlap, and blocking work cannot be forcibly preempted. The observer does
+not count unseen auxiliary requests or estimate tokens from text. Reported usage
+observed before native retries is not refunded by restarting a provider attempt
+inside the same prompt. The ordinary native deadline still bounds the run.
+
+The persisted `tokens_spent` remains selected-branch assistant accounting, not a
+second event ledger. A discarded retry can therefore make observed usage exceed
+what remains on that branch. The final checkpoint retains the `BudgetLimited`
+status and an observed-budget explanation without fabricating a higher recorded
+token count. Inspect the native result and history before revising allowances.
+Save failures retain their existing unconfirmed/interrupted behavior.
 
 The timeout starts when `run_goal` or `run_goal_with_verifier` constructs its
 future, not at its first poll.
@@ -272,12 +299,15 @@ future; cooperative cleanup may outlive the timeout. Blocking native work and
 host callbacks are not forcibly preempted.
 
 Exhaustion is `BudgetLimited`, never automatic completion. A successful final
-prompt may still be explicitly verified complete at the budget boundary. An
-exhausted goal cannot be resumed by resetting its counters. A host can explicitly
-revise its total allowances with `set_goal_budget` (or `/goal budget`) while
-retaining spent work, then review and resume the paused goal. Replacing the
-objective instead requires explicitly dropping the old goal and creating a new
-one. See [budget revisions](goal-budget-revisions.md) for limits and recovery.
+prompt may still be explicitly verified complete at the **prompt-count** boundary
+when no token stop or other interruption occurred. After a token stop, review
+the retained result; explicit lifecycle completion remains an attestation, not
+an automatic consequence of the assistant's final text. An exhausted goal cannot
+be resumed by resetting its counters. A host can explicitly revise its total
+allowances with `set_goal_budget` (or `/goal budget`) while retaining spent work,
+then review and resume the paused goal. Replacing the objective instead requires
+explicitly dropping the old goal and creating a new one. See
+[budget revisions](goal-budget-revisions.md) for limits and recovery.
 
 ## Pause, input and interruption
 
@@ -356,3 +386,13 @@ Borrowed-session and asynchronous-verification workflows are covered in
 `tests/goal_borrowed.rs`; timer/cancellation registration probes are in
 `src/goal/driver/verification.rs`. These tests were also authored but not run in
 the implementation environment. Source inspection is not runtime acceptance.
+
+Eight additional regressions in `src/goal/driver/budget.rs` cover terminal-only
+usage normalization, saturation and first-stop precedence, native file-tool
+rounds, retained attachment-bearing follow-ups, server continuations, normal
+under-budget completion, remaining allowances after resume/revision, and a late
+verdict losing without invented journal usage. Provider responses are controlled;
+Agent, goal/session control, tool execution and filesystem operations are native.
+These tests are authored, not executed. DSR was attempted again and was absent
+(exit 127). Compilation, Rust tests, formatting and Clippy remain unverified.
+This change does not complete the terminal goal keyboard-control integration.
