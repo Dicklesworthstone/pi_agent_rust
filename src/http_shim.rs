@@ -558,6 +558,7 @@ export function get(input, optionsOrCallback, callback) {
 const VIRTUAL_HTTP_QUEUE_LIMIT = 1024 * 1024;
 const VIRTUAL_HTTP_HIGH_WATER_MARK = 64 * 1024;
 const VIRTUAL_HTTP_REQUEST_LIMIT = 10 * 1024 * 1024;
+const VIRTUAL_HTTP_REQUEST_CHUNK_BYTES = 16 * 1024;
 
 function virtualHttpError(message, code = 'ERR_PIJS_VIRTUAL_HTTP') {
   const error = new Error(message);
@@ -576,13 +577,16 @@ function virtualHttpHeader(name, value) {
 
 function makeVirtualTransaction(server, request) {
   const url = new URL(request.url);
-  const body = request.body_bytes !== undefined
+  let body = request.body_bytes !== undefined
     ? __pi_http_decode_body_bytes(request.body_bytes)
     : __pi_http_clone_body_chunk(request.body || '');
   if (body.length > VIRTUAL_HTTP_REQUEST_LIMIT) {
     throw virtualHttpError('Virtual HTTP request exceeds 10 MiB');
   }
-  const req = new EventEmitter();
+  // Request listeners run inside the transaction's failure boundary. Unlike
+  // the general EventEmitter, swallowing a data/end exception here can leave
+  // a live relay operation waiting forever or continue it after rejection.
+  const req = new HttpEventEmitter();
   req.method = String(request.method || 'GET').toUpperCase();
   req.url = url.pathname + url.search;
   req.headers = Object.create(null);
@@ -602,9 +606,21 @@ function makeVirtualTransaction(server, request) {
   req.socket.setNoDelay = () => req.socket;
   req.socket.setKeepAlive = () => req.socket;
   req.connection = req.socket;
-  req.setEncoding = (encoding) => { req._encoding = encoding; return req; };
-  req.pause = () => req;
-  req.resume = () => req;
+  let requestStarted = false;
+  let requestScheduled = false;
+  let requestPaused = false;
+  let requestOffset = 0;
+  let requestDecoder = null;
+  req.setEncoding = (encoding) => {
+    const name = encoding ? String(encoding) : 'utf8';
+    const decoder = new StringDecoder(name);
+    req._encoding = name;
+    requestDecoder = decoder;
+    return req;
+  };
+  req.pause = () => { requestPaused = true; return req; };
+  req.resume = () => { requestPaused = false; scheduleRequestBody(); return req; };
+  req.isPaused = () => requestPaused;
 
   const res = new EventEmitter();
   res.statusCode = 200;
@@ -632,6 +648,10 @@ function makeVirtualTransaction(server, request) {
   const complete = () => {
     if (finished) return;
     finished = true;
+    // The response may outlive the upload, or reject it before consumption.
+    // Do not retain up to 10 MiB in the transaction after either terminal path.
+    body = null;
+    requestDecoder = null;
     if (timeoutHandle !== null) clearTimeout(timeoutHandle);
     timeoutHandle = null;
     wake();
@@ -651,11 +671,16 @@ function makeVirtualTransaction(server, request) {
     req.destroyed = true;
     res.destroyed = true;
     // Notify every cancellation observer even if one listener throws.
-    for (const [emitter, event, value] of [
-      [req, 'aborted', undefined], [req, 'close', undefined],
-      [res, 'close', undefined], [req.socket, 'close', undefined],
+    for (const [emitter, event] of [
+      [req, 'aborted'], [req, 'close'],
+      [res, 'close'], [req.socket, 'close'],
     ]) {
-      try { emitter.emit(event, value); } catch (_) {}
+      if (event === 'aborted' && !req.aborted) continue;
+      // Preserve once wrappers while isolating each cleanup observer: a
+      // throwing close listener must not prevent a later upstream canceller.
+      for (const listener of emitter.rawListeners(event).slice()) {
+        try { Reflect.apply(listener, emitter, []); } catch (_) {}
+      }
     }
     complete();
   };
@@ -771,17 +796,53 @@ function makeVirtualTransaction(server, request) {
     }
     return finished ? { done: true } : { done: false, value: { pending: true } };
   };
-  // The callback and request body are delivered after callers own a cancellation
-  // handle. This also gives standard Node request listeners time to attach.
+  function canDeliverRequestBody() {
+    return requestStarted && !requestPaused && body !== null &&
+      !req.destroyed && !res.destroyed && !res.writableEnded;
+  }
+  function scheduleRequestBody() {
+    if (requestScheduled || !canDeliverRequestBody()) return;
+    requestScheduled = true;
+    queueMicrotask(deliverRequestBody);
+  }
+  function deliverRequestBody() {
+    requestScheduled = false;
+    if (!canDeliverRequestBody()) return;
+    try {
+      if (requestOffset < body.length) {
+        const end = Math.min(requestOffset + VIRTUAL_HTTP_REQUEST_CHUNK_BYTES, body.length);
+        const bytes = __pi_http_clone_body_chunk(body.subarray(requestOffset, end));
+        requestOffset = end;
+        armTimeout();
+        const chunk = requestDecoder ? requestDecoder.write(bytes) : bytes;
+        if (chunk.length > 0) req.emit('data', chunk);
+        // Even the last chunk yields before end. A data listener may pause,
+        // destroy, respond early, or queue cancellation in a microtask.
+        scheduleRequestBody();
+        return;
+      }
+      const tail = requestDecoder ? requestDecoder.end() : '';
+      requestDecoder = null;
+      if (tail) {
+        req.emit('data', tail);
+        scheduleRequestBody();
+        return;
+      }
+      if (!canDeliverRequestBody()) return;
+      req.complete = true;
+      body = null;
+      req.emit('end');
+    } catch (error) { fail(error); }
+  }
+  // Dispatch only after callers own cancellation. Bounded body deliveries on
+  // later microtasks honor pause/resume without opening a socket or accepting
+  // streaming fetch uploads; the existing whole-request limit is unchanged.
   queueMicrotask(() => {
     if (res.destroyed) return;
     try {
       server.emit('request', req, res);
-      if (!req.destroyed && !res.writableEnded) {
-        if (body.length > 0) req.emit('data', __pi_http_decode_chunk(body, req._encoding));
-        req.complete = true;
-        req.emit('end');
-      }
+      requestStarted = true;
+      scheduleRequestBody();
     } catch (error) { fail(error); }
   });
   return {
