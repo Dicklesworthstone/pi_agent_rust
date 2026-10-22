@@ -1,4 +1,4 @@
-//! Request-body lifecycle through PiJS's owned virtual HTTP route (#270).
+//! Request/response lifecycle through PiJS's owned virtual HTTP route (#270).
 //! These tests never bind a socket or permit external HTTP. They complement
 //! virtual_http_server's provider ownership and response-stream coverage.
 
@@ -257,4 +257,202 @@ fn virtual_request_body_decoder_preserves_split_utf8_and_terminal_tail() {
     assert_eq!(result["types"], true);
     assert_eq!(result["ends"], 1);
     assert!(result["tail"].as_str().expect("tail").ends_with("☃🎼é�"));
+}
+
+#[test]
+fn virtual_response_end_callback_runs_once_for_each_supported_overload() {
+    let result = run_case(
+        "virtual_response_end_ack",
+        r#"
+        let callbacks = 0, failures = 0;
+        const server = http.createServer((req, res) => {
+            const done = error => { callbacks++; if (error) failures++; };
+            if (req.url === '/empty') res.end(done);
+            else if (req.url === '/encoded') res.end('snowman: ☃', 'utf8', done);
+            else if (req.url === '/binary') res.end(Buffer.from([0, 255, 65]), done);
+            else res.end('completed', done);
+        });
+        await new Promise(resolve => server.listen(28180, '127.0.0.1', resolve));
+        try {
+            const bodies = [];
+            for (const path of ['/empty', '/encoded', '/binary', '/text']) {
+                const response = await fetch('http://127.0.0.1:28180' + path);
+                bodies.push(Array.from(new Uint8Array(await response.arrayBuffer())));
+            }
+            await Promise.resolve();
+            return { result: { callbacks, failures, bodies } };
+        } finally { server.close(); }
+        "#,
+    );
+    assert_eq!(result["callbacks"], 4);
+    assert_eq!(result["failures"], 0);
+    assert_eq!(
+        result["bodies"],
+        json!([
+            Vec::<u8>::new(),
+            "snowman: ☃".as_bytes(),
+            [0, 255, 65],
+            "completed".as_bytes(),
+        ])
+    );
+}
+
+#[test]
+fn virtual_response_finish_teardown_preserves_final_sse_bytes() {
+    let result = run_case(
+        "virtual_response_finish_teardown",
+        r#"
+        let closed = 0, finished = 0, acknowledgements = 0;
+        const expected = 'data: first\n\ndata: [DONE]\n\n';
+        const server = http.createServer((req, res) => {
+            const parts = req.url.slice(1).split('/');
+            res.once(parts[0], () => {
+                if (parts[1] === 'request') req.destroy();
+                else if (parts[1] === 'response') res.destroy();
+                else req.socket.destroy();
+            });
+            res.on('finish', () => { throw new Error('finish observer'); });
+            res.once('finish', () => { finished++; });
+            res.on('close', () => { throw new Error('close observer'); });
+            res.once('close', () => { closed++; });
+            res.writeHead(200, { 'content-type': 'text/event-stream' });
+            res.write('data: first\n\n');
+            res.end('data: [DONE]\n\n', () => {
+                acknowledgements++;
+                throw new Error('completion observer');
+            });
+        });
+        await new Promise(resolve => server.listen(28180, '127.0.0.1', resolve));
+        try {
+            const bodies = [];
+            for (const event of ['finish', 'close']) {
+                for (const target of ['request', 'response', 'socket']) {
+                    const response = await fetch('http://127.0.0.1:28180/' + event + '/' + target);
+                    bodies.push(await response.text() === expected);
+                }
+            }
+            await Promise.resolve();
+            return { result: { bodies, closed, finished, acknowledgements } };
+        } finally { server.close(); }
+        "#,
+    );
+    assert_eq!(
+        result,
+        json!({"bodies": [true, true, true, true, true, true], "closed": 6, "finished": 6, "acknowledgements": 6})
+    );
+}
+
+#[test]
+fn virtual_response_async_callback_failures_release_active_request_slots() {
+    let result = run_case(
+        "virtual_response_callback_failure",
+        r#"
+        let closed = 0, failures = 0;
+        const server = http.createServer((req, res) => {
+            if (req.url === '/ok') { res.end('recovered'); return; }
+            res.once('close', () => { closed++; });
+            if (req.url === '/write') {
+                res.write('pending', () => { throw new Error('owned-write-failure'); });
+            } else {
+                res.once('drain', () => { throw new Error('owned-drain-failure'); });
+                res.write(Buffer.alloc(64 * 1024, 65));
+            }
+        });
+        await new Promise(resolve => server.listen(28180, '127.0.0.1', resolve));
+        try {
+            for (const path of ['/write', '/drain']) {
+                // More than the 64 active-request limit: leaked transactions
+                // cannot make the test appear to succeed on just one request.
+                for (let i = 0; i < 70; i++) {
+                    try {
+                        const response = await fetch('http://127.0.0.1:28180' + path);
+                        await response.arrayBuffer();
+                    } catch (error) {
+                        if (String(error).includes('owned-' + path.slice(1) + '-failure')) failures++;
+                        else throw error;
+                    }
+                }
+            }
+            const response = await fetch('http://127.0.0.1:28180/ok');
+            return { result: { closed, failures, recovered: await response.text() } };
+        } finally { server.close(); }
+        "#,
+    );
+    assert_eq!(
+        result,
+        json!({"closed": 140, "failures": 140, "recovered": "recovered"})
+    );
+}
+
+#[test]
+fn virtual_response_cancelled_and_oversized_writes_never_acknowledge_success() {
+    let result = run_case(
+        "virtual_response_failed_ack",
+        r#"
+        const errors = [];
+        let rejected = 0;
+        const server = http.createServer((req, res) => {
+            const ack = error => { errors.push(String(error)); };
+            if (req.url === '/cancel') {
+                res.write('queued', ack);
+                res.destroy(new Error('relay-stopped'));
+            } else {
+                res.end(Buffer.alloc(1024 * 1024 + 1), ack);
+            }
+        });
+        await new Promise(resolve => server.listen(28180, '127.0.0.1', resolve));
+        try {
+            for (const path of ['/cancel', '/oversized']) {
+                try {
+                    const response = await fetch('http://127.0.0.1:28180' + path);
+                    await response.text();
+                } catch (_) { rejected++; }
+            }
+            await Promise.resolve();
+            return { result: { rejected, count: errors.length,
+                cancelled: errors[0].includes('relay-stopped'), bounded: errors[1].includes('1 MiB') } };
+        } finally { server.close(); }
+        "#,
+    );
+    assert_eq!(
+        result,
+        json!({"rejected": 2, "count": 2, "cancelled": true, "bounded": true})
+    );
+}
+
+#[test]
+fn virtual_response_backpressure_streams_more_than_its_queue_limit_without_truncation() {
+    let result = run_case(
+        "virtual_response_backpressure",
+        r#"
+        let writes = 0, drains = 0;
+        const server = http.createServer((_req, res) => {
+            function pump() {
+                if (writes === 24) { res.end(); return; }
+                if (res.write(Buffer.alloc(64 * 1024, writes++))) throw new Error('expected backpressure');
+                res.once('drain', () => { drains++; pump(); });
+            }
+            pump();
+        });
+        await new Promise(resolve => server.listen(28180, '127.0.0.1', resolve));
+        try {
+            const response = await fetch('http://127.0.0.1:28180/stream');
+            const reader = response.body.getReader();
+            let count = 0, intact = true;
+            for (;;) {
+                const part = await reader.read();
+                if (part.done) break;
+                for (const byte of part.value) {
+                    if (byte !== Math.floor(count / (64 * 1024))) intact = false;
+                    count++;
+                }
+            }
+            return { result: { count, intact, writes, drains } };
+        } finally { server.close(); }
+        "#,
+    );
+    assert_eq!(
+        result,
+        json!({"count": 1_572_864, "intact": true, "writes": 24, "drains": 24})
+    );
 }

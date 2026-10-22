@@ -398,3 +398,205 @@ test('normal completion disarms the request timeout', async () => {
   assert.equal(f.timers.size, 0);
   f.expire(); assert.equal(bodyOf(tx).body.toString(), 'complete');
 });
+
+// Response-side lifecycle is as important as upload delivery: callbacks may
+// launch the next relay operation, so success is exactly once and failure must
+// release the current transaction before consumers can wait again.
+test('end with a chunk and callback acknowledges completion exactly once', async () => {
+  for (const binary of [false, true]) {
+    let calls = 0;
+    const f = await fixture((_req, res) => {
+      res.end(binary ? Buffer.from([0, 255, 65]) : 'relay-final', () => { calls++; });
+    });
+    const tx = f.transaction();
+    f.drain();
+    assert.deepEqual(bodyOf(tx).body, binary ? Buffer.from([0, 255, 65]) : Buffer.from('relay-final'));
+    assert.equal(calls, 1, 'the end callback must not also become a write callback');
+  }
+});
+
+test('finish and close cleanup cannot erase an already completed response', async () => {
+  for (const event of ['finish', 'close']) {
+    for (const target of ['request', 'response', 'socket']) {
+      let closes = 0, finishes = 0;
+      const f = await fixture((req, res) => {
+        res.on('finish', () => { finishes++; });
+        res.on('close', () => { closes++; });
+        res.once(event, () => {
+          if (target === 'request') req.destroy();
+          else if (target === 'response') res.destroy();
+          else req.socket.destroy();
+        });
+        res.write('data: first\n\n');
+        res.end('data: [DONE]\n\n');
+      });
+      const tx = f.transaction();
+      f.drain();
+      assert.equal(bodyOf(tx).body.toString(), 'data: first\n\ndata: [DONE]\n\n');
+      assert.equal(finishes, 1);
+      assert.equal(closes, 1, `${event}/${target} must not emit a second close`);
+    }
+  }
+});
+
+test('a throwing drain handler terminates and releases the response', async () => {
+  let response, closes = 0, finished = false;
+  const f = await fixture((_req, res) => {
+    response = res;
+    res.on('close', () => { closes++; });
+    res.once('drain', () => { throw new Error('relay-drain-failed'); });
+    assert.equal(res.write(Buffer.alloc(64 * 1024)), false);
+  });
+  const tx = f.transaction();
+  tx.finished.then(() => { finished = true; });
+  f.drain();
+  assert.equal(tx.poll().value.status, 200);
+  assert.equal(Buffer.from(tx.poll().value.body_bytes, 'base64').length, 64 * 1024);
+  f.drain();
+  await Promise.resolve();
+  assert.equal(response.destroyed, true);
+  assert.equal(finished, true);
+  assert.equal(closes, 1);
+  assert.throws(() => tx.poll(), /relay-drain-failed/);
+});
+
+test('throwing write callbacks fail the owned response instead of escaping the scheduler', async () => {
+  let response, finished = false, closes = 0;
+  const f = await fixture((_req, res) => {
+    response = res;
+    res.on('close', () => { closes++; });
+    res.write('pending', () => { throw new Error('relay-write-failed'); });
+  });
+  const tx = f.transaction();
+  tx.finished.then(() => { finished = true; });
+  assert.doesNotThrow(() => f.drain());
+  await Promise.resolve();
+  assert.equal(response.destroyed, true);
+  assert.equal(finished, true);
+  assert.equal(closes, 1);
+  assert.throws(() => tx.poll(), /relay-write-failed/);
+});
+
+test('cancelled write callbacks receive failure, never a late success', async () => {
+  let error, calls = 0, response;
+  const f = await fixture((_req, res) => {
+    response = res;
+    res.write('queued', value => { calls++; error = value; });
+    res.destroy(new Error('relay-stopped'));
+  });
+  const tx = f.transaction();
+  f.drain();
+  assert.equal(response.destroyed, true);
+  assert.equal(calls, 1);
+  assert.match(String(error), /relay-stopped/);
+  assert.throws(() => tx.poll(), /relay-stopped/);
+});
+
+test('oversized end acknowledges failure once and releases its transaction', async () => {
+  let calls = 0, error, finished = false;
+  const f = await fixture((_req, res) => {
+    res.end(Buffer.alloc(1024 * 1024 + 1), value => { calls++; error = value; });
+  });
+  const tx = f.transaction();
+  tx.finished.then(() => { finished = true; });
+  f.drain();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  assert.match(String(error), /1 MiB/);
+  assert.equal(finished, true);
+  assert.throws(() => tx.poll(), /1 MiB/);
+});
+
+test('queued drain notifications do not restart a completed relay producer', async () => {
+  let response, drains = 0;
+  const f = await fixture((_req, res) => {
+    response = res;
+    res.on('drain', () => { drains++; });
+    assert.equal(res.write(Buffer.alloc(64 * 1024, 65)), false);
+  });
+  const tx = f.transaction();
+  f.drain();
+  assert.equal(tx.poll().value.status, 200);
+  assert.equal(Buffer.from(tx.poll().value.body_bytes, 'base64').length, 64 * 1024);
+  response.end('tail');
+  f.drain();
+  assert.equal(drains, 0, 'drain must not be emitted after finish');
+  assert.equal(bodyOf(tx).body.toString(), 'tail');
+});
+
+test('throwing completion observers cannot prevent later cleanup or discard bytes', async () => {
+  let lateFinish = 0, lateClose = 0, callback = 0;
+  const f = await fixture((_req, res) => {
+    res.on('finish', () => { throw new Error('finish-observer'); });
+    res.once('finish', () => { lateFinish++; });
+    res.on('close', () => { throw new Error('close-observer'); });
+    res.once('close', () => { lateClose++; });
+    res.end('completed', () => { callback++; throw new Error('completion-observer'); });
+  });
+  const tx = f.transaction();
+  assert.doesNotThrow(() => f.drain());
+  assert.equal(bodyOf(tx).body.toString(), 'completed');
+  assert.equal(lateFinish, 1);
+  assert.equal(lateClose, 1);
+  assert.equal(callback, 1);
+});
+
+test('backpressure permits responses larger than the queue without loss', async () => {
+  let writes = 0, drains = 0;
+  const f = await fixture((_req, res) => {
+    function pump() {
+      if (writes === 24) { res.end(); return; }
+      assert.equal(res.write(Buffer.alloc(64 * 1024, writes++)), false);
+      res.once('drain', () => { drains++; pump(); });
+    }
+    pump();
+  });
+  const tx = f.transaction();
+  const chunks = [];
+  f.drain();
+  assert.equal(tx.poll().value.status, 200);
+  for (;;) {
+    f.drain();
+    const item = tx.poll();
+    if (item.done) break;
+    assert(item.value.body_bytes, 'producer must make progress after drain');
+    chunks.push(Buffer.from(item.value.body_bytes, 'base64'));
+  }
+  const bytes = Buffer.concat(chunks);
+  assert.equal(bytes.length, 24 * 64 * 1024);
+  assert(bytes.every((byte, i) => byte === Math.floor(i / (64 * 1024))));
+  assert.equal(writes, 24);
+  assert.equal(drains, 24);
+});
+
+test('consumer cancellation still releases completed unread bytes', async () => {
+  let closes = 0;
+  const f = await fixture((_req, res) => {
+    res.on('close', () => { closes++; });
+    res.end(Buffer.alloc(1024 * 1024, 65));
+  });
+  const tx = f.transaction();
+  f.drain();
+  tx.cancel(); tx.cancel();
+  assert.equal(bodyOf(tx).body.length, 0);
+  assert.equal(closes, 1);
+});
+
+test('repeated response failures do not leave unfinished transactions or timers', async () => {
+  let closes = 0, finished = 0;
+  const f = await fixture((_req, res) => {
+    res.once('close', () => { closes++; });
+    res.setTimeout(1234);
+    res.write('pending', () => { throw new Error('repeat-failure'); });
+  });
+  for (let i = 0; i < 80; i++) {
+    const tx = f.transaction();
+    tx.finished.then(() => { finished++; });
+    f.drain();
+    assert.throws(() => tx.poll(), /repeat-failure/);
+    assert.equal(f.timers.size, 0);
+    await Promise.resolve();
+  }
+  assert.equal(finished, 80);
+  assert.equal(closes, 80);
+});

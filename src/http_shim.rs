@@ -622,7 +622,7 @@ function makeVirtualTransaction(server, request) {
   req.resume = () => { requestPaused = false; scheduleRequestBody(); return req; };
   req.isPaused = () => requestPaused;
 
-  const res = new EventEmitter();
+  const res = new HttpEventEmitter();
   res.statusCode = 200;
   res.headersSent = false;
   res.writableEnded = false;
@@ -657,13 +657,17 @@ function makeVirtualTransaction(server, request) {
     wake();
     finish();
   };
-  const fail = (reason) => {
-    if (res.destroyed) return;
-    if (finished && res.writableEnded) {
-      queue.length = 0;
-      queuedBytes = 0;
-      return;
+  const notifyCleanup = (emitter, event) => {
+    // Once wrappers and ordering are retained, but one cleanup observer must
+    // never prevent a later observer from releasing its upstream operation.
+    for (const listener of emitter.rawListeners(event).slice()) {
+      try { Reflect.apply(listener, emitter, []); } catch (_) {}
     }
+  };
+  const fail = (reason) => {
+    // Producer teardown after finish must not discard the successful response
+    // that its consumer has yet to read. Reader cancellation is separate below.
+    if (res.destroyed || finished) return;
     failure = reason instanceof Error ? reason : virtualHttpError(String(reason || 'Virtual HTTP request cancelled'), 'ABORT_ERR');
     queue.length = 0;
     queuedBytes = 0;
@@ -676,13 +680,17 @@ function makeVirtualTransaction(server, request) {
       [res, 'close'], [req.socket, 'close'],
     ]) {
       if (event === 'aborted' && !req.aborted) continue;
-      // Preserve once wrappers while isolating each cleanup observer: a
-      // throwing close listener must not prevent a later upstream canceller.
-      for (const listener of emitter.rawListeners(event).slice()) {
-        try { Reflect.apply(listener, emitter, []); } catch (_) {}
-      }
+      notifyCleanup(emitter, event);
     }
     complete();
+  };
+  const acknowledge = (callback) => {
+    if (typeof callback !== 'function') return;
+    queueMicrotask(() => {
+      // A cancellation between enqueue and delivery is not a successful write.
+      // Callback failures belong to this transaction, not the realm scheduler.
+      try { callback(failure || undefined); } catch (error) { fail(error); }
+    });
   };
   const armTimeout = () => {
     if (timeoutHandle !== null) clearTimeout(timeoutHandle);
@@ -735,7 +743,7 @@ function makeVirtualTransaction(server, request) {
   };
   res.write = (chunk, encoding, callback) => {
     const cb = typeof encoding === 'function' ? encoding : callback;
-    if (res.destroyed) return false;
+    if (res.destroyed) { acknowledge(cb); return false; }
     if (res.writableEnded) throw virtualHttpError('Write after end', 'ERR_STREAM_WRITE_AFTER_END');
     res.flushHeaders();
     const bytes = typeof chunk === 'string' && typeof Buffer !== 'undefined'
@@ -743,6 +751,7 @@ function makeVirtualTransaction(server, request) {
       : __pi_http_clone_body_chunk(chunk);
     if (queuedBytes + bytes.length > VIRTUAL_HTTP_QUEUE_LIMIT) {
       fail(virtualHttpError('Virtual HTTP response buffer exceeds 1 MiB'));
+      acknowledge(cb);
       return false;
     }
     if (bytes.length > 0) {
@@ -751,22 +760,28 @@ function makeVirtualTransaction(server, request) {
       armTimeout();
       wake();
     }
-    if (typeof cb === 'function') queueMicrotask(() => cb());
+    acknowledge(cb);
     backpressured = queuedBytes >= VIRTUAL_HTTP_HIGH_WATER_MARK;
     return !backpressured;
   };
   res.end = (chunk, encoding, callback) => {
     const cb = typeof chunk === 'function' ? chunk : typeof encoding === 'function' ? encoding : callback;
-    if (res.destroyed || res.writableEnded) return res;
-    if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') res.write(chunk, encoding);
-    if (res.destroyed) return res;
+    if (res.destroyed) { acknowledge(cb); return res; }
+    if (res.writableEnded) return res;
+    if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') {
+      // The second argument may be the end callback, not a write callback.
+      res.write(chunk, typeof encoding === 'string' ? encoding : undefined);
+    }
+    if (res.destroyed) { acknowledge(cb); return res; }
     res.flushHeaders();
     res.writableEnded = true;
     res.writableFinished = true;
-    try { res.emit('finish'); } finally {
-      try { res.emit('close'); } finally { complete(); }
-    }
-    if (typeof cb === 'function') queueMicrotask(() => cb());
+    // Commit the terminal result before user cleanup runs. A finish/close
+    // observer may destroy the request, response, or socket reentrantly.
+    complete();
+    notifyCleanup(res, 'finish');
+    notifyCleanup(res, 'close');
+    acknowledge(cb);
     return res;
   };
   res.setTimeout = (ms, callback) => {
@@ -790,7 +805,10 @@ function makeVirtualTransaction(server, request) {
       armTimeout();
       if (backpressured && queuedBytes < VIRTUAL_HTTP_HIGH_WATER_MARK) {
         backpressured = false;
-        queueMicrotask(() => { if (!res.destroyed) res.emit('drain'); });
+        queueMicrotask(() => {
+          if (finished || res.destroyed || queuedBytes >= VIRTUAL_HTTP_HIGH_WATER_MARK) return;
+          try { res.emit('drain'); } catch (error) { fail(error); }
+        });
       }
       return { done: false, value: { body_bytes: __pi_http_chunks_to_base64([bytes]) } };
     }
@@ -855,7 +873,16 @@ function makeVirtualTransaction(server, request) {
         await new Promise((resolve) => { waiting = resolve; });
       }
     },
-    cancel(reason) { fail(reason); return { done: true }; },
+    cancel(reason) {
+      if (finished && !failure) {
+        // Only the consumer may discard an already completed unread body.
+        queue.length = 0;
+        queuedBytes = 0;
+      } else {
+        fail(reason);
+      }
+      return { done: true };
+    },
   };
 }
 
