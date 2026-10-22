@@ -225,7 +225,10 @@ fn stale_borrowed_snapshot_is_rejected_without_provider_work() {
         let owner = AgentCx::for_current_or_request();
         let goal = handle.create_goal(&owner, "Old review", GoalBudget::default())
             .await.expect("goal").goal;
-        handle.pause_goal(&owner, &goal, "changed after review").await.expect("pause");
+        let _ = handle
+            .pause_goal(&owner, &goal, "changed after review")
+            .await
+            .expect("pause");
         let report = handle.run_goal(&owner, &goal, Duration::from_secs(10), |_, _| {}, |_, _| complete())
             .expect("run").await;
         assert_eq!(report.stop, GoalRunStop::Failed);

@@ -34,7 +34,7 @@ impl PromptBudget {
         let tokens = super::super::usage_tokens(&message.usage);
         let previous = self
             .observed
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
                 Some(spent.saturating_add(tokens))
             })
             .unwrap_or_else(|spent| spent);

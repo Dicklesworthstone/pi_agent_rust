@@ -189,7 +189,7 @@ fn sdk_accounts_active_usage_once_and_pauses_unrelated_accounting() {
         assert_eq!(current(&handle).tokens_spent(), 80);
         assert!(handle.resume_goal(&owner, &changed.goal).await.unwrap_err().to_string().contains("GOAL_STALE"));
         let reviewed = current(&handle);
-        handle.resume_goal(&owner, &reviewed).await.unwrap();
+        let _ = handle.resume_goal(&owner, &reviewed).await.unwrap();
         usage(&mut handle.session_store().try_lock().unwrap(), 10);
         assert_eq!(current(&handle).tokens_spent(), 90);
     });

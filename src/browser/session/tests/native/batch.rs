@@ -2,7 +2,6 @@
 //! No alternate backend or synthetic batch executor is involved.
 
 use super::*;
-use futures::FutureExt as _;
 
 fn workflow(calls: Vec<Value>) -> Value {
     let steps: Vec<_> = calls.into_iter().map(|call| json!({"call":call})).collect();

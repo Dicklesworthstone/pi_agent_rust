@@ -1306,7 +1306,7 @@ mod tests {
             agent.set_queue_modes(QueueMode::All, QueueMode::All);
             for text in ["first queued task", "second queued task"] {
                 let delivery = queued_user_message(text);
-                delivery.bind_persistence_identity(None);
+                let _ = delivery.bind_persistence_identity(None);
                 agent.message_queue.push_follow_up(delivery);
             }
             let accepted = agent.message_queue.follow_up.clone();

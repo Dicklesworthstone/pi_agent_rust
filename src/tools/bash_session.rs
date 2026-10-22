@@ -518,7 +518,6 @@ impl Snapshot {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]

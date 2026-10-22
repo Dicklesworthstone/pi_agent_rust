@@ -348,7 +348,10 @@ fn stale_goal_snapshot_is_refused_before_native_execution() {
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
         let created = session.create_goal(&owner, "stale", GoalBudget::default()).await.unwrap();
-        session.pause_goal(&owner, &created.goal, "host paused").await.unwrap();
+        let _ = session
+            .pause_goal(&owner, &created.goal, "host paused")
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
         let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| panic!("stale dispatch"), |_, _| panic!("stale verdict")).unwrap().await;
         assert_eq!(report.stop, GoalRunStop::Failed);

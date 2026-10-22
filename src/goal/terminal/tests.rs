@@ -149,7 +149,7 @@ fn plan_mode_blocks_creation_and_resume_without_weakening_other_controls() {
     let (mut handle, _) = fixture(Session::in_memory(), false);
     execute(async {
         let owner = AgentCx::for_current_or_request();
-        handle.enter_plan_mode(&owner).await.unwrap();
+        let _ = handle.enter_plan_mode(&owner).await.unwrap();
     });
     let token = review(&mut handle);
     let before = leaf(&handle);
@@ -157,14 +157,14 @@ fn plan_mode_blocks_creation_and_resume_without_weakening_other_controls() {
     assert_eq!(leaf(&handle), before);
     execute(async {
         let owner = AgentCx::for_current_or_request();
-        handle.exit_plan_mode(&owner).await.unwrap();
+        let _ = handle.exit_plan_mode(&owner).await.unwrap();
     });
     create(&mut handle, "preserve goal through planning");
     let token = review(&mut handle);
     execute(run(&mut handle, &format!("pause {token}"))).unwrap();
     execute(async {
         let owner = AgentCx::for_current_or_request();
-        handle.enter_plan_mode(&owner).await.unwrap();
+        let _ = handle.enter_plan_mode(&owner).await.unwrap();
     });
     let token = review(&mut handle);
     assert!(execute(run(&mut handle, &format!("resume {token}"))).unwrap_err().to_string().contains("GOAL_PLAN_MODE"));

@@ -71,8 +71,17 @@ fn receipt_from(text: &str) -> String {
 
 async fn create(handle: &mut AgentSessionHandle) -> String {
     let owner = AgentCx::for_current_or_request();
-    handle.create_goal(&owner, "implement and inspect the requested feature",
-        GoalBudget { max_prompts: 8, token_budget: 1000 }).await.unwrap();
+    let _ = handle
+        .create_goal(
+            &owner,
+            "implement and inspect the requested feature",
+            GoalBudget {
+                max_prompts: 8,
+                token_budget: 1000,
+            },
+        )
+        .await
+        .unwrap();
     receipt_from(&run(handle, "status").await.unwrap())
 }
 
@@ -192,7 +201,7 @@ fn lifecycle_stale_and_plan_commands_never_publish_execution_controls() {
         let error = run_with_control(&mut handle, &format!("step {review}"), move |_| { counted.fetch_add(1, Ordering::SeqCst); }).await.unwrap_err();
         assert!(error.to_string().contains("GOAL_STALE"));
         let owner = AgentCx::for_current_or_request();
-        handle.enter_plan_mode(&owner).await.unwrap();
+        let _ = handle.enter_plan_mode(&owner).await.unwrap();
         let review = receipt_from(&run(&mut handle, "status").await.unwrap());
         let counted = Arc::clone(&calls);
         let error = run_with_control(&mut handle, &format!("step {review}"), move |_| { counted.fetch_add(1, Ordering::SeqCst); }).await.unwrap_err();
