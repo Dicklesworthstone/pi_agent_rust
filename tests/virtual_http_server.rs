@@ -348,6 +348,11 @@ fn readable_from_web_iterator_break_cancels_virtual_response() {
             const source = Readable.fromWeb(response.body);
             let first;
             for await (const chunk of source) { first = chunk.toString('utf8'); break; }
+            // Breaking destroys the Node stream, which cancels the Web reader.
+            // That cancellation is asynchronous, as it is in Node, so the
+            // server sees its response close before the next timer turn, not
+            // before the loop exits. Waiting one turn also shows it closes once.
+            await new Promise(resolve => setTimeout(resolve, 0));
             return { result: { first, closed, destroyed: source.destroyed, listeners: ['data', 'error', 'end', 'close'].map(event => source.listenerCount(event)) } };
         } finally { server.close(); }
         "#,
