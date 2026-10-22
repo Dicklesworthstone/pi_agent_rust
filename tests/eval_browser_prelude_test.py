@@ -325,6 +325,7 @@ def main():
     assert "make_browser" not in NAMESPACE
     assert sys.path[0] == ""
     assert len(sys.argv) == 2 and sys.argv[1].endswith("kernel.py")
+    assert NAMESPACE["recovery_installed"] is True
     result = asyncio.run(NAMESPACE["browser"].tab("app").get_by_label("Email").fill("value"))
     print(json.dumps({"result":result,"workspace":workspace_module.value}))
 if __name__ == "__main__":
@@ -332,9 +333,12 @@ if __name__ == "__main__":
 ''', encoding="utf-8")
             (root / "workspace_module.py").write_text("value = 42\n", encoding="utf-8")
             (root / "kernel.py").write_text("raise RuntimeError('wrong kernel path')\n", encoding="utf-8")
+            recovery = staged / "agent_recovery.py"
+            recovery.write_text("def install(kernel):\n    kernel.NAMESPACE['recovery_installed'] = True\n", encoding="utf-8")
+            (root / "agent_recovery.py").write_text("raise RuntimeError('wrong recovery path')\n", encoding="utf-8")
             command = [sys.executable, "-c",
                        "import sys\nwith open(sys.argv[1], encoding='utf-8') as source:\n code = source.read()\nexec(compile(code, sys.argv[1], 'exec'))",
-                       str(helper), str(kernel)]
+                       str(helper), str(kernel), str(recovery)]
             run = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=10)
             self.assertEqual(run.returncode, 0, run.stderr)
             reply = json.loads(run.stdout)

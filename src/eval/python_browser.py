@@ -299,9 +299,10 @@ def _start_kernel():
     import importlib.util
     import sys
 
-    if len(sys.argv) != 3:
-        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: expected the staged kernel path")
+    if len(sys.argv) != 4:
+        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: expected staged kernel and recovery paths")
     kernel_path = sys.argv[2]
+    recovery_path = sys.argv[3]
     # Restore the same argv shape as the previous direct kernel bootstrap.
     sys.argv[:] = [sys.argv[0], kernel_path]
     spec = importlib.util.spec_from_file_location("_pi_eval_kernel", kernel_path)
@@ -311,6 +312,13 @@ def _start_kernel():
     sys.modules[spec.name] = kernel
     spec.loader.exec_module(kernel)
     kernel.NAMESPACE["browser"] = make_browser(kernel.NAMESPACE["tool"].result)
+    recovery_spec = importlib.util.spec_from_file_location("_pi_eval_agent_recovery", recovery_path)
+    if recovery_spec is None or recovery_spec.loader is None:
+        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: recovery loader unavailable")
+    recovery = importlib.util.module_from_spec(recovery_spec)
+    sys.modules[recovery_spec.name] = recovery
+    recovery_spec.loader.exec_module(recovery)
+    recovery.install(kernel)
     kernel.main()
 
 

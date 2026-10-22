@@ -35,6 +35,7 @@ pub(crate) use display::image_dimensions;
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 const PY_BROWSER_BOOTSTRAP: &str = include_str!("eval/python_browser.py");
+const PY_AGENT_RECOVERY: &str = include_str!("eval/python_agent_recovery.py");
 
 /// Default per-cell budget.
 const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
@@ -74,6 +75,9 @@ impl PyKernel {
         let bootstrap = packages.path().join("browser.py");
         std::fs::write(&bootstrap, PY_BROWSER_BOOTSTRAP)
             .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
+        let recovery = packages.path().join("agent_recovery.py");
+        std::fs::write(&recovery, PY_AGENT_RECOVERY)
+            .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
         let mut command = runtime.command();
         command
             // Keep -c's workspace import semantics; only the large bootstrap
@@ -84,6 +88,7 @@ impl PyKernel {
             ])
             .arg(&bootstrap)
             .arg(&script)
+            .arg(&recovery)
             .env("_PI_EVAL_PACKAGE_ROOT", packages.path())
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -659,7 +664,12 @@ impl Tool for EvalTool {
          Set keepAlive:true in JS or keep_alive=True in Python to retain one \
          live child conversation; await worker.send(prompt) queues a follow-up \
          and returns a handle pinned to that turn. await worker.close() cancels \
-         its running and queued turns. await workpool({agent,concurrency}) in JS \
+         its running and queued turns. JS agent.attachWorker(id) or Python \
+         agent.attach_worker(id) recovers an existing worker without launching \
+         or replaying work; worker.turn(id) selects an existing turn. Recovered \
+         handles disable new sends unless allowSend:true / allow_send=True is \
+         explicit. An uncertain send acknowledgment disables further sends. \
+         await workpool({agent,concurrency}) in JS \
          or await workpool(agent=...,concurrency=...) in Python creates a lazy \
          native pool; await pool.push([prompts]) atomically admits a batch and \
          returns fixed item handles. One session job owns 1-8 reusable workers. \
@@ -675,6 +685,10 @@ impl Tool for EvalTool {
          await pool.close() cancels running and queued work. Pools admit at most \
          32 items with fixed total lifetimes; split pushes above 256 KiB encoded. \
          Native results survive kernel reset; jobs list exposes recovery IDs. \
+         await workpool.attach(poolId) recovers the existing pool and ordered \
+         item handles without changing its deadline. New pushes remain disabled \
+         unless allowPush:true / allow_push=True is explicit and the native pool \
+         is open. Inspect accepted work before allowing new sends or pushes. \
          Await every pool command. Each operation \
          uses the current cell's host and policy. JS handles can be retained on \
          globalThis; all waits remain within the current cell's deadline. \

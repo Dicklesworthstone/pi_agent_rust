@@ -324,3 +324,34 @@ test('inherited permission flags do not enable recovered submissions', async () 
     const result = plain(await h.run("const w = await agent.attachWorker('worker-a',Object.create({allowSend:true})); const p = await workpool.attach('pool-a',Object.create({allowPush:true})); return [w.sendAllowed,p.closed];"));
     assert.deepEqual(result,[false,true]);
 });
+
+test('recovered pool retains context observations and explicit incremental result acknowledgments', async () => {
+    let completed = false;
+    const cursor = itemIds => ({schema:'pi.subagent.pool.cursor.v1',poolId:'pool-a',itemIds});
+    const h = host(async (_,args) => {
+        if (args.operation === 'pool_status') return pool(['running','completed'],'open',{
+            workerContexts:[{workerIndex:1,tokens:400,window:8000},{workerIndex:2,tokens:100,window:8000}],
+        });
+        assert.equal(args.operation,'pool_drain');
+        const before = args.cursor?.itemIds ?? [];
+        const settled = completed ? [1,2] : [2];
+        const items = settled.filter(id => !before.includes(id)).map(id => ({id,status:'completed',result:output(`item-${id}`)}));
+        return {schema:'pi.subagent.pool.drain.v1',poolId:'pool-a',jobId:'job-pool',agent:'reviewer',
+            status:completed ? 'completed' : 'open',sealed:completed,admittedItems:2,
+            settledItems:settled.length,pendingItems:2-settled.length,items,
+            cursor:cursor(before),nextCursor:cursor(settled),hasMore:false,
+            done:completed,timedOut:items.length === 0 && !completed};
+    });
+    await h.run("globalThis.p = await workpool.attach('pool-a');");
+    assert.equal(await h.run('return p.closed;'),true);
+    assert.deepEqual(plain(await h.run('return (await p.peek()).workerContexts;')),
+        [{workerIndex:1,tokens:400,window:8000},{workerIndex:2,tokens:100,window:8000}]);
+    await h.run('globalThis.first = await p.drain({timeout:0});');
+    assert.deepEqual(plain(await h.run('return first.items.map(item => item.id);')),[2]);
+    assert.deepEqual(plain(await h.run('return (await p.drain({timeout:0})).items.map(item => item.id);')),[2]);
+    assert.equal(await h.run('return (await p.drain({cursor:first.nextCursor,timeout:0})).timedOut;'),true);
+    completed = true;
+    assert.deepEqual(plain(await h.run('const page = await p.drain({cursor:first.nextCursor,timeout:0}); return [page.items.map(item => item.id),page.nextCursor.itemIds,page.done];')),
+        [[1],[1,2],true]);
+    assert.ok(h.calls.every(call => call.args.operation === 'pool_status' || call.args.operation === 'pool_drain'));
+});
