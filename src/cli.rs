@@ -2654,7 +2654,7 @@ pub enum Commands {
     /// Parallel model code review with prioritized findings and a ship verdict
     #[command(name = "review")]
     Review {
-        /// Target: uncommitted (default), staged, commit:REF, branch:REF, or a commit range
+        /// Target: uncommitted (default), staged, commit:REF, branch:REF, a commit range, or an HTTPS GitHub PR / GitLab MR URL
         #[arg(value_name = "TARGET")]
         target: Option<String>,
         /// Run only local heuristics; do not send code to a model

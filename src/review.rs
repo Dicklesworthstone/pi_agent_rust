@@ -10,6 +10,8 @@
 //! - Ship verdict card calculation (`SHIP`, `SHIP-WITH-NITS`, `BLOCK`)
 //! - Strict schema-governed JSON (`pi.review.v1`), Markdown, and terminal formats
 
+mod hosted;
+
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -925,6 +927,20 @@ fn excluded_review_path(path: &str) -> bool {
         || path.ends_with(".min.js") || path.ends_with(".min.css")
 }
 
+fn filter_review_hunks(hunks: Vec<DiffHunk>, skipped: &mut Vec<String>) -> Vec<DiffHunk> {
+    let filtered = hunks.into_iter().filter(|hunk| {
+        if excluded_review_path(&hunk.file_path) {
+            skipped.push(hunk.file_path.clone());
+            false
+        } else {
+            true
+        }
+    }).collect();
+    skipped.sort();
+    skipped.dedup();
+    filtered
+}
+
 fn parse_review_diff(diff: &str, skipped: &mut Vec<String>) -> Result<Vec<DiffHunk>> {
     let mut hunks = Vec::new();
     // Parse one file at a time: the general commit parser otherwise appends
@@ -1238,6 +1254,15 @@ impl CodeReviewer {
     }
 
     fn acquire_diff_with_coverage(cwd: &Path, target: Option<&str>) -> Result<(String, Vec<DiffHunk>, Vec<String>)> {
+        if let Some(target) = target
+            && let Some(hosted) = hosted::Target::parse(target)?
+        {
+            let diff = hosted.acquire(cwd)?;
+            let mut skipped = Vec::new();
+            let hunks = parse_review_diff(&diff, &mut skipped)?;
+            let hunks = filter_review_hunks(hunks, &mut skipped);
+            return Ok((hosted.url(), hunks, skipped));
+        }
         let target_name = target.unwrap_or("uncommitted");
         let root = run_review_git(review_git(cwd).args(["rev-parse", "--show-toplevel"]), false)?;
         let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
@@ -1310,23 +1335,7 @@ impl CodeReviewer {
             }
         }
 
-        // Exclude lockfiles and minified files. Suffix matching is intentionally
-        // exact and case-sensitive; these are conventional literal file names.
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        let filtered_hunks: Vec<DiffHunk> = all_hunks
-            .into_iter()
-            .filter(|h| {
-                if excluded_review_path(&h.file_path) {
-                    skipped.push(h.file_path.clone());
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        skipped.sort();
-        skipped.dedup();
+        let filtered_hunks = filter_review_hunks(all_hunks, &mut skipped);
         Ok((target_name.to_string(), filtered_hunks, skipped))
     }
 
