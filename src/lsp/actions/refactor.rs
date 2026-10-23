@@ -416,7 +416,6 @@ impl LspTool {
             .as_deref()
             .filter(|path| !path.is_empty())
             .ok_or_else(|| tool_err("LSP_USAGE", "rename_file requires a nonempty newFile"))?;
-        let owner = AgentCx::for_current_or_request();
         let requested = resolve_tool_path(file, &self.cwd);
         let metadata = std::fs::symlink_metadata(&requested)?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -432,10 +431,10 @@ impl LspTool {
         if self.registry.specs_for_file(&old_path).len() > 1 {
             return self.run_rename_group(input, &requested, new_file, false).await;
         }
+        let budget = prepare::Budget::new(self.request_timeout(input));
+        budget.remaining()?;
         let hash = file_hash(&old_path)?;
-        let (old_uri, entry) = self
-            .synced_with_timeout(&old_path, self.request_timeout(input))
-            .await?;
+        let (old_uri, entry) = budget.synchronize(self, &old_path).await?;
         let snapshot = RefactorSnapshot::capture(&entry, &old_path, hash)?;
         // Use a canonical base without creating parents. Scope validation
         // rejects traversal and symlink components, including dangling targets.
@@ -459,16 +458,17 @@ impl LspTool {
                 .call(
                     "workspace/willRenameFiles",
                     params.clone(),
-                    self.request_timeout(input),
+                    budget.remaining()?,
                 )
                 .await?
         } else {
             Value::Null
         };
+        budget.remaining()?;
         let combined = append_move(edit, &old_uri, &new_uri)?;
+        let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
+        budget.remaining()?;
         if input.apply == Some(false) {
-            crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
             return self.cache_refactor(
                 &entry,
                 prepared,
@@ -476,12 +476,14 @@ impl LspTool {
                 json!({"action":"rename_file","from":display_path(&old_path,&self.cwd),
                     "to":display_path(&new_path,&self.cwd),"willRenameFiles":will}),
                 did.then_some(params),
-                &owner,
+                &budget.owner,
             );
         }
         // One transaction computes import updates AND the move before any
         // target changes. A late destination conflict cannot strand imports.
-        let outcome = self.apply_refactor(&entry, &combined, &snapshot, &owner)?;
+        let result = prepared.commit(|| budget.verify(&entry, &snapshot));
+        self.invalidate_refactor(&entry);
+        let outcome = result?;
         let warning = Self::notify_refactor_move(&entry, did.then_some(params));
         let updates: Vec<_> = outcome
             .files_changed

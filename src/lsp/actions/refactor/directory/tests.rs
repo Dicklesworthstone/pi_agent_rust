@@ -139,6 +139,97 @@ impl Fixture {
 }
 
 #[test]
+fn file_and_directory_moves_refresh_open_imports_on_every_contributing_server() {
+    for directory in [false, true] {
+        for preview in [false, true] {
+            let Some(fixture) = Fixture::with_matching_servers("fresh", "fresh") else {
+                return;
+            };
+            for (name, file) in [
+                ("directory-fixture", "imports.refactor"),
+                ("secondary-fixture", "imports.other"),
+            ] {
+                let path = fixture.root.join(file);
+                let spec = fixture
+                    .tool
+                    .registry
+                    .specs_for_file(&path)
+                    .into_iter()
+                    .find(|spec| spec.name == name)
+                    .unwrap();
+                fixture
+                    .runtime
+                    .block_on(fixture.tool.synced_for_spec_with_timeout(
+                        &path,
+                        spec,
+                        std::time::Duration::from_secs(5),
+                    ))
+                    .unwrap();
+            }
+            std::fs::write(
+                fixture.root.join("imports.refactor"),
+                "header\r\n😀 old\r\n",
+            )
+            .unwrap();
+            std::fs::write(
+                fixture.root.join("imports.other"),
+                "first\nsecond\n🦀 old\n",
+            )
+            .unwrap();
+            let source = if directory { "old" } else { "old/lib.refactor" };
+            let target = if directory {
+                "nested/new"
+            } else {
+                "nested/new.refactor"
+            };
+            let details = fixture
+                .run(json!({"action":"rename_file","file":source,
+                "newFile":target,"apply":!preview,"timeout":5}))
+                .unwrap()
+                .details
+                .unwrap();
+            assert_eq!(details["serverCount"], 2);
+            if preview {
+                assert_eq!(
+                    std::fs::read_to_string(fixture.root.join("imports.refactor")).unwrap(),
+                    "header\r\n😀 old\r\n"
+                );
+                fixture.run(json!({"action":"rename_file","refactorId":details["refactorId"],"apply":true})).unwrap();
+            }
+            fixture.flush();
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("imports.refactor")).unwrap(),
+                "header\r\n😀 new\r\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("imports.other")).unwrap(),
+                "first\nsecond\n🦀 new\n"
+            );
+            assert!(!fixture.root.join(source).exists());
+            assert!(fixture.root.join(target).exists());
+            for prefix in ["", "secondary-"] {
+                let messages = fixture
+                    .peer_requests(&format!("{prefix}requests.jsonl"), "textDocument/didChange");
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "each contributor refreshes its own retained import"
+                );
+                let requests = fixture.peer_requests(
+                    &format!("{prefix}requests.jsonl"),
+                    "workspace/willRenameFiles",
+                );
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "approval must reuse the original response"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn public_directory_move_updates_imports_and_notifies_after_commit() {
     let Some(fixture) = Fixture::new("normal") else { return };
     let result = fixture.rename(false).unwrap();

@@ -75,12 +75,29 @@ immediately when `apply` is omitted or true; use false to review first.
 
 ## Request lifetime and limits
 
+Before a fresh symbol, file, or directory rename, Pi refreshes every retained
+open document on each contributing language-server connection. This includes
+siblings changed by another editor since their last LSP request, so the server
+computes cross-file ranges from the current text. Each document retains its
+language ID and the server's negotiated full or incremental synchronization
+policy. Refresh uses one admission lane and the remaining rename deadline for
+the bounded working set (128 documents, 16 MiB per document, 64 MiB retained).
+Unreadable documents, changed document incarnations or membership, and a refresh
+that would evict a retained document fail the fresh request before edits apply.
+Already admitted synchronization notifications are not rolled back on failure.
+
+The refresh precedes the new request's evidence snapshot. It never runs when
+approving a `refactorId`: a changed file still invalidates the reviewed plan
+instead of being silently incorporated into it.
+
 The symbol request retains one bounded source snapshot and synchronized
 document incarnation across initialization, preparation, rename computation,
 and transaction staging. Source changes or same-text close/reopen invalidate
 that evidence. Owner cancellation and filesystem I/O authority are checked
 before work and again before commit. Initialization and both protocol calls
-share one request budget; each phase does not get a fresh timeout. That budget
+share one request budget, including the open-document refresh; each phase does
+not get a fresh timeout. File and directory rename contributors likewise share
+the original request deadline. That budget
 begins after the tool's serialized workflow lane is acquired. Waiting for the
 lane remains cancellable but is not included in this timeout.
 

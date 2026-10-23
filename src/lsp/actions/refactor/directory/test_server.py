@@ -17,6 +17,7 @@ PREFIX = "secondary-" if SECONDARY else ""
 SAME_SOURCE = len(sys.argv) > 3 and sys.argv[3] == "same-source"
 EXTENSION = "other" if SECONDARY and not SAME_SOURCE else "refactor"
 MAX_FRAME = 2 * 1024 * 1024
+DOCUMENTS = {}
 
 
 def send(message):
@@ -52,9 +53,15 @@ def registration(kind, glob):
     return {"filters": [{"scheme": "file", "pattern": {"glob": glob, "matches": kind}}]}
 
 
-def replacement():
-    return [{"range": {"start": {"line": 0, "character": 0},
-                       "end": {"line": 0, "character": 3}}, "newText": "new"}]
+def replacement(uri=None):
+    line, column = 0, 0
+    if MODE == "fresh":
+        text = DOCUMENTS[uri] if uri in DOCUMENTS else native(uri).read_text(encoding="utf-8")
+        prefix = text[:text.index("old")].replace("\r\n", "\n").replace("\r", "\n")
+        line = prefix.count("\n")
+        column = len(prefix.split("\n")[-1].encode("utf-16-le")) // 2
+    return [{"range": {"start": {"line": line, "character": column},
+                       "end": {"line": line, "character": column + 3}}, "newText": "new"}]
 
 
 def native(uri):
@@ -65,6 +72,14 @@ while (message := receive()) is not None:
     with (ROOT / f"{PREFIX}requests.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(message) + "\n")
     method = message.get("method")
+    if method == "textDocument/didOpen":
+        doc = message["params"]["textDocument"]
+        DOCUMENTS[doc["uri"]] = doc["text"]
+    elif method == "textDocument/didChange":
+        params = message["params"]
+        DOCUMENTS[params["textDocument"]["uri"]] = params["contentChanges"][0]["text"]
+    elif method == "textDocument/didClose":
+        DOCUMENTS.pop(message["params"]["textDocument"]["uri"], None)
     if method == "workspace/didRenameFiles":
         new = ROOT / "nested/new"
         single = not new.is_dir()
@@ -102,7 +117,7 @@ while (message := receive()) is not None:
                  [ROOT / "old/lib.refactor", ROOT / "old/sub/use.refactor", ROOT / "imports.refactor"])
         if SAME_SOURCE:
             paths[0] = ROOT / "old/lib.refactor"
-        result = {"changes": {path.as_uri(): replacement() for path in paths}}
+        result = {"changes": {path.as_uri(): replacement(path.as_uri()) for path in paths}}
         if MODE == "invalid":
             result["changes"][paths[-1].as_uri()][0]["range"]["end"]["line"] = 999
         elif MODE == "escape":

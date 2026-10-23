@@ -78,6 +78,28 @@ fn sync_error(message: &str) -> Error {
     Error::tool("lsp", format!("[LSP_SYNC_UNSUPPORTED] {message}"))
 }
 
+fn refactor_sync_conflict() -> Error {
+    Error::tool(
+        "lsp",
+        "[LSP_EDIT_CONFLICT] open document identities changed during synchronization; retry the refactor",
+    )
+}
+
+fn same_open_documents(
+    before: &HashMap<String, OpenDoc>,
+    after: &HashMap<String, OpenDoc>,
+) -> bool {
+    before.len() == after.len()
+        && before.iter().all(|(uri, expected)| {
+            after.get(uri).is_some_and(|current| {
+                expected.version == current.version
+                    && expected.opened == current.opened
+                    && expected.language_id == current.language_id
+                    && Arc::ptr_eq(&expected.text, &current.text)
+            })
+        })
+}
+
 fn bool_option(value: &Value, key: &str) -> Result<bool> {
     match value.get(key) {
         None => Ok(false),
@@ -407,6 +429,7 @@ impl LspClient {
         language_id: &str,
         budget: &RequestBudget,
         prepared: &mut Option<SyncPlan>,
+        retained: Option<&mut HashMap<String, OpenDoc>>,
     ) -> Result<SyncAttempt> {
         budget.remaining()?;
         let canonical = path.canonicalize()?;
@@ -416,6 +439,11 @@ impl LspClient {
         // the incremental baseline and planned evictions can change while an
         // async caller is waiting, so neither may be trusted without rechecking.
         let mut docs = Self::lock(&self.open_docs);
+        if retained.as_ref().is_some_and(|expected| {
+            !expected.contains_key(&uri) || !same_open_documents(expected, &docs)
+        }) {
+            return Err(refactor_sync_conflict());
+        }
         if !self.rpc.is_alive() {
             docs.clear();
             Self::lock(&self.diagnostics).clear();
@@ -440,6 +468,9 @@ impl LspClient {
         }
         budget.remaining()?;
         let plan = prepared.as_mut().expect("prepared document transaction");
+        if retained.is_some() && !plan.evicted.is_empty() {
+            return Err(refactor_sync_conflict());
+        }
         if let Err(error) = self.rpc.try_admit_notifications(&mut plan.notifications) {
             if matches!(error, TransportError::Backpressure(_)) {
                 return Ok(SyncAttempt::Busy(error));
@@ -455,6 +486,9 @@ impl LspClient {
         // Once admission succeeds, publish before checking cancellation again:
         // the server may receive this transaction even if its owner is dropped.
         let plan = prepared.take().expect("admitted document transaction");
+        if let Some(retained) = retained {
+            retained.insert(uri.clone(), plan.document.clone());
+        }
         {
             let mut diagnostics = Self::lock(&self.diagnostics);
             for evicted in plan.evicted {
@@ -475,7 +509,7 @@ impl LspClient {
     /// server; callers that can wait should use `ensure_synced_with_timeout`.
     pub fn ensure_synced(&self, path: &Path, language_id: &str) -> Result<String> {
         let budget = RequestBudget::new(DEFAULT_REQUEST_TIMEOUT);
-        match self.try_ensure_synced(path, language_id, &budget, &mut None)? {
+        match self.try_ensure_synced(path, language_id, &budget, &mut None, None)? {
             SyncAttempt::Synced(uri) => Ok(uri),
             SyncAttempt::Busy(error) => Err(LspCallError::Transport(error).into()),
         }
@@ -496,11 +530,61 @@ impl LspClient {
         let _lane = budget.acquire(&self.request_lane).await?;
         let mut prepared = None;
         loop {
-            match self.try_ensure_synced(path, language_id, &budget, &mut prepared)? {
+            match self.try_ensure_synced(path, language_id, &budget, &mut prepared, None)? {
                 SyncAttempt::Synced(uri) => return Ok(uri),
                 SyncAttempt::Busy(_) => budget.pause(WAIT_TICK).await?,
             }
         }
+    }
+
+    /// Refresh the retained working set before computing a fresh workspace
+    /// rename. One lane and deadline cover all documents and capacity waits;
+    /// an already reviewed transaction must never call this method.
+    pub(in crate::lsp) async fn ensure_open_documents_synced(
+        &self,
+        timeout: Duration,
+    ) -> Result<()> {
+        let budget = RequestBudget::new(timeout);
+        let _lane = budget.acquire(&self.request_lane).await?;
+        let mut retained = Self::lock(&self.open_docs).clone();
+        let mut documents: Vec<_> = retained
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.language_id.clone()))
+            .collect();
+        documents.sort_by(|left, right| left.0.cmp(&right.0));
+        for (uri, language_id) in documents {
+            let path = super::uri_to_path(&uri).ok_or_else(refactor_sync_conflict)?;
+            let mut prepared = None;
+            loop {
+                budget.remaining()?;
+                // Refuse observed deletion, replacement, eviction or links.
+                // Canonicalization is rechecked during synchronization; this
+                // does not provide an OS sandbox against racing path swaps.
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || try_path_to_uri(&path.canonicalize()?)? != uri
+                {
+                    return Err(refactor_sync_conflict());
+                }
+                match self.try_ensure_synced(
+                    &path,
+                    &language_id,
+                    &budget,
+                    &mut prepared,
+                    Some(&mut retained),
+                )? {
+                    SyncAttempt::Synced(current) if current == uri => break,
+                    SyncAttempt::Synced(_) => return Err(refactor_sync_conflict()),
+                    SyncAttempt::Busy(_) => budget.pause(WAIT_TICK).await?,
+                }
+            }
+        }
+        budget.remaining()?;
+        if !same_open_documents(&retained, &Self::lock(&self.open_docs)) {
+            return Err(refactor_sync_conflict());
+        }
+        Ok(())
     }
 
     pub fn invalidate(&self, uri: &str) {

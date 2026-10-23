@@ -195,6 +195,7 @@ impl LspTool {
             let (_, entry) = asupersync::time::timeout(
                 now, remaining()?, self.synced_for_spec_with_timeout(&anchor, &spec, remaining()?),
             ).await.map_err(|_| tool_err("LSP_TIMEOUT", "rename server startup timed out"))??;
+            entry.client.ensure_open_documents_synced(remaining()?).await?;
             remaining()?;
             before.verify()?;
             if entry.client.root() != root.as_path() {

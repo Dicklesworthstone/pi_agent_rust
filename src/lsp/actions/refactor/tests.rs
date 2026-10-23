@@ -10,12 +10,19 @@ import json, pathlib, sys, urllib.parse, urllib.request
 root = pathlib.Path.cwd()
 mode = sys.argv[1]
 versions = {}
+documents = {}
 def send(message):
     body = json.dumps(message).encode('utf-8')
     sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode('ascii') + body)
     sys.stdout.buffer.flush()
-def edits():
-    return [{'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}}, 'newText': 'renamed'}]
+def edits(uri=None):
+    line, column = 0, 0
+    if mode.endswith('fresh'):
+        text = documents[uri]
+        prefix = text[:text.index('old')].replace('\r\n', '\n').replace('\r', '\n')
+        line = prefix.count('\n')
+        column = len(prefix.split('\n')[-1].encode('utf-16-le')) // 2
+    return [{'range': {'start': {'line': line, 'character': column}, 'end': {'line': line, 'character': column + 3}}, 'newText': 'renamed'}]
 def native(uri):
     return pathlib.Path(urllib.request.url2pathname(urllib.parse.urlsplit(uri).path))
 while True:
@@ -36,6 +43,11 @@ while True:
     if method == 'textDocument/didOpen':
         doc = params['textDocument']
         versions[doc['uri']] = doc['version']
+        documents[doc['uri']] = doc['text']
+    if method == 'textDocument/didChange':
+        doc = params['textDocument']
+        versions[doc['uri']] = doc['version']
+        documents[doc['uri']] = params['contentChanges'][0]['text']
     if method == 'workspace/didRenameFiles':
         moved = params['files'][0]
         target = native(moved['newUri'])
@@ -60,7 +72,7 @@ while True:
     elif method == 'textDocument/rename':
         source = params['textDocument']['uri']
         sibling = (root / 'sibling.refactor').as_uri()
-        result = {'changes': {source: edits(), sibling: edits()}}
+        result = {'changes': {source: edits(source), sibling: edits(sibling)}}
         if mode == 'escape':
             result['changes'][(root.parent / 'outside.refactor').as_uri()] = edits()
         elif mode in ('version', 'stale', 'unknown'):
@@ -80,7 +92,7 @@ while True:
         source = params['files'][0]['oldUri']
         destination = native(params['files'][0]['newUri'])
         sibling = (root / 'sibling.refactor').as_uri()
-        result = {'changes': {source: edits(), sibling: edits()}}
+        result = {'changes': {source: edits(source), sibling: edits(sibling)}}
         if mode == 'move-appeared':
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text('external destination\n', encoding='utf-8')
@@ -161,6 +173,192 @@ fn rename(tool: &LspTool, runtime: &asupersync::runtime::Runtime) -> Result<Tool
 
 fn contents(root: &Path, name: &str) -> String {
     std::fs::read_to_string(root.join(name)).unwrap()
+}
+
+#[test]
+fn fresh_symbol_and_file_renames_refresh_siblings_before_computing_utf16_edits() {
+    for action in ["rename", "rename_file"] {
+        for preview in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mode = if action == "rename" {
+                "fresh"
+            } else {
+                "move-fresh"
+            };
+            let Some((tool, runtime)) = fixture(temp.path(), mode) else {
+                return;
+            };
+            let (_, entry) = runtime
+                .block_on(tool.synced(&tool.cwd.join("sibling.refactor")))
+                .unwrap();
+            let unrelated = tool.cwd.join("unrelated.refactor");
+            std::fs::write(&unrelated, "unrelated\n").unwrap();
+            runtime.block_on(tool.synced(&unrelated)).unwrap();
+            std::fs::write(temp.path().join("sibling.refactor"), "header\r\n😀 old\r\n").unwrap();
+            std::fs::write(&unrelated, "external unrelated\n").unwrap();
+            let mut args =
+                json!({"action":action,"file":"source.refactor","apply":!preview,"timeout":5});
+            if action == "rename" {
+                args["symbol"] = json!("old");
+                args["newName"] = json!("renamed");
+            } else {
+                args["newFile"] = json!("moved.refactor");
+            }
+            let result = runtime
+                .block_on(tool.execute("fresh-rename", args, None))
+                .unwrap();
+            if preview {
+                assert_eq!(contents(temp.path(), "source.refactor"), "old\n");
+                assert_eq!(
+                    contents(temp.path(), "sibling.refactor"),
+                    "header\r\n😀 old\r\n"
+                );
+                let details = result.details.unwrap();
+                runtime
+                    .block_on(tool.execute(
+                        "approve-fresh",
+                        json!({
+                            "action":action,"refactorId":details["refactorId"],"apply":true
+                        }),
+                        None,
+                    ))
+                    .unwrap();
+            }
+            runtime
+                .block_on(entry.client.call(
+                    "test/barrier",
+                    json!({}),
+                    std::time::Duration::from_secs(5),
+                ))
+                .unwrap();
+            let target = if action == "rename" {
+                "source.refactor"
+            } else {
+                "moved.refactor"
+            };
+            assert_eq!(contents(temp.path(), target), "renamed\n");
+            assert_eq!(
+                contents(temp.path(), "sibling.refactor"),
+                "header\r\n😀 renamed\r\n"
+            );
+            assert_eq!(
+                contents(temp.path(), "unrelated.refactor"),
+                "external unrelated\n"
+            );
+            let messages = frames(temp.path());
+            let method = if action == "rename" {
+                "textDocument/rename"
+            } else {
+                "workspace/willRenameFiles"
+            };
+            let request = messages
+                .iter()
+                .position(|message| message["method"] == method)
+                .unwrap();
+            let changes: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message["method"] == "textDocument/didChange")
+                .collect();
+            assert_eq!(
+                changes.len(),
+                2,
+                "refresh also includes retained documents outside the edit set"
+            );
+            assert!(changes.iter().all(|(index, _)| *index < request));
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message["method"] == method)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn unreadable_retained_sibling_refuses_rename_before_dispatch_or_writes() {
+    for action in ["rename", "rename_file"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((tool, runtime)) = fixture(temp.path(), "move-fresh") else {
+            return;
+        };
+        let (_, entry) = runtime
+            .block_on(tool.synced(&tool.cwd.join("sibling.refactor")))
+            .unwrap();
+        std::fs::write(temp.path().join("sibling.refactor"), [255]).unwrap();
+        let args = if action == "rename" {
+            json!({"action":action,"file":"source.refactor","symbol":"old","newName":"renamed","timeout":5})
+        } else {
+            json!({"action":action,"file":"source.refactor","newFile":"moved.refactor","timeout":5})
+        };
+        assert!(
+            runtime
+                .block_on(tool.execute("unreadable-sibling", args, None))
+                .is_err()
+        );
+        runtime
+            .block_on(entry.client.call(
+                "test/barrier",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap();
+        assert!(!frames(temp.path()).iter().any(|message| matches!(
+            message["method"].as_str(),
+            Some("textDocument/rename" | "workspace/willRenameFiles")
+        )));
+        assert_eq!(contents(temp.path(), "source.refactor"), "old\n");
+        assert_eq!(
+            std::fs::read(temp.path().join("sibling.refactor")).unwrap(),
+            [255]
+        );
+        assert!(!temp.path().join("moved.refactor").exists());
+    }
+}
+
+#[test]
+fn approving_a_preview_never_refreshes_a_newer_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((tool, runtime)) = fixture(temp.path(), "fresh") else {
+        return;
+    };
+    let (_, entry) = runtime
+        .block_on(tool.synced(&tool.cwd.join("sibling.refactor")))
+        .unwrap();
+    let preview = runtime.block_on(tool.execute("preview", json!({
+        "action":"rename","file":"source.refactor","symbol":"old","newName":"renamed","apply":false,"timeout":5
+    }), None)).unwrap().details.unwrap();
+    std::fs::write(temp.path().join("sibling.refactor"), "external\n😀 old\n").unwrap();
+    assert!(
+        runtime
+            .block_on(tool.execute(
+                "approve",
+                json!({
+                    "action":"rename","refactorId":preview["refactorId"],"apply":true
+                }),
+                None
+            ))
+            .is_err()
+    );
+    runtime
+        .block_on(
+            entry
+                .client
+                .call("test/barrier", json!({}), std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+    assert_eq!(contents(temp.path(), "source.refactor"), "old\n");
+    assert_eq!(
+        contents(temp.path(), "sibling.refactor"),
+        "external\n😀 old\n"
+    );
+    assert!(
+        !frames(temp.path())
+            .iter()
+            .any(|message| message["method"] == "textDocument/didChange")
+    );
 }
 
 #[test]
