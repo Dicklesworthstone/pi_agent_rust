@@ -129,13 +129,125 @@ renewed through the existing trust flow after this update; an acknowledgment
 from another project cannot authorize a new root even when server `cwd` is fixed.
 
 These connections advertise no sampling, elicitation, or task capabilities.
-OAuth login and `/mcp reauth` are not implemented by this protocol update;
-configured authentication headers and credential references retain their
-existing behavior.
+HTTP OAuth is available through the native authentication flow below.
+Configured authentication headers and credential references remain supported.
 
 Protocol references: [OMP v18.12.6 client](https://github.com/can1357/oh-my-pi/blob/v18.12.6/packages/coding-agent/src/mcp/client.ts),
 [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots).
+
+## Native HTTP OAuth
+
+Trusted HTTP MCP servers can use a native browser sign-in flow through print
+commands, ACP operator commands, and RPC requests. The client discovers the
+resource and authorization-server metadata, uses PKCE with an S256 challenge,
+and receives the authorization response on a temporary loopback listener.
+OAuth endpoints must use HTTPS; loopback HTTP is accepted for local servers
+and development.
+
+Review the server's source configuration and acknowledge its trust before
+starting authentication:
+
+```text
+/mcp trust docs
+/mcp reauth docs
+```
+
+A protected server can reject the initial trust/connect attempt with an
+authentication error; the trust acknowledgment remains saved. Run reauth next,
+open the displayed sign-in URL in your browser, and complete the authorization.
+Successful login saves the credentials, reconnects the server, and loads its
+tool catalog. Cancelling the browser wait does not clear an existing login.
+After credentials have been saved, a reconnect failure or late cancellation
+does not roll them back. The browser flow has a five-minute outer deadline.
+
+```text
+/mcp unauth docs
+```
+
+Unauth removes the local managed login and retires the live connection and tool
+catalog. It does not change trust or edit the server definition, and remains
+available after a definition has been denied or disabled. It does not revoke
+the account's grant at the remote authorization server.
+
+Credentials live in the configured global Pi agent directory using the existing
+private, atomic credential storage. They are bound to the exact server
+definition, endpoint, workspace, and source identity. A changed definition
+cannot inherit another server's login. Tokens are never copied into project MCP
+configuration or editor-supplied definitions.
+
+Access tokens are attached to every HTTP channel, including event streams,
+cancellation notifications, and session termination. Near-expiry tokens can be
+refreshed before an ordinary request. Refresh rotation is saved before the
+replacement token is used; cleanup requests do not initiate refresh or browser
+interaction. Logout invalidates older refresh and browser-flow commits, and old
+connections cannot borrow credentials from a replacement login.
+
+An explicit configured `Authorization` header remains authoritative. Managed
+reauth/unauth refuse such definitions; remove that header from the source
+configuration before switching to managed OAuth. Authentication failures appear
+as authentication-required status and do not spend the server-crash restart
+budget. A rejected tool call is not replayed. If authentication fails after a
+request has already been accepted, the result remains outcome-unknown.
+
+### One-shot authentication
+
+```bash
+pi -p "/mcp reauth docs"
+pi --mode json "/mcp unauth docs"
+```
+
+These commands run before LLM credential loading, resource expansion, extension
+startup, and model selection. They use existing server-trust acknowledgments;
+complete the trust step with `pi -p "/mcp trust docs"` or in an interactive/ACP
+session first. They accept one standalone quoted command argument. Piped text,
+file attachments, additional prompts, and expanded prompt templates cannot
+authorize this operation.
+
+JSON mode emits a `mcp_auth_url` record with the server and sign-in URL, followed
+by a `mcp_auth_result` record containing the command, server, and success status.
+Failures return a nonzero process status. Successful one-shot login closes its
+temporary MCP connection while retaining the saved credentials for future
+sessions.
+
+### ACP and RPC authentication
+
+ACP accepts `/mcp reauth <name>` and `/mcp unauth <name>` as standalone
+operator commands. Sign-in URLs are delivered through the active session's
+updates. The request remains cancellable, and the resulting tool catalog is
+reconciled before the operator request finishes. These commands do not ask a
+model to interpret the command.
+
+RPC exposes explicit requests with exact server names:
+
+```json
+{"id":"login-docs","type":"mcp_reauth","server":"docs"}
+{"id":"logout-docs","type":"mcp_unauth","server":"docs"}
+```
+
+A browser sign-in first emits a `mcp_auth_url` event containing the original
+request `id`, the `command`, `server`, and `url`. Completion uses the ordinary
+RPC response envelope, with `command: "mcp_reauth"` or `"mcp_unauth"`, a
+`success` flag, and either an error or `data: {"server":"docs","authenticated":true}`
+(`authenticated` is `false` for successful logout).
+
+Authentication requires an idle RPC session. Other session-changing requests
+are rejected as busy until it finishes; the normal `abort` request can cancel
+it. The browser
+wait does not hold the session mutex and does not emit a model turn or append
+conversation entries. A failed URL delivery ends the login attempt.
+
+By default, browser sign-in uses the authorization server's dynamic client
+registration endpoint. If the server requires a previously registered public
+client, provide its identifier through RPC:
+
+```json
+{"id":"login-docs","type":"mcp_reauth","server":"docs","clientId":"registered-public-client"}
+```
+
+The manager API also accepts this optional client ID. Print and ACP commands
+use dynamic registration by default. Custom callback ports, scopes, and OMP
+OAuth configuration fields are not imported by this native flow.
 
 ## Request timeouts
 

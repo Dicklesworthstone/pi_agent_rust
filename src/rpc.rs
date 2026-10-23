@@ -190,6 +190,32 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
         .map_err(|_| Error::Validation(format!("{field} exceeds the maximum supported value")))
 }
 
+fn parse_mcp_auth_request(parsed: &Value, reauth: bool) -> Result<(String, Option<String>)> {
+    let server = parsed
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty() && !name.contains(['\0', '\r', '\n']))
+        .ok_or_else(|| Error::validation("MCP server must be a nonempty, single-line string"))?;
+    let client_id = match parsed.get("clientId") {
+        None => None,
+        Some(Value::String(value))
+            if reauth && !value.trim().is_empty() && !value.contains(['\0', '\r', '\n']) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) if !reauth => {
+            return Err(Error::validation("mcp_unauth does not accept clientId"));
+        }
+        Some(_) => {
+            return Err(Error::validation(
+                "MCP clientId must be a nonempty, single-line string",
+            ));
+        }
+    };
+    // Configuration keys are exact strings; never collapse spaces in a name.
+    Ok((server.to_string(), client_id))
+}
+
 fn parse_handoff_focus(parsed: &Value) -> Result<&str> {
     let focus = match parsed.get("focus") {
         None => "",
@@ -1324,6 +1350,178 @@ impl Drop for TerminalAgentEndOnDrop {
         if let Some(is_streaming) = &self.is_streaming {
             is_streaming.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// An operator auth request owns its response and maintenance admission before
+/// runtime submission, including rejection and a future dropped before polling.
+struct RpcMcpAuthCompletion {
+    id: Option<String>,
+    command: &'static str,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    abort: crate::agent::AbortSignal,
+    reconcile: Option<Box<dyn FnOnce() + Send>>,
+    answered: bool,
+}
+
+impl RpcMcpAuthCompletion {
+    fn finish(&mut self, result: Result<Value>) {
+        if self.answered {
+            return;
+        }
+        // Logout may already have removed credentials when cancellation or a
+        // reconnect error wins. Publish that catalog before releasing admission.
+        if let Some(reconcile) = self.reconcile.take() {
+            reconcile();
+        }
+        let response = match result {
+            Ok(data) => response_ok(self.id.clone(), self.command, Some(data)),
+            Err(error) => response_error_with_hints(self.id.clone(), self.command, &error),
+        };
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcMcpAuthCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            let error = if self.abort.is_aborted() {
+                Error::Aborted
+            } else {
+                Error::session("MCP authentication ended without a terminal response")
+            };
+            self.finish(Err(error));
+        }
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_rpc_mcp_auth(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    id: Option<String>,
+    reauth: bool,
+    server: String,
+    client_id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let command = if reauth { "mcp_reauth" } else { "mcp_unauth" };
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let mut completion = RpcMcpAuthCompletion {
+        id: id.clone(),
+        command,
+        out_tx: out_tx.clone(),
+        is_compacting,
+        abort: abort_signal.clone(),
+        reconcile: None,
+        answered: false,
+    };
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let result: Result<Value> = async {
+            {
+                let mut slot = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                    .await
+                    .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                if retry_abort.load(Ordering::SeqCst) {
+                    abort_handle.abort();
+                }
+                *slot = Some(abort_handle.clone());
+            }
+            if abort_signal.is_aborted() || client_cx.checkpoint().is_err() {
+                return Err(Error::Aborted);
+            }
+            let (manager, shared_tools) = {
+                let guard = OwnedMutexGuard::lock(session, &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                let manager = guard
+                    .mcp_manager()
+                    .ok_or_else(|| Error::validation("MCP discovery is disabled for this session"))?;
+                (manager, guard.agent.shared_tools())
+            };
+            let cleanup_manager = Arc::clone(&manager);
+            completion.reconcile = Some(Box::new(move || {
+                crate::mcp::reconcile_tools(&cleanup_manager, &shared_tools);
+            }));
+            // The browser wait never holds the outer AgentSession mutex, so
+            // control commands and the independent abort lane stay responsive.
+            let output_failed = Arc::new(AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_owner = owner.clone();
+            let callback_server = server.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                let mut frame = json!({
+                    "type": "mcp_auth_url",
+                    "command": command,
+                    "server": callback_server,
+                    "url": url,
+                });
+                if let Some(id) = &id {
+                    frame["id"] = Value::String(id.clone());
+                }
+                if out_tx.try_send(event(&frame)).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                    callback_owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("MCP sign-in URL could not be delivered"),
+                    );
+                }
+            });
+            let work = owner.with_current(async {
+                if reauth {
+                    manager.reauthenticate(&server, client_id, on_url).await
+                } else {
+                    manager.unauthenticate(&server).await
+                }
+            });
+            let cancelled = async {
+                loop {
+                    if output_failed.load(Ordering::Acquire) {
+                        return Error::tool(
+                            "mcp",
+                            "[MCP_AUTH_OUTPUT_FAILED] sign-in URL could not be delivered",
+                        );
+                    }
+                    if abort_signal.is_aborted()
+                        || retry_abort.load(Ordering::SeqCst)
+                        || client_cx.checkpoint().is_err()
+                        || owner.checkpoint().is_err()
+                    {
+                        abort_handle.abort();
+                        return Error::Aborted;
+                    }
+                    supervisor.time().sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = supervisor
+                .with_current(async {
+                    match futures::future::select(Box::pin(cancelled), Box::pin(work)).await {
+                        futures::future::Either::Left((error, pending)) => {
+                            drop(pending);
+                            Err(error)
+                        }
+                        futures::future::Either::Right((result, _)) => result,
+                    }
+                })
+                .await;
+            outcome.map(|()| json!({"server": server, "authenticated": reauth}))
+        }
+        .await;
+        // Clear the previous handle before the terminal response makes this
+        // maintenance lane available for another request.
+        if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+            *slot = None;
+        }
+        completion.finish(result);
     }
 }
 
@@ -4254,6 +4452,56 @@ pub async fn run(
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
             }
 
+            "mcp_reauth" | "mcp_unauth" => {
+                let reauth = command_type == "mcp_reauth";
+                let (server, client_id) = match parse_mcp_auth_request(&parsed, reauth) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, command_type, &error));
+                        continue;
+                    }
+                };
+                let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+                    .is_some();
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if !bash_running
+                        && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+                    {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        command_type,
+                        "MCP authentication needs an idle session",
+                    ));
+                    continue;
+                }
+                // These operator commands change external credentials and the
+                // tool catalog, without advancing or recovering a model turn.
+                let task = run_rpc_mcp_auth(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    id,
+                    reauth,
+                    server,
+                    client_id,
+                    out_tx.clone(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
+            }
             "handoff" => {
                 let focus = parse_handoff_focus(&parsed)?.to_string();
                 let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
@@ -17315,6 +17563,160 @@ mod tests {
                 .try_iter()
                 .all(|line| parse_response(&line)["type"] != "agent_end"));
         }));
+    }
+
+    #[test]
+    fn rpc_mcp_auth_validates_native_fields_without_normalizing_names() {
+        assert_eq!(
+            parse_mcp_auth_request(
+                &json!({"server": "remote  service", "clientId": "native-public-client"}),
+                true,
+            )
+            .unwrap(),
+            ("remote  service".to_string(), Some("native-public-client".to_string())),
+        );
+        assert_eq!(
+            parse_mcp_auth_request(&json!({"server": "日本語 server"}), false).unwrap(),
+            ("日本語 server".to_string(), None),
+        );
+        for invalid in [
+            json!({}),
+            json!({"server": null}),
+            json!({"server": 42}),
+            json!({"server": ""}),
+            json!({"server": " \t "}),
+            json!({"server": "remote\nservice"}),
+            json!({"server": "remote\u{0}service"}),
+            json!({"server": "remote", "clientId": null}),
+            json!({"server": "remote", "clientId": 42}),
+            json!({"server": "remote", "clientId": ""}),
+            json!({"server": "remote", "clientId": "client\rid"}),
+        ] {
+            assert!(parse_mcp_auth_request(&invalid, true).is_err(), "{invalid}");
+        }
+        assert!(parse_mcp_auth_request(
+            &json!({"server": "remote", "clientId": "public-client"}), false,
+        ).is_err());
+        for command in ["mcp_reauth", "mcp_unauth"] {
+            assert!(!command_resumes_rpc_agent(command, &json!({}), None));
+            assert!(!command_can_queue_while_rpc_agent_streams(command));
+        }
+    }
+
+    #[test]
+    fn rpc_unpolled_mcp_auth_answers_once_and_releases_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for reauth in [true, false] {
+            let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let compacting = Arc::new(AtomicBool::new(true));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let future = run_rpc_mcp_auth(
+                runtime.handle(),
+                AgentCx::for_testing(),
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                Some("not-polled".to_string()),
+                reauth,
+                "remote  service".to_string(),
+                None,
+                out_tx,
+                Arc::clone(&compacting),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(asupersync::sync::Mutex::new(None)),
+            );
+            drop(future);
+            assert!(!compacting.load(Ordering::SeqCst));
+            let frames = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 1);
+            assert_err(&frames[0], if reauth { "mcp_reauth" } else { "mcp_unauth" });
+            assert_eq!(frames[0]["id"], "not-polled");
+        }
+    }
+
+    #[test]
+    fn rpc_mcp_auth_honors_abort_between_admission_and_task_start() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let compacting = Arc::new(AtomicBool::new(true));
+            let abort_slot = Arc::new(asupersync::sync::Mutex::new(None));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            run_rpc_mcp_auth(
+                runtime_handle,
+                AgentCx::for_testing(),
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                Some("already-aborted".to_string()),
+                true,
+                "remote".to_string(),
+                None,
+                out_tx,
+                Arc::clone(&compacting),
+                Arc::new(AtomicBool::new(true)),
+                Arc::clone(&abort_slot),
+            )
+            .await;
+            assert!(!compacting.load(Ordering::SeqCst));
+            assert!(abort_slot.try_lock().unwrap().is_none());
+            let frames = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 1);
+            assert_err(&frames[0], "mcp_reauth");
+            assert!(frames[0]["error"].as_str().unwrap().to_lowercase().contains("abort"));
+            assert_eq!(frames[0]["id"], "already-aborted");
+        }));
+    }
+
+    #[test]
+    fn rpc_mcp_auth_disabled_discovery_drains_eof_without_a_model_turn() {
+        for command in ["mcp_reauth", "mcp_unauth"] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+                .build()
+                .expect("runtime");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(Box::pin(async move {
+                let temp = tempfile::tempdir().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider = Arc::new(GatedAutoCompactionProvider {
+                    calls: Arc::clone(&calls),
+                    compaction_entered: Mutex::new(None),
+                    compaction_gate: Mutex::new(None),
+                });
+                let session = handoff_agent_session(Session::in_memory(), false, provider);
+                let inner = Arc::clone(&session.session);
+                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = mpsc::channel(4);
+                in_tx.send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id": "auth", "type": command, "server": "remote  service"}).to_string(),
+                ).await.unwrap();
+                drop(in_tx);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+                Box::pin(run(session, options, in_rx, out_tx))
+                    .await
+                    .expect("failed auth is returned as an RPC response");
+                let frames = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(frames.len(), 1, "operator auth emits no agent lifecycle");
+                assert_err(&frames[0], command);
+                assert_eq!(frames[0]["id"], "auth");
+                assert!(frames[0]["error"].as_str().unwrap().contains("MCP discovery is disabled"));
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(inner.try_lock().unwrap().entries.is_empty());
+            }));
+        }
     }
 
     #[test]

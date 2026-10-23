@@ -217,8 +217,8 @@ pub(super) fn commands_notification(id: &str) -> String {
                 "sessionUpdate": "available_commands_update",
                 "availableCommands": [{
                     "name": "mcp",
-                    "description": "Inspect, refresh, trust, deny, or test this session's MCP servers",
-                    "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME" },
+                    "description": "Inspect, refresh, trust, authenticate, or test this session's MCP servers",
+                    "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME" },
                 }],
             },
         }),
@@ -234,6 +234,8 @@ fn status(state: &SessionMcp) -> String {
         // targets. Expose a bounded health category, not raw diagnostics.
         let health = if row.health.starts_with("ready") {
             "ready"
+        } else if row.health.starts_with("authentication required") {
+            "authentication required; use /mcp reauth NAME"
         } else if row.health.starts_with("unhealthy") {
             "unhealthy; use /mcp test after checking the server"
         } else if row.health.starts_with("failed") {
@@ -246,7 +248,7 @@ fn status(state: &SessionMcp) -> String {
             row.name, row.trust, health, row.tools
         ));
     }
-    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
+    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp reauth NAME signs in to a trusted HTTP server; /mcp unauth NAME removes its managed login. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
     lines.join("\n")
 }
 
@@ -269,6 +271,8 @@ pub(super) enum Command {
     Trust(String),
     Deny(String),
     Test(String),
+    Reauth(String),
+    Unauth(String),
 }
 
 /// Inspect original wire blocks, NOT flattened model content. An embedded
@@ -294,6 +298,18 @@ pub(super) fn command_from_prompt(blocks: &[Value]) -> Result<Option<Command>, S
             "An MCP operator command must be one standalone text block on one line".to_string(),
         );
     }
+    // Authentication uses the exact configured name, including internal spaces.
+    let rest = rest.trim();
+    if let Some((verb, name)) = rest.split_once(char::is_whitespace) {
+        let name = name.trim();
+        if !name.is_empty() {
+            match verb {
+                "reauth" => return Ok(Some(Command::Reauth(name.to_string()))),
+                "unauth" => return Ok(Some(Command::Unauth(name.to_string()))),
+                _ => {}
+            }
+        }
+    }
     let words: Vec<_> = rest.split_whitespace().collect();
     let command =
         match words.as_slice() {
@@ -304,7 +320,7 @@ pub(super) fn command_from_prompt(blocks: &[Value]) -> Result<Option<Command>, S
             ["deny", name] => Command::Deny((*name).to_string()),
             ["test", name] => Command::Test((*name).to_string()),
             _ => return Err(
-                "Usage: /mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME"
+                "Usage: /mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME"
                     .to_string(),
             ),
         };
@@ -358,7 +374,11 @@ async fn refresh_catalogs(state: &SessionMcp) {
 
 // The Ok/Err arms read clearer as a match than as map_or_else closures.
 #[allow(clippy::option_if_let_else)]
-async fn execute(state: &SessionMcp, command: Command) -> String {
+async fn execute(
+    state: &SessionMcp,
+    command: Command,
+    on_url: Arc<dyn Fn(&str) + Send + Sync>,
+) -> String {
     match command {
         Command::List => status(state),
         Command::Refresh => {
@@ -383,6 +403,18 @@ async fn execute(state: &SessionMcp, command: Command) -> String {
             Ok(tools) => format!("Connected MCP server {name}: {} tools", tools.len()),
             Err(_) => "MCP test failed. Inspect the server configuration and its trust state with /mcp list.".to_string(),
         },
+        Command::Reauth(name) => match state.manager.reauthenticate(&name, None, on_url).await {
+            Ok(()) => format!("Signed in to MCP server {name}; its tool catalog has been refreshed"),
+            Err(error) if error.to_string().contains("[MCP_AUTH_RECONNECT_FAILED]") =>
+                "MCP login was saved, but reconnecting or loading tools failed. Use /mcp list and /mcp test NAME after checking the server.".to_string(),
+            Err(_) =>
+                "MCP sign-in did not complete. The server must be trusted, enabled, and HTTP-based without a configured Authorization header; inspect its configuration and use /mcp list.".to_string(),
+        },
+        Command::Unauth(name) => match state.manager.unauthenticate(&name).await {
+            Ok(()) => format!("Removed the managed login for MCP server {name}; its connection and tools were retired. Trust is unchanged."),
+            Err(_) =>
+                "MCP credential removal did not complete. An explicit Authorization header must be removed from the server configuration; otherwise check the credential store and retry.".to_string(),
+        },
     }
 }
 
@@ -403,11 +435,25 @@ pub(super) async fn before_prompt(
     }
     if let Some(command) = command {
         let text = if let Some(state) = state {
-            let Ok(text) = cancellable(signal, cx, execute(state, command)).await else {
+            let callback_out = out.clone();
+            let callback_id = id.to_string();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                // The synchronous output lane fails closed on disconnect or
+                // overflow, which also aborts the reserved ACP prompt.
+                let _ = callback_out.send(json_rpc_notification("session/update", json!({
+                    "sessionId": callback_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": format!("Open this URL to sign in to the MCP server:\n{url}\n")},
+                    },
+                })));
+            });
+            let result = cancellable(signal, cx, execute(state, command, on_url)).await;
+            // Even cancellation can follow durable credential removal.
+            mount(agent, state);
+            let Ok(text) = result else {
                 return Some(ACP_STOP_REASON_CANCELLED);
             };
-            // Publish the whole current overlay, including removals on deny.
-            mount(agent, state);
             text
         } else {
             "No MCP servers were supplied for this session.".to_string()
@@ -947,6 +993,9 @@ mod tests {
             ("/mcp trust remote", Command::Trust("remote".into())),
             ("/mcp deny remote", Command::Deny("remote".into())),
             ("/mcp test remote", Command::Test("remote".into())),
+            ("/mcp reauth remote", Command::Reauth("remote".into())),
+            ("/mcp unauth remote", Command::Unauth("remote".into())),
+            ("/mcp reauth remote  service", Command::Reauth("remote  service".into())),
         ] {
             assert_eq!(
                 command_from_prompt(&[json!({"type":"text","text":text})]).unwrap(),
@@ -1027,12 +1076,12 @@ mod tests {
     fn operator_inspection_never_exposes_connection_secrets() {
         let root = tempfile::tempdir().unwrap();
         let state = prepare(root.path(), root.path(), http_servers(root.path())).unwrap();
-        let text = runtime().block_on(execute(&state, Command::Inspect("remote".into())));
+        let text = runtime().block_on(execute(&state, Command::Inspect("remote".into()), Arc::new(|_| {})));
         assert!(text.contains("HTTP"));
         assert!(text.contains("1 headers"));
         assert!(!text.contains("PRIVATE-HEADER-VALUE"));
         assert!(!text.contains("https://"));
-        let denied = runtime().block_on(execute(&state, Command::Deny("remote".into())));
+        let denied = runtime().block_on(execute(&state, Command::Deny("remote".into()), Arc::new(|_| {})));
         assert!(denied.contains("Denied"));
         assert_eq!(state.manager.list()[0].trust, "denied");
         assert_eq!(state.manager.list()[0].tools, 0);

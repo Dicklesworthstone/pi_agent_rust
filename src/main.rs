@@ -1661,6 +1661,8 @@ enum PrintMcpCommand {
     Deny(String),
     Test(String),
     Refresh(Option<String>),
+    Reauthenticate(String),
+    Unauthenticate(String),
 }
 
 impl PrintMcpCommand {
@@ -1672,6 +1674,8 @@ impl PrintMcpCommand {
             Self::Deny(_) => "mcp_deny",
             Self::Test(_) => "mcp_test",
             Self::Refresh(_) => "mcp_refresh",
+            Self::Reauthenticate(_) => "mcp_reauth",
+            Self::Unauthenticate(_) => "mcp_unauth",
         }
     }
 }
@@ -1718,8 +1722,10 @@ fn print_mcp_command(
         ("deny", Some(name)) => PrintMcpCommand::Deny(name.to_string()),
         ("test", Some(name)) => PrintMcpCommand::Test(name.to_string()),
         ("refresh", name) => PrintMcpCommand::Refresh(name.map(str::to_string)),
+        ("reauth", Some(name)) => PrintMcpCommand::Reauthenticate(name.to_string()),
+        ("unauth", Some(name)) => PrintMcpCommand::Unauthenticate(name.to_string()),
         _ => bail!(
-            "Usage: /mcp list | inspect NAME | trust NAME | deny NAME | test NAME | refresh [NAME]"
+            "Usage: /mcp list | inspect NAME | trust NAME | deny NAME | test NAME | refresh [NAME] | reauth NAME | unauth NAME"
         ),
     };
     Ok(Some(command))
@@ -1728,6 +1734,7 @@ fn print_mcp_command(
 async fn execute_print_mcp_command(
     manager: &pi::mcp::McpManager,
     command: &PrintMcpCommand,
+    on_url: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> pi::error::Result<Value> {
     match command {
         PrintMcpCommand::List => Ok(json!({"servers": manager.list()})),
@@ -1764,12 +1771,26 @@ async fn execute_print_mcp_command(
             manager.connect_trusted().await;
             Ok(json!({"servers": manager.list()}))
         }
+        PrintMcpCommand::Reauthenticate(name) => {
+            Box::pin(manager.reauthenticate(name, None, on_url)).await?;
+            let tools = manager
+                .list()
+                .iter()
+                .find(|server| server.name == *name)
+                .map_or(0, |server| server.tools);
+            Ok(json!({"server": name, "authenticated": true, "tools": tools}))
+        }
+        PrintMcpCommand::Unauthenticate(name) => {
+            Box::pin(manager.unauthenticate(name)).await?;
+            Ok(json!({"server": name, "authenticated": false, "tools": 0}))
+        }
     }
 }
 
 /// Run before resources, extensions, or provider credentials load. The startup
 /// path still verifies a selected session's workspace before invoking MCP.
 /// Native MCP setup must work even when no LLM account has been configured.
+#[allow(clippy::too_many_lines)]
 async fn run_print_mcp_command(
     command: PrintMcpCommand,
     cli: &cli::Cli,
@@ -1779,6 +1800,17 @@ async fn run_print_mcp_command(
 ) -> Result<()> {
     let json_mode = cli.mode.as_deref() == Some("json");
     let action = command.rpc_name();
+    let auth_server = match &command {
+        PrintMcpCommand::Reauthenticate(name) | PrintMcpCommand::Unauthenticate(name) => {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+    let record_type = if auth_server.is_some() {
+        "mcp_auth_result"
+    } else {
+        "mcp_result"
+    };
     let outcome: Result<Value> = async {
         if cli.no_mcp {
             bail!("MCP is disabled by --no-mcp");
@@ -1789,18 +1821,79 @@ async fn run_print_mcp_command(
             &cli.mcp_config,
             project_trusted,
         )?;
-        let result = Box::pin(execute_print_mcp_command(&manager, &command)).await;
+        let output_error = Arc::new(StdMutex::new(None::<io::Error>));
+        let owner = pi::agent_cx::AgentCx::for_current_or_request();
+        let on_url: Arc<dyn Fn(&str) + Send + Sync> = {
+            let server = auth_server.clone();
+            let output_error = Arc::clone(&output_error);
+            let owner = owner.clone();
+            Arc::new(move |url| {
+                let Some(server) = server.as_deref() else {
+                    return;
+                };
+                let output = if json_mode {
+                    format!(
+                        "{}\n",
+                        json!({
+                            "type": "mcp_auth_url",
+                            "command": "mcp_reauth",
+                            "server": server,
+                            "url": url,
+                        }),
+                    )
+                } else {
+                    format!("Open this URL to sign in to MCP server {server}:\n{url}\n")
+                };
+                if let Err(error) = emit_text_delta(&output) {
+                    *output_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                    // Stop waiting when the sign-in URL could not be delivered.
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("MCP sign-in URL output failed"),
+                    );
+                }
+            })
+        };
+        let result = owner
+            .with_current(Box::pin(execute_print_mcp_command(
+                &manager,
+                &command,
+                on_url,
+            )))
+            .await;
         // This invocation owns its processes and receive tasks, including
-        // partial connections left by a failed trust/test attempt.
+        // partial connections left by failed setup or authentication.
         manager.shutdown_all().await;
+        let failed_output = output_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(error) = failed_output {
+            return Err(error.into());
+        }
         result.map_err(anyhow::Error::from)
     }
     .await;
     match outcome {
         Ok(data) => {
             let output = if json_mode {
-                json!({"type": "mcp_result", "command": action, "success": true, "data": data})
-                    .to_string()
+                let record = if auth_server.is_some() {
+                    let mut record = data;
+                    record["type"] = json!(record_type);
+                    record["command"] = json!(action);
+                    record["success"] = json!(true);
+                    record
+                } else {
+                    json!({
+                        "type": record_type,
+                        "command": action,
+                        "success": true,
+                        "data": data,
+                    })
+                };
+                record.to_string()
             } else {
                 serde_json::to_string_pretty(&data)?
             };
@@ -1809,13 +1902,16 @@ async fn run_print_mcp_command(
         }
         Err(error) => {
             if json_mode {
-                let output = json!({
-                    "type": "mcp_result",
+                let mut record = json!({
+                    "type": record_type,
                     "command": action,
                     "success": false,
                     "error": error.to_string(),
                 });
-                emit_text_delta(&format!("{output}\n"))?;
+                if let Some(server) = auth_server {
+                    record["server"] = json!(server);
+                }
+                emit_text_delta(&format!("{record}\n"))?;
             }
             Err(error)
         }
@@ -11181,6 +11277,23 @@ mod tests {
     use clap::Parser as _;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn print_mcp_auth_commands_preserve_exact_names_and_use_native_dispatch() {
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp reauth docs  europe"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Reauthenticate("docs  europe".into()))
+        );
+        let cli = cli::Cli::parse_from(["pi", "--mode", "json", "/mcp unauth docs"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Unauthenticate("docs".into()))
+        );
+        assert!(print_mcp_command(&cli, Some("attached context")).is_err());
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp reauth"]);
+        assert!(print_mcp_command(&cli, None).is_err());
+    }
 
     #[test]
     fn print_mcp_commands_preserve_exact_server_names() {
