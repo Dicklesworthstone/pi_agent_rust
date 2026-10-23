@@ -13060,7 +13060,9 @@ mod tests {
         assert!(!request.id.is_empty());
         assert!(model.handoff_in_progress());
         let _ = model.handle_agent(PiMsg::SystemNote("background task completed".into()));
-        let _ = model.handle_agent(PiMsg::StatusSnapshot(FtuiStatusSnapshot::default()));
+        let _ = model.handle_agent(PiMsg::StatusSnapshot(
+            crate::interactive::FtuiStatusSnapshot::default(),
+        ));
         let _ = model.handle_agent(PiMsg::AgentDone {
             usage: None, stop_reason: StopReason::Stop, error_message: None,
         });
@@ -17896,7 +17898,7 @@ mod tests {
         let UiCommand::Handoff { focus, request } = submit_rx.try_recv().unwrap() else {
             panic!("native handoff route");
         };
-        sim.inject_event(key(KeyCode::Esc, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
         assert!(request.abort.signal().is_aborted());
         assert!(sim.model().handoff_in_progress());
         sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));

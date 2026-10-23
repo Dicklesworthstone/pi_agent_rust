@@ -250,6 +250,7 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
                 )])),
                 failover_cooldown_secs: Some(0),
                 max_failovers_per_turn: Some(2),
+                ..crate::config::RetrySettings::default()
             }),
             ..Config::default()
         },
